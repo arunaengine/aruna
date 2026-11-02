@@ -287,7 +287,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Describe the node answering this request: api version, capabilities, peer addresses, and network, blob, and database service status. Takes no arguments. Use get_realm_info for realm-wide configuration and the list of member nodes. Buckets, objects, and jobs are node-local, so this identifies the node those tools act on.",
+        description = "Describe the node answering this request: api version, capabilities, peer addresses, and network, blob, and database service status. Takes no arguments. Use get_realm_info for realm-wide configuration and the list of member nodes. Jobs are node-local, so this identifies the node the job tools act on; the object tools run on the node that holds the bucket.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

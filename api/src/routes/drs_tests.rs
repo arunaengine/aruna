@@ -804,6 +804,7 @@ mod global {
     async fn stored(node: &Node) -> String {
         let info = bucket_info(&node.state, BUCKET).await.unwrap();
         let input = WriteObjectInput {
+            node_id: None,
             bucket: BUCKET.to_string(),
             key: "a.md".to_string(),
             text: "bytes".to_string(),

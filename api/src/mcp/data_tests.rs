@@ -305,6 +305,7 @@ async fn lists_readable_objects() {
         .unwrap();
     for key in ["a.md", "secret.md", "z.md"] {
         let input = WriteObjectInput {
+            node_id: None,
             bucket: bucket.to_string(),
             key: key.to_string(),
             text: "x".to_string(),
@@ -343,6 +344,7 @@ async fn lists_readable_objects() {
             .extensions
             .insert(None::<crate::auth::ValidatedBearer>);
         let input = ListObjectsInput {
+            node_id: None,
             bucket: bucket.to_string(),
             prefix: None,
             cursor: cursor.take(),
@@ -401,6 +403,7 @@ mod distributed {
 
     fn write(key: &str) -> WriteObjectInput {
         WriteObjectInput {
+            node_id: None,
             bucket: BUCKET.to_string(),
             key: key.to_string(),
             text: "noted".to_string(),
@@ -466,6 +469,7 @@ mod distributed {
         // A link to a target the caller cannot read stays out of the range's listing.
         hidden_link(&members, "a/secret").await;
         let input = ListObjectsInput {
+            node_id: None,
             bucket: BUCKET.to_string(),
             prefix: Some("a/".to_string()),
             cursor: None,
@@ -671,6 +675,7 @@ async fn lists_public_prefix() {
         .unwrap();
     for key in ["closed.md", "open/b.md"] {
         let input = WriteObjectInput {
+            node_id: None,
             bucket: BUCKET.to_string(),
             key: key.to_string(),
             text: "x".to_string(),
@@ -692,6 +697,7 @@ async fn lists_public_prefix() {
     crate::tests::routes::open_paths(&state.get_ctx(), &actor, node.group_id, &[open]).await;
     let server = McpServer::new(state.clone());
     let list = |prefix: Option<&str>| ListObjectsInput {
+        node_id: None,
         bucket: BUCKET.to_string(),
         prefix: prefix.map(str::to_string),
         cursor: None,
@@ -714,6 +720,7 @@ async fn lists_public_prefix() {
     };
     assert_eq!(body(root)["code"], "Forbidden");
     let aggregate = AggregateObjectsInput {
+        node_id: None,
         bucket: BUCKET.to_string(),
         prefix: Some("open/".to_string()),
         bucket_by: BucketUnit::Day,
@@ -724,6 +731,7 @@ async fn lists_public_prefix() {
     let counted = server.aggregate_objects(stranger(), Parameters(aggregate));
     assert_eq!(counted.await.unwrap().0.scanned, 2);
     let stat = StatObjectInput {
+        node_id: None,
         bucket: BUCKET.to_string(),
         key: "open/ref.fna".to_string(),
         version_id: None,

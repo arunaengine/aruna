@@ -424,6 +424,7 @@ mod mint {
         advertise(&node).await;
         let info = bucket_info(&node.state, BUCKET).await.unwrap();
         let input = WriteObjectInput {
+            node_id: None,
             bucket: BUCKET.to_string(),
             key: "a.md".to_string(),
             text: "x".to_string(),

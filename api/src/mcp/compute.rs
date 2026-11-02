@@ -555,6 +555,7 @@ impl McpServer {
             self,
             &auth,
             WriteObjectInput {
+                node_id: None,
                 bucket: plan
                     .request
                     .workspace
@@ -580,6 +581,7 @@ impl McpServer {
                 self,
                 &auth,
                 WriteObjectInput {
+                    node_id: None,
                     bucket,
                     key,
                     text,

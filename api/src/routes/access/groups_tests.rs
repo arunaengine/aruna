@@ -1322,6 +1322,7 @@ mod distributed {
         let info = bucket_info(&node.state, BUCKET).await.unwrap();
         for key in ["a.md", "secret.md", "z.md"] {
             let input = WriteObjectInput {
+                node_id: None,
                 bucket: BUCKET.to_string(),
                 key: key.to_string(),
                 text: "x".to_string(),
@@ -1375,6 +1376,7 @@ mod distributed {
         let info = bucket_info(&node.state, BUCKET).await.unwrap();
         for key in ["a.md", "dir/b.md"] {
             let input = WriteObjectInput {
+                node_id: None,
                 bucket: BUCKET.to_string(),
                 key: key.to_string(),
                 text: "x".to_string(),

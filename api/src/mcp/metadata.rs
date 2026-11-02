@@ -213,6 +213,7 @@ impl McpServer {
                 self,
                 &auth,
                 ReadObjectInput {
+                    node_id: None,
                     bucket,
                     key,
                     offset: None,

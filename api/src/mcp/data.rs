@@ -90,6 +90,10 @@ pub struct ListObjectsInput {
     /// the range 1 to 200.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    /// Optional `node_id` from `list_buckets` that holds the bucket. Omit it to run the call
+    /// on the node that holds the bucket, found by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, utoipa::ToSchema)]
@@ -136,6 +140,10 @@ pub struct ReadObjectInput {
     /// `truncated` when the object continues past this window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<usize>,
+    /// Optional `node_id` from `list_buckets` that holds the bucket. Omit it to run the call
+    /// on the node that holds the bucket, found by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -164,6 +172,10 @@ pub struct StatObjectInput {
     /// or a previous write returned. Omit it for the key's latest version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
+    /// Optional `node_id` from `list_buckets` that holds the bucket. Omit it to run the call
+    /// on the node that holds the bucket, found by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -226,6 +238,10 @@ pub struct AggregateObjectsInput {
     /// clamped to the range 1 to 1000; a longer series sets `truncated`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_buckets: Option<usize>,
+    /// Optional `node_id` from `list_buckets` that holds the bucket. Omit it to run the call
+    /// on the node that holds the bucket, found by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -271,6 +287,10 @@ pub struct WriteObjectInput {
     /// Defaults to `text/plain; charset=utf-8`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    /// Optional `node_id` from `list_buckets` that holds the bucket. Omit it to run the call
+    /// on the node that holds the bucket, found by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, utoipa::ToSchema)]
@@ -329,7 +349,7 @@ pub(crate) fn toolset() -> rmcp::handler::server::router::tool::ToolRouter<McpSe
 #[tool_router(router = data_router)]
 impl McpServer {
     #[tool(
-        description = "List the buckets across the realm that the caller may read, as the bucket search does: the caller's own groups' buckets, buckets shared with the caller and public buckets, each with its name, owning group_id, node_id, and creation time. Call it first to obtain the bucket name that list_objects, read_object, write_object, and run_script require. Those tools read buckets held by this node (get_node_info names it); a distributed bucket shows once, under one of its member nodes. Follow next_cursor for the next page; nodes_failed above zero means buckets of an unreachable node may be missing.",
+        description = "List the buckets across the realm that the caller may read, as the bucket search does: the caller's own groups' buckets, buckets shared with the caller and public buckets, each with its name, owning group_id, node_id, and creation time. Call it first to obtain the bucket name that list_objects, read_object, write_object, and run_script require. Those tools run on the node that holds the bucket, found by its name, and report it as node_id; a distributed bucket shows once, under one of its member nodes. Follow next_cursor for the next page; nodes_failed above zero means buckets of an unreachable node may be missing.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -394,6 +414,15 @@ impl McpServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ListObjectsInput>,
     ) -> Result<Json<ObjectsOutput>, CallToolResult> {
         let auth = request_auth(&parts)?;
+        let prefix = input.prefix.as_deref().unwrap_or_default();
+        let call = (&parts, &auth);
+        let node = self.bucket_node(call, &input.bucket, input.node_id.as_deref(), prefix);
+        if let Some(node_id) = node.await? {
+            return Ok(Json(
+                self.forward(&parts, node_id, "list_objects", &input)
+                    .await?,
+            ));
+        }
         let extras = tool_extras("list_objects", &input)?;
         let bucket_info = self.bucket_info(&input.bucket).await?;
         let path = listing_path(&self.state, &bucket_info, &input.bucket, &input.prefix);
@@ -440,6 +469,13 @@ impl McpServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ReadObjectInput>,
     ) -> Result<Json<ReadObjectOutput>, CallToolResult> {
         let auth = request_auth(&parts)?;
+        let call = (&parts, &auth);
+        let node = self.bucket_node(call, &input.bucket, input.node_id.as_deref(), &input.key);
+        if let Some(node_id) = node.await? {
+            return Ok(Json(
+                self.forward(&parts, node_id, "read_object", &input).await?,
+            ));
+        }
         let extras = tool_extras("read_object", &input)?;
         Ok(Json(read_text(self, &auth, input, extras).await?))
     }
@@ -458,6 +494,13 @@ impl McpServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<StatObjectInput>,
     ) -> Result<Json<StatObjectOutput>, CallToolResult> {
         let auth = request_auth(&parts)?;
+        let call = (&parts, &auth);
+        let node = self.bucket_node(call, &input.bucket, input.node_id.as_deref(), &input.key);
+        if let Some(node_id) = node.await? {
+            return Ok(Json(
+                self.forward(&parts, node_id, "stat_object", &input).await?,
+            ));
+        }
         let extras = tool_extras("stat_object", &input)?;
         validate_key(&input.key)?;
         let version_id = input
@@ -571,6 +614,13 @@ impl McpServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<AggregateObjectsInput>,
     ) -> Result<Json<AggregateObjectsOutput>, CallToolResult> {
         let auth = request_auth(&parts)?;
+        let prefix = input.prefix.as_deref().unwrap_or_default();
+        let call = (&parts, &auth);
+        let node = self.bucket_node(call, &input.bucket, input.node_id.as_deref(), prefix);
+        if let Some(node_id) = node.await? {
+            let tool = "aggregate_objects";
+            return Ok(Json(self.forward(&parts, node_id, tool, &input).await?));
+        }
         let extras = tool_extras("aggregate_objects", &input)?;
         let since = parse_bound("since", input.since.as_deref())?;
         let until = parse_bound("until", input.until.as_deref())?;
@@ -654,6 +704,14 @@ impl McpServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<WriteObjectInput>,
     ) -> Result<Json<WriteObjectOutput>, CallToolResult> {
         let auth = request_auth(&parts)?;
+        let call = (&parts, &auth);
+        let node = self.bucket_node(call, &input.bucket, input.node_id.as_deref(), &input.key);
+        if let Some(node_id) = node.await? {
+            return Ok(Json(
+                self.forward(&parts, node_id, "write_object", &input)
+                    .await?,
+            ));
+        }
         let extras = tool_extras("write_object", &input)?;
         let bearer = request_bearer(&parts);
         let relay = (&parts.headers, bearer.as_ref());
@@ -885,8 +943,8 @@ fn listing_path(
 fn missing_bucket() -> CallToolResult {
     explained(
         crate::error::ServerError::NotFound,
-        "no bucket with that name exists on this node; list_buckets names the node that holds \
-         each readable bucket, and this tool reads only buckets this node holds. Pass the bare \
+        "no bucket with that name exists on the node named by node_id; omit node_id to use the \
+         node that holds the bucket, or call list_buckets for readable names. Pass the bare \
          bucket name without an s3:// prefix or a key",
     )
 }
@@ -1220,7 +1278,7 @@ async fn authorize_search(
         .map_err(server_error)
 }
 
-fn map_bucket_error(error: GetBucketError) -> CallToolResult {
+pub(crate) fn map_bucket_error(error: GetBucketError) -> CallToolResult {
     match error {
         GetBucketError::NotFound => missing_bucket(),
         GetBucketError::StorageError(error) => internal_error(error),
