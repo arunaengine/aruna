@@ -98,7 +98,7 @@ async fn stores_text_locally() {
 async fn relays_to_coordinator() {
     let node = node_state().await;
     distribute(&node.state, node.group_id, BUCKET).await;
-    let answer = r#"{"bucket":"routed","key":"z.md","version_id":"v","size":8,"content_type":"text/markdown"}"#;
+    let answer = r#"{"bucket":"routed","key":"z.md","version_id":"v","size":8,"content_type":"text/markdown","node_id":"peer"}"#;
     let peer = mock_peer(StatusCode::OK, answer).await;
     publish_api(&node.state, node_id(PEER), &peer.url).await;
 

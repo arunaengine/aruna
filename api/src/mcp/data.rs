@@ -110,11 +110,13 @@ pub struct ObjectOutput {
     pub link: Option<aruna_core::structs::execution::staging::VersionSourceBinding>,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObjectsOutput {
     pub bucket: String,
     pub objects: Vec<ObjectOutput>,
     pub next_cursor: Option<String>,
+    /// The node that answered the call.
+    pub node_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -136,7 +138,7 @@ pub struct ReadObjectInput {
     pub max_bytes: Option<usize>,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReadObjectOutput {
     pub bucket: String,
     pub key: String,
@@ -145,6 +147,8 @@ pub struct ReadObjectOutput {
     pub content_type: String,
     pub truncated: bool,
     pub text: String,
+    /// The node that answered the call.
+    pub node_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -162,7 +166,7 @@ pub struct StatObjectInput {
     pub version_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct StatObjectOutput {
     pub bucket: String,
     pub key: String,
@@ -224,7 +228,7 @@ pub struct AggregateObjectsInput {
     pub max_buckets: Option<usize>,
 }
 
-#[derive(Debug, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TimeBucketOutput {
     /// Start of the bucket in RFC 3339 UTC; it spans one `bucket_by` unit.
     pub start: String,
@@ -232,7 +236,7 @@ pub struct TimeBucketOutput {
     pub bytes: u64,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AggregateObjectsOutput {
     pub bucket: String,
     pub prefix: Option<String>,
@@ -247,6 +251,8 @@ pub struct AggregateObjectsOutput {
     /// The scan hit its object cap or the series exceeded `max_buckets`, so the
     /// answer covers only part of the prefix.
     pub truncated: bool,
+    /// The node that answered the call.
+    pub node_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -274,6 +280,8 @@ pub struct WriteObjectOutput {
     pub version_id: String,
     pub size: u64,
     pub content_type: String,
+    /// The node that answered the call.
+    pub node_id: String,
 }
 
 /// Which section of the unified search to query.
@@ -414,6 +422,7 @@ impl McpServer {
             bucket: input.bucket,
             objects: page.objects,
             next_cursor: page.next_cursor,
+            node_id: self.state.get_node_id().to_string(),
         }))
     }
 
@@ -631,6 +640,7 @@ impl McpServer {
             total_bytes: folded.total_bytes,
             scanned,
             truncated: scan_truncated || folded.truncated,
+            node_id: self.state.get_node_id().to_string(),
         }))
     }
 
@@ -961,6 +971,7 @@ pub(crate) async fn read_text(
         ))
     })?;
     Ok(ReadObjectOutput {
+        node_id: server.state.get_node_id().to_string(),
         bucket: input.bucket,
         key: input.key,
         offset,
@@ -1068,6 +1079,7 @@ pub(crate) async fn store_text(
     )
     .await?;
     Ok(WriteObjectOutput {
+        node_id: state.get_node_id().to_string(),
         bucket: input.bucket,
         key: input.key,
         version_id: result.version_id.to_string(),
