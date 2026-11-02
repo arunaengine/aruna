@@ -6,6 +6,7 @@
 use super::info_topics;
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use craqle::{
     GraphId, GraphPolicy, PolicyTag, TopicCursorRepairAudit, VectorClock, topic_cursor_digest,
 };
@@ -120,6 +121,16 @@ pub async fn repair_cursor(request: CursorRepair) -> Result<(), CliError> {
 }
 
 fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> {
+    // The document id names the event log that identifies the graph's local writers.
+    if MetadataRegistryRecord::graph_document(&request.graph)
+        .filter(|document| MetadataRegistryRecord::graph_iri_for(*document) == request.graph)
+        .is_none()
+    {
+        return Err(ExplorerError::Refused(format!(
+            "{} is not an Aruna metadata graph IRI",
+            request.graph
+        )));
+    }
     let storage = Path::new(&request.database_path);
     let craqle_path = request
         .craqle_path
@@ -428,7 +439,7 @@ mod tests {
     use std::collections::BTreeSet;
     use tempfile::{TempDir, tempdir};
 
-    const GRAPH: &str = "urn:test:doctor-repair-cursor";
+    const GRAPH: &str = "https://w3id.org/aruna/0000000000000000000000001A";
     const REPLICA_SEED: u8 = 9;
     const NODE_SECRET: [u8; 32] = [21; 32];
 
@@ -908,6 +919,23 @@ mod tests {
         let error = repair_output(&dry_request(bare.path())).unwrap_err();
         assert!(matches!(error, ExplorerError::Refused(_)), "{error}");
         assert_eq!(files(bare.path()), before);
+    }
+
+    /// Only an Aruna metadata graph IRI in its canonical form names a document to inspect.
+    #[test]
+    fn refuses_foreign_graph() {
+        let (_temp, mut request) = replaced_replica(Setup::default());
+        for graph in [
+            "urn:test:doctor-repair-cursor",
+            "https://w3id.org/aruna/0000000000000000000000001a",
+        ] {
+            request.graph = graph.to_string();
+            let error = repair_output(&request).unwrap_err();
+            assert!(
+                matches!(&error, ExplorerError::Refused(reason) if reason.contains("metadata graph")),
+                "{graph}: {error}"
+            );
+        }
     }
 
     /// After the repair Craqle opens with sync again, and the kept graph takes the new genesis.
