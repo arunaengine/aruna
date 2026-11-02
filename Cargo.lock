@@ -699,6 +699,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "spareval",
  "spargebra",
  "sysinfo",
  "tantivy",

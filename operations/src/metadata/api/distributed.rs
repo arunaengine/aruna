@@ -240,6 +240,9 @@ pub(super) async fn run_query_distributed(
             Some(result) => Ok(result),
             None => aggregate_query_results(Vec::new(), query_form, select_limit),
         }
+    } else if let Some(order) = query_order(&query) {
+        order_solutions(parts, &order)
+            .and_then(|rows| aggregate_query_results(vec![rows], query_form, select_limit))
     } else {
         aggregate_query_results(parts, query_form, select_limit)
     };
@@ -492,6 +495,136 @@ pub fn query_select_limit(query: &str) -> Option<usize> {
         return None;
     };
     length
+}
+
+/// Returns the `ORDER BY` keys of a `SELECT` below its slice, distinct and projection.
+pub(super) fn query_order(query: &str) -> Option<Vec<spargebra::algebra::OrderExpression>> {
+    use spargebra::algebra::GraphPattern;
+
+    let spargebra::Query::Select { mut pattern, .. } =
+        spargebra::SparqlParser::new().parse_query(query).ok()?
+    else {
+        return None;
+    };
+    loop {
+        pattern = match pattern {
+            GraphPattern::Slice { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Project { inner, .. } => *inner,
+            GraphPattern::OrderBy { expression, .. } => return Some(expression),
+            _ => return None,
+        };
+    }
+}
+
+/// Sorts the union of partition rows with the engine's SPARQL ordering (spareval), so terms
+/// order as in one store; rows with equal keys keep a fixed order by content.
+pub(super) fn order_solutions(
+    results: Vec<MetadataQueryResults>,
+    order: &[spargebra::algebra::OrderExpression],
+) -> Result<MetadataQueryResults, MetadataApiError> {
+    use oxrdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, Quad, Term, Variable};
+    use spargebra::algebra::{Expression, GraphPattern, OrderExpression};
+    use spargebra::term::TriplePattern;
+
+    let mut rows: Vec<_> = results
+        .into_iter()
+        .flat_map(|result| match result {
+            MetadataQueryResults::Solutions(rows) => rows,
+            _ => Vec::new(),
+        })
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    // Each row becomes a subject with its position and one column triple per bound variable.
+    let row = Variable::new_unchecked("order-row");
+    let index = Variable::new_unchecked("order-index");
+    let index_iri = NamedNode::new_unchecked("urn:aruna:order:index");
+    let column = |name: &str| NamedNode::new_unchecked(format!("urn:aruna:order:column:{name}"));
+    let mut dataset = Dataset::new();
+    for (position, values) in rows.iter().enumerate() {
+        let subject = BlankNode::default();
+        let position = Literal::from(position as u64);
+        dataset.insert(&Quad::new(
+            subject.clone(),
+            index_iri.clone(),
+            position,
+            GraphName::DefaultGraph,
+        ));
+        for (name, value) in values {
+            let term: Term = value.parse().map_err(|error: oxrdf::TermParseError| {
+                MetadataApiError::Internal(error.to_string())
+            })?;
+            dataset.insert(&Quad::new(
+                subject.clone(),
+                column(name),
+                term,
+                GraphName::DefaultGraph,
+            ));
+        }
+    }
+    let names: std::collections::BTreeSet<&String> = rows
+        .iter()
+        .flat_map(std::collections::BTreeMap::keys)
+        .collect();
+    let mut pattern = GraphPattern::Bgp {
+        patterns: vec![TriplePattern {
+            subject: row.clone().into(),
+            predicate: index_iri.into(),
+            object: index.clone().into(),
+        }],
+    };
+    for name in names {
+        let column = TriplePattern {
+            subject: row.clone().into(),
+            predicate: column(name).into(),
+            object: Variable::new_unchecked(name).into(),
+        };
+        pattern = GraphPattern::LeftJoin {
+            left: Box::new(pattern),
+            right: Box::new(GraphPattern::Bgp {
+                patterns: vec![column],
+            }),
+            expression: None,
+        };
+    }
+    let mut expression = order.to_vec();
+    expression.push(OrderExpression::Asc(Expression::Variable(index.clone())));
+    let query = spargebra::Query::Select {
+        dataset: None,
+        base_iri: None,
+        pattern: GraphPattern::Project {
+            inner: Box::new(GraphPattern::OrderBy {
+                inner: Box::new(pattern),
+                expression,
+            }),
+            variables: vec![index.clone()],
+        },
+    };
+    let evaluator = spareval::QueryEvaluator::new();
+    let spareval::QueryResults::Solutions(solutions) = evaluator
+        .prepare(&query)
+        .execute(&dataset)
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))?
+    else {
+        return Err(MetadataApiError::Internal(
+            "ordering returned no rows".to_string(),
+        ));
+    };
+    let mut slots: Vec<_> = rows.into_iter().map(Some).collect();
+    let mut ordered = Vec::with_capacity(slots.len());
+    for solution in solutions {
+        let solution = solution.map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        let position = match solution.get(&index) {
+            Some(Term::Literal(literal)) => literal.value().parse::<usize>().ok(),
+            _ => None,
+        };
+        let row = position
+            .and_then(|position| slots.get_mut(position)?.take())
+            .ok_or_else(|| MetadataApiError::Internal("ordering lost a row".to_string()))?;
+        ordered.push(row);
+    }
+    Ok(MetadataQueryResults::Solutions(ordered))
 }
 
 pub fn query_form(query: &str) -> Option<MetadataQueryForm> {

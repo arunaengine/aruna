@@ -165,8 +165,20 @@ pub(super) fn query_union_safe(query: &str) -> bool {
             let spargebra::algebra::GraphPattern::Distinct { inner } = pattern else {
                 return false;
             };
-            let spargebra::algebra::GraphPattern::Project { inner, .. } = *inner else {
+            let spargebra::algebra::GraphPattern::Project { inner, variables } = *inner else {
                 return false;
+            };
+            let inner = match *inner {
+                spargebra::algebra::GraphPattern::OrderBy { inner, expression } => {
+                    if !expression
+                        .iter()
+                        .all(|order| order_projected(order, &variables))
+                    {
+                        return false;
+                    }
+                    *inner
+                }
+                pattern => pattern,
             };
             union_pattern_safe(&inner)
         }
@@ -178,6 +190,15 @@ pub(super) fn query_union_safe(query: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn order_projected(
+    order: &spargebra::algebra::OrderExpression,
+    variables: &[spargebra::term::Variable],
+) -> bool {
+    let (spargebra::algebra::OrderExpression::Asc(expression)
+    | spargebra::algebra::OrderExpression::Desc(expression)) = order;
+    matches!(expression, spargebra::algebra::Expression::Variable(variable) if variables.contains(variable))
 }
 
 fn union_pattern_safe(pattern: &spargebra::algebra::GraphPattern) -> bool {

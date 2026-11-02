@@ -4,6 +4,37 @@
 
 use super::*;
 
+use super::super::distributed::{order_solutions, query_order};
+
+const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+
+fn solution_row(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+fn merge_parts(
+    query: &str,
+    parts: Vec<Vec<BTreeMap<String, String>>>,
+) -> Vec<BTreeMap<String, String>> {
+    let parts = parts
+        .into_iter()
+        .map(MetadataQueryResults::Solutions)
+        .collect();
+    let limit = query_select_limit(query);
+    let merged = match query_order(query) {
+        Some(order) => order_solutions(parts, &order)
+            .and_then(|rows| aggregate_query_results(vec![rows], MetadataQueryForm::Select, limit)),
+        None => aggregate_query_results(parts, MetadataQueryForm::Select, limit),
+    };
+    let Ok(MetadataQueryResults::Solutions(rows)) = merged else {
+        panic!("expected solutions");
+    };
+    rows
+}
+
 #[test]
 fn deduplicates_select_rows() {
     let results = aggregate_query_results(
@@ -116,6 +147,93 @@ fn query_validation_accepts() {
     assert!(!query_union_safe(
         "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }"
     ));
+    assert!(query_union_safe(
+        "SELECT DISTINCT ?s ?o WHERE { ?s ?p ?o } ORDER BY DESC(?o) ?s LIMIT 10"
+    ));
+    assert!(!query_union_safe(
+        "SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY ?o"
+    ));
+    assert!(!query_union_safe(
+        "SELECT DISTINCT ?s WHERE { ?s ?p ?o } ORDER BY STR(?s)"
+    ));
+    assert!(!query_union_safe(
+        "SELECT ?s WHERE { ?s ?p ?o } ORDER BY ?s"
+    ));
+}
+
+#[test]
+fn orders_numeric_desc() {
+    let query = "SELECT DISTINCT ?s ?n WHERE { ?s <urn:n> ?n } ORDER BY DESC(?n) LIMIT 3";
+    let number = |value: u32| format!("\"{value}\"^^<{INTEGER}>");
+    let first = vec![
+        solution_row(&[("s", "<urn:a>"), ("n", &number(9))]),
+        solution_row(&[("s", "<urn:b>"), ("n", &number(10))]),
+    ];
+    let second = vec![
+        solution_row(&[("s", "<urn:c>"), ("n", &number(100))]),
+        solution_row(&[("s", "<urn:b>"), ("n", &number(10))]),
+        solution_row(&[("s", "<urn:d>"), ("n", &number(2))]),
+    ];
+    let expected = vec![
+        solution_row(&[("s", "<urn:c>"), ("n", &number(100))]),
+        solution_row(&[("s", "<urn:b>"), ("n", &number(10))]),
+        solution_row(&[("s", "<urn:a>"), ("n", &number(9))]),
+    ];
+    assert_eq!(
+        merge_parts(query, vec![first.clone(), second.clone()]),
+        expected
+    );
+    assert_eq!(merge_parts(query, vec![second, first]), expected);
+}
+
+#[test]
+fn orders_mixed_terms() {
+    let query = "SELECT DISTINCT ?k ?s WHERE { ?s <urn:k> ?k } ORDER BY ?k DESC(?s)";
+    let first = vec![
+        solution_row(&[("k", "\"b\""), ("s", "<urn:a>")]),
+        solution_row(&[("k", "<urn:z>"), ("s", "<urn:a>")]),
+        solution_row(&[("s", "<urn:a>")]),
+    ];
+    let second = vec![
+        solution_row(&[("k", "\"a\""), ("s", "<urn:a>")]),
+        solution_row(&[("k", "_:b1"), ("s", "<urn:a>")]),
+        solution_row(&[("k", "\"a\""), ("s", "<urn:b>")]),
+    ];
+    let expected = vec![
+        solution_row(&[("s", "<urn:a>")]),
+        solution_row(&[("k", "_:b1"), ("s", "<urn:a>")]),
+        solution_row(&[("k", "<urn:z>"), ("s", "<urn:a>")]),
+        solution_row(&[("k", "\"a\""), ("s", "<urn:b>")]),
+        solution_row(&[("k", "\"a\""), ("s", "<urn:a>")]),
+        solution_row(&[("k", "\"b\""), ("s", "<urn:a>")]),
+    ];
+    assert_eq!(
+        merge_parts(query, vec![first.clone(), second.clone()]),
+        expected
+    );
+    assert_eq!(merge_parts(query, vec![second, first]), expected);
+}
+
+#[test]
+fn unordered_keeps_arrival() {
+    let query = "SELECT DISTINCT ?s WHERE { ?s ?p ?o } LIMIT 3";
+    let first = vec![
+        solution_row(&[("s", "<urn:z>")]),
+        solution_row(&[("s", "<urn:a>")]),
+    ];
+    let second = vec![
+        solution_row(&[("s", "<urn:m>")]),
+        solution_row(&[("s", "<urn:b>")]),
+    ];
+    assert!(query_order(query).is_none());
+    assert_eq!(
+        merge_parts(query, vec![first, second]),
+        vec![
+            solution_row(&[("s", "<urn:z>")]),
+            solution_row(&[("s", "<urn:a>")]),
+            solution_row(&[("s", "<urn:m>")]),
+        ]
+    );
 }
 
 #[test]
