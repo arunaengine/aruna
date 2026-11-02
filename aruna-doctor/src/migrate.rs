@@ -67,10 +67,13 @@ mod sessions;
 mod sizes;
 mod staging;
 mod sync_ops;
+mod topic_purge;
 mod uploads;
 mod user_sessions;
 mod vault;
 mod versions;
+
+pub use topic_purge::purge_topic;
 
 #[derive(Debug, Serialize)]
 pub struct MigrateOutput {

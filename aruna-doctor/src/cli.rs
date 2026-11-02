@@ -150,6 +150,21 @@ pub enum TopicCommands {
         #[arg(long)]
         id: Option<String>,
     },
+    /// Delete one document sync topic with its cursors, quarantine rows and queued publishes, so
+    /// the node joins the realm's topic again. Run with the node stopped; without `--apply` it
+    /// only lists what it would delete.
+    Purge {
+        #[arg(long)]
+        database_path: String,
+        /// Topic id as 64 hex characters.
+        #[arg(long)]
+        id: String,
+        /// Document sync store; defaults to `<database_path>/document-sync`.
+        #[arg(long)]
+        sync_path: Option<String>,
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -16,7 +16,7 @@ use crate::explorer::{
 use crate::export::export_bucket;
 use crate::info::print_info;
 use crate::iroh_check::print_iroh_check;
-use crate::migrate::migrate;
+use crate::migrate::{migrate, purge_topic};
 use crate::portal::update_portal;
 use crate::reclaim::{print_status as reclaim_status, seed_backend};
 use crate::storage::{import, snapshot};
@@ -91,6 +91,12 @@ async fn main() -> Result<(), CliError> {
             TopicCommands::Placements { database_path, id } => {
                 print_topic_placements(database_path, id).await?
             }
+            TopicCommands::Purge {
+                database_path,
+                id,
+                sync_path,
+                apply,
+            } => purge_topic(database_path, sync_path, id, apply).await?,
         },
         Commands::NodeState { database_path } => print_node_state(database_path).await?,
         Commands::Import {
