@@ -77,6 +77,23 @@ pub async fn authorize(
     Ok(())
 }
 
+/// Authorizes reading the metadata document at `path`: a public one needs only the request
+/// policies, as every metadata read decides it, a private one also READ by role.
+pub async fn authorize_document(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: &AuthContext,
+    (path, public): (&str, bool),
+    extras: PolicyRequestExtras,
+) -> Result<(), AuthorizeError> {
+    if !public {
+        return authorize(context, realm_id, auth, path, &Permission::READ, extras).await;
+    }
+    let request = policy_request_with(path, &Permission::READ, Some(auth), extras);
+    enforce_policies(context, realm_id, &request).await?;
+    Ok(())
+}
+
 /// One caller's rules and policies for a bucket, loaded once to decide many of its keys.
 pub struct BucketAccess {
     auth: AuthContext,
