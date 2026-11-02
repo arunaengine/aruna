@@ -155,6 +155,7 @@ async fn distributed_search_routes() -> TestResult<()> {
             bearer_token: Some(realm.bearer_string()),
             query: "data".to_string(),
             key: None,
+            operation: None,
             limit: 10,
             group_id: None,
             cursor: None,
@@ -166,6 +167,80 @@ async fn distributed_search_routes() -> TestResult<()> {
     assert_eq!(buckets.hits.len(), 1);
     assert_eq!(buckets.hits[0].bucket, "data");
 
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_keeps_member() -> TestResult<()> {
+    // An extra operation's deny on the member a merged page would show leaves the bucket listed
+    // through another member, because each node applies it before the members merge.
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
+    let mut realm = Topology::spawn_sharded(2, 0, 1, 1).await?;
+    let group_id = realm.seed_group().await?;
+    let set_id = Ulid::from_parts(4, 4);
+    for (index, member) in [(0, 1u16), (1, 2u16)] {
+        let binding = DistributionBinding {
+            set_id,
+            member_id: Ulid::from_parts(5, member.into()),
+            incarnation: 0,
+            revision: DistributionRevision::default(),
+        };
+        let info = BucketInfo {
+            group_id,
+            created_at: UNIX_EPOCH,
+            created_by: realm.user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: Some(binding),
+        };
+        let node = realm.node(index);
+        write_value(node, S3_BUCKET_KEYSPACE, b"data".to_vec(), info.to_bytes()?).await?;
+    }
+    let mut members = realm.node_ids();
+    members.sort_by_key(|node_id| *node_id.as_bytes());
+    let (first, second) = (members[0], members[1]);
+    let mut config = realm.config.clone();
+    config.request_policies = vec![RequestPolicy {
+        policy_id: Ulid::from_parts(6, 6),
+        name: "hide-first-member".to_string(),
+        kind: PolicyKind::Deny,
+        when: None,
+        expression: format!("operation == 'mcp:list_buckets' && path.contains('{first}')"),
+        enabled: true,
+    }];
+    realm.apply_config(config).await?;
+    let search = |operation: Option<&str>| BucketSearchRequest {
+        auth: realm.auth_context(),
+        bearer_token: Some(realm.bearer_string()),
+        query: "data".to_string(),
+        key: None,
+        operation: operation.map(str::to_string),
+        limit: 10,
+        group_id: None,
+        cursor: None,
+        target_nodes: Some(realm.node_ids()),
+        database: false,
+    };
+    let origin = realm.node(0);
+    let shown = |request| {
+        search_buckets_distributed(
+            origin.context.as_ref(),
+            realm.realm_id,
+            origin.node_id(),
+            request,
+        )
+    };
+    let plain = shown(search(None)).await?;
+    let nodes: Vec<_> = plain.hits.iter().map(|hit| hit.node_id).collect();
+    assert_eq!(nodes, [first]);
+    let filtered = shown(search(Some("mcp:list_buckets"))).await?;
+    let nodes: Vec<_> = filtered.hits.iter().map(|hit| hit.node_id).collect();
+    assert_eq!(nodes, [second]);
     realm.shutdown().await;
     Ok(())
 }

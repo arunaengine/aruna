@@ -43,6 +43,9 @@ pub struct SearchBucketsInput {
     pub query: String,
     /// Admits a bucket by READ on this key or key prefix inside it instead of on its root.
     pub key: Option<String>,
+    /// Another request operation whose policies must also allow each hit, such as an MCP tool's;
+    /// applied on each node before the members of a distributed bucket merge.
+    pub operation: Option<String>,
     pub limit: usize,
     /// Keeps only the buckets of this group.
     pub group_id: Option<GroupId>,
@@ -538,15 +541,13 @@ fn policy_allows(
     hit: &BucketSearchHit,
 ) -> bool {
     let path = candidate_path(input, hit.group_id, hit.node_id, &hit.bucket);
-    let request = policy_request_with(
-        &path,
-        &Permission::READ,
-        Some(&input.auth),
-        PolicyRequestExtras::operation("s3.ListBuckets"),
-    );
-    evaluators
-        .get(&(input.realm_id, hit.group_id))
-        .is_some_and(|evaluator| evaluator.evaluate(&request).is_ok())
+    let operations = std::iter::once("s3.ListBuckets").chain(input.operation.as_deref());
+    let evaluator = evaluators.get(&(input.realm_id, hit.group_id));
+    operations.into_iter().all(|operation| {
+        let extras = PolicyRequestExtras::operation(operation);
+        let request = policy_request_with(&path, &Permission::READ, Some(&input.auth), extras);
+        evaluator.is_some_and(|evaluator| evaluator.evaluate(&request).is_ok())
+    })
 }
 
 impl Operation for SearchBucketsOperation {
@@ -626,6 +627,7 @@ mod tests {
             node_id: iroh::SecretKey::from_bytes(&[10u8; 32]).public(),
             query: query.to_string(),
             key: None,
+            operation: None,
             limit,
             group_id: None,
             start_after: None,
@@ -936,6 +938,7 @@ mod tests {
                 node_id,
                 query: "DATA".to_string(),
                 key: None,
+                operation: None,
                 limit: 50,
                 group_id: None,
                 start_after: None,
@@ -987,6 +990,7 @@ mod tests {
                 node_id,
                 query: String::new(),
                 key: None,
+                operation: None,
                 limit: 50,
                 group_id: None,
                 start_after: None,
@@ -1014,6 +1018,7 @@ mod tests {
             node_id,
             query: "DATA".to_string(),
             key: None,
+            operation: None,
             limit: 50,
             group_id: None,
             start_after: None,

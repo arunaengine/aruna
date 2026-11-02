@@ -59,6 +59,9 @@ pub struct BucketSearchRequest {
     pub query: String,
     /// Admits a bucket by READ on this key or key prefix inside it instead of on its root.
     pub key: Option<String>,
+    /// Another request operation whose policies must also allow each hit, such as an MCP tool's;
+    /// applied on each node before the members of a distributed bucket merge.
+    pub operation: Option<String>,
     pub limit: usize,
     /// Only buckets of this group.
     pub group_id: Option<GroupId>,

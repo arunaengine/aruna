@@ -160,6 +160,8 @@ pub enum MetadataTransportMessage {
         query: String,
         /// Admits a bucket by READ on this key or key prefix inside it instead of on its root.
         key: Option<String>,
+        /// Another request operation whose policies must also allow each hit.
+        operation: Option<String>,
         limit: usize,
         group_id: Option<GroupId>,
         /// Continues after this bucket name or this node's sealed scan position.
@@ -1081,6 +1083,7 @@ mod tests {
             auth_token: Some(AuthToken::bearer("bucket-token").unwrap()),
             query: "dataset".to_string(),
             key: None,
+            operation: None,
             limit: 10,
             group_id: None,
             start_after: None,
@@ -1288,13 +1291,14 @@ mod tests {
                 auth_token: None,
                 query: String::new(),
                 key: None,
+                operation: None,
                 limit: 0,
                 group_id: None,
                 start_after: None,
                 database: false,
             })
             .unwrap(),
-            vec![12, 0, 0, 0, 0, 0, 0, 0]
+            vec![12, 0, 0, 0, 0, 0, 0, 0, 0]
         );
     }
 

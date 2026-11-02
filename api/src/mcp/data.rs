@@ -17,7 +17,6 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
 use aruna_core::structs::storage::data::identity::content_id;
-use aruna_operations::auth::request_policy::{enforce_policies, policy_request_with};
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
 use aruna_operations::realm::get_config::GetConfigOperation;
@@ -383,6 +382,8 @@ impl McpServer {
                 bearer_token: bearer,
                 query: String::new(),
                 key: None,
+                // The MCP policies apply on each node, before members of a distributed bucket merge.
+                operation: Some(extras.operation.clone()),
                 limit: BUCKET_PAGE,
                 group_id: None,
                 cursor: input.cursor,
@@ -393,26 +394,16 @@ impl McpServer {
         .await
         .map_err(crate::metadata::map_api_error)
         .map_err(server_error)?;
-        // The MCP policies of each bucket apply too, on the path the search checked.
-        let (context, realm_id) = (self.state.get_ctx(), self.state.get_realm_id());
-        let mut buckets = Vec::new();
-        for hit in result.hits {
-            let path = bucket_permission_path(realm_id, hit.group_id, hit.node_id, &hit.bucket);
-            let request =
-                policy_request_with(&path, &Permission::READ, Some(&auth), extras.clone());
-            if enforce_policies(&context, realm_id, &request)
-                .await
-                .is_err()
-            {
-                continue;
-            }
-            buckets.push(BucketOutput {
+        let buckets = result
+            .hits
+            .into_iter()
+            .map(|hit| BucketOutput {
                 bucket: hit.bucket,
                 group_id: hit.group_id.to_string(),
                 node_id: hit.node_id.to_string(),
                 created_at: chrono::DateTime::<chrono::Utc>::from(hit.created_at).to_rfc3339(),
-            });
-        }
+            })
+            .collect();
         Ok(Json(BucketsOutput {
             buckets,
             next_cursor: result.next_cursor,

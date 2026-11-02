@@ -619,11 +619,15 @@ pub async fn search_buckets_distributed(
             context.clone(),
             request.auth,
             realm_id,
-            (request.query.clone(), request.key.clone()),
+            (
+                request.query.clone(),
+                request.key.clone(),
+                request.operation.clone(),
+            ),
             limit,
             positions.clone(),
         ),
-        move |(context, auth, realm_id, (query, key), limit, positions), node_id| async move {
+        move |(context, auth, realm_id, (query, key, operation), limit, positions), node_id| async move {
             let Some(start_after) = start_after(&positions, node_id) else {
                 return Ok(BucketPage::default());
             };
@@ -635,6 +639,7 @@ pub async fn search_buckets_distributed(
                     node_id,
                     query,
                     key,
+                    operation,
                     limit,
                     group_id,
                     start_after: start_after.map(Into::into),
@@ -649,11 +654,11 @@ pub async fn search_buckets_distributed(
         (
             handle,
             remote_auth_token,
-            (request.query, request.key),
+            (request.query, request.key, request.operation),
             limit,
             positions.clone(),
         ),
-        move |(handle, auth_token, (query, key), limit, positions), node_id| async move {
+        move |(handle, auth_token, (query, key, operation), limit, positions), node_id| async move {
             let Some(start_after) = start_after(&positions, node_id) else {
                 return Ok(BucketPage::default());
             };
@@ -661,7 +666,7 @@ pub async fn search_buckets_distributed(
                 .request_bucket_search(
                     node_id,
                     auth_token,
-                    (query, key, limit),
+                    (query, key, operation, limit),
                     (group_id, database),
                     start_after,
                 )

@@ -876,7 +876,7 @@ impl MetadataHandle {
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
-        (query, key, limit): (String, Option<String>, usize),
+        (query, key, operation, limit): (String, Option<String>, Option<String>, usize),
         (group_id, database): (Option<GroupId>, bool),
         start_after: Option<Vec<u8>>,
     ) -> Result<BucketPage, MetadataReadError> {
@@ -890,6 +890,7 @@ impl MetadataHandle {
                 auth_token,
                 query,
                 key,
+                operation,
                 limit,
                 group_id,
                 start_after,
