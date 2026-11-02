@@ -252,20 +252,8 @@ impl McpServer {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("search_datasets", &input)?;
         let group_id = input.group_id.as_deref().map(parse_group).transpose()?;
-        match group_id {
-            Some(group_id) => {
-                authorize_tool(
-                    &self.state,
-                    &auth,
-                    metadata_group_path(self, group_id),
-                    Permission::READ,
-                    extras,
-                )
-                .await
-                .map_err(server_error)?;
-            }
-            None => metadata_probe(self, &auth, "search_datasets", extras).await?,
-        }
+        // As in REST, a group filter only narrows the hits, each checked for the caller.
+        metadata_probe(self, &auth, "search_datasets", extras).await?;
         let result = search_metadata(
             self.state.get_ctx().as_ref(),
             self.state.get_realm_id(),
@@ -1298,6 +1286,20 @@ mod authorization_tests {
         };
         let asked = server.sparql_query(caller(), Parameters(query)).await;
         asked.expect("a public document answers a query");
+        let search = DatasetSearchInput {
+            q: "authorization".to_string(),
+            conforms_to: None,
+            group_id: Some(fixture.group_id.to_string()),
+            limit: None,
+        };
+        let found = server.search_datasets(caller(), Parameters(search)).await;
+        let found = found
+            .expect("a group filter narrows the hits")
+            .0
+            .0
+            .to_string();
+        assert!(found.contains(&open.to_string()), "{found}");
+        assert!(!found.contains(&private.to_string()), "{found}");
         let denied = server.get_dataset(caller(), id(private)).await;
         let body = denied_body(denied, "a stranger must not read a private document");
         assert_eq!(body["code"], "Forbidden");
