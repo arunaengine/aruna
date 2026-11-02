@@ -429,6 +429,7 @@ impl MetadataHandle {
             MetadataTransportMessage::SearchBuckets {
                 auth_token,
                 query,
+                key,
                 limit,
                 group_id,
                 start_after,
@@ -452,6 +453,7 @@ impl MetadataHandle {
                                     realm_id: *net_handle.realm_id(),
                                     node_id: net_handle.node_id(),
                                     query,
+                                    key,
                                     limit,
                                     group_id,
                                     start_after: start_after.map(Into::into),

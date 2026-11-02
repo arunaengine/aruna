@@ -619,11 +619,11 @@ pub async fn search_buckets_distributed(
             context.clone(),
             request.auth,
             realm_id,
-            request.query.clone(),
+            (request.query.clone(), request.key.clone()),
             limit,
             positions.clone(),
         ),
-        move |(context, auth, realm_id, query, limit, positions), node_id| async move {
+        move |(context, auth, realm_id, (query, key), limit, positions), node_id| async move {
             let Some(start_after) = start_after(&positions, node_id) else {
                 return Ok(BucketPage::default());
             };
@@ -634,6 +634,7 @@ pub async fn search_buckets_distributed(
                     realm_id,
                     node_id,
                     query,
+                    key,
                     limit,
                     group_id,
                     start_after: start_after.map(Into::into),
@@ -648,11 +649,11 @@ pub async fn search_buckets_distributed(
         (
             handle,
             remote_auth_token,
-            request.query,
+            (request.query, request.key),
             limit,
             positions.clone(),
         ),
-        move |(handle, auth_token, query, limit, positions), node_id| async move {
+        move |(handle, auth_token, (query, key), limit, positions), node_id| async move {
             let Some(start_after) = start_after(&positions, node_id) else {
                 return Ok(BucketPage::default());
             };
@@ -660,7 +661,7 @@ pub async fn search_buckets_distributed(
                 .request_bucket_search(
                     node_id,
                     auth_token,
-                    (query, limit),
+                    (query, key, limit),
                     (group_id, database),
                     start_after,
                 )

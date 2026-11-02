@@ -154,6 +154,7 @@ async fn distributed_search_routes() -> TestResult<()> {
             auth: realm.auth_context(),
             bearer_token: Some(realm.bearer_string()),
             query: "data".to_string(),
+            key: None,
             limit: 10,
             group_id: None,
             cursor: None,

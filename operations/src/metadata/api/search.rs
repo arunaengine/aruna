@@ -57,6 +57,8 @@ pub struct BucketSearchRequest {
     pub bearer_token: Option<String>,
     /// An empty query lists every readable bucket.
     pub query: String,
+    /// Admits a bucket by READ on this key or key prefix inside it instead of on its root.
+    pub key: Option<String>,
     pub limit: usize,
     /// Only buckets of this group.
     pub group_id: Option<GroupId>,

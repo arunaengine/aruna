@@ -487,6 +487,7 @@ pub async fn bucket_search(
             auth: auth.clone(),
             bearer_token: bearer.clone(),
             query: query.to_string(),
+            key: None,
             limit: params
                 .limit
                 .unwrap_or(DEFAULT_SEARCH_LIMIT)
@@ -947,6 +948,7 @@ async fn run_buckets(
             auth: auth.clone(),
             bearer_token: bearer_token.clone(),
             query: query.to_string(),
+            key: None,
             limit: limit.min(MAX_BUCKET_LIMIT),
             group_id: None,
             cursor: None,

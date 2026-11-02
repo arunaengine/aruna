@@ -379,6 +379,7 @@ impl McpServer {
                 auth: auth.clone(),
                 bearer_token: bearer,
                 query: String::new(),
+                key: None,
                 limit: BUCKET_PAGE,
                 group_id: None,
                 cursor: input.cursor,

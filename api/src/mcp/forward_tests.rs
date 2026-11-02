@@ -341,3 +341,32 @@ async fn member_routes_key() {
         assert_eq!(own.unwrap(), None);
     }
 }
+
+// A caller whose only grant is a prefix inside a bucket still finds the node holding it.
+#[tokio::test]
+async fn prefix_grant_finds() {
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::storage::blob::object_permission_path;
+    let fixture = node_state().await;
+    let state = &fixture.state;
+    let (realm_id, here) = (state.get_realm_id(), state.get_node_id());
+    let open = object_permission_path(realm_id, fixture.group_id, here, BUCKET, "open/**");
+    let actor = Actor {
+        node_id: here,
+        user_id: fixture.owner.user_id,
+        realm_id,
+    };
+    crate::tests::routes::open_paths(&state.get_ctx(), &actor, fixture.group_id, &[open]).await;
+    let server = McpServer::new(state.clone());
+    let parts = auth_parts(&fixture.stranger, None);
+    let found = server.find_holders(&parts, &fixture.stranger, BUCKET, "open/a");
+    let found = tokio::time::timeout(Duration::from_secs(120), found).await;
+    let (holders, _) = found.expect("the holder search stops").unwrap();
+    assert_eq!(
+        holders
+            .iter()
+            .map(|holder| holder.node_id)
+            .collect::<Vec<_>>(),
+        [here]
+    );
+}

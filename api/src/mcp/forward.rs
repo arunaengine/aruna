@@ -154,7 +154,7 @@ impl McpServer {
         }
         let (mut holders, mut missed) = (Vec::new(), Missed::default());
         if named.is_none() && info.is_none() {
-            (holders, missed) = self.find_holders(parts, auth, bucket).await?;
+            (holders, missed) = self.find_holders(parts, auth, bucket, key).await?;
         }
         let mut members = Vec::new();
         if let Some(set_id) = holders.first().and_then(|holder| holder.set_id) {
@@ -164,13 +164,14 @@ impl McpServer {
             .map_err(|error| route_error(error, bucket, &missed))
     }
 
-    /// The nodes holding a readable bucket named `bucket`, each distributed bucket once, and
-    /// what the search could not cover before it stopped.
+    /// The nodes holding a bucket named `bucket` whose `key` the caller may read, each
+    /// distributed bucket once, and what the search could not cover before it stopped.
     pub(crate) async fn find_holders(
         &self,
         parts: &http::request::Parts,
         auth: &AuthContext,
         bucket: &str,
+        key: &str,
     ) -> Result<(Vec<Holder>, Missed), CallToolResult> {
         let bearer = request_bearer(parts).map(|carrier| carrier.as_str().to_string());
         let deadline = tokio::time::Instant::now() + DISCOVERY_TIMEOUT;
@@ -185,6 +186,7 @@ impl McpServer {
                     auth: auth.clone(),
                     bearer_token: bearer.clone(),
                     query: bucket.to_string(),
+                    key: (!key.is_empty()).then(|| key.to_string()),
                     limit: SEARCH_PAGE,
                     group_id: None,
                     cursor,

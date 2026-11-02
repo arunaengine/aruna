@@ -17,7 +17,9 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path, incarnation};
+use aruna_core::structs::storage::blob::{
+    BucketInfo, bucket_permission_path, incarnation, object_permission_path,
+};
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, StoredMetadata};
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::replication::ArunaArn;
@@ -39,6 +41,8 @@ pub struct SearchBucketsInput {
     pub realm_id: RealmId,
     pub node_id: NodeId,
     pub query: String,
+    /// Admits a bucket by READ on this key or key prefix inside it instead of on its root.
+    pub key: Option<String>,
     pub limit: usize,
     /// Keeps only the buckets of this group.
     pub group_id: Option<GroupId>,
@@ -264,12 +268,8 @@ impl SearchBucketsOperation {
             return self.fail(SearchBucketsError::NotFinished);
         };
         self.state = SearchBucketsState::CheckPermission;
-        let path = bucket_permission_path(
-            self.input.realm_id,
-            candidate.info.group_id,
-            self.input.node_id,
-            &candidate.bucket,
-        );
+        let (group_id, node_id) = (candidate.info.group_id, self.input.node_id);
+        let path = candidate_path(&self.input, group_id, node_id, &candidate.bucket);
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: self.input.auth.clone(),
@@ -495,6 +495,19 @@ async fn search_with_budget(
     }
 }
 
+/// The path a candidate's READ is checked on: the asked key inside the bucket, else its root.
+fn candidate_path(
+    input: &SearchBucketsInput,
+    group_id: GroupId,
+    node_id: NodeId,
+    bucket: &str,
+) -> String {
+    match input.key.as_deref() {
+        Some(key) => object_permission_path(input.realm_id, group_id, node_id, bucket, key),
+        None => bucket_permission_path(input.realm_id, group_id, node_id, bucket),
+    }
+}
+
 /// Whether a caller without a login may read the bucket, deny policies included.
 async fn anonymous_reads(
     context: &DriverContext,
@@ -524,7 +537,7 @@ fn policy_allows(
     input: &SearchBucketsInput,
     hit: &BucketSearchHit,
 ) -> bool {
-    let path = bucket_permission_path(input.realm_id, hit.group_id, hit.node_id, &hit.bucket);
+    let path = candidate_path(input, hit.group_id, hit.node_id, &hit.bucket);
     let request = policy_request_with(
         &path,
         &Permission::READ,
@@ -612,6 +625,7 @@ mod tests {
             realm_id,
             node_id: iroh::SecretKey::from_bytes(&[10u8; 32]).public(),
             query: query.to_string(),
+            key: None,
             limit,
             group_id: None,
             start_after: None,
@@ -921,6 +935,7 @@ mod tests {
                 realm_id,
                 node_id,
                 query: "DATA".to_string(),
+                key: None,
                 limit: 50,
                 group_id: None,
                 start_after: None,
@@ -971,6 +986,7 @@ mod tests {
                 realm_id,
                 node_id,
                 query: String::new(),
+                key: None,
                 limit: 50,
                 group_id: None,
                 start_after: None,
@@ -997,6 +1013,7 @@ mod tests {
             realm_id,
             node_id,
             query: "DATA".to_string(),
+            key: None,
             limit: 50,
             group_id: None,
             start_after: None,
