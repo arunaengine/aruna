@@ -262,6 +262,8 @@ minutes after its provider login.
 - A sign-in that already belongs to another account is refused with code `subject_taken`; merge
   that account with `POST /access/users/me/merge` instead.
 - Like a merge, it runs on the realm's merge coordinator; every other node passes the call there.
+  The coordinator is checked again when the change commits, so a node that does not coordinate
+  merges answers 503 `not_coordinator` instead.
 - The change replicates to every node. At most 6 attempts per minute."#,
     request_body(
         content = AttachSubjectRequest,
@@ -324,6 +326,7 @@ async fn attach_subject(
                 ServerError::Refused(StatusCode::CONFLICT, "subject_taken", error.to_string())
             }
             UpdateUserError::UserNotFound => ServerError::NotFound,
+            UpdateUserError::NotCoordinator => not_coordinator(error.to_string()),
             UpdateUserError::StorageError(_) | UpdateUserError::PlacementFenced => {
                 ServerError::ServiceUnavailableReason(error.to_string())
             }
