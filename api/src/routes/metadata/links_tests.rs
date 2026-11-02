@@ -400,3 +400,36 @@ async fn signed_out_parts() {
         assert!(matches!(refused, Err(ServerError::Unauthorized)), "{id}");
     }
 }
+
+#[tokio::test]
+async fn signed_out_remote_part() {
+    // Signed out, a part of another node's bucket resolves as that node answers, since only
+    // it knows the bucket's group and roles; its refusal stays a refusal.
+    use crate::tests::distributed::{PEER, mock_peer, node_id, publish_api};
+    use axum::http::StatusCode;
+    let test = setup_state().await;
+    let scope = LinkScope::Node {
+        realm_id: test.state.get_realm_id(),
+        node_id: node_id(PEER),
+        bucket: "remote".to_string(),
+    };
+    let id = scope.link("open/").to_id();
+    let answer = serde_json::json!({
+        "id": id, "bucket": "remote", "prefix": "open/", "set_id": null,
+        "node_id": node_id(PEER).to_string(), "held_here": true
+    });
+    let peer = mock_peer(StatusCode::OK, &answer.to_string()).await;
+    publish_api(&test.state, node_id(PEER), &peer.url).await;
+    let resolved = signed_out_target(&test, &id).await.unwrap();
+    assert_eq!(resolved.bucket.as_deref(), Some("remote"));
+    assert!(!resolved.held_here);
+    assert_eq!(peer.paths.lock().unwrap().len(), 1);
+
+    let closed = mock_peer(StatusCode::UNAUTHORIZED, r#"{"error":"unauthorized"}"#).await;
+    publish_api(&test.state, node_id(PEER), &closed.url).await;
+    let refused = signed_out_target(&test, &id).await;
+    assert!(
+        matches!(refused, Err(ServerError::Unauthorized)),
+        "{refused:?}"
+    );
+}
