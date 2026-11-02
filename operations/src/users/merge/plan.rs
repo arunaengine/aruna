@@ -32,7 +32,7 @@ pub(super) fn check_accounts(survivor: &User, merged: &User) -> Result<bool, Mer
     Ok(false)
 }
 
-/// Per document: the roles `merged` holds there, then those handed to the survivor.
+/// Per document: the roles handed to the survivor, then all roles `merged` holds there.
 type Handover = (Vec<RoleId>, Vec<RoleId>);
 
 /// The roles `merged` holds in each document and those handed to `survivor`, realm first. A
