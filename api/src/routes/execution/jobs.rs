@@ -21,7 +21,6 @@ use aruna_operations::jobs::command::{
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::cancel::publish_deletion;
 use aruna_operations::jobs::lifecycle::{FamilyReport, family_report};
 use aruna_operations::jobs::service::{
     ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
@@ -2168,9 +2167,10 @@ Self-scoped like the status read: only the submitter may delete, and anybody els
   showed the run. Every client listing through that node stops seeing it on its next read.
 - The node removes the run's row, its list entry, its report rows and its local attempt records in
   one transaction, the same rows retention pruning removes.
-- A run of a replicated family also gets a signed deletion record in its history, so a read by id
-  answers 404 on every node that received it. The history itself stays on the nodes that hold
-  it; captured outputs and the run dataset are not deleted.
+- A run of a replicated family first gets a signed deletion record in its history, so a read by
+  id answers 404 on every node that received it. The history itself stays on the nodes that hold
+  it; captured outputs and the run dataset are not deleted. When the record cannot be written,
+  the run is kept and the call answers 503, so a retry records it again.
 - Repeating the call answers 404 once the run is gone.
 
 - Any other job of the caller, such as a staging import, is taken off the list at once and its
@@ -2187,7 +2187,8 @@ Self-scoped like the status read: only the submitter may delete, and anybody els
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "This node lists no such run of the caller; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
-        (status = 409, description = "The job is still live, named by its state, or a run's container cleanup is still queued; cancel it or retry once it settled", body = ErrorResponse)
+        (status = 409, description = "The job is still live, named by its state, or a run's container cleanup is still queued; cancel it or retry once it settled", body = ErrorResponse),
+        (status = 503, description = "The run's deletion could not be recorded in its replicated history, so the run was kept; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -2198,18 +2199,14 @@ pub async fn delete_job(
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
-    let outcome = delete_owned_run(&state.get_ctx(), auth.user_id, job_id)
+    let outcome = delete_owned_run(&state.get_ctx(), &auth, job_id)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
     match outcome {
-        RunDelete::Deleted => {
-            // The rows are gone already, so a family this node cannot mark stays readable by id.
-            let context = state.get_ctx();
-            if let Err(error) = publish_deletion(&context, &auth, job_id).await {
-                tracing::warn!(%job_id, %error, "The deleted run's family was not marked deleted");
-            }
-            Ok(StatusCode::NO_CONTENT)
-        }
+        RunDelete::Deleted => Ok(StatusCode::NO_CONTENT),
+        RunDelete::Unrecorded(error) => Err(ServerError::ServiceUnavailableReason(format!(
+            "the run's deletion could not be recorded, so it was kept; retry: {error}"
+        ))),
         RunDelete::NotFound => Err(ServerError::NotFound),
         RunDelete::Unfinished(state) => Err(ServerError::Conflict(format!(
             "the job is {}; cancel it before deleting it",

@@ -397,6 +397,8 @@ pub enum RunDelete {
     Unfinished(JobState),
     /// The run's container cleanup is still queued.
     CleanupPending,
+    /// The run's deletion could not be recorded in its replicated family, so it was kept.
+    Unrecorded(String),
 }
 
 /// Removes a finished run of `user_id` from this node in one transaction: its
