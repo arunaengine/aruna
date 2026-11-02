@@ -166,6 +166,8 @@ pub enum JobTarget {
     Bucket {
         bucket: String,
         path: Option<String>,
+        /// `path` is one exact key; otherwise the job touches every key that starts with it.
+        exact: bool,
     },
     Dataset {
         dataset_id: Ulid,
@@ -186,9 +188,10 @@ pub struct RunningJobView {
 
 impl RunningJobView {
     pub fn new(record: &JobRecord, started_at_ms: u64) -> Self {
-        let bucket = |bucket: &str, path: &str| JobTarget::Bucket {
+        let bucket = |bucket: &str, path: &str, exact: bool| JobTarget::Bucket {
             bucket: bucket.to_string(),
             path: (!path.is_empty()).then(|| path.to_string()),
+            exact,
         };
         let dataset = |dataset_id: Ulid| Some(JobTarget::Dataset { dataset_id });
         let (target, group_id) = match &record.payload {
@@ -199,7 +202,7 @@ impl RunningJobView {
                 record
                     .workspace_bucket
                     .as_deref()
-                    .map(|name| bucket(name, "")),
+                    .map(|name| bucket(name, "", false)),
                 Some(spec.group_id),
             ),
             JobPayload::Staging(spec) => {
@@ -207,25 +210,28 @@ impl RunningJobView {
                     [prefix] => prefix.target_prefix.as_str(),
                     _ => "",
                 };
-                (Some(bucket(&spec.bucket, path)), Some(spec.group_id))
+                (Some(bucket(&spec.bucket, path, false)), Some(spec.group_id))
             }
             JobPayload::ImportRoCrate(spec) => (
-                Some(bucket(&spec.target.bucket, &spec.target.prefix)),
+                Some(bucket(&spec.target.bucket, &spec.target.prefix, false)),
                 Some(spec.metadata.group_id),
             ),
             JobPayload::ExportRoCrate(spec) => (dataset(spec.document_id), None),
             JobPayload::Harvest(spec) => (None, Some(spec.group_id)),
             JobPayload::MintPersistentId(spec) => (dataset(spec.document_id), None),
             JobPayload::StoragePurge(spec) | JobPayload::StoragePurgeFiles(spec) => {
-                let path = match &spec.scope {
-                    StoragePurgeScope::File { key, .. } => key.as_str(),
-                    StoragePurgeScope::Prefix { prefix, .. } => prefix.as_str(),
-                    StoragePurgeScope::Bucket { .. } => "",
+                let (path, exact) = match &spec.scope {
+                    StoragePurgeScope::File { key, .. } => (key.as_str(), true),
+                    StoragePurgeScope::Prefix { prefix, .. } => (prefix.as_str(), false),
+                    StoragePurgeScope::Bucket { .. } => ("", false),
                 };
-                (Some(bucket(spec.scope.bucket(), path)), Some(spec.group_id))
+                (
+                    Some(bucket(spec.scope.bucket(), path, exact)),
+                    Some(spec.group_id),
+                )
             }
             JobPayload::CopyObject(spec) => (
-                Some(bucket(&spec.dest_bucket, &spec.dest_key)),
+                Some(bucket(&spec.dest_bucket, &spec.dest_key, true)),
                 Some(spec.group_id),
             ),
             JobPayload::RegisterIdentifiers(spec) => (dataset(spec.document_id), None),

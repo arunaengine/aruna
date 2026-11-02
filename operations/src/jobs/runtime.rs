@@ -2002,7 +2002,8 @@ mod tests {
             listed[0].target,
             Some(aruna_core::jobs::JobTarget::Bucket {
                 bucket: "target".to_string(),
-                path: Some("crate".to_string())
+                path: Some("crate".to_string()),
+                exact: false,
             })
         );
         assert_eq!(listed[0].group_id, Some(Ulid::from_bytes([4u8; 16])));

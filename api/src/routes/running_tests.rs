@@ -96,6 +96,7 @@ fn copy_job(group: Ulid, bucket: &str, created_by: UserId, started: u64) -> Runn
         target: Some(JobTarget::Bucket {
             bucket: bucket.to_string(),
             path: Some("assemblies/2025/".to_string()),
+            exact: false,
         }),
         group_id: Some(group),
         created_by,
@@ -249,4 +250,103 @@ async fn deny_below_hides() {
         .await
         .unwrap();
     assert_eq!((response.jobs.len(), response.hidden), (1, 0));
+}
+
+/// A job of the member's group on `path` of the test bucket, an exact key or a prefix.
+fn target_job(fixture: &Fixture, path: &str, exact: bool) -> RunningJobView {
+    RunningJobView {
+        target: Some(JobTarget::Bucket {
+            bucket: "bakta-runs".to_string(),
+            path: Some(path.to_string()),
+            exact,
+        }),
+        ..copy_job(fixture.group, "bakta-runs", fixture.admin, 1)
+    }
+}
+
+/// The member's view of `jobs` with a token restricted to `patterns`, each a READ below the
+/// test bucket's path on node `node`.
+async fn restricted(
+    fixture: &Fixture,
+    node: &str,
+    patterns: &[&str],
+    jobs: Vec<RunningJobView>,
+) -> NodeJobsResponse {
+    use aruna_core::structs::identity::auth::{PathRestriction, Permission};
+    let realm_id = fixture.state.get_realm_id();
+    let root = format!("/{realm_id}/g/{}/data/{node}/bakta-runs", fixture.group);
+    let restrictions = (patterns.iter())
+        .map(|pattern| PathRestriction {
+            pattern: format!("{root}{pattern}"),
+            permission: Permission::READ,
+        })
+        .collect();
+    let caller = AuthContext {
+        path_restrictions: Some(restrictions),
+        ..auth(fixture, fixture.member)
+    };
+    visible_jobs(&fixture.state, Some(&caller), jobs)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn prefix_needs_all() {
+    // READ on the key `private` shows a copy to that key, never a purge of every key that
+    // starts with it; a grant on all keys below shows the purge.
+    let fixture = fixture().await;
+    let node = fixture.state.get_node_id().to_string();
+    let jobs = || {
+        vec![
+            target_job(&fixture, "private", true),
+            target_job(&fixture, "private", false),
+            target_job(&fixture, "private/", false),
+        ]
+    };
+    let key = restricted(&fixture, &node, &["", "/private"], jobs()).await;
+    assert_eq!((key.jobs.len(), key.hidden), (1, 2));
+    let all = restricted(&fixture, &node, &["", "/**"], jobs()).await;
+    assert_eq!((all.jobs.len(), all.hidden), (3, 0));
+    // The distributed bucket grant names every node by a wildcard segment.
+    let any_node = restricted(&fixture, "*", &["", "/**"], jobs()).await;
+    assert_eq!((any_node.jobs.len(), any_node.hidden), (3, 0));
+}
+
+#[tokio::test]
+async fn path_policy_hides() {
+    // A group policy that decides by path may deny a key below a prefix, so a prefix job is
+    // hidden while an exact key it allows still shows.
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+    let fixture = fixture().await;
+    let realm_id = fixture.state.get_realm_id();
+    let actor = Actor {
+        node_id: fixture.state.get_node_id(),
+        user_id: fixture.admin,
+        realm_id,
+    };
+    let mut document =
+        GroupAuthorizationDocument::default_group_doc(fixture.member, realm_id, fixture.group);
+    document.policies = vec![RequestPolicy {
+        policy_id: Ulid::from_parts(3, 3),
+        name: "no secrets".to_string(),
+        kind: PolicyKind::Deny,
+        when: None,
+        expression: "path.endsWith('/secret')".to_string(),
+        enabled: true,
+    }];
+    let bytes = document.to_bytes(&actor).unwrap();
+    let key = fixture.group.to_bytes().to_vec().into();
+    crate::tests::routes::write_doc(&fixture.state.get_ctx(), AUTH_KEYSPACE, key, bytes.into())
+        .await;
+    let caller = auth(&fixture, fixture.member);
+    let jobs = vec![
+        target_job(&fixture, "data", true),
+        target_job(&fixture, "data", false),
+    ];
+    let response = visible_jobs(&fixture.state, Some(&caller), jobs)
+        .await
+        .unwrap();
+    assert_eq!((response.jobs.len(), response.hidden), (1, 1));
 }

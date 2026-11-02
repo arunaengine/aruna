@@ -64,7 +64,9 @@ impl From<RunningJobView> for NodeJobResponse {
         Self {
             kind: job.kind.name().to_string(),
             target: job.target.map(|target| match target {
-                JobTarget::Bucket { bucket, path } => JobTargetResponse::Bucket { bucket, path },
+                JobTarget::Bucket { bucket, path, .. } => {
+                    JobTargetResponse::Bucket { bucket, path }
+                }
                 JobTarget::Dataset { dataset_id } => JobTargetResponse::Dataset {
                     dataset_id: dataset_id.to_string(),
                 },
@@ -189,7 +191,12 @@ async fn may_read(
         return Ok(false);
     };
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
-    let Some(JobTarget::Bucket { bucket, path }) = &job.target else {
+    let Some(JobTarget::Bucket {
+        bucket,
+        path,
+        exact,
+    }) = &job.target
+    else {
         let path = group_permission_path(realm_id, group_id, node_id);
         return permission_granted(state, auth, path, Permission::READ).await;
     };
@@ -197,11 +204,11 @@ async fn may_read(
     let access = BucketAccess::load(&context, auth, (realm_id, group_id, node_id), bucket)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    // A prefix shows only when no deny below it hides a part of what the job touches.
+    // A prefix shows only when the caller may read every key the job may touch below it.
     let path = path.as_deref().unwrap_or_default();
-    Ok(match path.is_empty() || path.ends_with('/') {
-        true => access.reads_subtree(path),
-        false => access.allows(Some(path), &Permission::READ),
+    Ok(match exact {
+        true => access.allows(Some(path), &Permission::READ),
+        false => access.reads_below(path),
     })
 }
 
