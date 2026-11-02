@@ -79,106 +79,123 @@ truncated."#,
     responses(
         (
             status = 200,
-            description = "RO-Crate export in the requested view: a projected rocrate object, or the stored revision for the raw view",
-            body = MetadataRoCrateResponse,
-            examples(
-                (
-                    "FullRoCrate" = (
-                        summary = "Full RO-Crate export",
-                        value = json!({
-                            "rocrate": {
-                                "@context": "https://w3id.org/ro/crate/1.2/context",
-                                "@graph": [
-                                    {
-                                        "@id": "ro-crate-metadata.json",
-                                        "@type": "CreativeWork",
-                                        "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
-                                        "about": { "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE" }
-                                    },
-                                    {
-                                        "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
-                                        "@type": "Dataset",
-                                        "name": "Proteomics Run 42",
-                                        "description": "Metadata record for LC-MS run 42",
-                                        "datePublished": "2026-04-09",
-                                        "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" },
-                                        "hasPart": [{ "@id": "./data/run-42.raw" }]
-                                    },
-                                    {
-                                        "@id": "./data/run-42.raw",
-                                        "@type": "File",
-                                        "name": "run-42.raw"
-                                    }
-                                ]
-                            },
-                            "total_data_entities": null,
-                            "returned_data_entities": null,
-                            "next_offset": null,
-                            "next_cursor": null,
-                            "revision": "01JEVENT00123456789ABCDEFG"
-                        })
+            description = "RO-Crate export in the requested view: a projected rocrate object, or the stored revision for the raw view; a projected view negotiated as `application/ld+json` is the bare crate",
+            content(
+                (MetadataRoCrateResponse = "application/json", examples(
+                    (
+                        "FullRoCrate" = (
+                            summary = "Full RO-Crate export",
+                            value = json!({
+                                "rocrate": {
+                                    "@context": "https://w3id.org/ro/crate/1.2/context",
+                                    "@graph": [
+                                        {
+                                            "@id": "ro-crate-metadata.json",
+                                            "@type": "CreativeWork",
+                                            "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                                            "about": { "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE" }
+                                        },
+                                        {
+                                            "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                                            "@type": "Dataset",
+                                            "name": "Proteomics Run 42",
+                                            "description": "Metadata record for LC-MS run 42",
+                                            "datePublished": "2026-04-09",
+                                            "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" },
+                                            "hasPart": [{ "@id": "./data/run-42.raw" }]
+                                        },
+                                        {
+                                            "@id": "./data/run-42.raw",
+                                            "@type": "File",
+                                            "name": "run-42.raw"
+                                        }
+                                    ]
+                                },
+                                "total_data_entities": null,
+                                "returned_data_entities": null,
+                                "next_offset": null,
+                                "next_cursor": null,
+                                "revision": "01JEVENT00123456789ABCDEFG"
+                            })
+                        )
+                    ),
+                    (
+                        "PagedRoCrate" = (
+                            summary = "One page of root-linked data entities",
+                            value = json!({
+                                "rocrate": {
+                                    "@context": "https://w3id.org/ro/crate/1.2/context",
+                                    "@graph": [
+                                        {
+                                            "@id": "ro-crate-metadata.json",
+                                            "@type": "CreativeWork",
+                                            "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                                            "about": { "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE?view=page&limit=1" }
+                                        },
+                                        {
+                                            "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE?view=page&limit=1",
+                                            "@type": "Dataset",
+                                            "name": "Proteomics Run 42",
+                                            "hasPart": [{ "@id": "./data/run-42.raw" }]
+                                        },
+                                        {
+                                            "@id": "./data/run-42.raw",
+                                            "@type": "File",
+                                            "name": "run-42.raw"
+                                        }
+                                    ]
+                                },
+                                "total_data_entities": 128,
+                                "returned_data_entities": 1,
+                                "next_offset": 1,
+                                "next_cursor": "./data/run-42.raw"
+                            })
+                        )
+                    ),
+                    (
+                        "RawRevision" = (
+                            summary = "Last accepted revision with its projection state",
+                            value = json!({
+                                "raw": {
+                                    "@context": "https://w3id.org/ro/crate/1.2/context",
+                                    "@graph": [
+                                        {
+                                            "@id": "ro-crate-metadata.json",
+                                            "@type": "CreativeWork",
+                                            "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                                            "about": { "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE" }
+                                        },
+                                        {
+                                            "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                                            "@type": "Dataset",
+                                            "name": "Proteomics Run 42"
+                                        }
+                                    ]
+                                },
+                                "winning_event_id": "01JEVENT00123456789ABCDEFG",
+                                "projection_state": "pending",
+                                "context_digest": "3f5a1c9d8e7b6a4f2d0c1b3a5e7f90813f5a1c9d8e7b6a4f2d0c1b3a5e7f9081",
+                                "dataset_digest": "0b1c2d3e4f5a69788796a5b4c3d2e1f00b1c2d3e4f5a69788796a5b4c3d2e1f0"
+                            })
+                        )
                     )
-                ),
-                (
-                    "PagedRoCrate" = (
-                        summary = "One page of root-linked data entities",
-                        value = json!({
-                            "rocrate": {
-                                "@context": "https://w3id.org/ro/crate/1.2/context",
-                                "@graph": [
-                                    {
-                                        "@id": "ro-crate-metadata.json",
-                                        "@type": "CreativeWork",
-                                        "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
-                                        "about": { "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE?view=page&limit=1" }
-                                    },
-                                    {
-                                        "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE?view=page&limit=1",
-                                        "@type": "Dataset",
-                                        "name": "Proteomics Run 42",
-                                        "hasPart": [{ "@id": "./data/run-42.raw" }]
-                                    },
-                                    {
-                                        "@id": "./data/run-42.raw",
-                                        "@type": "File",
-                                        "name": "run-42.raw"
-                                    }
-                                ]
-                            },
-                            "total_data_entities": 128,
-                            "returned_data_entities": 1,
-                            "next_offset": 1,
-                            "next_cursor": "./data/run-42.raw"
-                        })
-                    )
-                ),
-                (
-                    "RawRevision" = (
-                        summary = "Last accepted revision with its projection state",
-                        value = json!({
-                            "raw": {
-                                "@context": "https://w3id.org/ro/crate/1.2/context",
-                                "@graph": [
-                                    {
-                                        "@id": "ro-crate-metadata.json",
-                                        "@type": "CreativeWork",
-                                        "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
-                                        "about": { "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE" }
-                                    },
-                                    {
-                                        "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
-                                        "@type": "Dataset",
-                                        "name": "Proteomics Run 42"
-                                    }
-                                ]
-                            },
-                            "winning_event_id": "01JEVENT00123456789ABCDEFG",
-                            "projection_state": "pending",
-                            "context_digest": "3f5a1c9d8e7b6a4f2d0c1b3a5e7f90813f5a1c9d8e7b6a4f2d0c1b3a5e7f9081",
-                            "dataset_digest": "0b1c2d3e4f5a69788796a5b4c3d2e1f00b1c2d3e4f5a69788796a5b4c3d2e1f0"
-                        })
-                    )
-                )
+                )),
+                (Object = "application/ld+json", example = json!({
+                    "@context": "https://w3id.org/ro/crate/1.2/context",
+                    "@graph": [
+                        {
+                            "@id": "ro-crate-metadata.json",
+                            "@type": "CreativeWork",
+                            "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                            "about": { "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE" }
+                        },
+                        {
+                            "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                            "@type": "Dataset",
+                            "name": "Proteomics Run 42"
+                        }
+                    ]
+                }))
             )
         ),
         (status = 400, description = "Document id that is not a structured metadata id, or both offset and after sent for the page view", body = ErrorResponse),
