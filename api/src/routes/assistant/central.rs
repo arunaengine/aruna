@@ -185,11 +185,6 @@ fn build_central(
         ));
     }
     let models = model_ids(request.models);
-    if models.is_empty() {
-        return Err(ServerError::BadRequestReason(
-            "at least one allowed model is required".to_string(),
-        ));
-    }
     if let Some(default) = &request.default_model
         && !models.contains(default)
     {
@@ -298,7 +293,8 @@ pub async fn get_central(
   be the central assistant. `base_url` is required for `openai_compatible`.
 - `api_key` is stored encrypted on the holder node and never returned. On a replace an omitted
   `api_key` keeps the stored key.
-- Members may only call the models in `models`; `default_model` must be one of them.
+- Members may only call the models in `models`; `default_model` must be one of them. A setup
+  without models is saved so its models can be loaded, and members cannot call it yet.
 - `daily_limit` is the number of model calls per user per UTC day; omitted means no limit.
 - Every forwarded call names the user by a stable pseudonymous id in the `user_header` header and
   the request's `user` field, and the chat by the `session_header` header. They default to
@@ -336,7 +332,7 @@ pub async fn get_central(
                     "session_header": "x-session-id"
                 }
             })),
-        (status = 400, description = "Unknown or ChatGPT kind, invalid base URL, no models, or an invalid header name", body = ErrorResponse),
+        (status = 400, description = "Unknown or ChatGPT kind, invalid base URL, or an invalid header name", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not a realm admin, or the token carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse),
