@@ -50,6 +50,11 @@ pub enum ValidationError {
     InvalidWeight,
     #[error("endpoint must be spelled as the http client parses it")]
     AmbiguousEndpoint,
+    #[error(
+        "endpoint must not carry a user name, password, query or fragment; put credentials in \
+         the connector's secret settings"
+    )]
+    EndpointCredentials,
     #[error("bucket `{0}` must not contain `/`, `\\`, `?`, `#` or `@`")]
     UnsafeBucket(String),
     #[error("credentials must not be set when `skip_signature` is enabled")]
@@ -136,6 +141,17 @@ pub fn validate_connector_input(
         && !endpoint_screening::is_canonical(endpoint)
     {
         return Err(ValidationError::AmbiguousEndpoint);
+    }
+    // Version and source root records copy the endpoint, and listings show it.
+    if let Some(endpoint) = public_config.get("endpoint")
+        && url::Url::parse(endpoint).is_ok_and(|url| {
+            !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+        })
+    {
+        return Err(ValidationError::EndpointCredentials);
     }
     if let Some(bucket) = public_config.get("bucket")
         && endpoint_screening::breaks_authority(bucket)
@@ -461,6 +477,28 @@ mod pure_tests {
                 "{weight}"
             );
         }
+    }
+
+    #[test]
+    fn refuses_endpoint_credentials() {
+        for endpoint in [
+            "https://reader:canary-11@example.org/data",
+            "https://reader@example.org/data",
+            "https://example.org/data?token=canary-11",
+            "https://example.org/data#canary-11",
+        ] {
+            let public = HashMap::from([("endpoint".to_string(), endpoint.to_string())]);
+            for kind in [SourceConnectorKind::Http, SourceConnectorKind::Webdav] {
+                let error = validate_connector_input("source", kind, &public, &HashMap::new());
+                assert_eq!(
+                    error,
+                    Err(ValidationError::EndpointCredentials),
+                    "{endpoint}"
+                );
+            }
+        }
+        let error = ValidationError::EndpointCredentials.to_string();
+        assert!(error.contains("secret settings") && !error.contains("canary"));
     }
 
     #[test]
