@@ -455,10 +455,8 @@ async fn relays_to_holder() {
     assert_eq!(through.headers[SESSION_HEADER], "c1");
 }
 
-#[test]
-fn session_needs_tools() {
-    // Without its own tools a call must not open an Open WebUI session with server tools.
-    let mut central = CentralAssistant {
+fn compatible_central() -> CentralAssistant {
+    CentralAssistant {
         provider: AssistantProvider {
             provider_id: CENTRAL_PROVIDER_ID.to_string(),
             user_id: member_of(RealmId::from_bytes([3; 32])).user_id,
@@ -479,7 +477,18 @@ fn session_needs_tools() {
         user_header: USER_HEADER.to_string(),
         session_header: SESSION_HEADER.to_string(),
         changed_at: 0,
-    };
+    }
+}
+
+fn rewritten(central: &CentralAssistant, body: serde_json::Value) -> serde_json::Value {
+    let body = central_body(central, body.to_string().as_bytes(), "p", "s1").unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[test]
+fn session_needs_tools() {
+    // Without its own tools a call must not open an Open WebUI session with server tools.
+    let mut central = compatible_central();
     let plain = serde_json::json!({"model": MODEL, "messages": [], "session_id": "x"});
     let body = central_body(&central, plain.to_string().as_bytes(), "p", "s1").unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -512,4 +521,26 @@ async fn concurrent_charges_count() {
         .filter(|result| matches!(result, Ok(Err(ServerError::AssistantQuota { .. }))))
         .count();
     assert_eq!((allowed, refused), (10, 6));
+}
+
+#[test]
+fn empty_tools_no_session() {
+    // Open WebUI treats a null or empty tool list as none and would add its own server tools.
+    let central = compatible_central();
+    for tools in [serde_json::Value::Null, serde_json::json!([])] {
+        let body = rewritten(
+            &central,
+            serde_json::json!({"model": MODEL, "messages": [], "tools": tools}),
+        );
+        assert!(
+            body.get("session_id").is_none(),
+            "session sent with tools {tools}"
+        );
+    }
+    let named = serde_json::json!([{"type": "function", "function": {"name": "submit_job"}}]);
+    let body = rewritten(
+        &central,
+        serde_json::json!({"model": MODEL, "messages": [], "tools": named}),
+    );
+    assert_eq!(body["session_id"], "s1");
 }

@@ -517,9 +517,13 @@ fn central_body(
         ));
     }
     object.retain(|field, _| !SERVER_FIELDS.contains(&field.as_str()));
-    // Open WebUI adds its own server tools for a session unless the call names its tools.
+    // Open WebUI adds its own server tools to a session whose `tools` is missing or null.
     let compatible = central.provider.kind == AssistantProviderKind::OpenaiCompatible;
-    if compatible && object.contains_key("tools") {
+    let named = object
+        .get("tools")
+        .and_then(|tools| tools.as_array())
+        .is_some_and(|tools| !tools.is_empty());
+    if compatible && named {
         object.insert("session_id".to_string(), session.into());
     }
     let pseudonym = serde_json::Value::String(pseudonym.to_string());
