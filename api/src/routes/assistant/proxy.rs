@@ -10,7 +10,7 @@ use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::{AssistantProvider, AssistantProviderKind};
+use aruna_core::structs::{AssistantProvider, AssistantProviderKind, CENTRAL_PROVIDER_ID};
 use axum::Extension;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Request, State};
@@ -24,7 +24,7 @@ fn normalized_path(path: &str) -> String {
     format!("/{}", path.trim_start_matches('/'))
 }
 
-fn allowed_path(kind: AssistantProviderKind, method: &Method, path: &str) -> bool {
+pub(super) fn allowed_path(kind: AssistantProviderKind, method: &Method, path: &str) -> bool {
     let path = normalized_path(path);
     if method == Method::GET {
         return match kind {
@@ -91,7 +91,7 @@ fn sensitive_header(value: &str) -> ServerResult<HeaderValue> {
     Ok(value)
 }
 
-async fn send_upstream(
+pub(super) async fn send_upstream(
     state: &ServerState,
     provider: &AssistantProvider,
     method: Method,
@@ -174,7 +174,7 @@ fn response_headers(headers: &HeaderMap) -> HeaderMap {
     sanitize_headers(headers)
 }
 
-fn stream_response(response: reqwest::Response) -> ServerResult<Response> {
+pub(super) fn stream_response(response: reqwest::Response) -> ServerResult<Response> {
     let status = response.status();
     let headers = response_headers(response.headers());
     let stream = response
@@ -195,6 +195,9 @@ async fn proxy_request(
 ) -> ServerResult<Response> {
     ensure_enabled(&state)?;
     let auth = require_unrestricted_auth(&state, auth)?;
+    if provider_id == CENTRAL_PROVIDER_ID {
+        return super::central::central_proxy(&state, &auth, &path, request).await;
+    }
     let mut provider = load_provider(&state, auth.user_id, provider_id).await?;
     if !allowed_path(provider.kind, request.method(), &path) {
         return Err(ServerError::NotFound);
@@ -249,20 +252,37 @@ refused. Providers are self-scoped, so a caller reaches only their own.
   answer is the one returned.
 - The upstream status, headers and body are streamed through as they arrive and are never buffered,
   so a streaming answer stays a streaming answer.
+- The id `central` names the realm's central assistant, which any member may call. Its holder node
+  answers; every other node streams the call through to it.
+- A central call needs the `x-session-id` header naming the chat: 1 to 64 characters from A-Z,
+  a-z, 0-9, `_` and `-`. It is forwarded unchanged in the admin's session header.
+- A central call names the user only by a stable pseudonymous id, in the admin's user header and
+  in the body's `user` field (`metadata.user_id` for `anthropic`). Other inbound headers are
+  dropped, and the body's `model` must be one the admin allowed.
+- A central call counts once against the caller's daily limit before it is forwarded; a refused
+  call is not counted, a call that fails upstream stays counted.
 
 **Limits**
 - The request body is capped at 4 MiB."#,
     params(
-        ("id" = String, Path, description = "Provider id, as a 26-character ULID"),
+        ("id" = String, Path, description = "Provider id, as a 26-character ULID, or `central`"),
         ("path" = String, Path, description = "Upstream path to forward, one of the chat paths the provider kind allows")
     ),
     responses(
         (status = 200, description = "Upstream response streamed unchanged"),
-        (status = 400, description = "The body is not JSON a ChatGPT request can carry, or the provider credentials are incomplete", body = ErrorResponse),
+        (status = 400, description = "The body is not JSON a ChatGPT request can carry, the provider credentials are incomplete, or a central call lacks a valid session id or names a model that is not allowed", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, a path this kind does not allow, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
+        (status = 429, description = "The caller used up today's central assistant calls; `Retry-After` names the seconds to the next UTC midnight", body = ErrorResponse,
+            headers(("Retry-After" = String, description = "Seconds until the limit resets")),
+            example = json!({
+                "error": "daily assistant limit reached",
+                "code": "assistant_quota_exhausted",
+                "quota": {"scope": "user", "dimension": "assistant_requests",
+                    "observed": 50, "requested": 1, "limit": 50}
+            })),
         (status = 502, description = "The provider was unreachable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

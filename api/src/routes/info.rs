@@ -1602,7 +1602,7 @@ fn map_node_document(
     }
 }
 
-async fn is_realm_admin(state: &ServerState, auth: &AuthContext) -> ServerResult<bool> {
+pub(crate) async fn is_realm_admin(state: &ServerState, auth: &AuthContext) -> ServerResult<bool> {
     let realm_id = state.get_realm_id();
     permission_granted(
         state,

@@ -2,11 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod central;
 mod chatgpt;
 mod chats;
 pub(crate) mod egress;
 mod proxy;
 
+use central::{
+    __path_delete_central, __path_get_central, __path_put_central, __path_test_central,
+    delete_central, get_central, put_central, test_central,
+};
 use chatgpt::{__path_poll_login, __path_start_login, poll_login, start_login};
 use chats::{
     __path_delete_chat, __path_get_turns, __path_list_chats, __path_put_chat, __path_put_turn,
@@ -22,7 +27,7 @@ use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
-    AssistantProviderStatus,
+    AssistantProviderStatus, CENTRAL_PROVIDER_ID,
 };
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::assistant::provider::{
@@ -61,7 +66,9 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(list_chats))
         .routes(routes!(put_chat, delete_chat))
         .routes(routes!(get_turns))
-        .routes(routes!(put_turn));
+        .routes(routes!(put_turn))
+        .routes(routes!(get_central, put_central, delete_central))
+        .routes(routes!(test_central));
     super::routes_at(
         router,
         "/system/assistant/providers/{id}/proxy/{*path}",
@@ -681,8 +688,10 @@ refused. Providers are self-scoped, so a caller reaches only their own.
   chat request can use remain.
 - A ChatGPT provider refreshes its login first and falls back to the fixed set this node knows when
   the backend list is unusable, because that list is not a published contract.
-- A model marked `static` came from that fixed set rather than from the provider."#,
-    params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
+- A model marked `static` came from that fixed set rather than from the provider.
+- For the id `central` the realm's central assistant answers with the models its admin allowed,
+  without asking the provider."#,
+    params(("id" = String, Path, description = "Provider id, as a 26-character ULID, or `central`")),
     responses(
         (status = 200, description = "The models the provider reports", body = ProviderModelsResponse,
             example = json!({
@@ -708,6 +717,10 @@ pub async fn get_models(
 ) -> ServerResult<(StatusCode, Json<ProviderModelsResponse>)> {
     ensure_enabled(&state)?;
     let auth = require_unrestricted_auth(&state, auth)?;
+    if provider_id == CENTRAL_PROVIDER_ID {
+        let models = central::central_models(&state, &auth).await?;
+        return Ok((StatusCode::OK, Json(ProviderModelsResponse { models })));
+    }
     let provider = load_provider(&state, auth.user_id, provider_id).await?;
     let models = if provider.kind == AssistantProviderKind::Chatgpt {
         // The backend list is not a published contract; the static set covers a refusal.
