@@ -459,7 +459,7 @@ async fn metadata_hits_authorized() {
 }
 
 // Metadata words of at least three characters match by their start, through the index query
-// and, for a prefix too common for the index, through the check of the loaded versions.
+// and, for a prefix too common or too costly for the index, through the version check.
 #[tokio::test]
 async fn metadata_prefixes_found() {
     let ready = IndexState::Ready { generation: 1 };
@@ -469,9 +469,10 @@ async fn metadata_prefixes_found() {
     for (key, organism) in folders {
         described.push(describe(&test.fixture, key, organism).await);
     }
-    for scan in [1_000_000, 0] {
-        let dir = test._index_dir.path().join(scan.to_string());
-        test.indexes = Arc::new(RangeIndexes::with_scan(dir, scan));
+    for (scan, bytes) in [(1_000_000, usize::MAX), (0, usize::MAX), (1_000_000, 0)] {
+        let dir = test._index_dir.path().join(format!("{scan}-{bytes}"));
+        let indexes = RangeIndexes::with_scan(dir, scan).with_range_bytes(bytes);
+        test.indexes = Arc::new(indexes);
         let changes = described.clone();
         let set_id = test.binding.set_id;
         (test.indexes.apply(set_id, test.lower, 1, changes))

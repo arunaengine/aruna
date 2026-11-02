@@ -45,6 +45,8 @@ const OPEN_WRITERS: usize = 8;
 const INDEX_PERMITS: usize = 4;
 /// Matches a page scans at most: a query whose rarest term has more walks the keys instead.
 const MATCH_SCAN_LIMIT: u64 = 1_000_000;
+/// Bitset memory the prefix range queries of one search may hold at once.
+const RANGE_BYTES: usize = 16 << 20;
 
 #[derive(Debug, Error)]
 pub enum KeyIndexError {
@@ -159,6 +161,7 @@ pub struct RangeIndexes {
     writers: Mutex<VecDeque<PathBuf>>,
     permits: Arc<Semaphore>,
     scan_limit: u64,
+    range_bytes: usize,
 }
 
 impl std::fmt::Debug for RangeIndexes {
@@ -178,6 +181,7 @@ impl RangeIndexes {
             writers: Mutex::new(VecDeque::new()),
             permits: Arc::new(Semaphore::new(INDEX_PERMITS)),
             scan_limit: MATCH_SCAN_LIMIT,
+            range_bytes: RANGE_BYTES,
         }
     }
 
@@ -186,6 +190,14 @@ impl RangeIndexes {
         Self {
             scan_limit,
             ..Self::new(root)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_range_bytes(self, range_bytes: usize) -> Self {
+        Self {
+            range_bytes,
+            ..self
         }
     }
 
@@ -227,7 +239,7 @@ impl RangeIndexes {
         let dir = self.directory(set_id, range_id, generation);
         self.blocking(move |indexes| {
             let open = indexes.open_index(&dir, false)?;
-            search_keys(&open, &query, indexes.scan_limit)
+            search_keys(&open, &query, indexes.scan_limit, indexes.range_bytes)
         })
         .await
     }
@@ -482,6 +494,7 @@ fn search_keys(
     open: &OpenIndex,
     query: &KeyQuery,
     scan_limit: u64,
+    range_bytes: usize,
 ) -> Result<KeyPage, KeyIndexError> {
     let fields = fields(&open.index.schema())?;
     let mut analyzer = open.index.tokenizer_for_field(fields.name)?;
@@ -518,17 +531,32 @@ fn search_keys(
     let (mut ranges, mut checked) = (Vec::new(), Vec::new());
     for (field, prefix) in prefixes {
         let found = prefix_freq(&searcher, field, &prefix, scan_limit)?;
-        rarest = rarest.min(found);
         match (found > scan_limit, field == fields.name) {
-            (false, _) => ranges.push((field, prefix)),
+            (false, _) => ranges.push((found, field, prefix)),
             (true, true) => checked.push(prefix),
             (true, false) => {}
         }
     }
+    // A range query holds a bitset of each segment's documents: the rarest ranges that fit the
+    // budget are queried, the others fall back like prefixes with too many matches.
+    let bitset = (searcher.segment_readers().iter())
+        .map(|segment| (segment.max_doc() as usize).div_ceil(8))
+        .max()
+        .unwrap_or(0);
+    ranges.sort_by_key(|(found, ..)| *found);
+    let fits = range_bytes.checked_div(bitset).unwrap_or(usize::MAX);
+    for (_, field, prefix) in ranges.split_off(fits.min(ranges.len())) {
+        if field == fields.name {
+            checked.push(prefix);
+        }
+    }
+    for (found, ..) in &ranges {
+        rarest = rarest.min(*found);
+    }
     let mut page = match rarest > scan_limit {
         true => walk_keys(&searcher, fields, query, Some(&terms))?,
         false => {
-            let ranges = ranges.iter().map(|(field, prefix)| {
+            let ranges = ranges.iter().map(|(_, field, prefix)| {
                 let end = prefix_upper_bound(prefix.as_bytes());
                 let end = end.map_or(Bound::Unbounded, |end| {
                     Bound::Excluded(Term::from_field_bytes(*field, &end))
@@ -919,6 +947,35 @@ mod tests {
                 "only the start of a name part matches"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn range_budget_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = RangeIndexes::new(dir.path()).with_range_bytes(0);
+        let indexes = Arc::new(indexes);
+        let changes = vec![
+            described("a/", &["samd00012345"], &[]),
+            described("b/", &["samn00000001"], &[]),
+            put("SAMD00012345/a.fna"),
+        ];
+        indexes.apply(set(), range(), 1, changes).await.unwrap();
+        let names = query(Bound::Unbounded, Bound::Unbounded, Some("SAMD"), 10);
+        let page = indexes.search(set(), range(), 1, names).await.unwrap();
+        assert_eq!(
+            page.keys,
+            ["SAMD00012345/a.fna"],
+            "name prefixes are checked on keys"
+        );
+        let page = indexes
+            .search(set(), range(), 1, meta(&["samd"], &[], 10, None))
+            .await;
+        let found = page.unwrap().keys;
+        assert_eq!(
+            found,
+            ["a/", "b/"],
+            "metadata prefixes are left to the version check"
+        );
     }
 
     #[tokio::test]
