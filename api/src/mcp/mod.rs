@@ -24,6 +24,7 @@ use std::sync::Arc;
 mod compute;
 mod context;
 pub(crate) mod data;
+mod forward;
 mod metadata;
 mod prompts;
 mod resources;
