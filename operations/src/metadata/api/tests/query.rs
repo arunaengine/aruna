@@ -522,3 +522,73 @@ async fn unordered_runs_once() {
     assert_eq!(*runs.lock().unwrap(), vec![query]);
     assert_eq!(fetched, Ok(MetadataQueryResults::Solutions(rows)));
 }
+
+/// Runs a partition like craqle, which refuses results over its row limit instead of cutting them.
+async fn capped_partition(query: &str, objects: &[(&str, String)]) -> MetadataQueryResults {
+    let (partition, order) = ordered_query(query).unwrap().unwrap();
+    let ties = query_select_limit(query).map(|limit| (order, limit));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    fetch_ties(partition, ties, deadline, permits, |text| async move {
+        let rows = partition_rows(&text, objects);
+        match rows.len() > QUERY_MAX_ROWS {
+            true => Err(MetadataReadError::Unavailable),
+            false => Ok(MetadataQueryResults::Solutions(rows)),
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn row_limit_fetch() {
+    let query =
+        format!("SELECT DISTINCT ?k WHERE {{ ?s <urn:k> ?k }} ORDER BY ?k LIMIT {QUERY_MAX_ROWS}");
+    let objects: Vec<_> = (0..QUERY_MAX_ROWS + 5)
+        .map(|index| ("s", format!("\"{index}\"^^<{INTEGER}>")))
+        .collect();
+    let MetadataQueryResults::Solutions(rows) = capped_partition(&query, &objects).await else {
+        panic!("expected solutions");
+    };
+    assert_eq!(rows.len(), QUERY_MAX_ROWS);
+}
+
+#[tokio::test]
+async fn ties_stop_at_limit() {
+    // The tie group at the cut runs past the row limit, so the partition keeps what fits.
+    let limit = QUERY_MAX_ROWS - 1;
+    let query = format!("SELECT DISTINCT ?k WHERE {{ ?s <urn:k> ?k }} ORDER BY ?k LIMIT {limit}");
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    let mut objects: Vec<_> = (1..limit)
+        .map(|index| ("s", format!("\"-{index}\"^^<{INTEGER}>")))
+        .collect();
+    objects.extend([
+        ("s", format!("\"1\"^^<{xsd}int>")),
+        ("s", format!("\"1\"^^<{xsd}integer>")),
+        ("s", format!("\"01\"^^<{xsd}integer>")),
+    ]);
+    let MetadataQueryResults::Solutions(rows) = capped_partition(&query, &objects).await else {
+        panic!("expected solutions");
+    };
+    assert_eq!(rows.len(), QUERY_MAX_ROWS);
+}
+
+#[test]
+fn partition_query_widest() {
+    // Tie fetches raise LIMIT up to the row limit, so the widest partition text must still fit.
+    let query = |fill: usize| {
+        format!(
+            "SELECT DISTINCT ?s WHERE {{ ?s ?p ?o FILTER(?o != \"{}\") }} ORDER BY ?s LIMIT 1",
+            "x".repeat(fill)
+        )
+    };
+    let base = ordered_query(&query(0)).unwrap().unwrap().0.len();
+    let fill = QUERY_MAX_BYTES - base;
+    assert!(matches!(
+        ordered_query(&query(fill)),
+        Err(MetadataApiError::InvalidQuery(_))
+    ));
+    let widest = QUERY_MAX_ROWS.to_string().len() - 1;
+    let (partition, _) = ordered_query(&query(fill - widest)).unwrap().unwrap();
+    assert_eq!(partition.len() + widest, QUERY_MAX_BYTES);
+}

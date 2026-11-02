@@ -602,7 +602,11 @@ where
     let order = Arc::new(order);
     let mut margin = 1usize;
     loop {
-        let fetch = limit.saturating_add(margin);
+        // Craqle refuses results over its row limit, so fetches stop there and keep what fits.
+        let fetch = limit.saturating_add(margin).min(QUERY_MAX_ROWS).max(limit);
+        if fetch == limit {
+            return run(query).await;
+        }
         let spargebra::Query::Select {
             pattern: spargebra::algebra::GraphPattern::Slice { length, .. },
             ..
@@ -623,7 +627,7 @@ where
         .await
         .map_err(|_| MetadataReadError::Unavailable)?;
         let kept = limit - 1 + tied;
-        if kept < rows.len() || rows.len() < fetch {
+        if kept < rows.len() || rows.len() < fetch || fetch == QUERY_MAX_ROWS {
             rows.truncate(kept);
             return Ok(MetadataQueryResults::Solutions(rows));
         }
@@ -680,7 +684,11 @@ pub(super) fn ordered_query(
         };
     };
     let partition = parsed.to_string();
-    if partition.len() > QUERY_MAX_BYTES {
+    // Tie fetches may raise `LIMIT` up to the row limit, which lengthens the partition text.
+    let widest = query_select_limit(query).map_or(0, |limit| {
+        QUERY_MAX_ROWS.max(limit).to_string().len() - limit.to_string().len()
+    });
+    if partition.len() + widest > QUERY_MAX_BYTES {
         return Err(MetadataApiError::InvalidQuery(
             "This ordered query is too long to run across the realm; shorten its variable names \
              or run it locally"
