@@ -21,6 +21,13 @@ const META_PREFIX: u8 = b'M';
 const CLOCK_PREFIX: u8 = b'K';
 const TERM_DOMAIN: &[u8] = b"craqle-term/v1\0";
 
+#[cfg(test)]
+thread_local! {
+    /// Runs right before the cursor write, so a test can check that both stores stay locked.
+    static BEFORE_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Craqle's version 2 applied topic cursor, checked by version, topic and checksum.
 #[derive(Serialize, Deserialize)]
 struct CursorPayload {
@@ -107,31 +114,26 @@ fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> 
         }
     }
     let graph = GraphId::new(&request.graph);
-    // Each store is opened in turn; opening takes its lock, so this refuses while the node runs.
+    // Both stores stay open, and so locked, from validation through the durable write; the
+    // locks also refuse while the node runs.
+    let sync = FjallStorage::open(&sync_path)?;
+    let (db, graphs) = open_graphs(&craqle_path)?;
     let topic = graph_topic(&graph);
-    let (applied, bytes) = {
-        let (db, graphs) = open_graphs(&craqle_path)?;
-        let applied = applied_dots(&db, &graphs, &graph)?;
-        let bound = graphs.get(store_key(BINDING_PREFIX, &topic))?;
-        if bound.as_deref() != Some(request.graph.as_bytes()) {
-            return Err(ExplorerError::Refused(format!(
-                "topic {topic} is not bound to graph {graph}"
-            )));
-        }
-        let bytes = graphs
-            .get(store_key(CURSOR_PREFIX, &topic))?
-            .map(|value| value.to_vec())
-            .ok_or_else(|| {
-                ExplorerError::Refused("graph has no applied sync cursor".to_string())
-            })?;
-        (applied, bytes)
-    };
+    let applied = applied_dots(&db, &graphs, &graph)?;
+    let bound = graphs.get(store_key(BINDING_PREFIX, &topic))?;
+    if bound.as_deref() != Some(request.graph.as_bytes()) {
+        return Err(ExplorerError::Refused(format!(
+            "topic {topic} is not bound to graph {graph}"
+        )));
+    }
+    let bytes = graphs
+        .get(store_key(CURSOR_PREFIX, &topic))?
+        .map(|value| value.to_vec())
+        .ok_or_else(|| ExplorerError::Refused("graph has no applied sync cursor".to_string()))?;
     let stale = decode_cursor(&topic, &bytes)?;
-    let view = FjallStorage::open(&sync_path)?
-        .topic_view(&topic, None)?
-        .ok_or_else(|| {
-            ExplorerError::Refused(format!("topic {topic} is not in the local sync store"))
-        })?;
+    let view = sync.topic_view(&topic, None)?.ok_or_else(|| {
+        ExplorerError::Refused(format!("topic {topic} is not in the local sync store"))
+    })?;
     if stale.genesis == view.state.genesis {
         let reason = if stale.epoch == view.epoch {
             "the cursor already names the current topic branch"
@@ -183,7 +185,8 @@ fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> 
         clock: ActorClock::default(),
         target: None,
     })?;
-    let audit = replace_cursor(&craqle_path, &topic, &bytes, &replacement)?;
+    let audit = replace_cursor(&db, &graphs, &topic, &bytes, &replacement)?;
+    drop((db, sync));
     output.replacement_cursor_digest = Some(hex::encode(audit.replacement_cursor_digest));
     output.applied = true;
     Ok(output)
@@ -221,12 +224,12 @@ fn open_graphs(craqle_path: &Path) -> Result<(Database, Keyspace), ExplorerError
 /// Compare-and-replace with an audit record, as Craqle's authorized cursor repair writes it.
 /// That repair needs Craqle opened with sync, and its open-time reconcile fails on this cursor.
 fn replace_cursor(
-    craqle_path: &Path,
+    db: &Database,
+    graphs: &Keyspace,
     topic: &TopicId,
     old: &[u8],
     replacement: &[u8],
 ) -> Result<TopicCursorRepairAudit, ExplorerError> {
-    let (db, graphs) = open_graphs(craqle_path)?;
     let key = store_key(CURSOR_PREFIX, topic);
     if graphs.get(key)?.as_deref() != Some(old) {
         return Err(ExplorerError::Refused(
@@ -245,9 +248,13 @@ fn replace_cursor(
     audit_key.extend_from_slice(&audit.replacement_cursor_digest);
     let audit_value = postcard::to_allocvec(&audit)
         .map_err(|error| ExplorerError::Decode(format!("cursor audit: {error}")))?;
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_WRITE.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     let mut batch = db.batch();
-    batch.insert(&graphs, key, replacement.to_vec());
-    batch.insert(&graphs, audit_key, audit_value);
+    batch.insert(graphs, key, replacement.to_vec());
+    batch.insert(graphs, audit_key, audit_value);
     batch.commit()?;
     db.persist(PersistMode::SyncAll)?;
     Ok(audit)
@@ -584,6 +591,25 @@ mod tests {
         repair_output(&request).unwrap();
         assert_eq!(store_state(temp.path()), before);
         assert!(!temp.path().join("craqle").join("search").exists());
+    }
+
+    /// Both stores stay locked from validation through the write, so nothing changes between.
+    #[test]
+    fn holds_store_locks() {
+        let (temp, mut request) = replaced_replica(2, false, false);
+        let store = temp.path().join("craqle").join("store");
+        let sync = temp.path().join("document-sync");
+        let locked = std::rc::Rc::new(std::cell::Cell::new((false, false)));
+        let seen = locked.clone();
+        BEFORE_WRITE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let craqle = Database::builder(&store).open().is_err();
+                seen.set((craqle, FjallStorage::open(&sync).is_err()));
+            }));
+        });
+        request.apply = true;
+        assert!(repair_output(&request).unwrap().applied);
+        assert_eq!(locked.get(), (true, true), "craqle and sync store locks");
     }
 
     /// One signer minted both geneses, so its sequences collide and the cursor stays.
