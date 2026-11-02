@@ -14,6 +14,7 @@ use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKE
 use aruna_core::structs::storage::blob::{
     BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::metadata::api::{
     BucketSearchRequest, ObjectQueryMode, SearchQueryRequest, search_buckets_distributed,
     search_objects,
@@ -155,7 +156,7 @@ async fn distributed_search_routes() -> TestResult<()> {
             bearer_token: Some(realm.bearer_string()),
             query: "data".to_string(),
             key: None,
-            operation: None,
+            extras: None,
             limit: 10,
             group_id: None,
             cursor: None,
@@ -219,7 +220,7 @@ async fn policy_keeps_member() -> TestResult<()> {
         bearer_token: Some(realm.bearer_string()),
         query: "data".to_string(),
         key: None,
-        operation: operation.map(str::to_string),
+        extras: operation.map(PolicyRequestExtras::operation),
         limit: 10,
         group_id: None,
         cursor: None,

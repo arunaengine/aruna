@@ -160,8 +160,8 @@ pub enum MetadataTransportMessage {
         query: String,
         /// Admits a bucket by READ on this key or key prefix inside it instead of on its root.
         key: Option<String>,
-        /// Another request operation whose policies must also allow each hit.
-        operation: Option<String>,
+        /// An MCP tool's policy context whose policies must also allow each hit.
+        extras: Option<crate::auth::request_policy::PolicyRequestExtras>,
         limit: usize,
         group_id: Option<GroupId>,
         /// Continues after this bucket name or this node's sealed scan position.
@@ -1083,7 +1083,7 @@ mod tests {
             auth_token: Some(AuthToken::bearer("bucket-token").unwrap()),
             query: "dataset".to_string(),
             key: None,
-            operation: None,
+            extras: None,
             limit: 10,
             group_id: None,
             start_after: None,
@@ -1291,7 +1291,7 @@ mod tests {
                 auth_token: None,
                 query: String::new(),
                 key: None,
-                operation: None,
+                extras: None,
                 limit: 0,
                 group_id: None,
                 start_after: None,

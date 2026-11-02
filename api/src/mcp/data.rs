@@ -382,8 +382,8 @@ impl McpServer {
                 bearer_token: bearer,
                 query: String::new(),
                 key: None,
-                // The MCP policies apply on each node, before members of a distributed bucket merge.
-                operation: Some(extras.operation.clone()),
+                // The tool's policies apply on each node, before members of a bucket merge.
+                extras: Some(extras.clone()),
                 limit: BUCKET_PAGE,
                 group_id: None,
                 cursor: input.cursor,

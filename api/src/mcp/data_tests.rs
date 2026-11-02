@@ -883,3 +883,79 @@ async fn aggregate_work_bounded() {
     let counted = counted.await.unwrap().0;
     assert_eq!((counted.scanned, counted.truncated), (1, true));
 }
+
+// A group policy on the MCP tool's parameters applies to every listed bucket of the group: a
+// deny of continuation pages hides the group's buckets there, while the first page lists them.
+#[tokio::test]
+async fn continuation_policy_applies() {
+    use crate::tests::distributed::{bucket_info, node_state, write};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = node_state().await;
+    let (state, realm_id) = (&node.state, node.state.get_realm_id());
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: node.owner.user_id,
+        realm_id,
+    };
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.ensure_node(state.get_node_id(), RealmNodeKind::Server);
+    let config = config.to_bytes(&actor).unwrap();
+    write(
+        state,
+        REALM_CONFIG_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        config,
+    )
+    .await;
+    let owner = node.owner.user_id;
+    let mut group = GroupAuthorizationDocument::default_group_doc(owner, realm_id, node.group_id);
+    group.policies = vec![RequestPolicy {
+        policy_id: ulid::Ulid::from_parts(8, 8),
+        name: "first-page-only".to_string(),
+        kind: PolicyKind::Deny,
+        when: None,
+        expression: "operation == 'mcp:list_buckets' && 'cursor' in params".to_string(),
+        enabled: true,
+    }];
+    let group = group.to_bytes(&actor).unwrap();
+    write(
+        state,
+        AUTH_KEYSPACE,
+        node.group_id.to_bytes().to_vec(),
+        group,
+    )
+    .await;
+    // More buckets than one page holds, so the first page ends with a cursor.
+    for index in 0..BUCKET_PAGE {
+        let info = bucket_info(node.group_id, None).to_bytes().unwrap();
+        let name = format!("page-{index:03}");
+        write(state, S3_BUCKET_KEYSPACE, name.into_bytes(), info).await;
+    }
+    let server = McpServer::new(state.clone());
+    let first = Parameters(ListBucketsInput::default());
+    let first = server
+        .list_buckets(Extension(caller(&node.owner)), first)
+        .await;
+    let first = first.unwrap().0;
+    assert_eq!(first.buckets.len(), BUCKET_PAGE);
+    let cursor = first.next_cursor.expect("a second page follows");
+    let next = Parameters(ListBucketsInput {
+        cursor: Some(cursor),
+    });
+    let next = server
+        .list_buckets(Extension(caller(&node.owner)), next)
+        .await;
+    let names: Vec<String> = next
+        .unwrap()
+        .0
+        .buckets
+        .into_iter()
+        .map(|hit| hit.bucket)
+        .collect();
+    assert!(names.is_empty(), "{names:?}");
+}

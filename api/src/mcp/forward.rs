@@ -183,7 +183,7 @@ impl McpServer {
                     bearer_token: bearer.clone(),
                     query: bucket.to_string(),
                     key: (!key.is_empty()).then(|| key.to_string()),
-                    operation: None,
+                    extras: None,
                     limit: SEARCH_PAGE,
                     group_id: None,
                     cursor,
