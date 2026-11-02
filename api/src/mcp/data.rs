@@ -17,6 +17,7 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
 use aruna_core::structs::storage::data::identity::content_id;
+use aruna_operations::auth::request_policy::{enforce_policies, policy_request_with};
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
 use aruna_operations::realm::get_config::GetConfigOperation;
@@ -366,7 +367,8 @@ impl McpServer {
         rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ListBucketsInput>,
     ) -> Result<Json<BucketsOutput>, CallToolResult> {
         let auth = request_auth(&parts)?;
-        authorize_search(self, &auth, tool_extras("list_buckets", &input)?).await?;
+        let extras = tool_extras("list_buckets", &input)?;
+        authorize_search(self, &auth, extras.clone()).await?;
         // Every node checks the caller on its own buckets and leaves out what it may not read.
         let bearer = request_bearer(&parts).map(|carrier| carrier.as_str().to_string());
         let result = search_buckets_distributed(
@@ -374,7 +376,7 @@ impl McpServer {
             self.state.get_realm_id(),
             self.state.get_node_id(),
             BucketSearchRequest {
-                auth,
+                auth: auth.clone(),
                 bearer_token: bearer,
                 query: String::new(),
                 limit: BUCKET_PAGE,
@@ -387,16 +389,26 @@ impl McpServer {
         .await
         .map_err(crate::metadata::map_api_error)
         .map_err(server_error)?;
-        let buckets = result
-            .hits
-            .into_iter()
-            .map(|hit| BucketOutput {
+        // The MCP policies of each bucket apply too, on the path the search checked.
+        let (context, realm_id) = (self.state.get_ctx(), self.state.get_realm_id());
+        let mut buckets = Vec::new();
+        for hit in result.hits {
+            let path = bucket_permission_path(realm_id, hit.group_id, hit.node_id, &hit.bucket);
+            let request =
+                policy_request_with(&path, &Permission::READ, Some(&auth), extras.clone());
+            if enforce_policies(&context, realm_id, &request)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            buckets.push(BucketOutput {
                 bucket: hit.bucket,
                 group_id: hit.group_id.to_string(),
                 node_id: hit.node_id.to_string(),
                 created_at: chrono::DateTime::<chrono::Utc>::from(hit.created_at).to_rfc3339(),
-            })
-            .collect();
+            });
+        }
         Ok(Json(BucketsOutput {
             buckets,
             next_cursor: result.next_cursor,

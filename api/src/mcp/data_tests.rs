@@ -532,7 +532,7 @@ fn caller(auth: &AuthContext) -> http::request::Parts {
 }
 
 // The bucket list shows what the bucket search shows: a public bucket of another group joins
-// the caller's own, while a closed bucket or one a deny policy hides is left out, not refused.
+// the caller's own; a closed bucket or one a deny policy hides, also for MCP only, is left out.
 #[tokio::test]
 async fn lists_readable_buckets() {
     use crate::tests::distributed::{bucket_info, node_state, write};
@@ -551,14 +551,25 @@ async fn lists_readable_buckets() {
     };
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.ensure_node(state.get_node_id(), RealmNodeKind::Server);
-    config.request_policies = vec![RequestPolicy {
-        policy_id: ulid::Ulid::from_parts(3, 3),
-        name: "hide-bucket".to_string(),
-        kind: PolicyKind::Deny,
-        when: None,
-        expression: "path.endsWith('/hidden')".to_string(),
-        enabled: true,
-    }];
+    config.request_policies = vec![
+        RequestPolicy {
+            policy_id: ulid::Ulid::from_parts(3, 3),
+            name: "hide-bucket".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "path.endsWith('/hidden')".to_string(),
+            enabled: true,
+        },
+        RequestPolicy {
+            policy_id: ulid::Ulid::from_parts(3, 4),
+            name: "hide-from-mcp".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "operation == 'mcp:list_buckets' && path.endsWith('/closed-data')"
+                .to_string(),
+            enabled: true,
+        },
+    ];
     let config = config.to_bytes(&actor).unwrap();
     write(
         state,
@@ -594,8 +605,8 @@ async fn lists_readable_buckets() {
     open_paths(&context, &stranger, other, &[open]).await;
     let server = McpServer::new(state.clone());
     for (auth, expected) in [
-        (&node.owner, ["open-data", "routed"]),
-        (&node.stranger, ["closed-data", "open-data"]),
+        (&node.owner, &["open-data", "routed"][..]),
+        (&node.stranger, &["open-data"][..]),
     ] {
         let input = Parameters(ListBucketsInput::default());
         let listed = server.list_buckets(Extension(caller(auth)), input).await;
