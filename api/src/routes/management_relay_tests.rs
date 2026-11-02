@@ -4,8 +4,8 @@
 
 use super::{
     API_PREFIX, MANAGEMENT_URL_TTL, RELAYED_ROUTES, coordinated_route, gateway_failed,
-    healthy_first, may_try_next, may_try_response, relay_route, relay_targets, relay_url,
-    relayed_headers,
+    healthy_first, holder_route, may_try_next, may_try_response, relay_route, relay_targets,
+    relay_url, relayed_headers,
 };
 use crate::error::{ErrorResponse, ServerError};
 use axum::body::to_bytes;
@@ -54,6 +54,26 @@ fn matches_allowlisted_routes() {
         relay_route(&Method::GET, Some("/api/v1/system/realm/quota"), false),
         None
     );
+}
+
+#[test]
+fn central_goes_to_holder() {
+    let proxy = Some("/api/v1/system/assistant/providers/{id}/proxy/{*path}");
+    let central: Uri = "/api/v1/system/assistant/providers/central/proxy/v1/messages"
+        .parse()
+        .unwrap();
+    let own: Uri =
+        "/api/v1/system/assistant/providers/01JCNCTR0123456789ABCDEFGH/proxy/v1/messages"
+            .parse()
+            .unwrap();
+    assert!(holder_route(&Method::POST, proxy, &central, false));
+    // A user's own provider stays on the node that stored it, and a relayed call stays put.
+    assert!(!holder_route(&Method::POST, proxy, &own, false));
+    assert!(!holder_route(&Method::POST, proxy, &central, true));
+    let setup: Uri = "/api/v1/system/assistant/central".parse().unwrap();
+    let route = Some("/api/v1/system/assistant/central");
+    assert!(holder_route(&Method::PUT, route, &setup, false));
+    assert!(!holder_route(&Method::PATCH, route, &setup, false));
 }
 
 #[test]
