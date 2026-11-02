@@ -3,13 +3,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::info_topics;
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
 use craqle::{GraphId, TopicCursorRepairAudit, VectorClock, topic_cursor_digest};
+use fjall::OptimisticTxDatabase;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use irokle::{ActorClock, FjallStorage, OpId, Storage, TopicId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 const CURSOR_VERSION: u8 = 2;
@@ -63,7 +65,7 @@ pub struct RepairOutput {
     topic_id: String,
     stale: BranchView,
     current: BranchView,
-    /// Every actor in the graph's applied clock by highest sequence; topic actors among them block.
+    /// Every actor in the graph's applied clock by highest sequence; all but this node's own block.
     applied_actors: BTreeMap<String, u64>,
     /// Actors whose sequences can collide across the geneses, so a replay could skip records.
     overlap: Vec<ActorOverlap>,
@@ -114,6 +116,7 @@ fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> 
         }
     }
     let graph = GraphId::new(&request.graph);
+    let local = local_writer(storage)?;
     // Both stores stay open, and so locked, from validation through the durable write; the
     // locks also refuse while the node runs.
     let sync = FjallStorage::open(&sync_path)?;
@@ -151,7 +154,17 @@ fn repair_output(request: &CursorRepair) -> Result<RepairOutput, ExplorerError> 
         .iter()
         .chain(view.state.membership_controls.keys())
         .map(|peer| irokle::actor_id_for(topic, *peer));
-    let overlap = actor_overlap(&stale.clock, &applied, &view.clock, members);
+    // Every applied actor but this node's own unpublished writer can restart on the new genesis.
+    let candidates: BTreeSet<[u8; 32]> = applied
+        .0
+        .keys()
+        .map(|actor| *actor.as_bytes())
+        .chain(stale.clock.iter().map(|(actor, _)| *actor.as_bytes()))
+        .chain(view.clock.iter().map(|(actor, _)| *actor.as_bytes()))
+        .chain(members.map(|actor| *actor.as_bytes()))
+        .filter(|actor| actor != local.as_bytes())
+        .collect();
+    let overlap = actor_overlap(&candidates, &stale.clock, &applied, &view.clock);
     let applied_actors = applied
         .0
         .iter()
@@ -311,35 +324,38 @@ fn decode_cursor(topic: &TopicId, bytes: &[u8]) -> Result<CursorPayload, Explore
     Ok(envelope.payload)
 }
 
-/// A topic actor collides when the graph applied any of its records, or when both geneses have
-/// it, since the current genesis keeps its actor id and restarts its sequences.
+/// An actor collides when the graph applied any of its records, or when both geneses have it,
+/// since the current genesis keeps its actor id and restarts its sequences.
 fn actor_overlap(
+    candidates: &BTreeSet<[u8; 32]>,
     stale: &ActorClock,
     applied: &VectorClock,
     current: &ActorClock,
-    members: impl Iterator<Item = irokle::ActorId>,
 ) -> Vec<ActorOverlap> {
-    let actors: BTreeMap<String, irokle::ActorId> = stale
+    candidates
         .iter()
-        .chain(current.iter())
-        .map(|(actor, _)| *actor)
-        .chain(members)
-        .map(|actor| (hex::encode(actor.as_bytes()), actor))
-        .collect();
-    actors
-        .into_iter()
-        .filter_map(|(name, actor)| {
+        .filter_map(|bytes| {
+            let actor = irokle::ActorId::from_bytes(*bytes);
             let (stale_cursor, current) = (stale.get(&actor), current.get(&actor));
             let applied = applied_sequence(applied, &actor);
             let collides = applied > 0 || (stale_cursor > 0 && current > 0);
             collides.then_some(ActorOverlap {
-                actor: name,
+                actor: hex::encode(bytes),
                 stale_cursor,
                 applied,
                 current,
             })
         })
         .collect()
+}
+
+/// Aruna's own Craqle actor, the node id, which writes local metadata without publishing it.
+fn local_writer(database_path: &Path) -> Result<craqle::ActorId, ExplorerError> {
+    let db = OptimisticTxDatabase::builder(database_path).open()?;
+    let state = info_topics::persisted_node_state(&db)?
+        .ok_or_else(|| ExplorerError::Refused("node has no stored identity".to_string()))?;
+    let node_id = iroh::SecretKey::from_bytes(&state.net_secret_key).public();
+    Ok(craqle::ActorId::from_bytes(*node_id.as_bytes()))
 }
 
 fn applied_sequence(applied: &VectorClock, actor: &irokle::ActorId) -> u64 {
@@ -374,6 +390,48 @@ mod tests {
 
     const GRAPH: &str = "urn:test:doctor-repair-cursor";
     const REPLICA_SEED: u8 = 9;
+    const NODE_SECRET: [u8; 32] = [21; 32];
+
+    /// The Craqle actor Aruna writes local metadata with: the id of the node holding `NODE_SECRET`.
+    fn node_writer() -> craqle::ActorId {
+        let node_id = iroh::SecretKey::from_bytes(&NODE_SECRET).public();
+        craqle::ActorId::from_bytes(*node_id.as_bytes())
+    }
+
+    /// Stores the node identity Aruna keeps beside the Craqle and sync stores.
+    fn store_identity(path: &Path) {
+        use aruna::identity::{
+            BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+        };
+        use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
+        let realm = aruna_core::structs::identity::realm::RealmId([3u8; 32]);
+        let state = PersistedNodeState {
+            boot_origin: BootOrigin::Onboarded,
+            status: PersistedNodeStatus::PendingOnboarding,
+            realm_id: realm,
+            net_secret_key: NODE_SECRET,
+            onboarding_phase: None,
+            onboarding_sync_ticket: None,
+            identity: PersistedNodeIdentity::User {
+                owner: aruna_core::UserId::nil(realm),
+            },
+        };
+        let value = postcard::to_allocvec(&state).unwrap();
+        super::super::tests::write(path, NODE_STATE_KEYSPACE, vec![(NODE_STATE_KEY, value)]);
+    }
+
+    /// One `replaced_replica` scenario; the default is a safe repair of Aruna-style content.
+    #[derive(Default)]
+    struct Setup {
+        /// One signer mints both geneses.
+        shared_signer: bool,
+        /// The first genesis carries a published crate the replica applies.
+        first_writes: bool,
+        /// The replica publishes once more and applies it before any reconcile.
+        own_write: bool,
+        /// The replica's local content is written by an actor that is not this node.
+        stranger_writes: bool,
+    }
 
     fn signed(seed: u8) -> Irokle {
         Irokle::builder()
@@ -426,16 +484,27 @@ mod tests {
             .unwrap();
     }
 
+    /// The replica's unpublished local crate, written as `actor`.
+    fn create_local(node: &CraqleNode, actor: craqle::ActorId) {
+        let request = CreateCrateRequest::new(
+            GraphId::new(GRAPH),
+            "first",
+            "description",
+            "2025-01-01",
+            None,
+            policy(),
+        );
+        let durability = CraqleRequestDurability::WalAlreadyDurable;
+        node.create_crate_with_durability_as(&AllowAllAuthorizer, request, durability, Some(actor))
+            .unwrap();
+    }
+
     /// A stopped replica whose cursor names a genesis minted by seed 1, while its sync store now
-    /// holds a second genesis minted by `second_seed`. Without `first_writes` the replica's
-    /// content is local and unpublished, as Aruna writes it, and the first genesis has a policy.
-    /// With `own_write` the replica publishes once more and applies it before any reconcile.
-    fn replaced_replica(
-        second_seed: u8,
-        first_writes: bool,
-        own_write: bool,
-    ) -> (TempDir, CursorRepair) {
+    /// holds a second genesis for the same graph topic, shaped by `setup`.
+    fn replaced_replica(setup: Setup) -> (TempDir, CursorRepair) {
         let temp = tempdir().unwrap();
+        store_identity(temp.path());
+        let second_seed = if setup.shared_signer { 1 } else { 2 };
         let (first, second) = (signed(1), signed(second_seed));
         let replica_sync = replica_irokle(temp.path());
         let replica_id = replica_sync.peer_id();
@@ -448,14 +517,15 @@ mod tests {
             &[first.peer_id()],
         );
         let graph = GraphId::new(GRAPH);
-        if first_writes {
+        if setup.first_writes {
             create(&first_node, "first", CraqleRequestDurability::Durable);
         } else {
-            create(
-                &replica,
-                "first",
-                CraqleRequestDurability::WalAlreadyDurable,
-            );
+            let writer = if setup.stranger_writes {
+                craqle::ActorId::from_bytes([77; 32])
+            } else {
+                node_writer()
+            };
+            create_local(&replica, writer);
             first_node
                 .mint_irokle_topic(&graph, BTreeSet::from([replica_id]))
                 .unwrap();
@@ -479,7 +549,7 @@ mod tests {
             .unwrap();
         push(&first, &replica_sync, topic);
         replica.reconcile_irokle().unwrap();
-        if own_write {
+        if setup.own_write {
             replica
                 .add_data_entity(&AllowAllAuthorizer, &graph, "own.csv", "File", "own")
                 .unwrap();
@@ -503,6 +573,7 @@ mod tests {
     /// A stopped replica whose topic was reset and rejoined under the same genesis.
     fn rejoined_replica() -> (TempDir, CursorRepair) {
         let temp = tempdir().unwrap();
+        store_identity(temp.path());
         let first = signed(1);
         let replica_sync = replica_irokle(temp.path());
         let first_node = member(
@@ -541,7 +612,7 @@ mod tests {
 
     #[test]
     fn dry_run_reports() {
-        let (_temp, request) = replaced_replica(2, false, false);
+        let (_temp, request) = replaced_replica(Setup::default());
         let output = repair_output(&request).unwrap();
         assert_ne!(output.stale.genesis, output.current.genesis);
         // The local unpublished writes are listed but belong to no topic actor.
@@ -586,7 +657,7 @@ mod tests {
     /// A dry run starts no node, so it rebuilds, repairs or settles nothing in either store.
     #[test]
     fn dry_run_untouched() {
-        let (temp, request) = replaced_replica(2, false, false);
+        let (temp, request) = replaced_replica(Setup::default());
         let before = store_state(temp.path());
         repair_output(&request).unwrap();
         assert_eq!(store_state(temp.path()), before);
@@ -596,7 +667,7 @@ mod tests {
     /// Both stores stay locked from validation through the write, so nothing changes between.
     #[test]
     fn holds_store_locks() {
-        let (temp, mut request) = replaced_replica(2, false, false);
+        let (temp, mut request) = replaced_replica(Setup::default());
         let store = temp.path().join("craqle").join("store");
         let sync = temp.path().join("document-sync");
         let locked = std::rc::Rc::new(std::cell::Cell::new((false, false)));
@@ -615,7 +686,11 @@ mod tests {
     /// One signer minted both geneses, so its sequences collide and the cursor stays.
     #[test]
     fn refuses_shared_actor() {
-        let (_temp, mut request) = replaced_replica(1, true, false);
+        let (_temp, mut request) = replaced_replica(Setup {
+            shared_signer: true,
+            first_writes: true,
+            ..Setup::default()
+        });
         let output = repair_output(&request).unwrap();
         let [overlap] = output.overlap.as_slice() else {
             panic!("expected one shared actor, got {:?}", output.overlap);
@@ -633,7 +708,10 @@ mod tests {
     /// yet; its later records there would reuse those sequences, so the cursor stays.
     #[test]
     fn refuses_applied_actor() {
-        let (_temp, mut request) = replaced_replica(2, true, false);
+        let (_temp, mut request) = replaced_replica(Setup {
+            first_writes: true,
+            ..Setup::default()
+        });
         let output = repair_output(&request).unwrap();
         let [overlap] = output.overlap.as_slice() else {
             panic!("expected one applied actor, got {:?}", output.overlap);
@@ -655,7 +733,10 @@ mod tests {
     /// has not published on; its actor is in neither clock but its sequences would restart.
     #[test]
     fn refuses_member_actor() {
-        let (_temp, mut request) = replaced_replica(2, false, true);
+        let (_temp, mut request) = replaced_replica(Setup {
+            own_write: true,
+            ..Setup::default()
+        });
         let output = repair_output(&request).unwrap();
         let [overlap] = output.overlap.as_slice() else {
             panic!("expected the replica's actor, got {:?}", output.overlap);
@@ -670,10 +751,30 @@ mod tests {
         assert!(matches!(error, ExplorerError::Refused(_)));
     }
 
+    /// Local content written by an actor that is not this node could be an old peer's record
+    /// a crash left applied but unconsumed; only this node's own writer is exempt.
+    #[test]
+    fn refuses_unknown_actor() {
+        let (_temp, mut request) = replaced_replica(Setup {
+            stranger_writes: true,
+            ..Setup::default()
+        });
+        let output = repair_output(&request).unwrap();
+        let stranger = hex::encode([77; 32]);
+        let [overlap] = output.overlap.as_slice() else {
+            panic!("expected the stranger, got {:?}", output.overlap);
+        };
+        assert_eq!(overlap.actor, stranger);
+        assert!(overlap.applied > 0 && overlap.stale_cursor == 0 && overlap.current == 0);
+        request.apply = true;
+        let error = repair_output(&request).unwrap_err();
+        assert!(matches!(error, ExplorerError::Refused(_)));
+    }
+
     /// After the repair Craqle opens with sync again, and the kept graph takes the new genesis.
     #[test]
     fn apply_repairs_cursor() {
-        let (temp, mut request) = replaced_replica(2, false, false);
+        let (temp, mut request) = replaced_replica(Setup::default());
         request.apply = true;
         let output = repair_output(&request).unwrap();
         assert!(output.applied && output.replacement_cursor_digest.is_some());
@@ -696,7 +797,7 @@ mod tests {
 
     #[test]
     fn refuses_running_node() {
-        let (temp, mut request) = replaced_replica(2, false, false);
+        let (temp, mut request) = replaced_replica(Setup::default());
         let craqle_path = temp.path().join("craqle");
         let running = CraqleNode::open_with_options(&craqle_path, CraqleOptions::new()).unwrap();
         request.apply = true;

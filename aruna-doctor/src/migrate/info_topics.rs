@@ -63,13 +63,20 @@ pub(super) fn cursor_key(topic_id: &TopicId) -> Vec<u8> {
 
 /// The realm of the node, or `None` before it joined one.
 pub(super) fn node_realm(db: &OptimisticTxDatabase) -> Result<Option<RealmId>, ExplorerError> {
+    Ok(persisted_node_state(db)?.map(|state| state.realm_id))
+}
+
+/// The node's stored identity, or `None` before it has one.
+pub(super) fn persisted_node_state(
+    db: &OptimisticTxDatabase,
+) -> Result<Option<PersistedNodeState>, ExplorerError> {
     let states = db.keyspace(NODE_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let Some(state) = db.read_tx().get(&states, NODE_STATE_KEY)? else {
         return Ok(None);
     };
-    let state = postcard::from_bytes::<PersistedNodeState>(&state)
-        .map_err(|error| ExplorerError::Decode(error.to_string()))?;
-    Ok(Some(state.realm_id))
+    postcard::from_bytes::<PersistedNodeState>(&state)
+        .map(Some)
+        .map_err(|error| ExplorerError::Decode(error.to_string()))
 }
 
 pub(super) fn info_cleanup(
