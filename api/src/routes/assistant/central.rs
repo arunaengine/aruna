@@ -629,11 +629,26 @@ async fn charge_call(
     limit: Option<u32>,
     now: u64,
 ) -> ServerResult<()> {
-    loop {
+    let context = state.get_ctx();
+    retry_conflicts(now, || {
         let operation = ChargeUsageOperation::new(user_id, utc_day(now), limit);
-        return match drive(operation, &state.get_ctx()).await {
+        drive(operation, &context)
+    })
+    .await
+}
+
+/// Charges at most this often for one call; a conflict is usually another call of the same user.
+const CHARGE_ATTEMPTS: usize = 5;
+
+/// Runs a charge again after a conflict and refuses with a retryable 503 once the attempts end.
+async fn retry_conflicts<F, C>(now: u64, mut charge: F) -> ServerResult<()>
+where
+    F: FnMut() -> C,
+    C: std::future::Future<Output = Result<AssistantUsage, CentralStoreError>>,
+{
+    for _ in 0..CHARGE_ATTEMPTS {
+        return match charge().await {
             Ok(_) => Ok(()),
-            // Another call of this user committed first; charge again against its count.
             Err(CentralStoreError::Storage(StorageError::TransactionConflict)) => continue,
             Err(CentralStoreError::QuotaReached(reached)) => Err(ServerError::AssistantQuota {
                 used: reached.used,
@@ -643,6 +658,9 @@ async fn charge_call(
             Err(error) => Err(map_central_error(error)),
         };
     }
+    Err(ServerError::ServiceUnavailableReason(
+        "the daily assistant count is busy; try again".to_string(),
+    ))
 }
 
 #[cfg(test)]

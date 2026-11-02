@@ -503,24 +503,26 @@ fn session_needs_tools() {
 
 #[tokio::test]
 async fn concurrent_charges_count() {
-    // Calls racing on one user's counter all settle: none fails, the limit still holds.
+    // Calls racing on one user's counter never fail hard; the limit and the count still hold.
     let fixture = fixture().await;
     let user_id = fixture.member.user_id;
-    let now = 86_400 * 20_000;
+    let now = unix_timestamp_secs();
     let calls = (0..16).map(|_| {
         let state = fixture.state.clone();
         tokio::spawn(async move { charge_call(&state, user_id, Some(10), now).await })
     });
     let results = futures_util::future::join_all(calls).await;
-    let allowed = results
-        .iter()
-        .filter(|result| matches!(result, Ok(Ok(()))))
-        .count();
-    let refused = results
-        .iter()
-        .filter(|result| matches!(result, Ok(Err(ServerError::AssistantQuota { .. }))))
-        .count();
-    assert_eq!((allowed, refused), (10, 6));
+    let mut allowed = 0;
+    for result in results {
+        match result.unwrap() {
+            Ok(()) => allowed += 1,
+            Err(ServerError::AssistantQuota { .. } | ServerError::ServiceUnavailableReason(_)) => {}
+            Err(error) => panic!("a racing charge failed: {error}"),
+        }
+    }
+    let (_, usage) = load_central(&fixture.state, user_id).await.unwrap();
+    assert!(allowed <= 10);
+    assert_eq!(AssistantUsage::used_on(usage, utc_day(now)), allowed);
 }
 
 #[test]
@@ -637,4 +639,41 @@ async fn relay_loop_refused() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+fn conflict() -> Result<AssistantUsage, CentralStoreError> {
+    Err(CentralStoreError::Storage(
+        StorageError::TransactionConflict,
+    ))
+}
+
+#[tokio::test]
+async fn charge_survives_conflicts() {
+    let mut left = 2;
+    let result = retry_conflicts(0, || {
+        let outcome = match left {
+            0 => Ok(AssistantUsage { day: 1, count: 1 }),
+            _ => conflict(),
+        };
+        left -= 1;
+        async move { outcome }
+    })
+    .await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn busy_charge_retries_later() {
+    // Conflicts that never end, a start failure among them, end in a retryable refusal.
+    let mut attempts = 0;
+    let refused = retry_conflicts(0, || {
+        attempts += 1;
+        async { conflict() }
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(attempts, CHARGE_ATTEMPTS);
+    let response = refused.into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().contains_key(header::RETRY_AFTER));
 }

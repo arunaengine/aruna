@@ -284,7 +284,8 @@ refused. Providers are self-scoped, so a caller reaches only their own.
                 "quota": {"scope": "user", "dimension": "assistant_requests",
                     "observed": 50, "requested": 1, "limit": 50}
             })),
-        (status = 502, description = "The provider was unreachable", body = ErrorResponse)
+        (status = 502, description = "The provider was unreachable", body = ErrorResponse),
+        (status = 503, description = "A central call found no reachable holder node, or the caller's daily count stayed busy; retry after `Retry-After`", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
