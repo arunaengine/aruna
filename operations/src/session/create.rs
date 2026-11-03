@@ -10,13 +10,14 @@ use aruna_core::compute::Secret;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
+use aruna_core::keyspaces::{USER_KEYSPACE, USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{
     NodeCapabilities, PathRestriction, SessionKind, SessionRef,
 };
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
@@ -200,6 +201,11 @@ impl CreateSessionOperation {
         Ok(())
     }
 
+    /// A restricted session audits under the group owning its account, read in the transaction.
+    fn reads_owner(&self) -> bool {
+        self.config.restrictions.is_some() && !matches!(self.issuer, Some((_, Some(_))))
+    }
+
     fn handle_started(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected("transaction started", event);
@@ -235,6 +241,10 @@ impl CreateSessionOperation {
             USER_SESSION_KEYSPACE.to_string(),
             self.sid.as_bytes().into(),
         ));
+        if self.reads_owner() {
+            let key = self.config.user_id.to_bytes().into();
+            reads.push((USER_KEYSPACE.to_string(), key));
+        }
         self.state = CreateSessionState::ReadSessions {
             index: index.clone(),
         };
@@ -245,9 +255,18 @@ impl CreateSessionOperation {
     }
 
     fn handle_sessions(&mut self, event: Event, index: BTreeSet<String>) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+        let Event::Storage(StorageEvent::BatchReadResult { mut values }) = event else {
             return self.unexpected("session records read", event);
         };
+        if self.reads_owner() {
+            let owner = values.pop().and_then(|(_, value)| value);
+            let group_id = match owner.as_deref().map(User::from_bytes).transpose() {
+                Ok(owner) => owner.as_ref().and_then(User::service_group),
+                Err(error) => return self.emit_error(error.into()),
+            };
+            let actor = self.issuer.map_or(self.config.user_id, |(actor, _)| actor);
+            self.issuer = Some((actor, group_id));
+        }
         if values.len() != index.len() + 1 {
             return self.emit_error(CreateSessionError::IndexInconsistent);
         }
@@ -508,6 +527,7 @@ pub async fn create_making_room(
 mod pure_tests {
     use super::*;
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
     use aruna_core::structs::identity::auth::Permission;
     use aruna_core::types::{Key, Value};
 
@@ -646,7 +666,6 @@ mod pure_tests {
 
     #[test]
     fn restricted_session_audited() {
-        use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
         let mut config = session_config();
         let rows = written_rows(CreateSessionOperation::new(config.clone()));
         assert!(rows.iter().all(|row| row.0 != ADMIN_AUDIT_KEYSPACE));
@@ -670,6 +689,52 @@ mod pure_tests {
         assert_eq!((record.actor, record.target), (admin, config.user_id));
         assert_eq!(record.group_id, Some(group));
         assert_eq!(record.session_id, Some(sid));
+    }
+
+    #[test]
+    fn audits_owner_group() {
+        // A service account's own restricted session reaches its group's audit rows.
+        use aruna_core::structs::identity::auth::Actor;
+        use aruna_core::user::validation::SERVICE_GROUP_ATTRIBUTE;
+        let mut config = session_config();
+        config.restrictions = Some(Vec::new());
+        let group = Ulid::from_bytes([6; 16]);
+        let owner = User {
+            user_id: config.user_id,
+            name: "service".to_string(),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: [(SERVICE_GROUP_ATTRIBUTE.to_string(), group.to_string())].into(),
+        };
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            user_id: config.user_id,
+            realm_id: config.realm_id,
+        };
+        let mut operation = CreateSessionOperation::new(config.clone());
+        begin_read(&mut operation, &BTreeSet::new(), Ulid::from_parts(9, 9));
+        let sid = operation.sid.clone();
+        let written = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (sid.as_bytes().into(), None),
+                (
+                    Key::from(Vec::new()),
+                    Some(owner.to_bytes(&actor).unwrap().into()),
+                ),
+            ],
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = written.as_slice() else {
+            panic!("the session must be written");
+        };
+        let audit = writes
+            .iter()
+            .rfind(|row| row.0 == ADMIN_AUDIT_KEYSPACE)
+            .unwrap();
+        let record = AdminAuditRecord::from_bytes(&audit.2).unwrap();
+        assert_eq!(
+            (record.actor, record.group_id),
+            (config.user_id, Some(group))
+        );
     }
 
     #[test]
