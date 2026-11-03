@@ -1167,6 +1167,9 @@ mod authorization_tests {
         )
         .await
         .unwrap();
+        // A text search sees only committed index updates.
+        let handle = ctx.metadata_handle.as_ref().unwrap();
+        handle.flush_search_updates().await.unwrap();
     }
 
     fn draft_crate(name: &str) -> Value {
