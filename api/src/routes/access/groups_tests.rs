@@ -849,32 +849,38 @@ async fn policy_denies_admins() {
         )
     };
     assert!(stats(owner).await.is_ok() && tokens(owner).await.is_ok());
-    assert!(stats(admin).await.is_ok() && overview().await.is_ok());
-    assert!(revoke_all().await.is_ok());
+    assert!(stats(admin).await.is_ok() && tokens(admin).await.is_ok());
+    assert!(overview().await.is_ok() && revoke_all().await.is_ok());
 
-    let denied = [
-        format!("/{realm_id}/g/{group_id}/admin"),
+    let deny = |paths: Vec<String>| {
+        update_config(&state, move |config| {
+            for path in &paths {
+                config
+                    .request_policies
+                    .push(aruna_core::request_policy::RequestPolicy {
+                        policy_id: Ulid::generate(),
+                        name: format!("deny {path}"),
+                        kind: aruna_core::request_policy::PolicyKind::Deny,
+                        when: None,
+                        expression: format!("path == '{path}'"),
+                        enabled: true,
+                    });
+            }
+        })
+    };
+    // A deny on the group path alone also binds the realm groups admin.
+    deny(vec![format!("/{realm_id}/g/{group_id}/admin")]).await;
+    for user in [owner, admin] {
+        assert!(matches!(stats(user).await, Err(ServerError::Forbidden)));
+        assert!(matches!(tokens(user).await, Err(ServerError::Forbidden)));
+    }
+    assert!(overview().await.is_ok());
+
+    deny(vec![
         format!("/{realm_id}/admin/groups"),
         format!("/{realm_id}/admin/u/{owner}"),
-    ];
-    update_config(&state, |config| {
-        for path in &denied {
-            config
-                .request_policies
-                .push(aruna_core::request_policy::RequestPolicy {
-                    policy_id: Ulid::generate(),
-                    name: format!("deny {path}"),
-                    kind: aruna_core::request_policy::PolicyKind::Deny,
-                    when: None,
-                    expression: format!("path == '{path}'"),
-                    enabled: true,
-                });
-        }
-    })
+    ])
     .await;
-    assert!(matches!(stats(owner).await, Err(ServerError::Forbidden)));
-    assert!(matches!(tokens(owner).await, Err(ServerError::Forbidden)));
-    assert!(matches!(stats(admin).await, Err(ServerError::Forbidden)));
     assert!(matches!(overview().await, Err(ServerError::Forbidden)));
     assert!(matches!(revoke_all().await, Err(ServerError::Forbidden)));
 }

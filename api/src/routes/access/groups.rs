@@ -889,7 +889,7 @@ pub async fn update_group(
 }
 
 /// The operation decides again; the boundary refuses early for anyone who is
-/// neither a group admin nor a realm groups administrator.
+/// neither a group admin nor a realm groups administrator, or whom a group policy denies.
 pub(crate) async fn ensure_group_admin(
     state: &ServerState,
     auth: &AuthContext,
@@ -897,16 +897,16 @@ pub(crate) async fn ensure_group_admin(
 ) -> ServerResult<()> {
     let realm_id = auth.realm_id;
     let group_admin = format!("/{realm_id}/g/{group_id}/admin");
-    if !crate::auth::permission_granted(state, auth, group_admin, Permission::WRITE).await? {
-        crate::auth::ensure_permission(
-            state,
-            auth,
-            format!("/{realm_id}/admin/groups"),
-            Permission::WRITE,
-        )
-        .await?;
-    }
-    Ok(())
+    let realm_admin = format!("/{realm_id}/admin/groups");
+    aruna_operations::auth::request_authorization::authorize_either(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        auth,
+        (&group_admin, &realm_admin),
+        &Permission::WRITE,
+    )
+    .await
+    .map_err(crate::auth::map_authorize_error)
 }
 
 #[utoipa::path(
