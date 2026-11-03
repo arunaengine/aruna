@@ -645,8 +645,14 @@ fn join_finds_split() {
     let plan = join_plan(JOIN_QUERY).unwrap();
     assert!(plan.sides.iter().all(|side| query_union_safe(side)));
     let side = |query: &str| [shard_rows(query, &first), shard_rows(query, &second)].concat();
-    let joined = join_rows(&plan, side(&plan.sides[0]), side(&plan.sides[1])).unwrap();
+    let (left, right) = (side(&plan.sides[0]), side(&plan.sides[1]));
+    let cancel = spareval::CancellationToken::new();
+    let joined = join_rows(&plan, left.clone(), right.clone(), &cancel).unwrap();
     assert_eq!(joined, union);
+    // A join past its deadline stops instead of holding the merge permit.
+    cancel.cancel();
+    let stopped = join_rows(&plan, left, right, &cancel);
+    assert!(matches!(stopped, Err(MetadataApiError::ServiceUnavailable)));
 }
 
 #[test]
@@ -673,6 +679,7 @@ fn join_refuses_oversize() {
     let rows = (0..=JOIN_SIDE_ROWS)
         .map(|index| solution_row(&[("dataset", &format!("<urn:d{index}>")), ("file", "<urn:f>")]))
         .collect();
-    let refused = join_rows(&plan, rows, Vec::new());
+    let cancel = spareval::CancellationToken::new();
+    let refused = join_rows(&plan, rows, Vec::new(), &cancel);
     assert!(matches!(refused, Err(MetadataApiError::InvalidQuery(_))));
 }

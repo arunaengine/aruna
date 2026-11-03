@@ -318,6 +318,8 @@ fn run_join(
     scope: MetadataFanoutScope,
 ) -> futures_util::future::BoxFuture<'_, QueryAnswer> {
     Box::pin(async move {
+        let deadline = (scope.deadline)
+            .unwrap_or_else(|| tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE);
         let side = |query: String| {
             let (auth, bearer_token, scope) = (auth.clone(), bearer_token.clone(), scope.clone());
             run_query_distributed(
@@ -337,7 +339,11 @@ fn run_join(
             MetadataQueryResults::Solutions(rows) => rows,
             MetadataQueryResults::Boolean(_) | MetadataQueryResults::Graph(_) => Vec::new(),
         };
-        let joined = join_rows(&plan, rows(left.0), rows(right.0))?;
+        let (left_rows, right_rows) = (rows(left.0), rows(right.0));
+        let joined = run_ordering(deadline, MERGE_PERMITS.clone(), move |cancel| {
+            join_rows(&plan, left_rows, right_rows, cancel)
+        })
+        .await?;
         let stats = merge_stats(left.1, right.1);
         Ok((MetadataQueryResults::Solutions(joined), stats))
     })

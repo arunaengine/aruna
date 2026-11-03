@@ -127,6 +127,7 @@ pub(super) fn join_rows(
     plan: &JoinPlan,
     left: Vec<Row>,
     right: Vec<Row>,
+    cancel: &spareval::CancellationToken,
 ) -> Result<Vec<Row>, MetadataApiError> {
     if left.len() > JOIN_SIDE_ROWS || right.len() > JOIN_SIDE_ROWS {
         return Err(MetadataApiError::InvalidQuery(format!(
@@ -146,6 +147,9 @@ pub(super) fn join_rows(
     }
     let (mut seen, mut joined, mut pairs, mut bytes) = (HashSet::new(), Vec::new(), 0, 32usize);
     for row in &left {
+        if cancel.is_cancelled() {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
         for other in index.get(&key(row)).into_iter().flatten() {
             if joined.len() >= limit {
                 return Ok(joined);
