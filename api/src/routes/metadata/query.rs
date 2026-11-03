@@ -183,10 +183,13 @@ caller may read, so an anonymous request sees the public documents alone.
 - `SERVICE` clauses are refused.
 - A distributed query must be union-safe: only an `ASK` or a `SELECT DISTINCT` over a single
   pattern, without `OFFSET`, can be merged across partitions. Such a `SELECT` may use `ORDER BY`
-  with `ASC` or `DESC` keys that are projected variables."#,
+  with `ASC` or `DESC` keys that are projected variables.
+- One join also runs across partitions: a `SELECT DISTINCT` over two triple patterns that share
+  a variable, with no modifier but `LIMIT`. Each pattern may match at most 5000 rows and the join
+  at most 1000000 row pairs across the realm; a larger join is refused with 400."#,
     request_body(
         content = SparqlQueryRequest,
-        description = "A SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` evaluates the current node's authorized graph union. `mode=distributed` accepts only union-safe `ASK` or `SELECT DISTINCT` single-pattern queries, optionally ordered by projected variables, merges partition sets, and is best-effort by default; set `allow_partial=false` to fail when a partition is unavailable.",
+        description = "A SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` evaluates the current node's authorized graph union. `mode=distributed` accepts only union-safe `ASK` or `SELECT DISTINCT` single-pattern queries, optionally ordered by projected variables, or a bounded `SELECT DISTINCT` join of two patterns that share a variable, merges partition sets, and is best-effort by default; set `allow_partial=false` to fail when a partition is unavailable.",
         examples(
             (
                 "SelectDatasets" = (

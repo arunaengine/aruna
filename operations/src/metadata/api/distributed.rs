@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::join::{JoinPlan, join_plan, join_rows, merge_stats};
 use super::{
     ApiQueryMode, Arc, AuthContext, BucketPage, DISTRIBUTED_QUERY_DEADLINE, DriverContext, GroupId,
     HashMap, HashSet, Instant, MAX_PAGINATION_DEPTH, MAX_RESULT_BYTES, MetadataApiError,
@@ -150,7 +151,9 @@ pub(super) async fn run_query_distributed(
     let mode = scope.mode.unwrap_or(ApiQueryMode::Distributed);
     let single_dataset_result = mode == ApiQueryMode::Local || graph_iris.is_some();
     if mode == ApiQueryMode::Distributed && graph_iris.is_none() && !query_union_safe(&query) {
-        return Err(MetadataApiError::BadRequest);
+        let plan = join_plan(&query).ok_or(MetadataApiError::BadRequest)?;
+        let caller = (auth, bearer_token);
+        return run_join(context, (realm_id, local_node_id), caller, plan, scope).await;
     }
     let handle = context
         .metadata_handle
@@ -300,6 +303,44 @@ pub(super) async fn run_query_distributed(
         }
     }
     result.map(|results| (results, fanout_stats))
+}
+
+type QueryAnswer = Result<(MetadataQueryResults, MetadataFanoutStats), MetadataApiError>;
+
+/// Runs both patterns of a bounded join across shards, each authorized as its own union-safe
+/// query, then joins their rows here; either side's partial coverage is reported for the join.
+/// Boxed, as it runs [`run_query_distributed`] again for each side.
+fn run_join(
+    context: &DriverContext,
+    (realm_id, local_node_id): (RealmId, NodeId),
+    (auth, bearer_token): (Option<AuthContext>, Option<String>),
+    plan: JoinPlan,
+    scope: MetadataFanoutScope,
+) -> futures_util::future::BoxFuture<'_, QueryAnswer> {
+    Box::pin(async move {
+        let side = |query: String| {
+            let (auth, bearer_token, scope) = (auth.clone(), bearer_token.clone(), scope.clone());
+            run_query_distributed(
+                context,
+                realm_id,
+                local_node_id,
+                auth,
+                bearer_token,
+                None,
+                query,
+                scope,
+            )
+        };
+        let [left, right] = plan.sides.clone();
+        let (left, right) = futures_util::future::try_join(side(left), side(right)).await?;
+        let rows = |results: MetadataQueryResults| match results {
+            MetadataQueryResults::Solutions(rows) => rows,
+            MetadataQueryResults::Boolean(_) | MetadataQueryResults::Graph(_) => Vec::new(),
+        };
+        let joined = join_rows(&plan, rows(left.0), rows(right.0))?;
+        let stats = merge_stats(left.1, right.1);
+        Ok((MetadataQueryResults::Solutions(joined), stats))
+    })
 }
 
 #[tracing::instrument(
