@@ -31,10 +31,10 @@ use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi()]
-pub struct BucketMetadataApiDoc;
+pub struct BucketMetadataDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BucketMetadataApiDoc::openapi())
+    OpenApiRouter::with_openapi(BucketMetadataDoc::openapi())
         .routes(routes!(get_bucket_metadata, put_bucket_metadata))
 }
 
@@ -126,7 +126,8 @@ pub struct BucketMetadataResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct PutBucketMetadataRequest {
+#[schema(as = PutBucketMetadataRequest)]
+pub struct PutMetadataRequest {
     /// `null` clears the metadata.
     pub metadata: Option<BucketMetadataBody>,
 }
@@ -206,7 +207,7 @@ distributed bucket the set's publisher checks the forwarded token again.
   the bucket still belongs to the group. A distributed bucket's metadata changes in its set;
   a settings change of the set keeps it."#,
     params(("bucket" = String, Path, description = "Bucket name on this node")),
-    request_body(content = PutBucketMetadataRequest, example = json!({
+    request_body(content = PutMetadataRequest, example = json!({
         "metadata": {
             "database": true,
             "title": "Bakta database",
@@ -232,7 +233,7 @@ pub async fn put_bucket_metadata(
     Extension(auth): Extension<Option<AuthContext>>,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
-    Json(request): Json<PutBucketMetadataRequest>,
+    Json(request): Json<PutMetadataRequest>,
 ) -> ServerResult<Json<BucketMetadataResponse>> {
     let auth = require_realm_auth(&state, auth)?;
     let metadata = request.metadata.map(BucketMetadata::try_from).transpose()?;

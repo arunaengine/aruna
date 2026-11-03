@@ -631,7 +631,7 @@ pub enum MetadataTransportMessage {
         submission: aruna_core::structs::execution::job::SubmissionId,
         digest: [u8; 32],
     },
-    JobInputPageResult {
+    InputPageResult {
         page: Option<Box<aruna_core::structs::execution::job::InputPage>>,
     },
     /// Inputs an ingress asks their source node to resolve and grant, under the caller's bearer.

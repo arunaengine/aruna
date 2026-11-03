@@ -1653,7 +1653,7 @@ async fn relinked_get_fails() {
 }
 
 #[tokio::test]
-async fn remote_relink_asks_target() {
+async fn relink_asks_target() {
     // A wrong ETag for a target on another node is answered only after that node admits the
     // GET; here it cannot be reached, so the caller learns nothing about the ETag.
     let (_storage_dir, service, user_access, group_id) = subpath_node().await;
@@ -1695,7 +1695,7 @@ async fn remote_relink_asks_target() {
 }
 
 #[tokio::test]
-async fn denied_relink_hides_length() {
+async fn relink_hides_length() {
     // A wrong ETag with an unsatisfiable range is refused for a caller the target denies, so
     // the range answer never tells such a caller the recorded length.
     let (_storage_dir, service, user_access, group_id) = subpath_node().await;
@@ -1947,7 +1947,7 @@ async fn scoped_scan_bounded() {
 }
 
 #[tokio::test]
-async fn hides_link_only_prefix() {
+async fn hides_unreadable_prefix() {
     // A prefix holding more unreadable links than one request examines never shows; the page
     // that stops inside it is empty and sealed, and the listing resumes past it.
     use aruna_operations::s3::object::visible::SCAN_BUDGET;
@@ -2049,7 +2049,7 @@ async fn hides_link_versions() {
 }
 
 #[tokio::test]
-async fn resumed_prefix_fills_page() {
+async fn prefix_fills_page() {
     // A prefix found after a sealed page fills a page of one by itself, for objects and for
     // versions alike, and the listing goes on after it.
     use aruna_operations::s3::object::visible::SCAN_BUDGET;

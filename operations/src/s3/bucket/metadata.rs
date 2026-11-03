@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_checked_in_write() {
+    async fn write_checks_admin() {
         // Only an admin of the bucket's group writes its metadata, checked in the write itself.
         let temp = tempfile::tempdir().unwrap();
         let context = DriverContext {

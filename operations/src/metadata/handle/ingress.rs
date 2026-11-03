@@ -1173,7 +1173,7 @@ impl MetadataHandle {
                 let page =
                     crate::jobs::records::pages::serve_page(context, peer, submission, digest);
                 let page = Box::pin(page).await;
-                (MetadataTransportMessage::JobInputPageResult { page }, None)
+                (MetadataTransportMessage::InputPageResult { page }, None)
             }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {

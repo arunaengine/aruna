@@ -18,7 +18,7 @@ use crate::types::GroupId;
 /// The CopyObject header that writes a link instead of a copy, with the value `link`.
 pub const COPY_MODE_HEADER: &str = "x-aruna-copy-mode";
 /// Names the node the copy source lives on; absent means the node that serves the request.
-pub const COPY_SOURCE_NODE_HEADER: &str = "x-aruna-copy-source-node";
+pub const SOURCE_NODE_HEADER: &str = "x-aruna-copy-source-node";
 /// The public setting a link keeps its target's group under.
 const GROUP_KEY: &str = "group";
 const VERSION_PREFIX: &str = "version:";

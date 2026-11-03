@@ -1,6 +1,5 @@
-//! Publishes database releases: lists the current files under a prefix at each range's
-//! coordinator, authorizes every file for the caller, and writes the tagged release crate as
-//! one guarded version. Also answers other members and runs the release effects.
+//! Publishes database releases: lists current files at each range's coordinator, authorizes them
+//! and writes the tagged crate as one version. Also answers other members and runs its effects.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -201,10 +200,9 @@ async fn all_files(
     }
 }
 
-/// One page of the current versions under `prefix` in `range` (the whole bucket without one)
-/// after the key `after`, `skip` left out, and the key the next page starts after. Every field
-/// of a file comes from one exact version, and the caller must be able to read every file, or
-/// nothing is published.
+/// One page of current versions under `prefix` in `range` (or the whole bucket) after `after`,
+/// `skip` left out, and the key the next page starts after. Each file comes from one exact
+/// version, and the caller must be able to read every file, or nothing is published.
 pub async fn release_files(
     context: &DriverContext,
     scope: BucketScope<'_>,

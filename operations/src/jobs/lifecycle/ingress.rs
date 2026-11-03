@@ -2118,7 +2118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_needs_pin_and_bearer() {
+    async fn pin_and_bearer() {
         // An input on another node needs an exact version and the caller's own bearer.
         let dir = tempdir().unwrap();
         let context = test_ctx(dir.path().to_str().unwrap());
