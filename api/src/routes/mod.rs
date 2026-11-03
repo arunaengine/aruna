@@ -43,6 +43,7 @@ pub mod shares;
 pub mod staging;
 pub mod storage;
 pub mod sync;
+pub mod webhooks;
 
 // Temporary aliases for the pre-family module paths; the access, execution
 // and storage families own these modules now. Remove once consumers migrate.
@@ -122,6 +123,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(link_routes::router())
         .merge(node_names::router())
         .merge(notifications::router())
+        .merge(webhooks::router())
         .merge(policies::router())
         .merge(portal::router())
         .merge(oidc_providers::router())
@@ -261,6 +263,9 @@ pub(crate) mod tests {
         ("POST", "/data/archives/links"),
         ("GET", "/data/archives/download"),
         ("GET", "/access/audit"),
+        ("GET", "/system/notifications/webhook"),
+        ("PUT", "/system/notifications/webhook"),
+        ("DELETE", "/system/notifications/webhook"),
         (
             "DELETE",
             "/metadata/groups/{group_id}/repositories/{connector_id}",
