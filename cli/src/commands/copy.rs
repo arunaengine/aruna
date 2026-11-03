@@ -343,7 +343,7 @@ pub async fn sync(context: &mut Context<'_>, args: SyncArgs) -> Result<(), CliEr
     }
 }
 
-/// Refuses a download whose keys leave `root` or overwrite each other on case-insensitive volumes.
+/// Refuses a download whose keys leave `root` or overwrite each other on some file systems.
 fn check_targets(
     root: &Path,
     remote_files: &[RemoteFile],
@@ -367,7 +367,7 @@ fn check_targets(
     match clashes.is_empty() {
         true => Ok(()),
         false => Err(CliError::usage(format!(
-            "these paths differ only in case and would overwrite each other: {}",
+            "these paths name the same file on some systems and would overwrite each other: {}",
             clashes.join(", ")
         ))),
     }

@@ -6,6 +6,7 @@ use crate::error::CliError;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 /// Which side is copied onto the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -170,13 +171,14 @@ pub fn walk_local(root: &Path) -> Result<Vec<LocalFile>, CliError> {
 }
 
 /// Whether a remote key relative to a folder stays below it on every platform: no empty, `.` or
-/// `..` part, no backslash, no absolute path, and on Windows no colon (drive or stream).
+/// `..` part, no part ending in a period or space (Windows drops them), no backslash, no absolute
+/// path, and on Windows no colon (drive or stream).
 pub fn is_safe_key(relative: &str) -> bool {
     !relative.contains('\\')
         && !(cfg!(windows) && relative.contains(':'))
         && relative
             .split('/')
-            .all(|part| !matches!(part, "" | "." | ".."))
+            .all(|part| !part.is_empty() && !part.ends_with(['.', ' ']))
         && Path::new(relative)
             .components()
             .all(|part| matches!(part, Component::Normal(_)))
@@ -228,11 +230,13 @@ fn is_link(meta: &std::fs::Metadata) -> bool {
     meta.file_type().is_symlink()
 }
 
-/// Paths that differ only in case and so overwrite each other on case-insensitive volumes.
+/// Paths that differ only in case or Unicode normalization and so overwrite each other on
+/// case-insensitive or normalizing volumes such as NTFS and APFS.
 pub fn case_clashes<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let mut groups: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
     for path in paths {
-        groups.entry(path.to_lowercase()).or_default().insert(path);
+        let folded = path.to_lowercase().nfc().collect();
+        groups.entry(folded).or_default().insert(path);
     }
     groups
         .into_values()

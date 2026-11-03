@@ -34,5 +34,6 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+unicode-normalization = { workspace = true }
 url = { workspace = true }
 zip = { workspace = true, features = ["deflate-flate2"] }

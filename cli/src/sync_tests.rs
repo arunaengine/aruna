@@ -138,6 +138,10 @@ fn refuses_unsafe_keys() {
         "..\\outside.txt",
         "C:\\x",
         "",
+        "report.txt.",
+        "report.txt ",
+        "dir./a",
+        "dir /a",
     ] {
         assert!(!is_safe_key(key), "{key}");
     }
@@ -164,4 +168,12 @@ fn finds_case_clashes() {
     let clashes = case_clashes(["A.txt", "b/c", "a.txt", "B/C", "b/c", "d"]);
     assert_eq!(clashes, vec!["A.txt", "a.txt", "B/C", "b/c"]);
     assert!(case_clashes(["a", "b", "a"]).is_empty());
+}
+
+#[test]
+fn finds_normalized_clashes() {
+    let composed = "caf\u{e9}.txt";
+    let decomposed = "cafe\u{301}.txt";
+    let clashes = case_clashes([composed, decomposed, "CAF\u{c9}.TXT", "other"]);
+    assert_eq!(clashes, vec!["CAF\u{c9}.TXT", decomposed, composed]);
 }
