@@ -282,7 +282,7 @@ stays responsible for its own data.
   `FEDERATION_REGISTRY_URL=` (empty) before the first start to opt out.
 
 The [operations guide](docs/operations.md) covers configuration, restore, encrypted buckets, your
-own storage, NFS settings and the registry in detail.
+own storage, NFS settings, the registry and the trust between nodes in detail.
 
 ## Learn more
 
