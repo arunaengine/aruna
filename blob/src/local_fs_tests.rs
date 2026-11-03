@@ -1,4 +1,4 @@
-//! Tests that the read-only folder service lists in key order and never leaves its root.
+//! Tests that the local folder service lists in key order and never leaves its root.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -9,11 +9,11 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 
 fn operator(root: &Path) -> Operator {
-    Operator::new(ReadOnlyFsBuilder::default().root(root.to_str().unwrap())).unwrap()
+    Operator::new(LocalFsBuilder::default().root(root.to_str().unwrap())).unwrap()
 }
 
 fn filtered(root: &Path, filter: PathFilter) -> Operator {
-    let builder = ReadOnlyFsBuilder::default()
+    let builder = LocalFsBuilder::default()
         .root(root.to_str().unwrap())
         .filter(filter);
     Operator::new(builder).unwrap()

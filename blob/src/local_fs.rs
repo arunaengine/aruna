@@ -26,20 +26,20 @@ use std::sync::Arc;
 /// `/`. Every folder on the way to an entry is asked too, so a refused folder hides its content.
 pub type PathFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
-const SCHEME: &str = "readonly-fs";
+const SCHEME: &str = "local-fs";
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
-pub struct ReadOnlyFsConfig {
+pub struct LocalFsConfig {
     /// Folder the service serves. It may itself be a symlink; nothing below it is followed.
     pub root: Option<String>,
 }
 
-impl Configurator for ReadOnlyFsConfig {
-    type Builder = ReadOnlyFsBuilder;
+impl Configurator for LocalFsConfig {
+    type Builder = LocalFsBuilder;
 
     fn into_builder(self) -> Self::Builder {
-        ReadOnlyFsBuilder {
+        LocalFsBuilder {
             config: self,
             filter: None,
         }
@@ -47,21 +47,21 @@ impl Configurator for ReadOnlyFsConfig {
 }
 
 #[derive(Default)]
-pub struct ReadOnlyFsBuilder {
-    config: ReadOnlyFsConfig,
+pub struct LocalFsBuilder {
+    config: LocalFsConfig,
     filter: Option<PathFilter>,
 }
 
-impl fmt::Debug for ReadOnlyFsBuilder {
+impl fmt::Debug for LocalFsBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ReadOnlyFsBuilder")
+        f.debug_struct("LocalFsBuilder")
             .field("config", &self.config)
             .field("filter", &self.filter.is_some())
             .finish()
     }
 }
 
-impl ReadOnlyFsBuilder {
+impl LocalFsBuilder {
     pub fn root(mut self, root: &str) -> Self {
         self.config.root = Some(root.to_string());
         self
@@ -73,8 +73,8 @@ impl ReadOnlyFsBuilder {
     }
 }
 
-impl Builder for ReadOnlyFsBuilder {
-    type Config = ReadOnlyFsConfig;
+impl Builder for LocalFsBuilder {
+    type Config = LocalFsConfig;
 
     // No I/O here: a share that is mounted late only fails the operations made before it is back.
     fn build(self) -> Result<impl Service> {
@@ -83,7 +83,7 @@ impl Builder for ReadOnlyFsBuilder {
             .root
             .filter(|root| !root.is_empty())
             .ok_or_else(|| Error::new(ErrorKind::ConfigInvalid, "root is not specified"))?;
-        Ok(ReadOnlyFs {
+        Ok(LocalFs {
             core: Arc::new(Core {
                 root: PathBuf::from(root),
                 filter: self.filter,
@@ -174,21 +174,21 @@ impl Core {
     }
 }
 
-/// Serves a local folder read-only. See [`ReadOnlyFsBuilder`].
+/// Serves a local folder read-only. See [`LocalFsBuilder`].
 #[derive(Clone)]
-pub struct ReadOnlyFs {
+pub struct LocalFs {
     core: Arc<Core>,
 }
 
-impl fmt::Debug for ReadOnlyFs {
+impl fmt::Debug for LocalFs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ReadOnlyFs")
+        f.debug_struct("LocalFs")
             .field("root", &self.core.root)
             .finish_non_exhaustive()
     }
 }
 
-impl Service for ReadOnlyFs {
+impl Service for LocalFs {
     type Reader = oio::PositionReader<FileReader>;
     type Writer = ();
     type Lister = FolderLister;
@@ -562,5 +562,5 @@ fn read_only() -> Error {
 }
 
 #[cfg(test)]
-#[path = "readonly_fs_tests.rs"]
+#[path = "local_fs_tests.rs"]
 mod tests;

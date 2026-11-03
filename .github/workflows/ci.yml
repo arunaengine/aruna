@@ -127,8 +127,8 @@ jobs:
         with:
           shared-key: platform-tests
 
-      - name: Run the read-only folder service tests
-        run: cargo test -p aruna-blob --lib --locked readonly_fs
+      - name: Run the local folder service tests
+        run: cargo test -p aruna-blob --lib --locked local_fs
 
   native-git:
     name: Native Git tests
