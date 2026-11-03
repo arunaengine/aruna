@@ -74,7 +74,7 @@ impl NodeDisplays {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SetNodeNameConfig {
+pub struct NodeNameConfig {
     pub actor: Actor,
     /// The caller's own token context; it is never derived from `actor`.
     pub auth_context: AuthContext,
@@ -84,15 +84,15 @@ pub struct SetNodeNameConfig {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct SetNodeNameOperation {
-    config: SetNodeNameConfig,
+pub struct NodeNameOperation {
+    config: NodeNameConfig,
     txn_id: Option<TxnId>,
-    state: SetNodeNameState,
-    output: Option<Result<NodeDisplay, SetNodeNameError>>,
+    state: NodeNameState,
+    output: Option<Result<NodeDisplay, NodeNameError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum SetNodeNameState {
+enum NodeNameState {
     Init,
     Auth,
     StartTransaction,
@@ -108,7 +108,7 @@ enum SetNodeNameState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum SetNodeNameError {
+pub enum NodeNameError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -143,12 +143,12 @@ pub enum SetNodeNameError {
     },
 }
 
-impl SetNodeNameOperation {
-    pub fn new(config: SetNodeNameConfig) -> Self {
+impl NodeNameOperation {
+    pub fn new(config: NodeNameConfig) -> Self {
         Self {
             config,
             txn_id: None,
-            state: SetNodeNameState::Init,
+            state: NodeNameState::Init,
             output: None,
         }
     }
@@ -160,7 +160,7 @@ impl SetNodeNameOperation {
     }
 
     fn begin_transaction(&mut self) -> Effects {
-        self.state = SetNodeNameState::StartTransaction;
+        self.state = NodeNameState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
         })]
@@ -168,7 +168,7 @@ impl SetNodeNameOperation {
 
     fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
         self.txn_id = Some(txn_id);
-        self.state = SetNodeNameState::ReadCurrent;
+        self.state = NodeNameState::ReadCurrent;
         let document = DocumentTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
         };
@@ -191,17 +191,17 @@ impl SetNodeNameOperation {
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, SetNodeNameError> {
+    ) -> Result<Effects, NodeNameError> {
         let Some(txn_id) = self.txn_id else {
-            return Err(SetNodeNameError::MissingTransaction);
+            return Err(NodeNameError::MissingTransaction);
         };
         let Some(document_value) = document_value else {
-            return Err(SetNodeNameError::ConfigMissing);
+            return Err(NodeNameError::ConfigMissing);
         };
         let document = RealmConfigDocument::from_bytes(&document_value)?;
         // Peers accept realm config events from management nodes only.
         if !is_management(&document, self.config.actor.node_id) {
-            return Err(SetNodeNameError::NotManagementNode);
+            return Err(NodeNameError::NotManagementNode);
         }
         let node_id = self.config.node_id;
         let node_key = node_id.to_string();
@@ -211,7 +211,7 @@ impl SetNodeNameOperation {
             NameScope::RealmAdmin => true,
         });
         if !allowed {
-            return Err(SetNodeNameError::UnknownNode { node_id });
+            return Err(NodeNameError::UnknownNode { node_id });
         }
 
         let target = self.admin_target();
@@ -279,7 +279,7 @@ impl SetNodeNameOperation {
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(shown));
-        self.state = SetNodeNameState::WriteState {
+        self.state = NodeNameState::WriteState {
             stale_conflict_deletes: stale_conflict_deletes(
                 previous_state.as_ref(),
                 Some(&reducer_state),
@@ -293,22 +293,22 @@ impl SetNodeNameOperation {
 
     fn emit_commit(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
-            return self.fail(SetNodeNameError::MissingTransaction);
+            return self.fail(NodeNameError::MissingTransaction);
         };
-        self.state = SetNodeNameState::CommitTransaction;
+        self.state = NodeNameState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
-    fn fail(&mut self, error: SetNodeNameError) -> Effects {
+    fn fail(&mut self, error: NodeNameError) -> Effects {
         let cleanup = self.abort();
-        self.state = SetNodeNameState::Error;
+        self.state = NodeNameState::Error;
         self.output = Some(Err(error));
         cleanup
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
-        self.fail(SetNodeNameError::UnexpectedEvent {
+        self.fail(NodeNameError::UnexpectedEvent {
             state,
             expected,
             got,
@@ -316,9 +316,9 @@ impl SetNodeNameOperation {
     }
 }
 
-impl Operation for SetNodeNameOperation {
+impl Operation for NodeNameOperation {
     type Output = NodeDisplay;
-    type Error = SetNodeNameError;
+    type Error = NodeNameError;
 
     fn start(&mut self) -> Effects {
         let auth = &self.config.auth_context;
@@ -326,7 +326,7 @@ impl Operation for SetNodeNameOperation {
         let foreign = auth.realm_id != self.config.actor.realm_id
             || (self.config.scope == NameScope::Owner && auth.path_restrictions.is_some());
         if foreign {
-            return self.fail(SetNodeNameError::Unauthorized);
+            return self.fail(NodeNameError::Unauthorized);
         }
         if let Err(error) = normalize_change(&mut self.config.change) {
             return self.fail(error);
@@ -334,7 +334,7 @@ impl Operation for SetNodeNameOperation {
         if self.config.scope == NameScope::Owner {
             return self.begin_transaction();
         }
-        self.state = SetNodeNameState::Auth;
+        self.state = NodeNameState::Auth;
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: self.config.auth_context.clone(),
@@ -347,30 +347,30 @@ impl Operation for SetNodeNameOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state.clone() {
-            SetNodeNameState::Auth => match event {
+            NodeNameState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
                         Ok(true) => self.begin_transaction(),
-                        Ok(false) => self.fail(SetNodeNameError::Unauthorized),
+                        Ok(false) => self.fail(NodeNameError::Unauthorized),
                         Err(AuthorizationError::StorageError(error)) => {
-                            self.fail(SetNodeNameError::StorageError(error))
+                            self.fail(NodeNameError::StorageError(error))
                         }
                         Err(error) => {
                             warn!(error = %error, "Node name authorization check failed");
-                            self.fail(SetNodeNameError::Unauthorized)
+                            self.fail(NodeNameError::Unauthorized)
                         }
                     }
                 }
                 other => self.unexpected_event("authorization result", format!("{other:?}")),
             },
-            SetNodeNameState::StartTransaction => match event {
+            NodeNameState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("transaction start result", format!("{other:?}")),
             },
-            SetNodeNameState::ReadCurrent => match event {
+            NodeNameState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
@@ -387,17 +387,17 @@ impl Operation for SetNodeNameOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            SetNodeNameState::WriteState {
+            NodeNameState::WriteState {
                 stale_conflict_deletes,
             } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
-                        return self.fail(SetNodeNameError::MissingTransaction);
+                        return self.fail(NodeNameError::MissingTransaction);
                     };
                     if stale_conflict_deletes.is_empty() {
                         return self.emit_commit();
                     }
-                    self.state = SetNodeNameState::DeleteConflicts;
+                    self.state = NodeNameState::DeleteConflicts;
                     smallvec![Effect::Storage(StorageEffect::BatchDelete {
                         deletes: stale_conflict_deletes,
                         txn_id: Some(txn_id),
@@ -406,15 +406,15 @@ impl Operation for SetNodeNameOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             },
-            SetNodeNameState::DeleteConflicts => match event {
+            NodeNameState::DeleteConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_commit(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
             },
-            SetNodeNameState::CommitTransaction => match event {
+            NodeNameState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = SetNodeNameState::ScheduleSyncDrain;
+                    self.state = NodeNameState::ScheduleSyncDrain;
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
@@ -423,14 +423,14 @@ impl Operation for SetNodeNameOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            SetNodeNameState::ScheduleSyncDrain => match event {
+            NodeNameState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = SetNodeNameState::Finish;
+                    self.state = NodeNameState::Finish;
                     smallvec![]
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = SetNodeNameState::Finish;
+                    self.state = NodeNameState::Finish;
                     smallvec![]
                 }
                 other => self.unexpected_event(
@@ -438,24 +438,21 @@ impl Operation for SetNodeNameOperation {
                     format!("{other:?}"),
                 ),
             },
-            SetNodeNameState::Finish | SetNodeNameState::Error | SetNodeNameState::Init => {
+            NodeNameState::Finish | NodeNameState::Error | NodeNameState::Init => {
                 smallvec![]
             }
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            SetNodeNameState::Finish | SetNodeNameState::Error
-        )
+        matches!(self.state, NodeNameState::Finish | NodeNameState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         if !self.is_complete() {
-            return Err(SetNodeNameError::NotFinished);
+            return Err(NodeNameError::NotFinished);
         }
-        self.output.unwrap_or(Err(SetNodeNameError::NotFinished))
+        self.output.unwrap_or(Err(NodeNameError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -467,19 +464,17 @@ impl Operation for SetNodeNameOperation {
 }
 
 /// Trims the change's texts and checks every field; an empty change is refused.
-fn normalize_change(change: &mut NodeChange) -> Result<(), SetNodeNameError> {
+fn normalize_change(change: &mut NodeChange) -> Result<(), NodeNameError> {
     if *change == NodeChange::default() {
-        return Err(SetNodeNameError::EmptyChange);
+        return Err(NodeNameError::EmptyChange);
     }
     for text in [&mut change.display_name, &mut change.place] {
         if let Some(Some(raw)) = text {
-            *raw = normalize_node_name(raw).ok_or(SetNodeNameError::InvalidName)?;
+            *raw = normalize_node_name(raw).ok_or(NodeNameError::InvalidName)?;
         }
     }
     match change.coordinates {
-        Some(Some(coordinates)) if !coordinates.valid() => {
-            Err(SetNodeNameError::InvalidCoordinates)
-        }
+        Some(Some(coordinates)) if !coordinates.valid() => Err(NodeNameError::InvalidCoordinates),
         _ => Ok(()),
     }
 }
@@ -490,7 +485,7 @@ fn normalize_change(change: &mut NodeChange) -> Result<(), SetNodeNameError> {
 pub struct ReadNamesOperation {
     realm_id: RealmId,
     done: bool,
-    output: Option<Result<NodeDisplays, SetNodeNameError>>,
+    output: Option<Result<NodeDisplays, NodeNameError>>,
 }
 
 impl ReadNamesOperation {
@@ -502,7 +497,7 @@ impl ReadNamesOperation {
         }
     }
 
-    fn finish(&mut self, output: Result<NodeDisplays, SetNodeNameError>) -> Effects {
+    fn finish(&mut self, output: Result<NodeDisplays, NodeNameError>) -> Effects {
         self.done = true;
         self.output = Some(output);
         smallvec![]
@@ -511,7 +506,7 @@ impl ReadNamesOperation {
 
 impl Operation for ReadNamesOperation {
     type Output = NodeDisplays;
-    type Error = SetNodeNameError;
+    type Error = NodeNameError;
 
     fn start(&mut self) -> Effects {
         let target = AdminDocumentTarget::RealmConfig {
@@ -540,11 +535,11 @@ impl Operation for ReadNamesOperation {
                         });
                         displays.unwrap_or_default()
                     })
-                    .map_err(SetNodeNameError::from);
+                    .map_err(NodeNameError::from);
                 self.finish(displays)
             }
             Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
-            other => self.finish(Err(SetNodeNameError::UnexpectedEvent {
+            other => self.finish(Err(NodeNameError::UnexpectedEvent {
                 state: "ReadState".to_string(),
                 expected: "storage read result",
                 got: format!("{other:?}"),
@@ -557,7 +552,7 @@ impl Operation for ReadNamesOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(SetNodeNameError::NotFinished))
+        self.output.unwrap_or(Err(NodeNameError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {

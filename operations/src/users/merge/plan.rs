@@ -35,11 +35,9 @@ pub(super) fn check_accounts(survivor: &User, merged: &User) -> Result<bool, Mer
 /// Per document: the roles handed to the survivor, then all roles `merged` holds there.
 type Handover = (Vec<RoleId>, Vec<RoleId>);
 
-/// The roles `merged` holds in each document and those handed to `survivor`, realm first. A
-/// role is handed when it grants a path above the survivor's level, and so is every deny of
-/// `merged`, in any document, that overlaps a handed grant, since a deny wins over any grant.
-/// A handed deny that also overlaps a grant of the survivor is refused, naming its role; the
-/// survivor's grants count from every document, `others` being those `merged` has no role in.
+/// The roles of `merged` per document and those handed to `survivor`, realm first: grants above
+/// the survivor's level and every deny of `merged` overlapping one. A handed deny overlapping any
+/// survivor grant (`others` are documents without a `merged` role) is refused, naming its role.
 pub(super) fn hand_over(
     documents: &[&HashMap<RoleId, Role>],
     others: &[&HashMap<RoleId, Role>],

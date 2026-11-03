@@ -1123,7 +1123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn joined_revocation_follows_caller() {
+    async fn revocation_follows_caller() {
         // Inside the caller's transaction the revocation commits or aborts with the caller.
         let (_dir, context, actor) = setup_realm().await;
         let start = || async {

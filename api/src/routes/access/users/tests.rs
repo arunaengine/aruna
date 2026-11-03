@@ -55,6 +55,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
+#[path = "merge_tests.rs"]
 mod merge;
 
 #[derive(Clone)]

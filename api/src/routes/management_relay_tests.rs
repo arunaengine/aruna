@@ -76,7 +76,7 @@ fn central_goes_to_holder() {
 }
 
 #[test]
-fn merge_goes_to_coordinator() {
+fn merge_reaches_coordinator() {
     // Every node, a management node too, passes a merge on to the coordinator.
     let route = Some("/api/v1/access/users/me/merge");
     assert_eq!(

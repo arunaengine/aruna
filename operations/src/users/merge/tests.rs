@@ -191,7 +191,7 @@ fn paths(name: &str, entries: &[(&str, Permission)], users: &[UserId]) -> Role {
 }
 
 #[test]
-fn conflict_keeps_higher_role() {
+fn higher_role_wins() {
     let (survivor, merged) = (id(1), id(2));
     let member = role("member", Permission::READ, &[survivor]);
     let admin = role("admin", Permission::WRITE, &[merged]);
@@ -207,7 +207,7 @@ fn conflict_keeps_higher_role() {
 }
 
 #[test]
-fn deny_moves_with_grant() {
+fn deny_follows_grant() {
     // B reads everything but the secret; A gets the deny too, never more than B had.
     let (survivor, merged) = (id(1), id(2));
     let all = paths("all", &[("/r/g/1/**", Permission::READ)], &[merged]);
@@ -224,7 +224,7 @@ fn deny_moves_with_grant() {
 }
 
 #[test]
-fn realm_deny_moves_with_group_grant() {
+fn realm_deny_follows() {
     let (survivor, merged) = (id(1), id(2));
     let deny = paths(
         "no-secret",
@@ -239,7 +239,7 @@ fn realm_deny_moves_with_group_grant() {
 }
 
 #[test]
-fn deny_on_own_access_refused() {
+fn own_deny_refused() {
     // Moving the deny would cut A's own access, and dropping it would widen B's: refuse.
     let (survivor, merged) = (id(1), id(2));
     let own = paths(
@@ -261,7 +261,7 @@ fn deny_on_own_access_refused() {
 }
 
 #[test]
-fn realm_deny_on_other_group_refused() {
+fn foreign_deny_refused() {
     // A realm deny moving with B's grant would cut A's access in a group only A is in.
     let (survivor, merged) = (id(1), id(2));
     let deny = paths("no-groups", &[("/r/g/**", Permission::DENY)], &[merged]);
@@ -311,7 +311,7 @@ fn copies_missing_attributes() {
 }
 
 #[test]
-fn copies_only_what_fits() {
+fn copies_what_fits() {
     // A full survivor takes what fits; merge markers never count towards its own attributes.
     let mut survivor = user(1, &[]);
     for index in 0..127 {
@@ -341,7 +341,7 @@ fn copies_only_what_fits() {
 }
 
 #[test]
-fn claims_move_to_survivor() {
+fn claims_reach_survivor() {
     let claims = plan::moved_claims(BTreeSet::from([id(2)]), id(1), id(2));
     assert_eq!(claims, BTreeSet::from([id(1)]));
 }
@@ -405,7 +405,7 @@ fn copied_vault_accepted() {
 }
 
 #[test]
-fn failed_cutoff_aborts_merge() {
+fn failed_cutoff_aborts() {
     let mut operation = MergeUsersOperation::new(config(id(1), id(2)));
     operation.start();
     operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
@@ -496,7 +496,7 @@ fn pinned_node_coordinates() {
 }
 
 #[test]
-fn repeat_only_cuts_off() {
+fn repeat_cuts_off() {
     let mut merged = user(2, &[]);
     merged
         .attributes
@@ -749,7 +749,7 @@ fn hand_off_in(
 }
 
 #[test]
-fn only_coordinator_hands_off() {
+fn coordinator_hands_off() {
     // The pinned node hands on; an administrator names one only while none is recorded or the
     // recorded one has left management. An unknown recorded node is never replaced here.
     let target = iroh::SecretKey::from_bytes(&[3u8; 32]).public();

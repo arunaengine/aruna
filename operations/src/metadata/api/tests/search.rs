@@ -318,7 +318,7 @@ async fn capped_fanout_incomplete() {
 }
 
 #[tokio::test]
-async fn capped_fanout_names_rest() {
+async fn names_capped_nodes() {
     // The nodes the cap leaves out are named, and skipping the asked ones reaches them next.
     let directory = tempdir().unwrap();
     let context = DriverContext {

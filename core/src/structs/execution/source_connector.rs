@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn weight_names_no_source() {
+    fn weight_names_nothing() {
         // Sources bound through a connector stay one source whatever weight it gets later.
         let endpoint = ("endpoint".to_string(), "https://a.example.org".to_string());
         let weighted = HashMap::from([endpoint.clone(), (SOURCE_WEIGHT.to_string(), "5".into())]);

@@ -14,7 +14,7 @@ use aruna_operations::connectors::get_connector::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::object::source_edit::{
+use aruna_operations::s3::object::source::edit::{
     SourceChange, SourceEditError, SourceEditInput, SourceEditOperation, SourceEditResult,
 };
 use axum::extract::{Path, State};

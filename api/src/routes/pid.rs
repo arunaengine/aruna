@@ -1159,7 +1159,7 @@ mod tests {
 
     /// Browsers get the portal page once the realm names a portal; clients keep the RO-Crate.
     #[tokio::test]
-    async fn w3id_picks_pages() {
+    async fn browsers_get_pages() {
         use aruna_core::effects::StorageEffect;
         use aruna_core::federation::{
             AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode, Signed,
@@ -1262,7 +1262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn w3id_dispatches_shapes() {
+    async fn dispatches_pid_shapes() {
         let (_dir, state, _, _, _) = public_pid().await;
         let hash = "ab".repeat(32);
         let data = w3id(&state, &format!("data/{hash}"), "*/*").await;

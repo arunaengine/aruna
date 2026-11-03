@@ -1,3 +1,4 @@
+//! Tests what a new share link may name and how a visit is narrowed.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -103,7 +104,7 @@ fn scope_confines_visit() {
 }
 
 #[test]
-fn visit_ends_with_link() {
+fn visit_follows_link() {
     let mut share = link(folder("in/"), ShareMode::Read);
     assert_eq!(visit_expiry(&share, 500), 1_000);
     share.expires_at = None;
@@ -124,7 +125,7 @@ fn upload_names_checked() {
 }
 
 #[test]
-fn numbered_keys_keep_extension() {
+fn numbering_keeps_extension() {
     assert_eq!(numbered_key("in/report.pdf", 2), "in/report (2).pdf");
     assert_eq!(numbered_key("report", 1), "report (1)");
     assert_eq!(numbered_key(".env", 1), ".env (1)");

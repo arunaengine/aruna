@@ -14,7 +14,7 @@ async fn put(node: &Node, body: serde_json::Value) -> ServerResult<BucketMetadat
         .header("content-type", "application/json")
         .body(axum::body::Body::from(body.to_string()))
         .unwrap();
-    let parsed = Json::<PutBucketMetadataRequest>::from_request(request, &()).await;
+    let parsed = Json::<PutMetadataRequest>::from_request(request, &()).await;
     put_bucket_metadata(
         State(node.state.clone()),
         Extension(Some(node.owner.clone())),
@@ -66,7 +66,7 @@ async fn requires_metadata_field() {
 // The description lives only in the dataset: former description fields are refused, a database
 // needs a dataset, and a dataset the caller cannot read is never linked.
 #[tokio::test]
-async fn description_only_in_dataset() {
+async fn description_in_dataset() {
     let node = node_state().await;
     for field in ["title", "description", "version", "license", "identifiers"] {
         let body = json!({"metadata": {"database": false, field: "x"}});

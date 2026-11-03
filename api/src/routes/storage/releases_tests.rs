@@ -215,7 +215,7 @@ async fn pins_one_version() {
 }
 
 #[tokio::test]
-async fn lists_only_read_crates() {
+async fn lists_readable_crates() {
     let node = node_state().await;
     store(&node, "db/a.fasta", ">a").await;
     publish(

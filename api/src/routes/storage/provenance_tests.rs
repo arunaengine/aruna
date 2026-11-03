@@ -24,7 +24,7 @@ fn recheck(auth: &AuthContext, hops: usize) -> Recheck {
     );
     Arc::new(move |_, _| {
         let open = left
-            .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+            .try_update(SeqCst, SeqCst, |left| left.checked_sub(1))
             .is_ok();
         let auth = auth.clone();
         Box::pin(async move { open.then_some(auth) })

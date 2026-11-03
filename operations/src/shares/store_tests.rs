@@ -1,3 +1,4 @@
+//! Tests the share link records, the owner index and the access log.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -50,7 +51,7 @@ fn link(owner: u8, id: u8) -> ShareLink {
 }
 
 #[tokio::test]
-async fn lists_only_own_links() {
+async fn lists_own_links() {
     let dir = tempfile::tempdir().unwrap();
     let context = context(&dir);
     for (owner, id) in [(3, 10), (3, 11), (4, 12)] {
@@ -77,7 +78,7 @@ async fn lists_only_own_links() {
 }
 
 #[tokio::test]
-async fn log_pages_in_order() {
+async fn log_pages_ordered() {
     let dir = tempfile::tempdir().unwrap();
     let context = context(&dir);
     let share = Ulid::from_bytes([7; 16]);
@@ -121,7 +122,7 @@ async fn log_pages_in_order() {
 }
 
 #[tokio::test]
-async fn concurrent_logs_keep_counts() {
+async fn concurrent_logs_count() {
     let dir = tempfile::tempdir().unwrap();
     let context = context(&dir);
     let share = Ulid::from_bytes([7; 16]);

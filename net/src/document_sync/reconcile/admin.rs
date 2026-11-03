@@ -1273,10 +1273,9 @@ pub(in crate::document_sync) fn materialize_realm_role(
     overlay_realm_role(auth_doc, reducer_state, role.role_id);
 }
 
-/// The root of `user`'s merges: the end of its merge pointers, once that account exists in the
-/// same realm and lists `user` among its merged accounts. `None` while that is not shown, for
-/// an account that is not merged, and for pointers that loop. `applied` is the account the event
-/// being applied changes; it is read as just materialized, since its row is not written yet.
+/// The end of `user`'s merge pointers once that account exists in the realm and lists `user` as
+/// merged; `None` until then, when unmerged, or when pointers loop. `applied`, the account the
+/// event being applied changes, is read as just materialized, since its row is not written yet.
 async fn merge_root(
     storage: &StorageHandle,
     txn_id: TxnId,

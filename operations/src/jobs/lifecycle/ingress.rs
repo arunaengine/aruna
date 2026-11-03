@@ -1026,10 +1026,9 @@ async fn capture_inputs(
     Ok(captured_inputs)
 }
 
-/// The bucket's metadata and its dataset's description when the caller may read the bucket
-/// itself, checked like the metadata route; READ on one key alone shows none of it, and the run
-/// still starts. A dataset the caller may not read leaves the description empty; one that is
-/// unavailable now fails the admission, which may be retried.
+/// The bucket's metadata and dataset description when the caller may read the bucket itself, as
+/// the metadata route checks; READ on one key alone shows none of it and the run still starts.
+/// An unreadable dataset leaves the description empty; an unavailable one fails the admission.
 async fn readable_metadata(
     context: &DriverContext,
     (auth, local, bearer): (&AuthContext, NodeId, Option<&str>),
@@ -2232,7 +2231,7 @@ mod tests {
 
     // A node named by the caller still needs an exact version; a range coordinator does not.
     #[test]
-    fn named_node_needs_version() {
+    fn node_needs_version() {
         assert!(exact_version(&s3_input("db", "a", None)).is_err());
         let version = Ulid::from_parts(1, 1).to_string();
         assert!(exact_version(&s3_input("db", "a", Some(&version))).is_ok());
@@ -2300,7 +2299,7 @@ mod tests {
     #[tokio::test]
     async fn remote_needs_bearer() {
         // An input on another node needs the caller's own bearer; its version rule is checked
-        // where the caller names the node (`named_node_needs_version`).
+        // where the caller names the node (`node_needs_version`).
         let dir = tempdir().unwrap();
         let context = test_ctx(dir.path().to_str().unwrap());
         let caller = (

@@ -1,6 +1,5 @@
-//! Bootstraps a catching-up member or a new copy of a range from its coordinators: bounded pages
-//! over the ordered inventory with a durable cursor, each waiting for its jobs while live
-//! publications overlap.
+//! Bootstraps a catching-up member or a new range copy from its coordinators: bounded pages over
+//! the ordered inventory with a durable cursor, each waiting for its jobs while publications go on.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

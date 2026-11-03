@@ -85,13 +85,9 @@ pub(super) fn retired_nodes(parts: &[(NodeId, BucketPage)]) -> Vec<NodeId> {
     retired.map(|(node_id, _)| *node_id).collect()
 }
 
-/// Orders node pages by bucket name and node, cuts them to `limit` and moves each node past
-/// its hits on this page, or past its scan when it showed every hit and its scan was cut. A
-/// node with fewer than `limit` hits, all shown and an uncut scan, is done. A failed node keeps
-/// its position, a node left out by the fanout cap is kept for a later page, done nodes stay
-/// done, and other nodes this page did not ask are dropped from the cursor. A distributed bucket
-/// shows once: its other members count as given, so their nodes move past it too, and the
-/// cursor remembers it while a member may still reach it on a later page.
+/// Orders node pages by bucket and node, cuts them to `limit` and moves each node past its shown
+/// hits, or past a cut scan when all hits showed; under `limit` hits with an uncut scan it is done.
+/// Failed and capped nodes keep their place, unasked ones drop, a distributed bucket shows once.
 pub(super) fn merge_pages(
     parts: Vec<(NodeId, BucketPage)>,
     (failed, omitted): (&[NodeId], &[NodeId]),

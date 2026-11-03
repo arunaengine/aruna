@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_login_opens_root() {
+    fn merged_opens_root() {
         let pointer = |to: &User| vec![(MERGED_INTO_ATTRIBUTE.to_string(), to.user_id.to_string())];
         let unlisted = user(1, Vec::new());
         let merged = user(2, pointer(&unlisted));

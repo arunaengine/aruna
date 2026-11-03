@@ -31,7 +31,7 @@ use crate::s3::object::lookup::{
     multipart_summary_read, summary_from_read,
 };
 use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
-use crate::s3::object::source_choice::{Candidate, choose_source};
+use crate::s3::object::source::choice::{Candidate, choose_source};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{

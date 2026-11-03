@@ -3164,7 +3164,7 @@ fn disagreeing_source_drifts() {
 // A randomly picked source whose size or bytes fail their proof was not served, so the read
 // moves on to the other source instead of failing.
 #[test]
-fn failed_proof_moves_on() {
+fn failed_proof_advances() {
     let mut operation = mirrored_operation(digested(9, 7));
     let effects = ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX);
     assert_eq!(headed_path(&effects), "mirror/file.txt");
@@ -3227,7 +3227,7 @@ fn mirror_type_kept() {
 // A transfer that breaks while its bytes are spooled for the checksum check moves on to the
 // next source, as nothing was served yet.
 #[test]
-fn broken_spool_fails_over() {
+fn broken_spool_failover() {
     let mut operation = mirrored_operation(digested(9, 7));
     let effects = ranked_head(&mut operation, vec![false, false]);
     assert_eq!(headed_path(&effects), "folder/file.txt");
@@ -3413,7 +3413,7 @@ fn matched_weight_counts() {
 // The first source failing its checksums leaves the read to another source; only a pinned read
 // with no source left is refused.
 #[test]
-fn first_proof_moves_on() {
+fn first_proof_advances() {
     let mut operation = mirrored_operation(digested(9, 7));
     let effects = ranked_head(&mut operation, vec![false, false]);
     assert_eq!(headed_path(&effects), "folder/file.txt");
@@ -3468,7 +3468,7 @@ fn pinned_s3_mirror() -> (GetObjectOperation, aruna_core::types::Effects) {
 // A pinned read whose first source answers without the recorded validator moves on to a mirror
 // that enforces the recorded strong ETag; with none left it is refused.
 #[test]
-fn missing_validator_moves_on() {
+fn missing_validator_advances() {
     let (mut operation, effects) = pinned_s3_mirror();
     assert_eq!(headed_path(&effects), "folder/file.txt");
     let mut unvalidated = observation(9);

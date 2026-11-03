@@ -67,7 +67,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_split_by_host() {
+    async fn routes_split_hosts() {
         let app = app(Some("registry.example.org"), Some("resolve.example.org"));
         let cases = [
             (Some("registry.example.org"), "/v1/realms", StatusCode::OK),
@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unset_hosts_answer_everywhere() {
+    async fn unset_hosts_answer() {
         let app = app(None, None);
         for host in [None, Some("registry.example.org"), Some("anything.example")] {
             assert_eq!(status(&app, host, "/v1/realms").await, StatusCode::OK);

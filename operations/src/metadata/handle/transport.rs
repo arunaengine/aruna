@@ -529,7 +529,7 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::PromotionCheck => "promotion_check",
         MetadataTransportMessage::PromotionReady { .. } => "promotion_ready",
         MetadataTransportMessage::JobInputPage { .. } => "job_input_page",
-        MetadataTransportMessage::JobInputPageResult { .. } => "job_input_page_result",
+        MetadataTransportMessage::InputPageResult { .. } => "job_input_page_result",
         MetadataTransportMessage::ResolveJobInputs { .. } => "resolve_job_inputs",
         MetadataTransportMessage::ResolvedJobInputs { .. } => "resolved_job_inputs",
     }
@@ -756,7 +756,7 @@ impl MetadataHandle {
     ) -> Result<Option<aruna_core::structs::execution::job::InputPage>, String> {
         let request = MetadataTransportMessage::JobInputPage { submission, digest };
         match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
-            Ok(MetadataTransportMessage::JobInputPageResult { page }) => Ok(page.map(|page| *page)),
+            Ok(MetadataTransportMessage::InputPageResult { page }) => Ok(page.map(|page| *page)),
             Ok(other) => Err(format!(
                 "the node answered {}",
                 transport_message_kind(&other)

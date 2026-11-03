@@ -74,8 +74,8 @@ const PROBE_SLOTS: usize = 8;
 /// Guesses that ask other sites, per minute across all clients, and their burst.
 const GUESSES_PER_MINUTE: u32 = 600;
 const GUESS_BURST: u32 = 60;
-/// The stricter share of one client, charged first, so one caller cannot use up the budget.
-const CLIENT_GUESSES_PER_MINUTE: u32 = 60;
+/// One client's stricter share per minute, charged first, so it cannot use up the budget.
+const CLIENT_GUESS_RATE: u32 = 60;
 const CLIENT_BURST: u32 = 20;
 /// Client limiter keys above which idle ones are dropped.
 const CLIENT_ENTRIES: usize = 10_000;
@@ -271,10 +271,8 @@ impl Resolver {
             )),
             guesses: RateLimiter::direct_with_clock(quota, clock.clone()),
             clients: RateLimiter::dashmap_with_clock(
-                Quota::per_minute(
-                    NonZeroU32::new(CLIENT_GUESSES_PER_MINUTE).expect("nonzero rate"),
-                )
-                .allow_burst(NonZeroU32::new(CLIENT_BURST).expect("nonzero burst")),
+                Quota::per_minute(NonZeroU32::new(CLIENT_GUESS_RATE).expect("nonzero rate"))
+                    .allow_burst(NonZeroU32::new(CLIENT_BURST).expect("nonzero burst")),
                 clock.clone(),
             ),
             routes: Mutex::new(HashMap::new()),

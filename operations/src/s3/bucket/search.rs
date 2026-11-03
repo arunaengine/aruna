@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_budget_keeps_position() {
+    fn budget_keeps_position() {
         let mut operation = SearchBucketsOperation::new(scan_input("missing", 1));
         operation.start();
         let mut remaining = SearchBucketsOperation::MAX_SCAN_ROWS;

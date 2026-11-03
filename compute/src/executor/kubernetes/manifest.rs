@@ -1274,7 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn caches_inputs_through_kubedal() {
+    fn kubedal_caches_inputs() {
         // Cached inputs come from a KubeDAL file list with the shared scope; others stay FUSE.
         let mut cached = config();
         cached.kubedal = Some(Box::new(crate::executor::config::KubedalMount {
