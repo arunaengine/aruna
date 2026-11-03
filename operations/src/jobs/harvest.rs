@@ -26,6 +26,9 @@ use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::auth::request_authorization::AuthorizeError;
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::forward::authorize::authorize_create;
 use crate::forward::transport::MetadataWriteError;
 use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
 use crate::harvest::oai_pmh::parse::{
@@ -307,6 +310,7 @@ async fn apply_record(
             counts.minted += 1;
         }
         ProvenanceDecision::Update { meta_resource_id } => {
+            authorize_write(ctx, source, realm_id, record, meta_resource_id).await?;
             match read_stored(ctx, meta_resource_id).await? {
                 Some(stored) => {
                     update_document(
@@ -357,6 +361,7 @@ async fn apply_record(
             }
         }
         ProvenanceDecision::Tombstone { meta_resource_id } => {
+            authorize_write(ctx, source, realm_id, record, meta_resource_id).await?;
             confirm_withdrawn(ctx, source, actor, realm_id, meta_resource_id).await?;
             row.meta_resource_id = meta_resource_id;
             row.state = HarvestRecordState::Tombstoned;
@@ -474,7 +479,7 @@ async fn create_document(
     document_id: Ulid,
     record: &OaiRecord,
 ) -> Result<(), HarvestFailure> {
-    let document_path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
+    let document_path = authorize_write(ctx, source, realm_id, record, document_id).await?;
     let created = Box::pin(route_metadata_create(
         CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
             actor: actor.clone(),
@@ -538,15 +543,47 @@ async fn update_document(
     Ok(())
 }
 
-/// Harvest writes run as the source owner, unrestricted: the source record is
-/// the authorization decision, made when an operator created it.
+/// Harvest writes run as the source owner, unrestricted, after [`authorize_write`].
 fn internal_token(created_by: aruna_core::UserId, realm_id: RealmId) -> AuthToken {
-    AuthToken::internal(AuthContext {
+    AuthToken::internal(owner_auth(created_by, realm_id))
+}
+
+fn owner_auth(created_by: aruna_core::UserId, realm_id: RealmId) -> AuthContext {
+    AuthContext {
         user_id: created_by,
         realm_id,
         path_restrictions: None,
         session: None,
-    })
+    }
+}
+
+/// Checks the source owner as a direct metadata create of the record's document path would,
+/// and returns that path.
+async fn authorize_write(
+    ctx: &JobContext,
+    source: &HarvestSource,
+    realm_id: RealmId,
+    record: &OaiRecord,
+    document_id: Ulid,
+) -> Result<String, HarvestFailure> {
+    let path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
+    let checked = authorize_create(
+        &ctx.driver,
+        realm_id,
+        &owner_auth(source.created_by, realm_id),
+        PolicyRequestExtras::default(),
+        source.group_id,
+        &path,
+        document_id,
+    )
+    .await;
+    match checked {
+        Ok(()) => Ok(path),
+        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => Err(permanent(
+            format!("harvest write to [{path}] is not permitted"),
+        )),
+        Err(error) => Err(retryable(format!("harvest permission check: {error}"))),
+    }
 }
 
 fn next_version(existing: Option<&HarvestProvenance>) -> u64 {
