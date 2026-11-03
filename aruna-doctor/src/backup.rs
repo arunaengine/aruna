@@ -115,12 +115,11 @@ pub fn restore_backup(backup: &Path, target: &Path) -> Result<SnapshotStats, Sna
     ensure_target_path(&partial)?;
     let mut reader = SnapshotReader::new(BufReader::new(File::open(backup)?))?;
     std::fs::create_dir(&partial)?;
-    match restore_into(&mut reader, &partial) {
-        Ok(()) => std::fs::rename(&partial, target)?,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&partial);
-            return Err(error);
-        }
+    let restored = restore_into(&mut reader, &partial)
+        .and_then(|()| std::fs::rename(&partial, target).map_err(SnapshotError::from));
+    if let Err(error) = restored {
+        let _ = std::fs::remove_dir_all(&partial);
+        return Err(error);
     }
     Ok(reader.stats())
 }
