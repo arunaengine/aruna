@@ -95,9 +95,10 @@ pub struct StorageHandle {
     pub(super) database: Arc<OnceLock<OpenDatabase>>,
 }
 
-/// The opened node database; Fjall's handle has no `Debug`.
+/// The opened node database behind a `Send + Sync` object, so the auto trait proofs of handle
+/// futures stop here instead of walking Fjall's internals; Fjall's handle has no `Debug`.
 #[derive(Clone)]
-pub(super) struct OpenDatabase(pub(super) fjall::Database);
+pub(super) struct OpenDatabase(pub(super) Arc<dyn Fn() -> fjall::Database + Send + Sync>);
 
 impl std::fmt::Debug for OpenDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -168,7 +169,7 @@ impl StorageHandle {
     /// The opened node database, for consistent read snapshots such as live backups. `None`
     /// on a handle without opened storage behind it.
     pub fn database(&self) -> Option<fjall::Database> {
-        self.database.get().map(|database| database.0.clone())
+        self.database.get().map(|database| (database.0)())
     }
 
     /// New channels sharing this handle's metrics, for test proxies that forward effects to
