@@ -11,6 +11,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::harvest::{
     HarvestSelector, HarvestSource, RepositoryConnector, RepositoryConnectorKind,
 };
+use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -46,7 +47,7 @@ enum State {
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateSourceError {
     #[error(transparent)]
-    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    GroupWrite(#[from] GroupWriteError),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -89,6 +90,8 @@ pub struct CreateSourceOperation {
     input: CreateSourceInput,
     state: State,
     source: Option<HarvestSource>,
+    /// Set after a concurrent first submission created the source; its row is read again.
+    reread: bool,
     output: Option<Result<HarvestSource, CreateSourceError>>,
 }
 
@@ -110,6 +113,7 @@ impl CreateSourceOperation {
             input,
             state: State::Init,
             source: None,
+            reread: false,
             output: None,
         }
     }
@@ -203,6 +207,9 @@ impl CreateSourceOperation {
             self.output = Some(Ok(existing));
             return smallvec![];
         }
+        if self.reread {
+            return self.emit_error(CreateSourceError::Failed);
+        }
         let source = HarvestSource::new(
             source_id(self.input.connector_id, &self.input.namespace),
             self.input.group_id,
@@ -218,13 +225,13 @@ impl CreateSourceOperation {
             Ok(value) => value,
             Err(error) => return self.emit_error(error.into()),
         };
-        let write = crate::groups::fence::write_group_records(
+        let key = crate::harvest::repository::source_key(source.group_id, source.source_id);
+        let keyspace = aruna_core::keyspaces::HARVEST_SOURCE_KEYSPACE.to_string();
+        let write = crate::groups::fence::write_group_new(
             self.input.group_id,
-            vec![(
-                aruna_core::keyspaces::HARVEST_SOURCE_KEYSPACE.to_string(),
-                crate::harvest::repository::source_key(source.group_id, source.source_id),
-                value.into(),
-            )],
+            vec![(keyspace.clone(), key.clone(), value.into())],
+            None,
+            (keyspace, key),
         );
         self.source = Some(source);
         self.state = State::WriteSource;
@@ -232,8 +239,18 @@ impl CreateSourceOperation {
     }
 
     fn handle_written(&mut self, event: Event) -> Effects {
-        if let Err(error) = crate::groups::fence::group_write_result(event) {
-            return self.emit_error(error.into());
+        match crate::groups::fence::group_write_result(event) {
+            Ok(()) => {}
+            Err(GroupWriteError::Taken) => {
+                self.reread = true;
+                self.state = State::ReadSource;
+                return smallvec![read_source_effect(
+                    self.input.group_id,
+                    source_id(self.input.connector_id, &self.input.namespace),
+                    None,
+                )];
+            }
+            Err(error) => return self.emit_error(error.into()),
         }
         let Some(source) = self.source.clone() else {
             return self.emit_error(CreateSourceError::Failed);
@@ -531,6 +548,51 @@ mod tests {
             op.finalize().unwrap_err(),
             CreateSourceError::UnsupportedConnector
         );
+    }
+
+    #[test]
+    fn taken_source_reread() {
+        // A concurrent first submission wins the create; this one rereads and compares.
+        let group = ulid::Ulid::generate();
+        let connector = RepositoryConnector::new(
+            ulid::Ulid::generate(),
+            group,
+            "zenodo".to_string(),
+            RepositoryConnectorKind::OaiPmh,
+            "https://zenodo.org/oai2d".to_string(),
+            HashMap::new(),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+        );
+        let read = |value: Option<Vec<u8>>| {
+            Event::Storage(StorageEvent::ReadResult {
+                key: byteview::ByteView::from(Vec::new()),
+                value: value.map(Into::into),
+            })
+        };
+        let taken = || {
+            Event::SubOperation(aruna_core::events::SubOperationEvent::GroupWritten {
+                result: Err(GroupWriteError::Taken),
+            })
+        };
+        for (prefix, reused) in [("imported/zenodo", true), ("imported/other", false)] {
+            let mut op = CreateSourceOperation::new(input(group, connector.connector_id));
+            op.start();
+            op.step(read(Some(connector.to_bytes().unwrap())));
+            assert_eq!(op.step(read(None)).len(), 1, "the create is conditional");
+            let mut winner = op.source.clone().unwrap();
+            winner.target_prefix = prefix.to_string();
+            assert_eq!(op.step(taken()).len(), 1, "the source is read again");
+            assert!(op.step(read(Some(winner.to_bytes().unwrap()))).is_empty());
+            match reused {
+                true => assert_eq!(op.finalize(), Ok(winner)),
+                false => assert_eq!(
+                    op.finalize(),
+                    Err(CreateSourceError::SourceConflict(winner.source_id))
+                ),
+            }
+        }
     }
 
     #[test]
