@@ -643,6 +643,7 @@ async fn relayed_bounds(
                 "bucket": "research-raw",
                 "objects": [{
                     "key": "runs/2026/sample.fastq.gz",
+                    "version_id": "01JMVER0123456789ABCDEFGHJ",
                     "size": 1048576,
                     "etag": "9b2cf535f27731c974343645a3985328",
                     "last_modified": "2026-10-24T10:00:00+00:00",
