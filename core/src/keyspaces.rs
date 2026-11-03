@@ -54,8 +54,6 @@ pub const DOCUMENT_JOB_KEYSPACE: &str = "metadata_materialization_document_jobs"
 pub const DEAD_LETTER_KEYSPACE: &str = "metadata_materialization_dead_letters";
 pub const MATERIALIZATION_PRUNE_KEYSPACE: &str = "metadata_materialization_prunes";
 pub const DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
-/// Database marks waiting for owner consent on this management node, by request id.
-pub const DATABASE_REQUEST_KEYSPACE: &str = "database_requests";
 /// Reduced distribution records by set id, materialized from their admin reducer state.
 pub const DISTRIBUTION_KEYSPACE: &str = "distribution_records";
 /// Requests a set's publisher accepted, by set id and request id, with the revision they made.
@@ -250,6 +248,10 @@ pub const S3_SESSION_KEYSPACE: &str = "s3_sessions";
 pub const SESSION_OWNER_KEYSPACE: &str = "s3_session_owner";
 pub const SESSION_EXPIRY_KEYSPACE: &str = "s3_session_expiry";
 pub const S3_BUCKET_KEYSPACE: &str = "s3_buckets";
+/// `StoredMetadata` of node-local ordinary buckets, keyed by bucket name.
+pub const BUCKET_METADATA_KEYSPACE: &str = "bucket_metadata";
+/// `ReleasePointer` rows of tagged release crate versions, keyed by `release_key`.
+pub const BUCKET_RELEASE_KEYSPACE: &str = "bucket_releases";
 /// The creation id of each bucket by name, fresh on every creation of the name.
 pub const BUCKET_CREATION_KEYSPACE: &str = "s3_bucket_creations";
 pub const RELATIONSHIP_OUT_KEYSPACE: &str = "sync_relationship_out";
@@ -410,11 +412,17 @@ pub const JOB_INDEX_KEYSPACE: &str = "job_owner_index";
 pub const ACTIVE_USER_KEYSPACE: &str = "job_active_user";
 pub const DEDUP_INDEX_KEYSPACE: &str = "job_dedup_index";
 pub const RUN_CRATE_KEYSPACE: &str = "job_run_crate";
+/// `RunLink` rows by physical job id; job pruning keeps them.
+pub const RUN_LINK_KEYSPACE: &str = "job_run_links";
 
 /// The realm target a device froze for publishing one local run, and the copies it made,
 /// keyed like `job_run_crate`. Device-local and never replicated.
 pub const RUN_PUBLISH_KEYSPACE: &str = "job_run_publish";
+/// The crate JSON-LD of an unpublished local run, keyed like `job_run_crate`. Device-local.
+pub const LOCAL_CRATE_KEYSPACE: &str = "job_local_run_crates";
 pub const ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
+/// `LaunchRecord` rows keyed like `job_attempt_control`; pruned with the job.
+pub const LAUNCH_RECORD_KEYSPACE: &str = "job_launch_records";
 /// The live claim of an unsettled job, keyed like `jobs`; rewritten only when the claim changes.
 pub const JOB_CLAIM_KEYSPACE: &str = "job_claims";
 /// Signed immutable output records, keyed by ExecutionId.
@@ -425,6 +433,9 @@ pub const JOB_ENTRY_KEYSPACE: &str = "job_entries";
 /// written once: the same digest replays as a no-op and a different digest is
 /// retained in the conflict keyspace instead of overwriting it.
 pub const FAMILY_RECORD_KEYSPACE: &str = "job_family_records";
+/// Input pages of stored specs and launches, keyed by family and page digest. They sit apart
+/// from the family records, so no family read bound or lifecycle evidence counts them.
+pub const INPUT_PAGE_KEYSPACE: &str = "job_input_pages";
 /// Bounded records whose predecessor evidence, or whose local holder view, is
 /// not available yet. A pending record is never projected or relayed.
 pub const FAMILY_PENDING_KEYSPACE: &str = "job_family_pending";
@@ -499,8 +510,6 @@ pub const DOCUMENT_IRI_KEYSPACE: &str = "metadata_document_iris";
 pub const SEARCH_FEED_KEYSPACE: &str = "distribution_search_feed";
 /// The search index state of each range on this member, by set id and range id.
 pub const SEARCH_INDEX_KEYSPACE: &str = "distribution_search_indexes";
-/// The register version of each database entry this node saw unlinked, by entry id.
-pub const DATABASE_UNLINKED_KEYSPACE: &str = "database_unlinked";
 /// The value each row a running usage rebuild reads had when the rebuild began, kept on change.
 pub const USAGE_PREIMAGE_KEYSPACE: &str = "usage_rebuild_preimages";
 /// Bytes this node admitted for distributed bucket members: a member row by set id with its
@@ -546,7 +555,6 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DEAD_LETTER_KEYSPACE,
     MATERIALIZATION_PRUNE_KEYSPACE,
     DOCUMENT_STATE_KEYSPACE,
-    DATABASE_REQUEST_KEYSPACE,
     DISTRIBUTION_KEYSPACE,
     DISTRIBUTION_ACCEPT_KEYSPACE,
     DISTRIBUTION_PUBLISHER_KEYSPACE,
@@ -640,6 +648,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SESSION_OWNER_KEYSPACE,
     SESSION_EXPIRY_KEYSPACE,
     S3_BUCKET_KEYSPACE,
+    BUCKET_METADATA_KEYSPACE,
+    BUCKET_RELEASE_KEYSPACE,
     BUCKET_CREATION_KEYSPACE,
     RELATIONSHIP_OUT_KEYSPACE,
     RELATIONSHIP_IN_KEYSPACE,
@@ -711,12 +721,16 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     ACTIVE_USER_KEYSPACE,
     DEDUP_INDEX_KEYSPACE,
     RUN_CRATE_KEYSPACE,
+    RUN_LINK_KEYSPACE,
     RUN_PUBLISH_KEYSPACE,
+    LOCAL_CRATE_KEYSPACE,
     ATTEMPT_CONTROL_KEYSPACE,
+    LAUNCH_RECORD_KEYSPACE,
     JOB_CLAIM_KEYSPACE,
     OUTPUT_RECORD_KEYSPACE,
     JOB_ENTRY_KEYSPACE,
     FAMILY_RECORD_KEYSPACE,
+    INPUT_PAGE_KEYSPACE,
     FAMILY_PENDING_KEYSPACE,
     FAMILY_CONFLICT_KEYSPACE,
     FAMILY_ALIAS_KEYSPACE,
@@ -770,7 +784,6 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DOCUMENT_IRI_KEYSPACE,
     SEARCH_FEED_KEYSPACE,
     SEARCH_INDEX_KEYSPACE,
-    DATABASE_UNLINKED_KEYSPACE,
     USAGE_PREIMAGE_KEYSPACE,
     CAPACITY_RESERVATION_KEYSPACE,
 ];

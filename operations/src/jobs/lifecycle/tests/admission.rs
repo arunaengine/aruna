@@ -273,6 +273,7 @@ fn identity_is_deterministic() {
         ingress_node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         captured_inputs: Vec::new(),
         output_policies: Vec::new(),
+        input_pages: None,
     };
     let identity = request.identity().expect("identity derives");
 
@@ -299,11 +300,34 @@ fn identity_is_deterministic() {
         destination_key: "reads.fastq".to_string(),
         source_node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         version_id: Ulid::from_bytes([1u8; 16]),
-        blake3: [2u8; 32],
+        content: aruna_core::structs::execution::job::InputContent::Blake3([2u8; 32]),
         bytes: 3,
         policies: Vec::new(),
+        source_group_id: Default::default(),
+        public: false,
+        link: None,
+        source_pin: None,
+        database: None,
+        releases: Vec::new(),
+        releases_complete: false,
+        grant: None,
     });
-    assert_ne!(pinned.identity().expect("identity derives"), identity);
+    let pinned_identity = pinned.identity().expect("identity derives");
+    assert_ne!(pinned_identity, identity);
+    // A keyed retry re-reads metadata and gets new grants; only the pins identify it.
+    let mut retried = pinned.clone();
+    retried.captured_inputs[0].public = true;
+    retried.captured_inputs[0].releases_complete = true;
+    retried.captured_inputs[0].source_group_id = Ulid::from_bytes([3u8; 16]);
+    assert_eq!(
+        retried.identity().expect("identity derives"),
+        pinned_identity
+    );
+    retried.captured_inputs[0].version_id = Ulid::from_bytes([4u8; 16]);
+    assert_ne!(
+        retried.identity().expect("identity derives"),
+        pinned_identity
+    );
 }
 
 /// One local node of `kind` in a five node realm, with a live net handle so the

@@ -4,7 +4,7 @@
 
 use crate::NodeId;
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
-use crate::structs::execution::job::{EffectiveResources, SubmissionId};
+use crate::structs::execution::job::{EffectiveResources, InputContent, SubmissionId};
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::compute_config::ComputeConfigError;
 use crate::structs::placement::policy::{
@@ -19,8 +19,6 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use ulid::Ulid;
 
-/// Maximum inputs one plan pins.
-pub const MAX_PLAN_INPUTS: usize = 512;
 /// Maximum registered holders considered per input.
 pub const MAX_INPUT_HOLDERS: usize = 32;
 /// Maximum advertisements one planning page screens. A scan continues in the
@@ -38,8 +36,6 @@ pub const MAX_PLAN_REJECTIONS: usize = 32;
 pub enum PlanError {
     #[error("the job has no durable logical admission record")]
     NotAdmitted,
-    #[error("a plan pins at most {MAX_PLAN_INPUTS} inputs")]
-    InputCount,
     #[error("an input resolves at most {MAX_INPUT_HOLDERS} holders")]
     HolderCount,
     #[error("one planning page screens at most {MAX_TARGET_SCAN} advertised targets")]
@@ -75,7 +71,7 @@ pub struct ResolvedInput {
     pub destination_key: String,
     pub source: VersionedObjectArn,
     pub version_id: Ulid,
-    pub blake3: [u8; 32],
+    pub content: InputContent,
     pub bytes: u64,
     pub policies: Vec<PlacementPolicyRef>,
     pub holders: Vec<InputHolder>,
@@ -129,9 +125,6 @@ impl PlanRequest {
     pub fn canonical(&self) -> Result<Self, PlanError> {
         if !self.admitted {
             return Err(PlanError::NotAdmitted);
-        }
-        if self.inputs.len() > MAX_PLAN_INPUTS {
-            return Err(PlanError::InputCount);
         }
         if self.required_labels.len() > MAX_SELECTOR_LABELS {
             return Err(PlanError::LabelCount);

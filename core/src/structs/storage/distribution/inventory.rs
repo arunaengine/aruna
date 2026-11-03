@@ -195,6 +195,8 @@ pub struct VersionEntry {
     pub identity: Option<[u8; 32]>,
     /// Content whose hash a later verified read records.
     pub pending: bool,
+    /// The version names columns that metadata search matches.
+    pub searchable: bool,
 }
 
 impl VersionEntry {

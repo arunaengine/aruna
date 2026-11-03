@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
-    ExecutorKind, FenceContext, LogLimits, LogTails, MAX_OUTPUT_MATCHES, MAX_TRANSFER_BYTES,
+    ExecutorKind, FenceContext, GrantedResources, LogLimits, LogTails, MAX_OUTPUT_MATCHES,
     NetworkAccess, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput,
     TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix, normalize_container_path,
 };
@@ -126,6 +126,7 @@ impl ApptainerBackend {
             layout_digest,
             output_paths: spec.output_paths.clone(),
         };
+        let (memory, cores) = enforced_limits(&self.config, spec)?;
         let launch = LaunchRecord {
             sif,
             argv,
@@ -144,17 +145,8 @@ impl ApptainerBackend {
                 .max_walltime
                 .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX)),
             pids_limit: spec.security.pids_limit.unwrap_or(2048),
-            memory_bytes: enforced_limit(
-                spec.resources.ram_bytes,
-                self.config.default_mem_bytes,
-                "memory",
-            )?,
-            cpu_cores: u32::try_from(enforced_limit(
-                spec.resources.cpu_cores.map(u64::from),
-                self.config.default_cpu_cores.map(u64::from),
-                "cpu",
-            )?)
-            .unwrap_or(u32::MAX),
+            memory_bytes: memory,
+            cpu_cores: u32::try_from(cores).unwrap_or(u32::MAX),
             isolated_network: spec.security.network == NetworkAccess::Isolated,
         };
         write_json(&temp.join("attempt.json"), &record)?;
@@ -278,6 +270,17 @@ impl ApptainerBackend {
     }
 }
 
+/// Memory bytes and CPU cores an attempt of `spec` is launched with.
+fn enforced_limits(config: &ApptainerConfig, spec: &TaskSpec) -> Result<(u64, u64), BackendError> {
+    let memory = enforced_limit(spec.resources.ram_bytes, config.default_mem_bytes, "memory")?;
+    let cores = enforced_limit(
+        spec.resources.cpu_cores.map(u64::from),
+        config.default_cpu_cores.map(u64::from),
+        "cpu",
+    )?;
+    Ok((memory, cores.min(u64::from(u32::MAX))))
+}
+
 #[async_trait]
 impl ExecutorBackend for ApptainerBackend {
     fn kind(&self) -> ExecutorKind {
@@ -293,6 +296,20 @@ impl ExecutorBackend for ApptainerBackend {
             limits: self.config.envelope,
             ..BackendCaps::default()
         }
+    }
+
+    fn granted(&self, spec: &TaskSpec) -> Result<GrantedResources, BackendError> {
+        let (memory, cores) = enforced_limits(&self.config, spec)?;
+        Ok(GrantedResources {
+            nano_cpus: Some(cores * 1_000_000_000),
+            ram_bytes: Some(memory),
+            disk_bytes: None,
+            workspace_bytes: None,
+            walltime_ms: spec
+                .resources
+                .max_walltime
+                .map(aruna_core::telemetry::duration_ms),
+        })
     }
 
     /// Apptainer performs no user switch, so tasks inherit the service identity.
@@ -497,11 +514,6 @@ impl ExecutorBackend for ApptainerBackend {
             ));
         }
         let size = candidate.metadata().map_err(io_error)?.len();
-        if size > MAX_TRANSFER_BYTES {
-            return Err(BackendError::InvalidSpec(
-                "output exceeds transfer limit".to_string(),
-            ));
-        }
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(stream_file(candidate, tx));
         Ok(TaskOutput {
@@ -788,7 +800,7 @@ async fn stage_files(directory: &Path, plan: StagePlan) -> Result<Vec<BindMount>
             written = written.checked_add(chunk.len() as u64).ok_or_else(|| {
                 BackendError::InvalidSpec("input byte count overflows".to_string())
             })?;
-            if written > entry.size || written > MAX_TRANSFER_BYTES {
+            if written > entry.size {
                 return Err(BackendError::InvalidSpec(format!(
                     "input `{}` exceeds its declared size",
                     entry.path.display()

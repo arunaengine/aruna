@@ -20,6 +20,7 @@ pub mod hash;
 pub mod invenio;
 mod messages;
 pub mod opendal;
+pub mod pace;
 mod part_chain;
 pub mod repo;
 pub mod rocrate;

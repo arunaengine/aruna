@@ -89,6 +89,7 @@ fn entry(path: &str) -> PageEntry {
         source_path: format!("data/{path}"),
         target_key: path.to_string(),
         observation: observation(path),
+        metadata: Default::default(),
     }
 }
 
@@ -100,6 +101,7 @@ fn checkpoint() -> StagingJobCheckpoint {
         prefixes_done: 1,
         walk: None,
         manifest: None,
+        table: None,
         queue_head: 0,
         queue_tail: 0,
         items_current: 0,
@@ -138,7 +140,6 @@ fn input(entries: Vec<PageEntry>) -> PageImportInput {
         writes: Vec::new(),
         deletes: Vec::new(),
         now: SystemTime::UNIX_EPOCH + Duration::from_secs(2_000),
-        database: None,
         ranges: None,
     }
 }
@@ -369,16 +370,12 @@ fn page_registers_atomically() {
     assert_eq!(result.checkpoint.items_succeeded, 2);
 }
 
-// The database entry the bucket is listed under is fixed in the origin when it is minted.
+// An imported version records its external source as its origin.
 #[test]
-fn origin_keeps_database() {
+fn origin_marks_source() {
     use aruna_core::structs::storage::blob::BlobVersion;
     use aruna_core::structs::storage::origin::VersionOrigin;
-    let database = Some(Ulid::from_bytes([8; 16]));
-    let mut operation = PageImportOperation::new(PageImportInput {
-        database,
-        ..input(vec![entry("a")])
-    });
+    let mut operation = PageImportOperation::new(input(vec![entry("a")]));
 
     let writes = run_to_writes(&mut operation, vec![None], None);
 
@@ -386,7 +383,7 @@ fn origin_keeps_database() {
         .find(|(space, ..)| space == BLOB_VERSIONS_KEYSPACE)
         .unwrap();
     let version = BlobVersion::from_bytes(value).unwrap();
-    assert_eq!(version.origin, Some(VersionOrigin::Source { database }));
+    assert_eq!(version.origin, Some(VersionOrigin::Source));
 }
 
 #[test]
@@ -691,6 +688,86 @@ async fn flush_keeps_page() {
     panic!("the page never reached its commit");
 }
 
+// An observation with nothing to compare but its size, as a table row gives it, imported
+// again unchanged writes nothing; a different size or a moved source is no longer unchanged.
+#[tokio::test]
+async fn bare_size_unchanged() {
+    use crate::connectors::repository::source_connector_key;
+    use crate::driver::drive;
+    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
+
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let group_id = bucket().group_id;
+    let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
+    let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
+    crate::jobs::store::insert_job(&context.storage_handle, &record(token()))
+        .await
+        .unwrap();
+    let bare = |content_length| PageEntry {
+        observation: SourceMetadata {
+            content_length,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        },
+        ..entry("a")
+    };
+    let page = |content_length, checkpoint| PageImportInput {
+        connector: connector.clone(),
+        expected_bucket: expected_bucket.clone(),
+        checkpoint,
+        ..input(vec![bare(content_length)])
+    };
+    let run = |page| drive(PageImportOperation::new(page), context);
+
+    let first = run(page(4, checkpoint())).await.unwrap();
+    let again = run(page(4, first.checkpoint.clone())).await.unwrap();
+    assert_eq!(
+        (first.registered, again.registered, again.unchanged),
+        (1, 0, 1)
+    );
+    let resized = run(page(5, again.checkpoint.clone())).await.unwrap();
+    assert_eq!(resized.unchanged, 0);
+
+    // A later job sees the same bare row as unchanged until the connector's endpoint moves;
+    // then it binds the file to the new source.
+    let started = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let started = started.as_millis() as u64 + 1;
+    let job_id = JobId::from_bytes([6; 16]);
+    let mut later = record(token());
+    later.job_id = job_id;
+    (later.created_at_ms, later.updated_at_ms) = (started, started);
+    crate::jobs::store::insert_job(&context.storage_handle, &later)
+        .await
+        .unwrap();
+    let mut moved = connector.clone();
+    let endpoint = "http://127.0.0.1:10".to_string();
+    moved.public_config.insert("endpoint".to_string(), endpoint);
+    let later_page = |connector: &SourceConnector| PageImportInput {
+        job_id,
+        checkpoint_key: ByteView::from(job_id.to_bytes().to_vec()),
+        connector: connector.clone(),
+        ..page(4, checkpoint())
+    };
+    let kept = run(later_page(&connector)).await.unwrap();
+    assert_eq!((kept.registered, kept.unchanged), (0, 1));
+    let write = StorageEffect::Write {
+        key_space: SOURCE_INDEX_KEYSPACE.to_string(),
+        key: source_connector_key(group_id, moved.connector_id),
+        value: moved.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    context.storage_handle.send_storage_effect(write).await;
+    let rebound = run(later_page(&moved)).await.unwrap();
+    assert_eq!((rebound.registered, rebound.unchanged), (1, 0));
+}
+
 // Runs the page twice against real storage: the commit is atomic and the replay finds the
 // registered head, so usage and connector rows are counted once.
 #[tokio::test]
@@ -976,6 +1053,7 @@ fn bakrep_entry(index: usize) -> PageEntry {
             source_version: None,
             digests: Default::default(),
         },
+        metadata: Default::default(),
     }
 }
 

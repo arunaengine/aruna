@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use aruna_core::compute::{
-    BackendError, FenceContext, NetworkAccess, SessionMount, StagingMode, TaskSpec,
-    normalize_container_path,
+    BackendError, FenceContext, GrantedResources, NetworkAccess, SessionMount, StagingMode,
+    TaskSpec, normalize_container_path,
 };
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolume, PersistentVolumeClaim, Pod, Secret};
@@ -64,15 +64,14 @@ pub fn job_manifest(
             json!({"name":"marker","configMap":{"name":marker_name(&name)}}),
             json!({"name":"tools","emptyDir":{}}),
         ]);
-        if spec.staging_mode == StagingMode::Files {
-            for input in &layout.files {
-                mounts.push(json!({
-                    "name":"workspace",
-                    "mountPath":input.path,
-                    "subPath":relative_path(&input.path)?,
-                    "readOnly":true
-                }));
-            }
+        // Copied inputs come from the workspace, also next to mounted ones.
+        for input in &layout.files {
+            mounts.push(json!({
+                "name":"workspace",
+                "mountPath":input.path,
+                "subPath":relative_path(&input.path)?,
+                "readOnly":true
+            }));
         }
         for output in &layout.output_parents {
             mounts.push(json!({
@@ -104,10 +103,20 @@ pub fn job_manifest(
     if spec.staging_mode == StagingMode::S3Mount {
         let buckets = mount_buckets(layout);
         for (index, bucket) in buckets.iter().enumerate() {
-            volumes.push(json!({
-                "name":mount_name(&name,index),
-                "persistentVolumeClaim":{"claimName":mount_name(&name,index)}
-            }));
+            // KubeDAL reads its endpoint and credential from the run's own DataNode.
+            let source = match &config.kubedal {
+                Some(kubedal) => json!({"csi":{
+                    "driver":kubedal.driver,
+                    "readOnly":true,
+                    "volumeAttributes":{"dataNode":mount_name(&name,index),"mount":"fuse-read-only"}
+                }}),
+                None => json!({"persistentVolumeClaim":{"claimName":mount_name(&name,index)}}),
+            };
+            let mut volume = json!({"name":mount_name(&name,index)});
+            if let (Some(volume), Some(source)) = (volume.as_object_mut(), source.as_object()) {
+                volume.extend(source.clone());
+            }
+            volumes.push(volume);
             for input in layout.mounts.iter().filter(|input| &input.bucket == bucket) {
                 mounts.push(json!({
                     "name":mount_name(&name,index),
@@ -197,10 +206,7 @@ pub fn job_manifest(
         "terminationMessagePolicy":"FallbackToLogsOnError",
         "volumeMounts":mounts
     });
-    let deadline = spec
-        .resources
-        .max_walltime
-        .map(|duration| i64::try_from(duration.as_secs().max(1)).unwrap_or(i64::MAX));
+    let deadline = deadline_secs(spec);
     serde_json::from_value(json!({
         "apiVersion":"batch/v1",
         "kind":"Job",
@@ -267,6 +273,40 @@ pub fn mount_pv_manifest(
     let name = mount_name(&context.attempt.external_name(), index);
     let options = ["file-mode=0444", "dir-mode=0555"];
     s3_pv_manifest(context, config, &name, bucket, &options, true)
+}
+
+/// The KubeDAL DataNode one mounted bucket reads through: this node's gateway, the bucket
+/// and the run's own secret, read only. The run's labels and epoch let cleanup find it.
+pub fn data_node_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    index: usize,
+    bucket: &str,
+) -> Result<serde_json::Value, BackendError> {
+    let kubedal = config.kubedal.as_ref().ok_or_else(|| {
+        BackendError::InvalidSpec("KubeDAL mounts are disabled on this backend".to_string())
+    })?;
+    let name = context.attempt.external_name();
+    Ok(json!({
+        "apiVersion":"kubedal.arunaengine.org/v1alpha1",
+        "kind":"DataNode",
+        "metadata":{
+            "name":mount_name(&name,index),
+            "namespace":config.namespace,
+            "labels":labels(context,"s3-mount"),
+            "annotations":annotations_base(context,"active")
+        },
+        "spec":{
+            "backend":"S3",
+            "read_only":true,
+            "secretRef":{"name":secret_name(&name)},
+            "config":{
+                "bucket":bucket,
+                "endpoint":kubedal.endpoint,
+                "region":kubedal.region
+            }
+        }
+    }))
 }
 
 pub fn mount_pvc_manifest(
@@ -637,7 +677,8 @@ pub fn mount_buckets(layout: &StageLayout) -> Vec<String> {
 
 pub fn needs_workspace(spec: &TaskSpec) -> bool {
     spec.staging_mode == StagingMode::Files
-        || (spec.staging_mode == StagingMode::S3Mount && !spec.output_paths.is_empty())
+        || (spec.staging_mode == StagingMode::S3Mount
+            && (!spec.output_paths.is_empty() || !spec.inputs.is_empty()))
 }
 
 pub fn secret_name(name: &str) -> String {
@@ -757,15 +798,7 @@ fn resource_limits(
     config: &KubernetesConfig,
 ) -> Result<serde_json::Value, BackendError> {
     let mut limits = BTreeMap::new();
-    limits.insert(
-        "cpu",
-        enforced_limit(
-            spec.resources.cpu_cores.map(u64::from),
-            config.default_cpu_cores.map(u64::from),
-            "cpu",
-        )?
-        .to_string(),
-    );
+    limits.insert("cpu", cpu_cores(spec, config)?.to_string());
     limits.insert(
         "memory",
         enforced_limit(spec.resources.ram_bytes, config.default_mem_bytes, "memory")?.to_string(),
@@ -774,6 +807,48 @@ fn resource_limits(
         limits.insert("ephemeral-storage", disk.to_string());
     }
     Ok(json!({"limits":limits,"requests":limits}))
+}
+
+fn cpu_cores(spec: &TaskSpec, config: &KubernetesConfig) -> Result<u64, BackendError> {
+    enforced_limit(
+        spec.resources.cpu_cores.map(u64::from),
+        config.default_cpu_cores.map(u64::from),
+        "cpu",
+    )
+}
+
+/// Seconds of the Job's `activeDeadlineSeconds`, at least one.
+fn deadline_secs(spec: &TaskSpec) -> Option<i64> {
+    spec.resources
+        .max_walltime
+        .map(|duration| i64::try_from(duration.as_secs().max(1)).unwrap_or(i64::MAX))
+}
+
+/// The workspace volume of a run: its disk request, else its staged inputs plus room to work.
+pub fn workspace_bytes(spec: &TaskSpec) -> u64 {
+    spec.resources.disk_bytes.unwrap_or_else(|| {
+        (spec.inputs.iter()).fold(super::DEFAULT_WORKSPACE_BYTES, |total, input| {
+            total.saturating_add(input.size())
+        })
+    })
+}
+
+/// The limits the task pod and its workspace volume are created with.
+pub fn granted_resources(
+    spec: &TaskSpec,
+    config: &KubernetesConfig,
+) -> Result<GrantedResources, BackendError> {
+    Ok(GrantedResources {
+        nano_cpus: Some(cpu_cores(spec, config)?.saturating_mul(1_000_000_000)),
+        ram_bytes: Some(enforced_limit(
+            spec.resources.ram_bytes,
+            config.default_mem_bytes,
+            "memory",
+        )?),
+        disk_bytes: spec.resources.disk_bytes.or(config.default_disk_bytes),
+        workspace_bytes: needs_workspace(spec).then(|| workspace_bytes(spec)),
+        walltime_ms: deadline_secs(spec).map(|secs| (secs as u64).saturating_mul(1000)),
+    })
 }
 
 /// The selector every task and helper pod carries, so a declared worker site is
@@ -846,6 +921,34 @@ mod tests {
         let plain =
             serde_json::to_value(job_manifest(&context(), &spec, &base, &layout).unwrap()).unwrap();
         assert!(plain["spec"]["template"]["spec"]["nodeSelector"].is_null());
+    }
+
+    #[test]
+    fn granted_matches_manifest() {
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.resources.ram_bytes = Some(2_048);
+        spec.resources.max_walltime = Some(std::time::Duration::from_millis(1_500));
+        let mut config = config();
+        config.default_cpu_cores = Some(3);
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = serde_json::to_value(job_manifest(&context(), &spec, &config, &layout).unwrap())
+            .unwrap();
+        let granted = granted_resources(&spec, &config).unwrap();
+        let limits = &job["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"];
+        assert_eq!(limits["cpu"], "3");
+        assert_eq!(granted.nano_cpus, Some(3_000_000_000));
+        assert_eq!(limits["memory"], "2048");
+        assert_eq!(granted.ram_bytes, Some(2_048));
+        assert!(limits["ephemeral-storage"].is_null());
+        assert_eq!(granted.disk_bytes, None);
+        assert_eq!(job["spec"]["activeDeadlineSeconds"], 1);
+        assert_eq!(granted.walltime_ms, Some(1_000));
+        assert_eq!(granted.workspace_bytes, Some(workspace_bytes(&spec)));
+        spec.staging_mode = StagingMode::DirectS3;
+        assert_eq!(
+            granted_resources(&spec, &config).unwrap().workspace_bytes,
+            None
+        );
     }
 
     #[test]
@@ -981,6 +1084,65 @@ mod tests {
                 mount.mount_path == "/inputs/requirements.txt" && mount.read_only == Some(true)
             }));
         }
+    }
+
+    #[test]
+    fn mounts_through_kubedal() {
+        // KubeDAL reads the run's own DataNode: this node's gateway, the view bucket and the
+        // run secret, read only, as one inline FUSE volume with a sub path per input.
+        let mut kubedal = config();
+        kubedal.kubedal = Some(Box::new(crate::executor::config::KubedalMount {
+            driver: "kubedal.arunaengine.org".to_string(),
+            endpoint: "https://s3.node-2.example".to_string(),
+            region: "us-east-1".to_string(),
+        }));
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.staging_mode = StagingMode::S3Mount;
+        spec.s3_mounts.push(S3Mount {
+            bucket: "in-run".to_string(),
+            key: "db/bakta.db".to_string(),
+            path: "/db/bakta.db".to_string(),
+        });
+        spec.secret_env
+            .insert("access_key_id".to_string(), Secret::new("temporary-access"));
+        spec.secret_env.insert(
+            "secret_access_key".to_string(),
+            Secret::new("temporary-secret"),
+        );
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = serde_json::to_value(job_manifest(&context(), &spec, &kubedal, &layout).unwrap())
+            .unwrap();
+        let pod = &job["spec"]["template"]["spec"];
+        let volume = pod["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume.get("csi").is_some())
+            .expect("inline volume");
+        let name = mount_name(&context().attempt.external_name(), 0);
+        assert_eq!(volume["csi"]["driver"], "kubedal.arunaengine.org");
+        assert_eq!(volume["csi"]["readOnly"], true);
+        assert_eq!(volume["csi"]["volumeAttributes"]["dataNode"], name.as_str());
+        assert_eq!(volume["csi"]["volumeAttributes"]["mount"], "fuse-read-only");
+        assert!(volume.get("persistentVolumeClaim").is_none());
+        let mounts = pod["containers"][0]["volumeMounts"].as_array().unwrap();
+        assert!(mounts.iter().any(|mount| mount["subPath"] == "db/bakta.db"
+            && mount["mountPath"] == "/db/bakta.db"
+            && mount["readOnly"] == true));
+        let node = data_node_manifest(&context(), &kubedal, 0, "in-run").unwrap();
+        assert_eq!(node["kind"], "DataNode");
+        assert_eq!(node["spec"]["read_only"], true);
+        assert_eq!(node["spec"]["config"]["bucket"], "in-run");
+        assert_eq!(
+            node["spec"]["config"]["endpoint"],
+            "https://s3.node-2.example"
+        );
+        assert_eq!(
+            node["spec"]["secretRef"]["name"],
+            secret_name(&context().attempt.external_name()).as_str()
+        );
+        assert_eq!(node["metadata"]["labels"][ROLE_LABEL], "s3-mount");
+        assert!(data_node_manifest(&context(), &config(), 0, "in-run").is_err());
     }
 
     #[test]

@@ -238,7 +238,7 @@ async fn file_names_datasets() {
     assert!(!inside.more);
     assert_eq!(
         inside.more_datasets,
-        format!("/api/v1/data/buckets/{BUCKET}/links?key=raw%2Fa+b.fq&parts_only=true")
+        format!("/api/v1/data/buckets/{BUCKET}/datasets?key=raw%2Fa+b.fq&parts_only=true")
     );
     let outside = part_of_file(&test, &test.auth, BUCKET, "tmp/a.fq")
         .await

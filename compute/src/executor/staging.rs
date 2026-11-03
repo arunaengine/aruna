@@ -60,12 +60,10 @@ impl StageLayout {
                     "DirectS3 staging must not include container file inputs".to_string(),
                 ));
             }
-            StagingMode::S3Mount
-                if !spec.inputs.is_empty() || (!spec.session && spec.workspace.is_some()) =>
-            {
+            // Mounted inputs may sit next to copied ones; only a session binds a workspace.
+            StagingMode::S3Mount if !spec.session && spec.workspace.is_some() => {
                 return Err(BackendError::InvalidSpec(
-                    "S3Mount staging must not include copied inputs or a workspace binding"
-                        .to_string(),
+                    "S3Mount staging must not include a workspace binding".to_string(),
                 ));
             }
             _ => {}

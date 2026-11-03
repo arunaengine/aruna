@@ -100,6 +100,9 @@ pub struct BucketSearchParams {
     pub group_id: Option<String>,
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Only buckets whose metadata marks them as a database.
+    #[serde(default)]
+    pub database: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -119,6 +122,8 @@ pub enum ObjectMatchMode {
     #[default]
     Substring,
     Prefix,
+    /// Searchable object metadata: free text plus `column=value` filters.
+    Metadata,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -176,6 +181,9 @@ pub struct ObjectHit {
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// The object's kept metadata columns; filled for `match=metadata` only.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -271,6 +279,12 @@ pub struct BucketHit {
     /// set on several nodes are one bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set_id: Option<String>,
+    /// The bucket's metadata, in a `database=true` search only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<crate::routes::storage::bucket_metadata::BucketMetadataBody>,
+    /// Anyone, also without a login, may read the bucket; in a `database=true` search only.
+    #[serde(default)]
+    pub public: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -382,6 +396,9 @@ to its own buckets, so a bucket the caller may not read never appears.
 - The search fans out over the realm's serving nodes under one shared deadline of about 12 seconds.
 - An empty or missing `q` lists every bucket the caller may read; `group_id` keeps only the
   buckets of that group.
+- `database=true` keeps only buckets whose current metadata marks them as a database, across
+  groups, and adds that `metadata` and `public` (readable without a login) to each hit. This is
+  how clients find databases; there is no separate database list.
 - A member of a distributed bucket carries its `set_id`; every member node answers its own hit,
   so hits with one `set_id` are one bucket.
 - Hits are ordered by bucket name, then node id. `next_cursor` continues the listing and is absent
@@ -389,6 +406,11 @@ to its own buckets, so a bucket the caller may not read never appears.
   `q` and `group_id`; every page checks authorization again.
 - A node that fails on a page keeps its position, so a later page asks it again from there; the
   listing then ends only once every node answered to its end.
+- One page asks at most 32 nodes. Nodes left out stay in the cursor and are asked on later
+  pages, once others reached their end; hits are then ordered within each page only.
+- A node that scans many buckets without enough hits ends its part of the page where its scan
+  stopped, and the next page goes on from there. That position opens only on its node until the
+  node restarts; after a restart the node's part ends and the page counts it in `nodes_failed`.
 - A node that fails, times out or is dropped by the node cap does not fail the request. The answer
   is partial and reports it through `nodes_queried`, `nodes_failed` and `failed_nodes`, which names
   the nodes that did not answer and carries `partition-discovery` when node discovery itself
@@ -402,7 +424,8 @@ to its own buckets, so a bucket the caller may not read never appears.
         ("q" = Option<String>, Query, description = "Case-insensitive bucket-name substring; trimmed, empty or at least 2 characters, no wildcards"),
         ("group_id" = Option<String>, Query, description = "Only buckets of this group, as a 26-character ULID"),
         ("limit" = Option<usize>, Query, description = "Maximum number of merged hits (default 10, clamped to 1..=50)"),
-        ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` of the previous page, with the same `q` and `group_id`")
+        ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` of the previous page, with the same `q`, `group_id` and `database`"),
+        ("database" = Option<bool>, Query, description = "Only buckets whose metadata marks them as a database; hits then carry `metadata` and `public`")
     ),
     responses(
         (
@@ -461,6 +484,7 @@ pub async fn bucket_search(
             group_id,
             cursor: params.cursor,
             target_nodes: None,
+            database: params.database,
         },
     )
     .await
@@ -498,14 +522,21 @@ restrictions and request policies before it can be returned.
   `coverage.index_progress` lists the keys indexed so far and the range's key count for each
   such range whose coordinator answered. `distributed_strict` answers 503 while any remain, and
   the error message says how many ranges and about how many keys are still to be indexed.
+- `match=metadata` matches object metadata instead of keys, for objects whose version names
+  searchable columns in `aruna-search-text` and `aruna-search-exact` (table imports set both).
+  Words of `q` must all appear in the text columns (case-insensitive, whole words); terms
+  `column=value` must equal an exact column, with quotes around values with spaces, as in
+  `coli taxid=562 assembly_level="Complete Genome"`. Each hit carries the object's kept metadata
+  columns in `metadata`, after the same authorization as every hit. A distributed bucket walks only its
+  searchable keys, a bounded number per page, so a rare match may take many pages.
 - A search without `bucket` skips distributed buckets, which only their key indexes cover;
   each skipped bucket counts in `coverage.incomplete_ranges`.
 - A cursor that continues after keys the caller may not see carries them sealed; a restart of
   the node that sealed it makes such a cursor invalid."#,
     params(
-        ("q" = String, Query, description = "Case-sensitive key substring or prefix; trimmed, minimum 2 characters"),
+        ("q" = String, Query, description = "Case-sensitive key substring or prefix, or a metadata query; trimmed, minimum 2 characters"),
         ("bucket" = Option<String>, Query, description = "Optional exact bucket name"),
-        ("match" = Option<ObjectMatchMode>, Query, description = "Key match mode: substring (default) or prefix"),
+        ("match" = Option<ObjectMatchMode>, Query, description = "Match mode: substring (default) or prefix on keys, or metadata"),
         ("mode" = Option<ObjectMode>, Query, description = "Coverage mode: distributed_best_effort (default), distributed_strict, or local"),
         ("limit" = Option<usize>, Query, description = "Maximum merged hits (default 10, clamped to 1..=100)"),
         ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same query, bucket, match type, and mode")
@@ -585,6 +616,7 @@ pub async fn object_search(
     let key_match = match params.match_mode.unwrap_or_default() {
         ObjectMatchMode::Substring => ObjectKeyMatch::Substring,
         ObjectMatchMode::Prefix => ObjectKeyMatch::Prefix,
+        ObjectMatchMode::Metadata => ObjectKeyMatch::Metadata,
     };
     let result = search_objects(
         state.get_ctx().as_ref(),
@@ -652,6 +684,7 @@ fn map_search_response(result: ObjectExecution, mode: ObjectMode) -> ObjectRespo
                 }),
                 size: hit.size,
                 updated_at: hit.updated_at.map(format_system_time),
+                metadata: hit.metadata,
             })
             .collect(),
         next_cursor: result.next_cursor,
@@ -901,6 +934,7 @@ async fn run_buckets(
             group_id: None,
             cursor: None,
             target_nodes: None,
+            database: false,
         },
     )
     .await
@@ -930,6 +964,8 @@ fn map_bucket_section(result: BucketSearchExecution) -> BucketsSection {
                 group_name: hit.group_name,
                 created_at: chrono::DateTime::<chrono::Utc>::from(hit.created_at).to_rfc3339(),
                 set_id: hit.set_id.map(|set_id| set_id.to_string()),
+                metadata: hit.metadata.map(Into::into),
+                public: hit.public,
             })
             .collect(),
         next_cursor: result.next_cursor,

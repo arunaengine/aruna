@@ -27,7 +27,7 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle bound, not a deadline: it resets on every byte, so a stalled tenant
 /// endpoint is dropped while a multi-gigabyte transfer keeps running.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
-const REDIRECT_HOPS: usize = 5;
+pub(crate) const REDIRECT_HOPS: usize = 5;
 
 type LookupFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
 type Lookup = Arc<dyn Fn(String) -> LookupFuture + Send + Sync>;
@@ -153,8 +153,17 @@ impl HttpTransport for ScreenedFetch {
             return Err(denied(EgressError::MissingHost(uri)));
         };
         screen_host(&self.policy, &host).map_err(denied)?;
-        self.client.fetch(request).await
+        // Each request opendal sends, its own retries included, takes a token of a paced task.
+        crate::pace::turn().await.map_err(unpaced)?;
+        let response = self.client.fetch(request).await?;
+        crate::pace::answered(response.status(), response.headers()).map_err(unpaced)?;
+        Ok(response)
     }
+}
+
+/// A request a paced task did not send, or whose answer it cannot honour.
+fn unpaced(error: crate::pace::PaceError) -> opendal::Error {
+    opendal::Error::new(ErrorKind::Unexpected, error.to_string())
 }
 
 /// Bundles the egress policy with the clients that enforce it.
@@ -236,6 +245,24 @@ impl EgressGuard {
             .ok_or_else(|| EgressError::MissingHost(url.to_string()))?;
         screen_host(&self.policy, host)?;
         Ok(self.plain.get(url))
+    }
+
+    /// Screened GET builder that follows no redirect, for callers that follow each hop
+    /// themselves; `visited` are the earlier hops, and a hop may not leave HTTPS. Errors name
+    /// the hop's host only, never its path or query, which may hold credentials.
+    pub fn hop_request(
+        &self,
+        url: Url,
+        visited: &[Url],
+    ) -> Result<reqwest::RequestBuilder, EgressError> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| EgressError::MissingHost(format!("{}:", url.scheme())))?;
+        screen_host(&self.policy, host)?;
+        if scheme_downgraded(visited, &url) {
+            return Err(EgressError::SchemeDowngrade(host.to_string()));
+        }
+        Ok(self.opendal.get(url))
     }
 
     /// Screens repository requests and refuses redirects for authenticated writes.

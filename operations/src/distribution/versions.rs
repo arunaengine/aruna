@@ -374,7 +374,9 @@ impl InventoryVersionsOperation {
                     created_at,
                 },
                 BlobVersionState::Reference {
-                    cached_metadata, ..
+                    cached_metadata,
+                    source,
+                    ..
                 } => ListVersionsItem::Version {
                     key,
                     version_id,
@@ -382,6 +384,9 @@ impl InventoryVersionsOperation {
                     location: None,
                     source_metadata: Some(cached_metadata),
                     created_at,
+                    link: (source.descriptor.kind
+                        == aruna_core::structs::execution::source_connector::SourceConnectorKind::ArunaLink)
+                        .then_some(source),
                 },
                 _ => ListVersionsItem::Version {
                     key,
@@ -390,6 +395,7 @@ impl InventoryVersionsOperation {
                     location,
                     source_metadata: None,
                     created_at,
+                    link: None,
                 },
             });
         }

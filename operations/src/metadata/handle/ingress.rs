@@ -18,7 +18,7 @@ use aruna_net::streams::BiStream;
 use tracing::{Span, field};
 
 use super::effects::metadata_read_error;
-use super::peer_auth::{bucket_search_auth, config_digest_matches};
+use super::peer_auth::{bucket_search_auth, config_digest_matches, release_auth};
 use super::query::query_local_graphs;
 use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
@@ -32,6 +32,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{AuthToken, MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::release::publish::{PublishError, holder_answer};
 use crate::s3::bucket::search::{SearchBucketsInput, search_local_buckets};
 use crate::s3::object::search::{SearchObjectsInput, search_local_objects};
 use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
@@ -429,6 +430,7 @@ impl MetadataHandle {
                 limit,
                 group_id,
                 start_after,
+                database,
             } => {
                 Box::pin(async {
                     match bucket_search_auth(
@@ -450,7 +452,8 @@ impl MetadataHandle {
                                     query,
                                     limit,
                                     group_id,
-                                    start_after: start_after.map(|after| after.into_bytes().into()),
+                                    start_after: start_after.map(Into::into),
+                                    database,
                                 },
                             )
                             .await
@@ -526,6 +529,30 @@ impl MetadataHandle {
                     }
                 })
                 .await
+            }
+            MetadataTransportMessage::ReleaseHolder {
+                auth_token,
+                bucket,
+                ask,
+            } => {
+                let result = Box::pin(async {
+                    let realm_id = self.inner.net_handle.as_ref().map(|net| *net.realm_id());
+                    let storage = &self.inner.storage_handle;
+                    let validation = &self.inner.auth_validation;
+                    let auth =
+                        release_auth(validation, storage, peer, realm_id, auth_token).await?;
+                    let net_handle =
+                        (self.inner.net_handle.as_ref()).ok_or(MetadataReadError::Unavailable)?;
+                    let scope = (*net_handle.realm_id(), net_handle.node_id());
+                    holder_answer(context.as_ref(), scope, &auth, (bucket.as_str(), ask))
+                        .await
+                        .map_err(|error| match error {
+                            PublishError::Forbidden(_) => MetadataReadError::Forbidden,
+                            _ => MetadataReadError::Unavailable,
+                        })
+                })
+                .await;
+                MetadataTransportMessage::ReleaseHolderResults { result }
             }
             _ => unreachable!("request family routed incorrectly"),
         }
@@ -1011,7 +1038,8 @@ impl MetadataHandle {
                 (self.preflight_request(context, peer, message).await, None)
             }
             message @ (MetadataTransportMessage::SearchBuckets { .. }
-            | MetadataTransportMessage::SearchObjects { .. }) => {
+            | MetadataTransportMessage::SearchObjects { .. }
+            | MetadataTransportMessage::ReleaseHolder { .. }) => {
                 (self.bucket_request(context, peer, message).await, None)
             }
             MetadataTransportMessage::LookupIdentifier {
@@ -1130,6 +1158,22 @@ impl MetadataHandle {
                 let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
                 let result = Box::pin(ready).await;
                 (MetadataTransportMessage::PromotionReady { result }, None)
+            }
+            MetadataTransportMessage::ResolveJobInputs {
+                auth_token,
+                request,
+            } => {
+                let resolved = crate::jobs::lifecycle::ingress::serve_input_resolve(
+                    context, peer, auth_token, *request,
+                );
+                let result = Box::pin(resolved).await;
+                (MetadataTransportMessage::ResolvedJobInputs { result }, None)
+            }
+            MetadataTransportMessage::JobInputPage { submission, digest } => {
+                let page =
+                    crate::jobs::records::pages::serve_page(context, peer, submission, digest);
+                let page = Box::pin(page).await;
+                (MetadataTransportMessage::InputPageResult { page }, None)
             }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {

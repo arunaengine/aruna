@@ -175,6 +175,7 @@ async fn publishes_terminal_success() {
         TOKEN,
         intent,
         Some(receipt.execution_id),
+        None,
         4_100,
     )
     .await

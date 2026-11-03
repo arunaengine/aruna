@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    API_PREFIX, RELAYED_ROUTES, gateway_failed, may_try_next, may_try_response, pinned_route,
-    pinned_targets, relay_route, relay_targets, relay_url, relayed_headers,
+    API_PREFIX, MANAGEMENT_URL_TTL, RELAYED_ROUTES, gateway_failed, healthy_first, may_try_next,
+    may_try_response, relay_route, relay_targets, relay_url, relayed_headers,
 };
 use crate::error::{ErrorResponse, ServerError};
 use axum::body::to_bytes;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::IntoResponse;
+use std::collections::BTreeMap;
+use std::time::Instant;
 
 #[test]
 fn matches_allowlisted_routes() {
@@ -103,30 +105,6 @@ fn management_answers_itself() {
 }
 
 #[test]
-fn requests_reach_owner() {
-    // A database request asked of any management node is relayed to the request owner.
-    let route = Some("/api/v1/system/realm/databases/requests/{request_id}/approve");
-    assert_eq!(
-        relay_route(&Method::POST, route, true, false),
-        Some("/system/realm/databases/requests/{request_id}/approve")
-    );
-    assert_eq!(relay_route(&Method::POST, route, true, true), None);
-    let owner = iroh::SecretKey::from_bytes(&[1; 32]).public();
-    let url = "https://owner.example.test".to_string();
-    let peers = vec!["https://peer.example.test".to_string()];
-    let known = Some((owner, Some(url.clone())));
-    assert_eq!(
-        pinned_targets(known.clone(), peers.clone(), true),
-        std::slice::from_ref(&url)
-    );
-    assert_eq!(pinned_targets(known, peers.clone(), false), [url]);
-    // A realm node never falls back to another management node when the owner has no url.
-    let unpublished = Some((owner, None));
-    assert!(pinned_targets(unpublished.clone(), peers.clone(), true).is_empty());
-    assert_eq!(pinned_targets(unpublished, peers.clone(), false), peers);
-}
-
-#[test]
 fn builds_target_url() {
     // Node info documents publish `API_PUBLIC_URL` as a bare origin.
     let uri: Uri = "/api/v1/access/onboarding/secrets?limit=5".parse().unwrap();
@@ -159,21 +137,20 @@ fn uses_installed_urls() {
 }
 
 #[test]
-fn requests_stay_pinned() {
-    // Pending database requests live on one management node, so no fallback target is tried.
-    assert!(pinned_route("/system/realm/databases"));
-    assert!(pinned_route("/system/realm/databases/requests"));
-    assert!(pinned_route(
-        "/system/realm/databases/requests/{request_id}/approve"
-    ));
-    assert!(!pinned_route("/system/realm/databases/{entry_id}"));
-    assert!(!pinned_route("/system/realm/quota"));
-}
-
-#[test]
 fn connect_failure_advances() {
     assert!(may_try_next(&Method::POST, true));
     assert!(may_try_next(&Method::GET, true));
+}
+
+#[test]
+fn failed_target_last() {
+    let targets = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let failed = BTreeMap::from([("a".to_string(), Instant::now())]);
+    assert_eq!(healthy_first(targets.clone(), &failed), ["b", "c", "a"]);
+    // An old failure no longer demotes its target.
+    let old = Instant::now().checked_sub(MANAGEMENT_URL_TTL).unwrap();
+    let failed = BTreeMap::from([("a".to_string(), old)]);
+    assert_eq!(healthy_first(targets, &failed), ["a", "b", "c"]);
 }
 
 #[test]

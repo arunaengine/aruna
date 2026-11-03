@@ -168,6 +168,7 @@ async fn adopt_spares_live() {
             attempt_epoch: 0,
         },
         None,
+        None,
         1_000,
     )
     .await
@@ -460,6 +461,7 @@ async fn report_freezes() {
             current: 2,
             total: Some(2),
             unit: "items".to_string(),
+            paused_until: None,
         },
         4_000,
     )
@@ -685,6 +687,7 @@ async fn success_clears_error() {
         current: 1,
         total: Some(1),
         unit: "items".to_string(),
+        paused_until: None,
     };
     let payload = JobResultPayload::Staging {
         completed_items: 1,
@@ -699,6 +702,39 @@ async fn success_clears_error() {
 
     assert_eq!(done.state, JobState::Succeeded);
     assert!(done.last_error.is_none());
+}
+
+// A pause shown while the attempt runs is gone once the attempt fails or is cancelled.
+#[tokio::test]
+async fn finish_clears_pause() {
+    let (_dir, storage) = temp_storage();
+    let paused = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(60));
+    for (seed, cancel) in [(0x46u8, false), (0x47u8, true)] {
+        let job_id = JobId::from_bytes([seed; 16]);
+        insert_job(&storage, &queued_record(job_id)).await.unwrap();
+        let ClaimOutcome::Claimed(record) = claim_job(&storage, job_id, node_id(3), 5_000)
+            .await
+            .unwrap()
+        else {
+            panic!("job must be claimed")
+        };
+        let token = record.claim.unwrap().claim_token;
+        transition_to_running(&storage, job_id, token, 5_500)
+            .await
+            .unwrap();
+        let mut progress = JobProgress::new("items");
+        progress.paused_until = paused;
+        renew_lease(&storage, job_id, token, 6_000, Some(progress))
+            .await
+            .unwrap();
+        let stored = read_job_record(&storage, job_id, None).await.unwrap();
+        assert_eq!(stored.unwrap().progress.paused_until, paused);
+        let finished = match cancel {
+            true => cancel_running_job(&storage, job_id, token, 7_000).await,
+            false => fail_job(&storage, job_id, token, JobError::retryable("x"), 7_000).await,
+        };
+        assert_eq!(finished.unwrap().progress.paused_until, None);
+    }
 }
 
 // Retried payload work starts over, so persisted progress must start over too.
@@ -1108,6 +1144,7 @@ async fn fence_attempt(storage: &StorageHandle, job_id: JobId, token: Ulid) -> A
             pinned_image: "alpine@sha256:0".to_string(),
             attempt_epoch: 0,
         },
+        None,
         None,
         2_000,
     )
@@ -1902,7 +1939,7 @@ async fn attempt_intent_persists() {
                 .to_string(),
         attempt_epoch: 0,
     };
-    let committed = record_attempt_intent(&storage, job_id, token, intent, None, 6_000)
+    let committed = record_attempt_intent(&storage, job_id, token, intent, None, None, 6_000)
         .await
         .unwrap();
 
@@ -1934,7 +1971,7 @@ async fn cancel_blocks_intent() {
                 .to_string(),
         attempt_epoch: 0,
     };
-    let error = record_attempt_intent(&storage, job_id, token, intent, None, 6_000)
+    let error = record_attempt_intent(&storage, job_id, token, intent, None, None, 6_000)
         .await
         .unwrap_err();
 
@@ -1958,7 +1995,7 @@ async fn cancel_blocks_running() {
                 .to_string(),
         attempt_epoch: 0,
     };
-    let committed = record_attempt_intent(&storage, job_id, token, intent, None, 4_000)
+    let committed = record_attempt_intent(&storage, job_id, token, intent, None, None, 4_000)
         .await
         .unwrap();
     set_cancel_requested(&storage, job_id, 5_000).await.unwrap();
@@ -1972,6 +2009,116 @@ async fn cancel_blocks_running() {
     assert_eq!(stored.attempt_intent, committed.record.attempt_intent);
     assert!(stored.started_at_ms.is_none());
     assert!(stored.claim.is_some());
+}
+
+fn sample_launch() -> LaunchRecord {
+    LaunchRecord {
+        node_id: node_id(5),
+        executor_kind: "docker".to_string(),
+        location: "giessen".to_string(),
+        resources: Default::default(),
+        workdir: None,
+        env: Default::default(),
+        started_at_ms: None,
+    }
+}
+
+fn plain_intent(job_id: JobId) -> AttemptIntent {
+    AttemptIntent {
+        attempt_no: 0,
+        external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 0),
+        executor_kind: "docker".to_string(),
+        pinned_image:
+            "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        attempt_epoch: 0,
+    }
+}
+
+#[tokio::test]
+async fn launch_marks_executed() {
+    // The launch row joins the epoch's guarded commit and counts only once the job runs.
+    let (_dir, storage) = temp_storage();
+    let job_id = JobId::from_bytes([0xB1; 16]);
+    let token = Ulid::generate();
+    insert_job(&storage, &execution_record(job_id, token, JobState::Ready))
+        .await
+        .unwrap();
+    let launch = sample_launch();
+    let committed = record_attempt_intent(
+        &storage,
+        job_id,
+        token,
+        plain_intent(job_id),
+        None,
+        Some(&launch),
+        4_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_launch_record(&storage, &committed.record).await,
+        Ok(None)
+    );
+
+    let running = begin_external_running(&storage, job_id, token, Some(5_500), 6_000)
+        .await
+        .unwrap();
+    let executed = read_launch_record(&storage, &running)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(executed.started_at_ms, Some(5_500));
+    assert_eq!(executed.location, "giessen");
+}
+
+#[tokio::test]
+async fn stale_launch_refused() {
+    // A claimant whose token lost writes no launch facts; an accepted attempt counts as executed
+    // even when a cancellation keeps it from running.
+    let (_dir, storage) = temp_storage();
+    let job_id = JobId::from_bytes([0xB2; 16]);
+    let token = Ulid::generate();
+    insert_job(&storage, &execution_record(job_id, token, JobState::Ready))
+        .await
+        .unwrap();
+    let launch = sample_launch();
+    let stale = record_attempt_intent(
+        &storage,
+        job_id,
+        Ulid::generate(),
+        plain_intent(job_id),
+        None,
+        Some(&launch),
+        4_000,
+    )
+    .await;
+    assert!(stale.is_err());
+    let key = ByteView::from(attempt_control_key(job_id, 1));
+    let row = read_raw(&storage, LAUNCH_RECORD_KEYSPACE, key, None).await;
+    assert_eq!(row, Ok(None));
+
+    record_attempt_intent(
+        &storage,
+        job_id,
+        token,
+        plain_intent(job_id),
+        None,
+        Some(&launch),
+        4_000,
+    )
+    .await
+    .unwrap();
+    set_cancel_requested(&storage, job_id, 5_000).await.unwrap();
+    let stored = begin_external_running(&storage, job_id, token, Some(5_500), 6_000)
+        .await
+        .unwrap();
+    assert_eq!(stored.state, JobState::Ready);
+    let executed = read_launch_record(&storage, &stored)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(executed.started_at_ms, Some(5_500));
 }
 
 #[tokio::test]

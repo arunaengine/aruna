@@ -852,6 +852,7 @@ fn job_context(driver: Arc<DriverContext>, owner_node_id: NodeId) -> JobContext 
                 current: 0,
                 total: None,
                 unit: "entries".to_string(),
+                paused_until: None,
             },
         ),
         range_turns: Default::default(),

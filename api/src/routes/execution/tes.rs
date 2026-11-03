@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path as FilePath;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -18,6 +18,7 @@ use aruna_core::structs::execution::job::{
     OutputSelection, PhysicalExecutionResult, ResultMessage, WorkspaceMode,
 };
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::auth::bearer_token::realm_user_cutoff;
@@ -69,8 +70,6 @@ const DERIVED_TAG_KEYS: [&str; 4] = [ID_TAG_KEY, STATE_TAG_KEY, KIND_TAG_KEY, TR
 
 const DEFAULT_PAGE_SIZE: usize = 256;
 const MAX_PAGE_SIZE: usize = 512;
-/// Bounds the quadratic input/output path-overlap validation.
-const MAX_TASK_IO: usize = 512;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -565,7 +564,8 @@ naming a different one; a bearer token requires that tag.
 - An input url may instead be a versioned object ARN,
   `arn:aruna:<realm>:<node>:s3/<bucket>/<key>@<version>`. A local task then copies that exact
   version from the named realm node while staging; an unreachable node fails the run, not the
-  submission. The task reports such an input by its bucket and key.
+  submission. A task reports every input as the ARN of the exact version it read, so the task can
+  be submitted again unchanged.
 - A realm task reads every input from the bucket its `s3://` url names, at the version resolved
   when the task was accepted, so a later write to the source key never changes what a running task
   reads. Each declared output is written to the bucket its own url names. No bucket is created for
@@ -579,15 +579,17 @@ naming a different one; a bearer token requires that tag.
   `reserved_tag`.
 - Input urls must be `s3://bucket/key` or a versioned object ARN, output urls `s3://bucket/key`;
   container paths must be absolute, canonical and
-  may not overlap between inputs and outputs; at most 512 inputs and 1024 outputs, the same bound
-  the immutable output record carries.
+  may not overlap between inputs and outputs; at most 1024 outputs, the same bound the immutable
+  output record carries.
+- A `DIRECTORY` input names an `s3://bucket/prefix`; admission pins every object below the prefix
+  at its current version and places it below the input path.
 - An output path with POSIX wildcards additionally requires `path_prefix`, the literal ancestor
   stripped from each match before it is appended to the destination url. Such outputs may share
   one url. A pattern that matches a directory captures every file below it, and a staged input it
   matches is never captured. A `DIRECTORY` output captures every file below its path under its url.
   Within a pattern, brace alternatives such as `*.{bam,bai}` select each listed form and a `**`
   component spans any number of directories, as in Nextflow.
-- Unsupported: directory inputs, inline input content, wildcards in an input path, volumes,
+- Unsupported: inline input content, wildcards in an input path, volumes,
   executor stdin/stdout/stderr redirection and resource zones."#,
     request_body(
         content = TesTask,
@@ -922,7 +924,7 @@ pub async fn get_task(
     let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
     tes_json_response(
         StatusCode::OK,
-        project_task(&record, &details, view, &base_url),
+        project_task(&record, &details, view, (&base_url, state.get_realm_id())),
     )
 }
 
@@ -1096,7 +1098,9 @@ pub async fn list_tasks(
     };
     let tasks = records
         .iter()
-        .map(|(record, details)| project_task(record, details, view, &base_url))
+        .map(|(record, details)| {
+            project_task(record, details, view, (&base_url, state.get_realm_id()))
+        })
         .collect();
 
     tes_json_response(
@@ -1332,28 +1336,27 @@ fn validate_task_shape(task: &TesTask) -> Result<&TesExecutor, TesError> {
 }
 
 fn map_task_inputs(task: &TesTask, input_mode: InputMode) -> Result<Vec<InputSelection>, TesError> {
-    if task.inputs.len() > MAX_TASK_IO {
-        return Err(TesError::bad_request("too many task inputs"));
-    }
     let mut inputs: Vec<InputSelection> = Vec::with_capacity(task.inputs.len());
+    let mut paths = BTreeSet::new();
     for input in &task.inputs {
         let input = map_input(input, input_mode)?;
-        if inputs
-            .iter()
-            .any(|existing| existing.container_path == input.container_path)
+        if let Some(path) = input.container_path.clone()
+            && !paths.insert(path)
         {
             return Err(TesError::bad_request("duplicate input path"));
         }
-        if let Some(path) = input.container_path.as_deref()
-            && inputs.iter().any(|existing| {
-                existing.container_path.as_deref().is_some_and(|other| {
-                    FilePath::new(path).starts_with(other) || FilePath::new(other).starts_with(path)
-                })
-            })
-        {
-            return Err(TesError::bad_request("input paths overlap"));
-        }
         inputs.push(input);
+    }
+    // An input below another input's path would be hidden by it.
+    let nested = paths.iter().any(|path| {
+        FilePath::new(path)
+            .ancestors()
+            .skip(1)
+            .filter_map(FilePath::to_str)
+            .any(|ancestor| paths.contains(ancestor))
+    });
+    if nested {
+        return Err(TesError::bad_request("input paths overlap"));
     }
     Ok(inputs)
 }
@@ -1479,9 +1482,6 @@ fn map_task_resources(task: &TesTask) -> Result<ComputeResources, TesError> {
 }
 
 fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesError> {
-    if input.kind != TesFileType::File {
-        return Err(TesError::bad_request("directory inputs are not supported"));
-    }
     if input.content.is_some() {
         return Err(TesError::bad_request(
             "inline input content is not supported",
@@ -1491,18 +1491,34 @@ fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesErr
         .url
         .as_deref()
         .ok_or_else(|| TesError::bad_request("input url is required"))?;
-    let (source, source_node_id) = parse_input_url(url)?;
+    let (mut source, source_node_id) = parse_input_url(url)?;
     validate_path(&input.path, "input path", false)?;
-    // TES 1.1 defines wildcards for outputs only; an input path is one file.
+    // TES 1.1 defines wildcards for outputs only; an input path is one file or directory.
     if has_wildcard(&input.path) {
         return Err(TesError::bad_request(
             "input path must not contain wildcards",
         ));
     }
+    // A directory names a key prefix, which admission expands into its objects.
+    let mut dest_key = input.path[1..].to_string();
+    if input.kind == TesFileType::Directory {
+        let InputSource::S3 {
+            key, version_id, ..
+        } = &mut source;
+        if version_id.is_some() {
+            return Err(TesError::bad_request(
+                "a directory input names an s3:// prefix, not one version",
+            ));
+        }
+        if !key.ends_with('/') {
+            key.push('/');
+        }
+        dest_key.push('/');
+    }
     Ok(InputSelection {
         source,
         source_node_id,
-        dest_key: input.path[1..].to_string(),
+        dest_key,
         mode,
         container_path: Some(input.path.clone()),
         name: input.name.clone(),
@@ -1746,11 +1762,37 @@ impl TaskDetails {
     }
 }
 
+/// An input as the versioned object ARN a submission accepts: its source at the node and
+/// version the run captured, or else named; a plain `s3://` url only when it names neither.
+/// So a saved or repeated task reads exactly the data this run read.
+fn input_url(record: &JobRecord, input: &InputSelection, realm_id: RealmId) -> String {
+    let InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &input.source;
+    let captured =
+        (record.captured_inputs.iter()).find(|captured| captured.destination_key == input.dest_key);
+    let pinned = match captured {
+        Some(captured) => Some((captured.source_node_id, captured.version_id)),
+        None => (input.source_node_id).zip(
+            version_id
+                .as_deref()
+                .and_then(|v| Ulid::from_string(v).ok()),
+        ),
+    };
+    pinned
+        .and_then(|(node_id, version)| {
+            VersionedObjectArn::new(realm_id, node_id, bucket, key, version).ok()
+        })
+        .map_or_else(|| format!("s3://{bucket}/{key}"), |arn| arn.to_string())
+}
+
 fn project_task(
     record: &JobRecord,
     details: &TaskDetails,
     view: TesView,
-    base_url: &str,
+    (base_url, realm_id): (&str, RealmId),
 ) -> TesTask {
     let id = record.job_id.to_string();
     let state = tes_state(record);
@@ -1789,11 +1831,10 @@ fn project_task(
         .iter()
         .filter_map(|input| {
             let container_path = input.container_path.as_ref()?;
-            let InputSource::S3 { bucket, key, .. } = &input.source;
             Some(TesInput {
                 name: input.name.clone(),
                 description: input.description.clone(),
-                url: Some(format!("s3://{bucket}/{key}")),
+                url: Some(input_url(record, input, realm_id)),
                 path: container_path.clone(),
                 kind: TesFileType::File,
                 ..Default::default()

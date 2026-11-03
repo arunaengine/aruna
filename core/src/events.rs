@@ -429,6 +429,7 @@ pub enum NetEvent {
     VaultSign(VaultSignEvent),
     SnapshotSign(SnapshotSignEvent),
     StatementSign(StatementSignEvent),
+    Release(crate::structs::storage::release::ReleaseEvent),
     Error(NetError),
 }
 

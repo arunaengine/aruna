@@ -75,6 +75,7 @@ pub fn validate_connector_input(
             | SourceConnectorKind::ArunaNative
             | SourceConnectorKind::LocalDirectory
             | SourceConnectorKind::Invenio
+            | SourceConnectorKind::ArunaLink
     ) {
         return Err(ValidationError::UnsupportedConnectorKind { kind });
     }
@@ -191,7 +192,7 @@ pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorRules {
             allowed_public_keys: &[OFFERED_DIRECTORY_BUCKET],
             allowed_secret_keys: &[],
         },
-        SourceConnectorKind::Invenio => SourceConnectorRules {
+        SourceConnectorKind::Invenio | SourceConnectorKind::ArunaLink => SourceConnectorRules {
             required_public_keys: &[],
             allowed_public_keys: &[],
             allowed_secret_keys: &[],

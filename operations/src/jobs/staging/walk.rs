@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 use std::time::{Duration, SystemTime};
 
@@ -19,6 +19,7 @@ use aruna_core::structs::execution::source_access::{
     DigestOrigin, DigestScope, ListRequest, SourceDigest, SourceEntry, SourceEntryKind,
     SourceMetadata,
 };
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
@@ -31,6 +32,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 use ulid::Ulid;
 
+use super::limiter::retried;
 use super::manifest::{
     ManifestDigest, lasting_head, lasting_resolution, lasting_source, manifest_digests,
 };
@@ -40,14 +42,14 @@ use super::{
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::permission_rules::{PermissionRules, permission_rules};
+use crate::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
 use crate::distribution::guard::{
     GuardError, authority_reads, authority_rows, write_target, write_targets,
 };
 use crate::driver::drive;
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::store::{batch_delete, iter_prefix_page, read_state};
-use crate::s3::object::origin::database_entry;
-use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
+use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
 use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
 };
@@ -201,13 +203,17 @@ pub(super) enum PageFailure {
     Conflict(String),
 }
 
-/// A file a listing page found, mapped to its destination key.
-struct StagedFile {
-    source_path: String,
-    target_key: String,
-    size: Option<u64>,
-    observation: Option<SourceMetadata>,
-    manifest: Option<ManifestDigest>,
+/// A file a listing page or a table row found, mapped to its destination key.
+pub(super) struct StagedFile {
+    pub(super) source_path: String,
+    pub(super) target_key: String,
+    pub(super) size: Option<u64>,
+    pub(super) observation: Option<SourceMetadata>,
+    /// Shipped digests, from a checksum manifest or a table row.
+    pub(super) manifest: Vec<ManifestDigest>,
+    pub(super) metadata: BTreeMap<String, String>,
+    /// A table row's modification time; it replaces the one a HEAD reports.
+    pub(super) modified: Option<SystemTime>,
 }
 
 /// Lists one page of the current walk and records it, with the walk's next position and the
@@ -280,12 +286,15 @@ pub(super) async fn walk_page(
         }
     }
     let mut files = Vec::new();
+    // HTTP index pages round sizes and print local minutes, so each file gets a HEAD (step 0).
+    let exact =
+        (page.as_ref()).is_some_and(|page| page.connector.kind != SourceConnectorKind::Http);
     let listed = page
         .as_mut()
         .map(|page| std::mem::take(&mut page.entries))
         .unwrap_or_default();
     for entry in listed {
-        match map_source_entry(&walk, entry, flat) {
+        match map_source_entry(&walk, entry, (flat, exact)) {
             Ok(MappedEntry::File(file)) => {
                 next.bytes_discovered =
                     next.bytes_discovered.saturating_add(file.size.unwrap_or(0));
@@ -313,7 +322,7 @@ pub(super) async fn walk_page(
             .await
             .map_err(PageFailure::Retry)?;
         for (file, digest) in files.iter_mut().zip(digests) {
-            file.manifest = digest;
+            file.manifest = digest.into_iter().collect();
         }
     }
     next.phase = item_phase(spec);
@@ -335,7 +344,9 @@ pub(super) async fn walk_page(
                 let listing = listing(ctx, spec, &walk, (flat, upper)).await.ok()?;
                 Some(Ahead { walk, listing })
             };
-            let import = import_page(ctx, spec, (slot, turn), checkpoint, next, rows, page);
+            let source = Some((page.connector, page.secret_fingerprint));
+            let rows = (rows.files, rows.writes, rows.deletes);
+            let import = import_page(ctx, spec, (slot, turn), checkpoint, next, rows, source);
             let (imported, fetched) = tokio::join!(import, prefetch);
             if imported.is_ok() {
                 *ahead = fetched;
@@ -409,6 +420,13 @@ async fn listing(
     Ok(Listing::Page(segment, page))
 }
 
+/// A page's files with the job rows written and deleted with it.
+pub(super) type PageFiles = (
+    Vec<StagedFile>,
+    Vec<(KeySpace, Key, Value)>,
+    Vec<(KeySpace, Key)>,
+);
+
 /// What one listing page adds: files to stage and the job's queue changes.
 struct PageRows {
     files: Vec<StagedFile>,
@@ -480,38 +498,45 @@ async fn list_page(
         StagingStrategy::Snapshot => SNAPSHOT_PAGE_SIZE,
         StagingStrategy::Reference | StagingStrategy::Sync => STAGING_PAGE_SIZE,
     };
-    drive(
-        ListStagingOperation::new(ListStagingInput {
-            group_id: spec.group_id,
-            connector_id: spec.connector_id,
-            source_path: walk.source_path.clone(),
-            request: ListRequest {
-                cursor: walk.cursor.clone(),
-                lower: segment.and_then(|segment| segment.lower.clone()),
-                stop: segment.and_then(|segment| segment.stop.clone()),
-                limit,
-                recursive: flat,
-                files_only: flat,
-            },
-        }),
-        &ctx.driver,
-    )
-    .await
-    .map_err(list_failure)
+    let list = || {
+        drive(
+            ListStagingOperation::new(ListStagingInput {
+                group_id: spec.group_id,
+                connector_id: spec.connector_id,
+                source_path: walk.source_path.clone(),
+                request: ListRequest {
+                    cursor: walk.cursor.clone(),
+                    lower: segment.and_then(|segment| segment.lower.clone()),
+                    stop: segment.and_then(|segment| segment.stop.clone()),
+                    limit,
+                    recursive: flat,
+                    files_only: flat,
+                },
+            }),
+            &ctx.driver,
+        )
+    };
+    let transient = |error: &ListStagingError| (!lasting_list(error)).then(|| error.to_string());
+    retried((&ctx.cancel, &ctx.shutdown), spec, transient, list)
+        .await
+        .map_err(list_failure)
 }
 
 /// A source that refuses the path skips it; any other listing error retries the page, so one
 /// transient failure never abandons the rest of a large walk.
 fn list_failure(error: ListStagingError) -> ItemFailure {
-    let lasting = match &error {
+    match lasting_list(&error) {
+        true => ItemFailure::Stage(error.to_string()),
+        false => ItemFailure::System(error.to_string()),
+    }
+}
+
+fn lasting_list(error: &ListStagingError) -> bool {
+    match error {
         ListStagingError::Resolve(error) => lasting_resolution(error),
         ListStagingError::Staging(StagingSourceError::InvalidListing(_)) => true,
         ListStagingError::Staging(error) => lasting_source(error),
         _ => false,
-    };
-    match lasting {
-        true => ItemFailure::Stage(error.to_string()),
-        false => ItemFailure::System(error.to_string()),
     }
 }
 
@@ -660,6 +685,15 @@ async fn segment_of(
             clamped(vec![(String::new(), None)], upper),
         ));
     };
+    let coordinated = own_ranges(ctx, binding).await?;
+    Ok(next_segment(walk, clamped(coordinated, upper)))
+}
+
+/// The key ranges of a distributed bucket this node coordinates, as lower and upper keys.
+pub(super) async fn own_ranges(
+    ctx: &JobContext,
+    binding: &DistributionBinding,
+) -> Result<Vec<(String, Option<String>)>, PageFailure> {
     let read = StorageEffect::BatchRead {
         reads: authority_reads(binding.set_id),
         txn_id: None,
@@ -683,7 +717,7 @@ async fn segment_of(
             Err(error) => return Err(retry(error)),
         }
     }
-    Ok(next_segment(walk, clamped(coordinated, upper)))
+    Ok(coordinated)
 }
 
 /// Key ranges cut at a lane's exclusive upper target key; ranges left empty are dropped.
@@ -763,16 +797,19 @@ async fn own_files(
     Ok((files, turns))
 }
 
+/// The connector a page's references name, as resolved for its listing or its first HEAD.
+pub(super) type PageSource = (SourceConnector, Option<[u8; 16]>);
+
 /// Registers a page's files as references with listing metadata, in one transaction with the
 /// checkpoint. Files a listing gives no size for are read with one HEAD each.
-async fn import_page(
+pub(super) async fn import_page(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     (slot, turn): (Option<u64>, Option<&Mutex<()>>),
     checkpoint: &mut StagingJobCheckpoint,
     mut next: StagingJobCheckpoint,
-    rows: PageRows,
-    page: ListStagingResult,
+    (files, writes, deletes): PageFiles,
+    mut source: Option<PageSource>,
 ) -> Result<(), PageFailure> {
     let bucket = match pinned_bucket(ctx, spec).await {
         Ok(bucket) => bucket,
@@ -785,7 +822,7 @@ async fn import_page(
             return Err(PageFailure::Permanent(message));
         }
     };
-    let (files, ranges) = own_files(ctx, &bucket, rows.files).await?;
+    let (files, ranges) = own_files(ctx, &bucket, files).await?;
     let mut entries = Vec::with_capacity(files.len());
     // The submitter's rules are collected once per page and decide every file in memory.
     let rules = access_rules(ctx, spec).await.map_err(PageFailure::Retry)?;
@@ -794,9 +831,12 @@ async fn import_page(
         let observation = match access {
             Ok(()) => match file.observation {
                 Some(observation) => Ok(observation),
-                None => head_observation(ctx, spec, &file.source_path).await,
+                None => head_observation(ctx, spec, &file.source_path, &mut source).await,
             }
-            .map(|observation| with_manifest(observation, file.manifest)),
+            .map(|mut observation| {
+                observation.last_modified = file.modified.or(observation.last_modified);
+                with_manifest(observation, file.manifest)
+            }),
             Err(failure) => Err(failure),
         };
         match observation {
@@ -804,6 +844,7 @@ async fn import_page(
                 source_path: file.source_path,
                 target_key: file.target_key,
                 observation,
+                metadata: file.metadata,
             }),
             Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
                 record_failure(&mut next, &file.source_path, &file.target_key, message)
@@ -812,13 +853,13 @@ async fn import_page(
             Err(ItemFailure::Lasting(message)) => return Err(PageFailure::Permanent(message)),
         }
     }
-    let database = database_entry(
-        &ctx.driver,
-        (spec.auth_context.realm_id, spec.node_id),
-        &spec.bucket,
-        (bucket.distribution.as_ref()).map(|binding| binding.set_id),
-    )
-    .await;
+    // Files a table row describes are not headed; the page then resolves its connector itself.
+    let source = match (source, entries.first()) {
+        (Some(source), _) => source,
+        (None, None) => return commit_slot(ctx, slot, checkpoint, next, writes, deletes).await,
+        (None, Some(entry)) => resolved_source(ctx, spec, &entry.source_path).await?,
+    };
+    let (connector, secret_fingerprint) = source;
     let input = PageImportInput {
         job_id: ctx.job_id,
         claim_token: ctx.claim_token,
@@ -829,15 +870,14 @@ async fn import_page(
         node_id: spec.node_id,
         bucket: spec.bucket.clone(),
         expected_bucket: bucket,
-        connector: page.connector,
-        secret_fingerprint: page.secret_fingerprint,
+        connector,
+        secret_fingerprint,
         entries,
         checkpoint: next,
         checkpoint_key: checkpoint_key(ctx.job_id, slot),
-        writes: rows.writes,
-        deletes: rows.deletes,
+        writes,
+        deletes,
         now: SystemTime::now(),
-        database,
         ranges: None,
     };
     let result = {
@@ -931,10 +971,9 @@ async fn snapshot_page(
             return Ok(());
         }
         next.current_path = Some(file.source_path.clone());
-        let expected = file
-            .manifest
-            .map(|(algorithm, digest)| vec![ExpectedChecksum { algorithm, digest }])
-            .unwrap_or_default();
+        let expected = (file.manifest.into_iter())
+            .map(|(algorithm, digest)| ExpectedChecksum { algorithm, digest })
+            .collect();
         match stage_item(ctx, spec, &file.source_path, &file.target_key, expected).await {
             Ok(size) => {
                 next.items_current = next.items_current.saturating_add(1);
@@ -955,12 +994,9 @@ async fn snapshot_page(
     commit_rows(ctx, checkpoint, next, rows.writes, rows.deletes).await
 }
 
-/// Adds a shipped manifest digest to an observation; it binds every complete read.
-fn with_manifest(
-    mut observation: SourceMetadata,
-    digest: Option<ManifestDigest>,
-) -> SourceMetadata {
-    if let Some((algorithm, digest)) = digest {
+/// Adds shipped digests to an observation; they bind every complete read.
+fn with_manifest(mut observation: SourceMetadata, digests: Vec<ManifestDigest>) -> SourceMetadata {
+    for (algorithm, digest) in digests {
         let origin = DigestOrigin::Manifest;
         let scope = DigestScope::FullObject;
         let digest = SourceDigest {
@@ -973,26 +1009,61 @@ fn with_manifest(
     observation
 }
 
+/// The connector a page's references name, read from storage without a source request.
+async fn resolved_source(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    source_path: &str,
+) -> Result<PageSource, PageFailure> {
+    let input = ResolveConnectorInput {
+        group_id: spec.group_id,
+        connector_id: spec.connector_id,
+        source_path: source_path.to_string(),
+        allow_root: false,
+    };
+    match drive(ResolveConnectorOperation::new(input), &ctx.driver).await {
+        Ok(resolved) => Ok((resolved.connector, resolved.secret_fingerprint)),
+        Err(error) if lasting_resolution(&error) => Err(PageFailure::Permanent(error.to_string())),
+        Err(error) => Err(PageFailure::Retry(error.to_string())),
+    }
+}
+
+/// One HEAD; the page takes its connector from the first one, and a changed one replays it.
 async fn head_observation(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     source_path: &str,
+    source: &mut Option<PageSource>,
 ) -> Result<SourceMetadata, ItemFailure> {
-    drive(
-        HeadSourceOperation::new(HeadSourceInput {
-            group_id: spec.group_id,
-            connector_id: spec.connector_id,
-            source_path: source_path.to_string(),
-        }),
-        &ctx.driver,
-    )
-    .await
-    .map(|result| result.metadata)
-    .map_err(|error| match lasting_head(&error) {
-        true => ItemFailure::Stage(error.to_string()),
-        // A transient failure replays the page instead of failing the file for good.
-        false => ItemFailure::System(error.to_string()),
-    })
+    let transient = |error: &HeadSourceError| (!lasting_head(error)).then(|| error.to_string());
+    let head = || {
+        drive(
+            HeadSourceOperation::new(HeadSourceInput {
+                group_id: spec.group_id,
+                connector_id: spec.connector_id,
+                source_path: source_path.to_string(),
+            }),
+            &ctx.driver,
+        )
+    };
+    let result = retried((&ctx.cancel, &ctx.shutdown), spec, transient, head)
+        .await
+        .map_err(|error| match lasting_head(&error) {
+            true => ItemFailure::Stage(error.to_string()),
+            // A transient failure replays the page instead of failing the file for good.
+            false => ItemFailure::System(error.to_string()),
+        })?;
+    let headed = (result.connector, result.secret_fingerprint);
+    match source {
+        Some(known) if *known != headed => Err(ItemFailure::System(
+            "the connector changed while the page was read".to_string(),
+        )),
+        Some(_) => Ok(result.metadata),
+        None => {
+            *source = Some(headed);
+            Ok(result.metadata)
+        }
+    }
 }
 
 /// READ on the source file and WRITE on the destination key, as the submitting user.
@@ -1007,7 +1078,10 @@ pub(super) async fn check_access(
 }
 
 /// The submitter's permission rules in the job's group, which holds the source and target paths.
-async fn access_rules(ctx: &JobContext, spec: &StagingJobSpec) -> Result<PermissionRules, String> {
+pub(super) async fn access_rules(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+) -> Result<PermissionRules, String> {
     let root = source_permission_path(spec, "");
     permission_rules(&ctx.driver, &spec.auth_context, &root)
         .await
@@ -1047,15 +1121,17 @@ enum MappedEntry {
 fn map_source_entry(
     walk: &StagingWalk,
     entry: SourceEntry,
-    flat: bool,
+    (flat, exact): (bool, bool),
 ) -> Result<MappedEntry, String> {
     let entry_path = canonical_walker_path(&entry.path)?;
     let relative = relative_entry_path(&walk.source_path, &entry_path, flat)?;
     let target = join_target_prefix(&walk.target_prefix, &relative);
     Ok(match entry.kind {
         SourceEntryKind::File => MappedEntry::File(StagedFile {
-            observation: entry.observation(),
-            manifest: None,
+            observation: entry.observation().filter(|_| exact),
+            manifest: Vec::new(),
+            metadata: BTreeMap::new(),
+            modified: None,
             source_path: entry_path,
             target_key: target,
             size: entry.size,
@@ -1243,7 +1319,8 @@ mod pure_tests {
             ..file("refseq/")
         };
 
-        let MappedEntry::Directory(directory) = map_source_entry(&walk(""), entry, false).unwrap()
+        let MappedEntry::Directory(directory) =
+            map_source_entry(&walk(""), entry, (false, true)).unwrap()
         else {
             panic!("expected directory")
         };
@@ -1251,10 +1328,29 @@ mod pure_tests {
         assert_eq!(directory.target_prefix, "copy/refseq");
     }
 
+    // An NCBI index page gives a rounded size and a local minute: never an observation.
+    #[test]
+    fn index_entries_headed() {
+        let entry = SourceEntry {
+            size: Some(928 << 20),
+            modified: Some(std::time::UNIX_EPOCH + Duration::from_secs(1_763_401_080)),
+            etag: None,
+            ..file("all/GCF/fcs_report.txt")
+        };
+        let mapped = map_source_entry(&walk("all/GCF/"), entry.clone(), (false, false));
+        let Ok(MappedEntry::File(mapped)) = mapped else {
+            panic!("expected file")
+        };
+        assert_eq!(mapped.observation, None);
+        assert_eq!(mapped.size, Some(928 << 20));
+        let exact = map_source_entry(&walk("all/GCF/"), entry, (false, true));
+        assert!(matches!(exact, Ok(MappedEntry::File(file)) if file.observation.is_some()));
+    }
+
     #[test]
     fn flat_maps_nested() {
         let MappedEntry::File(mapped) =
-            map_source_entry(&walk("data/"), file("data/a/b.txt"), true).unwrap()
+            map_source_entry(&walk("data/"), file("data/a/b.txt"), (true, true)).unwrap()
         else {
             panic!("expected file")
         };
@@ -1264,7 +1360,7 @@ mod pure_tests {
         assert_eq!(observation.content_type, None);
         assert_eq!(observation.digests.len(), 1);
 
-        assert!(map_source_entry(&walk("data/"), file("data/a/b.txt"), false).is_err());
-        assert!(map_source_entry(&walk("data/"), file("other/b.txt"), true).is_err());
+        assert!(map_source_entry(&walk("data/"), file("data/a/b.txt"), (false, true)).is_err());
+        assert!(map_source_entry(&walk("data/"), file("other/b.txt"), (true, true)).is_err());
     }
 }

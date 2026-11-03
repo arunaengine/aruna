@@ -12,6 +12,7 @@ use aruna_operations::distribution::guard::{
     bound_view, copies_interval, lists_interval, local_fence,
 };
 use aruna_operations::s3::object::list::{ListBucketInput, ListContinuationToken};
+use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed, open_cursor};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::Method;
@@ -44,11 +45,19 @@ struct BoundToken {
 }
 
 /// Where a merged listing continues: after a listed entry, or at the first key of a range when
-/// a page visited its bound number of ranges without an entry.
+/// a page visited its bound number of ranges without an entry, or inside the range starting at
+/// `lower`, from the sealed cursor of the member that stopped there among hidden entries.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(in crate::s3::service) enum Resume {
     After(ListContinuationToken),
     From(String),
+    Sealed {
+        lower: String,
+        node: aruna_core::NodeId,
+        copy: bool,
+        cursor: String,
+        group: Option<String>,
+    },
 }
 
 /// Ranges one merged page visits at most, so its fan-out stays bounded.
@@ -272,10 +281,24 @@ impl ArunaS3Service {
     pub(in crate::s3::service) async fn ask_holders(
         &self,
         user: &UserAccess,
-        (binding, snapshot): (&DistributionBinding, &DistributionSnapshot),
+        context: (&DistributionBinding, &DistributionSnapshot),
         (range, copies): (&KeyRange, bool),
-        (operation, bucket, query): (&'static str, &str, String),
+        request: (&'static str, &str, String),
     ) -> S3Result<String> {
+        let asked = (range, copies, None);
+        let answer = self.ask_members(user, context, asked, request).await;
+        answer.map(|(body, _)| body)
+    }
+
+    /// Like `ask_holders`, from the member `only` names when it does, with the member that
+    /// answered.
+    async fn ask_members(
+        &self,
+        user: &UserAccess,
+        (binding, snapshot): (&DistributionBinding, &DistributionSnapshot),
+        (range, copies, only): (&KeyRange, bool, Option<aruna_core::NodeId>),
+        (operation, bucket, query): (&'static str, &str, String),
+    ) -> S3Result<(String, aruna_core::NodeId)> {
         let (holders, query) = match copies {
             true => (
                 snapshot.copy_holders(range),
@@ -283,9 +306,9 @@ impl ArunaS3Service {
             ),
             false => (snapshot.list_holder(range).into_iter().collect(), query),
         };
-        let others = holders
-            .into_iter()
-            .filter(|member| member.member_id != binding.member_id);
+        let others = (holders.into_iter())
+            .filter(|member| member.member_id != binding.member_id)
+            .filter(|member| only.is_none_or(|node| member.node_id == node));
         for member in others {
             let forward = Forward {
                 set_id: binding.set_id,
@@ -306,7 +329,7 @@ impl ArunaS3Service {
                 Err(error) => Err(error),
             };
             match answer {
-                Ok(body) => return Ok(body),
+                Ok(body) => return Ok((body, member.node_id)),
                 Err(error) if unreachable(&error) => continue,
                 Err(error) => return Err(error),
             }
@@ -314,15 +337,17 @@ impl ArunaS3Service {
         Err(incomplete(binding.set_id, range))
     }
 
-    /// One range's object page from a holder, keys mapped as this request encodes them.
+    /// One range's object page from a holder, keys mapped as this request encodes them, with
+    /// the member that listed it.
     async fn remote_objects(
         &self,
         user: &UserAccess,
         context: (&DistributionBinding, &DistributionSnapshot),
-        (range, copies): (&KeyRange, bool),
+        asked: (&KeyRange, bool, Option<aruna_core::NodeId>),
         (input, start, remaining): (&ListBucketInput, Option<(&'static str, String)>, usize),
         (owner, url_encoded): (Option<&Owner>, bool),
-    ) -> S3Result<ObjectListingPage> {
+    ) -> S3Result<(ObjectListingPage, aruna_core::NodeId)> {
+        let range = asked.0;
         let mut base = vec![
             ("list-type", "2".to_string()),
             ("max-keys", remaining.to_string()),
@@ -337,7 +362,7 @@ impl ArunaS3Service {
         base.extend(start);
         let query = range_query(&base, range);
         let request = ("ListObjectsV2", input.bucket.as_str(), query);
-        let body = (self.ask_holders(user, context, (range, copies), request)).await?;
+        let (body, lister) = (self.ask_members(user, context, asked, request)).await?;
         let contents = (elements(&body, "Contents").into_iter())
             .filter_map(|entry| {
                 Some(Object {
@@ -356,15 +381,19 @@ impl ArunaS3Service {
                 prefix: Some(self.encoded(prefix, url_encoded)),
             })
             .collect();
-        let continuation_token = match xml_field(&body, "NextContinuationToken") {
-            Some(token) => Self::decode_list_token(Some(&token))?,
-            None => None,
+        // A member that stopped among hidden entries answers with its own sealed cursor.
+        let (continuation_token, sealed) = match xml_field(&body, "NextContinuationToken") {
+            Some(token) if is_sealed(&token) => (None, Some(token)),
+            Some(token) => (Self::decode_list_token(Some(&token))?, None),
+            None => (None, None),
         };
-        Ok(ObjectListingPage {
+        let page = ObjectListingPage {
             contents,
             common_prefixes,
             continuation_token,
-        })
+            sealed,
+        };
+        Ok((page, lister))
     }
 
     /// One merged object page over every range under the prefix, at most `max_keys` entries,
@@ -375,8 +404,8 @@ impl ArunaS3Service {
         binding: &DistributionBinding,
         input: ListBucketInput,
         (owner, url_encoded, scope): (Option<Owner>, bool, Option<&SubpathScope>),
-        (from, bounded): (Option<String>, bool),
-    ) -> S3Result<(ObjectListingPage, Option<String>, Vec<Ulid>)> {
+        (from, bounded): (Option<Resume>, bool),
+    ) -> S3Result<(ObjectListingPage, Option<Resume>, Vec<Ulid>)> {
         let snapshot = self.snapshot(binding).await?;
         let fence = self.fence(binding).await?;
         let max = input
@@ -398,8 +427,24 @@ impl ArunaS3Service {
             contents: Vec::new(),
             common_prefixes: Vec::new(),
             continuation_token: None,
+            sealed: None,
         };
         let mut last_prefix = resume.as_ref().and_then(|(_, group)| group.clone());
+        // A sealed position resumes its range at the member that sealed it.
+        let (from, mut resumed) = match from {
+            Some(Resume::From(lower)) => (Some(lower), None),
+            Some(Resume::Sealed {
+                lower,
+                node,
+                copy,
+                cursor,
+                group,
+            }) => {
+                last_prefix = group;
+                (Some(lower), Some((node, copy, cursor)))
+            }
+            _ => (None, None),
+        };
         // Only entries of this page move its token on; a resumed prefix would repeat it.
         let mut page_prefix: Option<String> = None;
         let mut last_key: Option<String> = None;
@@ -427,23 +472,39 @@ impl ArunaS3Service {
                 merged.continuation_token =
                     scoped_marker(&input.bucket, last_key.as_deref(), page_prefix.as_deref())?;
                 // Nothing listed yet: the next page starts at this range.
-                let next = merged
-                    .continuation_token
-                    .is_none()
-                    .then(|| range.lower.clone());
+                let next = (merged.continuation_token.is_none())
+                    .then(|| Resume::From(range.lower.clone()));
                 return Ok((merged, next, stale));
             }
-            let remote = match snapshot.lists_locally(binding.member_id, range, &fence) {
-                true => None,
-                false => {
+            let (context, shape) = ((binding, &snapshot), (owner.as_ref(), url_encoded));
+            let resumed = resumed.take();
+            // A copy may be behind its coordinator, so a range resumed at one is marked stale.
+            if resumed.as_ref().is_some_and(|(_, copy, _)| *copy) {
+                stale.push(range.range_id);
+            }
+            let local = match &resumed {
+                Some((node, ..)) => *node == self.node_id,
+                None => snapshot.lists_locally(binding.member_id, range, &fence),
+            };
+            let remote = match (local, &resumed) {
+                (true, _) => None,
+                (false, Some((node, copy, cursor))) => {
+                    let start = Some(("continuation-token", cursor.clone()));
+                    let query = (&input, start, remaining);
+                    let asked = (range, *copy, Some(*node));
+                    let part = self
+                        .remote_objects(user, context, asked, query, shape)
+                        .await?;
+                    Some((part, *copy))
+                }
+                (false, None) => {
                     let query = (&input, remote_start(&input, first)?, remaining);
-                    let (context, shape) = ((binding, &snapshot), (owner.as_ref(), url_encoded));
-                    let asked = (range, false);
+                    let asked = (range, false, None);
                     match self
                         .remote_objects(user, context, asked, query.clone(), shape)
                         .await
                     {
-                        Ok(part) => Some(part),
+                        Ok(part) => Some((part, false)),
                         // The coordinator cannot answer, so this member's copy or another lists.
                         Err(error) if unreachable(&error) => {
                             stale.push(range.range_id);
@@ -451,38 +512,51 @@ impl ArunaS3Service {
                                 .any(|member| member.member_id == binding.member_id);
                             match here {
                                 true => None,
-                                false => Some(
+                                false => Some((
                                     (self.remote_objects(
                                         user,
                                         context,
-                                        (range, true),
+                                        (range, true, None),
                                         query,
                                         shape,
                                     ))
                                     .await?,
-                                ),
+                                    true,
+                                )),
                             }
                         }
                         Err(error) => return Err(error),
                     }
                 }
             };
-            let part = match remote {
-                Some(mut part) => {
+            let (part, lister, copy) = match remote {
+                Some(((mut part, lister), copy)) => {
                     if let Some(scope) = scope {
                         scope_part(&mut part, scope, url_encoded);
                     }
-                    part
+                    (part, lister, copy)
                 }
                 None => {
                     let mut sub = input.clone();
                     sub.max_keys = Some(remaining);
-                    if !first {
+                    if !first || resumed.is_some() {
                         (sub.continuation_token, sub.start_after) = (None, None);
                     }
+                    let hidden = match &resumed {
+                        Some((_, _, cursor)) => {
+                            Some(open_cursor::<HiddenCursor>(cursor).ok_or_else(|| {
+                                s3_error!(InvalidArgument, "Invalid continuation token")
+                            })?)
+                        }
+                        None => None,
+                    };
                     let bounds = Some((range.lower.clone(), range.upper.clone()));
-                    self.run_object_listing(sub, owner.clone(), url_encoded, scope, bounds)
-                        .await?
+                    let reader = (owner.clone(), Some(user));
+                    let part =
+                        self.run_object_listing(sub, reader, url_encoded, scope, (bounds, hidden));
+                    // Listing here instead of the coordinator lists this member's copy.
+                    let copy = resumed.as_ref().map_or(!local, |(_, copy, _)| *copy);
+                    (part.await?, self.node_id, copy)
                 }
             };
             first = false;
@@ -508,6 +582,17 @@ impl ArunaS3Service {
                 last_key = object.key.as_deref().map(|key| Self::raw(key, url_encoded));
             }
             merged.contents.extend(part.contents);
+            // A range that stopped among hidden entries goes on from its member's cursor.
+            if let Some(cursor) = part.sealed {
+                let next = Resume::Sealed {
+                    lower: range.lower.clone(),
+                    node: lister,
+                    copy,
+                    cursor,
+                    group: last_prefix,
+                };
+                return Ok((merged, Some(next), stale));
+            }
             if part.continuation_token.is_some() {
                 merged.continuation_token = part.continuation_token;
                 break;
@@ -604,6 +689,7 @@ mod tests {
                 prefix: Some("private/".to_string()),
             }],
             continuation_token: None,
+            sealed: None,
         };
         // A scope without grants hides what the holder listed under its own rules.
         scope_part(&mut part, &SubpathScope::default(), false);

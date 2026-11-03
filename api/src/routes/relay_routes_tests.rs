@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use super::{RELAY_HOP_HEADER, relay_middleware};
+use super::{RELAY_HOP_HEADER, healthy_first, relay_middleware};
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -166,7 +166,7 @@ async fn stopped_management_skipped() {
             .unwrap();
     });
     let (upstream, handle) = fake_upstream().await;
-    let fixture = setup(vec![stopped, upstream]).await;
+    let fixture = setup(vec![stopped.clone(), upstream.clone()]).await;
     let response = relay_app(fixture.state.clone())
         .oneshot(token_request())
         .await
@@ -174,7 +174,41 @@ async fn stopped_management_skipped() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(&body[..], b"{\"relayed\":true}");
+    // The ingress may wait for the stopped node first, so the next call skips it until last.
+    let cache = fixture.state.management_url_cache().read().await;
+    assert_eq!(
+        healthy_first(cache.urls.clone(), &cache.failed),
+        [upstream, stopped]
+    );
+    drop(cache);
     ingress.abort();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn refused_target_demoted() {
+    // A bound socket that never listens keeps its port reserved while connections are refused.
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let refused = format!("http://{}", reserved.local_addr().unwrap());
+    let (upstream, handle) = fake_upstream().await;
+    let fixture = setup(vec![refused.clone(), upstream.clone()]).await;
+    let response = relay_app(fixture.state.clone())
+        .oneshot(token_request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // The next call tries the healthy target first and the refused one only after it.
+    let cache = fixture.state.management_url_cache().read().await;
+    let order = healthy_first(cache.urls.clone(), &cache.failed);
+    assert_eq!(order, [upstream, refused]);
+    drop(cache);
+    let response = relay_app(fixture.state.clone())
+        .oneshot(token_request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(reserved);
     handle.abort();
 }
 
@@ -293,25 +327,4 @@ async fn hop_stays_local() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
-}
-
-#[tokio::test]
-async fn relayed_request_unowned() {
-    // A database request relayed to a node that is not its owner is refused, not kept there.
-    let fixture = setup(vec!["http://127.0.0.1:1".to_string()]).await;
-    let app = Router::new()
-        .route(
-            "/system/realm/databases",
-            axum::routing::post(|| async { StatusCode::IM_A_TEAPOT }),
-        )
-        .layer(from_fn_with_state(fixture.state.clone(), relay_middleware))
-        .with_state(fixture.state.clone());
-    let request = Request::builder()
-        .method("POST")
-        .uri("/system/realm/databases")
-        .header(RELAY_HOP_HEADER, "peer")
-        .body(Body::empty())
-        .unwrap();
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

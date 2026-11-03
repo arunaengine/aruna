@@ -576,7 +576,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         };
         return RoundOutcome::Retry { after_ms };
     };
-    let launch = LaunchIntent {
+    let mut launch = LaunchIntent {
         launch_id: Ulid::generate(),
         submission_id: family.submission_id,
         request_digest: family.request_digest,
@@ -587,11 +587,19 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
         holder_generation: holder_generation(&config, &view),
         target: selection.target.clone(),
         inputs: selection.inputs,
+        input_pages: None,
         output_policies: selection.output_policies,
         plan_digest: selection.plan_digest,
         spec_digest: spec.spec_digest,
         created_at_ms: now_ms,
     };
+    // Planned inputs too large for the launch record go to pages this node serves.
+    if crate::jobs::records::pages::page_launch(context, &mut launch)
+        .await
+        .is_err()
+    {
+        return RoundOutcome::Retry { after_ms: base };
+    }
     let Some(frame) = sign_record(context, realm_id, JobFamilyRecord::Launch(Box::new(launch)))
     else {
         return RoundOutcome::Retry { after_ms: base };

@@ -13,6 +13,7 @@ use aruna_core::keyspaces::{
     RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE, SEARCH_FEED_KEYSPACE, SOURCE_ROOT_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
+use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, RangeAccount, RangeCounters, RangeSlot, SAMPLE_SIZE, SampleEntry,
@@ -932,6 +933,7 @@ pub fn entry_of(version: &BlobVersion, size: u64) -> VersionEntry {
         referenced: matches!(version.state, BlobVersionState::Reference { .. }),
         identity: logical_identity(version),
         pending: matches!(version.state, BlobVersionState::PendingContent { .. }),
+        searchable: searchable(&version.metadata),
     }
 }
 

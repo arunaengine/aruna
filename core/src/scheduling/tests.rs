@@ -254,8 +254,8 @@ fn saturates_transfer_cost() {
 
 #[test]
 fn accepts_input_bound() {
-    // The planner accepts the same 512-input limit as the public APIs.
-    let inputs = (0..MAX_PLAN_INPUTS)
+    // The planner has no input count limit, so more than the former 512 inputs plan.
+    let inputs = (0..600)
         .map(|index| resolved_input(&format!("input-{index}"), (index % 255) as u8 + 1))
         .collect();
     assert!(request(inputs).canonical().is_ok());

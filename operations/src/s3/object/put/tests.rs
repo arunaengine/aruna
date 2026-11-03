@@ -1579,6 +1579,72 @@ async fn dedup_per_backend() {
 }
 
 #[tokio::test]
+async fn release_row_committed() {
+    // A version tagged as a release commits its release row; an untagged one writes none.
+    use aruna_core::keyspaces::BUCKET_RELEASE_KEYSPACE;
+    use aruna_core::structs::storage::bucket_metadata::{
+        RELEASE_PREFIX_TAG, RELEASE_TAG, ReleasePointer, release_key,
+    };
+    let temp_handle = tempdir().unwrap();
+    let temp_root = temp_handle.path().to_str().unwrap();
+    let (context, _, _) = setup_two_backends(temp_root).await;
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let tags = HashMap::from([
+        (RELEASE_TAG.to_string(), "6.0".to_string()),
+        (RELEASE_PREFIX_TAG.to_string(), "db/".to_string()),
+    ]);
+    let put = |key: &str, metadata: HashMap<String, String>| {
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            group_id,
+            realm_id,
+            node_id: context.net_handle.as_ref().unwrap().node_id(),
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: key.to_string(),
+                content_length: Some(2),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    b"{}".as_slice(),
+                ))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: archive_routing(group_id),
+        })
+        .with_metadata(metadata)
+    };
+    let tagged = drive(put("db/release.json", tags), &context).await.unwrap();
+    let plain = drive(put("db/other.json", HashMap::new()), &context)
+        .await
+        .unwrap();
+    let row = read_value(
+        &context,
+        BUCKET_RELEASE_KEYSPACE,
+        release_key("mybucket", tagged.version_id),
+    )
+    .await
+    .expect("the release row commits with the version");
+    let pointer = ReleasePointer::from_bytes(row.as_ref()).unwrap();
+    assert_eq!(pointer.key, "db/release.json");
+    assert_eq!(
+        (pointer.label.as_str(), pointer.prefix.as_str()),
+        ("6.0", "db/")
+    );
+    let untagged = read_value(
+        &context,
+        BUCKET_RELEASE_KEYSPACE,
+        release_key("mybucket", plain.version_id),
+    )
+    .await;
+    assert!(untagged.is_none());
+}
+
+#[tokio::test]
 async fn dedup_repeats_backend() {
     // A rewrite onto the same backend must still adopt the stored copy.
     let temp_handle = tempdir().unwrap();

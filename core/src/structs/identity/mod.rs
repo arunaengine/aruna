@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod auth;
-pub mod database;
 pub mod group;
 pub mod group_delete;
+pub mod identifier;
 pub mod realm;
 pub mod s3_session;
 pub mod user;

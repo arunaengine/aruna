@@ -4,13 +4,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod lanes;
+mod limiter;
 mod manifest;
+mod table;
 mod walk;
 
+use std::sync::Arc;
+
+use aruna_blob::pace::{Pace, paced};
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::structs::execution::job::{
-    JobError, JobId, JobResultPayload, ManifestRead, StagingJobCheckpoint, StagingJobPhase,
-    StagingJobSpec,
+    JobError, JobErrorKind, JobId, JobResultPayload, ManifestRead, StagingJobCheckpoint,
+    StagingJobPhase, StagingJobSpec,
 };
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -61,6 +66,48 @@ async fn read_main(
 }
 
 pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {
+    // Every source request of a table import, adapter retries included, takes a token; a
+    // pause a source asks for ends with the job and shows in its progress.
+    match spec.table.as_ref() {
+        Some(table) => {
+            let progress = ctx.progress.clone();
+            let pace = Pace {
+                stops: vec![ctx.cancel.clone(), ctx.shutdown.clone()],
+                notice: Some(Arc::new(move |until| progress.set_pause(until))),
+                ..Pace::new(spec.connector_id, table.rate())
+            };
+            let outcome = Box::pin(paced(pace, run_job(ctx, spec))).await;
+            stopped_outcome(ctx, outcome).await
+        }
+        None => Box::pin(run_job(ctx, spec)).await,
+    }
+}
+
+/// A failure while the job was cancelled or shut down, such as a paced wait the stop ended,
+/// is that stop's outcome and spends no attempt.
+async fn stopped_outcome(ctx: &JobContext, outcome: JobRunOutcome) -> JobRunOutcome {
+    if !matches!(
+        outcome,
+        JobRunOutcome::Failed(_) | JobRunOutcome::Deferred(_)
+    ) {
+        return outcome;
+    }
+    if ctx.cancel.is_cancelled() {
+        clear_queue(ctx).await;
+        return JobRunOutcome::Cancelled;
+    }
+    // A permanent failure already cleared the job's rows, so it stays terminal.
+    let permanent = matches!(
+        &outcome,
+        JobRunOutcome::Failed(error) if error.kind == JobErrorKind::Permanent
+    );
+    match ctx.shutdown.is_cancelled() && !permanent {
+        true => JobRunOutcome::Interrupted,
+        false => outcome,
+    }
+}
+
+async fn run_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunOutcome {
     if spec.strategy == StagingStrategy::Sync {
         return permanent_error("sync is not a staging job strategy");
     }
@@ -162,6 +209,17 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
                 }
             }
         }
+        if table::reads_table(&checkpoint) {
+            // Boxed, as its page import and object writes make a large future.
+            match Box::pin(table::read_table_chunk(ctx, spec, &mut checkpoint)).await {
+                Ok(()) => continue,
+                Err(PageFailure::Retry(message)) => return retryable_error(message),
+                Err(PageFailure::Conflict(message)) => return conflict_error(message),
+                Err(PageFailure::Permanent(message)) => {
+                    return finish_failed(ctx, permanent_error(message)).await;
+                }
+            }
+        }
         if checkpoint.manifest.is_none() && checkpoint.walk.is_none() {
             match start_walk(ctx, spec, &mut checkpoint).await {
                 Ok(true) => continue,
@@ -212,12 +270,14 @@ fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
         prefixes_done: 0,
         walk: None,
         manifest: None,
+        table: spec.table.as_ref().map(|_| Default::default()),
         queue_head: 0,
         queue_tail: 0,
         items_current: 0,
         items_succeeded: 0,
         items_failed: 0,
-        items_total: spec.prefixes.is_empty().then_some(spec.items.len() as u64),
+        items_total: (spec.prefixes.is_empty() && spec.table.is_none())
+            .then_some(spec.items.len() as u64),
         bytes_current: 0,
         bytes_total: None,
         bytes_discovered: 0,
@@ -226,14 +286,19 @@ fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
     }
 }
 
-/// Where a job a range's new coordinator takes over goes on: the former job's position without
-/// its counters, errors or directory queue. A flat walk keeps its listing cursor and reads its
-/// manifest again; a manifest read or a directory walk, whose queue stays behind, starts over.
+/// Where a job taken over by a range's new coordinator goes on: the former position without
+/// counters, errors or directory queue. A flat walk keeps its cursor and rereads its manifest;
+/// a manifest read, a table or a directory walk, whose queue stays behind, starts over.
 pub(crate) fn handed_checkpoint(
     spec: &StagingJobSpec,
     at: &StagingJobCheckpoint,
 ) -> StagingJobCheckpoint {
     let mut next = initial_checkpoint(spec);
+    // The table is read again from its start, pinned to what the former job first read.
+    if let (Some(table), Some(read)) = (next.table.as_mut(), at.table.as_ref()) {
+        table.version_id = read.version_id;
+        table.observation = read.observation.clone();
+    }
     next.flat = at.flat;
     next.items_done = at.items_done;
     let queued = at.queue_head < at.queue_tail;
@@ -549,6 +614,7 @@ mod pure_tests {
                 target_prefix: String::new(),
             }],
             checksum_manifest: None,
+            table: None,
         }
     }
 
@@ -618,6 +684,33 @@ mod pure_tests {
         assert_eq!(manifest.source_path, "refseq/SHA256SUMS");
         assert_eq!((manifest.offset, manifest.observation), (0, None));
         assert_eq!(handed_checkpoint(&test_spec(), &at).manifest, None);
+    }
+
+    // An uploaded table read to its end while folders still wait keeps its version on handover.
+    #[test]
+    fn handed_table_pinned() {
+        use aruna_core::structs::execution::job::TableRead;
+        let mut spec = test_spec();
+        spec.prefixes.clear();
+        let rows = serde_json::json!({ "kind": "folder", "source": "{p}", "target": "{p}" });
+        let table = serde_json::json!({ "source": { "object": { "bucket": "b", "key": "t.csv" } },
+            "rows": rows });
+        spec.table = Some(serde_json::from_value(table).unwrap());
+        let mut at = initial_checkpoint(&spec);
+        let version = Ulid::from_bytes([9; 16]);
+        at.table = Some(Box::new(TableRead {
+            offset: 4096,
+            version_id: Some(version),
+            columns: Some(vec!["p".to_string()]),
+            done: true,
+            ..TableRead::default()
+        }));
+        at.queue_tail = 3;
+        let handed = handed_checkpoint(&spec, &at);
+        let table = handed.table.expect("the table is read again");
+        assert_eq!((table.offset, table.done, table.columns), (0, false, None));
+        assert_eq!(table.version_id, Some(version));
+        assert_eq!((handed.queue_head, handed.queue_tail), (0, 0));
     }
 
     #[test]

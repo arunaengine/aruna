@@ -13,7 +13,7 @@ pub use cost::{InputRoute, UNKNOWN_PERMILLE};
 pub use digest::{PLAN_DIGEST_DOMAIN, plan_digest};
 pub use eligibility::{PolicyVerdict, RejectionVerdict};
 pub use inputs::{
-    InputHolder, MAX_INPUT_HOLDERS, MAX_PLAN_ALTERNATIVES, MAX_PLAN_CANDIDATES, MAX_PLAN_INPUTS,
+    InputHolder, MAX_INPUT_HOLDERS, MAX_PLAN_ALTERNATIVES, MAX_PLAN_CANDIDATES,
     MAX_PLAN_REJECTIONS, MAX_TARGET_SCAN, PlanError, PlanRequest, ResolvedInput, TargetCandidate,
     TargetScore,
 };
@@ -29,7 +29,7 @@ use ulid::Ulid;
 pub struct PlannedInput {
     pub destination_key: String,
     pub version_id: Ulid,
-    pub blake3: [u8; 32],
+    pub content: crate::structs::execution::job::InputContent,
     pub bytes: u64,
     pub policies: Vec<crate::structs::placement::policy::PlacementPolicyRef>,
     /// `None` when the target already holds the exact compliant copy.
@@ -168,7 +168,7 @@ fn planned_inputs(request: &PlanRequest, routes: &[InputRoute]) -> Vec<PlannedIn
         .map(|(input, route)| PlannedInput {
             destination_key: input.destination_key.clone(),
             version_id: input.version_id,
-            blake3: input.blake3,
+            content: input.content.clone(),
             bytes: input.bytes,
             policies: input.policies.clone(),
             source_node_id: route.source_node_id,

@@ -47,9 +47,6 @@ use aruna_operations::metadata::stats::count_group_purpose;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
-use aruna_operations::s3::object::list::{
-    ListBucketInput, ListBucketOperation, ListContinuationToken,
-};
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -2142,7 +2139,7 @@ pub async fn list_data_paths(
             require_data_read(&state, &auth, listing_path).await?;
             list_bucket_objects(
                 &state,
-                (group_id, bearer.as_ref()),
+                (group_id, bearer.as_ref(), &auth),
                 &bucket,
                 &key_prefix,
                 query.delimiter.as_deref(),
@@ -2218,7 +2215,7 @@ async fn list_group_buckets(
 
 async fn list_bucket_objects(
     state: &ServerState,
-    (group_id, bearer): (Ulid, Option<&crate::auth::ValidatedBearer>),
+    (group_id, bearer, auth): (Ulid, Option<&crate::auth::ValidatedBearer>, &AuthContext),
     bucket: &str,
     key_prefix: &str,
     delimiter: Option<&str>,
@@ -2236,76 +2233,40 @@ async fn list_bucket_objects(
         });
     }
 
-    // A distributed bucket is listed across its key ranges.
-    if let Some(info) = distributed_bucket(state, bucket).await? {
-        let request = ListRequest {
-            bucket: bucket.to_string(),
-            prefix: (!key_prefix.is_empty()).then(|| key_prefix.to_string()),
-            delimiter: delimiter.map(str::to_string),
-            cursor: continuation_token.map(str::to_string),
-            limit,
-        };
-        let page = object_page(state, &info, bearer, request).await?;
-        let path = |key: &str| object_permission_path(realm_id, group_id, node_id, bucket, key);
-        let folders = page.prefixes.iter().map(|prefix| DataPathEntry {
-            permission_path: path(prefix),
-            kind: DataPathKind::Folder,
-        });
-        let objects = page.objects.iter().map(|object| DataPathEntry {
-            permission_path: path(&object.key),
-            kind: DataPathKind::Object,
-        });
+    // Only what the caller may read shows, as in the bucket's own listing; a distributed
+    // bucket is listed across its key ranges.
+    let Some(info) = listed_bucket(state, bucket).await? else {
         return Ok(DataPathsResponse {
-            entries: folders.chain(objects).collect(),
-            continuation_token: page.next_cursor,
+            entries: Vec::new(),
+            continuation_token: None,
         });
-    }
-    let continuation_token = decode_object_token(continuation_token)?;
-    let result = drive(
-        ListBucketOperation::new(ListBucketInput {
-            bucket: bucket.to_string(),
-            group_id,
-            continuation_token,
-            max_keys: Some(limit),
-            prefix: (!key_prefix.is_empty()).then(|| key_prefix.to_string()),
-            delimiter: delimiter.map(str::to_string),
-            start_after: None,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
-
-    let mut entries = Vec::with_capacity(result.objects.len() + result.common_prefixes.len());
-    for prefix in result.common_prefixes {
-        entries.push(DataPathEntry {
-            permission_path: object_permission_path(realm_id, group_id, node_id, bucket, &prefix),
-            kind: DataPathKind::Folder,
-        });
-    }
-    for object in result.objects {
-        entries.push(DataPathEntry {
-            permission_path: object_permission_path(
-                realm_id,
-                group_id,
-                node_id,
-                bucket,
-                &object.head.key,
-            ),
-            kind: DataPathKind::Object,
-        });
-    }
+    };
+    let request = ListRequest {
+        bucket: bucket.to_string(),
+        prefix: (!key_prefix.is_empty()).then(|| key_prefix.to_string()),
+        delimiter: delimiter.map(str::to_string),
+        cursor: continuation_token.map(str::to_string),
+        limit,
+    };
+    let expiry = bearer.map_or(0, crate::auth::ValidatedBearer::expires_at_secs);
+    let page = object_page(state, &info, (bearer, Some((auth, expiry))), request).await?;
+    let path = |key: &str| object_permission_path(realm_id, group_id, node_id, bucket, key);
+    let folders = page.prefixes.iter().map(|prefix| DataPathEntry {
+        permission_path: path(prefix),
+        kind: DataPathKind::Folder,
+    });
+    let objects = page.objects.iter().map(|object| DataPathEntry {
+        permission_path: path(&object.key),
+        kind: DataPathKind::Object,
+    });
     Ok(DataPathsResponse {
-        entries,
-        continuation_token: result
-            .continuation_token
-            .map(encode_object_token)
-            .transpose()?,
+        entries: folders.chain(objects).collect(),
+        continuation_token: page.next_cursor,
     })
 }
 
-/// The bucket when it is a member of a distributed bucket.
-async fn distributed_bucket(
+/// The bucket's record, or `None` when there is no such bucket.
+async fn listed_bucket(
     state: &ServerState,
     bucket: &str,
 ) -> ServerResult<Option<aruna_core::structs::storage::blob::BucketInfo>> {
@@ -2315,7 +2276,7 @@ async fn distributed_bucket(
     )
     .await
     {
-        Ok(info) => Ok(info.distribution.is_some().then_some(info)),
+        Ok(info) => Ok(Some(info)),
         Err(GetBucketError::NotFound) => Ok(None),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
@@ -2350,24 +2311,6 @@ fn decode_bucket_token(token: Option<&str>) -> ServerResult<Option<String>> {
 
 fn encode_bucket_token(bucket: String) -> String {
     STANDARD.encode(bucket.as_bytes())
-}
-
-fn decode_object_token(token: Option<&str>) -> ServerResult<Option<ListContinuationToken>> {
-    token
-        .map(|token| {
-            let bytes = STANDARD
-                .decode(token)
-                .map_err(|_| ServerError::BadRequest)?;
-            ListContinuationToken::from_bytes(&bytes).map_err(|_| ServerError::BadRequest)
-        })
-        .transpose()
-}
-
-fn encode_object_token(token: ListContinuationToken) -> ServerResult<String> {
-    token
-        .to_bytes()
-        .map(|bytes| STANDARD.encode(bytes))
-        .map_err(|err| ServerError::InternalError(err.to_string()))
 }
 
 #[cfg(test)]

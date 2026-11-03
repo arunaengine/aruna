@@ -116,7 +116,8 @@ pub async fn write_text_object(
         text: request.text,
         content_type: request.content_type,
     };
-    Ok(Json(store_text(&state, &auth, &info, input).await?))
+    let stored = store_text(&state, &auth, &info, input, Default::default()).await?;
+    Ok(Json(stored))
 }
 
 #[cfg(test)]

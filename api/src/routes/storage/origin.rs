@@ -9,15 +9,20 @@ use aruna_core::structs::SyncMode;
 use aruna_core::structs::execution::source_access::{DigestOrigin, DigestScope};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
+use aruna_core::structs::storage::data::identity::content_id;
 use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
+use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, VersionOrigin,
 };
+use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_operations::distribution::guard::{
     GuardError, copy_readers, read_coordinator, route_read,
 };
-use aruna_operations::distribution::resolve::key_holders;
+use aruna_operations::distribution::resolve::{
+    GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version,
+};
 use aruna_operations::s3::bucket::sources::{FileSource, bucket_sources};
 use aruna_operations::s3::object::origin::{OriginError, OriginView, read_origin};
 use axum::extract::{Path, Query, State};
@@ -32,11 +37,22 @@ use utoipa_axum::routes;
 
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::identifiers::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
+use crate::routes::storage::bucket_metadata::{BucketIdentifierBody, BucketMetadataBody};
 use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::distributed::map_guard_error;
-use crate::routes::storage::relay::{RestForward, relay_get, relayed_set, stale_miss};
+use crate::routes::storage::relay::{
+    self, RestForward, node_directed, node_read, relay_get, relayed_set, stale_miss,
+};
 use crate::server::state::ServerState;
+use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
+use aruna_operations::s3::bucket::release::{
+    BucketScope, MembershipCaller, MembershipQuery, release_members,
+};
+
+/// How long an origin read directed at another node may take, body included.
+const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(OpenApi)]
 #[openapi()]
@@ -45,6 +61,7 @@ pub struct OriginApiDoc;
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(OriginApiDoc::openapi())
         .routes(routes!(get_origin))
+        .routes(routes!(get_version_origin))
         .routes(routes!(get_sources))
 }
 
@@ -65,8 +82,8 @@ pub enum OriginBody {
         node_id: String,
         device: Option<String>,
     },
-    /// From an external source or a database; details are under `source`.
-    Source { database_entry: Option<String> },
+    /// From an external source; details are under `source`.
+    Source,
     /// Copied from another exact version (global id or versioned node ARN as w3id).
     Copy { from: String },
     /// Registered in place from a storage backend folder.
@@ -110,6 +127,13 @@ pub enum ProjectionBody {
     /// The run crate convention: a `CreateAction` of the run with this file as `result`.
     #[serde(rename = "CreateAction")]
     CreatedBy { run_id: String },
+    /// A `PropertyValue` the database's parser found, linked by `identifier`.
+    #[serde(rename = "identifier")]
+    Identifier {
+        name: String,
+        value: String,
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -125,9 +149,51 @@ pub struct OriginResponse {
     pub source: Option<SourceBody>,
     /// The publication-safe projection: uploads and imports in place give none.
     pub projection: Vec<ProjectionBody>,
+    /// The bucket's metadata now; it may have changed since the version was made.
+    pub bucket_metadata: Option<BucketMetadataBody>,
+    /// Links the bucket metadata's identifier rules find in the key and source URL.
+    #[serde(default)]
+    pub identifiers: Vec<IdentifierView>,
+    /// The content id of the bytes, from their BLAKE3; absent for versions not stored here
+    /// as bytes, such as references.
+    pub content_id: Option<String>,
     /// Ranges a copy answered for because their coordinator could not; it may be behind.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_ranges: Vec<String>,
+    /// Releases of the bucket that pin exactly this version and the caller may read.
+    #[serde(default)]
+    pub releases: Vec<ReleaseView>,
+    /// `false` when release membership could not be checked everywhere, so one may be missing.
+    #[serde(default = "complete_default")]
+    pub releases_complete: bool,
+}
+
+fn complete_default() -> bool {
+    true
+}
+
+/// A release that pins a version: its release crate's exact version, label and upstream ids.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReleaseView {
+    pub crate_version: String,
+    pub label: String,
+    pub upstream: Vec<BucketIdentifierBody>,
+}
+
+impl From<ReleaseRef> for ReleaseView {
+    fn from(release: ReleaseRef) -> Self {
+        Self {
+            crate_version: release.crate_version.to_id(),
+            label: release.label,
+            upstream: (release.upstream.into_iter())
+                .map(|identifier| BucketIdentifierBody {
+                    name: identifier.name,
+                    value: identifier.value,
+                    url: identifier.url,
+                })
+                .collect(),
+        }
+    }
 }
 
 fn version_id(version: &OriginVersion) -> String {
@@ -146,9 +212,7 @@ impl From<OriginView> for OriginResponse {
                     node_id: node_id.to_string(),
                     device,
                 },
-                VersionOrigin::Source { database } => OriginBody::Source {
-                    database_entry: database.map(|entry| entry.to_string()),
-                },
+                VersionOrigin::Source => OriginBody::Source,
                 VersionOrigin::Copy { from } => OriginBody::Copy {
                     from: version_id(&from),
                 },
@@ -201,9 +265,17 @@ impl From<OriginView> for OriginResponse {
                     OriginProjection::CreatedBy { run_id } => ProjectionBody::CreatedBy {
                         run_id: run_id.to_string(),
                     },
+                    OriginProjection::Identifier { name, value, url } => {
+                        ProjectionBody::Identifier { name, value, url }
+                    }
                 })
                 .collect(),
+            bucket_metadata: view.bucket_metadata.map(Into::into),
+            identifiers: view.identifiers.into_iter().map(Into::into).collect(),
+            content_id: view.content_hash.map(content_id),
             stale_ranges: Vec::new(),
+            releases: Vec::new(),
+            releases_complete: true,
         }
     }
 }
@@ -225,7 +297,13 @@ impl From<OriginView> for OriginResponse {
 - `projection` is what datasets receive: `isBasedOn` the source URL, the copied version or
   the synced source version when it is a version of a distributed bucket (a node ARN names
   its bucket and key, so it is left out); `CreateAction` for job results; nothing for
-  uploads and imports in place.
+  uploads and imports in place; `identifier` for each link the database's parser finds.
+- `bucket_metadata` and `identifiers` come from the bucket's metadata now, not from when the
+  version was made; a bucket without metadata gives none.
+- `releases` lists the bucket's releases whose release crate names exactly this version, among
+  those the caller may read. `releases_complete` is `false` when membership could not be
+  checked everywhere (a range holder of a distributed bucket did not answer), so a release may
+  be missing.
 - Without `version_id` the range's coordinator answers. While it cannot, a ready copy answers
   and `stale_ranges` names the range, since the copy may be behind; a 404 from a copy has the
   code `stale_not_found` and says the version may exist.
@@ -246,7 +324,10 @@ impl From<OriginView> for OriginResponse {
             "origin": {"kind": "copy", "from": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13"},
             "hop": null,
             "source": null,
-            "projection": [{"property": "isBasedOn", "id": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13"}]
+            "projection": [{"property": "isBasedOn", "id": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13"}],
+            "bucket_metadata": null,
+            "identifiers": [],
+            "content_id": "https://w3id.org/aruna/data/af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
@@ -264,7 +345,20 @@ pub async fn get_origin(
     Query(params): Query<OriginParams>,
 ) -> ServerResult<Json<OriginResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    let info = bucket_info(&state, &bucket).await?;
+    origin_answer(&state, &auth, bearer, &headers, bucket, params).await
+}
+
+/// The origin of one version of a local bucket's key, or the answer of the holder this member
+/// relays to with the caller's token.
+async fn origin_answer(
+    state: &Arc<ServerState>,
+    auth: &AuthContext,
+    bearer: Option<ValidatedBearer>,
+    headers: &HeaderMap,
+    bucket: String,
+    params: OriginParams,
+) -> ServerResult<Json<OriginResponse>> {
+    let info = bucket_info(state, &bucket).await?;
     let path = object_permission_path(
         state.get_realm_id(),
         info.group_id,
@@ -272,8 +366,8 @@ pub async fn get_origin(
         &bucket,
         &params.key,
     );
-    ensure_permission(&state, &auth, path, Permission::READ).await?;
-    relayed_set(&info, &headers)?;
+    ensure_permission(state, auth, path, Permission::READ).await?;
+    relayed_set(&info, headers)?;
     // A member that holds no copy of the key's range asks a holder, which checks again. A copy
     // may lag behind the current version, so only a pinned version comes from one, unless the
     // coordinator cannot answer; then a copy answers, marked stale.
@@ -290,7 +384,7 @@ pub async fn get_origin(
                 Ok(Some((range_id, node_id))) => {
                     let target = (binding.set_id, range_id, node_id);
                     let path = (path.as_str(), HeaderMap::new());
-                    Some(relay_origin(&state, target, vec![node_id], path, bearer.clone()).await)
+                    Some(relay_origin(state, target, vec![node_id], path, bearer.clone()).await)
                 }
                 Err(error) => Some(Err(error)),
             };
@@ -304,7 +398,7 @@ pub async fn get_origin(
                     stale = Some(range_id);
                     if !here {
                         let target = (binding.set_id, range_id);
-                        return copy_origin(&state, target, copies, &path, bearer).await;
+                        return copy_origin(state, target, copies, &path, bearer).await;
                     }
                 }
                 Some(answer) => return answer,
@@ -318,7 +412,7 @@ pub async fn get_origin(
             holders.push(node_id);
             let target = (binding.set_id, range_id, node_id);
             let path = origin_path(&bucket, &params);
-            return relay_origin(&state, target, holders, (&path, HeaderMap::new()), bearer).await;
+            return relay_origin(state, target, holders, (&path, HeaderMap::new()), bearer).await;
         }
     }
     // A relayed current read sent here as coordinator is refused once this node is none.
@@ -357,7 +451,7 @@ pub async fn get_origin(
             let target = (binding.set_id, range_id, node_id);
             // While the coordinator cannot answer, this copy's miss stands, marked.
             let asked = relay_origin(
-                &state,
+                state,
                 target,
                 vec![node_id],
                 (&path, HeaderMap::new()),
@@ -374,8 +468,32 @@ pub async fn get_origin(
         (OriginError::BucketMissing | OriginError::VersionMissing, _) => ServerError::NotFound,
         (OriginError::Storage(reason), _) => ServerError::InternalError(reason),
     })?;
+    let version_id = view.version_id;
     let mut answer = OriginResponse::from(view);
     answer.stale_ranges = stale.iter().map(ToString::to_string).collect();
+    // Only releases the caller may read count; any other node is asked with its own bearer.
+    let scope = BucketScope {
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        bucket: &bucket,
+        info: &info,
+    };
+    let caller = MembershipCaller {
+        auth,
+        bearer: bearer.as_ref().map(ValidatedBearer::as_str),
+    };
+    let query = [MembershipQuery {
+        key: params.key.clone(),
+        version_id,
+    }];
+    match release_members(state.get_ctx().as_ref(), scope, caller, &query).await {
+        Ok(mut found) => {
+            let members = found.answers.remove(0);
+            answer.releases = members.releases.into_iter().map(Into::into).collect();
+            answer.releases_complete = members.complete;
+        }
+        Err(_) => answer.releases_complete = false,
+    }
     Ok(Json(answer))
 }
 
@@ -405,6 +523,149 @@ async fn copy_origin(
         Err(ServerError::NotFound) => Err(stale_miss(range_id)),
         Err(error) => Err(error),
     }
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct VersionOriginParams {
+    /// The exact version: a global id URL or a versioned object w3id (node ARN).
+    pub version: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/origin",
+    tag = "data/storage",
+    summary = "Read a version's origin by its id",
+    description = r#"Returns the origin of one exact version named by the id a crate or another origin uses.
+
+**Authentication**: realm bearer token with READ on the file, checked on the node that holds it.
+
+**Behavior**
+- A versioned object w3id of this node is answered as by the bucket origin route. One of
+  another node is read on that node with the caller's token; that node may relay once more
+  to a holder of a distributed bucket's range, and never further.
+- A global id is answered by the holders of the version's range, in turn.
+- The answer and its refusals are the holder's: 403 without READ, 404 for an unknown version.
+
+**Limits**
+- One version per call; at most two relays."#,
+    params(VersionOriginParams),
+    responses(
+        (status = 200, description = "The version's origin", body = OriginResponse, example = json!({
+            "version_id": "01K8T6A2C4E6G8JKMPRSTVXZ13",
+            "global_id": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13",
+            "created_by": "01K8Z1C0RAT0R0000000000000",
+            "created_at": "2026-08-20T10:12:00Z",
+            "origin": {"kind": "job", "run_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2"},
+            "hop": null,
+            "source": null,
+            "projection": [{"property": "CreateAction", "run_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2"}],
+            "bucket_metadata": null,
+            "identifiers": [],
+            "content_id": null
+        })),
+        (status = 400, description = "Not a version id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No READ on the file", body = ErrorResponse),
+        (status = 404, description = "Version not found", body = ErrorResponse),
+        (status = 409, description = "The read was directed at another node", body = ErrorResponse),
+        (status = 503, description = "No node holding the version answered", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_version_origin(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: HeaderMap,
+    Query(params): Query<VersionOriginParams>,
+) -> ServerResult<Json<OriginResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let deadline = tokio::time::Instant::now() + RELAY_DEADLINE;
+    version_answer(&state, &auth, bearer, &headers, (&params.version, deadline)).await
+}
+
+/// The origin of the version `version` names, read where it lives with the caller's token.
+pub(crate) async fn version_answer(
+    state: &Arc<ServerState>,
+    auth: &AuthContext,
+    bearer: Option<ValidatedBearer>,
+    headers: &HeaderMap,
+    (version, deadline): (&str, tokio::time::Instant),
+) -> ServerResult<Json<OriginResponse>> {
+    let directed = node_directed(state, headers)?;
+    let refused = || ServerError::BadRequestReason("not a version id".to_string());
+    match W3idIdentifier::parse(version).map_err(|_| refused())? {
+        W3idIdentifier::VersionedObject(arn) if arn.realm_id != state.get_realm_id() => {
+            Err(ServerError::NotFound)
+        }
+        W3idIdentifier::VersionedObject(arn) if arn.node_id == state.get_node_id() => {
+            let params = OriginParams {
+                key: arn.key,
+                version_id: Some(arn.version),
+            };
+            origin_answer(state, auth, bearer, headers, arn.bucket, params).await
+        }
+        // A node-directed read reached its node; it never directs the read on.
+        W3idIdentifier::VersionedObject(_) if directed => Err(ServerError::Conflict(
+            "the version is not on the node the read was directed at".to_string(),
+        )),
+        W3idIdentifier::VersionedObject(arn) => {
+            let path = relay::query_path("/data/origin", &[("version", version)]);
+            node_read(state, arn.node_id, &path, bearer.as_ref(), deadline)
+                .await
+                .map(Json)
+        }
+        W3idIdentifier::Global(GlobalId::Version {
+            realm_id,
+            version_id,
+        }) if realm_id == state.get_realm_id() => {
+            global_origin(state, auth, bearer, headers, version_id).await
+        }
+        _ => Err(refused()),
+    }
+}
+
+/// The origin of a distributed bucket's version from this member, or from its holders in turn.
+async fn global_origin(
+    state: &Arc<ServerState>,
+    auth: &AuthContext,
+    bearer: Option<ValidatedBearer>,
+    headers: &HeaderMap,
+    version_id: Ulid,
+) -> ServerResult<Json<OriginResponse>> {
+    let deadline = tokio::time::Instant::now() + RESOLVE_BUDGET;
+    let found = match resolve_version(state.get_ctx().as_ref(), version_id, deadline).await {
+        GlobalResolution::Found(found) => found,
+        GlobalResolution::NotFound => return Err(ServerError::NotFound),
+        GlobalResolution::Unavailable => {
+            return Err(ServerError::ServiceUnavailableReason(
+                "the version's bucket did not answer".to_string(),
+            ));
+        }
+        GlobalResolution::Ambiguous => {
+            return Err(ServerError::Conflict(
+                "more than one distributed bucket holds this version id".to_string(),
+            ));
+        }
+    };
+    let params = OriginParams {
+        key: found.key.clone(),
+        version_id: Some(version_id),
+    };
+    if found.local {
+        return origin_answer(state, auth, bearer, headers, found.bucket, params).await;
+    }
+    let path = origin_path(&found.bucket, &params);
+    // Holders come coordinator first, so its miss decides.
+    let Some(coordinator) = found.holders.first().copied() else {
+        return Err(ServerError::ServiceUnavailableReason(format!(
+            "no holder of version {version_id} is known"
+        )));
+    };
+    let target = (found.set_id, Ulid::nil(), coordinator);
+    let sent = (path.as_str(), HeaderMap::new());
+    relay_origin(state, target, found.holders, sent, bearer).await
 }
 
 /// Asks `holders` in turn for the origin; a copy's miss goes on, the coordinator's decides.

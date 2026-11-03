@@ -371,3 +371,50 @@ fn caught_up_ranges() {
         MemberState::Ready
     );
 }
+
+#[test]
+fn metadata_survives_settings() {
+    use crate::structs::storage::bucket_metadata::BucketMetadata;
+    let metadata = BucketMetadata {
+        database: true,
+        title: Some("Bakta DB".to_string()),
+        ..BucketMetadata::default()
+    };
+    let metadata = Box::new(metadata);
+    let set = DistributionRequest::ChangeMetadata {
+        metadata: Some(metadata.clone()),
+    };
+    let head = step(&created(), &set);
+    assert_eq!(head.config.settings.metadata, Some(metadata.clone()));
+    // A settings change carries no metadata, yet keeps the stored one.
+    let settings = DistributionRequest::ChangeSettings {
+        settings: DistributionSettings {
+            public: true,
+            ..DistributionSettings::default()
+        },
+    };
+    let head = step(&head, &settings);
+    assert!(head.config.settings.public);
+    assert_eq!(head.config.settings.metadata, Some(metadata));
+    let cleared = step(
+        &head,
+        &DistributionRequest::ChangeMetadata { metadata: None },
+    );
+    assert_eq!(cleared.config.settings.metadata, None);
+    assert!(cleared.config.settings.public);
+    let broken = DistributionRequest::ChangeMetadata {
+        metadata: Some(Box::new(BucketMetadata {
+            identifiers: vec![crate::structs::identity::identifier::Identifier {
+                name: "DOI".to_string(),
+                value: "10.1/x".to_string(),
+                url: "javascript:alert(1)".to_string(),
+                target: crate::structs::identity::identifier::IdentifierTarget::Key,
+            }],
+            ..BucketMetadata::default()
+        })),
+    };
+    assert!(matches!(
+        next_snapshot(realm(), Some(&cleared), &broken),
+        Err(DistributionError::InvalidMetadata(_))
+    ));
+}

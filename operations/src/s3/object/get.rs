@@ -49,6 +49,7 @@ use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::source_access::{
     ObservationMatch, ResolvedSourceAccess, SourceMetadata,
 };
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
@@ -225,6 +226,9 @@ pub enum GetObjectError {
     /// The version waits for its content hash; a token credential or object key promotes it first.
     #[error("The object content waits for its bucket key.")]
     PendingContent(ArchiveKey),
+    /// The version is a link: the caller reads its target under its own rights there.
+    #[error("The version links to another object.")]
+    Link(Box<(VersionSourceBinding, SourceMetadata)>),
     #[error(transparent)]
     Abe(#[from] aruna_core::structs::storage::abe::AbeError),
 }
@@ -684,6 +688,10 @@ impl GetObjectOperation {
                 last_refresh,
                 ..
             } => {
+                if source.descriptor.kind == SourceConnectorKind::ArunaLink {
+                    let linked = Box::new((source, cached_metadata));
+                    return self.emit_error(GetObjectError::Link(linked));
+                }
                 // Access-driven successor-on-drift (#256); verified cache,
                 // origin relay and sync polling stay deferred (#375/#380/#314).
                 self.source_binding = Some(source.clone());
@@ -1274,6 +1282,11 @@ impl GetObjectOperation {
                 // its bytes were never cached (#375 deferred).
                 if self.reference_explicit {
                     return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
+                }
+                // Recorded digests bind the bytes, so a drifted source never replaces them.
+                let bound = self.reference_cached.as_ref();
+                if bound.is_some_and(|stored| !stored.enforced_checksums().is_empty()) {
+                    return self.emit_error(GetObjectError::ReferenceSourceChanged);
                 }
                 // Current drift records a same-binding successor, but repeated
                 // change fails rather than serving mismatched bytes.

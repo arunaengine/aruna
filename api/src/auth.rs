@@ -404,27 +404,28 @@ async fn extract_auth_parts(
     let Some(token) = bearer_token(headers) else {
         return (None, None);
     };
+    match bearer_auth(state, token).await {
+        Some((auth_context, bearer)) => (Some(auth_context), Some(bearer)),
+        None => (None, None),
+    }
+}
 
-    let claims = match handle_token(state, token).await {
-        Ok(claims) => claims,
-        Err(_) => return (None, None),
-    };
+/// The caller a bearer token names now, checked in full: signature, expiry and revocation.
+pub(crate) async fn bearer_auth(
+    state: &ServerState,
+    token: &str,
+) -> Option<(AuthContext, ValidatedBearer)> {
+    let claims = handle_token(state, token).await.ok()?;
     let expires_at_secs = claims.exp;
-    let auth_context: AuthContext = match claims.try_into() {
-        Ok(auth_context) => auth_context,
-        Err(_) => return (None, None),
-    };
+    let auth_context: AuthContext = claims.try_into().ok()?;
     // Reject tokens whose restriction set exceeds the fail-closed size limits so
     // an oversized delegation never reaches the permission evaluator.
     if let Some(restrictions) = auth_context.path_restrictions.as_deref()
         && aruna_core::permission_path::validate_restriction_limits(restrictions).is_err()
     {
-        return (None, None);
+        return None;
     }
-    (
-        Some(auth_context),
-        Some(ValidatedBearer::new(token, expires_at_secs)),
-    )
+    Some((auth_context, ValidatedBearer::new(token, expires_at_secs)))
 }
 
 pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaims, TokenError> {

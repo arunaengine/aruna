@@ -5,7 +5,7 @@
 use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::create::CreateBucketOperation;
-use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
@@ -33,8 +33,10 @@ pub(crate) async fn setup_driver_context() -> StagingTestContext {
     let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
         .await
         .expect("net handle must initialize");
-    let blob_handle = BlobHandler::with_egress(
-        BackendConfig {
+    // Verified reads of references spool their bytes before they are served.
+    let spool = Some(format!("{temp_root}/spool").into());
+    let blob_handle = BlobHandler::with_registry(
+        BackendRegistry::single(BackendConfig {
             backend_type: Backend::FileSystem,
             root: blob_root,
             service_config: HashMap::new(),
@@ -42,10 +44,11 @@ pub(crate) async fn setup_driver_context() -> StagingTestContext {
             max_bucket_size: Some(1),
             multipart_bucket: Some("uploaded-parts".to_string()),
             timeouts: Default::default(),
-        },
+        }),
         storage_handle.clone(),
         net_handle,
         EgressPolicy::loopback(),
+        spool,
     )
     .await
     .expect("blob handle must initialize");

@@ -14,6 +14,7 @@ pub mod append;
 pub mod audit;
 pub mod family;
 pub mod keys;
+pub mod pages;
 pub mod project;
 pub mod reduce;
 pub mod rows;

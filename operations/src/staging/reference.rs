@@ -17,7 +17,6 @@ use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
 use crate::replication::queue::build_live_obligation;
-use crate::s3::object::origin::database_entry;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
@@ -198,13 +197,6 @@ pub async fn write_reference_version(
         )
         .await?;
         let set_hint = binding.as_ref().map(DistributionBinding::hint);
-        let database = database_entry(
-            context,
-            (write.realm_id, write.node_id),
-            &write.bucket,
-            binding.as_ref().map(|binding| binding.set_id),
-        )
-        .await;
         // Only the coordinator of the key's range writes, at its epoch.
         let epoch = match binding.as_ref() {
             Some(binding) => {
@@ -335,7 +327,7 @@ pub async fn write_reference_version(
             write.user_id,
             now,
         )
-        .with_origin(Some(VersionOrigin::Source { database }))
+        .with_origin(Some(VersionOrigin::Source))
         .with_policies(policies)?;
         let version = stamp_version(version, binding.as_ref(), generation, epoch);
         apply_storage_effect(

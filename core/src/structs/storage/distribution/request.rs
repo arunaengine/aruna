@@ -72,6 +72,10 @@ pub enum DistributionRequest {
     DeleteCommit,
     /// A member's or coordinator's signed statement for the publisher to embed.
     Statement(Box<SignedStatement>),
+    /// Replaces the bucket metadata only; `None` clears it.
+    ChangeMetadata {
+        metadata: Option<Box<crate::structs::storage::bucket_metadata::BucketMetadata>>,
+    },
 }
 
 impl DistributionRequest {
@@ -87,6 +91,7 @@ impl DistributionRequest {
             Self::DeletePrepare { .. } => "delete prepare",
             Self::DeleteCommit => "delete commit",
             Self::Statement(signed) => signed.statement.kind.name(),
+            Self::ChangeMetadata { .. } => "change metadata",
         }
     }
 
@@ -200,7 +205,21 @@ fn accept(
             if settings.split_objects == Some(0) || settings.split_bytes == Some(0) {
                 return Err(DistributionError::InvalidSplit);
             }
-            next.config.settings = settings.clone();
+            // Metadata changes only through `ChangeMetadata`, so neither change loses the other.
+            let metadata = next.config.settings.metadata.take();
+            next.config.settings = DistributionSettings {
+                metadata,
+                ..settings.clone()
+            };
+            Ok(())
+        }
+        DistributionRequest::ChangeMetadata { metadata } => {
+            changeable(next)?;
+            if let Some(metadata) = metadata {
+                crate::structs::storage::bucket_metadata::validate_metadata(metadata)
+                    .map_err(DistributionError::InvalidMetadata)?;
+            }
+            next.config.settings.metadata = metadata.clone();
             Ok(())
         }
         DistributionRequest::Create { .. } => Err(DistributionError::SetMismatch(next.set_id())),

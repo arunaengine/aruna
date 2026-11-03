@@ -374,6 +374,7 @@ mod tests {
             referenced,
             identity: None,
             pending: false,
+            searchable: false,
         }
     }
 

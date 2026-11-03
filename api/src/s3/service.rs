@@ -19,9 +19,13 @@ use aruna_core::structs::storage::distribution::delegation::{
     COPY_CONTEXT_HEADER, Payload, body_digest,
 };
 use aruna_core::structs::storage::distribution::upload::UploadTag;
+mod link;
 mod multipart;
 mod object;
 mod response;
+mod view;
+
+pub(crate) use self::view::InputView;
 
 use self::attributes::{
     RequestedAttributes, attributes_checksum, attributes_output, attributes_parts, parse_max_parts,
@@ -119,6 +123,7 @@ use aruna_operations::s3::object::head::{HeadObjectInput as HOI, HeadObjectOpera
 use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListBucketOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput as LOVI, ListVersionsOperation};
+use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed, open_cursor};
 use aruna_operations::sync::mirror_repair::{
     SyncMirrorIntent, kick_mirror_repair, stage_mirror_delete, stage_mirror_reconcile,
 };
@@ -278,22 +283,22 @@ impl ArunaS3Service {
             .and_then(|info| info.distribution.clone())
             .zip(extensions.get::<UserAccess>());
         // A distributed bucket's folder spans its key ranges, as its S3 listing does.
-        let (page, stale) = match distributed {
+        let (page, stale, more) = match distributed {
             Some((binding, user)) => {
                 let user = forward::reads::anonymous_window(user);
                 let shape = (None, false, None);
-                let (page, _, stale) =
+                let (page, next, stale) =
                     (self.merged_objects(&user, &binding, input, shape, (None, true))).await?;
-                (page, stale)
+                (page, stale, next.is_some())
             }
             None => {
                 let page = self
-                    .run_object_listing(input, None, false, None, None)
+                    .run_object_listing(input, (None, None), false, None, (None, None))
                     .await?;
-                (page, Vec::new())
+                (page, Vec::new(), false)
             }
         };
-        let truncated = page.continuation_token.is_some();
+        let truncated = more || page.continuation_token.is_some() || page.sealed.is_some();
         let folders = page
             .common_prefixes
             .into_iter()
@@ -397,6 +402,9 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
+        if let Some(view) = req.extensions.get::<InputView>().copied() {
+            return self.view_head_bucket(view).await;
+        }
         debug!(bucket = %req.input.bucket, "Received HEAD BUCKET Request");
 
         let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
@@ -648,6 +656,9 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        if let Some(view) = req.extensions.get::<InputView>().copied() {
+            return self.view_list(view, req.input).await;
+        }
         debug!(
             bucket = %req.input.bucket,
             prefix = ?req.input.prefix,
@@ -670,13 +681,22 @@ impl S3 for ArunaS3Service {
         let requested_continuation_token = req.input.continuation_token.clone();
         let query = (req.input.prefix.as_deref(), req.input.delimiter.as_deref());
         let requested = requested_continuation_token.as_deref();
+        // A sealed token resumes a page that stopped among entries the caller may not see.
+        let hidden = match requested.filter(|token| is_sealed(token)) {
+            Some(token) => Some(
+                open_cursor::<HiddenCursor>(token)
+                    .ok_or_else(|| s3_error!(InvalidArgument, "Invalid continuation token"))?,
+            ),
+            None => None,
+        };
+        let plain = requested.filter(|_| hidden.is_none());
         let (continuation_token, from) = match &merged {
-            Some(binding) => match decode_bound(binding.set_id, query, requested)? {
+            Some(binding) => match decode_bound(binding.set_id, query, plain)? {
                 Some(Resume::After(token)) => (Some(token), None),
-                Some(Resume::From(key)) => (None, Some(key)),
+                Some(other) => (None, Some(other)),
                 None => (None, None),
             },
-            None => (Self::decode_list_token(requested)?, None),
+            None => (Self::decode_list_token(plain)?, None),
         };
         let max_keys = match req.input.max_keys {
             None => ListBucketOperation::DEFAULT_MAX_KEYS,
@@ -733,7 +753,7 @@ impl S3 for ArunaS3Service {
             delimiter: delimiter.clone(),
             start_after: start_after.clone(),
         };
-        let (page, next_from, stale) = match &merged {
+        let (page, next, stale) = match &merged {
             Some(binding) => {
                 let shape = (owner, url_encoded, scope.as_ref());
                 self.merged_objects(&user_access, binding, input, shape, (from, true))
@@ -741,7 +761,13 @@ impl S3 for ArunaS3Service {
             }
             None => {
                 let page = self
-                    .run_object_listing(input, owner, url_encoded, scope.as_ref(), bounds)
+                    .run_object_listing(
+                        input,
+                        (owner, Some(&user_access)),
+                        url_encoded,
+                        scope.as_ref(),
+                        (bounds, hidden),
+                    )
                     .await?;
                 (page, None, Vec::new())
             }
@@ -751,15 +777,19 @@ impl S3 for ArunaS3Service {
             contents,
             common_prefixes,
             continuation_token: result_token,
+            sealed,
         } = page;
         let key_count = contents.len() + common_prefixes.len();
         let next_continuation_token = match &merged {
             Some(binding) => {
                 let query = (prefix.as_deref(), delimiter.as_deref());
-                let resume = (result_token.map(Resume::After)).or(next_from.map(Resume::From));
+                let resume = (result_token.map(Resume::After)).or(next);
                 encode_bound(binding.set_id, query, resume.as_ref())?
             }
-            None => Self::encode_list_token(result_token.as_ref())?,
+            None => match sealed {
+                Some(sealed) => Some(sealed),
+                None => Self::encode_list_token(result_token.as_ref())?,
+            },
         };
         let is_truncated = next_continuation_token.is_some();
 
@@ -831,15 +861,33 @@ impl S3 for ArunaS3Service {
             }
         }
 
+        // A sealed marker resumes among hidden entries; any other marker is a key.
+        let hidden = match marker.as_deref().filter(|marker| is_sealed(marker)) {
+            Some(marker) => Some(
+                open_cursor::<HiddenCursor>(marker)
+                    .ok_or_else(|| s3_error!(InvalidArgument, "Invalid marker"))?,
+            ),
+            None => None,
+        };
+        // In a distributed bucket a marker may be the sealed position this listing issued; any
+        // other token, such as a ListObjectsV2 one, stays a plain key.
+        let query = (prefix.as_deref(), delimiter.as_deref());
+        let resumed = (merged.as_ref().zip(marker.as_deref()))
+            .and_then(|(binding, marker)| decode_bound(binding.set_id, query, Some(marker)).ok())
+            .flatten()
+            .filter(|resume| matches!(resume, Resume::Sealed { .. }));
+        let key_marker = marker
+            .as_deref()
+            .filter(|_| hidden.is_none() && resumed.is_none());
         let continuation_token = marker_continuation_token(
             &bucket,
-            marker.as_deref(),
+            key_marker,
             prefix.as_deref(),
             delimiter.as_deref(),
         )?;
         let start_after = continuation_token
             .is_none()
-            .then(|| marker.clone())
+            .then(|| key_marker.map(str::to_string))
             .flatten();
 
         let owner = Some(Owner {
@@ -872,14 +920,24 @@ impl S3 for ArunaS3Service {
             // A marker cannot name a range start, so a legacy listing visits every range.
             Some(binding) => {
                 let shape = (owner, url_encoded, scope.as_ref());
-                let (page, _, stale) =
-                    (self.merged_objects(&user_access, binding, input, shape, (None, false)))
+                let (mut page, next, stale) =
+                    (self.merged_objects(&user_access, binding, input, shape, (resumed, false)))
                         .await?;
+                // A range that stopped among hidden entries goes on from this marker.
+                if let Some(next) = next {
+                    page.sealed = encode_bound(binding.set_id, query, Some(&next))?;
+                }
                 (page, stale)
             }
             None => {
                 let page = self
-                    .run_object_listing(input, owner, url_encoded, scope.as_ref(), None)
+                    .run_object_listing(
+                        input,
+                        (owner, Some(&user_access)),
+                        url_encoded,
+                        scope.as_ref(),
+                        (None, hidden),
+                    )
                     .await?;
                 (page, Vec::new())
             }
@@ -889,14 +947,18 @@ impl S3 for ArunaS3Service {
             contents,
             common_prefixes,
             continuation_token: result_token,
+            sealed,
         } = page;
-        let is_truncated = result_token.is_some();
-        let next_marker = next_marker_for(
-            delimiter.as_deref(),
-            result_token.as_ref(),
-            contents.is_empty(),
-        )
-        .map(&encode_field);
+        let is_truncated = result_token.is_some() || sealed.is_some();
+        let next_marker = match sealed {
+            Some(sealed) => Some(sealed),
+            None => next_marker_for(
+                delimiter.as_deref(),
+                result_token.as_ref(),
+                contents.is_empty(),
+            )
+            .map(&encode_field),
+        };
 
         let mut response = S3Response::new(ListObjectsOutput {
             name: Some(bucket),
@@ -1123,6 +1185,16 @@ impl S3 for ArunaS3Service {
 
         let (source_bucket, source_key, source_version_id) =
             parse_copy_source(&req.input.copy_source)?;
+        // A link copy writes a link to the source's exact version instead of a copy.
+        let mode = req
+            .headers
+            .get(aruna_core::structs::storage::link::COPY_MODE_HEADER);
+        if mode.and_then(|value| value.to_str().ok()) == Some("link") {
+            let source = (source_bucket, source_key, source_version_id);
+            return self
+                .copy_link(&req, &user_access, dest_bucket_info.as_ref(), source)
+                .await;
+        }
         let source_extras = req
             .extensions
             .get::<PolicyRequestExtras>()
@@ -1925,6 +1997,9 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        if let Some(view) = req.extensions.get::<InputView>().copied() {
+            return self.view_get(view, req.input).await;
+        }
         debug!(
             bucket = %req.input.bucket,
             key = %req.input.key,
@@ -1951,6 +2026,7 @@ impl S3 for ArunaS3Service {
                 .await;
         }
         let requested_range = req.input.range;
+        let link_read = (requested_range, req.input.if_match.clone());
         let version_id = parse_version_id(req.input.version_id)?;
         let bucket = req.input.bucket;
         let key = req.input.key;
@@ -2012,8 +2088,15 @@ impl S3 for ArunaS3Service {
                 get_object_keyed(&self.state, input, restrictions, private, limits).await
             }
             _ => get_object_token(&self.state, input, restrictions, token).await,
+        };
+        // A link is read at its target, under the caller's own rights there.
+        if let Err(aruna_operations::s3::object::get::GetObjectError::Link(linked)) = &result {
+            let bucket = response_bucket.as_str();
+            return self
+                .follow_get(&user_access, bucket, linked, link_read)
+                .await;
         }
-        .map_err(IntoS3Error::into_s3_error);
+        let result = result.map_err(IntoS3Error::into_s3_error);
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -2229,6 +2312,9 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
+        if let Some(view) = req.extensions.get::<InputView>().copied() {
+            return self.view_head(view, req.input).await;
+        }
         debug!(
             bucket = %req.input.bucket,
             key = %req.input.key,
@@ -2323,6 +2409,10 @@ impl S3 for ArunaS3Service {
             }
         };
 
+        // A link answers from its recorded target only to a caller who may read the target.
+        if let Some(binding) = result.source_binding.as_ref() {
+            self.check_link(&user_access, &bucket, binding).await?;
+        }
         // A reference answers from its source observation without opening a source read.
         let remote_info = if result.location.is_none() && result.source_metadata.is_none() {
             Some(
@@ -2607,19 +2697,27 @@ impl S3 for ArunaS3Service {
             return Ok(S3Response::new(output));
         }
 
-        let result = drive(
-            ListVersionsOperation::new(LOVI {
-                bucket: bucket.clone(),
-                prefix: prefix.clone(),
-                delimiter: delimiter.clone(),
-                key_marker: key_marker.clone(),
-                version_id_marker,
-                max_keys: Some(max_keys),
-            }),
-            &self.state,
-        )
-        .await
-        .map_err(IntoS3Error::into_s3_error)?;
+        // A sealed key marker resumes among versions the caller may not see.
+        let hidden = match key_marker.as_deref().filter(|marker| is_sealed(marker)) {
+            Some(marker) => Some(
+                open_cursor::<link::VersionCursor>(marker)
+                    .ok_or_else(|| s3_error!(InvalidArgument, "Invalid key-marker"))?,
+            ),
+            None => None,
+        };
+        let (key_marker, version_id_marker) = match hidden {
+            Some(_) => (None, None),
+            None => (key_marker, version_id_marker),
+        };
+        let input = LOVI {
+            bucket: bucket.clone(),
+            prefix: prefix.clone(),
+            delimiter: delimiter.clone(),
+            key_marker,
+            version_id_marker,
+            max_keys: Some(max_keys),
+        };
+        let result = self.visible_versions(&user_access, input, hidden).await?;
 
         Ok(self.list_versions_output(req.input, group_id, max_keys, result))
     }

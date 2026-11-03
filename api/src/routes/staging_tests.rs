@@ -404,6 +404,7 @@ async fn batch_rejects_cap() {
             items: Some(items),
             prefixes: None,
             checksum_manifest: None,
+            table: None,
         }),
     )
     .await;
@@ -428,6 +429,7 @@ async fn batch_rejects_node() {
             items: None,
             prefixes: None,
             checksum_manifest: None,
+            table: None,
         }),
     )
     .await;
@@ -457,6 +459,7 @@ fn job_states_mapped() {
         items: Vec::new(),
         prefixes: Vec::new(),
         checksum_manifest: None,
+        table: None,
     };
     let node = iroh::SecretKey::from_bytes(&[6; 32]).public();
     let job_id = JobId::from_bytes([7; 16]);
@@ -479,6 +482,21 @@ fn job_states_mapped() {
         record.state = state;
         assert_eq!(staging_job_response(&record, None).unwrap().state, name);
     }
+    // A job waiting out a source's `Retry-After` shows when it goes on.
+    assert_eq!(
+        staging_job_response(&record, None).unwrap().paused_until,
+        None
+    );
+    record.progress.paused_until = Some(UNIX_EPOCH + std::time::Duration::from_secs(60));
+    let paused = staging_job_response(&record, None).unwrap().paused_until;
+    assert_eq!(paused.as_deref(), Some("1970-01-01T00:01:00+00:00"));
+    // A stored end beyond the calendar shows no date instead of failing the response.
+    let far = std::time::Duration::from_secs(100_000_000_000_000);
+    record.progress.paused_until = UNIX_EPOCH.checked_add(far);
+    assert_eq!(
+        staging_job_response(&record, None).unwrap().paused_until,
+        None
+    );
 }
 
 #[tokio::test]
@@ -497,6 +515,7 @@ async fn batch_sync_unimplemented() {
             items: None,
             prefixes: None,
             checksum_manifest: None,
+            table: None,
         }),
     )
     .await;
@@ -915,6 +934,7 @@ mod distributed {
                     .collect(),
             ),
             checksum_manifest: None,
+            table: None,
         }
     }
 
@@ -1141,6 +1161,49 @@ mod distributed {
         let mut foreign = batch(&node, &["data/a.bin"], &[]);
         foreign.group_id = ulid::Ulid::nil().to_string();
         assert!(submit(&node, foreign).await.is_err());
+    }
+
+    // A table import takes no items, uses references and needs a valid descriptor.
+    #[tokio::test]
+    async fn submit_checks_tables() {
+        use aruna_core::structs::execution::table::TableImport;
+        let node = node_state().await;
+        let table = |target: &str| {
+            let rows = serde_json::json!({ "kind": "file", "source": "{url}", "target": target });
+            let table =
+                serde_json::json!({ "source": { "connector": "lists/a.csv" }, "rows": rows });
+            Some(serde_json::from_value::<TableImport>(table).unwrap())
+        };
+        let mut with_items = batch(&node, &["data/a.bin"], &[]);
+        with_items.strategy = ApiStagingStrategy::Reference;
+        with_items.table = table("{url|basename}");
+        let mut snapshot = batch(&node, &[], &[]);
+        snapshot.table = table("{url|basename}");
+        let mut invalid = batch(&node, &[], &[]);
+        invalid.strategy = ApiStagingStrategy::Reference;
+        invalid.table = table("{url|upper}");
+        for request in [with_items, snapshot, invalid] {
+            let refused = submit(&node, request).await;
+            assert!(matches!(refused, Err(ServerError::BadRequestReason(_))));
+        }
+        // Rows are read through a connector even when the list itself is an uploaded object.
+        let mut unconnected = batch(&node, &[], &[]);
+        unconnected.strategy = ApiStagingStrategy::Reference;
+        unconnected.connector_id = String::new();
+        unconnected.table = table("{url|basename}");
+        let Err(ServerError::BadRequestReason(reason)) = submit(&node, unconnected).await else {
+            panic!("a table without a connector is refused");
+        };
+        assert!(reason.contains("read through a connector"));
+        let mut blocking = batch(&node, &[], &[]);
+        blocking.table = table("{url|basename}");
+        let refused = stage_batch(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            Json(blocking),
+        )
+        .await;
+        assert!(matches!(refused, Err(ServerError::BadRequestReason(_))));
     }
 
     #[tokio::test]

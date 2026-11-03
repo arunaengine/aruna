@@ -11,7 +11,7 @@ use std::time::Duration;
 use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
-    CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails, MAX_TRANSFER_BYTES, NOBODY,
+    CancelEvidence, ExecutorKind, FenceContext, GrantedResources, LogLimits, LogTails, NOBODY,
     NetworkAccess, OutputMatcher, ReconcileEvidence, ResumePoint, StagingMode, TaskOutput,
     TaskSpec, TombstoneEvidence, TombstoneSpec, UserSpec, literal_prefix,
 };
@@ -49,17 +49,16 @@ const DIRECTORY_MODE: u32 = 1 << 31;
 const NON_REGULAR_MODES: u32 =
     DIRECTORY_MODE | (1 << 27) | (1 << 26) | (1 << 25) | (1 << 24) | (1 << 21) | (1 << 19);
 /// A wildcard listing streams the whole prefix archive to read its headers and
-/// uploads none of it, so the per-file transfer cap must not apply. This bound
-/// only stops an archive that never ends.
-const MAX_SCAN_BYTES: u64 = 1024 * MAX_TRANSFER_BYTES;
+/// uploads none of it. This bound only stops an archive that never ends.
+const MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 
 mod archive;
 mod control;
 mod session;
 
 use archive::{
-    ArchivePlan, BuildError, build_archive, container_path, count_limited, list_archive,
-    output_spec, stream_output,
+    ArchivePlan, BuildError, UPLOAD_LIMIT, build_archive, container_path, count_limited,
+    list_archive, output_spec, stream_output,
 };
 use control::{ControlGuard, ControlRecord, DaemonLock};
 pub use session::session_gateway;
@@ -348,7 +347,7 @@ impl DockerBackend {
         let handle = Handle::current();
         let (tx, rx) = mpsc::channel(4);
         let builder = tokio::task::spawn_blocking(move || {
-            build_archive(tx, handle, &directories, files, MAX_TRANSFER_BYTES)
+            build_archive(tx, handle, &directories, files, UPLOAD_LIMIT)
         });
         let options = UploadToContainerOptionsBuilder::new()
             .path("/")
@@ -568,6 +567,31 @@ fn validate_spec(config: &DockerConfig, spec: &TaskSpec) -> Result<(), BackendEr
     Ok(())
 }
 
+/// The limits a container of `spec` is created with; disk only when the backend sets a default.
+fn granted_resources(config: &DockerConfig, spec: &TaskSpec) -> GrantedResources {
+    let positive = |value: i64| u64::try_from(value).ok();
+    GrantedResources {
+        nano_cpus: spec
+            .resources
+            .cpu_cores
+            .map(|cores| u64::from(cores) * 1_000_000_000)
+            .or(config.default_nano_cpus.and_then(positive)),
+        ram_bytes: spec
+            .resources
+            .ram_bytes
+            .or(config.default_mem_bytes.and_then(positive)),
+        disk_bytes: config
+            .default_disk_bytes
+            .map(|default| spec.resources.disk_bytes.unwrap_or(default)),
+        workspace_bytes: None,
+        walltime_ms: spec
+            .resources
+            .max_walltime
+            .or(config.default_max_walltime)
+            .map(aruna_core::telemetry::duration_ms),
+    }
+}
+
 fn build_config(
     config: &DockerConfig,
     context: &FenceContext,
@@ -584,24 +608,16 @@ fn build_config(
         GENERATION_LABEL.to_string(),
         context.controller_generation.to_string(),
     );
-    if let Some(walltime) = spec.resources.max_walltime.or(config.default_max_walltime) {
-        labels.insert(WALLTIME_LABEL.to_string(), walltime.as_millis().to_string());
+    let granted = granted_resources(config, spec);
+    if let Some(walltime) = granted.walltime_ms {
+        labels.insert(WALLTIME_LABEL.to_string(), walltime.to_string());
     }
 
-    let memory = spec
-        .resources
-        .ram_bytes
-        .map(|b| b as i64)
-        .or(config.default_mem_bytes);
-    let nano_cpus = spec
-        .resources
-        .cpu_cores
-        .map(|c| c as i64 * 1_000_000_000)
-        .or(config.default_nano_cpus);
-    let storage_opt = config.default_disk_bytes.map(|default| {
-        let bytes = spec.resources.disk_bytes.unwrap_or(default);
-        HashMap::from([("size".to_string(), bytes.to_string())])
-    });
+    let memory = granted.ram_bytes.map(|bytes| bytes as i64);
+    let nano_cpus = granted.nano_cpus.map(|nanos| nanos as i64);
+    let storage_opt = granted
+        .disk_bytes
+        .map(|bytes| HashMap::from([("size".to_string(), bytes.to_string())]));
 
     let host_config = HostConfig {
         memory,
@@ -693,6 +709,11 @@ impl ExecutorBackend for DockerBackend {
             limits: self.config.envelope,
             ..BackendCaps::default()
         }
+    }
+
+    fn granted(&self, spec: &TaskSpec) -> Result<GrantedResources, BackendError> {
+        validate_spec(&self.config, spec)?;
+        Ok(granted_resources(&self.config, spec))
     }
 
     /// Docker switches users at launch via `--user`, so the identity is pinned.
@@ -1011,7 +1032,7 @@ impl ExecutorBackend for DockerBackend {
             .docker
             .download_from_container(container_id, Some(options))
             .map(|chunk| chunk.map_err(|error| io::Error::other(classify_archive(&error))));
-        let counted = Box::pin(count_limited(raw, MAX_TRANSFER_BYTES));
+        let counted = Box::pin(count_limited(raw, u64::MAX));
         let reader = SyncIoBridge::new_with_handle(StreamReader::new(counted), Handle::current());
         let (header_tx, header_rx) = oneshot::channel();
         let (tx, rx) = mpsc::channel(4);
@@ -1567,6 +1588,9 @@ fn parse_rfc3339_ms(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A byte bound tests pass explicitly, the size of the former fixed limit.
+    const TEST_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
     use aruna_core::compute::TaskInput;
     use bytes::Bytes;
     use std::io::Read;
@@ -1692,6 +1716,32 @@ mod tests {
             host.storage_opt.unwrap().get("size").unwrap(),
             &(2u64 << 30).to_string()
         );
+    }
+
+    #[test]
+    fn granted_matches_container() {
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.resources.ram_bytes = Some(3 << 30);
+        spec.resources.max_walltime = Some(Duration::from_secs(600));
+        for default_disk in [None, Some(2u64 << 30)] {
+            let config = DockerConfig {
+                default_disk_bytes: default_disk,
+                ..DockerConfig::default()
+            };
+            let granted = granted_resources(&config, &spec);
+            let body = build_config(&config, &fence(), &spec);
+            let host = body.host_config.unwrap();
+            assert_eq!(granted.ram_bytes, host.memory.map(|bytes| bytes as u64));
+            assert_eq!(granted.nano_cpus, host.nano_cpus.map(|nanos| nanos as u64));
+            let size = host
+                .storage_opt
+                .and_then(|options| options.get("size").cloned());
+            assert_eq!(granted.disk_bytes.map(|bytes| bytes.to_string()), size);
+            assert_eq!(granted.disk_bytes, default_disk);
+            let walltime = body.labels.unwrap().get(WALLTIME_LABEL).cloned();
+            assert_eq!(walltime.as_deref(), Some("600000"));
+            assert_eq!(granted.walltime_ms, Some(600_000));
+        }
     }
 
     #[test]
@@ -2110,7 +2160,7 @@ mod tests {
         spec.output_paths.push("/results/output.txt".to_string());
         let plan = ArchivePlan::new(&spec).unwrap();
         let directories = BTreeMap::from([(PathBuf::from("results"), 0o777)]);
-        let bytes = collect_archive(&plan, &directories, MAX_TRANSFER_BYTES)
+        let bytes = collect_archive(&plan, &directories, TEST_LIMIT)
             .await
             .unwrap();
         let found = read_entries(bytes);
@@ -2149,7 +2199,7 @@ mod tests {
         spec.session = true;
         spec.workdir = Some("/work".to_string());
         let plan = ArchivePlan::new(&spec).unwrap();
-        let bytes = collect_archive(&plan, &plan.directories, MAX_TRANSFER_BYTES)
+        let bytes = collect_archive(&plan, &plan.directories, TEST_LIMIT)
             .await
             .unwrap();
         let found = read_entries(bytes);
@@ -2175,7 +2225,7 @@ mod tests {
             Box::pin(futures_util::stream::iter(chunks)),
         ));
         let plan = ArchivePlan::new(&spec).unwrap();
-        let bytes = collect_archive(&plan, &BTreeMap::new(), MAX_TRANSFER_BYTES)
+        let bytes = collect_archive(&plan, &BTreeMap::new(), TEST_LIMIT)
             .await
             .unwrap();
         let found = read_entries(bytes);
@@ -2194,7 +2244,7 @@ mod tests {
                 Box::pin(futures_util::stream::iter(chunk)),
             ));
             let plan = ArchivePlan::new(&spec).unwrap();
-            let result = collect_archive(&plan, &BTreeMap::new(), MAX_TRANSFER_BYTES).await;
+            let result = collect_archive(&plan, &BTreeMap::new(), TEST_LIMIT).await;
             assert!(
                 matches!(result, Err(BackendError::Unavailable(_))),
                 "declared {declared} actual {actual} must fail"
@@ -2202,15 +2252,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn exact_budget_uploads() {
+        // Inputs that fill the disk request exactly still stage, although the tar stream that
+        // carries them is larger by its headers and padding.
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        spec.resources.disk_bytes = Some(1000);
+        let full = Bytes::from(vec![7u8; 1000]);
+        spec.inputs
+            .push(TaskInput::from_bytes("/data/in.bin", full));
+        let plan = ArchivePlan::new(&spec).unwrap();
+        let bytes = collect_archive(&plan, &plan.directories, UPLOAD_LIMIT)
+            .await
+            .unwrap();
+        assert!(bytes.len() > 1000);
+        spec.inputs.push(TaskInput::from_bytes(
+            "/data/more.bin",
+            Bytes::from_static(b"x"),
+        ));
+        assert!(matches!(
+            ArchivePlan::new(&spec),
+            Err(BackendError::InvalidSpec(_))
+        ));
+    }
+
     #[test]
-    fn oversized_plan() {
-        // Declared sizes above the 4 GiB aggregate guard reject before any I/O.
+    fn budget_bounds_plan() {
+        // Staged inputs above the run's disk request reject before any I/O; without a
+        // request, inputs past the former 4 GiB guard are planned.
         let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
         spec.inputs.push(TaskInput::from_stream(
             "/big.bin",
-            MAX_TRANSFER_BYTES + 1,
+            TEST_LIMIT + 1,
             Box::pin(futures_util::stream::empty()),
         ));
+        assert!(ArchivePlan::new(&spec).is_ok());
+        spec.resources.disk_bytes = Some(TEST_LIMIT);
         assert!(matches!(
             ArchivePlan::new(&spec),
             Err(BackendError::InvalidSpec(_))
@@ -2247,7 +2324,7 @@ mod tests {
     #[tokio::test]
     async fn output_archive() {
         let bytes = make_archive(&[("output.txt", tar::EntryType::Regular, b"done")]);
-        let (size, contents) = parse_bytes(bytes, Path::new("output.txt"), MAX_TRANSFER_BYTES)
+        let (size, contents) = parse_bytes(bytes, Path::new("output.txt"), TEST_LIMIT)
             .await
             .unwrap();
         assert_eq!(size, 4);
@@ -2255,12 +2332,12 @@ mod tests {
 
         let link = make_archive(&[("output.txt", tar::EntryType::Symlink, b"")]);
         assert!(matches!(
-            parse_bytes(link, Path::new("output.txt"), MAX_TRANSFER_BYTES).await,
+            parse_bytes(link, Path::new("output.txt"), TEST_LIMIT).await,
             Err(BackendError::InvalidSpec(_))
         ));
         let unexpected = make_archive(&[("other.txt", tar::EntryType::Regular, b"x")]);
         assert!(
-            parse_bytes(unexpected, Path::new("output.txt"), MAX_TRANSFER_BYTES)
+            parse_bytes(unexpected, Path::new("output.txt"), TEST_LIMIT)
                 .await
                 .is_err()
         );
@@ -2269,7 +2346,7 @@ mod tests {
             ("other.txt", tar::EntryType::Regular, b"y"),
         ]);
         assert!(
-            parse_bytes(multiple, Path::new("output.txt"), MAX_TRANSFER_BYTES)
+            parse_bytes(multiple, Path::new("output.txt"), TEST_LIMIT)
                 .await
                 .is_err()
         );
@@ -2287,7 +2364,7 @@ mod tests {
         builder.append(&header, &b"x"[..]).unwrap();
         let bytes = builder.into_inner().unwrap();
         assert!(matches!(
-            parse_bytes(bytes, Path::new("output.txt"), MAX_TRANSFER_BYTES).await,
+            parse_bytes(bytes, Path::new("output.txt"), TEST_LIMIT).await,
             Err(BackendError::InvalidSpec(_))
         ));
     }
@@ -2327,7 +2404,7 @@ mod tests {
         let matched = list_archive(io::Cursor::new(bytes), Path::new("/"), &glob).unwrap();
 
         assert_eq!(matched, vec!["/out/a.txt", "/out/b.txt"]);
-        const { assert!(MAX_SCAN_BYTES > MAX_TRANSFER_BYTES) };
+        const { assert!(MAX_SCAN_BYTES > TEST_LIMIT) };
     }
 
     #[test]

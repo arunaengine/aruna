@@ -113,6 +113,11 @@ pub async fn family_report(
     if spec.created_by != auth.user_id {
         return Some(Err(JobRouteError::NotFound));
     }
+    // A paged spec reports its inputs as if they were inline.
+    let spec = match crate::jobs::records::pages::with_inputs(context, &spec).await {
+        Ok(spec) => spec,
+        Err(error) => return Some(Err(JobRouteError::Unavailable(error.to_string()))),
+    };
     let projection = projected.projection.clone()?;
     let family = JobFamilyId {
         submission_id: projection.submission_id,

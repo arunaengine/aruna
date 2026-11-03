@@ -30,7 +30,7 @@ async fn store(node: &Node, key: &str) {
         text: "x".to_string(),
         content_type: None,
     };
-    store_text(&node.state, &node.owner, &info, input)
+    store_text(&node.state, &node.owner, &info, input, Default::default())
         .await
         .unwrap();
 }
@@ -303,6 +303,7 @@ fn view_keeps_fields() {
         source: Some(aruna_operations::s3::object::origin::SourceView {
             url: Some("https://s3.example.org/a".to_string()),
             path: "a".to_string(),
+            version: None,
             etag: Some("etag".to_string()),
             digests: vec![
                 (ChecksumAlgorithm::Md5, digest),
@@ -318,6 +319,10 @@ fn view_keeps_fields() {
                 run_id: Ulid::from_bytes([48; 16]),
             },
         ],
+        bucket_metadata: None,
+        identifiers: Vec::new(),
+        content_hash: None,
+        size: None,
     };
     let response = OriginResponse::from(view);
     assert_eq!(response.global_id, Some(global.to_url()));
@@ -361,9 +366,7 @@ fn origin_kinds_named() {
     };
     let kinds = [
         upload,
-        VersionOrigin::Source {
-            database: Some(Ulid::from_bytes([49; 16])),
-        },
+        VersionOrigin::Source,
         VersionOrigin::Storage {
             backend_id: Ulid::from_bytes([50; 16]),
             key: "share/a.txt".to_string(),
@@ -381,6 +384,10 @@ fn origin_kinds_named() {
         hop: None,
         source: None,
         projection: Vec::new(),
+        bucket_metadata: None,
+        identifiers: Vec::new(),
+        content_hash: None,
+        size: None,
     };
     let bodies: Vec<_> = kinds
         .into_iter()
@@ -390,12 +397,7 @@ fn origin_kinds_named() {
         &bodies[0],
         OriginBody::Upload { device: Some(device), .. } if device == "laptop"
     ));
-    assert!(matches!(
-        &bodies[1],
-        OriginBody::Source {
-            database_entry: Some(_)
-        }
-    ));
+    assert!(matches!(&bodies[1], OriginBody::Source));
     assert!(matches!(
         &bodies[2],
         OriginBody::Storage { key, .. } if key == "share/a.txt"
@@ -516,4 +518,144 @@ fn relay_path_kept() {
             Ulid::from_bytes([1; 16])
         )
     );
+}
+
+async fn by_version(
+    node: &Node,
+    named: Option<NodeId>,
+    version: &str,
+) -> ServerResult<OriginResponse> {
+    let mut headers = HeaderMap::new();
+    if let Some(named) = named {
+        let value = named.to_string().parse().unwrap();
+        headers.insert(crate::routes::storage::relay::RELAY_NODE_HEADER, value);
+    }
+    get_version_origin(
+        State(node.state.clone()),
+        Extension(Some(node.owner.clone())),
+        Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+        headers,
+        Query(VersionOriginParams {
+            version: version.to_string(),
+        }),
+    )
+    .await
+    .map(|Json(response)| response)
+}
+
+fn arn(node: NodeId, realm_id: RealmId, key: &str, version: Ulid) -> String {
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+    VersionedObjectArn::new(realm_id, node, BUCKET, key, version)
+        .unwrap()
+        .to_w3id()
+}
+
+#[tokio::test]
+async fn reads_by_version() {
+    use crate::tests::distributed::LOCAL;
+    let node = node_state().await;
+    store(&node, "a.md").await;
+    let current = origin(&node, &node.owner, HeaderMap::new(), BUCKET, "a.md", None)
+        .await
+        .unwrap();
+    let version = Ulid::from_string(&current.version_id).unwrap();
+    let local = arn(node_id(LOCAL), node.state.get_realm_id(), "a.md", version);
+    let read = by_version(&node, None, &local).await.unwrap();
+    assert_eq!(read.version_id, current.version_id);
+    // Stored bytes carry their content id.
+    assert!(
+        read.content_id
+            .unwrap()
+            .starts_with("https://w3id.org/aruna/data/")
+    );
+    let directed = by_version(&node, Some(node_id(LOCAL)), &local)
+        .await
+        .unwrap();
+    assert_eq!(directed.version_id, current.version_id);
+
+    let foreign = arn(
+        node_id(LOCAL),
+        RealmId::from_bytes([4; 32]),
+        "a.md",
+        version,
+    );
+    assert!(matches!(
+        by_version(&node, None, &foreign).await,
+        Err(ServerError::NotFound)
+    ));
+    let malformed = by_version(&node, None, "s3://routed/a.md").await;
+    assert!(matches!(malformed, Err(ServerError::BadRequestReason(_))));
+    let elsewhere = by_version(&node, Some(node_id(PEER)), &local).await;
+    assert!(matches!(elsewhere, Err(ServerError::Conflict(_))));
+
+    // Another node's version is read on that node, never directed on from there.
+    let peer = mock_peer(StatusCode::OK, &answer()).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let remote = arn(node_id(PEER), node.state.get_realm_id(), "b.md", version);
+    let relayed = by_version(&node, None, &remote).await.unwrap();
+    assert_eq!(relayed.created_by, "peer-user");
+    let paths = peer.paths.lock().unwrap().clone();
+    assert_eq!(paths.len(), 1);
+    assert!(paths[0].starts_with("/api/v1/data/origin?version="));
+    let again = by_version(&node, Some(node_id(LOCAL)), &remote).await;
+    assert!(matches!(again, Err(ServerError::Conflict(_))));
+    assert_eq!(peer.paths.lock().unwrap().len(), 1);
+
+    let refusal = mock_peer(StatusCode::FORBIDDEN, r#"{"error":"no grant"}"#).await;
+    publish_api(&node.state, node_id(PEER), &refusal.url).await;
+    let refused = by_version(&node, None, &remote).await;
+    assert!(matches!(refused, Err(ServerError::Forbidden)));
+}
+
+#[tokio::test]
+async fn directed_relays_once() {
+    // A version of a distributed bucket whose range the target keeps no records of is
+    // answered through one set-directed relay to a holder.
+    use crate::tests::distributed::LOCAL;
+    let node = node_state().await;
+    let set_id = distribute(&node.state, node.group_id, BUCKET)
+        .await
+        .set_id();
+    let peer = mock_peer(StatusCode::OK, &answer()).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let version = Ulid::from_bytes([43; 16]);
+    let local = arn(node_id(LOCAL), node.state.get_realm_id(), "z.md", version);
+    let relayed = by_version(&node, Some(node_id(LOCAL)), &local)
+        .await
+        .unwrap();
+    assert_eq!(relayed.created_by, "peer-user");
+    let paths = peer.paths.lock().unwrap().clone();
+    assert_eq!(paths.len(), 1);
+    assert!(paths[0].starts_with("/api/v1/data/buckets/routed/objects/origin?key=z.md"));
+    // The holder sees a set-directed relay, which it never relays again.
+    let mut hop = HeaderMap::new();
+    hop.insert(RELAY_HOP_HEADER, "peer".parse().unwrap());
+    hop.insert(RELAY_SET_HEADER, set_id.to_string().parse().unwrap());
+    let held = origin(&node, &node.owner, hop, BUCKET, "z.md", Some(version)).await;
+    assert!(matches!(held, Err(ServerError::NotFound)));
+    assert_eq!(peer.paths.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn reads_global_version() {
+    use crate::tests::distributed::mirror;
+    let node = node_state().await;
+    mirror(&node.state, node.group_id, BUCKET).await;
+    store(&node, "a.md").await;
+    let current = origin(&node, &node.owner, HeaderMap::new(), BUCKET, "a.md", None)
+        .await
+        .unwrap();
+    let global = current.global_id.clone().unwrap();
+    let read = by_version(&node, None, &global).await.unwrap();
+    assert_eq!(read.version_id, current.version_id);
+    let unknown = GlobalId::Version {
+        realm_id: node.state.get_realm_id(),
+        version_id: Ulid::from_bytes([44; 16]),
+    };
+    // The peer member cannot be asked here, so an unknown version is not proven absent.
+    let missing = by_version(&node, None, &unknown.to_url()).await;
+    assert!(matches!(
+        missing,
+        Err(ServerError::NotFound | ServerError::ServiceUnavailableReason(_))
+    ));
 }

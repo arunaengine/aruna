@@ -10,3 +10,4 @@ pub mod offered_directory;
 pub mod source_access;
 pub mod source_connector;
 pub mod staging;
+pub mod table;

@@ -184,9 +184,47 @@ pub struct CapturedInput {
     pub destination_key: String,
     pub source_node_id: crate::NodeId,
     pub version_id: Ulid,
-    pub blake3: [u8; 32],
+    pub content: InputContent,
     pub bytes: u64,
     pub policies: Vec<PlacementPolicyRef>,
+    /// The group of the source bucket, under whose path the creator's READ admitted it.
+    pub source_group_id: GroupId,
+    /// The Everyone principal may read the source as well.
+    pub public: bool,
+    /// The link version the input named, when admission followed one to this source.
+    pub link: Option<crate::structs::storage::replication::VersionedObjectArn>,
+    /// The external source of a reference version.
+    pub source_pin: Option<crate::structs::storage::origin::SourcePin>,
+    /// The source bucket's metadata at admission.
+    pub database: Option<crate::structs::storage::bucket_metadata::BucketMetadata>,
+    pub releases: Vec<crate::structs::storage::bucket_metadata::ReleaseRef>,
+    /// Release membership was checked; false means `releases` proves nothing.
+    pub releases_complete: bool,
+    /// The source node's grant for exact reads of this input by the creator.
+    pub grant: Option<crate::structs::storage::read_grant::SignedGrant>,
+}
+
+/// What binds the bytes of one captured input version.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputContent {
+    /// The BLAKE3 of the stored bytes.
+    Blake3([u8; 32]),
+    /// A reference version, bound to the source observation its record keeps.
+    Reference {
+        etag: Option<String>,
+        /// Every ranged read is bound to that observation, so the input may be mounted.
+        range_bound: bool,
+    },
+}
+
+impl InputContent {
+    /// The content hash, which only a stored copy has.
+    pub fn blake3(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Blake3(hash) => Some(*hash),
+            Self::Reference { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +254,8 @@ pub struct StagingJobSpec {
     /// Name of an `md5sum` or `sha256sum` manifest below each prefix whose digests the
     /// imported files carry and a complete read must match.
     pub checksum_manifest: Option<String>,
+    /// A table whose rows name the files or folders to import, instead of items and prefixes.
+    pub table: Option<crate::structs::execution::table::TableImport>,
 }
 
 /// One server-side object copy run outside a request, for a source whose bytes
@@ -283,6 +323,22 @@ pub struct ManifestRead {
     pub observation: Option<crate::structs::execution::source_access::SourceMetadata>,
 }
 
+/// A table being read in bounded chunks; its folders wait in the directory queue.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableRead {
+    /// Bytes read so far, after decompression for a gzip table.
+    pub offset: u64,
+    /// A connector table as first observed; later chunks are read bound to it.
+    pub observation: Option<crate::structs::execution::source_access::SourceMetadata>,
+    /// The version of an object table first read; later chunks read the same version.
+    pub version_id: Option<Ulid>,
+    /// The header, once the first chunk is read.
+    pub columns: Option<Vec<String>>,
+    pub gzip: Option<bool>,
+    /// The table was read to its end; the state stays for its pinned version.
+    pub done: bool,
+}
+
 /// Progress of a staging job. It stays small: positions and counters only, while directories
 /// still to list wait in the separately paginated queue.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +352,8 @@ pub struct StagingJobCheckpoint {
     pub prefixes_done: u64,
     pub walk: Option<StagingWalk>,
     pub manifest: Option<ManifestRead>,
+    /// The table being read; `None` once it is read or when the job has none.
+    pub table: Option<Box<TableRead>>,
     /// Queue rows `[queue_head, queue_tail)` are directories still to list.
     pub queue_head: u64,
     pub queue_tail: u64,

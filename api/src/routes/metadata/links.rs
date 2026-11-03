@@ -203,7 +203,7 @@ pub async fn data_links(
 
 #[utoipa::path(
     get,
-    path = "/data/buckets/{bucket}/links",
+    path = "/data/buckets/{bucket}/datasets",
     tag = "metadata/references",
     summary = "List datasets linking a file, folder or bucket",
     description = r#"Lists the readable metadata documents that link a file of this node's bucket, a folder of it, or the bucket root.
@@ -431,7 +431,9 @@ pub async fn file_part_of(
         more: found.more,
         complete: found.complete,
         hidden_references_exist: found.hidden,
-        more_datasets: format!("/api/v1/data/buckets/{bucket}/links?key={encoded}&parts_only=true"),
+        more_datasets: format!(
+            "/api/v1/data/buckets/{bucket}/datasets?key={encoded}&parts_only=true"
+        ),
     }))
 }
 

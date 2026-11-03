@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::{
-    AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails,
-    ReconcileEvidence, ResourceEnvelope, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,
-    UserSpec,
+    AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, GrantedResources,
+    LogLimits, LogTails, ReconcileEvidence, ResourceEnvelope, TaskOutput, TaskSpec,
+    TombstoneEvidence, TombstoneSpec, UserSpec,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -137,6 +137,12 @@ pub trait ExecutorBackend: Send + Sync {
     /// Backends that perform a real user switch pin it; backends that perform
     /// none MUST report the service's own identity rather than a wish.
     fn run_identity(&self) -> UserSpec;
+
+    /// The limits `submit` enforces for exactly this task. A backend that fills
+    /// defaults of its own MUST override this with the rule `submit` uses.
+    fn granted(&self, spec: &TaskSpec) -> Result<GrantedResources, BackendError> {
+        Ok(GrantedResources::requested(&spec.resources))
+    }
 
     /// Startup and advertisement gate.
     async fn health(&self) -> Result<(), BackendError>;

@@ -7,14 +7,15 @@ use std::time::SystemTime;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::source_access::SourceDigest;
-use aruna_core::structs::identity::database::DatabaseTarget;
+use aruna_core::structs::identity::identifier::{CompiledParser, Identifier};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
-    BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
+    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
     OriginProjection, SyncHop, VersionOrigin, project, public_source_url, publishable,
@@ -24,8 +25,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::metadata::bucket_metadata;
 
 #[derive(Debug, Error)]
 pub enum OriginError {
@@ -42,6 +43,8 @@ pub enum OriginError {
 pub struct SourceView {
     pub url: Option<String>,
     pub path: String,
+    /// The source's own version the binding names, when it names one.
+    pub version: Option<String>,
     pub etag: Option<String>,
     pub digests: Vec<(ChecksumAlgorithm, SourceDigest)>,
 }
@@ -59,12 +62,20 @@ pub struct OriginView {
     pub source: Option<SourceView>,
     /// What a dataset may add about the origin: never users, devices or storage paths.
     pub projection: Vec<OriginProjection>,
+    /// The bucket's metadata now; it may have changed since the version was made.
+    pub bucket_metadata: Option<BucketMetadata>,
+    /// What the metadata's identifier rules find in the key and source URL.
+    pub identifiers: Vec<Identifier>,
+    /// The BLAKE3 of the bytes, for a materialized version only; never a reference identity.
+    pub content_hash: Option<[u8; 32]>,
+    /// The size of exactly this version: its stored blob, or a reference's observed length.
+    pub size: Option<u64>,
 }
 
 /// Reads the origin of `version_id`, or of the current version, of a local bucket's key.
 pub async fn read_origin(
     context: &DriverContext,
-    (realm_id, _): (RealmId, NodeId),
+    (realm_id, _node_id): (RealmId, NodeId),
     bucket: &str,
     key: &str,
     version_id: Option<Ulid>,
@@ -105,28 +116,31 @@ pub async fn read_origin(
         realm_id,
         version_id,
     });
-    Ok(view(version_id, global, version))
-}
-
-/// The database list entry a bucket is listed under now: its set's entry, or this node's entry
-/// of its name. A source origin records it when the version is minted; none when unreadable.
-pub async fn database_entry(
-    context: &DriverContext,
-    (realm_id, node_id): (RealmId, NodeId),
-    bucket: &str,
-    set_id: Option<Ulid>,
-) -> Option<Ulid> {
-    let config = drive(GetConfigOperation::new(realm_id), context)
+    let metadata = bucket_metadata(context, bucket, &info)
         .await
-        .ok()?;
-    let entry = config.databases.iter().find(|entry| match &entry.target {
-        DatabaseTarget::Distributed { set_id: listed } => set_id == Some(*listed),
-        DatabaseTarget::Ordinary {
-            node_id: entry_node,
-            bucket: name,
-        } => set_id.is_none() && *entry_node == node_id && name == bucket,
-    });
-    entry.map(|entry| entry.entry_id)
+        .map_err(OriginError::Storage)?;
+    let parser = (metadata.as_ref())
+        .and_then(|metadata| metadata.parser.as_ref())
+        .and_then(|parser| CompiledParser::compile(parser).ok());
+    let size = version_size(context, &version).await?;
+    let mut view = view(version_id, global, version);
+    view.size = size;
+    let source_url = view
+        .source
+        .as_ref()
+        .and_then(|source| source.url.as_deref());
+    view.identifiers = parser.map_or_else(Vec::new, |parser| parser.find(key, source_url));
+    view.projection.extend(
+        view.identifiers
+            .iter()
+            .map(|found| OriginProjection::Identifier {
+                name: found.name.clone(),
+                value: found.value.clone(),
+                url: found.url.clone(),
+            }),
+    );
+    view.bucket_metadata = metadata;
+    Ok(view)
 }
 
 fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> OriginView {
@@ -152,6 +166,7 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
         } => Some(SourceView {
             url: public_source_url(&source.descriptor),
             path: source.descriptor.source_path.clone(),
+            version: source.descriptor.version_selector.clone(),
             etag: cached_metadata.etag.clone(),
             digests: cached_metadata
                 .digests
@@ -169,6 +184,7 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
         } => Some(SourceView {
             url: public_source_url(&source.descriptor),
             path: source.descriptor.source_path.clone(),
+            version: source.descriptor.version_selector.clone(),
             etag: None,
             digests: Vec::new(),
         }),
@@ -179,7 +195,9 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
         version.hop.as_ref(),
         (source.as_ref().filter(|_| published)).and_then(|source| source.url.clone()),
     );
+    let content_hash = version.blob_hash().copied();
     OriginView {
+        content_hash,
         version_id,
         global,
         created_by: version.created_by,
@@ -188,7 +206,32 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
         hop: version.hop,
         source,
         projection,
+        bucket_metadata: None,
+        identifiers: Vec::new(),
+        size: None,
     }
+}
+
+/// The size of one version: its blob location row, or a reference's cached observation.
+async fn version_size(
+    context: &DriverContext,
+    version: &BlobVersion,
+) -> Result<Option<u64>, OriginError> {
+    if let BlobVersionState::Reference {
+        cached_metadata, ..
+    } = &version.state
+    {
+        return Ok(Some(cached_metadata.content_length));
+    }
+    let Some(location) = version.location_key() else {
+        return Ok(None);
+    };
+    let Some(value) = read(context, BLOB_LOCATIONS_KEYSPACE, location.to_bytes()).await? else {
+        return Ok(None);
+    };
+    let location = BackendLocation::from_bytes(&value)
+        .map_err(|error| OriginError::Storage(error.to_string()))?;
+    Ok(Some(location.blob_size))
 }
 
 async fn read(
@@ -214,3 +257,7 @@ async fn read(
         other => Err(OriginError::Storage(format!("{other:?}"))),
     }
 }
+
+#[cfg(test)]
+#[path = "origin_tests.rs"]
+mod tests;

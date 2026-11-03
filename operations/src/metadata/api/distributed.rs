@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    ApiQueryMode, Arc, AuthContext, BucketSearchHit, DriverContext, GroupId, HashMap, HashSet,
-    Instant, MAX_PAGINATION_DEPTH, MAX_RESULT_BYTES, MetadataApiError, MetadataFanoutOperation,
+    ApiQueryMode, Arc, AuthContext, BucketPage, DriverContext, GroupId, HashMap, HashSet, Instant,
+    MAX_PAGINATION_DEPTH, MAX_RESULT_BYTES, MetadataApiError, MetadataFanoutOperation,
     MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataQueryResults,
     MetadataReadError, MetadataSearchHit, NodeId, NodeSearchResult, ObjectKeyMatch,
     ObjectQueryMode, QUERY_MAX_ROWS, RealmId, ReferenceNodeExecution, SearchNodePage,
@@ -28,6 +28,7 @@ pub(super) fn object_search_fingerprint(
     hasher.update(&[match key_match {
         ObjectKeyMatch::Substring => 1,
         ObjectKeyMatch::Prefix => 2,
+        ObjectKeyMatch::Metadata => 3,
     }]);
     match bucket {
         Some(bucket) => {
@@ -61,14 +62,11 @@ pub(super) fn record_object_result(
     }
 }
 
-pub(super) fn record_bucket_result(
-    span: &Span,
-    result: &Result<Vec<BucketSearchHit>, MetadataReadError>,
-) {
+pub(super) fn record_bucket_result(span: &Span, result: &Result<BucketPage, MetadataReadError>) {
     match result {
-        Ok(hits) => {
+        Ok(page) => {
             span.record("result", "ok");
-            span.record("hit_count", hits.len() as u64);
+            span.record("hit_count", page.hits.len() as u64);
         }
         Err(_) => {
             span.record("result", "error");

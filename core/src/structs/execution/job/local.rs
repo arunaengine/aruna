@@ -524,6 +524,9 @@ pub struct JobProgress {
     pub current: u64,
     pub total: Option<u64>,
     pub unit: String,
+    /// While set, the job waits until then because a source asked it to pause.
+    #[serde(default)]
+    pub paused_until: Option<std::time::SystemTime>,
 }
 
 impl JobProgress {
@@ -532,6 +535,7 @@ impl JobProgress {
             current: 0,
             total: None,
             unit: unit.into(),
+            paused_until: None,
         }
     }
 }
@@ -771,6 +775,27 @@ pub fn job_record_key(job_id: JobId) -> Key {
 /// Side-row key holding the run-crate obligation status for an execution job.
 pub fn run_crate_key(job_id: JobId) -> Key {
     ByteView::from(job_id.to_bytes().to_vec())
+}
+
+/// What a physical run id leads to, kept on the executor past job pruning. Holds ids only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunLink {
+    pub family: Option<JobFamilyId>,
+    pub logical_job_id: Option<JobId>,
+    pub group_id: GroupId,
+    pub created_by: UserId,
+    /// The run crate document, once written.
+    pub run_crate: Option<Ulid>,
+}
+
+impl RunLink {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
 }
 
 /// Dedup key of the follow-on `WriteRunCrate` obligation for `job_id`. Internal

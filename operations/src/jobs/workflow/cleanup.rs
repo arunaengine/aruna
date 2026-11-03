@@ -335,7 +335,7 @@ mod tests {
             lease_expires_ms: 10_000,
         });
         insert_job(storage, &record).await.unwrap();
-        record_attempt_intent(storage, job_id, token, intent(job_id, kind), None, 2)
+        record_attempt_intent(storage, job_id, token, intent(job_id, kind), None, None, 2)
             .await
             .unwrap()
             .record

@@ -18,12 +18,14 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::{RemoteBinding, SyncRefusal};
 use aruna_core::types::GroupId;
-use aruna_operations::device::publish_run::{PublishRunError, PublishRunInput, publish_run};
+use aruna_operations::device::publish_run::{
+    PublishRunError, PublishRunInput, local_run_crate, publish_run,
+};
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::{
-    insert_job, put_crate_status, read_crate_status, read_job_record,
+    insert_job, put_crate_status, read_crate_status, read_job_record, read_run_link,
 };
 use aruna_operations::jobs::workflow::run_crate::write_run_crate;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
@@ -31,7 +33,7 @@ use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
-use topology::{TestResult, Topology, read_group_auth, wait_until};
+use topology::{TestNode, TestResult, Topology, read_group_auth, wait_until};
 use ulid::Ulid;
 
 const REMOTE_BUCKET: &str = "lab-data";
@@ -115,12 +117,11 @@ fn output(realm: &Topology, version_id: Ulid) -> OutputObject {
 }
 
 async fn finished_run(
-    realm: &Topology,
+    (realm, device): (&Topology, &TestNode),
     group_id: GroupId,
     outputs: Vec<OutputObject>,
     status: RunCrateStatus,
 ) -> TestResult<JobId> {
-    let device = realm.user_node();
     let job_id = JobId::from_bytes([0xC3; 16]);
     let spec = ExecutionSpec {
         group_id,
@@ -207,7 +208,7 @@ async fn publishes_local_run() -> TestResult<()> {
     create_bucket(&device.context, LOCAL_BUCKET, group_id, &realm).await?;
     let version_id = write_output(&realm, group_id).await?;
     let job_id = finished_run(
-        &realm,
+        (&realm, realm.user_node()),
         group_id,
         vec![output(&realm, version_id)],
         RunCrateStatus::Local,
@@ -269,7 +270,13 @@ async fn crate_stays_local() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
     let storage = &device.context.storage_handle;
-    let job_id = finished_run(&realm, group_id, Vec::new(), RunCrateStatus::Pending).await?;
+    let job_id = finished_run(
+        (&realm, device),
+        group_id,
+        Vec::new(),
+        RunCrateStatus::Pending,
+    )
+    .await?;
     let record = read_job_record(storage, job_id, None)
         .await?
         .ok_or("the run is stored")?;
@@ -293,6 +300,21 @@ async fn crate_stays_local() -> TestResult<()> {
         read_crate_status(storage, job_id).await?,
         Some(RunCrateStatus::Local)
     );
+    // The device keeps the run's crate itself, rooted at the crate folder.
+    let local = local_run_crate(&device.context, job_id, record.created_by).await?;
+    let root = local["@graph"]
+        .as_array()
+        .ok_or("the crate has a graph")?
+        .iter()
+        .find(|entity| entity["conformsTo"]["@id"] == "https://w3id.org/ro/wfrun/process/0.5")
+        .ok_or("the crate has a root")?;
+    assert_eq!(root["@id"], "./");
+    let stranger = aruna_core::UserId::local(Ulid::from(9u128), realm.realm_id);
+    assert!(
+        local_run_crate(&device.context, job_id, stranger)
+            .await
+            .is_err()
+    );
 
     put_crate_status(storage, job_id, &RunCrateStatus::Pending).await?;
     let target = DocumentTarget::RealmConfig {
@@ -313,6 +335,20 @@ async fn crate_stays_local() -> TestResult<()> {
         read_crate_status(storage, job_id).await?,
         Some(RunCrateStatus::Pending)
     );
+    // Pruning the job record leaves the local crate readable by its owner.
+    storage
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: aruna_core::keyspaces::JOB_KEYSPACE.to_string(),
+            key: aruna_core::structs::execution::job::job_record_key(job_id),
+            txn_id: None,
+        })
+        .await;
+    assert!(read_job_record(storage, job_id, None).await?.is_none());
+    assert!(
+        local_run_crate(&device.context, job_id, record.created_by)
+            .await
+            .is_ok()
+    );
     Ok(())
 }
 
@@ -325,7 +361,13 @@ async fn checks_empty_target() -> TestResult<()> {
     let device = realm.user_node();
     let server = realm.node(0);
     assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
-    let job_id = finished_run(&realm, group_id, Vec::new(), RunCrateStatus::Local).await?;
+    let job_id = finished_run(
+        (&realm, device),
+        group_id,
+        Vec::new(),
+        RunCrateStatus::Local,
+    )
+    .await?;
 
     let refused = publish_run(
         &device.context,
@@ -352,5 +394,71 @@ async fn checks_empty_target() -> TestResult<()> {
         read_crate_status(&device.context.storage_handle, job_id).await?,
         Some(RunCrateStatus::Local)
     );
+    Ok(())
+}
+
+/// A crate job stopped after the document exists but before its outcome batch leaves neither
+/// `Written` nor the run link; the re-driven job writes both for the same document.
+#[tokio::test]
+async fn crate_redrive_links() -> TestResult<()> {
+    use aruna_core::keyspaces::RUN_LINK_KEYSPACE;
+    use aruna_core::structs::execution::job::run_crate_key;
+    let realm = Topology::spawn(2, 1, 1).await?;
+    let group_id = realm.seed_group().await?;
+    let server = realm.node(0);
+    let storage = &server.context.storage_handle;
+    let job_id = finished_run(
+        (&realm, server),
+        group_id,
+        Vec::new(),
+        RunCrateStatus::Pending,
+    )
+    .await?;
+    let record = read_job_record(storage, job_id, None)
+        .await?
+        .ok_or("the run is stored")?;
+    let context = || JobContext {
+        driver: server.context.clone(),
+        job_id,
+        owner_node_id: server.node_id(),
+        claim_token: Ulid::from(1u128),
+        final_attempt: false,
+        cancel: CancellationToken::new(),
+        shutdown: CancellationToken::new(),
+        progress: ProgressReporter::from_progress(&record.progress),
+        range_turns: Default::default(),
+    };
+    let JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource }) =
+        write_run_crate(&context(), job_id).await
+    else {
+        return Err("the crate is written".into());
+    };
+    let document_id = Ulid::from_string(&resource)?;
+    let link = read_run_link(storage, job_id)
+        .await?
+        .ok_or("the run is linked")?;
+    assert_eq!(link.run_crate, Some(document_id));
+    assert_eq!((link.group_id, link.created_by), (group_id, realm.user_id));
+
+    put_crate_status(storage, job_id, &RunCrateStatus::Minted { document_id }).await?;
+    storage
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: RUN_LINK_KEYSPACE.to_string(),
+            key: run_crate_key(job_id),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        write_run_crate(&context(), job_id).await,
+        JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource: ref again }) if *again == resource
+    ));
+    assert_eq!(
+        read_crate_status(storage, job_id).await?,
+        Some(RunCrateStatus::Written { resource })
+    );
+    let link = read_run_link(storage, job_id)
+        .await?
+        .ok_or("the run is linked again")?;
+    assert_eq!(link.run_crate, Some(document_id));
     Ok(())
 }

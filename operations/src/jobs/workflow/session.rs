@@ -42,7 +42,14 @@ pub(super) async fn start_session(
     // same one back, so the client sees when it really expires.
     let credential_expires_ms = match read_job_record(&context.storage_handle, job_id, None).await {
         Ok(Some(record)) => Box::pin(mint_workspace_credential(
-            context, spec, &record, node_id, bucket,
+            context,
+            spec,
+            &record,
+            node_id,
+            (
+                bucket,
+                super::prepare::mounted_view(context, spec, &record).as_deref(),
+            ),
         ))
         .await
         .map(|credential| credential.expires_at_ms)

@@ -591,6 +591,7 @@ mod tests {
                 source_version: None,
                 digests: Default::default(),
             },
+            metadata: Default::default(),
         });
         PageImportInput {
             job_id: ctx.job_id,
@@ -610,7 +611,6 @@ mod tests {
             writes: Vec::new(),
             deletes: Vec::new(),
             now: std::time::SystemTime::now(),
-            database: None,
             ranges: None,
         }
     }
