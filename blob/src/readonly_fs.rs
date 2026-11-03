@@ -537,3 +537,7 @@ fn refused(key: &str) -> Error {
 fn read_only() -> Error {
     Error::new(ErrorKind::Unsupported, "this backend is read-only")
 }
+
+#[cfg(test)]
+#[path = "readonly_fs_tests.rs"]
+mod tests;
