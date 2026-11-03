@@ -189,6 +189,32 @@ the group's Storage tab with the endpoint and keys; it needs no bucket. Then add
 `/data/groups/{group_id}/storage/imports`; `/data/buckets/{bucket}/storage/move` counts and moves
 stored files, and `/data/buckets/{bucket}/storage/check` finds and deletes broken files.
 
+### Local and NFS folders
+
+A node operator can let groups import a folder of the node in place, for example an NFS share.
+Approve the folder in the backends file (`BLOB_BACKENDS_PATH`, which also needs a default
+`[backend.<name>]`):
+
+```toml
+[import_root.projects]
+path = "/mnt/nfs/projects"      # absolute path on this node
+groups = ["01JABCDEF0123456789ABCDEFG"]
+writable = false                # the default; true lets Aruna write new files here
+```
+
+- **Groups.** Only the listed groups see the root. A group lists its roots with
+  `GET /data/groups/{group_id}/storage/import-roots`, which never shows paths, and adds a storage
+  of kind `fs` with `root` and an optional `folder` below it, like `raw/2026/`.
+- **Imports only.** An `fs` storage is the source of linked rules. It cannot be the default rule or
+  a bucket routing target. A read-only root needs another, writable storage for new uploads.
+- **Safety.** Aruna never follows a symlink below the root and skips special files. A missing
+  folder only logs a warning at start, so a late mount does not stop the node.
+  `[egress] serve_group_backends = false` withdraws these storages too.
+- **NFS.** Use NFSv4 with a `hard` mount, never `soft`, and keep locking on (no `nolock`). The
+  server should export the share with `sync`. Aruna writes new files to a temporary name and links
+  or renames them into place, which needs hard links on the share. Reading a large share hashes
+  every new or changed file once, so schedule runs at quiet times.
+
 ## Realm Registry
 
 By default, a realm lists itself in the global registry at `https://registry.aruna-engine.org`,
