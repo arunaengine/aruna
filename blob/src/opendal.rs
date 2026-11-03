@@ -103,7 +103,9 @@ pub(crate) fn build_group_service(
 fn folder_config(mut config: HashMap<String, String>) -> HashMap<String, String> {
     let folder = config.remove("root").unwrap_or_default();
     let path = config.remove("path").unwrap_or_default();
-    let writable = config.remove("writable").unwrap_or_else(|| false.to_string());
+    let writable = config
+        .remove("writable")
+        .unwrap_or_else(|| false.to_string());
     HashMap::from([
         ("root".to_string(), path),
         ("folder".to_string(), folder),
