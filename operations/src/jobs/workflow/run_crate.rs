@@ -50,6 +50,7 @@ use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_job_document,
 };
 use crate::metadata::forward::route_metadata_create;
+use crate::metadata::get_document::load_document_record;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
@@ -208,6 +209,21 @@ pub(crate) async fn record_crate(
             "run crate status write failed: {error}"
         )));
     }
+    // A re-driven job whose create already committed records it instead of importing again.
+    if saved_id.is_some() {
+        match load_document_record(context, document_id).await {
+            Ok(Some(record)) => {
+                let event_id = record.establishing_event_id;
+                return record_written(driver, (for_job, parent, spec), record, event_id).await;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return JobRunOutcome::Failed(JobError::retryable(format!(
+                    "run crate registry read failed: {error}"
+                )));
+            }
+        }
+    }
     let denied = match drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: AuthContext {
@@ -280,7 +296,7 @@ pub(crate) async fn record_crate(
         launch.as_ref(),
     );
 
-    let (status, resource, written) = match route_metadata_create(
+    let status = match route_metadata_create(
         CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
             actor,
             group_id: spec.group_id,
@@ -300,24 +316,8 @@ pub(crate) async fn record_crate(
     .await
     {
         Ok(result) => {
-            let resource = result.record.document_id.to_string();
-            emit_metadata_created(
-                driver,
-                driver.serving_realm(parent.created_by.realm_id),
-                parent.created_by,
-                result.record.group_id,
-                result.record.document_id,
-                &result.record.document_path,
-                result.event_id,
-            )
-            .await;
-            (
-                RunCrateStatus::Written {
-                    resource: resource.clone(),
-                },
-                resource,
-                Some(result.record.document_id),
-            )
+            let job = (for_job, parent, spec);
+            return record_written(driver, job, result.record, result.event_id).await;
         }
         // An invalid crate is permanent: record it and discharge the
         // obligation so it is not retried forever. Transient errors retry.
@@ -327,14 +327,49 @@ pub(crate) async fn record_crate(
                     "run crate write failed: {error}"
                 )));
             }
-            let status = RunCrateStatus::Failed {
+            RunCrateStatus::Failed {
                 message: error.to_string(),
-            };
-            let resource = status.name().to_string();
-            (status, resource, None)
+            }
         }
     };
-    if let Err(error) = put_outcome(storage, for_job, parent, spec, &status, written).await {
+    if let Err(error) = put_outcome(storage, for_job, parent, spec, &status, None).await {
+        return JobRunOutcome::Failed(JobError::retryable(format!(
+            "run crate status write failed: {error}"
+        )));
+    }
+    JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
+        resource: status.name().to_string(),
+    })
+}
+
+/// Announces the created crate document and records it as the run's written crate.
+async fn record_written(
+    driver: &Arc<DriverContext>,
+    (for_job, parent, spec): (JobId, &JobRecord, &ExecutionSpec),
+    record: MetadataRegistryRecord,
+    event_id: Ulid,
+) -> JobRunOutcome {
+    let realm_id = driver.serving_realm(parent.created_by.realm_id);
+    let (group_id, document_id) = (record.group_id, record.document_id);
+    let path = &record.document_path;
+    emit_metadata_created(
+        driver,
+        realm_id,
+        parent.created_by,
+        group_id,
+        document_id,
+        path,
+        event_id,
+    )
+    .await;
+    let resource = document_id.to_string();
+    let status = RunCrateStatus::Written {
+        resource: resource.clone(),
+    };
+    let storage = &driver.storage_handle;
+    if let Err(error) =
+        put_outcome(storage, for_job, parent, spec, &status, Some(document_id)).await
+    {
         return JobRunOutcome::Failed(JobError::retryable(format!(
             "run crate status write failed: {error}"
         )));
