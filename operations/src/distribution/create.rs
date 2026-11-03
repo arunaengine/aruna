@@ -183,11 +183,9 @@ pub async fn create_set(
     }
 }
 
-/// Admits every unadmitted member and activates the set once every coordinator and replica is in.
-/// A failed member keeps the set pending; a member refused for capacity loses its empty bucket.
-/// Each member checks capacity against `sizes`; a range no admitted member holds is empty. A
-/// member with a copy not admitted yet is admitted again, which opens the new range on its node.
-/// With `accepted`, this node's record must reach that revision first.
+/// Admits unadmitted members against `sizes`, where a range no admitted member holds is empty,
+/// and activates the set once all are in; a failure keeps it pending, a capacity refusal drops the
+/// empty bucket. A member with a new copy is admitted again; `accepted` must be reached first.
 pub async fn admit_pending(
     context: &Arc<DriverContext>,
     auth: &AuthContext,

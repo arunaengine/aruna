@@ -391,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn errors_fade_over_time() {
+    fn errors_fade_out() {
         // Errors stop counting as failing after a minute and their rate halves each minute.
         let mut table = SourceTable::default();
         let start = Instant::now();
@@ -410,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn averages_decay_and_forget() {
+    fn averages_decay_out() {
         let mut table = SourceTable::default();
         let start = Instant::now();
         let a = key("https://a");
@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metered_reads_end_once() {
+    async fn metered_reads_end() {
         use futures::StreamExt;
         let table = Arc::new(StdMutex::new(SourceTable::default()));
         let chunk = || Ok(Bytes::from_static(b"abc"));

@@ -214,7 +214,7 @@ mod tests {
     use aruna_storage::storage::FjallStorage;
 
     #[tokio::test]
-    async fn claims_once_until_released() {
+    async fn claims_until_released() {
         let dir = tempfile::tempdir().unwrap();
         let context = DriverContext {
             storage_handle: FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),

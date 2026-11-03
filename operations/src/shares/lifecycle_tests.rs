@@ -1,3 +1,4 @@
+//! Tests creating, opening and revoking share links.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -77,7 +78,7 @@ fn log_written() -> Event {
 }
 
 #[test]
-fn create_checks_creator_first() {
+fn create_checks_creator() {
     let mut denied = create(link(ShareMode::Upload), 4);
     assert!(matches!(denied.start()[0], Effect::SubOperation(_)));
     assert!(denied.step(allowed(Ok(false))).is_empty());
@@ -94,7 +95,7 @@ fn create_checks_creator_first() {
 }
 
 #[test]
-fn create_refuses_before_io() {
+fn refuses_before_io() {
     // A link for someone else, or a bad link, never reaches the permission check.
     let mut foreign = create(link(ShareMode::Read), 9);
     assert!(foreign.start().is_empty());
@@ -191,7 +192,7 @@ fn creator(deactivated: Option<bool>) -> Event {
 }
 
 #[test]
-fn deactivated_creator_ends_link() {
+fn deactivation_ends_link() {
     // A deactivated creator's link answers like an ended one: no password step, no log entry.
     let mut guarded = link(ShareMode::Read);
     guarded.password = Some(PasswordHash::new("secret", CHEAP, [8; 16]).unwrap());
@@ -209,7 +210,7 @@ fn deactivated_creator_ends_link() {
 }
 
 #[test]
-fn open_hides_ended_links() {
+fn open_hides_ended() {
     let mut revoked = link(ShareMode::Read);
     revoked.revoked_at = Some(400);
     let mut operation = open(&revoked, None);
@@ -235,7 +236,7 @@ fn open_hides_ended_links() {
 }
 
 #[test]
-fn revoke_only_own_link() {
+fn revoke_own_link() {
     let own = link(ShareMode::Read);
     let mut foreign = RevokeShareOperation::new(user(9), own.id, 600);
     foreign.start();
