@@ -833,6 +833,12 @@ impl OperationsTaskHandler {
                                 &local_records,
                             )
                             .await;
+                            crate::notifications::email::enqueue_emails(
+                                &self.context,
+                                local_node_id,
+                                &local_records,
+                            )
+                            .await;
                         }
                         if let Err(error) =
                             delete_outbox_records(&self.context.storage_handle, local_keys).await

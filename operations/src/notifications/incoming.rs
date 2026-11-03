@@ -27,6 +27,7 @@ use crate::notifications::client::{
     close_stream, drain_request_stream, read_message, write_message,
 };
 use crate::notifications::dispatch::{list_on_holder, mark_on_holder, unread_on_holder};
+use crate::notifications::email::enqueue_emails;
 use crate::notifications::inbox::upsert_with_report;
 use crate::notifications::mark_read::MARK_MAX_IDS;
 use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
@@ -118,6 +119,7 @@ async fn build_response(
                     wake_recipients(net_handle, &outcome.recipients);
                     if outcome.written > 0 {
                         enqueue_webhooks(context, local_node_id, &records).await;
+                        enqueue_emails(context, local_node_id, &records).await;
                     }
                     NotificationTransportMessage::DeliverAck {
                         written: outcome.written as u32,
