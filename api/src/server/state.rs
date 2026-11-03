@@ -20,6 +20,7 @@ use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
+use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_operations::auth::bearer_token::{
     ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_linked_owner,
     realm_token_revoked, realm_user_cutoff,
@@ -42,7 +43,7 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -216,6 +217,8 @@ pub struct ServerState {
     limits: RequestLimits,
     interfaces: Interfaces,
     assistant: AssistantConnections,
+    /// The operator's import roots that groups may use on this node.
+    import_roots: Arc<BTreeMap<String, ImportRoot>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -352,6 +355,7 @@ impl ServerState {
                 chatgpt_issuer: "https://auth.openai.com".to_string(),
                 chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             },
+            import_roots: Arc::default(),
         };
         state
             .identity
@@ -461,6 +465,15 @@ impl ServerState {
 
     pub fn credential_encryption_key(&self) -> &CredentialEncryptionKey {
         &self.identity.credential_encryption_key
+    }
+
+    pub fn with_import_roots(mut self, roots: BTreeMap<String, ImportRoot>) -> Self {
+        self.import_roots = Arc::new(roots);
+        self
+    }
+
+    pub fn import_roots(&self) -> &BTreeMap<String, ImportRoot> {
+        &self.import_roots
     }
 
     pub fn with_assistant_proxy(mut self, enabled: bool) -> Self {

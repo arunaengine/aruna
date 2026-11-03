@@ -378,6 +378,7 @@ pub(crate) mod tests {
             "/data/groups/{group_id}/storage/backends/{backend_id}/buckets/{bucket}",
         ),
         ("GET", "/data/groups/{group_id}/storage/buckets"),
+        ("GET", "/data/groups/{group_id}/storage/import-roots"),
         (
             "GET",
             "/data/groups/{group_id}/distributed-buckets/{set_id}",

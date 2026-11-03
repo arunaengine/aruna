@@ -53,13 +53,14 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(enable_group_backend))
         .routes(routes!(backend_reclaim_status))
         .routes(routes!(check_provider_bucket))
+        .routes(routes!(list_import_roots))
 }
 
 #[derive(Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[schema(as = CreateGroupBackendRequest)]
 pub struct CreateBackendRequest {
     pub name: String,
-    /// One of `s3`, `gcs`, `azblob`, `azdls`, `b2`.
+    /// One of `s3`, `gcs`, `azblob`, `azdls`, `b2`, `fs`.
     pub kind: String,
     #[serde(default)]
     pub public_config: HashMap<String, String>,
@@ -175,6 +176,19 @@ pub struct ListBackendsResponse {
     pub backends: Vec<GroupBackendResponse>,
 }
 
+/// An import root of this node that the group may use for `fs` backends.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ImportRootResponse {
+    pub name: String,
+    /// Whether Aruna may write new files into folders below this root.
+    pub writable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ImportRootsResponse {
+    pub roots: Vec<ImportRootResponse>,
+}
+
 impl From<GroupStorage> for GroupBackendResponse {
     fn from(value: GroupStorage) -> Self {
         Self {
@@ -232,9 +246,13 @@ group's data, so the group write rights that suffice for objects are not enough.
 - `cleanup` defaults to `retain`, which never deletes from tenant storage.
 - The backend is registered enabled, and the record is node-local: it stays on the node that served
   the request instead of replicating to the realm.
+- An `fs` backend is a folder below an import root the node operator approved for the group. Its
+  probe lists the folder; when the root is writable it also writes and deletes a test file. It never
+  follows a symlink below the root, and it serves backend imports only: it cannot be the default
+  storage or a bucket routing target.
 
 **Limits**
-- `kind` is one of `s3`, `gcs`, `azblob`, `azdls` and `b2`, matched case-insensitively.
+- `kind` is one of `s3`, `gcs`, `azblob`, `azdls`, `b2` and `fs`, matched case-insensitively.
 - Config keys are a closed allowlist per kind, are lowercased before matching, and may not be given
   twice.
 - `s3` needs `endpoint` plus the secrets `access_key_id` and `secret_access_key`, and also accepts
@@ -243,6 +261,9 @@ group's data, so the group write rights that suffice for objects are not enough.
 - `azblob` needs `endpoint`, `container` and `account_name`; `azdls` needs `endpoint`, `filesystem`
   and `account_name`; both accept `root` and take either `account_key` or `sas_token`.
 - `b2` needs `bucket` and `bucket_id` plus the secrets `application_key_id` and `application_key`.
+- `fs` needs `root`, the name of an import root listed by
+  `GET /data/groups/{group_id}/storage/import-roots`, and accepts `folder`, a relative folder below
+  it that ends with `/`. It takes no secrets.
 - An endpoint must be an `https` URL and `root` a relative path that stays below itself."#,
     params(("group_id" = String, Path, description = "Group that will own the backend, as a 26-character ULID")),
     request_body(
@@ -324,6 +345,7 @@ pub async fn create_group_backend(
             public_config: request.public_config,
             secret_config: request.secret_config,
             cleanup,
+            import_roots: state.import_roots().clone(),
         }),
         &state.get_ctx(),
     )
@@ -331,6 +353,62 @@ pub async fn create_group_backend(
     .map_err(map_create_error)?;
 
     Ok((StatusCode::CREATED, Json(record.into())))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/groups/{group_id}/storage/import-roots",
+    tag = "data/storage",
+    summary = "List the import roots a group may use",
+    description = r#"Lists the folders the node operator approved for this group, for `fs` backends.
+
+**Authentication**: realm bearer token with WRITE on the group's admin path, the same group
+administrator right that listing backends takes.
+
+**Behavior**
+- Only roots of this node whose operator settings list the group are returned, sorted by name.
+- Paths on the node are never returned; an `fs` backend names its root by `name`.
+- `writable` tells whether Aruna may write new files below the root. Imports from a read-only root
+  need a separate writable write backend.
+- The list is empty while the node withdraws group backends."#,
+    params(("group_id" = String, Path, description = "Group whose import roots are listed, as a 26-character ULID")),
+    responses(
+        (
+            status = 200,
+            description = "The import roots of this node that the group may use, sorted by name",
+            body = ImportRootsResponse,
+            example = json!({
+                "roots": [
+                    { "name": "projects", "writable": false }
+                ]
+            })
+        ),
+        (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (
+            status = 403,
+            description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
+            body = ErrorResponse
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_import_roots(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+) -> ServerResult<Json<ImportRootsResponse>> {
+    let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
+    let roots = state
+        .import_roots()
+        .iter()
+        .filter(|(_, root)| root.allows(group_id))
+        .map(|(name, root)| ImportRootResponse {
+            name: name.clone(),
+            writable: root.writable,
+        })
+        .collect();
+    Ok(Json(ImportRootsResponse { roots }))
 }
 
 #[utoipa::path(
@@ -586,6 +664,7 @@ pub async fn replace_group_backend(
                 public_config: request.public_config,
                 secret_config: request.secret_config,
                 cleanup,
+                import_roots: state.import_roots().clone(),
             },
         ),
         &state.get_ctx(),

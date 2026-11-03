@@ -5,13 +5,15 @@
 use super::{
     CleanupPolicy, CleanupStrategy, CreateBackendRequest, backend_reclaim_status,
     check_provider_bucket, create_group_backend, delete_group_backend, enable_group_backend,
-    list_group_backends,
+    list_group_backends, list_import_roots,
 };
 use crate::error::ServerError;
 use crate::tests::storage_routing::setup_state;
+use aruna_core::structs::storage::backends::ImportRoot;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use ulid::Ulid;
 
 #[tokio::test]
@@ -164,6 +166,67 @@ async fn lists_empty_backends() {
     .unwrap();
 
     assert!(listed.backends.is_empty());
+}
+
+#[tokio::test]
+async fn lists_group_import_roots() {
+    let test = setup_state().await;
+    let root = |groups: Vec<Ulid>, writable| ImportRoot {
+        path: "/srv/hidden-path".to_string(),
+        groups,
+        writable,
+    };
+    let roots = BTreeMap::from([
+        ("scratch".to_string(), root(vec![test.group_id], true)),
+        ("other".to_string(), root(vec![Ulid::nil()], false)),
+        ("projects".to_string(), root(vec![test.group_id], false)),
+    ]);
+    let state = Arc::new((*test.state).clone().with_import_roots(roots));
+
+    let Json(listed) = list_import_roots(
+        State(state.clone()),
+        Extension(Some(test.auth.clone())),
+        Path(test.group_id.to_string()),
+    )
+    .await
+    .unwrap();
+
+    let names: Vec<_> = listed
+        .roots
+        .iter()
+        .map(|root| (root.name.as_str(), root.writable))
+        .collect();
+    assert_eq!(names, [("projects", false), ("scratch", true)]);
+    assert!(!serde_json::to_string(&listed).unwrap().contains("hidden-path"));
+    let denied = list_import_roots(
+        State(state),
+        Extension(Some(test.other_auth.clone())),
+        Path(test.group_id.to_string()),
+    )
+    .await;
+    assert!(matches!(denied, Err(ServerError::Forbidden)));
+}
+
+#[tokio::test]
+async fn refuses_unoffered_root() {
+    // A group names only a root the operator listed it in, never a path.
+    let test = setup_state().await;
+
+    let result = create_group_backend(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Path(test.group_id.to_string()),
+        Json(CreateBackendRequest {
+            name: "share".to_string(),
+            kind: "fs".to_string(),
+            public_config: HashMap::from([("root".to_string(), "projects".to_string())]),
+            secret_config: HashMap::new(),
+            cleanup: None,
+        }),
+    )
+    .await;
+
+    assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 }
 
 #[test]
