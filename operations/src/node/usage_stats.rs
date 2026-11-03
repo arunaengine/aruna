@@ -434,10 +434,9 @@ pub enum QuotaGateError {
     UnexpectedEvent(Event),
 }
 
-/// Embeddable read side of the per-group quota gate: sums the realm-wide `logical_bytes` in the
-/// caller's write transaction, so same-group writes conflict; `ceiling` folds in grace. Replicas
-/// count only when the group's quota settings say so. A rebuild without complete counters from
-/// an earlier one refuses every write.
+/// Read side of the per-group quota gate: sums realm-wide `logical_bytes` in the caller's write
+/// transaction, so same-group writes conflict; `ceiling` folds in grace. Replicas count only when
+/// group quota settings say so. A rebuild without complete earlier counters refuses every write.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaGate {
     ceiling: u64,
