@@ -197,7 +197,11 @@ async fn lists_group_import_roots() {
         .map(|root| (root.name.as_str(), root.writable))
         .collect();
     assert_eq!(names, [("projects", false), ("scratch", true)]);
-    assert!(!serde_json::to_string(&listed).unwrap().contains("hidden-path"));
+    assert!(
+        !serde_json::to_string(&listed)
+            .unwrap()
+            .contains("hidden-path")
+    );
     let denied = list_import_roots(
         State(state),
         Extension(Some(test.other_auth.clone())),

@@ -780,7 +780,9 @@ default = true
         }
     }
 
-    fn with_roots(roots: &str) -> Result<super::NodeBackendsConfig, crate::errors::ConversionError> {
+    fn with_roots(
+        roots: &str,
+    ) -> Result<super::NodeBackendsConfig, crate::errors::ConversionError> {
         let file = format!("{FILE}\n{roots}");
         BackendsFile::parse(&file)?.resolve(&secrets, BlobTimeoutConfig::default())
     }
