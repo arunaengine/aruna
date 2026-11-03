@@ -870,6 +870,7 @@ fn lasting_put(error: &PutObjectError) -> bool {
             | RoutingError::InvalidClass(_)
             | RoutingError::OperatorBackendTarget
             | RoutingError::ForeignBackend(_)
+            | RoutingError::FolderTarget(_)
             | RoutingError::AmbiguousRules { .. } => true,
         },
         Put::PolicyGate(error) => lasting_gate(error),
