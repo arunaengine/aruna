@@ -19,6 +19,20 @@ fn filtered(root: &Path, filter: PathFilter) -> Operator {
     Operator::new(builder).unwrap()
 }
 
+#[cfg(unix)]
+fn link(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[cfg(windows)]
+fn link(target: &Path, link: &Path) {
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    } else {
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+}
+
 fn put(root: &Path, relative: &str, content: &str) {
     let path = root.join(relative);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -109,9 +123,9 @@ async fn skips_symlinks() {
     let outside = tempfile::tempdir().unwrap();
     put(outside.path(), "secret", "secret");
     put(root.path(), "plain", "plain");
-    std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("link")).unwrap();
-    std::os::unix::fs::symlink(outside.path(), root.path().join("folder")).unwrap();
-    std::os::unix::fs::symlink(root.path().join("plain"), root.path().join("inside")).unwrap();
+    link(&outside.path().join("secret"), &root.path().join("link"));
+    link(outside.path(), &root.path().join("folder"));
+    link(&root.path().join("plain"), &root.path().join("inside"));
     let op = operator(root.path());
 
     assert_eq!(files(&op, "", None).await, ["plain"]);
@@ -198,7 +212,8 @@ async fn skips_fifo() {
     let root = tempfile::tempdir().unwrap();
     put(root.path(), "plain", "plain");
     let fifo = root.path().join("pipe");
-    rustix::fs::mknodat(CWD, &fifo, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+    let mode = rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR;
+    rustix::fs::mknodat(rustix::fs::CWD, &fifo, rustix::fs::FileType::Fifo, mode, 0).unwrap();
     let op = operator(root.path());
 
     assert_eq!(files(&op, "", None).await, ["plain"]);

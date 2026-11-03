@@ -22,7 +22,6 @@ mod messages;
 pub mod opendal;
 pub mod pace;
 mod part_chain;
-#[cfg(unix)]
 pub mod readonly_fs;
 pub mod repo;
 pub mod rocrate;

@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use bytes::Bytes;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use opendal::raw::{
     OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite, RpCreateDir,
     RpPresign, RpRename, RpStat, Service, ServiceInfo, Timestamp, new_std_io_error,
@@ -13,25 +16,17 @@ use opendal::{
     Buffer, Builder, Capability, Configurator, Error, ErrorKind, Metadata, MetadataBuilder,
     OperationContext, Result,
 };
-use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat, fstat, openat, statat};
-use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::File;
-use std::os::fd::OwnedFd;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
 
 /// Decides whether a path below the root may be listed, stated or read. Folder paths end with
 /// `/`. Every folder on the way to an entry is asked too, so a refused folder hides its content.
 pub type PathFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 const SCHEME: &str = "readonly-fs";
-const FOLDER_FLAGS: OFlags = OFlags::RDONLY
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::CLOEXEC);
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
@@ -109,8 +104,9 @@ impl Core {
 
     /// Opens the folder `parts` names, one level at a time relative to the level above, so
     /// no symlink is followed even if a folder is swapped while it is walked.
-    fn open_folder(&self, parts: &[&str]) -> Result<OwnedFd> {
-        let mut folder = openat(CWD, &self.root, FOLDER_FLAGS, Mode::empty()).map_err(io_error)?;
+    fn open_folder(&self, parts: &[&str]) -> Result<Dir> {
+        let mut folder =
+            Dir::open_ambient_dir(&self.root, ambient_authority()).map_err(io_error)?;
         let mut key = String::new();
         for part in parts {
             key.push_str(part);
@@ -118,8 +114,7 @@ impl Core {
             if !self.allowed(&key) {
                 return Err(refused(&key));
             }
-            let flags = FOLDER_FLAGS | OFlags::NOFOLLOW;
-            folder = openat(&folder, *part, flags, Mode::empty()).map_err(io_error)?;
+            folder = open_child(&folder, part)?.ok_or_else(|| missing(&key))?;
         }
         Ok(folder)
     }
@@ -131,24 +126,22 @@ impl Core {
             return Ok(MetadataBuilder::dir().build());
         };
         let folder = self.open_folder(folders)?;
-        let stat = statat(&folder, *name, AtFlags::SYMLINK_NOFOLLOW).map_err(io_error)?;
+        let entry = folder.symlink_metadata(name).map_err(io_error)?;
         let mut key = parts.join("/");
-        match FileType::from_raw_mode(stat.st_mode) {
-            FileType::Directory => {
-                key.push('/');
-                if !self.allowed(&key) {
-                    return Err(refused(&key));
-                }
-                Ok(MetadataBuilder::dir().build())
+        if entry.is_dir() {
+            key.push('/');
+            if !self.allowed(&key) {
+                return Err(refused(&key));
             }
-            FileType::RegularFile if !path.ends_with('/') => {
-                if !self.allowed(&key) {
-                    return Err(refused(&key));
-                }
-                file_metadata(&stat)
-            }
-            _ => Err(missing(path)),
+            return Ok(MetadataBuilder::dir().build());
         }
+        if !entry.is_file() || path.ends_with('/') {
+            return Err(missing(path));
+        }
+        if !self.allowed(&key) {
+            return Err(refused(&key));
+        }
+        file_metadata(&entry)
     }
 
     fn open_file(&self, path: &str) -> Result<File> {
@@ -162,17 +155,22 @@ impl Core {
             return Err(refused(&key));
         }
         // The early check keeps devices from being opened; the late one catches a swap between.
-        let stat = statat(&folder, *name, AtFlags::SYMLINK_NOFOLLOW).map_err(io_error)?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        if !folder.symlink_metadata(name).map_err(io_error)?.is_file() {
             return Err(missing(path));
         }
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-        let file = openat(&folder, *name, flags, Mode::empty()).map_err(io_error)?;
-        let stat = fstat(&file).map_err(io_error)?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        // A file swapped for a fifo after the check must not block the open.
+        #[cfg(unix)]
+        cap_std::fs::OpenOptionsExt::custom_flags(
+            &mut options,
+            rustix::fs::OFlags::NONBLOCK.bits() as i32,
+        );
+        let file = folder.open_with(name, &options).map_err(io_error)?;
+        if !file.metadata().map_err(io_error)?.is_file() {
             return Err(missing(path));
         }
-        Ok(File::from(file))
+        Ok(file.into_std())
     }
 }
 
@@ -294,9 +292,7 @@ impl oio::PositionRead for FileReader {
         let file = handle.clone();
         let bytes = blocking(move || {
             let mut buffer = vec![0; size];
-            let read = file
-                .read_at(&mut buffer, offset)
-                .map_err(new_std_io_error)?;
+            let read = read_at(&file, &mut buffer, offset).map_err(new_std_io_error)?;
             buffer.truncate(read);
             Ok(buffer)
         })
@@ -317,7 +313,7 @@ struct Child {
 }
 
 struct Frame {
-    folder: Arc<OwnedFd>,
+    folder: Arc<Dir>,
     children: std::vec::IntoIter<Child>,
 }
 
@@ -402,7 +398,7 @@ impl oio::List for FolderLister {
                     if self.recursive && !self.passed(&child.key) {
                         let (name, key) = (child.name.clone(), child.key.clone());
                         if let Some(frame) =
-                            blocking(move || open_child(&parent, &name, &key)).await?
+                            blocking(move || open_frame(&parent, &name, &key)).await?
                         {
                             self.frames
                                 .as_mut()
@@ -422,13 +418,26 @@ impl oio::List for FolderLister {
     }
 }
 
-/// A folder that became a symlink or vanished after its parent was read is skipped.
-fn open_child(parent: &OwnedFd, name: &str, key: &str) -> Result<Option<Frame>> {
-    let flags = FOLDER_FLAGS | OFlags::NOFOLLOW;
-    let folder = match openat(parent, name, flags, Mode::empty()) {
-        Ok(folder) => folder,
-        Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => return Ok(None),
+/// Opens the folder `name` names in `parent`, or `None` if it is not a folder. A symlink is
+/// never a folder here, and one swapped in after the check fails the open instead.
+fn open_child(parent: &Dir, name: &str) -> Result<Option<Dir>> {
+    match parent.symlink_metadata(name) {
+        Ok(entry) if entry.is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if absent(&error) => return Ok(None),
         Err(error) => return Err(io_error(error)),
+    }
+    match parent.open_dir_nofollow(name) {
+        Ok(folder) => Ok(Some(folder)),
+        Err(error) if absent(&error) => Ok(None),
+        Err(error) => Err(io_error(error)),
+    }
+}
+
+/// A folder that became a symlink or vanished after its parent was read is skipped.
+fn open_frame(parent: &Dir, name: &str, key: &str) -> Result<Option<Frame>> {
+    let Some(folder) = open_child(parent, name)? else {
+        return Ok(None);
     };
     let children = read_folder(&folder, key)?;
     Ok(Some(Frame {
@@ -439,29 +448,30 @@ fn open_child(parent: &OwnedFd, name: &str, key: &str) -> Result<Option<Frame>> 
 
 /// Regular files and folders of one folder, sorted by key. Symlinks, special files and names
 /// that are not UTF-8 are left out.
-fn read_folder(folder: &OwnedFd, prefix: &str) -> Result<Vec<Child>> {
+fn read_folder(folder: &Dir, prefix: &str) -> Result<Vec<Child>> {
     let mut children = Vec::new();
-    let mut entries = Dir::read_from(folder).map_err(io_error)?;
-    while let Some(entry) = entries.read() {
+    for entry in folder.entries().map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
-        let Ok(name) = entry.file_name().to_str() else {
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|name| plain_name(name)) else {
             continue;
         };
-        if name == "." || name == ".." {
-            continue;
-        }
-        let stat = match statat(folder, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => stat,
-            Err(Errno::NOENT) => continue,
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) if absent(&error) => continue,
             Err(error) => return Err(io_error(error)),
         };
-        let (key, kind) = match FileType::from_raw_mode(stat.st_mode) {
-            FileType::Directory => (format!("{prefix}{name}/"), ChildKind::Folder),
-            FileType::RegularFile => (
-                format!("{prefix}{name}"),
-                ChildKind::File(file_metadata(&stat)?),
-            ),
-            _ => continue,
+        let (key, kind) = if kind.is_dir() {
+            (format!("{prefix}{name}/"), ChildKind::Folder)
+        } else if kind.is_file() {
+            let metadata = match entry.metadata() {
+                Ok(metadata) => file_metadata(&metadata)?,
+                Err(error) if absent(&error) => continue,
+                Err(error) => return Err(io_error(error)),
+            };
+            (format!("{prefix}{name}"), ChildKind::File(metadata))
+        } else {
+            continue;
         };
         children.push(Child {
             name: name.to_string(),
@@ -473,34 +483,42 @@ fn read_folder(folder: &OwnedFd, prefix: &str) -> Result<Vec<Child>> {
     Ok(children)
 }
 
-/// The names of a normalized path. Empty names, `.` and `..` name nothing below the root.
+/// The names of a normalized path. Each must be a plain name, see [`plain_name`].
 fn path_parts(path: &str) -> Result<Vec<&str>> {
     let trimmed = path.trim_start_matches('/').trim_end_matches('/');
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
     let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts
-        .iter()
-        .any(|part| matches!(*part, "" | "." | "..") || part.contains('\0'))
-    {
+    if !parts.iter().all(|part| plain_name(part)) {
         return Err(missing(path));
     }
     Ok(parts)
 }
 
-/// `Stat` field widths differ per platform, so some of these casts are no-ops on some of them.
-#[allow(clippy::unnecessary_cast)]
-fn file_metadata(stat: &Stat) -> Result<Metadata> {
-    let seconds = stat.st_mtime as i64;
-    let nanos = Duration::from_nanos(stat.st_mtime_nsec as u64);
-    let modified = match u64::try_from(seconds) {
-        Ok(seconds) => UNIX_EPOCH + Duration::from_secs(seconds) + nanos,
-        Err(_) => UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs()) + nanos,
-    };
-    let mut metadata = MetadataBuilder::file(stat.st_size as u64);
+/// Empty names, `.` and `..` name nothing below the root. Windows also reads `\` as a
+/// separator and `:` as a stream name.
+fn plain_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..")
+        && !name.contains('\0')
+        && !(cfg!(windows) && name.contains(['\\', ':']))
+}
+
+fn file_metadata(entry: &cap_std::fs::Metadata) -> Result<Metadata> {
+    let modified = entry.modified().map_err(new_std_io_error)?.into_std();
+    let mut metadata = MetadataBuilder::file(entry.len());
     metadata.last_modified(Timestamp::try_from(modified)?);
     Ok(metadata.build())
+}
+
+#[cfg(unix)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
 }
 
 async fn blocking<T: Send + 'static>(
@@ -511,14 +529,19 @@ async fn blocking<T: Send + 'static>(
         .map_err(new_task_join_error)?
 }
 
-/// A symlink, or a file where a folder was expected, counts as absent.
-fn io_error(errno: Errno) -> Error {
-    match errno {
-        Errno::NOENT | Errno::LOOP | Errno::NOTDIR => {
-            Error::new(ErrorKind::NotFound, "no such file or folder below the root")
-        }
-        other => new_std_io_error(std::io::Error::from(other)),
+/// A missing entry, or a file where a folder was expected, counts as absent.
+fn absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+fn io_error(error: std::io::Error) -> Error {
+    if absent(&error) {
+        return Error::new(ErrorKind::NotFound, "no such file or folder below the root");
     }
+    new_std_io_error(error)
 }
 
 fn missing(path: &str) -> Error {
