@@ -32,6 +32,8 @@ use super::staging::{StageLayout, StagePlan};
 use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, now_ms};
 
 mod runtime;
+#[cfg(feature = "slurm")]
+pub mod slurm;
 mod state;
 
 use state::{
