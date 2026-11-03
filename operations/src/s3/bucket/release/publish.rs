@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::release::{
+use super::{
     Access, BucketScope, MembersConfig, ReleaseError, ReleaseMembersOperation, load_access,
 };
 use crate::auth::request_authorization::{AuthorizeError, authorize};
@@ -752,7 +752,7 @@ async fn ask_holder(
 
 #[cfg(test)]
 mod tests {
-    use super::super::release::{pinned_ids, upstream_of};
+    use super::super::{pinned_ids, upstream_of};
     use super::*;
     use aruna_core::structs::identity::identifier::IdentifierTarget;
     use aruna_core::structs::storage::global_id::GlobalId;

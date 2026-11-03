@@ -645,9 +645,7 @@ fn inputs(run_crate: &Value) -> Vec<(String, Option<String>)> {
     found
 }
 
-#[path = "provenance_spool.rs"]
 mod spool;
 
 #[cfg(test)]
-#[path = "provenance_tests.rs"]
 mod tests;

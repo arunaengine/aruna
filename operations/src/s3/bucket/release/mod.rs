@@ -627,5 +627,4 @@ pub(crate) fn upstream_of(crate_json: &Value) -> Vec<Identifier> {
 }
 
 #[cfg(test)]
-#[path = "release_tests.rs"]
 mod tests;
