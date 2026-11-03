@@ -264,6 +264,7 @@ impl CreateBucketOperation {
                 write_pattern: PLAIN_PATTERN.to_string(),
                 now: self.bucket_info.created_at,
                 move_existing: false,
+                import_roots: Default::default(),
             };
             self.link = Some(CreateImportOperation::within(input, txn_id));
             self.provider = Some((storage.backend_id, provider));

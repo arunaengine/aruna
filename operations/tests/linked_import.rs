@@ -255,6 +255,7 @@ async fn setup_pattern(pattern: &str) -> TestContext {
         write_pattern: pattern.to_string(),
         now: SystemTime::now(),
         move_existing: false,
+        import_roots: Default::default(),
     });
     let rule = drive(rule, &driver).await.unwrap();
     let auth = AuthContext {
