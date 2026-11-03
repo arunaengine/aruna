@@ -1149,6 +1149,132 @@ mod pure_tests {
         assert!(still_retained.publishers.contains(&node(9)));
     }
 
+    /// A full turnover of bucket 7 from `old` to `target`: barriers from `frozen`, proofs from every
+    /// target, and a forced cutover when an old holder never froze.
+    fn full_turnover(
+        strategy_id: Ulid,
+        seed: u8,
+        (old, target, frozen): (&[u8], &[u8], &[u8]),
+    ) -> aruna_core::structs::placement::transition::PlacementTransition {
+        use aruna_core::structs::placement::transition::{
+            BucketBarrier, BucketForceFinalize, BucketPlan, PlacementTransition, ProofClaim,
+            TransitionLimits, TransitionPlan,
+        };
+        let nodes = |seeds: &[u8]| seeds.iter().map(|seed| node(*seed)).collect::<Vec<_>>();
+        let mut transition = PlacementTransition::new(TransitionPlan {
+            transition_id: Ulid::from_bytes([seed; 16]),
+            strategy_id,
+            buckets: vec![BucketPlan {
+                bucket: 7,
+                old_holders: nodes(old),
+                target_holders: nodes(target),
+                predecessor_epoch: u64::from(seed),
+            }],
+            target_map_epoch: u64::from(seed) + 1,
+            limits: TransitionLimits {
+                max_incomplete_buckets: 1,
+                grace_ms: 1_000,
+            },
+            created_by: node(1),
+            created_at_ms: 1,
+        });
+        for holder in frozen {
+            transition.barriers.push(BucketBarrier {
+                bucket: 7,
+                reported_by: node(*holder),
+                frontier: vec![*holder],
+            });
+        }
+        for holder in target {
+            let digest = transition.barrier_digest(7);
+            let claim = ProofClaim {
+                realm_id: RealmId::from_bytes([3u8; 32]),
+                transition_id: transition.plan.transition_id,
+                strategy_id,
+                bucket: 7,
+                old_activation_epoch: u64::from(seed),
+                target_map_epoch: u64::from(seed) + 1,
+                barrier_digest: digest,
+                checkpoint_root: [seed; 32],
+                holder: node(*holder),
+            };
+            let secret = iroh::SecretKey::from_bytes(&[*holder; 32]);
+            transition.proofs.push(claim.sign(&secret));
+        }
+        if !transition.bucket_ready(7) {
+            transition.forced.push(BucketForceFinalize {
+                bucket: 7,
+                at_risk_report: "old holder unavailable".to_string(),
+            });
+        }
+        transition
+    }
+
+    #[test]
+    fn repeated_turnover_bounded() {
+        // Two full turnovers with grace, while old holder 9 never answers: the cutover needs
+        // the operator's force, holder 9 stays retained without its drain report, and the next
+        // turnover adds only its own departing holders until they drain.
+        use aruna_core::structs::placement::transition::{BucketCompletion, BucketDrain};
+        let (mut config, placement) = config_and_placement();
+        let strategy_id = placement.strategy_id;
+        let base = resolve_shard_holders(&config, &placement);
+        let extra = |config: &RealmConfigDocument, now_ms: u64| {
+            let membership = bucket_membership(config, &placement, now_ms);
+            let added = |nodes: Vec<NodeId>| {
+                let added = nodes.into_iter().filter(|node_id| !base.contains(node_id));
+                added.collect::<Vec<_>>()
+            };
+            (added(membership.members), added(membership.publishers))
+        };
+
+        let mut first = full_turnover(strategy_id, 2, (&[9, 10], &[12, 13], &[10]));
+        assert_eq!(
+            first.forced.len(),
+            1,
+            "a missing barrier needs a forced cutover"
+        );
+        assert!(first.bucket_ready(7));
+        first.completed.push(BucketCompletion {
+            bucket: 7,
+            completed_at_ms: 100,
+        });
+        first.drained.push(BucketDrain {
+            bucket: 7,
+            reported_by: node(10),
+        });
+        config.placement_transitions.push(first);
+        assert_eq!(
+            extra(&config, 500),
+            (vec![node(9), node(10)], vec![node(9), node(10)])
+        );
+        assert_eq!(extra(&config, 1_100), (vec![node(9)], vec![node(9)]));
+        assert!(config.placement_transitions[0].is_terminal());
+        assert!(!config.placement_transitions[0].released(u64::MAX));
+
+        let mut second = full_turnover(strategy_id, 3, (&[12, 13], &[14, 15], &[12, 13]));
+        assert!(second.forced.is_empty(), "every old holder froze");
+        second.completed.push(BucketCompletion {
+            bucket: 7,
+            completed_at_ms: 2_000,
+        });
+        for holder in [12, 13] {
+            second.drained.push(BucketDrain {
+                bucket: 7,
+                reported_by: node(holder),
+            });
+        }
+        config.placement_transitions.push(second);
+        let (members, _) = extra(&config, 2_500);
+        assert_eq!(members, vec![node(9), node(12), node(13)]);
+        assert_eq!(extra(&config, 3_100), (vec![node(9)], vec![node(9)]));
+        assert!(config.placement_transitions[1].released(3_100));
+        assert!(
+            drain_pending(&config, 3_100),
+            "holder 9 still owes its report"
+        );
+    }
+
     #[test]
     fn release_deadline_derived() {
         // Before the grace end the deadline is completion plus grace; past it
