@@ -1144,7 +1144,7 @@ mod pure_tests {
     }
 
     #[test]
-    fn repeat_attach_ignores_stale_claim() {
+    fn stale_claim_ignored() {
         // A merge elsewhere may leave the merged account's claim here for a while.
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let owner = UserId::local(Ulid::from_bytes([4u8; 16]), realm_id);

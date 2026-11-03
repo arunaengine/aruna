@@ -1058,7 +1058,7 @@ async fn subject_remove_cleans() {
 }
 
 #[tokio::test]
-async fn merge_grant_needs_role() {
+async fn merge_needs_role() {
     // A merge hands a role of the merged account on, only from a management node.
     let realm_id = RealmId::from_bytes([62; 32]);
     let group_id = Ulid::from_parts(1_640, 1);
@@ -1242,14 +1242,14 @@ async fn hand_over_subject(
 }
 
 #[tokio::test]
-async fn merged_removal_hands_subject() {
+async fn removal_hands_subject() {
     // The merged account's removal arrives before the primary's addition: the primary owns it.
     let (_, primary, owner) = hand_over_subject(true, RealmId::from_bytes([63; 32])).await;
     assert_eq!(owner, Some(primary));
 }
 
 #[tokio::test]
-async fn unverified_pointer_keeps_subject() {
+async fn unverified_keeps_subject() {
     // A pointer the primary does not confirm, or one into another realm, moves nothing.
     for (lists, realm) in [(false, [63; 32]), (true, [65; 32])] {
         let (merged, _, owner) = hand_over_subject(lists, RealmId::from_bytes(realm)).await;
@@ -1258,7 +1258,7 @@ async fn unverified_pointer_keeps_subject() {
 }
 
 #[tokio::test]
-async fn merge_pointer_needs_management() {
+async fn pointer_needs_management() {
     // A server node may not point an account at another account; a management node may.
     let realm_id = RealmId::from_bytes([64; 32]);
     let merged = UserId::local(Ulid::from_parts(1_660, 1), realm_id);
@@ -1392,7 +1392,7 @@ async fn apply_with_claims(
 }
 
 #[tokio::test]
-async fn late_removal_reaches_root() {
+async fn removal_reaches_root() {
     // B into A, then A into C: B's late removal still names A, but the subject goes to C.
     let realm_id = RealmId::from_bytes([66; 32]);
     let id = |seed: u64| UserId::local(Ulid::from_parts(1_680 + seed, 1), realm_id);
@@ -1410,7 +1410,7 @@ async fn late_removal_reaches_root() {
 }
 
 #[tokio::test]
-async fn root_takes_kept_claim() {
+async fn root_takes_claim() {
     // B's claim waited for its root; the root's own addition ends it.
     let realm_id = RealmId::from_bytes([67; 32]);
     let id = |seed: u64| UserId::local(Ulid::from_parts(1_690 + seed, 1), realm_id);
@@ -1427,7 +1427,7 @@ async fn root_takes_kept_claim() {
 }
 
 #[test]
-fn merge_handoff_needs_coordinator() {
+fn handoff_needs_coordinator() {
     // Only the pinned coordinator names the next one, unless none is pinned or it left management.
     let realm_id = RealmId::from_bytes([68; 32]);
     let user = UserId::local(Ulid::from_parts(1_700, 1), realm_id);
@@ -1496,7 +1496,7 @@ fn merge_handoff_needs_coordinator() {
 }
 
 #[tokio::test]
-async fn final_marker_clears_kept_claim() {
+async fn marker_clears_claim() {
     // B's removal kept its claim, A's addition came before its marker: the marker clears it.
     let realm_id = RealmId::from_bytes([69; 32]);
     let id = |seed: u64| UserId::local(Ulid::from_parts(1_710 + seed, 1), realm_id);

@@ -998,10 +998,9 @@ async fn record_pages_resume() {
     server.abort();
 }
 
-/// Imports `rows` record rows and `empty` empty rows spread over `jobs` tables at once, in key
-/// blocks or interleaved, the drain and the search feed running beside them when `background`;
-/// returns the completed and failed rows, the storage conflicts meanwhile, the seconds the jobs
-/// took and the seconds the search index took after them to catch up.
+/// Imports `rows` record and `empty` empty rows over `jobs` tables at once, in key blocks or
+/// interleaved, with drain and search feed beside them when `background`. Returns completed and
+/// failed rows, storage conflicts, the jobs' seconds and the search index's catch-up seconds.
 async fn import_records(
     rows: usize,
     empty: usize,

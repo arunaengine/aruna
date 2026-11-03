@@ -650,7 +650,7 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
-    fn private_name_never_matches() {
+    fn private_name_unmatched() {
         // A chosen display name must not probe for a private name; a verified email still matches.
         let realm_id = aruna_core::structs::identity::realm::RealmId([5u8; 32]);
         let mut user = User {

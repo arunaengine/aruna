@@ -485,10 +485,9 @@ async fn collect(
     Ok(bytes)
 }
 
-/// The decompressed chunk of at most `window` bytes at `at`, a version, an observation and an
-/// offset, decoded on from the stream an earlier step of this run left open there; a new stream
-/// from `open` decodes from the start and skips to the offset once. Returns the version the
-/// stream opened, if it opened one.
+/// The decompressed chunk of at most `window` bytes at a version, observation and offset, read on
+/// from a stream an earlier step left open there, or from a new `open` stream skipped to the
+/// offset once. Returns the version the stream opened, if it opened one.
 async fn gzip_chunk<F, Opening>(
     kept: &mut Option<GzipStream>,
     (version_id, observation, offset): (Option<ulid::Ulid>, Option<SourceMetadata>, u64),

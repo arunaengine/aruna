@@ -1,3 +1,4 @@
+//! Tests resolving w3id paths to realms, legacy sites and their fallbacks and limits.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -488,7 +489,7 @@ async fn retired_realms_gone() {
 }
 
 #[tokio::test]
-async fn old_nodes_use_pid() {
+async fn legacy_uses_pid() {
     // Nodes without the w3id route are asked and reached through their PID routes.
     let (_dir, resolver, now) = resolver(BASE, true);
     let id = minted();
@@ -518,7 +519,7 @@ async fn old_nodes_use_pid() {
 }
 
 #[tokio::test]
-async fn mixed_backends_fall_back() {
+async fn mixed_backends_fallback() {
     // A node without the w3id route behind a checked address: its PID route still decides.
     let (_dir, resolver, now) = resolver(BASE, true);
     let id = minted();
@@ -542,7 +543,7 @@ async fn mixed_backends_fall_back() {
 }
 
 #[tokio::test]
-async fn old_nodes_never_absent() {
+async fn legacy_never_absent() {
     // An older node answers 503 for ids it cannot place, which must not send v3 ids to v2.
     let (_dir, resolver, now) = resolver(BASE, true);
     let pid = format!("{API}/pid/{LEGACY}");
@@ -556,7 +557,7 @@ async fn old_nodes_never_absent() {
 }
 
 #[tokio::test]
-async fn unclear_check_uses_pid() {
+async fn unclear_uses_pid() {
     // An unreachable route check picks the routes every node serves and waits before the next.
     let (_dir, resolver, now) = resolver(BASE, true);
     let sites = Sites::serving(&[], Holding::Unavailable);
@@ -657,7 +658,7 @@ async fn data_ids_direct() {
 }
 
 #[tokio::test]
-async fn w3id_host_refused() {
+async fn looping_api_refused() {
     // A realm API on w3id.org would send the redirect back to this resolver.
     let (_dir, resolver, now) = resolver("https://w3id.org/aruna", true);
     let path = format!("data/{}", "ab".repeat(32));
@@ -837,7 +838,7 @@ async fn probes_follow_nothing() {
 }
 
 #[tokio::test]
-async fn late_fallback_keeps_cooldown() {
+async fn late_fallback_cooldown() {
     // A PID fallback that finishes late must not clear a newer check or its cooldown.
     let (_dir, resolver, now) = resolver(BASE, true);
     let entry = resolver

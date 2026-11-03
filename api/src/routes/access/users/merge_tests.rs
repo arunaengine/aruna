@@ -97,7 +97,7 @@ async fn stop(node: TestNode, oidc_task: tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
-async fn registration_waits_for_choice() {
+async fn registration_awaits_choice() {
     let key = generate_signing_key();
     let (provider, oidc_task) = spawn_oidc_provider(ISSUER, KID, &key).await;
     let node = spawn_test_node(provider, true).await;
@@ -265,7 +265,7 @@ async fn merge_moves_signin() {
 }
 
 #[tokio::test]
-async fn opposite_merges_one_wins() {
+async fn one_merge_wins() {
     // A into B and B into A at once: exactly one commits and one account stays active.
     let key = generate_signing_key();
     let (provider, oidc_task) = spawn_oidc_provider(ISSUER, KID, &key).await;
