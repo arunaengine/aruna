@@ -22,18 +22,21 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::reducer::AdminDocumentState;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, TokenClaims};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, TokenClaims};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::placement::transition::TransitionLimits;
-use aruna_core::structs::storage::blob::{Backend, BackendConfig};
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, group_permission_path};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_operations::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
@@ -351,11 +354,11 @@ impl Topology {
         wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
             "the seeded group never reached every sync-eligible node",
             || async {
-                // Policy loading needs the group record as well as its auth
-                // document, and the two replicate independently.
+                // Policy loading needs the group record as well as its auth document, and the
+                // creator's grant may reach a node after the document itself.
                 let mut pending = 0;
                 for node in self.nodes.iter().filter(|node| node.is_sync_eligible()) {
-                    if read_group_auth(node, group.group_id).await?.is_none()
+                    if !self.creator_reads(node, group.group_id).await
                         || read_group_record(node, group.group_id).await?.is_none()
                     {
                         pending += 1;
@@ -366,6 +369,17 @@ impl Topology {
         )
         .await?;
         Ok(group.group_id)
+    }
+
+    /// Whether `node` already grants this realm's user READ on its data in `group_id`.
+    async fn creator_reads(&self, node: &TestNode, group_id: Ulid) -> bool {
+        let path = group_permission_path(self.realm_id, group_id, node.node_id());
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.auth_context(),
+            path,
+            required_permission: Permission::READ,
+        });
+        matches!(drive(check, node.context.as_ref()).await, Ok(true))
     }
 
     pub async fn create_document(
