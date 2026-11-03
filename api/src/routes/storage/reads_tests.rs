@@ -72,7 +72,7 @@ async fn placement_asks_holder() {
 }
 
 #[tokio::test]
-async fn blob_reads_ask_holder() {
+async fn reads_ask_holder() {
     let answer = serde_json::json!({
         "bucket": BUCKET, "key": PEER_KEY, "version_id": VERSION, "copies": [],
         "complete": true, "limits": [],
