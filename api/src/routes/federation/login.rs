@@ -129,6 +129,8 @@ sessions and other session kinds are refused, so a login cannot chain to a third
                 "description": "",
                 "api_url": "https://b.example.org/api/v1",
                 "portal_url": "https://b.example.org/",
+                "contact": null,
+                "login_providers": [],
                 "issued_at": 1791000000
             },
             "signer": "Realm",
@@ -405,10 +407,15 @@ mod tests {
             description: String::new(),
             api_url: Url::parse("https://b.example.org/api/v1").unwrap(),
             portal_url: Url::parse("https://b.example.org").unwrap(),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at: 10,
         };
         let settings = FederationSettings {
             name: descriptor.name.clone(),
+            description: String::new(),
+            contact: None,
+            login_providers: Vec::new(),
             api_url: descriptor.api_url.clone(),
             portal_url: descriptor.portal_url.clone(),
             registry_url: None,
@@ -557,6 +564,8 @@ mod tests {
             description: String::new(),
             api_url: Url::parse("https://a.example.org/api/v1").unwrap(),
             portal_url: Url::parse("https://a.example.org").unwrap(),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at: 1,
         };
         let request = || LoginHandoffRequest {

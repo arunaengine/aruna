@@ -18,6 +18,7 @@ use aruna_core::structs::execution::table::{
 };
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::RoutingError;
 use bytes::Bytes;
 use byteview::ByteView;
@@ -26,7 +27,7 @@ use futures_util::StreamExt;
 use super::limiter::retried;
 use super::manifest::{lasting_head, lasting_resolution, lasting_source};
 use super::walk::{
-    PageFailure, StagedFile, access_rules, commit_rows, coordinated, import_page, own_ranges,
+    PageFailure, StagedFile, access_rules, commit_rows, import_page, key_turns, own_ranges,
     record_failure, source_permission_path,
 };
 use super::{ItemFailure, pinned_bucket, queue_key};
@@ -47,12 +48,23 @@ use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
+use crate::staging::page::rows::MAX_PAGE_ENTRIES;
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 
 /// Directories the queue holds before the table is read further.
 pub(super) const QUEUE_PAUSE: u64 = 1024;
 /// Rows one step maps, so one page and its HEADs stay bounded.
 const STEP_ROWS: usize = 1000;
+/// Table bytes one step of record rows reads; they need no HEAD, so their pages are larger.
+const RECORD_WINDOW: usize = 4 << 20;
+
+/// The rows one step maps and the table bytes it reads for them.
+fn step_size(import: &TableImport) -> (usize, usize) {
+    match import.rows.kind {
+        RowKind::Record => (MAX_PAGE_ENTRIES, RECORD_WINDOW),
+        RowKind::File | RowKind::Folder => (STEP_ROWS, TABLE_CHUNK),
+    }
+}
 
 /// Whether the job reads its table next: the table is open, no directory is being listed
 /// and the queue has room.
@@ -158,9 +170,10 @@ pub(super) async fn read_table_chunk(
     let (mut rows, mut used) =
         parse_rows(&import.format, width, &chunk.bytes, chunk.complete).map_err(permanent)?;
     let mut complete = chunk.complete;
-    if rows.len() > STEP_ROWS {
-        used = rows[STEP_ROWS - 1].1;
-        rows.truncate(STEP_ROWS);
+    let (step_rows, _) = step_size(import);
+    if rows.len() > step_rows {
+        used = rows[step_rows - 1].1;
+        rows.truncate(step_rows);
         complete = false;
     }
     let mut entries = Vec::new();
@@ -289,7 +302,7 @@ async fn connector_chunk(
                 let stream = open_source(ctx, spec, path, observation, None).await?;
                 Ok((stream, None))
             };
-            let (bytes, complete, _) = gzip_chunk(kept, at, open).await?;
+            let (bytes, complete, _) = gzip_chunk(kept, at, step_size(import).1, open).await?;
             read.gzip = Some(true);
             return Ok(Chunk {
                 bytes,
@@ -297,7 +310,7 @@ async fn connector_chunk(
                 read,
             });
         }
-        let end = (read.offset + TABLE_CHUNK as u64).min(length);
+        let end = (read.offset + step_size(import).1 as u64).min(length);
         if read.offset >= end {
             return Ok(Chunk {
                 bytes: Vec::new(),
@@ -405,7 +418,7 @@ async fn object_chunk(
                 Ok((found.blob, found.resolved_version_id.or(found.version_id)))
             };
             let at = (version_id, None, read.offset);
-            let (bytes, complete, opened) = gzip_chunk(kept, at, open).await?;
+            let (bytes, complete, opened) = gzip_chunk(kept, at, step_size(import).1, open).await?;
             read.version_id = read.version_id.or(opened);
             read.gzip = Some(true);
             return Ok(Chunk {
@@ -417,7 +430,7 @@ async fn object_chunk(
         let start = read.offset;
         let range = Some(ObjectRangeRequest::StartEnd {
             start,
-            end: start + TABLE_CHUNK as u64 - 1,
+            end: start + step_size(import).1 as u64 - 1,
         });
         let input = input(read.version_id, range);
         let result = match get_object_routed(&ctx.driver, input, restrictions()).await {
@@ -472,12 +485,14 @@ async fn collect(
     Ok(bytes)
 }
 
-/// The decompressed chunk at `at`, a version, an observation and an offset, decoded on from the
-/// stream an earlier step of this run left open there; a new stream from `open` decodes from the
-/// start and skips to the offset once. Returns the version the stream opened, if it opened one.
+/// The decompressed chunk of at most `window` bytes at `at`, a version, an observation and an
+/// offset, decoded on from the stream an earlier step of this run left open there; a new stream
+/// from `open` decodes from the start and skips to the offset once. Returns the version the
+/// stream opened, if it opened one.
 async fn gzip_chunk<F, Opening>(
     kept: &mut Option<GzipStream>,
     (version_id, observation, offset): (Option<ulid::Ulid>, Option<SourceMetadata>, u64),
+    window: usize,
     mut open: F,
 ) -> Result<(Vec<u8>, bool, Option<ulid::Ulid>), ChunkFailure>
 where
@@ -499,7 +514,7 @@ where
                     version_id: version_id.or(version),
                     observation: observation.clone(),
                     stream,
-                    cursor: GzipCursor::new(offset, TABLE_CHUNK),
+                    cursor: GzipCursor::new(offset, window),
                 }
             }
         };
@@ -593,7 +608,9 @@ async fn empty_objects(
 ) -> Result<(), PageFailure> {
     let bucket = pinned_bucket(ctx, spec).await.map_err(page_failure)?;
     let rules = access_rules(ctx, spec).await.map_err(PageFailure::Retry)?;
-    for entry in entries {
+    let keys: Vec<&str> = entries.iter().map(|entry| entry.target.as_str()).collect();
+    let turns = key_turns(ctx, &bucket, &keys).await;
+    for (entry, turn) in entries.iter().zip(turns.map_err(PageFailure::Retry)?) {
         let target = object_permission_path(
             spec.auth_context.realm_id,
             spec.group_id,
@@ -605,10 +622,11 @@ async fn empty_objects(
             record_failure(next, "", &entry.target, "permission denied".to_string());
             continue;
         }
-        let own = coordinated(ctx, &bucket, &[entry.target.as_str()]).await;
-        if own.map_err(PageFailure::Retry)?.first() != Some(&true) {
+        let Some(turn) = turn else {
             continue;
-        }
+        };
+        // Pages of other jobs into the key's range wait instead of conflicting with the put.
+        let _turn = ctx.range_turns.take(&turn).await;
         match Box::pin(put_folder(
             ctx,
             spec,
@@ -618,7 +636,10 @@ async fn empty_objects(
         ))
         .await
         {
-            Ok(()) => {}
+            Ok(()) => {
+                next.items_current = next.items_current.saturating_add(1);
+                next.items_succeeded = next.items_succeeded.saturating_add(1);
+            }
             Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
                 record_failure(next, "", &entry.target, message)
             }
@@ -666,8 +687,9 @@ async fn folder_rows(
             );
             continue;
         }
-        let own = coordinated(ctx, &bucket, &[prefix.as_str()]).await;
-        if own.map_err(PageFailure::Retry)?.first() == Some(&true) {
+        let turn = key_turns(ctx, &bucket, &[prefix.as_str()]).await;
+        if let Some(Some(turn)) = turn.map_err(PageFailure::Retry)?.pop() {
+            let _turn = ctx.range_turns.take(&turn).await;
             match Box::pin(put_folder(ctx, spec, &bucket, &prefix, &entry.metadata)).await {
                 Ok(()) => {}
                 Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
@@ -749,7 +771,8 @@ async fn put_folder(
     .await
 }
 
-/// Writes `body` at `key` through the ordinary put, as the submitter, and queues its replication.
+/// Writes `body` at `key` through the ordinary put, as the submitter, and queues its replication;
+/// the version's origin is the job's import, like the references of its other rows.
 async fn write_object(
     ctx: &JobContext,
     spec: &StagingJobSpec,
@@ -792,6 +815,9 @@ async fn write_object(
         routing,
     })
     .with_bucket_guard(bucket.clone())
+    .with_version_origin(Some(VersionOrigin::Source {
+        job_id: Some(ctx.job_id.as_ulid()),
+    }))
     .with_restrictions(auth.path_restrictions.clone())
     .with_metadata(metadata.clone().into_iter().collect::<HashMap<_, _>>());
     if let Some(gate) = gate {

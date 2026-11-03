@@ -1558,6 +1558,7 @@ async fn snapshot_blob(
     let result = stage_snapshot_blob(
         &state.get_ctx(),
         MaterializeSnapshotInput {
+            job_id: None,
             group_id,
             user_id: auth.user_id,
             realm_id: state.get_realm_id(),
@@ -1625,6 +1626,7 @@ async fn reference_blob(
     let result = stage_reference_blob(
         &state.get_ctx(),
         MaterializeReferenceInput {
+            job_id: None,
             group_id,
             user_id: auth.user_id,
             realm_id: state.get_realm_id(),

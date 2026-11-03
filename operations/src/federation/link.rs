@@ -88,7 +88,7 @@ fn config_read(auth: &AuthContext) -> (String, ByteView) {
 
 /// An unrestricted portal session of a local account whose primary login was at most
 /// `MAX_LINK_SECS` ago; renewals keep that time and child sessions have none.
-fn fresh_local(auth: &AuthContext, auth_time: Option<u64>, now: u64) -> bool {
+pub fn fresh_local(auth: &AuthContext, auth_time: Option<u64>, now: u64) -> bool {
     let portal = auth.session.as_ref().map(|session| session.kind) == Some(SessionKind::Portal);
     portal
         && auth.path_restrictions.is_none()
@@ -342,6 +342,7 @@ impl LinkLoginOperation {
                 issued_at: payload.foreign_issued_at,
                 now: config.now,
             }),
+            subject: None,
         }
     }
 }
@@ -490,6 +491,7 @@ impl UnlinkLoginOperation {
             remove_attributes: Vec::new(),
             system: true,
             alias: Some(AliasChange::Remove(config.alias)),
+            subject: None,
         }));
         let effects = update.update.start();
         self.state = UnlinkState::Update(update);
@@ -652,6 +654,8 @@ mod tests {
             description: String::new(),
             api_url: Url::parse("https://b.example.org/api/v1").unwrap(),
             portal_url: Url::parse("https://b.example.org/").unwrap(),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at: 1,
         };
         Signed::sign(descriptor, &capabilities()).unwrap()
@@ -731,6 +735,9 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
         config.federation = Some(FederationSettings {
             name: "B".to_string(),
+            description: String::new(),
+            contact: None,
+            login_providers: Vec::new(),
             api_url: descriptor.payload.api_url.clone(),
             portal_url: descriptor.payload.portal_url.clone(),
             registry_url: None,

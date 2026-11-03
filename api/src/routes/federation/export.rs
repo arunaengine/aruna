@@ -150,7 +150,7 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
     request_body(
         content = FederatedExportRequest,
         example = json!({
-            "descriptor": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "name": "B", "description": "", "api_url": "https://b.example.org/api/v1", "portal_url": "https://b.example.org/", "issued_at": 1791000000 }, "signer": "Realm", "signature": "<hex>" },
+            "descriptor": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "name": "B", "description": "", "api_url": "https://b.example.org/api/v1", "portal_url": "https://b.example.org/", "contact": null, "login_providers": [], "issued_at": 1791000000 }, "signer": "Realm", "signature": "<hex>" },
             "intent": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "descriptor_digest": "<hex>", "principal": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "destination": { "group_id": "<group id>", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "<ulid>" }, "signer": "Realm", "signature": "<hex>" },
             "document_id": "01JD0C0123456789ABCDEFGHJK",
             "files": ["data/reads.fastq"]
@@ -384,7 +384,7 @@ that owns the job.
     request_body(
         content = PushExportRequest,
         example = json!({
-            "descriptor": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "name": "B", "description": "", "api_url": "https://b.example.org/api/v1", "portal_url": "https://b.example.org/", "issued_at": 1791000000 }, "signer": "Realm", "signature": "<hex>" },
+            "descriptor": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "name": "B", "description": "", "api_url": "https://b.example.org/api/v1", "portal_url": "https://b.example.org/", "contact": null, "login_providers": [], "issued_at": 1791000000 }, "signer": "Realm", "signature": "<hex>" },
             "intent": { "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "descriptor_digest": "<hex>", "principal": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "destination": { "group_id": "<group id>", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "<ulid>" }, "signer": "Realm", "signature": "<hex>" }
         })
     ),

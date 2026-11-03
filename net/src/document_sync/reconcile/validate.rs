@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::user::validation::{DEACTIVATED_ATTRIBUTE, SERVICE_GROUP_ATTRIBUTE};
+use aruna_core::user::validation::{
+    DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, SERVICE_GROUP_ATTRIBUTE,
+};
 
 impl ConfigValidationCache {
     pub(in crate::document_sync) fn invalidate(&mut self) {
@@ -246,6 +248,61 @@ fn report_participation(
     }
 }
 
+/// Admits a new merge coordinator only from the current one, so the old coordinator stops before
+/// the new one starts. A realm without one, or whose coordinator left management, may name one.
+fn merge_handoff(
+    config: Option<&RealmConfigDocument>,
+    previous_state: Option<&AdminDocumentState>,
+    event: &AdminDocumentEvent,
+    node_id: &NodeId,
+) -> AdminEventValidation {
+    let Some(config) = config else {
+        return AdminEventValidation::Deferred {
+            dependency: Some(DocumentSyncDependency::RealmConfig(config_realm(event))),
+            reason: "current realm config is unavailable".to_string(),
+        };
+    };
+    let management = |node: &NodeId| {
+        matches!(
+            configured_node_kind(config, node),
+            Some(RealmNodeKind::Management)
+        )
+    };
+    if !management(&event.origin_node_id) || !management(node_id) {
+        return AdminEventValidation::Rejected(
+            "a merge coordinator is named by and among management nodes".to_string(),
+        );
+    }
+    let pinned = previous_state.and_then(AdminDocumentState::materialized_merge_coordinator);
+    let left = |pinned: &NodeId| {
+        previous_state.is_some_and(|state| state.removed_config_nodes().contains(pinned))
+            || configured_node_kind(config, pinned)
+                .is_some_and(|kind| *kind != RealmNodeKind::Management)
+    };
+    match pinned {
+        None => AdminEventValidation::Accepted,
+        Some(pinned) if pinned == event.origin_node_id || left(&pinned) => {
+            AdminEventValidation::Accepted
+        }
+        Some(pinned) if configured_node_kind(config, &pinned).is_none() => {
+            AdminEventValidation::Deferred {
+                dependency: Some(DocumentSyncDependency::RealmConfig(config_realm(event))),
+                reason: "the current merge coordinator is not known here yet".to_string(),
+            }
+        }
+        Some(_) => AdminEventValidation::Rejected(
+            "only the current merge coordinator hands the role on".to_string(),
+        ),
+    }
+}
+
+fn config_realm(event: &AdminDocumentEvent) -> RealmId {
+    match event.target {
+        AdminDocumentTarget::RealmConfig { realm_id } => realm_id,
+        _ => event.actor.realm_id,
+    }
+}
+
 pub(in crate::document_sync) fn validate_config_authority(
     current_config: Option<&RealmConfigDocument>,
     event: &AdminDocumentEvent,
@@ -292,6 +349,14 @@ pub(in crate::document_sync) fn validate_config_authority(
             });
         }
         return Ok(AdminEventValidation::Accepted);
+    }
+    if let AdminDocumentOperation::MergeCoordinatorSet { node_id } = &event.op {
+        return Ok(merge_handoff(
+            current_config,
+            previous_state,
+            event,
+            node_id,
+        ));
     }
     // Placement reducer state precedes config materialization; only band and
     // handle checks consult it, so the overlay is not paid for every op.
@@ -547,6 +612,20 @@ pub(in crate::document_sync) async fn validate_user_authority(
         ));
     }
 
+    // Merge pointers move logins between accounts, so only a management node's merge sets them,
+    // never a self-service or other attribute change.
+    let merge_key = match &event.op {
+        AdminDocumentOperation::UserAttributeSet { key, .. }
+        | AdminDocumentOperation::UserAttributeRemoved { key } => {
+            key == MERGED_INTO_ATTRIBUTE || key.starts_with(MERGED_PREFIX)
+        }
+        _ => false,
+    };
+    if merge_key && !matches!(origin_kind, RealmNodeKind::Management) {
+        return Ok(AdminEventValidation::Rejected(
+            "merge attributes come only from a management node's merge".to_string(),
+        ));
+    }
     let self_service = event.actor.user_id == user_id;
     // Only the account owner links a login; the owner or a realm administrator unlinks it.
     let alias = matches!(
@@ -856,6 +935,20 @@ pub(in crate::document_sync) async fn validate_group_authority(
         return Ok(AdminEventValidation::Rejected(
             "stored authorization identity does not match the group".to_string(),
         ));
+    }
+    // An account merge hands each role of the merged account to the surviving account; only a
+    // management node merges, after both accounts proved a fresh login.
+    if let AdminDocumentOperation::GroupAssignmentAdded { role_id, .. } = &event.op
+        && matches!(
+            configured_node_kind(&config, &event.origin_node_id),
+            Some(RealmNodeKind::Management)
+        )
+        && group_auth
+            .roles
+            .get(role_id)
+            .is_some_and(|role| role.assigned_users.contains(&event.actor.user_id))
+    {
+        return Ok(AdminEventValidation::Accepted);
     }
     // Any one of these paths carries the authority; a rename is also open to a
     // realm administrator who is not a member of the group.
@@ -1716,6 +1809,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::ConfigReplicasSet { .. }
         | AdminDocumentOperation::NodeNameSet { .. }
         | AdminDocumentOperation::NodePlaceSet { .. }
+        | AdminDocumentOperation::MergeCoordinatorSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
         AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
     };

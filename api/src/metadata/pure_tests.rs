@@ -221,3 +221,21 @@ fn create_accepts_message() {
     };
     assert_eq!(request.message.as_deref(), Some("Add run 42"));
 }
+
+#[test]
+fn create_names_field() {
+    // A refused body names the field it lacks, for the form its fields select.
+    let parse = |body| serde_json::from_value::<CreateMetadataRequest>(body).unwrap_err();
+    let scaffold = parse(json!({
+        "group_id": "01JABCDEF0123456789ABCDEFG",
+        "path": "datasets/run-42",
+        "name": "Run 42",
+        "description": "LC-MS run"
+    }));
+    assert!(
+        scaffold.to_string().contains("date_published"),
+        "{scaffold}"
+    );
+    let rocrate = parse(json!({ "path": "datasets/run-42", "rocrate": {} }));
+    assert!(rocrate.to_string().contains("group_id"), "{rocrate}");
+}

@@ -13,6 +13,12 @@ pub const RESERVED_PREFIX: &str = "aruna-engine.org/";
 pub const DEACTIVATED_ATTRIBUTE: &str = "aruna-engine.org/deactivated";
 /// Group that owns a service account.
 pub const SERVICE_GROUP_ATTRIBUTE: &str = "aruna-engine.org/service-group";
+/// The account a merged account was merged into; set together with deactivation.
+pub const MERGED_INTO_ATTRIBUTE: &str = "aruna-engine.org/merged-into";
+/// Prefix of one attribute per secondary account a primary account absorbed, keyed by its ulid.
+pub const MERGED_PREFIX: &str = "aruna-engine.org/merged.";
+/// Hex BLAKE3 of the lowercased email the issuer marked verified at registration.
+pub const EMAIL_HASH_ATTRIBUTE: &str = "aruna-engine.org/email-hash";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum UserAttributeError {
@@ -22,6 +28,13 @@ pub enum UserAttributeError {
     InvalidValue(String),
     #[error("too many user attributes")]
     TooManyAttributes,
+}
+
+/// The stored form of a verified email: hex BLAKE3 of the trimmed, lowercased address.
+pub fn email_hash(email: &str) -> String {
+    blake3::hash(email.trim().to_lowercase().as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 pub fn is_reserved_attribute(key: &str) -> bool {
@@ -52,6 +65,14 @@ pub fn validate_attribute_value(key: &str, value: &str) -> Result<(), UserAttrib
     }
 
     Ok(())
+}
+
+/// Attributes that count towards [`MAX_USER_ATTRIBUTES`]: those a user sets. Reserved ones are
+/// set by Aruna alone, among them one per merged account, which has no limit.
+pub fn counted_attributes<'a>(keys: impl IntoIterator<Item = &'a String>) -> usize {
+    keys.into_iter()
+        .filter(|key| !is_reserved_attribute(key))
+        .count()
 }
 
 pub fn validate_attribute_count(count: usize) -> Result<(), UserAttributeError> {
@@ -133,6 +154,11 @@ mod tests {
     #[test]
     fn user_attribute_limit() {
         assert_eq!(validate_attribute_count(MAX_USER_ATTRIBUTES), Ok(()));
+        let reserved = (0..MAX_USER_ATTRIBUTES + 5)
+            .map(|index| format!("{}{index}", super::MERGED_PREFIX))
+            .chain(["orcid".to_string()])
+            .collect::<Vec<_>>();
+        assert_eq!(super::counted_attributes(&reserved), 1);
         assert_eq!(
             validate_attribute_count(MAX_USER_ATTRIBUTES + 1),
             Err(UserAttributeError::TooManyAttributes)

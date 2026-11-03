@@ -14,7 +14,7 @@ use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
-    OriginProjection, OriginVersion, SyncHop, VersionOrigin,
+    OriginProjection, OriginVersion, SyncHop, UploadClient, VersionOrigin,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_operations::distribution::guard::{
@@ -24,7 +24,7 @@ use aruna_operations::distribution::resolve::{
     GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version,
 };
 use aruna_operations::s3::bucket::sources::{FileSource, bucket_sources};
-use aruna_operations::s3::object::origin::{OriginError, OriginView, read_origin};
+use aruna_operations::s3::object::origin::{OriginError, OriginView, bucket_runs, read_origin};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
@@ -66,6 +66,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_origin))
         .routes(routes!(get_version_origin))
         .routes(routes!(get_sources))
+        .routes(routes!(get_bucket_runs))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -76,7 +77,8 @@ pub struct OriginParams {
     pub version_id: Option<Ulid>,
 }
 
-/// How a version's content got into its bucket.
+/// How a version's content got into its bucket. `job_id` is the system job that wrote it,
+/// `null` when no job did.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OriginBody {
@@ -84,15 +86,48 @@ pub enum OriginBody {
     Upload {
         node_id: String,
         device: Option<String>,
+        /// The client the upload came through; `null` when not recorded.
+        client: Option<UploadClientBody>,
     },
     /// From an external source; details are under `source`.
-    Source,
+    Source { job_id: Option<String> },
     /// Copied from another exact version (global id or versioned node ARN as w3id).
-    Copy { from: String },
+    Copy {
+        from: String,
+        job_id: Option<String>,
+    },
     /// Registered in place from a storage backend folder.
-    Storage { backend_id: String, key: String },
+    Storage {
+        backend_id: String,
+        key: String,
+        job_id: Option<String>,
+    },
     /// Written by a compute job.
-    Job { run_id: String },
+    Job {
+        run_id: String,
+        /// The user who submitted the job; `null` when the system started it.
+        started_by: Option<String>,
+    },
+}
+
+/// `portal`: S3 signed with a temporary session, which only the portal requests; `s3`: S3
+/// signed with an access key; `device`: published by a desktop device.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadClientBody {
+    Portal,
+    S3,
+    Device,
+}
+
+impl From<UploadClient> for UploadClientBody {
+    fn from(client: UploadClient) -> Self {
+        match client {
+            UploadClient::Portal => Self::Portal,
+            UploadClient::S3 => Self::S3,
+            UploadClient::Device => Self::Device,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -131,6 +166,8 @@ pub struct SourcePlaceBody {
     pub path: String,
     /// The connector of this node the source reads through; absent for a public source.
     pub connector_id: Option<String>,
+    /// The connector's display name, read now; `null` when this node does not hold it.
+    pub connector_name: Option<String>,
 }
 
 /// One statement a dataset may add when this file joins it.
@@ -226,20 +263,34 @@ impl From<OriginView> for OriginResponse {
             created_by: view.created_by.to_string(),
             created_at: view.created_at.into(),
             origin: view.origin.map(|origin| match origin {
-                VersionOrigin::Upload { node_id, device } => OriginBody::Upload {
+                VersionOrigin::Upload {
+                    node_id,
+                    device,
+                    client,
+                } => OriginBody::Upload {
                     node_id: node_id.to_string(),
                     device,
+                    client: client.map(Into::into),
                 },
-                VersionOrigin::Source => OriginBody::Source,
-                VersionOrigin::Copy { from } => OriginBody::Copy {
+                VersionOrigin::Source { job_id } => OriginBody::Source {
+                    job_id: job_id.as_ref().map(Ulid::to_string),
+                },
+                VersionOrigin::Copy { from, job_id } => OriginBody::Copy {
                     from: version_id(&from),
+                    job_id: job_id.as_ref().map(Ulid::to_string),
                 },
-                VersionOrigin::Storage { backend_id, key } => OriginBody::Storage {
+                VersionOrigin::Storage {
+                    backend_id,
+                    key,
+                    job_id,
+                } => OriginBody::Storage {
                     backend_id: backend_id.to_string(),
                     key,
+                    job_id: job_id.as_ref().map(Ulid::to_string),
                 },
-                VersionOrigin::Job { run_id } => OriginBody::Job {
+                VersionOrigin::Job { run_id, started_by } => OriginBody::Job {
                     run_id: run_id.to_string(),
+                    started_by: started_by.as_ref().map(ToString::to_string),
                 },
             }),
             hop: view.hop.map(
@@ -279,6 +330,7 @@ impl From<OriginView> for OriginResponse {
                         url: place.url,
                         path: place.path,
                         connector_id: place.connector_id.map(|id| id.to_string()),
+                        connector_name: place.connector_name,
                     })
                     .collect(),
             }),
@@ -319,7 +371,10 @@ impl From<OriginView> for OriginResponse {
 - The origin is set by the server when the version is minted and never changes; members of a
   distributed bucket hold the same origin. A sync destination keeps the source's origin and
   adds a hop naming the relationship and the exact source version.
-- Readers of the file see the full record, including the uploader, node and device.
+- Readers of the file see the full record, including the uploader, node, device and upload
+  client, the system job that wrote the version (`job_id`), who submitted a compute job
+  (`started_by`), and the display name of each source's connector (`connector_name`).
+  Credentials and connector settings are never part of it.
 - `projection` is what datasets receive: `isBasedOn` the source URL, the copied version or
   the synced source version when it is a version of a distributed bucket (a node ARN names
   its bucket and key, so it is left out); `CreateAction` for job results; nothing for
@@ -348,7 +403,7 @@ impl From<OriginView> for OriginResponse {
             "global_id": null,
             "created_by": "01K8Z1C0RAT0R0000000000000",
             "created_at": "2026-08-20T10:12:00Z",
-            "origin": {"kind": "copy", "from": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13"},
+            "origin": {"kind": "copy", "from": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13", "job_id": "01K8W0J0B000000000000000AA"},
             "hop": null,
             "source": null,
             "projection": [{"property": "isBasedOn", "id": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13"}],
@@ -588,7 +643,7 @@ pub struct VersionOriginParams {
             "global_id": "https://w3id.org/aruna/data/k3V9xQ2mT7aLd0RpYc8WnHfJ5uBsE1gZtO4iXvNq6Ay/01K8T6A2C4E6G8JKMPRSTVXZ13",
             "created_by": "01K8Z1C0RAT0R0000000000000",
             "created_at": "2026-08-20T10:12:00Z",
-            "origin": {"kind": "job", "run_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2"},
+            "origin": {"kind": "job", "run_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "started_by": "01K8Z1C0RAT0R0000000000000"},
             "hop": null,
             "source": null,
             "projection": [{"property": "CreateAction", "run_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2"}],
@@ -847,6 +902,94 @@ pub async fn get_sources(
             })
             .collect(),
         complete,
+    }))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct BucketRunsParams {
+    /// Only files whose key starts with this; empty or absent for the whole bucket.
+    #[serde(default)]
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BucketRunBody {
+    /// The job id of the run, as `GET /compute/runs/{run_id}` takes it.
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BucketRunsResponse {
+    pub runs: Vec<BucketRunBody>,
+    /// Every current file under the prefix was read and no run was left out.
+    pub complete: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/buckets/{bucket}/runs",
+    tag = "data/storage",
+    summary = "List the runs that wrote a bucket's files",
+    description = r#"Lists the compute runs whose results are current files of the bucket under a prefix, as their origins record them.
+
+**Authentication**: realm bearer token with READ on the bucket, or on the prefix it lists.
+Without a token, READ granted by public roles applies, and a refusal answers 401.
+
+**Behavior**
+- Asked on a node that holds the bucket; another node answers 404. A distributed bucket is
+  answered from the ranges this node holds, so `complete` is false for it.
+- Runs are newest first. Files that a later upload replaced count no more.
+
+**Limits**
+- At most 5000 current files are read and at most 50 runs named; `complete` is false when
+  either limit cut the answer."#,
+    params(
+        ("bucket" = String, Path, description = "Bucket name on this node"),
+        BucketRunsParams
+    ),
+    responses(
+        (status = 200, description = "The runs that wrote current files under the prefix", body = BucketRunsResponse, example = json!({
+            "runs": [{ "run_id": "01JJRSTVWXYZ0123456789ABCD" }],
+            "complete": true
+        })),
+        (status = 401, description = "Invalid bearer token, or no public READ without one", body = ErrorResponse),
+        (status = 403, description = "No READ on the bucket or the prefix", body = ErrorResponse),
+        (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ())
+)]
+pub async fn get_bucket_runs(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(bucket): Path<String>,
+    Query(params): Query<BucketRunsParams>,
+) -> ServerResult<Json<BucketRunsResponse>> {
+    // Signed out, only public roles grant READ, and a refusal hides whether the bucket exists.
+    let signed_out = auth.is_none();
+    let auth = auth.unwrap_or_else(|| AuthContext::anonymous(state.get_realm_id()));
+    let auth = require_realm_auth(&state, Some(auth))?;
+    let hidden = |error| match error {
+        ServerError::NotFound | ServerError::Forbidden if signed_out => ServerError::Unauthorized,
+        error => error,
+    };
+    let info = bucket_info(&state, &bucket).await.map_err(hidden)?;
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let path = match params.prefix.is_empty() {
+        true => bucket_permission_path(realm_id, info.group_id, node_id, &bucket),
+        false => object_permission_path(realm_id, info.group_id, node_id, &bucket, &params.prefix),
+    };
+    ensure_permission(&state, &auth, path, Permission::READ)
+        .await
+        .map_err(hidden)?;
+    let found = bucket_runs(state.get_ctx().as_ref(), &bucket, &params.prefix)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let runs = found.run_ids.iter().map(|run_id| BucketRunBody {
+        run_id: run_id.to_string(),
+    });
+    Ok(Json(BucketRunsResponse {
+        runs: runs.collect(),
+        complete: found.complete && info.distribution.is_none(),
     }))
 }
 

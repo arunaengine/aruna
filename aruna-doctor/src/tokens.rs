@@ -153,6 +153,8 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
             subject_id: onboarding_secret.enrollment_id.to_string(),
             name: "local-admin".to_string(),
             user_id,
+            email_hash: None,
+            create_new: false,
         }),
         &driver_ctx,
     )
@@ -332,6 +334,7 @@ async fn exchange_oidc_token(
         .bearer_auth(oidc_token)
         .json(&RegisterUserRequest {
             onboarding_secret: None,
+            create_new: false,
         })
         .send()
         .await?
@@ -362,6 +365,7 @@ async fn exchange_bootstrap_token(
         .bearer_auth(oidc_token)
         .json(&RegisterUserRequest {
             onboarding_secret: Some(onboarding_secret),
+            create_new: false,
         })
         .send()
         .await?

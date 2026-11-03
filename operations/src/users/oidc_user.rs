@@ -9,7 +9,7 @@ use aruna_core::admin_documents::{
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
 };
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -23,6 +23,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, TxnId};
+use aruna_core::user::validation::EMAIL_HASH_ATTRIBUTE;
 use aruna_core::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -42,7 +43,14 @@ pub struct ResolveOidcInput {
     pub subject_id: String,
     pub name: String,
     pub user_id: UserId,
+    /// Hash of the email the issuer marked verified; only such an identity hears of a match.
+    pub email_hash: Option<String>,
+    /// The person chose a new account although an existing one may be theirs.
+    pub create_new: bool,
 }
+
+/// Users read per page while looking for an account a new identity may belong to.
+const MATCH_PAGE: usize = 256;
 
 #[derive(Debug, PartialEq)]
 pub struct ResolveOidcOperation {
@@ -62,6 +70,9 @@ enum ResolveOidcState {
         txn_id: TxnId,
     },
     ReadExistingUser {
+        txn_id: TxnId,
+    },
+    ScanUsers {
         txn_id: TxnId,
     },
     WriteDocumentRevision {
@@ -106,6 +117,8 @@ pub enum ResolveOidcError {
     PlacementFenced,
     #[error("registration did not finish")]
     NotFinished,
+    #[error("an account with this email or name already exists")]
+    MatchPending,
 }
 
 impl ResolveOidcOperation {
@@ -201,10 +214,54 @@ impl ResolveOidcOperation {
 
         match subject_value.clone() {
             Some(value) => self.read_existing(txn_id, value),
-            None => match self.emit_create_user(txn_id) {
-                Ok(effects) => effects,
-                Err(err) => self.fail(err),
-            },
+            None if self.input.email_hash.is_some() && !self.input.create_new => {
+                self.scan_users(txn_id, None)
+            }
+            None => self.create_user(txn_id),
+        }
+    }
+
+    fn create_user(&mut self, txn_id: TxnId) -> Effects {
+        match self.emit_create_user(txn_id) {
+            Ok(effects) => effects,
+            Err(err) => self.fail(err),
+        }
+    }
+
+    /// Looks for an active account the new identity may belong to before creating one.
+    fn scan_users(&mut self, txn_id: TxnId, after: Option<ByteView>) -> Effects {
+        self.state = ResolveOidcState::ScanUsers { txn_id };
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: USER_KEYSPACE.to_string(),
+            prefix: None,
+            start: after.map(IterStart::After),
+            limit: MATCH_PAGE,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn accept_users(&mut self, event: Event, txn_id: TxnId) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.unexpected_event("Event::Storage(StorageEvent::IterResult)", got);
+        };
+        let email_hash = self.input.email_hash.clone().unwrap_or_default();
+        for (_, value) in values {
+            match User::from_bytes(&value) {
+                Ok(user) if may_match(&user, &self.input.name, &email_hash) => {
+                    return self.fail(ResolveOidcError::MatchPending);
+                }
+                Ok(_) => {}
+                Err(error) => return self.fail(error.into()),
+            }
+        }
+        match next_start_after {
+            Some(after) => self.scan_users(txn_id, Some(after)),
+            None => self.create_user(txn_id),
         }
     }
 
@@ -224,7 +281,12 @@ impl ResolveOidcOperation {
             name: self.input.name.clone(),
             subject_ids: vec![subject_id.clone()],
             alias_user_ids: Default::default(),
-            attributes: Default::default(),
+            attributes: self
+                .input
+                .email_hash
+                .iter()
+                .map(|hash| (EMAIL_HASH_ATTRIBUTE.to_string(), hash.clone()))
+                .collect(),
         };
 
         self.state = ResolveOidcState::WriteDocumentRevision {
@@ -463,6 +525,7 @@ impl Operation for ResolveOidcOperation {
                 self.accept_subject_write(event, txn_id, user)
             }
             ResolveOidcState::ReadExistingUser { txn_id } => self.accept_existing(event, txn_id),
+            ResolveOidcState::ScanUsers { txn_id } => self.accept_users(event, txn_id),
             ResolveOidcState::ReadBucketFence {
                 txn_id,
                 user,
@@ -495,6 +558,7 @@ impl Operation for ResolveOidcOperation {
         match self.state {
             ResolveOidcState::ReadSubjectIndex { txn_id }
             | ResolveOidcState::ReadExistingUser { txn_id }
+            | ResolveOidcState::ScanUsers { txn_id }
             | ResolveOidcState::WriteDocumentRevision { txn_id, .. }
             | ResolveOidcState::WriteSubjectIndex { txn_id, .. }
             | ResolveOidcState::ReadBucketFence { txn_id, .. } => {
@@ -505,18 +569,42 @@ impl Operation for ResolveOidcOperation {
     }
 }
 
+/// Whether an active personal account may be the person behind a new identity: the same
+/// verified email, or the same name where the directory shows it, so no private name is probed.
+fn may_match(user: &User, name: &str, email_hash: &str) -> bool {
+    if user.is_deactivated() || user.service_group().is_some() {
+        return false;
+    }
+    user.public_name_is(&name.trim().to_lowercase())
+        || user
+            .attributes
+            .get(EMAIL_HASH_ATTRIBUTE)
+            .map(String::as_str)
+            == Some(email_hash)
+}
+
 fn seed_admin_events(
     state: &mut AdminDocumentState,
     input: &ResolveOidcInput,
     subject_id: String,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
-    let mut events = Vec::with_capacity(2);
+    let mut events = Vec::with_capacity(3);
+    let email = input
+        .email_hash
+        .iter()
+        .map(|hash| AdminDocumentOperation::UserAttributeSet {
+            key: EMAIL_HASH_ATTRIBUTE.to_string(),
+            value: hash.clone(),
+        });
     for operation in [
         AdminDocumentOperation::UserNameSet {
             name: input.name.clone(),
         },
         AdminDocumentOperation::SubjectIdAdded { subject_id },
-    ] {
+    ]
+    .into_iter()
+    .chain(email)
+    {
         let event = state.apply_operation(&input.actor, operation)?;
         events.push(event);
     }
@@ -561,6 +649,30 @@ mod tests {
     use std::collections::BTreeSet;
     use ulid::Ulid;
 
+    #[test]
+    fn private_name_never_matches() {
+        // A chosen display name must not probe for a private name; a verified email still matches.
+        let realm_id = aruna_core::structs::identity::realm::RealmId([5u8; 32]);
+        let mut user = User {
+            user_id: UserId::local(Ulid::from_bytes([6u8; 16]), realm_id),
+            name: "Anna Smith".to_string(),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: [(
+                aruna_core::user::validation::EMAIL_HASH_ATTRIBUTE.to_string(),
+                "hash".to_string(),
+            )]
+            .into(),
+        };
+        assert!(super::may_match(&user, " anna smith ", "other"));
+        user.attributes.insert(
+            format!("{}name", aruna_core::user::profile::VISIBILITY_PREFIX),
+            "private".to_string(),
+        );
+        assert!(!super::may_match(&user, "Anna Smith", "other"));
+        assert!(super::may_match(&user, "Someone", "hash"));
+    }
+
     #[tokio::test]
     async fn creates_user_index() {
         let realm_id = aruna_core::structs::identity::realm::RealmId([3u8; 32]);
@@ -576,6 +688,8 @@ mod tests {
             subject_id: "subject-1".to_string(),
             name: "alice".to_string(),
             user_id,
+            email_hash: None,
+            create_new: false,
         });
         let expected_user = User {
             user_id,
@@ -764,6 +878,8 @@ mod tests {
             subject_id: "subject-3".to_string(),
             name: "carol".to_string(),
             user_id,
+            email_hash: None,
+            create_new: false,
         });
         let document_target = DocumentTarget::User { user_id };
 
@@ -839,6 +955,8 @@ mod tests {
             subject_id: "subject-2".to_string(),
             name: "ignored".to_string(),
             user_id: UserId::local(Ulid::generate(), realm_id),
+            email_hash: None,
+            create_new: false,
         });
 
         operation.start();

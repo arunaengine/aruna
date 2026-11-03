@@ -78,7 +78,9 @@ fn scopes_reach_releases() {
     assert_eq!(reach(&folder, "db/v6/"), Some("db/"));
     assert_eq!(reach(&folder, ""), Some("db/"));
     assert_eq!(reach(&folder, "dbx/"), None);
-    assert_eq!(reach(&bucket, ""), None);
+    // The whole bucket holds every release.
+    assert_eq!(reach(&bucket, ""), Some(""));
+    assert_eq!(reach(&bucket, "db/v6/"), Some(""));
 }
 
 #[test]

@@ -218,6 +218,7 @@ pub async fn create_link(
         false => remote_target(context, caller, &source).await?,
     };
     let write = ReferenceWrite {
+        job_id: None,
         preassigned_version_id: None,
         group_id,
         user_id: caller.auth.user_id,

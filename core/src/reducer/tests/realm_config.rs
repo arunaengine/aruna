@@ -705,10 +705,15 @@ fn federation_settings_materialize() {
         description: String::new(),
         api_url: url("https://api.example.org"),
         portal_url: url("https://portal.example.org"),
+        contact: None,
+        login_providers: Vec::new(),
         issued_at: 1,
     };
     let settings = FederationSettings {
         name: descriptor.name.clone(),
+        description: String::new(),
+        contact: None,
+        login_providers: Vec::new(),
         api_url: descriptor.api_url.clone(),
         portal_url: descriptor.portal_url.clone(),
         registry_url: None,
@@ -859,4 +864,30 @@ fn node_place_sets_clears() {
         .apply(&realm_config_event(3, node(1), 3, observed, cleared))
         .unwrap();
     assert!(state.materialized_node_places().is_empty());
+}
+
+#[test]
+fn merge_coordinator_pins() {
+    // A handoff that saw the pin replaces it; two concurrent pins name no coordinator at all.
+    let base = AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+        realm_id: realm_id(),
+    });
+    let pin = |node_id| AdminDocumentOperation::MergeCoordinatorSet { node_id };
+    let mut first = base.clone();
+    first
+        .apply_operation(&actor(node(1)), pin(node(1)))
+        .unwrap();
+    assert_eq!(first.materialized_merge_coordinator(), Some(node(1)));
+    let mut handed = first.clone();
+    handed
+        .apply_operation(&actor(node(1)), pin(node(2)))
+        .unwrap();
+    assert_eq!(handed.materialized_merge_coordinator(), Some(node(2)));
+
+    let mut second = base.clone();
+    let rival = second
+        .apply_operation(&actor(node(3)), pin(node(3)))
+        .unwrap();
+    first.apply(&rival).unwrap();
+    assert_eq!(first.materialized_merge_coordinator(), None);
 }

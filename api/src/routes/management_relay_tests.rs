@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    API_PREFIX, MANAGEMENT_URL_TTL, RELAYED_ROUTES, gateway_failed, healthy_first, may_try_next,
-    may_try_response, relay_route, relay_targets, relay_url, relayed_headers,
+    API_PREFIX, MANAGEMENT_URL_TTL, RELAYED_ROUTES, coordinated_route, gateway_failed,
+    healthy_first, may_try_next, may_try_response, relay_route, relay_targets, relay_url,
+    relayed_headers,
 };
 use crate::error::{ErrorResponse, ServerError};
 use axum::body::to_bytes;
@@ -78,6 +79,37 @@ fn hop_stops_relay() {
         ),
         None
     );
+}
+
+#[test]
+fn merge_goes_to_coordinator() {
+    // Every node, a management node too, passes a merge on; the coordinator answers a relayed one.
+    let route = Some("/api/v1/access/users/me/merge");
+    assert_eq!(
+        coordinated_route(&Method::POST, route, false),
+        Some("/access/users/me/merge")
+    );
+    assert_eq!(coordinated_route(&Method::POST, route, true), None);
+    assert_eq!(
+        coordinated_route(
+            &Method::PUT,
+            Some("/api/v1/system/realm/merge-coordinator"),
+            false
+        ),
+        Some("/system/realm/merge-coordinator")
+    );
+    assert!(
+        !RELAYED_ROUTES
+            .iter()
+            .any(|(_, path)| *path == "/access/users/me/merge")
+    );
+    // Attaching a sign-in runs where merges run, so it cannot race one on another node.
+    let attach = Some("/api/v1/access/users/me/subjects");
+    assert_eq!(
+        coordinated_route(&Method::POST, attach, false),
+        Some("/access/users/me/subjects")
+    );
+    assert_eq!(relay_route(&Method::POST, attach, false, false), None);
 }
 
 #[test]

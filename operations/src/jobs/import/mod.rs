@@ -44,6 +44,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::data::identity::{ObjectLocation, normalized_id};
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use bytes::Bytes;
 use byteview::ByteView;
@@ -965,7 +966,10 @@ async fn write_next(
     .with_bucket_guard(bucket_info)
     .create_only()
     .with_rocrate_limits(spec.limits.clone())
-    .with_restrictions(spec.auth_context.path_restrictions.clone());
+    .with_restrictions(spec.auth_context.path_restrictions.clone())
+    .with_version_origin(Some(VersionOrigin::Source {
+        job_id: Some(ctx.job_id.as_ulid()),
+    }));
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }

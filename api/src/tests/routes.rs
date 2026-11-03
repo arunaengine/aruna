@@ -142,3 +142,32 @@ pub(crate) async fn seed_group_docs(
     )
     .await;
 }
+
+/// Rewrites the group's authorization with one more role that lets Everyone READ `paths`.
+pub(crate) async fn open_paths(
+    context: &Arc<DriverContext>,
+    actor: &Actor,
+    group_id: Ulid,
+    paths: &[String],
+) {
+    use aruna_core::structs::identity::auth::{Permission, Role};
+    let (realm_id, owner) = (actor.realm_id, actor.user_id);
+    let mut document = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+    let role_id = Ulid::from_parts(7, 7);
+    let permissions = paths.iter().map(|path| (path.clone(), Permission::READ));
+    let role = Role {
+        role_id,
+        name: "public".to_string(),
+        permissions: permissions.collect(),
+        assigned_users: std::collections::HashSet::from([UserId::nil(realm_id)]),
+    };
+    document.roles.insert(role_id, role);
+    let value = document.to_bytes(actor).unwrap();
+    write_doc(
+        context,
+        AUTH_KEYSPACE,
+        group_id.to_bytes().into(),
+        value.into(),
+    )
+    .await;
+}

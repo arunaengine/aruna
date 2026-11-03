@@ -8,8 +8,8 @@ use crate::distribution::guard::{authority_read, authority_rows, write_epochs};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 use crate::replication::queue::schedule_blob_drain;
 use crate::staging::page::rows::{
-    MAX_PAGE_ENTRIES, PageGuards, check_guards, decode_heads, guard_reads, head_range, head_reads,
-    interval_heads, page_rows, version_reads,
+    MAX_PAGE_ENTRIES, PageGuards, PreparedRows, check_guards, decode_heads, guard_reads,
+    head_range, head_reads, interval_heads, page_rows, version_reads,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
@@ -37,6 +37,9 @@ pub struct PageImportOperation {
     usage: Option<UsageCounterUpdate>,
     result: Option<PageImportResult>,
     output: Option<Result<PageImportResult, PageImportError>>,
+    /// Only builds the rows, in a read snapshot, and keeps them in `prepared`.
+    prepare: bool,
+    prepared: Option<PreparedRows>,
 }
 
 impl PageImportOperation {
@@ -49,7 +52,15 @@ impl PageImportOperation {
             usage: None,
             result: None,
             output: None,
+            prepare: false,
+            prepared: None,
         }
+    }
+
+    /// Rows a [`PreparePageOperation`] built from the same input.
+    pub fn with_prepared(mut self, prepared: Option<PreparedRows>) -> Self {
+        self.prepared = prepared;
+        self
     }
 
     fn fail(&mut self, error: PageImportError) -> Effects {
@@ -132,7 +143,24 @@ impl PageImportOperation {
         versions: Vec<Option<BlobVersion>>,
     ) -> Result<Effects, PageImportError> {
         let guards = self.guards.as_ref().ok_or(PageImportError::NotFinished)?;
-        let rows = page_rows(&self.input, guards, versions)?;
+        let rows = match self.prepared.take() {
+            Some(prepared) if prepared.guards == *guards && prepared.versions == versions => {
+                prepared.rows
+            }
+            _ if self.prepare => {
+                let rows = page_rows(&self.input, guards, versions.clone())?;
+                self.result = Some(rows.result.clone());
+                let guards = guards.clone();
+                self.prepared = Some(PreparedRows {
+                    guards,
+                    versions,
+                    rows,
+                });
+                // The read snapshot ends without writes.
+                return Ok(self.commit(txn_id));
+            }
+            _ => page_rows(&self.input, guards, versions)?,
+        };
         if rows.result.registered > 0 {
             let usage = UsageCounterUpdate::for_group(self.input.group_id, rows.delta)
                 .in_bucket(&self.input.bucket, RowChange::Kept)
@@ -373,7 +401,7 @@ impl Operation for PageImportOperation {
         }
         self.state = PageImportState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
+            read: self.prepare
         })]
     }
 
@@ -403,6 +431,46 @@ impl Operation for PageImportOperation {
             }
             None => smallvec![],
         }
+    }
+}
+
+/// Builds a page's rows in a read snapshot ahead of the page's turn, so the turn only reads,
+/// compares and writes them.
+#[derive(Debug, PartialEq)]
+pub struct PreparePageOperation(PageImportOperation);
+
+impl PreparePageOperation {
+    pub fn new(input: PageImportInput) -> Self {
+        let mut page = PageImportOperation::new(input);
+        page.prepare = true;
+        Self(page)
+    }
+}
+
+impl Operation for PreparePageOperation {
+    type Output = PreparedRows;
+    type Error = PageImportError;
+
+    fn start(&mut self) -> Effects {
+        self.0.start()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.0.step(event)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.0.is_complete()
+    }
+
+    fn finalize(mut self) -> Result<Self::Output, Self::Error> {
+        let prepared = self.0.prepared.take();
+        self.0.finalize()?;
+        prepared.ok_or(PageImportError::NotFinished)
+    }
+
+    fn abort(&mut self) -> Effects {
+        self.0.abort()
     }
 }
 

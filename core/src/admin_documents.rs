@@ -414,6 +414,12 @@ pub enum AdminDocumentOperation {
         node_id: NodeId,
         place: Option<crate::structs::identity::realm::NodePlace>,
     },
+    /// Names the one management node that runs account merges. Only the named node hands the
+    /// role on, so two nodes never merge at once; a realm pins its first node when created.
+    #[serde(rename = "RealmConfigMergeCoordinatorSet")]
+    MergeCoordinatorSet {
+        node_id: NodeId,
+    },
 }
 
 impl AdminDocumentOperation {

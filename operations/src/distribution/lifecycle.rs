@@ -377,7 +377,8 @@ impl SetWork {
         }
         let delete =
             crate::s3::bucket::delete::DeleteBucketOperation::new(snapshot.config.bucket.clone())
-                .bound_to(binding.clone());
+                .bound_to(binding.clone())
+                .purge_notices(context.node_and_realm());
         match drive(delete, context.as_ref()).await {
             Ok(()) | Err(crate::s3::bucket::delete::DeleteBucketError::NotFound) => {
                 self.clear_set(context, (&snapshot.config.bucket, true, None), budget)

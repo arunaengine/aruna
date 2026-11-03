@@ -325,8 +325,29 @@ pub(in crate::document_sync) async fn user_batch(
         };
         if user.subject_ids.contains(subject_id) {
             claims.insert(user_id);
+            // Claims an earlier hand-over left with accounts merged into this one end here.
+            for other in claims.clone() {
+                if other != user_id
+                    && let Some(record) = read_user(storage, txn_id, other).await?
+                    && merge_root(storage, txn_id, &record, &user).await? == Some(user_id)
+                {
+                    claims.remove(&other);
+                }
+            }
         } else {
-            claims.remove(&user_id);
+            // A merged account hands the subject to the current root of its merges, so the
+            // subject never lacks an owner while the root's own addition is on its way. Until
+            // that root is known and lists the account, the account's claim stays.
+            match merge_root(storage, txn_id, &user, &user).await? {
+                Some(primary) => {
+                    claims.remove(&user_id);
+                    claims.insert(primary);
+                }
+                None if user.merged_into().is_some() => {}
+                None => {
+                    claims.remove(&user_id);
+                }
+            }
         }
 
         if let Some(canonical_user_id) = claims.first().copied() {
@@ -827,6 +848,7 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::NodeNameSet { .. }
             | AdminDocumentOperation::NodePlaceSet { .. }
             | AdminDocumentOperation::ConfigTokenRevoked { .. }
+            | AdminDocumentOperation::MergeCoordinatorSet { .. }
     )
 }
 
@@ -1249,6 +1271,53 @@ pub(in crate::document_sync) fn materialize_realm_role(
         },
     );
     overlay_realm_role(auth_doc, reducer_state, role.role_id);
+}
+
+/// The root of `user`'s merges: the end of its merge pointers, once that account exists in the
+/// same realm and lists `user` among its merged accounts. `None` while that is not shown, for
+/// an account that is not merged, and for pointers that loop. `applied` is the account the event
+/// being applied changes; it is read as just materialized, since its row is not written yet.
+async fn merge_root(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    user: &User,
+    applied: &User,
+) -> Result<Option<UserId>> {
+    let mut seen = BTreeSet::from([user.user_id]);
+    let mut current = user.clone();
+    while let Some(next) = current.merged_into() {
+        if next.realm_id != user.user_id.realm_id || !seen.insert(next) {
+            return Ok(None);
+        }
+        if next == applied.user_id {
+            current = applied.clone();
+            continue;
+        }
+        match read_user(storage, txn_id, next).await? {
+            Some(record) => current = record,
+            None => return Ok(None),
+        }
+    }
+    let root = current.user_id;
+    Ok((root != user.user_id && current.merged_user_ids().contains(&user.user_id)).then_some(root))
+}
+
+async fn read_user(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    user_id: UserId,
+) -> Result<Option<User>> {
+    transaction_read(
+        storage,
+        aruna_core::keyspaces::USER_KEYSPACE.to_string(),
+        user_id.to_bytes().into(),
+        Some(txn_id),
+    )
+    .await?
+    .map(|bytes| User::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))
+    .map(|user| user.filter(|user| user.user_id == user_id))
 }
 
 pub(in crate::document_sync) fn materialize_user_operation(

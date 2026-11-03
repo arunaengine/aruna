@@ -98,6 +98,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::UserUpdated { .. } => {
                 "Event::SubOperation(SubOperationEvent::UserUpdated)".to_string()
             }
+            SubOperationEvent::VaultHeld { .. } => {
+                "Event::SubOperation(SubOperationEvent::VaultHeld)".to_string()
+            }
             SubOperationEvent::KeyRequestsOpened { .. } => {
                 "Event::SubOperation(SubOperationEvent::KeyRequestsOpened)".to_string()
             }

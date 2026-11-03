@@ -1056,3 +1056,463 @@ async fn subject_remove_cleans() {
         None
     );
 }
+
+#[tokio::test]
+async fn merge_grant_needs_role() {
+    // A merge hands a role of the merged account on, only from a management node.
+    let realm_id = RealmId::from_bytes([62; 32]);
+    let group_id = Ulid::from_parts(1_640, 1);
+    let owner = UserId::local(Ulid::from_parts(1_641, 1), realm_id);
+    let merged = UserId::local(Ulid::from_parts(1_642, 1), realm_id);
+    let survivor = UserId::local(Ulid::from_parts(1_643, 1), realm_id);
+    let role_id = Ulid::from_parts(1_644, 1);
+    let actor = test_actor(12, merged, realm_id);
+    for (kind, holder, accepted) in [
+        (RealmNodeKind::Management, merged, true),
+        (RealmNodeKind::Server, merged, false),
+        (RealmNodeKind::Management, owner, false),
+    ] {
+        let (_dir, storage) = test_storage();
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, kind.clone());
+        let group = Group {
+            display_name: "Engineering".to_string(),
+            group_id,
+            realm_id,
+            owner,
+            roles: HashSet::from([role_id]),
+        };
+        let auth = GroupAuthorizationDocument {
+            group_id,
+            policies: Vec::new(),
+            roles: HashMap::from([(
+                role_id,
+                Role {
+                    role_id,
+                    name: "member".to_string(),
+                    permissions: HashMap::new(),
+                    assigned_users: HashSet::from([holder]),
+                },
+            )]),
+        };
+        let realm_auth = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::new(),
+            operation_restrictions: Default::default(),
+        };
+        batch_write_to(
+            &storage,
+            vec![
+                target_write_entry(
+                    DocumentTarget::RealmConfig { realm_id },
+                    config.to_bytes(&actor).expect("config serializes").into(),
+                ),
+                target_write_entry(
+                    DocumentTarget::RealmAuthorization { realm_id },
+                    realm_auth
+                        .to_bytes(&actor)
+                        .expect("realm auth serializes")
+                        .into(),
+                ),
+                target_write_entry(
+                    DocumentTarget::GroupAuthorization { group_id },
+                    auth.to_bytes(&actor).expect("auth serializes").into(),
+                ),
+                (
+                    GROUP_KEYSPACE.to_string(),
+                    group_id.to_bytes().into(),
+                    group.to_bytes(&actor).expect("group serializes").into(),
+                ),
+            ],
+        )
+        .await
+        .expect("fixture writes");
+        let grant = test_admin_event(
+            Ulid::from_parts(1_645, 1),
+            AdminDocumentTarget::Group { group_id },
+            &actor,
+            1,
+            AdminDocumentOperation::GroupAssignmentAdded {
+                role_id,
+                user_id: survivor,
+            },
+        );
+        let validation = validate_group_authority(&storage, &grant, None)
+            .await
+            .expect("validation runs");
+        assert_eq!(
+            matches!(validation, AdminEventValidation::Accepted),
+            accepted,
+            "{kind:?} with holder {holder}"
+        );
+    }
+}
+
+/// Seeds `merged` holding one subject and pointing at `primary`, with `primary` stored as given;
+/// then removes the subject and returns the account the index names.
+async fn hand_over_subject(
+    primary_lists: bool,
+    primary_realm: RealmId,
+) -> (UserId, UserId, Option<UserId>) {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([63; 32]);
+    let merged = UserId::local(Ulid::from_parts(1_650, 1), realm_id);
+    let primary = UserId::local(Ulid::from_parts(1_651, 1), primary_realm);
+    let actor = Actor {
+        node_id: node(9),
+        user_id: merged,
+        realm_id,
+    };
+    let record = User {
+        user_id: merged,
+        name: "Bob".to_string(),
+        subject_ids: vec!["subject-moved".to_string()],
+        alias_user_ids: Default::default(),
+        attributes: [(
+            aruna_core::user::validation::MERGED_INTO_ATTRIBUTE.to_string(),
+            primary.to_string(),
+        )]
+        .into(),
+    };
+    let mut primary_record = User {
+        user_id: primary,
+        name: "Alice".to_string(),
+        subject_ids: Vec::new(),
+        alias_user_ids: Default::default(),
+        attributes: Default::default(),
+    };
+    if primary_lists {
+        primary_record.attributes.insert(
+            format!(
+                "{}{}",
+                aruna_core::user::validation::MERGED_PREFIX,
+                merged.user_ulid
+            ),
+            merged.to_string(),
+        );
+    }
+    batch_write_to(
+        &storage,
+        vec![
+            (
+                USER_KEYSPACE.to_string(),
+                merged.to_bytes().into(),
+                record.to_bytes(&actor).expect("user serializes").into(),
+            ),
+            (
+                USER_KEYSPACE.to_string(),
+                primary.to_bytes().into(),
+                primary_record
+                    .to_bytes(&actor)
+                    .expect("user serializes")
+                    .into(),
+            ),
+            (
+                SUBJECT_INDEX_KEYSPACE.to_string(),
+                subject_index_key("subject-moved"),
+                subject_index_value(merged),
+            ),
+        ],
+    )
+    .await
+    .expect("users and index write");
+
+    let event = AdminDocumentEvent {
+        event_id: Ulid::from_parts(1_652, 1),
+        target: AdminDocumentTarget::User { user_id: merged },
+        origin_node_id: actor.node_id,
+        origin_seq: 1,
+        observed: AdminDocumentClock::default(),
+        actor,
+        op: AdminDocumentOperation::SubjectIdRemoved {
+            subject_id: "subject-moved".to_string(),
+        },
+    };
+    apply_user_operation(&storage, DocumentTarget::User { user_id: merged }, event)
+        .await
+        .expect("subject remove applies");
+    let owner = read_storage_value(
+        &storage,
+        SUBJECT_INDEX_KEYSPACE,
+        subject_index_key("subject-moved"),
+    )
+    .await
+    .map(|bytes| UserId::from_storage_key(&bytes).expect("index decodes"));
+    (merged, primary, owner)
+}
+
+#[tokio::test]
+async fn merged_removal_hands_subject() {
+    // The merged account's removal arrives before the primary's addition: the primary owns it.
+    let (_, primary, owner) = hand_over_subject(true, RealmId::from_bytes([63; 32])).await;
+    assert_eq!(owner, Some(primary));
+}
+
+#[tokio::test]
+async fn unverified_pointer_keeps_subject() {
+    // A pointer the primary does not confirm, or one into another realm, moves nothing.
+    for (lists, realm) in [(false, [63; 32]), (true, [65; 32])] {
+        let (merged, _, owner) = hand_over_subject(lists, RealmId::from_bytes(realm)).await;
+        assert_eq!(owner, Some(merged));
+    }
+}
+
+#[tokio::test]
+async fn merge_pointer_needs_management() {
+    // A server node may not point an account at another account; a management node may.
+    let realm_id = RealmId::from_bytes([64; 32]);
+    let merged = UserId::local(Ulid::from_parts(1_660, 1), realm_id);
+    let primary = UserId::local(Ulid::from_parts(1_661, 1), realm_id);
+    let actor = test_actor(13, merged, realm_id);
+    let pointer = AdminDocumentOperation::UserAttributeSet {
+        key: aruna_core::user::validation::MERGED_INTO_ATTRIBUTE.to_string(),
+        value: primary.to_string(),
+    };
+    let ordinary = AdminDocumentOperation::UserAttributeSet {
+        key: "orcid".to_string(),
+        value: "0000-0002-1825-0097".to_string(),
+    };
+    for (kind, op, accepted) in [
+        (RealmNodeKind::Server, pointer.clone(), false),
+        (RealmNodeKind::Server, ordinary, true),
+        (RealmNodeKind::Management, pointer, true),
+    ] {
+        let (_dir, storage) = test_storage();
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(actor.node_id, kind.clone());
+        batch_write_to(
+            &storage,
+            vec![target_write_entry(
+                DocumentTarget::RealmConfig { realm_id },
+                config.to_bytes(&actor).expect("config serializes").into(),
+            )],
+        )
+        .await
+        .expect("config writes");
+        let event = test_admin_event(
+            Ulid::from_parts(1_662, 1),
+            AdminDocumentTarget::User { user_id: merged },
+            &actor,
+            1,
+            op.clone(),
+        );
+        let validation = validate_user_authority(&storage, &event, None)
+            .await
+            .expect("validation runs");
+        assert_eq!(
+            matches!(validation, AdminEventValidation::Accepted),
+            accepted,
+            "{kind:?} {op:?}"
+        );
+    }
+}
+
+fn merge_user(user_id: UserId, subjects: &[&str], into: Option<UserId>, lists: &[UserId]) -> User {
+    let mut attributes: HashMap<String, String> = lists
+        .iter()
+        .map(|listed| {
+            (
+                format!(
+                    "{}{}",
+                    aruna_core::user::validation::MERGED_PREFIX,
+                    listed.user_ulid
+                ),
+                listed.to_string(),
+            )
+        })
+        .collect();
+    if let Some(into) = into {
+        attributes.insert(
+            aruna_core::user::validation::MERGED_INTO_ATTRIBUTE.to_string(),
+            into.to_string(),
+        );
+    }
+    User {
+        user_id,
+        name: "user".to_string(),
+        subject_ids: subjects.iter().map(ToString::to_string).collect(),
+        alias_user_ids: Default::default(),
+        attributes,
+    }
+}
+
+/// Stores `users` and the subject's claims, applies `op` to `target` and returns the claims.
+async fn apply_with_claims(
+    users: Vec<User>,
+    claims: BTreeSet<UserId>,
+    target: UserId,
+    op: AdminDocumentOperation,
+) -> BTreeSet<UserId> {
+    let (_dir, storage) = test_storage();
+    let actor = Actor {
+        node_id: node(10),
+        user_id: target,
+        realm_id: target.realm_id,
+    };
+    let mut rows: Vec<_> = users
+        .iter()
+        .map(|user| {
+            (
+                USER_KEYSPACE.to_string(),
+                user.user_id.to_bytes().into(),
+                user.to_bytes(&actor).expect("user serializes").into(),
+            )
+        })
+        .collect();
+    rows.push((
+        SUBJECT_CLAIMS_KEYSPACE.to_string(),
+        subject_index_key("subject-moved"),
+        postcard::to_allocvec(&claims)
+            .expect("claims encode")
+            .into(),
+    ));
+    batch_write_to(&storage, rows)
+        .await
+        .expect("fixture writes");
+    let event = AdminDocumentEvent {
+        event_id: Ulid::from_parts(1_670, 1),
+        target: AdminDocumentTarget::User { user_id: target },
+        origin_node_id: actor.node_id,
+        origin_seq: 1,
+        observed: AdminDocumentClock::default(),
+        actor,
+        op,
+    };
+    apply_user_operation(&storage, DocumentTarget::User { user_id: target }, event)
+        .await
+        .expect("event applies");
+    read_storage_value(
+        &storage,
+        SUBJECT_CLAIMS_KEYSPACE,
+        subject_index_key("subject-moved"),
+    )
+    .await
+    .map(|bytes| postcard::from_bytes(&bytes).expect("claims decode"))
+    .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn late_removal_reaches_root() {
+    // B into A, then A into C: B's late removal still names A, but the subject goes to C.
+    let realm_id = RealmId::from_bytes([66; 32]);
+    let id = |seed: u64| UserId::local(Ulid::from_parts(1_680 + seed, 1), realm_id);
+    let (b, a, c) = (id(0), id(1), id(2));
+    let users = vec![
+        merge_user(b, &["subject-moved"], Some(a), &[]),
+        merge_user(a, &[], Some(c), &[]),
+        merge_user(c, &[], None, &[a, b]),
+    ];
+    let op = AdminDocumentOperation::SubjectIdRemoved {
+        subject_id: "subject-moved".to_string(),
+    };
+    let claims = apply_with_claims(users, BTreeSet::from([b]), b, op).await;
+    assert_eq!(claims, BTreeSet::from([c]));
+}
+
+#[tokio::test]
+async fn root_takes_kept_claim() {
+    // B's claim waited for its root; the root's own addition ends it.
+    let realm_id = RealmId::from_bytes([67; 32]);
+    let id = |seed: u64| UserId::local(Ulid::from_parts(1_690 + seed, 1), realm_id);
+    let (b, c) = (id(0), id(1));
+    let users = vec![
+        merge_user(b, &[], Some(c), &[]),
+        merge_user(c, &[], None, &[b]),
+    ];
+    let op = AdminDocumentOperation::SubjectIdAdded {
+        subject_id: "subject-moved".to_string(),
+    };
+    let claims = apply_with_claims(users, BTreeSet::from([b]), c, op).await;
+    assert_eq!(claims, BTreeSet::from([c]));
+}
+
+#[test]
+fn merge_handoff_needs_coordinator() {
+    // Only the pinned coordinator names the next one, unless none is pinned or it left management.
+    let realm_id = RealmId::from_bytes([68; 32]);
+    let user = UserId::local(Ulid::from_parts(1_700, 1), realm_id);
+    let (old, new) = (
+        test_actor(20, user, realm_id),
+        test_actor(21, user, realm_id),
+    );
+    let config = |old_kind: Option<RealmNodeKind>| {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(new.node_id, RealmNodeKind::Management);
+        if let Some(kind) = old_kind {
+            config.ensure_node(old.node_id, kind);
+        }
+        config
+    };
+    let pinned = |node_id| {
+        let mut state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
+        state
+            .apply_operation(
+                &old,
+                AdminDocumentOperation::MergeCoordinatorSet { node_id },
+            )
+            .expect("pin applies");
+        state
+    };
+    let handoff = |origin: &Actor| {
+        test_admin_event(
+            Ulid::from_parts(1_701, 1),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            origin,
+            1,
+            AdminDocumentOperation::MergeCoordinatorSet {
+                node_id: new.node_id,
+            },
+        )
+    };
+    let judge = |config: RealmConfigDocument, state: Option<AdminDocumentState>, origin: &Actor| {
+        validate_config_authority(Some(&config), &handoff(origin), state.as_ref())
+            .expect("validation runs")
+    };
+    let management = Some(RealmNodeKind::Management);
+    assert!(matches!(
+        judge(config(management.clone()), Some(pinned(old.node_id)), &old),
+        AdminEventValidation::Accepted
+    ));
+    assert!(matches!(
+        judge(config(management.clone()), Some(pinned(old.node_id)), &new),
+        AdminEventValidation::Rejected(_)
+    ));
+    assert!(matches!(
+        judge(config(management), None, &new),
+        AdminEventValidation::Accepted
+    ));
+    assert!(matches!(
+        judge(
+            config(Some(RealmNodeKind::Server)),
+            Some(pinned(old.node_id)),
+            &new
+        ),
+        AdminEventValidation::Accepted
+    ));
+    assert!(matches!(
+        judge(config(None), Some(pinned(old.node_id)), &new),
+        AdminEventValidation::Deferred { .. }
+    ));
+}
+
+#[tokio::test]
+async fn final_marker_clears_kept_claim() {
+    // B's removal kept its claim, A's addition came before its marker: the marker clears it.
+    let realm_id = RealmId::from_bytes([69; 32]);
+    let id = |seed: u64| UserId::local(Ulid::from_parts(1_710 + seed, 1), realm_id);
+    let (b, a) = (id(0), id(1));
+    let users = vec![
+        merge_user(b, &[], Some(a), &[]),
+        merge_user(a, &["subject-moved"], None, &[]),
+    ];
+    let marker = AdminDocumentOperation::UserAttributeSet {
+        key: format!(
+            "{}{}",
+            aruna_core::user::validation::MERGED_PREFIX,
+            b.user_ulid
+        ),
+        value: b.to_string(),
+    };
+    let claims = apply_with_claims(users, BTreeSet::from([a, b]), a, marker).await;
+    assert_eq!(claims, BTreeSet::from([a]));
+}

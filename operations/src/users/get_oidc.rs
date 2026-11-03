@@ -32,9 +32,22 @@ pub struct GetOidcOperation {
 enum GetOidcState {
     Init,
     StartTransaction,
-    ReadSubjectIndex { txn_id: TxnId },
-    ReadExistingUser { txn_id: TxnId },
-    CommitTransaction { user: User },
+    ReadSubjectIndex {
+        txn_id: TxnId,
+    },
+    ReadExistingUser {
+        txn_id: TxnId,
+    },
+    /// Follows a merged account's pointers to the root of its merges.
+    FollowMerge {
+        txn_id: TxnId,
+        start: User,
+        current: User,
+        seen: Vec<UserId>,
+    },
+    CommitTransaction {
+        user: User,
+    },
     Finish,
     Error,
 }
@@ -173,10 +186,60 @@ impl GetOidcOperation {
         value: Option<ByteView>,
     ) -> Result<Effects, GetOidcError> {
         let user = User::from_bytes(&value.ok_or_else(|| GetOidcError::UserNotFound)?)?;
+        Ok(self.follow(txn_id, user.clone(), user, vec![]))
+    }
+
+    /// A sign-in that still names a merged account opens the root of its merges, once that root
+    /// lists the account; otherwise the account itself, which then refuses as deactivated.
+    fn follow(
+        &mut self,
+        txn_id: TxnId,
+        start: User,
+        current: User,
+        mut seen: Vec<UserId>,
+    ) -> Effects {
+        if let Some(next) = current.merged_into()
+            && next.realm_id == start.user_id.realm_id
+            && next != start.user_id
+            && !seen.contains(&next)
+        {
+            seen.push(next);
+            self.state = GetOidcState::FollowMerge {
+                txn_id,
+                start,
+                current,
+                seen,
+            };
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: USER_KEYSPACE.to_string(),
+                key: ByteView::from(next.to_storage_key()),
+                txn_id: Some(txn_id),
+            })];
+        }
+        let root =
+            current.merged_into().is_none() && current.merged_user_ids().contains(&start.user_id);
+        let user = if root { current } else { start };
         self.state = GetOidcState::CommitTransaction { user };
-        Ok(smallvec![Effect::Storage(
-            StorageEffect::CommitTransaction { txn_id }
-        )])
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn accept_primary(
+        &mut self,
+        event: Event,
+        (txn_id, start, current, seen): (TxnId, User, User, Vec<UserId>),
+    ) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected_event("Event::Storage(StorageEvent::ReadResult)", got);
+        };
+        let expected = current.merged_into();
+        match value.map(|bytes| User::from_bytes(&bytes)).transpose() {
+            Ok(Some(next)) if Some(next.user_id) == expected => {
+                self.follow(txn_id, start, next, seen)
+            }
+            Ok(_) => self.follow(txn_id, start.clone(), start, seen),
+            Err(error) => self.fail(error.into()),
+        }
     }
 
     fn handle_commit_transaction(&mut self, event: Event, user: User) -> Effects {
@@ -211,6 +274,12 @@ impl Operation for GetOidcOperation {
             GetOidcState::StartTransaction => self.handle_start_txn(event),
             GetOidcState::ReadSubjectIndex { txn_id } => self.accept_subject(event, txn_id),
             GetOidcState::ReadExistingUser { txn_id } => self.accept_existing(event, txn_id),
+            GetOidcState::FollowMerge {
+                txn_id,
+                start,
+                current,
+                seen,
+            } => self.accept_primary(event, (txn_id, start, current, seen)),
             GetOidcState::CommitTransaction { user } => self.handle_commit_transaction(event, user),
             GetOidcState::Init | GetOidcState::Finish | GetOidcState::Error => {
                 smallvec![]
@@ -229,10 +298,84 @@ impl Operation for GetOidcOperation {
     fn abort(&mut self) -> Effects {
         match self.state {
             GetOidcState::ReadSubjectIndex { txn_id }
-            | GetOidcState::ReadExistingUser { txn_id } => {
+            | GetOidcState::ReadExistingUser { txn_id }
+            | GetOidcState::FollowMerge { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
             _ => smallvec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GetOidcInput, GetOidcOperation};
+    use aruna_core::UserId;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::identity::user::User;
+    use aruna_core::types::TxnId;
+    use aruna_core::user::validation::{MERGED_INTO_ATTRIBUTE, MERGED_PREFIX};
+    use byteview::ByteView;
+    use ulid::Ulid;
+
+    fn user(seed: u8, attributes: Vec<(String, String)>) -> User {
+        User {
+            user_id: UserId::local(Ulid::from_bytes([seed; 16]), RealmId([8u8; 32])),
+            name: format!("user {seed}"),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: attributes.into_iter().collect(),
+        }
+    }
+
+    fn read(user: &User) -> Event {
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            user_id: user.user_id,
+            realm_id: user.user_id.realm_id,
+        };
+        Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(Vec::new()),
+            value: Some(user.to_bytes(&actor).unwrap().into()),
+        })
+    }
+
+    /// Signs in with a subject indexed to `merged` and returns the account the login opens.
+    fn sign_in(merged: &User, primary: &User) -> UserId {
+        let mut operation = GetOidcOperation::new(GetOidcInput {
+            issuer: "https://issuer.example".to_string(),
+            subject_id: "subject".to_string(),
+        });
+        let txn_id = TxnId::generate();
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(Vec::new()),
+            value: Some(merged.user_id.to_storage_key().into()),
+        }));
+        operation.step(read(merged));
+        operation.step(read(primary));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        operation.finalize().unwrap().user_id
+    }
+
+    #[test]
+    fn merged_login_opens_root() {
+        let pointer = |to: &User| vec![(MERGED_INTO_ATTRIBUTE.to_string(), to.user_id.to_string())];
+        let unlisted = user(1, Vec::new());
+        let merged = user(2, pointer(&unlisted));
+        assert_eq!(sign_in(&merged, &unlisted), merged.user_id);
+
+        let marker = (
+            format!("{MERGED_PREFIX}{}", merged.user_id.user_ulid),
+            merged.user_id.to_string(),
+        );
+        let primary = user(1, vec![marker]);
+        assert_eq!(sign_in(&merged, &primary), primary.user_id);
     }
 }

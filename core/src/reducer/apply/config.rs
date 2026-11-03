@@ -55,6 +55,9 @@ impl AdminDocumentState {
             AdminDocumentOperation::ConfigPortalSet { features } => {
                 self.apply_config_setting(event, CONFIG_PORTAL_PATH, portal_value(features));
             }
+            AdminDocumentOperation::MergeCoordinatorSet { node_id } => {
+                self.apply_config_setting(event, CONFIG_MERGE_PATH, node_id.to_string());
+            }
             AdminDocumentOperation::ConfigReplicasSet { replicas } => {
                 let value = replicas_value(replicas);
                 self.apply_config_setting(event, CONFIG_REPLICAS_PATH, value);

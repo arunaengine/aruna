@@ -89,6 +89,9 @@ pub(crate) async fn register_default(config: &Config, ctx: &DriverContext) {
             .chars()
             .take(MAX_NAME_LEN)
             .collect(),
+        description: None,
+        contact: None,
+        login_providers: Vec::new(),
         api_url: points.api_url,
         portal_url: points.portal_url,
         registry_url: Some(points.registry_url),
@@ -258,6 +261,9 @@ mod tests {
             auth_context: None,
             node_capabilities: config.node_capabilities.clone(),
             name: "Chosen name".to_string(),
+            description: None,
+            contact: None,
+            login_providers: Vec::new(),
             api_url: Url::parse("https://api.example.org/api/v1").unwrap(),
             portal_url: Url::parse("https://portal.example.org/").unwrap(),
             registry_url: None,

@@ -388,6 +388,7 @@ pub struct CompleteUploadOperation {
     fence: Option<crate::s3::object::put::fenced::FencedWrite>,
     /// The rules that read the composed path, as the finalize transaction reads them.
     readers: crate::s3::object::put::ReaderScan,
+    version_origin: Option<VersionOrigin>,
 }
 
 impl CompleteUploadOperation {
@@ -453,7 +454,14 @@ impl CompleteUploadOperation {
             written_intent: Vec::new(),
             fence: None,
             readers: Default::default(),
+            version_origin: None,
         }
+    }
+
+    /// The origin the completed version records; an upload without a client by default.
+    pub fn with_version_origin(mut self, origin: VersionOrigin) -> Self {
+        self.version_origin = Some(origin);
+        self
     }
 
     pub fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
@@ -1746,10 +1754,13 @@ impl CompleteUploadOperation {
             ),
         }
         .with_metadata(upload_record.metadata.clone())
-        .with_origin(Some(VersionOrigin::Upload {
-            node_id: self.input.node_id,
-            device: None,
-        }));
+        .with_origin(Some(self.version_origin.clone().unwrap_or(
+            VersionOrigin::Upload {
+                node_id: self.input.node_id,
+                device: None,
+                client: None,
+            },
+        )));
         // Union with what part copies inherited: a part-wise copy of a governed
         // source can only add refs to the composed object.
         let mut policies = self.bucket_policies.clone();

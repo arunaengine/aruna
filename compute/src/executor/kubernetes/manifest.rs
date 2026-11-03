@@ -318,35 +318,38 @@ pub fn data_node_manifest(
     index: usize,
     bucket: &str,
 ) -> Result<serde_json::Value, BackendError> {
-    let name = mount_name(&context.attempt.external_name(), index);
-    kubedal_node(context, config, &name, bucket, true)
+    let name = context.attempt.external_name();
+    let node = mount_name(&name, index);
+    kubedal_node(context, config, &node, &secret_name(&name), bucket, true)
 }
 
 /// The session's writable DataNode for its workspace bucket, named like its data volume.
+/// It reads only the mount Secret: OpenDAL rejects the env Secret's AWS_* aliases as duplicates.
 pub fn session_node_manifest(
     context: &FenceContext,
     config: &KubernetesConfig,
     bucket: &str,
 ) -> Result<serde_json::Value, BackendError> {
-    let name = data_name(&context.attempt.external_name());
-    kubedal_node(context, config, &name, bucket, false)
+    let name = context.attempt.external_name();
+    let secret = mount_secret_name(&name);
+    kubedal_node(context, config, &data_name(&name), &secret, bucket, false)
 }
 
 fn kubedal_node(
     context: &FenceContext,
     config: &KubernetesConfig,
     node: &str,
+    secret: &str,
     bucket: &str,
     read_only: bool,
 ) -> Result<serde_json::Value, BackendError> {
     let kubedal = config.kubedal.as_ref().ok_or_else(|| {
         BackendError::InvalidSpec("KubeDAL mounts are disabled on this backend".to_string())
     })?;
-    let name = context.attempt.external_name();
     let mut spec = json!({
         "backend":"S3",
         "read_only":read_only,
-        "secretRef":{"name":secret_name(&name)},
+        "secretRef":{"name":secret},
         "config":{
             "bucket":bucket,
             "endpoint":kubedal.endpoint,
@@ -557,20 +560,52 @@ pub fn secret_manifest(
         .collect::<BTreeMap<_, _>>();
     // The CSI driver reads the data mount credential under its own key names.
     if session_mount(spec, config).is_some() {
-        for (env, key) in [
-            ("AWS_ACCESS_KEY_ID", "access_key_id"),
-            ("AWS_SECRET_ACCESS_KEY", "secret_access_key"),
-        ] {
-            if let Some(value) = values.get(env).cloned() {
-                values.entry(key.to_string()).or_insert(value);
-            }
+        for (key, value) in mount_keys(spec) {
+            values.entry(key).or_insert(value);
         }
     }
+    credential_secret(
+        context,
+        config,
+        &secret_name(&context.attempt.external_name()),
+        values,
+    )
+}
+
+/// The session DataNode's Secret: only the two S3 keys the mount needs, none of the task env.
+pub fn mount_secret_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    spec: &TaskSpec,
+) -> Result<Secret, BackendError> {
+    let name = mount_secret_name(&context.attempt.external_name());
+    credential_secret(context, config, &name, mount_keys(spec))
+}
+
+fn mount_keys(spec: &TaskSpec) -> BTreeMap<String, String> {
+    [
+        ("AWS_ACCESS_KEY_ID", "access_key_id"),
+        ("AWS_SECRET_ACCESS_KEY", "secret_access_key"),
+    ]
+    .into_iter()
+    .filter_map(|(env, key)| {
+        let value = spec.secret_env.get(env)?;
+        Some((key.to_string(), value.expose().to_string()))
+    })
+    .collect()
+}
+
+fn credential_secret(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    name: &str,
+    values: BTreeMap<String, String>,
+) -> Result<Secret, BackendError> {
     serde_json::from_value(json!({
         "apiVersion":"v1",
         "kind":"Secret",
         "metadata":{
-            "name":secret_name(&context.attempt.external_name()),
+            "name":name,
             "namespace":config.namespace,
             "labels":labels(context,"credentials"),
             "annotations":annotations_base(context,"active")
@@ -748,6 +783,10 @@ pub fn needs_workspace(spec: &TaskSpec) -> bool {
 
 pub fn secret_name(name: &str) -> String {
     format!("{name}-env")
+}
+
+pub fn mount_secret_name(name: &str) -> String {
+    format!("{name}-mount")
 }
 
 pub fn helper_name(name: &str, role: &str) -> String {
@@ -1398,6 +1437,30 @@ mod tests {
     }
 
     #[test]
+    fn isolates_mount_secret() {
+        // KubeDAL merges every Secret key into the OpenDAL config, which reads AWS_* names as
+        // aliases; the session DataNode's Secret must hold the two mount keys and nothing else.
+        let mut spec = session_spec();
+        spec.secret_env.insert(
+            "AWS_SESSION_TOKEN".to_string(),
+            Secret::new("session-token"),
+        );
+        let secret = mount_secret_manifest(&context(), &config(), &spec).unwrap();
+        assert_eq!(secret.metadata.name.as_deref(), Some("aruna-job-a1-mount"));
+        assert_eq!(secret.metadata.labels.unwrap()[ROLE_LABEL], "credentials");
+        assert_eq!(
+            secret.string_data.unwrap(),
+            BTreeMap::from([
+                ("access_key_id".to_string(), "session-access".to_string()),
+                (
+                    "secret_access_key".to_string(),
+                    "session-secret".to_string()
+                ),
+            ])
+        );
+    }
+
+    #[test]
     fn uses_configured_driver() {
         let mut config = config();
         config.s3_mount_driver = Some("s3.csi.example.org".to_string());
@@ -1597,12 +1660,7 @@ mod tests {
             node["spec"]["config"]["endpoint"],
             "https://s3.node-2.example"
         );
-        assert_eq!(node["spec"]["secretRef"]["name"], "aruna-job-a1-env");
-        let secret = secret_manifest(&context(), &config, &spec).unwrap();
-        assert_eq!(
-            secret.string_data.unwrap()["access_key_id"],
-            "session-access"
-        );
+        assert_eq!(node["spec"]["secretRef"]["name"], "aruna-job-a1-mount");
 
         // The whole bucket needs no path; KubeDAL alone also enables the mount.
         let mut spec = spec;

@@ -479,9 +479,9 @@ async fn set_coverage(
   is deleted only at the exact backend version Aruna recorded, only after the versions are gone
   and on disk, and only while no other key, version, link or copy reads it; such files stay.
   It needs an unrestricted token, and for a bucket `confirm` set to the bucket name.
-- A file or folder purge is refused while any release pins a version in it, also one the
-  caller cannot read; the refusal names no release. Delete the release crate version first, or
-  delete the keys for delete markers. A bucket purge deletes the releases with their files.
+- A file, folder or bucket purge is refused while any release pins a version in it, also one
+  the caller cannot read; the refusal names no release. Delete the release crate version first,
+  or delete the keys for delete markers.
 - `POST /data/storage/purge/jobs/{job_id}/{action}` pauses, resumes or aborts the purge."#,
     request_body(
         content = SubmitPurgeRequest,
@@ -520,7 +520,7 @@ async fn set_coverage(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller may not delete the selected scope permanently, or a restricted token asks to delete storage files", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
-        (status = 409, description = "The idempotency key is retained for a purge of a different scope, or a release pins a version in the file or folder", body = ErrorResponse),
+        (status = 409, description = "The idempotency key is retained for a purge of a different scope, or a release pins a version in the file, folder or bucket", body = ErrorResponse),
         (status = 503, description = "The bucket's releases could not all be checked", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

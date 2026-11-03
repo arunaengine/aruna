@@ -44,7 +44,8 @@ use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::{
-    ClaimOutcome, claim_job, complete_job, insert_job, put_purge_checkpoint, transition_to_running,
+    ClaimOutcome, claim_job, complete_job, fail_job, insert_job, put_purge_checkpoint,
+    transition_to_running,
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
@@ -287,6 +288,7 @@ async fn scoped_fence_isolates() {
                 metadata: None,
                 restrictions: None,
                 references: CopyReferences::Materialize,
+                job_id: None,
             },
         )
         .await,
@@ -1270,8 +1272,8 @@ async fn purge_releases_copies() {
     assert!(left.is_empty());
 }
 
-/// A release published after a file purge was submitted keeps the version it pins: the purge
-/// checks again before it deletes, and fails without deleting it.
+/// A release published after a file or bucket purge was submitted keeps the version it pins:
+/// the purge checks again before it deletes, and fails without deleting it.
 #[tokio::test]
 async fn purge_keeps_released() {
     use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
@@ -1325,11 +1327,40 @@ async fn purge_keeps_released() {
         JobRunOutcome::Failed(error) if error.message.contains("pinned by a release")
     ));
     let key = VersionKey::new("bucket", "db/a.fasta", file.version_id);
-    let row = read_value(
-        &context.driver.storage_handle,
-        BLOB_VERSIONS_KEYSPACE,
-        key.to_bytes().unwrap(),
+    let row = || {
+        let key = key.to_bytes().unwrap();
+        read_value(&context.driver.storage_handle, BLOB_VERSIONS_KEYSPACE, key)
+    };
+    assert!(row().await.is_some());
+
+    // The failed file purge ends, which drops its fence; a bucket purge then checks alike.
+    let error = aruna_core::structs::execution::job::JobError::permanent("pinned");
+    let storage = &context.driver.storage_handle;
+    fail_job(
+        storage,
+        job.job_id,
+        job.claim_token,
+        error,
+        unix_timestamp_millis(),
+    )
+    .await
+    .unwrap();
+    let bucket = StoragePurgeSpec {
+        scope: StoragePurgeScope::Bucket {
+            bucket: "bucket".to_string(),
+        },
+        ..spec
+    };
+    let job = claimed_job(
+        context.driver.clone(),
+        JobId::from_bytes([0xDA; 16]),
+        bucket.clone(),
     )
     .await;
-    assert!(row.is_some());
+    let outcome = run_storage_purge(&job, &bucket, false).await;
+    assert!(matches!(
+        outcome,
+        JobRunOutcome::Failed(error) if error.message.contains("pinned by a release")
+    ));
+    assert!(row().await.is_some());
 }

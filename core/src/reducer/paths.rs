@@ -18,6 +18,7 @@ pub const CONFIG_QUOTA_PATH: &str = "realm_config.quota";
 pub const CONFIG_COMPUTE_PATH: &str = "realm_config.compute";
 pub const CONFIG_FEDERATION_PATH: &str = "realm_config.federation";
 pub const CONFIG_PORTAL_PATH: &str = "realm_config.portal_features";
+pub const CONFIG_MERGE_PATH: &str = "realm_config.merge_coordinator";
 pub const CONFIG_REPLICAS_PATH: &str = "realm_config.replica_quota";
 pub const CONFIG_POLICIES_PATH: &str = "realm_config.request_policies";
 pub const CONFIG_STRATEGY_PATH: &str = "realm_config.placement.default_strategy";
@@ -112,6 +113,9 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         }
         AdminDocumentOperation::ConfigReplicasSet { .. } => {
             vec![CONFIG_REPLICAS_PATH.to_string()]
+        }
+        AdminDocumentOperation::MergeCoordinatorSet { .. } => {
+            vec![CONFIG_MERGE_PATH.to_string()]
         }
         AdminDocumentOperation::NodeNameSet { node_id, .. } => vec![node_name_path(node_id)],
         AdminDocumentOperation::NodePlaceSet { node_id, .. } => vec![node_place_path(node_id)],

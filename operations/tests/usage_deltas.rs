@@ -1043,6 +1043,7 @@ async fn copy_object(
             metadata: None,
             restrictions: None,
             references: CopyReferences::Materialize,
+            job_id: None,
         },
     )
     .await

@@ -112,6 +112,8 @@ pub struct SealedCopyInput {
     pub realm_id: RealmId,
     pub node_id: NodeId,
     pub quota_ceiling: Option<u64>,
+    /// The system job that runs the copy, recorded in the copy's origin.
+    pub job_id: Option<Ulid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -293,7 +295,8 @@ impl SealedCopyOperation {
                 .ok()?,
             ),
         };
-        Some(VersionOrigin::Copy { from })
+        let job_id = self.input.job_id;
+        Some(VersionOrigin::Copy { from, job_id })
     }
 
     fn source_version(&self) -> VersionKey {

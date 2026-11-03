@@ -8,4 +8,5 @@ pub mod link;
 pub mod login;
 pub mod publish;
 pub mod records;
+pub mod totals;
 pub mod transfer;

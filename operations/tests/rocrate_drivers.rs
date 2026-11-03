@@ -39,6 +39,7 @@ use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo, VersionKey};
 use aruna_core::structs::storage::bucket_metadata::release_marker;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
@@ -59,6 +60,7 @@ use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::object::origin::read_origin;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
@@ -186,6 +188,15 @@ async fn drivers_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     };
     assert_eq!(result.imported, 1);
     assert_eq!(result.failed, 0);
+    // The import job wrote the file, not an upload by its owner.
+    let place = (fixture.actor.realm_id, fixture.actor.node_id);
+    let origin = read_origin(&fixture.context, place, BUCKET, TARGET_KEY, None).await?;
+    assert_eq!(
+        origin.origin,
+        Some(VersionOrigin::Source {
+            job_id: Some(import_job.as_ulid())
+        })
+    );
 
     assert_eq!(replay_event_log(fixture.context.as_ref()).await?, 1);
     let materialized = process_materialization_batch(fixture.context.as_ref()).await?;

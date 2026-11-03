@@ -69,6 +69,8 @@ pub struct MaterializeReferenceInput {
     pub restrictions: Option<Vec<PathRestriction>>,
     /// Further sources of the same file: each connector of the group with the file's path there.
     pub mirrors: Vec<(SourceConnector, String)>,
+    /// The import job that registers the file, recorded in its origin.
+    pub job_id: Option<Ulid>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -151,6 +153,7 @@ pub async fn stage_reference_blob(
                 head_result.secret_fingerprint,
             )),
             mirror_guards: mirror_guards.collect(),
+            job_id: input.job_id,
         },
     )
     .await?;
@@ -185,6 +188,8 @@ pub struct ReferenceWrite {
     pub mirror_guards: Vec<SourceConnector>,
     /// The writer's path restrictions, which its replication obligation keeps.
     pub restrictions: Option<Vec<PathRestriction>>,
+    /// The system job that writes the reference, recorded in its origin.
+    pub job_id: Option<Ulid>,
 }
 
 /// Writes the reference version in one transaction and says whether anything
@@ -349,7 +354,9 @@ pub async fn write_reference_version(
             write.user_id,
             now,
         )
-        .with_origin(Some(VersionOrigin::Source))
+        .with_origin(Some(VersionOrigin::Source {
+            job_id: write.job_id,
+        }))
         .with_policies(policies)?;
         let version = stamp_version(version, binding.as_ref(), generation, epoch);
         apply_storage_effect(
@@ -1042,6 +1049,7 @@ mod tests {
         let result = stage_reference_blob(
             context,
             MaterializeReferenceInput {
+                job_id: None,
                 group_id,
                 user_id,
                 realm_id,
@@ -1145,6 +1153,7 @@ mod tests {
         let result = stage_reference_blob(
             context,
             MaterializeReferenceInput {
+                job_id: None,
                 group_id,
                 user_id,
                 realm_id,
@@ -1215,6 +1224,7 @@ mod tests {
         let (server, endpoint) = spawn_reference_server("ref-data").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
         let input = MaterializeReferenceInput {
+            job_id: None,
             group_id,
             user_id,
             realm_id,
@@ -1267,6 +1277,7 @@ mod tests {
         let connector = create_http_connector(context, group_id, &endpoint).await;
         let mirror = create_http_connector(context, group_id, &endpoint).await;
         let input = |key: &str, mirror: SourceConnector| MaterializeReferenceInput {
+            job_id: None,
             group_id,
             user_id,
             realm_id,
@@ -1316,6 +1327,7 @@ mod tests {
         let original = stage_reference_blob(
             context,
             MaterializeReferenceInput {
+                job_id: None,
                 group_id,
                 user_id,
                 realm_id,
@@ -1336,6 +1348,7 @@ mod tests {
         let _ = server.await;
         let planned = Ulid::generate();
         let input = |size| ReferenceWrite {
+            job_id: None,
             preassigned_version_id: Some(planned),
             group_id,
             user_id,
@@ -1412,6 +1425,7 @@ mod tests {
         offer_directory(context, offer.clone()).await.unwrap();
 
         let write = ReferenceWrite {
+            job_id: None,
             preassigned_version_id: None,
             group_id: offer.group_id,
             user_id: offer.user_id,

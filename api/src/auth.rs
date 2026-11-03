@@ -56,6 +56,9 @@ pub struct OidcIdentity {
     pub display_name: Option<String>,
     /// Verified provider login time; `None` when the provider did not send it.
     pub auth_time: Option<u64>,
+    /// The email address, only when the provider marks it verified.
+    #[serde(default)]
+    pub verified_email: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +101,9 @@ struct OidcClaims {
     family_name: Option<String>,
     #[serde(default)]
     auth_time: Option<u64>,
+    /// A boolean, or the string `"true"` some providers send.
+    #[serde(default)]
+    email_verified: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -262,12 +268,19 @@ impl OidcValidator {
         let _ = claims.exp;
         let _ = claims.nbf;
         let display_name = oidc_display_name(&claims);
+        let verified = claims
+            .email_verified
+            .as_ref()
+            .is_some_and(|value| value.as_bool() == Some(true) || value.as_str() == Some("true"));
 
         Ok(OidcIdentity {
             issuer: claims.iss,
             subject_id: claims.sub,
             display_name,
             auth_time: claims.auth_time,
+            verified_email: claims
+                .email
+                .filter(|email| verified && !email.trim().is_empty()),
         })
     }
 }
@@ -1459,6 +1472,8 @@ mod test {
                 name: "capabilities-user".to_string(),
                 subject_id: "a-random-subject-id".to_string(),
                 issuer: "issuer_id".to_string(),
+                email_hash: None,
+                create_new: false,
             }),
             &driver_ctx,
         )
@@ -1750,6 +1765,8 @@ mod test {
                 name: "validation-user".to_string(),
                 subject_id: "validation-user-subject_id".to_string(),
                 issuer: "validation-user-issuer-id".to_string(),
+                email_hash: None,
+                create_new: false,
             }),
             &driver_ctx,
         )

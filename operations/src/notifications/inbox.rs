@@ -10,10 +10,10 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
-use aruna_core::storage_entries::inbox_write_entries;
+use aruna_core::storage_entries::{inbox_delete_entries, inbox_write_entries};
 use aruna_core::structs::execution::notification::{
-    NotificationClass, NotificationRecord, TRANSIENT_USER_CAP, notification_inbox_key,
-    notification_inbox_prefix,
+    NotificationClass, NotificationKind, NotificationRecord, TRANSIENT_USER_CAP,
+    notification_inbox_key, notification_inbox_prefix,
 };
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use aruna_storage::StorageHandle;
@@ -25,12 +25,13 @@ pub(crate) enum UpsertFailure {
 }
 
 /// Result of a holder-local inbox upsert: `recipients` lists, in first-seen
-/// order, recipients that gained a record, so a caller can wake each once; a
-/// pure redelivery reports zero writes.
+/// order, recipients that gained or lost a record, so a caller can wake each once;
+/// a pure redelivery reports zero writes. `purged` counts records a bucket deletion removed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InboxWriteOutcome {
     pub written: usize,
     pub recipients: Vec<UserId>,
+    pub purged: usize,
 }
 
 /// Idempotent holder-local upsert: existing primary keys are skipped inside the
@@ -91,7 +92,7 @@ async fn upsert_once(
             return Err(error);
         }
     };
-    if outcome.written == 0 {
+    if outcome.written == 0 && outcome.purged == 0 {
         abort_txn(storage, txn_id).await;
         return Ok(outcome);
     }
@@ -113,6 +114,45 @@ pub(crate) async fn upsert_transactionally(
     records: &[NotificationRecord],
     txn_id: TxnId,
 ) -> Result<InboxWriteOutcome, UpsertFailure> {
+    // A bucket deletion is never stored: it removes the notices about its bucket instead.
+    let (purges, records): (Vec<&NotificationRecord>, Vec<&NotificationRecord>) = records
+        .iter()
+        .partition(|record| matches!(record.kind, NotificationKind::BucketDeleted { .. }));
+    let records: Vec<&NotificationRecord> = records
+        .into_iter()
+        .filter(|record| !purges.iter().any(|purge| purge.purges(record)))
+        .collect();
+    let mut outcome = InboxWriteOutcome::default();
+    let mut deletes = Vec::new();
+    for purge in &purges {
+        let purged = purged_records(storage, purge, txn_id).await?;
+        if !purged.is_empty() && !outcome.recipients.contains(&purge.recipient) {
+            outcome.recipients.push(purge.recipient);
+        }
+        outcome.purged += purged.len();
+        deletes.extend(purged.iter().flat_map(inbox_delete_entries));
+    }
+    if !deletes.is_empty() {
+        match storage
+            .send_storage_effect(StorageEffect::BatchDelete {
+                deletes,
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
+            other => {
+                return Err(UpsertFailure::Fatal(format!(
+                    "unexpected storage event: {other:?}"
+                )));
+            }
+        }
+    }
+    if records.is_empty() {
+        return Ok(outcome);
+    }
+
     let reads: Vec<(KeySpace, Key)> = records
         .iter()
         .map(|record| {
@@ -144,7 +184,6 @@ pub(crate) async fn upsert_transactionally(
     };
 
     let mut writes: Vec<(KeySpace, Key, Value)> = Vec::new();
-    let mut outcome = InboxWriteOutcome::default();
     let mut transient_counts = BTreeMap::new();
     for (record, (_, existing_value)) in records.iter().zip(existing) {
         if existing_value.is_some() {
@@ -177,7 +216,7 @@ pub(crate) async fn upsert_transactionally(
     }
 
     if writes.is_empty() {
-        return Ok(InboxWriteOutcome::default());
+        return Ok(outcome);
     }
 
     match storage
@@ -245,6 +284,50 @@ async fn count_transient(
         match next_start_after {
             Some(next) => start_after = Some(next),
             None => return Ok(count),
+        }
+    }
+}
+
+/// The stored notices of the purge's recipient that its bucket deletion removes.
+async fn purged_records(
+    storage: &StorageHandle,
+    purge: &NotificationRecord,
+    txn_id: TxnId,
+) -> Result<Vec<NotificationRecord>, UpsertFailure> {
+    let mut purged = Vec::new();
+    let mut start_after = None;
+    loop {
+        let event = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+                prefix: Some(notification_inbox_prefix(purge.recipient)),
+                start: start_after.take().map(IterStart::After),
+                limit: TRANSIENT_USER_CAP,
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let (values, next_start_after) = match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
+            other => {
+                return Err(UpsertFailure::Fatal(format!(
+                    "unexpected storage event: {other:?}"
+                )));
+            }
+        };
+        for (_, value) in values {
+            let record = NotificationRecord::from_bytes(&value)
+                .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
+            if purge.purges(&record) {
+                purged.push(record);
+            }
+        }
+        match next_start_after {
+            Some(next) => start_after = Some(next),
+            None => return Ok(purged),
         }
     }
 }
@@ -331,6 +414,62 @@ mod tests {
             record
         );
         assert_eq!(count_keyspace(&storage, PRUNE_INDEX_KEYSPACE).await, 1);
+    }
+
+    /// A bucket deletion removes the recipient's earlier notices about the bucket, stored or in
+    /// the same batch, wakes the recipient and is itself never stored.
+    #[tokio::test]
+    async fn deletion_purges_bucket() {
+        let (_dir, storage) = temp_storage();
+        let (recipient, other) = (user(1, 2), user(1, 3));
+        let node_id = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let group_id = ulid::Ulid::from_parts(1, 1);
+        let notice = |recipient, bucket: &str, at| {
+            let kind = NotificationKind::ShareUpload {
+                share_id: ulid::Ulid::generate(),
+                node_id,
+                group_id,
+                bucket: bucket.to_string(),
+                key: "key".to_string(),
+                size_bytes: 1,
+            };
+            NotificationRecord::new(recipient, NotificationClass::Direct, kind, at)
+        };
+        let gone = notice(recipient, "raw", 1_000);
+        let kept = [
+            notice(recipient, "other", 1_000),
+            notice(other, "raw", 1_000),
+            make_record(),
+        ];
+        let stored = [vec![gone.clone()], kept.to_vec()].concat();
+        assert_eq!(upsert_inbox_records(&storage, &stored).await, Ok(4));
+
+        let deletion = NotificationRecord::new(
+            recipient,
+            NotificationClass::Direct,
+            NotificationKind::BucketDeleted {
+                bucket: "raw".to_string(),
+                node_id,
+                group_id,
+            },
+            2_000,
+        );
+        let late = notice(recipient, "raw", 1_500);
+        let batch = [late.clone(), deletion.clone()];
+        let outcome = upsert_with_report(&storage, &batch).await.unwrap();
+        assert_eq!(outcome.written, 0);
+        assert_eq!(outcome.purged, 1);
+        assert_eq!(outcome.recipients, vec![recipient]);
+        for record in [&gone, &late, &deletion] {
+            assert_eq!(read_primary(&storage, record).await, None);
+        }
+        for record in &kept {
+            assert!(read_primary(&storage, record).await.is_some());
+        }
+        assert_eq!(count_keyspace(&storage, PRUNE_INDEX_KEYSPACE).await, 3);
+        // A redelivered deletion finds nothing left.
+        let again = upsert_with_report(&storage, &[deletion]).await.unwrap();
+        assert_eq!(again, InboxWriteOutcome::default());
     }
 
     #[tokio::test]

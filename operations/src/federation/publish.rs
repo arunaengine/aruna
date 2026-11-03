@@ -6,6 +6,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use aruna_blob::blob::BlobHandle;
 use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -31,14 +32,15 @@ use tracing::warn;
 use url::Url;
 
 use crate::driver::{DriverContext, drive};
+use crate::federation::totals::realm_totals;
 use crate::metadata::stats::{count_realm_documents, count_realm_groups};
 use crate::realm::get_config::GetConfigOperation;
 use crate::tasks::task_persistence::persist_task_effect;
 
 /// How often the reporting node renews its registration.
 pub const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
-/// Delay of the first publication after a settings change on this node.
-pub const PUBLISH_SOON: Duration = Duration::from_secs(60);
+/// Delay of the first publication after a settings change, so renames reach the registry at once.
+pub const PUBLISH_SOON: Duration = Duration::from_secs(5);
 /// Withdrawals sent while registration is disabled and the registry URL is kept.
 pub const MAX_WITHDRAWALS: u8 = 3;
 const STATE_KEY: &[u8] = b"publication";
@@ -322,7 +324,7 @@ pub async fn publish_registration(
     let now = unix_timestamp_secs();
     let sign_error = |error: FederationError| error.to_string();
     let captured = publication.clone();
-    let (method, registry_url, body) = match publication {
+    let (method, registry_url, body, totals) = match publication {
         Publication::Nothing => return Ok(()),
         Publication::Register {
             registry_url,
@@ -338,7 +340,8 @@ pub async fn publish_registration(
             };
             let signed = Signed::sign(registration, capabilities).map_err(sign_error)?;
             let body = serde_json::to_vec(&signed).map_err(|error| error.to_string())?;
-            (reqwest::Method::PUT, registry_url, body)
+            let totals = signed_totals(context, realm_id, node_id, capabilities).await;
+            (reqwest::Method::PUT, registry_url, body, totals)
         }
         Publication::Withdraw { registry_url, .. } => {
             let withdrawal = Withdrawal {
@@ -347,7 +350,7 @@ pub async fn publish_registration(
             };
             let signed = Signed::sign(withdrawal, capabilities).map_err(sign_error)?;
             let body = serde_json::to_vec(&signed).map_err(|error| error.to_string())?;
-            (reqwest::Method::DELETE, registry_url, body)
+            (reqwest::Method::DELETE, registry_url, body, None)
         }
     };
     let blob = context
@@ -362,6 +365,41 @@ pub async fn publish_registration(
     if !still_due(&current, node_id, &captured) {
         return Ok(());
     }
+    send(blob, method, url.clone(), body).await?;
+    // Best effort: a registry from before the totals route keeps the registration.
+    if let Some(body) = totals {
+        let sent = async { send(blob, reqwest::Method::PUT, totals_url(url)?, body).await };
+        if let Err(error) = sent.await {
+            warn!(error = %error, "Registry refused the realm totals");
+        }
+    }
+    Ok(())
+}
+
+/// The signed realm totals as a request body; `None` when a total is unknown.
+async fn signed_totals(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    capabilities: &NodeCapabilities,
+) -> Option<Vec<u8>> {
+    let totals = realm_totals(context, realm_id, node_id)
+        .await
+        .inspect_err(|error| warn!(error = %error, "Realm totals unavailable"))
+        .ok()?;
+    let signed = Signed::sign(totals, capabilities)
+        .inspect_err(|error| warn!(error = %error, "Signing realm totals failed"))
+        .ok()?;
+    serde_json::to_vec(&signed).ok()
+}
+
+/// Sends one signed JSON body through the screened egress client.
+async fn send(
+    blob: &BlobHandle,
+    method: reqwest::Method,
+    url: Url,
+    body: Vec<u8>,
+) -> Result<(), String> {
     let response = blob
         .repository_request(method, url)
         .map_err(|error| error.to_string())?
@@ -375,6 +413,15 @@ pub async fn publish_registration(
         return Err(format!("registry answered {}", response.status()));
     }
     Ok(())
+}
+
+/// The totals route below a realm's registry route.
+fn totals_url(mut realm_url: Url) -> Result<Url, String> {
+    realm_url
+        .path_segments_mut()
+        .map_err(|()| "registry URL cannot take a path".to_string())?
+        .push("totals");
+    Ok(realm_url)
 }
 
 /// The realm's totals; a count that fails is unknown (`None`), never zero.
@@ -487,6 +534,8 @@ mod tests {
             description: String::new(),
             api_url: url("https://api.example.org"),
             portal_url: url("https://portal.example.org"),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at: 1,
         };
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
@@ -496,6 +545,9 @@ mod tests {
         config.ensure_node(node(3), RealmNodeKind::Server);
         config.federation = Some(FederationSettings {
             name: descriptor.name.clone(),
+            description: String::new(),
+            contact: None,
+            login_providers: Vec::new(),
             api_url: descriptor.api_url.clone(),
             portal_url: descriptor.portal_url.clone(),
             registry_url: registry.then(|| url("https://registry.example.org")),
@@ -617,9 +669,14 @@ mod tests {
             &Url::parse("https://r.example.org/base").unwrap(),
             &realm_id,
         );
+        let url = url.unwrap();
         assert_eq!(
-            url.unwrap().as_str(),
+            url.as_str(),
             format!("https://r.example.org/base/v1/realms/{realm_id}")
+        );
+        assert_eq!(
+            totals_url(url).unwrap().as_str(),
+            format!("https://r.example.org/base/v1/realms/{realm_id}/totals")
         );
     }
 
@@ -635,7 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialized_change_shortens() {
-        // Replicated settings arriving at the reporter persist a due time one minute away.
+        // Replicated settings arriving at the reporter persist a due time a few seconds away.
         let dir = tempdir().unwrap();
         let context = DriverContext {
             storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
@@ -670,7 +727,7 @@ mod tests {
         assert_eq!(read_timer(storage, &key).await.unwrap(), None);
         publish_soon(&context, config.realm_id, reporter()).await;
         let due = read_timer(storage, &key).await.unwrap().unwrap();
-        let limit = (unix_timestamp_secs() + 61) * 1000;
+        let limit = (unix_timestamp_secs() + PUBLISH_SOON.as_secs() + 1) * 1000;
         assert!(due.due_unix_millis <= limit);
     }
 

@@ -88,6 +88,8 @@ pub struct CopyObjectInput {
     pub metadata: Option<HashMap<String, String>>,
     pub restrictions: Option<Vec<PathRestriction>>,
     pub references: CopyReferences,
+    /// The system job that runs the copy, recorded in the copy's origin.
+    pub job_id: Option<Ulid>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -391,7 +393,7 @@ async fn copy_inner(
         context,
         (input.realm_id, input.node_id),
         (&source_names.0, &source_names.1),
-        source_version_id,
+        (source_version_id, input.job_id),
     )
     .await;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
@@ -445,21 +447,26 @@ async fn copy_origin(
     context: &DriverContext,
     (realm_id, node_id): (RealmId, NodeId),
     (bucket, key): (&str, &str),
-    version_id: Option<Ulid>,
+    (version_id, job_id): (Option<Ulid>, Option<Ulid>),
 ) -> Option<VersionOrigin> {
     let version_id = version_id?;
     let source = drive(GetBucketOperation::new(bucket.to_string()), context)
         .await
         .ok()?;
     let distributed = source.distribution.is_some();
-    source_origin((realm_id, node_id), (bucket, key), version_id, distributed)
+    source_origin(
+        (realm_id, node_id),
+        (bucket, key),
+        (version_id, job_id),
+        distributed,
+    )
 }
 
 /// The origin of a copy of `version_id`: its global id in a distributed bucket, else its ARN.
 pub fn source_origin(
     (realm_id, node_id): (RealmId, NodeId),
     (bucket, key): (&str, &str),
-    version_id: Ulid,
+    (version_id, job_id): (Ulid, Option<Ulid>),
     distributed: bool,
 ) -> Option<VersionOrigin> {
     let from = match distributed {
@@ -471,7 +478,7 @@ pub fn source_origin(
             VersionedObjectArn::new(realm_id, node_id, bucket, key, version_id).ok()?,
         ),
     };
-    Some(VersionOrigin::Copy { from })
+    Some(VersionOrigin::Copy { from, job_id })
 }
 
 /// Publishes the destination as a new version of the source's archive and grants.
@@ -499,6 +506,7 @@ async fn sealed_copy(
         realm_id: input.realm_id,
         node_id: input.node_id,
         quota_ceiling: input.quota_ceiling,
+        job_id: input.job_id,
     });
     let operation = match gate_context(context, input.realm_id, now_ms()).await? {
         Some(gate) => operation.with_gate(gate),
@@ -590,6 +598,7 @@ async fn preserve_reference(
             connector_guard: None,
             mirror_guards: Vec::new(),
             restrictions: input.restrictions,
+            job_id: input.job_id,
         },
     )
     .await?;
@@ -903,6 +912,7 @@ pub(crate) mod test {
                 metadata: None,
                 restrictions: None,
                 references: CopyReferences::Materialize,
+                job_id: None,
             },
         )
         .await
@@ -957,6 +967,7 @@ pub(crate) mod test {
                 metadata: None,
                 restrictions: None,
                 references: CopyReferences::Materialize,
+                job_id: None,
             },
         )
         .await
@@ -1045,6 +1056,7 @@ pub(crate) mod test {
                 metadata: None,
                 restrictions: None,
                 references: CopyReferences::Materialize,
+                job_id: None,
             },
         )
         .await
@@ -1156,6 +1168,7 @@ pub(crate) mod test {
                 metadata: None,
                 restrictions: None,
                 references: CopyReferences::Preserve,
+                job_id: None,
             },
         )
         .await
@@ -1254,6 +1267,7 @@ pub(crate) mod test {
             metadata: None,
             restrictions: None,
             references: CopyReferences::Preserve,
+            job_id: None,
         };
 
         let refused = copy_object(&context, request("plain")).await;
@@ -1379,6 +1393,7 @@ pub(crate) mod test {
                 metadata: None,
                 restrictions: None,
                 references: CopyReferences::Materialize,
+                job_id: None,
             },
             Some(pulled.clone()),
         )
@@ -1451,6 +1466,7 @@ pub(crate) mod test {
                 metadata: None,
                 restrictions: None,
                 references: CopyReferences::Materialize,
+                job_id: None,
             },
             Some(pulled.clone()),
         )
@@ -1528,6 +1544,7 @@ pub(crate) mod test {
                 metadata: None,
                 restrictions: None,
                 references: CopyReferences::Materialize,
+                job_id: None,
             },
         )
         .await
@@ -1599,6 +1616,7 @@ pub(crate) mod test {
                 metadata: None,
                 restrictions: None,
                 references: CopyReferences::Materialize,
+                job_id: None,
             },
         )
         .await
@@ -1764,6 +1782,7 @@ pub(crate) mod test {
                 metadata: None,
                 restrictions: None,
                 references: CopyReferences::Materialize,
+                job_id: None,
             },
         )
         .await

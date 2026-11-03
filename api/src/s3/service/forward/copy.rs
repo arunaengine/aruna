@@ -288,6 +288,7 @@ impl ArunaS3Service {
                 realm_id: self.realm_id,
                 version_id,
             }),
+            job_id: None,
         });
         let context = CopyContext {
             policies: answered_policies(&read)?,
@@ -364,7 +365,7 @@ impl ArunaS3Service {
             policies: read.source_policies.clone(),
             origin: version.and_then(|id| {
                 let local = (self.realm_id, self.node_id);
-                source_origin(local, (&name, &key_of), id, distributed)
+                source_origin(local, (&name, &key_of), (id, None), distributed)
             }),
         };
         headers.extend(context_header(&context)?);
