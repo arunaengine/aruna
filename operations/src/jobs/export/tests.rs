@@ -863,6 +863,7 @@ fn job_context(driver: Arc<DriverContext>, owner_node_id: NodeId) -> JobContext 
             },
         ),
         range_turns: Default::default(),
+        mailer: None,
     }
 }
 
