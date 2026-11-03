@@ -1,4 +1,4 @@
-//! Stores the signed-in profile as JSON and its token in the OS keyring or a private file.
+//! Stores the signed-in profile as JSON and its token in the OS keyring, never in a file.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -9,17 +9,6 @@ use std::path::{Path, PathBuf};
 
 const KEYRING_SERVICE: &str = "aruna-cli";
 const PROFILE_FILE: &str = "profile.json";
-const TOKEN_FILE: &str = "token";
-
-/// Where a token is kept: `auto` tries the keyring first and falls back to the file.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum TokenStore {
-    #[default]
-    Auto,
-    Keyring,
-    File,
-}
 
 /// The realm and session a login recorded; never holds the token itself.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -32,24 +21,22 @@ pub struct Profile {
     pub user_name: Option<String>,
     pub session_id: Option<String>,
     pub expires_at: Option<String>,
-    pub store: TokenStore,
 }
 
-/// The configuration directory with its profile and token.
+/// The configuration directory with the profile; the token is in the keyring.
 pub struct Config {
     pub dir: PathBuf,
-    pub store: TokenStore,
 }
 
 impl Config {
-    pub fn new(dir: Option<PathBuf>, store: TokenStore) -> Result<Self, CliError> {
+    pub fn new(dir: Option<PathBuf>) -> Result<Self, CliError> {
         let dir = match dir {
             Some(dir) => dir,
             None => dirs::config_dir()
                 .ok_or_else(|| CliError::usage("no config directory; pass --config-dir"))?
                 .join("aruna-cli"),
         };
-        Ok(Self { dir, store })
+        Ok(Self { dir })
     }
 
     pub fn load_profile(&self) -> Result<Option<Profile>, CliError> {
@@ -67,20 +54,11 @@ impl Config {
         Ok(())
     }
 
-    /// Saves the token and returns the store that took it.
-    pub fn save_token(&self, api: &str, token: &str) -> Result<TokenStore, CliError> {
-        if self.store != TokenStore::File {
-            match keyring_entry(api).and_then(|entry| entry.set_password(token)) {
-                Ok(()) => return Ok(TokenStore::Keyring),
-                Err(error) if self.store == TokenStore::Keyring => {
-                    return Err(CliError::usage(format!("keyring unavailable: {error}")));
-                }
-                Err(_) => {}
-            }
-        }
-        std::fs::create_dir_all(&self.dir)?;
-        write_private(&self.dir.join(TOKEN_FILE), token.as_bytes())?;
-        Ok(TokenStore::File)
+    /// Saves the token in the OS keyring; without one, login fails and scripts use ARUNA_TOKEN.
+    pub fn save_token(&self, api: &str, token: &str) -> Result<(), CliError> {
+        keyring_entry(api)
+            .and_then(|entry| entry.set_password(token))
+            .map_err(keyring_missing)
     }
 
     /// The `ARUNA_TOKEN` variable wins over the stored token, so scripts need no login.
@@ -90,42 +68,39 @@ impl Config {
         {
             return Ok(token.trim().to_string());
         }
-        let token = match profile.store {
-            TokenStore::Keyring => keyring_entry(&profile.api)
-                .and_then(|entry| entry.get_password())
-                .map_err(|error| CliError::usage(format!("keyring: {error}")))?,
-            _ => match std::fs::read_to_string(self.dir.join(TOKEN_FILE)) {
-                Ok(token) => token,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(CliError::NotSignedIn);
-                }
-                Err(error) => return Err(error.into()),
-            },
-        };
-        Ok(token.trim().to_string())
+        match keyring_entry(&profile.api).and_then(|entry| entry.get_password()) {
+            Ok(token) => Ok(token.trim().to_string()),
+            Err(keyring::Error::NoEntry) => Err(CliError::NotSignedIn),
+            Err(error) => Err(keyring_missing(error)),
+        }
     }
 
-    /// Removes the token from both stores and the profile; missing entries are fine.
+    /// Removes the token from the keyring and the profile; missing entries are fine.
     pub fn forget(&self, profile: &Profile) -> Result<(), CliError> {
-        if profile.store == TokenStore::Keyring
-            && let Ok(entry) = keyring_entry(&profile.api)
-        {
+        if let Ok(entry) = keyring_entry(&profile.api) {
             let _ = entry.delete_credential();
         }
-        for name in [TOKEN_FILE, PROFILE_FILE] {
-            match std::fs::remove_file(self.dir.join(name)) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(error.into());
-                }
-                _ => {}
-            }
+        match std::fs::remove_file(self.dir.join(PROFILE_FILE)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
+fn keyring_missing(error: keyring::Error) -> CliError {
+    CliError::usage(format!(
+        "the OS keyring is not available ({error}); set ARUNA_API and ARUNA_TOKEN instead of login"
+    ))
+}
+
+/// An entry in the store the embedding program set, such as a test's mock, else the OS keyring.
 fn keyring_entry(api: &str) -> keyring::Result<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, api)
+    match keyring_core::get_default_store() {
+        Some(_) => Ok(keyring::Entry {
+            inner: keyring_core::Entry::new(KEYRING_SERVICE, api)?,
+        }),
+        None => keyring::Entry::new(KEYRING_SERVICE, api),
+    }
 }
 
 /// Writes a file only its owner can read, also on the first write.
@@ -151,28 +126,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn file_store_roundtrip() {
+    fn keyring_roundtrip() {
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::new(Some(dir.path().to_path_buf()), TokenStore::File).unwrap();
-        let store = config.save_token("http://node/api/v1/", "secret").unwrap();
-        assert_eq!(store, TokenStore::File);
+        let config = Config::new(Some(dir.path().to_path_buf())).unwrap();
         let profile = Profile {
-            api: "http://node/api/v1/".into(),
-            store,
+            api: "http://keyring-roundtrip/api/v1/".into(),
             ..Profile::default()
         };
+        config.save_token(&profile.api, "secret").unwrap();
         config.save_profile(&profile).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join(TOKEN_FILE))
-                .unwrap()
-                .permissions();
-            assert_eq!(mode.mode() & 0o777, 0o600);
-        }
-        let loaded = config.load_profile().unwrap().unwrap();
-        assert_eq!(loaded.store, TokenStore::File);
-        config.forget(&loaded).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(config.load_token(&profile).unwrap(), "secret");
+        config.forget(&profile).unwrap();
         assert!(config.load_profile().unwrap().is_none());
+        assert!(matches!(
+            config.load_token(&profile),
+            Err(CliError::NotSignedIn)
+        ));
     }
 }

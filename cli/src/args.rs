@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::config::TokenStore;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -22,18 +21,9 @@ pub struct Cli {
     /// The node's API URL, such as https://node.example; login stores it.
     #[arg(long, global = true, env = "ARUNA_API")]
     pub api: Option<String>,
-    /// Folder for the profile and the token file.
+    /// Folder for the profile; login keeps the token in the OS keyring.
     #[arg(long, global = true, env = "ARUNA_CONFIG_DIR")]
     pub config_dir: Option<PathBuf>,
-    /// Where login keeps the token: the OS keyring, a private file, or auto.
-    #[arg(
-        long,
-        global = true,
-        value_enum,
-        default_value_t,
-        env = "ARUNA_TOKEN_STORE"
-    )]
-    pub token_store: TokenStore,
     /// The node that hosts a bucket, when its name exists on several nodes.
     #[arg(long, global = true)]
     pub node: Option<String>,

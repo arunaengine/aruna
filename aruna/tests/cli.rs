@@ -9,18 +9,21 @@ use crate::shared::{
 use aws_sdk_s3::primitives::ByteStream;
 use serde_json::Value;
 use std::path::Path;
+use std::sync::Once;
 use std::time::Duration;
+
+static MOCK_KEYRING: Once = Once::new();
 
 /// Runs one command line with a private config folder and returns its standard output.
 async fn cli(config: &Path, args: &[&str]) -> TestResult<String> {
+    // An in-memory keyring keyed by API URL, so tests stay apart without an OS keyring.
+    MOCK_KEYRING.call_once(|| {
+        if let Ok(store) = keyring_core::mock::Store::new() {
+            keyring_core::set_default_store(store);
+        }
+    });
     let config = config.to_string_lossy().to_string();
-    let mut line = vec![
-        "aruna-cli",
-        "--config-dir",
-        &config,
-        "--token-store",
-        "file",
-    ];
+    let mut line = vec!["aruna-cli", "--config-dir", &config];
     line.extend_from_slice(args);
     let mut out = Vec::new();
     // Names the command but not its arguments, which can hold the token.

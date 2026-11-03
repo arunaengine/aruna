@@ -64,7 +64,6 @@ struct LoginSummary<'a> {
     realm_id: Option<&'a str>,
     session_id: Option<&'a str>,
     expires_at: Option<&'a str>,
-    store: crate::config::TokenStore,
 }
 
 pub async fn login(context: &mut Context<'_>, args: LoginArgs) -> Result<(), CliError> {
@@ -108,7 +107,12 @@ pub async fn login(context: &mut Context<'_>, args: LoginArgs) -> Result<(), Cli
         revoke_previous(&context.config, &previous).await;
         context.config.forget(&previous)?;
     }
-    let store = context.config.save_token(api.base(), &token)?;
+    if let Err(error) = context.config.save_token(api.base(), &token) {
+        if let Some(session_id) = &session_id {
+            let _ = api.delete(&format!("access/sessions/{session_id}")).await;
+        }
+        return Err(error);
+    }
     let website = match args.website {
         Some(website) => website.trim_end_matches('/').to_string(),
         None => origin(api.base()),
@@ -122,7 +126,6 @@ pub async fn login(context: &mut Context<'_>, args: LoginArgs) -> Result<(), Cli
         user_name: Some(me.user.name.clone()),
         session_id,
         expires_at,
-        store,
     };
     context.config.save_profile(&profile)?;
     let summary = LoginSummary {
@@ -132,7 +135,6 @@ pub async fn login(context: &mut Context<'_>, args: LoginArgs) -> Result<(), Cli
         realm_id: profile.realm_id.as_deref(),
         session_id: profile.session_id.as_deref(),
         expires_at: profile.expires_at.as_deref(),
-        store,
     };
     if context.out.json {
         return context.out.json(&summary);
@@ -142,10 +144,9 @@ pub async fn login(context: &mut Context<'_>, args: LoginArgs) -> Result<(), Cli
         me.user.name, me.user.user_id, profile.api
     ))?;
     context.out.line(format!(
-        "Session {} expires at {}; the token is in the {}.",
+        "Session {} expires at {}; the token is in the OS keyring.",
         profile.session_id.as_deref().unwrap_or("(given token)"),
         profile.expires_at.as_deref().unwrap_or("an unknown time"),
-        store_name(store)
     ))
 }
 
@@ -174,7 +175,6 @@ pub async fn whoami(context: &mut Context<'_>) -> Result<(), CliError> {
             "realm_id": profile.realm_id,
             "session_id": profile.session_id,
             "expires_at": profile.expires_at,
-            "store": profile.store,
         });
         return context.out.json(&value);
     }
@@ -201,7 +201,6 @@ pub async fn whoami(context: &mut Context<'_>) -> Result<(), CliError> {
             "Expires".into(),
             profile.expires_at.clone().unwrap_or_else(unknown),
         ],
-        vec!["Token".into(), store_name(profile.store).to_string()],
     ];
     context.out.table(&["", ""], &rows)?;
     for group in &me.groups {
@@ -255,13 +254,6 @@ pub fn origin(base: &str) -> String {
     url::Url::parse(base)
         .map(|url| url.origin().ascii_serialization())
         .unwrap_or_else(|_| base.to_string())
-}
-
-fn store_name(store: crate::config::TokenStore) -> &'static str {
-    match store {
-        crate::config::TokenStore::Keyring => "OS keyring",
-        _ => "private token file",
-    }
 }
 
 /// The expiry claim of a JWT as RFC 3339, read without checking the signature.

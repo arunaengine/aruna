@@ -60,7 +60,7 @@ impl Context<'_> {
 
 pub async fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<(), CliError> {
     let mut context = Context {
-        config: Config::new(cli.config_dir, cli.token_store)?,
+        config: Config::new(cli.config_dir)?,
         api_flag: cli.api,
         node: cli.node,
         s3_endpoint: cli.s3_endpoint,

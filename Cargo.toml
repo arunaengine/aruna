@@ -138,6 +138,7 @@ iroh-io = "0.6.2"
 jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 json-patch = "4.2.0"
 keyring = "4.2.0"
+keyring-core = "1.0.1"
 lru = "0.18.5"
 md5 = "0.8.1"
 mime = "0.3.17"

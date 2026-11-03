@@ -66,6 +66,7 @@ rand = { workspace = true }
 
 [dev-dependencies]
 aruna-cli = { workspace = true }
+keyring-core = { workspace = true }
 aruna-kpabe = { workspace = true }
 axum = { workspace = true }
 aws-sdk-s3 = { workspace = true }

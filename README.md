@@ -136,7 +136,8 @@ aruna-cli sync ./run-42 my-bucket/run-42 --dry-run
 aruna-cli meta search "proteomics"
 ```
 
-The token is kept in the OS keyring, or in a private file when no keyring is available.
+The token is kept in the OS keyring. Without a keyring, set `ARUNA_API` and `ARUNA_TOKEN` instead of
+signing in; the token is then never stored.
 `aruna-cli --help` and `aruna-cli <command> --help` describe every command.
 
 ## Encrypted Buckets
