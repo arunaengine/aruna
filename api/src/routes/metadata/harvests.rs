@@ -71,8 +71,8 @@ pub struct HarvestResponse {
 - Follow and cancel the run with the job routes at `status_url`.
 
 **Errors**
-- 409 when the source exists with another target prefix or set, when the key is bound to another
-  job, or when the group is being deleted."#,
+- 409 when the source exists with another target prefix or set, when its last run has not
+  finished, when the key is bound to another job, or when the group is being deleted."#,
     params(
         ("group_id" = String, Path, description = "Group that owns the connector, as a 26-character ULID"),
         ("connector_id" = String, Path, description = "OAI-PMH connector to harvest, as a 26-character ULID")
@@ -93,7 +93,7 @@ pub struct HarvestResponse {
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or no WRITE on the group's metadata path", body = ErrorResponse),
         (status = 404, description = "The connector does not exist in the group", body = ErrorResponse),
-        (status = 409, description = "Another source definition, an idempotency key bound to another job, or a group being deleted", body = ErrorResponse),
+        (status = 409, description = "Another source definition, an unfinished run of the source, an idempotency key bound to another job, or a group being deleted", body = ErrorResponse),
         (status = 503, description = "The job could not be placed right now; the unchanged request may be retried", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
