@@ -44,6 +44,7 @@ const OPTIONAL_AUTH: &[(&str, &str)] = &[
     ("/metadata/search", "get"),
     ("/pid/lookup", "get"),
     ("/system/info", "get"),
+    ("/system/jobs", "get"),
     ("/system/realm", "get"),
     ("/ga4gh/drs/v1/objects", "post"),
     ("/ga4gh/drs/v1/objects/{object_id}", "get"),
@@ -124,6 +125,17 @@ fn filled(value: Option<&Value>) -> bool {
 
 /// JSON media entries of a request body or response. Other media types are
 /// fully described but carry no JSON body example.
+#[test]
+fn declares_bare_crate() {
+    // A JSON-LD client gets the bare crate, so its media type is declared beside the wrapper.
+    let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+    let ok = &doc["paths"]["/metadata/{document_id}/rocrate"]["get"]["responses"]["200"];
+    assert!(ok["content"]["application/json"].is_object());
+    let bare = &ok["content"]["application/ld+json"];
+    assert_eq!(bare["schema"]["type"], json!("object"));
+    assert!(bare["example"]["@graph"].is_array());
+}
+
 fn json_media(carrier: &Value) -> Vec<(&String, &Value)> {
     carrier
         .get("content")

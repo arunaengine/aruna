@@ -244,7 +244,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Read one group's storage usage on this node next to its realm-wide totals, its exact lifecycle-live dataset, Profile, and process-run counts, and its quota status. The caller must be a member of that group; a non-member receives Forbidden. Use count_datasets for the caller's totals across every group in one call rather than summing this per group, get_realm_info for the realm's quota configuration rather than one group's consumption, and list_groups first for a valid group_id.",
+        description = "Read one group's storage usage on this node next to its realm-wide totals, its exact lifecycle-live dataset, Profile, and process-run counts, and its quota status. Every figure covers that one group only, never the realm: for how many objects or bytes the whole realm holds, call get_realm_info. The caller must be a member of that group; a non-member receives Forbidden. Use count_datasets for the caller's totals across every group in one call, and list_groups first for a valid group_id.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -267,7 +267,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Describe the realm this node serves: realm id, description, OIDC providers, metadata replication, quota configuration, member nodes, the endpoints this node exposes, and a public_overview whose live_datasets is the realm-wide count of live metadata documents, alongside the group and configured-node counts. Takes no arguments. That realm document count is already here, so a SPARQL count over all metadata is unnecessary. Its live_datasets is not caller-filtered and counts every document kind, so use count_datasets for the caller's own dataset, Profile, and process-run totals, get_group_usage for one group's counts and consumption, and get_node_info for the answering node's version and service health.",
+        description = "Describe the realm this node serves: realm id, description, OIDC providers, metadata replication, quota configuration, member nodes, the endpoints this node exposes, and public_overview with realm-wide totals. Call it for how many objects or bytes the realm holds: public_overview.objects counts the current objects of every bucket on every node, references included, and public_overview.data_bytes their bytes; null means this node cannot read the totals right now, not zero. public_overview.live_datasets counts every live metadata document kind, not the caller's datasets, so use count_datasets for those. Takes no arguments. Use get_group_usage for one group and get_node_info for the answering node's version and service health.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -287,7 +287,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Describe the node answering this request: api version, capabilities, peer addresses, and network, blob, and database service status. Takes no arguments. Use get_realm_info for realm-wide configuration and the list of member nodes. Buckets, objects, and jobs are node-local, so this identifies the node those tools act on.",
+        description = "Describe the node answering this request: api version, capabilities, peer addresses, and network, blob, and database service status. Takes no arguments. Its figures cover this one node only, not realm totals: use get_realm_info for realm-wide object and byte totals, configuration, and member nodes. Jobs are node-local, so this identifies the node the job tools act on; the object tools run on the node that holds the bucket.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

@@ -1038,7 +1038,7 @@ async fn registration_consumes_secret() {
 }
 
 /// A relay hop header from any caller must not let a node that is not a management node mint a
-/// user of its own.
+/// user of its own: the call is still relayed, and no management node answers here.
 #[tokio::test]
 async fn refuses_local_registration() {
     let issuer = "https://issuer.example";
@@ -1065,7 +1065,7 @@ async fn refuses_local_registration() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     node.server_task.abort();
     node.net.shutdown().await;

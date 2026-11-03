@@ -21,6 +21,7 @@ use crate::auth::{ValidatedBearer, ensure_permission, permission_granted, requir
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{bearer_token_string, map_api_error};
 use crate::routes::storage::deletion::bucket_info;
+use crate::routes::storage::relay::{node_read, query_path};
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 25;
@@ -437,6 +438,9 @@ pub async fn file_part_of(
     }))
 }
 
+/// How long a signed-out resolution waits for the node that owns the bucket.
+const OWNER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PartTargetParams {
     /// A bucket or prefix global id URL, or a bucket-prefix ARN of an ordinary bucket.
@@ -467,7 +471,9 @@ pub struct PartTargetResponse {
 
 **Authentication**: realm bearer token. Listing the files afterwards needs READ on the bucket
 on the node that serves them; resolving grants nothing. Without a token, only a part that
-public roles grant READ on resolves, and any other part answers 401 as an absent one does.
+public roles grant READ on resolves, and any other part answers 401 as an absent one does. A
+part of another node's ordinary bucket is then resolved by that node, which checks its own
+public roles.
 
 **Behavior**
 - A distributed bucket is named by its set and browsed on any member; `held_here` says whether
@@ -487,7 +493,8 @@ public roles grant READ on resolves, and any other part answers 401 as an absent
             "held_here": true
         })),
         (status = 400, description = "`id` names no bucket or prefix", body = ErrorResponse),
-        (status = 401, description = "Invalid bearer token, or no public READ on the part without one", body = ErrorResponse)
+        (status = 401, description = "Invalid bearer token, or no public READ on the part without one", body = ErrorResponse),
+        (status = 503, description = "Without a token, the node that owns the bucket did not answer", body = ErrorResponse)
     ),
     security(("bearer_auth" = []), ())
 )]
@@ -505,6 +512,19 @@ pub async fn part_target(
     let target = resolve_part(state.get_ctx().as_ref(), state.get_node_id(), link)
         .await
         .map_err(map_api_error)?;
+    // Signed out, a part of another node's bucket resolves only as that node answers.
+    if let Some(owner) = target.node_id.filter(|owner| *owner != state.get_node_id())
+        && signed_out
+        && target.read_paths.is_empty()
+    {
+        let path = query_path("/metadata/links/target", &[("id", &target.link.to_id())]);
+        let deadline = tokio::time::Instant::now() + OWNER_DEADLINE;
+        let answer: PartTargetResponse = node_read(&state, owner, &path, None, deadline).await?;
+        return Ok(Json(PartTargetResponse {
+            held_here: false,
+            ..answer
+        }));
+    }
     // Signed out, a part resolves only where public roles grant READ on it here.
     if signed_out && !any_granted(&state, &auth, &target.read_paths).await? {
         return Err(ServerError::Unauthorized);

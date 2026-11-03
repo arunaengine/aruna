@@ -378,6 +378,7 @@ async fn delete_versions(
     info: &BucketInfo,
     checkpoint: &mut StoragePurgeCheckpoint,
 ) -> Result<(), PurgeRunError> {
+    let guards = release_guards(ctx, spec, info).await?;
     loop {
         check_stop(ctx)?;
         wait_paused(ctx).await?;
@@ -407,7 +408,6 @@ async fn delete_versions(
         {
             authorize_object(ctx, spec, key).await?;
         }
-        let guards = release_guards(ctx, spec, info, &entries).await?;
         let indexes = match files {
             true => plan_files(ctx, spec, &entries).await?,
             false => Vec::new(),
@@ -423,7 +423,7 @@ async fn delete_versions(
                 node_id: spec.node_id,
                 deleted_by: spec.auth_context.user_id,
                 restrictions: spec.auth_context.path_restrictions.clone(),
-                guards,
+                guards: guards.clone(),
             },
         )
         .await;
@@ -444,13 +444,12 @@ async fn delete_versions(
     }
 }
 
-/// Refuses the batch while a release pins one of its versions, also one published after the
-/// purge was submitted; else the guards each delete keeps.
+/// Refuses the purge while a release pins any version in its scope, also one published after the
+/// purge was submitted; else the guards of the first check, which every delete keeps.
 async fn release_guards(
     ctx: &JobContext,
     spec: &StoragePurgeSpec,
     info: &BucketInfo,
-    entries: &[BulkDeleteEntry],
 ) -> Result<ReleaseGuards, PurgeRunError> {
     let scope = BucketScope {
         realm_id: spec.auth_context.realm_id,
@@ -458,21 +457,45 @@ async fn release_guards(
         bucket: spec.scope.bucket(),
         info,
     };
-    let queries: Vec<MembershipQuery> = (entries.iter())
-        .filter_map(|entry| {
-            Some(MembershipQuery {
-                key: entry.key.clone(),
-                version_id: entry.version_id?,
+    let (mut guards, mut key_marker, mut version_marker) = (None, None, None);
+    loop {
+        check_stop(ctx)?;
+        let page = list_version_page(
+            ctx,
+            &spec.scope,
+            PURGE_BATCH_SIZE,
+            key_marker,
+            version_marker,
+        )
+        .await?;
+        let queries: Vec<MembershipQuery> = (page.items.iter())
+            .map(|item| match item {
+                ListVersionsItem::Version {
+                    key, version_id, ..
+                }
+                | ListVersionsItem::DeleteMarker {
+                    key, version_id, ..
+                } => MembershipQuery {
+                    key: key.clone(),
+                    version_id: *version_id,
+                },
             })
-        })
-        .collect();
-    let auth = &spec.auth_context;
-    match version_pins(&ctx.driver, scope, auth, &queries).await {
-        Ok((pins, _)) if pins.contains(&true) => {
-            Err(JobError::permanent(PinnedError::Scope.to_string()).into())
+            .collect();
+        match version_pins(&ctx.driver, scope, &spec.auth_context, &queries).await {
+            Ok((pins, _)) if pins.contains(&true) => {
+                return Err(JobError::permanent(PinnedError::Scope.to_string()).into());
+            }
+            Ok((_, read)) => guards = guards.or(Some(read)),
+            Err(error) => return Err(JobError::retryable(error.to_string()).into()),
         }
-        Ok((_, guards)) => Ok(guards),
-        Err(error) => Err(JobError::retryable(error.to_string()).into()),
+        if !page.is_truncated {
+            return Ok(guards.unwrap_or_default());
+        }
+        key_marker = page.next_key_marker;
+        version_marker = page.next_version_marker;
+        if key_marker.is_none() {
+            return Err(JobError::retryable("version inventory truncated without a cursor").into());
+        }
     }
 }
 

@@ -6,6 +6,7 @@ use crate::auth::{
     ensure_permission, permission_granted, require_realm_auth, require_unrestricted_auth,
 };
 use crate::error::{ServerError, ServerResult};
+use crate::routes::federation::AcceptedRealmsSetting;
 use crate::routes::node_names::CoordinatesBody;
 pub use crate::server::state::PortalStatus;
 use crate::server::state::ServerState;
@@ -307,6 +308,10 @@ pub struct RealmInfoResponse {
     /// without sign-in reaches a named node. Public; user devices are never listed.
     #[serde(default)]
     pub public_nodes: Vec<PublicNode>,
+    /// Which other realms' users may log in here, from the federation settings; mode `none`
+    /// when the realm has none. Public.
+    #[serde(default)]
+    pub accepted_realms: AcceptedRealmsSetting,
     /// Realm discovery configuration. Realm-authenticated callers only.
     #[schema(value_type = Object)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1110,6 +1115,9 @@ token of another realm or one this node cannot validate, the response is the pub
 - `public_nodes` is also public: each server and management node's id and published api base url,
   nothing else, so a page without sign-in (such as a share link) reaches the node it names. User
   devices are never listed.
+- `accepted_realms` is also public: which other realms' users may log in here, from the federation
+  settings. Mode `none` (also without federation settings), `any`, or `only` with the accepted
+  realm ids in `realms`. A sign-in page offers login with another realm only when it is not `none`.
 - `public_overview` carries five nullable aggregates: `live_datasets`, the realm's lifecycle-live
   metadata registry count, never caller-filtered or replica-multiplied; `groups`, the realm's
   stored group count; `nodes_configured`, the membership count in this node's replicated realm
@@ -1164,6 +1172,7 @@ token of another realm or one this node cannot validate, the response is the pub
                         "is_management_node": false,
                         "management_urls": ["https://mgmt.example.test/api/v1"],
                         "public_nodes": [{"node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978", "api_url": "https://node.example.test/api/v1"}],
+                        "accepted_realms": {"mode": "only", "realms": ["BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"]},
                         "oidc_providers": [
                             {
                                 "id": "example",
@@ -1195,6 +1204,7 @@ token of another realm or one this node cannot validate, the response is the pub
                         "is_management_node": true,
                         "management_urls": ["https://node.example.test/api/v1"],
                         "public_nodes": [{"node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978", "api_url": "https://node.example.test/api/v1"}],
+                        "accepted_realms": {"mode": "any"},
                         "oidc_providers": [],
                         "discovery": {"Dynamic": {"methods": [{"DhtSigned": {"ttl_secs": 3600, "refresh_after_secs": 1800}}]}},
                         "nodes": [
@@ -1360,6 +1370,12 @@ pub(crate) async fn run_realm_info(
         (None, visitor_nodes(state, &config).await, None)
     };
 
+    let accepted_realms = config
+        .federation
+        .as_ref()
+        .map(|settings| AcceptedRealmsSetting::from(&settings.accepted_realms))
+        .unwrap_or_default();
+
     Ok(RealmInfoResponse {
         realm_id: config.realm_id.to_string(),
         description: config.description,
@@ -1378,6 +1394,7 @@ pub(crate) async fn run_realm_info(
         is_management_node: state.is_management_node(),
         management_urls,
         public_nodes,
+        accepted_realms,
         discovery,
         nodes,
         quota,
@@ -1585,7 +1602,7 @@ fn map_node_document(
     }
 }
 
-async fn is_realm_admin(state: &ServerState, auth: &AuthContext) -> ServerResult<bool> {
+pub(crate) async fn is_realm_admin(state: &ServerState, auth: &AuthContext) -> ServerResult<bool> {
     let realm_id = state.get_realm_id();
     permission_granted(
         state,
@@ -1614,13 +1631,13 @@ async fn require_realm_admin(
 /// How much of `/info` a caller may see. Foreign-realm tokens are treated like
 /// anonymous callers: `/info` answers every caller, it just answers with less.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InfoAccess {
+pub(crate) enum InfoAccess {
     Public,
     Realm,
     Admin,
 }
 
-async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAccess {
+pub(crate) async fn info_access(state: &ServerState, auth: Option<&AuthContext>) -> InfoAccess {
     let Some(auth) = auth else {
         return InfoAccess::Public;
     };

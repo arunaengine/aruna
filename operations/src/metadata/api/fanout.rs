@@ -165,8 +165,20 @@ pub(super) fn query_union_safe(query: &str) -> bool {
             let spargebra::algebra::GraphPattern::Distinct { inner } = pattern else {
                 return false;
             };
-            let spargebra::algebra::GraphPattern::Project { inner, .. } = *inner else {
+            let spargebra::algebra::GraphPattern::Project { inner, variables } = *inner else {
                 return false;
+            };
+            let inner = match *inner {
+                spargebra::algebra::GraphPattern::OrderBy { inner, expression } => {
+                    if !expression
+                        .iter()
+                        .all(|order| order_projected(order, &variables))
+                    {
+                        return false;
+                    }
+                    *inner
+                }
+                pattern => pattern,
             };
             union_pattern_safe(&inner)
         }
@@ -178,6 +190,15 @@ pub(super) fn query_union_safe(query: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn order_projected(
+    order: &spargebra::algebra::OrderExpression,
+    variables: &[spargebra::term::Variable],
+) -> bool {
+    let (spargebra::algebra::OrderExpression::Asc(expression)
+    | spargebra::algebra::OrderExpression::Desc(expression)) = order;
+    matches!(expression, spargebra::algebra::Expression::Variable(variable) if variables.contains(variable))
 }
 
 fn union_pattern_safe(pattern: &spargebra::algebra::GraphPattern) -> bool {
@@ -619,11 +640,15 @@ pub async fn search_buckets_distributed(
             context.clone(),
             request.auth,
             realm_id,
-            request.query.clone(),
+            (
+                request.query.clone(),
+                request.key.clone(),
+                request.extras.clone(),
+            ),
             limit,
             positions.clone(),
         ),
-        move |(context, auth, realm_id, query, limit, positions), node_id| async move {
+        move |(context, auth, realm_id, (query, key, extras), limit, positions), node_id| async move {
             let Some(start_after) = start_after(&positions, node_id) else {
                 return Ok(BucketPage::default());
             };
@@ -634,6 +659,8 @@ pub async fn search_buckets_distributed(
                     realm_id,
                     node_id,
                     query,
+                    key,
+                    extras,
                     limit,
                     group_id,
                     start_after: start_after.map(Into::into),
@@ -648,11 +675,11 @@ pub async fn search_buckets_distributed(
         (
             handle,
             remote_auth_token,
-            request.query,
+            (request.query, request.key, request.extras),
             limit,
             positions.clone(),
         ),
-        move |(handle, auth_token, query, limit, positions), node_id| async move {
+        move |(handle, auth_token, (query, key, extras), limit, positions), node_id| async move {
             let Some(start_after) = start_after(&positions, node_id) else {
                 return Ok(BucketPage::default());
             };
@@ -660,7 +687,7 @@ pub async fn search_buckets_distributed(
                 .request_bucket_search(
                     node_id,
                     auth_token,
-                    (query, limit),
+                    (query, key, extras, limit),
                     (group_id, database),
                     start_after,
                 )

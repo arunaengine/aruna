@@ -319,7 +319,9 @@ pub(crate) fn map_api_error(error: MetadataApiError) -> ServerError {
         MetadataApiError::PlacementUnavailable(_) => {
             ServerError::ServiceUnavailableReason("placement_activation_unavailable".to_string())
         }
-        MetadataApiError::InvalidCursor(message) => ServerError::BadRequestMessage(message),
+        MetadataApiError::InvalidCursor(message) | MetadataApiError::InvalidQuery(message) => {
+            ServerError::BadRequestMessage(message)
+        }
         MetadataApiError::Internal(message) => ServerError::InternalError(message),
     }
 }

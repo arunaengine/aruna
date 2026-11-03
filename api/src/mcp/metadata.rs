@@ -166,10 +166,8 @@ impl McpServer {
             authorize_summary(
                 self,
                 &auth,
-                &document.group_id,
-                &document.document_path,
-                &document.document_id,
-                "list_profiles",
+                (&document.group_id, &document.document_path),
+                (&document.document_id, document.public),
                 empty_extras("list_profiles"),
             )
             .await?;
@@ -215,6 +213,7 @@ impl McpServer {
                 self,
                 &auth,
                 ReadObjectInput {
+                    node_id: None,
                     bucket,
                     key,
                     offset: None,
@@ -254,20 +253,8 @@ impl McpServer {
         let auth = request_auth(&parts)?;
         let extras = tool_extras("search_datasets", &input)?;
         let group_id = input.group_id.as_deref().map(parse_group).transpose()?;
-        match group_id {
-            Some(group_id) => {
-                authorize_tool(
-                    &self.state,
-                    &auth,
-                    metadata_group_path(self, group_id),
-                    Permission::READ,
-                    extras,
-                )
-                .await
-                .map_err(server_error)?;
-            }
-            None => metadata_probe(self, &auth, "search_datasets", extras).await?,
-        }
+        // As in REST, a group filter only narrows the hits, each checked for the caller.
+        metadata_probe(self, &auth, "search_datasets", extras).await?;
         let result = search_metadata(
             self.state.get_ctx().as_ref(),
             self.state.get_realm_id(),
@@ -475,15 +462,10 @@ impl McpServer {
             let record = crate::metadata::load_document_record(&self.state, document_id)
                 .await
                 .map_err(|error| query_error(error, true))?;
-            authorize_tool(
-                &self.state,
-                &auth,
-                record.permission_path,
-                Permission::READ,
-                extras,
-            )
-            .await
-            .map_err(server_error)?;
+            let document = (record.permission_path.as_str(), record.public);
+            authorize_document(self, &auth, document, extras)
+                .await
+                .map_err(server_error)?;
             query_metadata_document(
                 self.state.get_ctx().as_ref(),
                 self.state.get_realm_id(),
@@ -713,28 +695,36 @@ fn metadata_group_path(server: &McpServer, group_id: Ulid) -> String {
 async fn authorize_summary(
     server: &McpServer,
     auth: &AuthContext,
-    group_id: &str,
-    path: &str,
-    document_id: &str,
-    _tool: &str,
+    (group_id, path): (&str, &str),
+    (document_id, public): (&str, bool),
     extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     let group_id = crate::auth::parse_group_id(group_id).map_err(server_error)?;
     let document_id = crate::metadata::parse_document_id(document_id).map_err(server_error)?;
-    authorize_tool(
-        &server.state,
-        auth,
-        MetadataRegistryRecord::permission_path_for(
-            &server.state.get_realm_id(),
-            group_id,
-            path,
-            document_id,
-        ),
-        Permission::READ,
-        extras,
+    let path = MetadataRegistryRecord::permission_path_for(
+        &server.state.get_realm_id(),
+        group_id,
+        path,
+        document_id,
+    );
+    authorize_document(server, auth, (&path, public), extras)
+        .await
+        .map_err(server_error)
+}
+
+/// A public document needs only the request policies, as for the REST metadata reads.
+async fn authorize_document(
+    server: &McpServer,
+    auth: &AuthContext,
+    document: (&str, bool),
+    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+) -> Result<(), crate::error::ServerError> {
+    let (context, realm_id) = (server.state.get_ctx(), server.state.get_realm_id());
+    aruna_operations::auth::request_authorization::authorize_document(
+        &context, realm_id, auth, document, extras,
     )
     .await
-    .map_err(server_error)
+    .map_err(crate::auth::map_authorize_error)
 }
 
 pub(crate) async fn load_raw(
@@ -748,15 +738,10 @@ pub(crate) async fn load_raw(
     let record = crate::metadata::load_document_record(&server.state, document_id)
         .await
         .map_err(document_error)?;
-    authorize_tool(
-        &server.state,
-        auth,
-        record.permission_path.clone(),
-        Permission::READ,
-        tool_extras(tool, input)?,
-    )
-    .await
-    .map_err(document_error)?;
+    let document = (record.permission_path.as_str(), record.public);
+    authorize_document(server, auth, document, tool_extras(tool, input)?)
+        .await
+        .map_err(document_error)?;
     let params = crate::metadata::RoCrateExportParams {
         view: Some(crate::metadata::MetadataRoCrateView::Raw),
         limit: None,
@@ -1182,6 +1167,9 @@ mod authorization_tests {
         )
         .await
         .unwrap();
+        // A text search sees only committed index updates.
+        let handle = ctx.metadata_handle.as_ref().unwrap();
+        handle.flush_search_updates().await.unwrap();
     }
 
     fn draft_crate(name: &str) -> Value {
@@ -1206,6 +1194,10 @@ mod authorization_tests {
     }
 
     async fn seed_document(fixture: &Fixture, path: &str) -> Ulid {
+        seed_visible(fixture, path, false).await
+    }
+
+    async fn seed_visible(fixture: &Fixture, path: &str, public: bool) -> Ulid {
         let record = crate::metadata::run_create_metadata(
             &fixture.server.state,
             &fixture.auth,
@@ -1213,7 +1205,7 @@ mod authorization_tests {
             None,
             fixture.group_id,
             path.to_string(),
-            false,
+            public,
             CreateDocumentPayload::RoCrate {
                 jsonld: serde_json::to_string(&draft_crate("MCP authorization fixture")).unwrap(),
             },
@@ -1269,6 +1261,52 @@ mod authorization_tests {
             .await
             .expect("the owner may read the document");
         assert!(allowed.0.0["raw"].is_object());
+    }
+
+    // A public document reads for every realm user, as through REST, and a public Profile
+    // lists for them, while a private document stays refused.
+    #[tokio::test]
+    async fn public_document_reads() {
+        let fixture = fixture().await;
+        let private = seed_document(&fixture, "datasets/mcp-private").await;
+        let open = seed_visible(&fixture, "profiles/mcp-open", true).await;
+        let server = &fixture.server;
+        let caller = || Extension(parts_with(Some(stranger(&fixture))));
+        let id = |document_id: Ulid| {
+            Parameters(IdInput {
+                id: document_id.to_string(),
+            })
+        };
+        let read = server.get_dataset(caller(), id(open)).await;
+        assert!(read.expect("a public document reads").0.0["raw"].is_object());
+        let profile = server.get_profile(caller(), id(open)).await;
+        assert!(profile.expect("a public Profile reads").0.0["profile"].is_object());
+        let listed = server.list_profiles(caller()).await;
+        let listed = listed.expect("a public Profile lists").0.0.to_string();
+        assert!(listed.contains(&open.to_string()), "{listed}");
+        let query = SparqlInput {
+            query: "ASK { ?s ?p ?o }".to_string(),
+            document_id: Some(open.to_string()),
+        };
+        let asked = server.sparql_query(caller(), Parameters(query)).await;
+        asked.expect("a public document answers a query");
+        let search = DatasetSearchInput {
+            q: "authorization".to_string(),
+            conforms_to: None,
+            group_id: Some(fixture.group_id.to_string()),
+            limit: None,
+        };
+        let found = server.search_datasets(caller(), Parameters(search)).await;
+        let found = found
+            .expect("a group filter narrows the hits")
+            .0
+            .0
+            .to_string();
+        assert!(found.contains(&open.to_string()), "{found}");
+        assert!(!found.contains(&private.to_string()), "{found}");
+        let denied = server.get_dataset(caller(), id(private)).await;
+        let body = denied_body(denied, "a stranger must not read a private document");
+        assert_eq!(body["code"], "Forbidden");
     }
 
     #[tokio::test]

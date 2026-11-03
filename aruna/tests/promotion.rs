@@ -4,13 +4,19 @@
 
 use crate::shared;
 
+use std::time::Duration;
+
 use aruna::identity::IdentityStore;
 use aruna_core::onboarding::OnboardingMode;
 use aruna_core::structs::identity::auth::NodeCapabilities;
+use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_operations::driver::drive;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use reqwest::StatusCode;
 use shared::{
-    TestResult, create_bearer_token, create_onboarding_secret, spawn_keyed_joiner, spawn_low_seed,
+    TestResult, WAIT_CAP, create_bearer_token, create_onboarding_secret, spawn_keyed_joiner,
+    spawn_low_seed, wait_until,
 };
 
 /// Node key of the joiner; its node id sorts above the low seed's, so it may be promoted.
@@ -41,6 +47,16 @@ async fn promoted_node_signs() -> TestResult<()> {
         seed.capabilities.clone(),
     )
     .await?;
+    let realm_id = seed.realm_id;
+    // The joiner's start still syncs the realm configuration, and a promotion racing that write
+    // loses with a conflict, so both nodes first hold the same configuration.
+    let agreed = || async {
+        let seed_config = drive(GetConfigOperation::new(realm_id), seed.context.as_ref()).await;
+        let joiner_config = drive(GetConfigOperation::new(realm_id), joiner.context.as_ref()).await;
+        matches!((seed_config, joiner_config), (Ok(left), Ok(right)) if left.digest().ok() == right.digest().ok())
+    };
+    let poll = Duration::from_millis(100);
+    wait_until("realm configuration agreement", WAIT_CAP, poll, agreed).await?;
 
     let response = reqwest::Client::new()
         .post(format!(
@@ -50,11 +66,21 @@ async fn promoted_node_signs() -> TestResult<()> {
         .bearer_auth(&admin_token)
         .send()
         .await?;
-    // The route answers only once the joiner's own config lists it, so no wait is needed here.
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: serde_json::Value = response.json().await?;
-    assert_eq!(body["ready"], true);
-    let realm_id = seed.realm_id;
+    // 202 means the configuration lists the node but has not reached it within the call yet.
+    let status = response.status();
+    assert!(
+        matches!(status, StatusCode::OK | StatusCode::ACCEPTED),
+        "{status}"
+    );
+    let listed = || async {
+        let config = drive(GetConfigOperation::new(realm_id), joiner.context.as_ref()).await;
+        config.is_ok_and(|config| {
+            (config.nodes.iter()).any(|node| {
+                node.node_id == joiner_id.to_string() && node.kind == RealmNodeKind::Management
+            })
+        })
+    };
+    wait_until("the joiner listing its promotion", WAIT_CAP, poll, listed).await?;
 
     // The harness cannot reopen a joiner; its next start runs exactly this step.
     let store = IdentityStore::from_storage(joiner.context.storage_handle.clone());

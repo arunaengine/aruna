@@ -11,10 +11,12 @@ use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use aruna_core::keyspaces::prefix_upper_bound;
+use aruna_core::structs::execution::table::PREFIX_CHARS;
 use tantivy::directory::MmapDirectory;
-use tantivy::query::{BooleanQuery, EnableScoring, Occur, Query, TermQuery, Weight};
+use tantivy::query::{BooleanQuery, EnableScoring, Occur, Query, RangeQuery, TermQuery, Weight};
 use tantivy::schema::{FAST, Field, IndexRecordOption, STORED, STRING, Schema, TEXT};
-use tantivy::tokenizer::TokenStream;
+use tantivy::tokenizer::{TextAnalyzer, TokenStream};
 use tantivy::{
     DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TERMINATED, TantivyDocument,
     TantivyError, Term,
@@ -43,6 +45,8 @@ const OPEN_WRITERS: usize = 8;
 const INDEX_PERMITS: usize = 4;
 /// Matches a page scans at most: a query whose rarest term has more walks the keys instead.
 const MATCH_SCAN_LIMIT: u64 = 1_000_000;
+/// Bitset memory the prefix range queries of one search may hold at once.
+const RANGE_BYTES: usize = 16 << 20;
 
 #[derive(Debug, Error)]
 pub enum KeyIndexError {
@@ -81,9 +85,9 @@ pub enum KeyChange {
     Remove(String),
 }
 
-/// Keys between `start` and `end` in key order; `names` keeps keys with every name token and
-/// `meta` searchable keys with every query term. With terms at most `limit` matches return,
-/// without them each index segment examines at most `limit` keys.
+/// Keys between `start` and `end` in key order; `names` or `meta` keep keys with every token or
+/// term. Text tokens of three or more characters match by start; an overfull metadata one is left
+/// out, so callers check loaded versions. Terms cap matches at `limit`, else keys per segment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyQuery {
     pub start: Bound<String>,
@@ -155,6 +159,7 @@ pub struct RangeIndexes {
     writers: Mutex<VecDeque<PathBuf>>,
     permits: Arc<Semaphore>,
     scan_limit: u64,
+    range_bytes: usize,
 }
 
 impl std::fmt::Debug for RangeIndexes {
@@ -174,14 +179,23 @@ impl RangeIndexes {
             writers: Mutex::new(VecDeque::new()),
             permits: Arc::new(Semaphore::new(INDEX_PERMITS)),
             scan_limit: MATCH_SCAN_LIMIT,
+            range_bytes: RANGE_BYTES,
         }
     }
 
     #[cfg(test)]
-    fn with_scan(root: impl Into<PathBuf>, scan_limit: u64) -> Self {
+    pub(crate) fn with_scan(root: impl Into<PathBuf>, scan_limit: u64) -> Self {
         Self {
             scan_limit,
             ..Self::new(root)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_range_bytes(self, range_bytes: usize) -> Self {
+        Self {
+            range_bytes,
+            ..self
         }
     }
 
@@ -223,7 +237,7 @@ impl RangeIndexes {
         let dir = self.directory(set_id, range_id, generation);
         self.blocking(move |indexes| {
             let open = indexes.open_index(&dir, false)?;
-            search_keys(&open, &query, indexes.scan_limit)
+            search_keys(&open, &query, indexes.scan_limit, indexes.range_bytes)
         })
         .await
     }
@@ -478,44 +492,128 @@ fn search_keys(
     open: &OpenIndex,
     query: &KeyQuery,
     scan_limit: u64,
+    range_bytes: usize,
 ) -> Result<KeyPage, KeyIndexError> {
     let fields = fields(&open.index.schema())?;
     let mut analyzer = open.index.tokenizer_for_field(fields.name)?;
-    let mut terms = Vec::new();
+    let (mut terms, mut prefixes) = (Vec::new(), Vec::new());
     if let Some(names) = &query.names {
         let mut stream = analyzer.token_stream(names);
         while let Some(token) = stream.next() {
-            terms.push(Term::from_field_text(fields.name, &token.text));
+            match token.text.chars().count() >= PREFIX_CHARS {
+                true => prefixes.push((fields.name, token.text.clone())),
+                false => terms.push(Term::from_field_text(fields.name, &token.text)),
+            }
         }
     }
     if let Some(meta) = &query.meta {
-        let text = meta.text.iter().map(|token| (fields.meta, token));
-        let exact = meta.exact.iter().map(|term| (fields.exact, term));
-        terms.extend(
-            text.chain(exact)
-                .map(|(field, term)| Term::from_field_text(field, term)),
-        );
+        for token in &meta.text {
+            match token.chars().count() >= PREFIX_CHARS {
+                true => prefixes.push((fields.meta, token.clone())),
+                false => terms.push(Term::from_field_text(fields.meta, token)),
+            }
+        }
+        let exact = meta.exact.iter();
+        terms.extend(exact.map(|term| Term::from_field_text(fields.exact, term)));
     }
     let searcher = open.reader.searcher();
-    if terms.is_empty() {
+    if terms.is_empty() && prefixes.is_empty() {
         return walk_keys(&searcher, fields, query, None);
     }
     let mut rarest = u64::MAX;
     for term in &terms {
         rarest = rarest.min(searcher.doc_freq(term)?);
     }
-    if rarest > scan_limit {
-        return walk_keys(&searcher, fields, query, Some(&terms));
+    // A prefix with more matches than the scan limit stays out of the index query: a name prefix
+    // is checked on each found key, a metadata prefix by the caller on each loaded version.
+    let (mut ranges, mut checked) = (Vec::new(), Vec::new());
+    for (field, prefix) in prefixes {
+        let found = prefix_freq(&searcher, field, &prefix, scan_limit)?;
+        match (found > scan_limit, field == fields.name) {
+            (false, _) => ranges.push((found, field, prefix)),
+            (true, true) => checked.push(prefix),
+            (true, false) => {}
+        }
     }
-    let clauses = (terms.into_iter())
-        .map(|term| {
-            let query: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
-            (Occur::Must, query)
-        })
-        .collect();
-    let weight =
-        BooleanQuery::new(clauses).weight(EnableScoring::disabled_from_searcher(&searcher))?;
-    matched_keys(&searcher, weight.as_ref(), query)
+    // A range query holds a bitset of each segment's documents: the rarest ranges that fit the
+    // budget are queried, the others fall back like prefixes with too many matches.
+    let bitset = (searcher.segment_readers().iter())
+        .map(|segment| (segment.max_doc() as usize).div_ceil(8))
+        .max()
+        .unwrap_or(0);
+    ranges.sort_by_key(|(found, ..)| *found);
+    let fits = range_bytes.checked_div(bitset).unwrap_or(usize::MAX);
+    for (_, field, prefix) in ranges.split_off(fits.min(ranges.len())) {
+        if field == fields.name {
+            checked.push(prefix);
+        }
+    }
+    for (found, ..) in &ranges {
+        rarest = rarest.min(*found);
+    }
+    let mut page = match rarest > scan_limit {
+        true => walk_keys(&searcher, fields, query, Some(&terms))?,
+        false => {
+            let ranges = ranges.iter().map(|(_, field, prefix)| {
+                let end = prefix_upper_bound(prefix.as_bytes());
+                let end = end.map_or(Bound::Unbounded, |end| {
+                    Bound::Excluded(Term::from_field_bytes(*field, &end))
+                });
+                let start = Bound::Included(Term::from_field_text(*field, prefix));
+                let query: Box<dyn Query> = Box::new(RangeQuery::new(start, end));
+                (Occur::Must, query)
+            });
+            let clauses = (terms.into_iter())
+                .map(|term| {
+                    let query: Box<dyn Query> =
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+                    (Occur::Must, query)
+                })
+                .chain(ranges)
+                .collect();
+            let scoring = EnableScoring::disabled_from_searcher(&searcher);
+            let weight = BooleanQuery::new(clauses).weight(scoring)?;
+            matched_keys(&searcher, weight.as_ref(), query)?
+        }
+    };
+    if !checked.is_empty() {
+        page.keys
+            .retain(|key| starts_parts(&mut analyzer, key, &checked));
+    }
+    Ok(page)
+}
+
+/// Documents holding a term that starts with `prefix`, counted until the count passes `limit`.
+fn prefix_freq(
+    searcher: &Searcher,
+    field: Field,
+    prefix: &str,
+    limit: u64,
+) -> Result<u64, KeyIndexError> {
+    let end = prefix_upper_bound(prefix.as_bytes());
+    let mut found = 0u64;
+    for segment in searcher.segment_readers() {
+        let inverted = segment.inverted_index(field)?;
+        let mut range = inverted.terms().range().ge(prefix.as_bytes());
+        if let Some(end) = &end {
+            range = range.lt(end);
+        }
+        let mut stream = range.into_stream()?;
+        while found <= limit && stream.advance() {
+            found += u64::from(stream.value().doc_freq);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether every prefix starts one of the name parts of `key`.
+fn starts_parts(analyzer: &mut TextAnalyzer, key: &str, prefixes: &[String]) -> bool {
+    let mut parts = Vec::new();
+    let mut stream = analyzer.token_stream(key);
+    while let Some(token) = stream.next() {
+        parts.push(token.text.clone());
+    }
+    (prefixes.iter()).all(|prefix| parts.iter().any(|part| part.starts_with(prefix.as_str())))
 }
 
 /// The first `query.limit` live keys of the window that hold every term. Each segment keeps
@@ -816,6 +914,68 @@ mod tests {
     // A term too common to scan walks a bounded number of keys per page and still continues
     // to every hit, while a rare term of the same index is scanned.
     #[tokio::test]
+    async fn name_prefixes_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ["SAMD00012345/a.fna", "SAMN00000001/b.fna", "sa/sample.txt"];
+        for scan in [MATCH_SCAN_LIMIT, 0] {
+            let indexes = Arc::new(RangeIndexes::with_scan(
+                dir.path().join(scan.to_string()),
+                scan,
+            ));
+            let changes = keys.iter().map(|key| put(key)).collect();
+            indexes.apply(set(), range(), 1, changes).await.unwrap();
+            let names = |text: &str| query(Bound::Unbounded, Bound::Unbounded, Some(text), 10);
+            let found = indexes
+                .search(set(), range(), 1, names("SAMD"))
+                .await
+                .unwrap();
+            assert_eq!(found.keys, ["SAMD00012345/a.fna"], "scan limit {scan}");
+            let found = indexes
+                .search(set(), range(), 1, names("sa"))
+                .await
+                .unwrap();
+            assert_eq!(found.keys, ["sa/sample.txt"], "short words stay exact");
+            let found = indexes
+                .search(set(), range(), 1, names("AMD0"))
+                .await
+                .unwrap();
+            assert!(
+                found.keys.is_empty(),
+                "only the start of a name part matches"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn range_budget_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = RangeIndexes::new(dir.path()).with_range_bytes(0);
+        let indexes = Arc::new(indexes);
+        let changes = vec![
+            described("a/", &["samd00012345"], &[]),
+            described("b/", &["samn00000001"], &[]),
+            put("SAMD00012345/a.fna"),
+        ];
+        indexes.apply(set(), range(), 1, changes).await.unwrap();
+        let names = query(Bound::Unbounded, Bound::Unbounded, Some("SAMD"), 10);
+        let page = indexes.search(set(), range(), 1, names).await.unwrap();
+        assert_eq!(
+            page.keys,
+            ["SAMD00012345/a.fna"],
+            "name prefixes are checked on keys"
+        );
+        let page = indexes
+            .search(set(), range(), 1, meta(&["samd"], &[], 10, None))
+            .await;
+        let found = page.unwrap().keys;
+        assert_eq!(
+            found,
+            ["a/", "b/"],
+            "metadata prefixes are left to the version check"
+        );
+    }
+
+    #[tokio::test]
     async fn common_term_walks() {
         let dir = tempfile::tempdir().unwrap();
         let indexes = Arc::new(RangeIndexes::with_scan(dir.path(), 2));
@@ -937,6 +1097,27 @@ mod tests {
                 limit,
             )
         }
+    }
+
+    // A long text token matches the indexed tokens that start with it, a short one only itself.
+    #[tokio::test]
+    async fn metadata_prefixes_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = Arc::new(RangeIndexes::new(dir.path()));
+        let changes = vec![
+            described("a/", &["samd00012345"], &["taxid=562"]),
+            described("b/", &["samn00000001"], &[]),
+            described("c/", &["sa"], &[]),
+        ];
+        indexes.apply(set(), range(), 1, changes).await.unwrap();
+        let found = |text| meta(&[text], &[], 10, None);
+        let page = indexes.search(set(), range(), 1, found("samd")).await;
+        assert_eq!(page.unwrap().keys, ["a/"]);
+        let page = indexes.search(set(), range(), 1, found("sa")).await;
+        assert_eq!(page.unwrap().keys, ["c/"]);
+        let exact = meta(&[], &["taxid=56"], 10, None);
+        let page = indexes.search(set(), range(), 1, exact).await;
+        assert!(page.unwrap().keys.is_empty(), "exact terms stay exact");
     }
 
     // Metadata queries match the indexed terms of searchable keys and continue after the last

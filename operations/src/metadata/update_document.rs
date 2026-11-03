@@ -39,7 +39,8 @@ use crate::metadata::materialization_queue::{
     new_materialization_job, new_pending_status, schedule_materialization,
 };
 use crate::metadata::profile::validation::{
-    not_profiled_status, stale_status, submission_profile_tag, validate_submission,
+    batch_adds_profile, not_profiled_status, profile_path_rule, stale_status,
+    submission_profile_tag, validate_submission,
 };
 use crate::metadata::projector::{create_outbox_record, registry_outbox_record};
 use crate::metadata::repository::{
@@ -363,6 +364,12 @@ impl UpdateDocumentOperation {
     }
 
     fn begin_transaction_effect(&mut self) -> Effects {
+        if let (Some(record), Some(batch)) = (&self.record, &self.planned_batch)
+            && let Err(error) =
+                profile_path_rule(&record.document_path, || batch_adds_profile(batch))
+        {
+            return self.fail(error.into());
+        }
         self.state = UpdateDocumentState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -2364,6 +2371,63 @@ mod pure_tests {
         let effects = operation.step(raw_events(&record));
         assert_no_mutation(effects.as_slice());
         assert_update_batch(effects.as_slice(), txn_id, is_replace);
+    }
+
+    fn plan_profile_type(document_path: &str) -> (UpdateDocumentOperation, Effects) {
+        let actor = actor();
+        let mut record = record(&actor);
+        record.document_path = document_path.to_string();
+        let mut operation = UpdateDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateDocumentMutation::ReplaceRoCrate {
+                jsonld: replace_jsonld(record.document_id, "Profile Type"),
+            },
+        ));
+        operation.start();
+        operation.step(registry_read(&record));
+        configured(&mut operation, realm_config_read(&record));
+        let Event::Metadata(MetadataEvent::BatchPlanned {
+            mut batch,
+            graph_iri,
+        }) = batch_planned(&record)
+        else {
+            unreachable!("batch_planned builds a planned batch");
+        };
+        batch.ops.push(aruna_core::metadata::MetadataQuadOp::Add {
+            subject: format!("<{}>", record.graph_iri),
+            predicate: "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_string(),
+            object: "<http://www.w3.org/ns/dx/prof/Profile>".to_string(),
+            dot: aruna_core::metadata::MetadataDot {
+                actor: [7u8; 32],
+                counter: 1,
+            },
+        });
+        let effects = operation.step(Event::Metadata(MetadataEvent::BatchPlanned {
+            graph_iri,
+            batch,
+        }));
+        (operation, effects)
+    }
+
+    #[test]
+    fn refuses_profile_outside() {
+        let (operation, effects) = plan_profile_type("resolver-check/profile");
+
+        assert!(effects.is_empty(), "no transaction may start: {effects:?}");
+        let Err(UpdateDocumentError::MetadataError(MetadataError::InvalidInput(message))) =
+            operation.finalize()
+        else {
+            panic!("expected the Profile path refusal");
+        };
+        assert!(message.contains("Profiles must be stored under profiles/"));
+    }
+
+    #[test]
+    fn accepts_profile_inside() {
+        let (_, effects) = plan_profile_type("profiles/example");
+
+        assert_start_transaction(effects.as_slice());
     }
 
     #[test]

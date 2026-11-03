@@ -876,7 +876,7 @@ impl MetadataHandle {
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
-        (query, limit): (String, usize),
+        (query, key, extras, limit): (String, Option<String>, Option<PolicyRequestExtras>, usize),
         (group_id, database): (Option<GroupId>, bool),
         start_after: Option<Vec<u8>>,
     ) -> Result<BucketPage, MetadataReadError> {
@@ -889,6 +889,8 @@ impl MetadataHandle {
             MetadataTransportMessage::SearchBuckets {
                 auth_token,
                 query,
+                key,
+                extras,
                 limit,
                 group_id,
                 start_after,

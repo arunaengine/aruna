@@ -261,6 +261,16 @@ async fn copy(
     (source, dest): (&str, &str),
     metadata: Option<(&str, &str)>,
 ) -> s3s::S3Result<s3s::dto::CopyObjectOutput> {
+    copy_as(members, (on, members.user_on(on)), (source, dest), metadata).await
+}
+
+/// A copy like [`copy`], signed by `user`.
+async fn copy_as(
+    members: &Members,
+    (on, user): (usize, UserAccess),
+    (source, dest): (&str, &str),
+    metadata: Option<(&str, &str)>,
+) -> s3s::S3Result<s3s::dto::CopyObjectOutput> {
     use s3s::dto::{CopyObjectInput, CopySource, MetadataDirective};
     let node = &members.nodes[on];
     let mut input = CopyObjectInput::builder()
@@ -280,7 +290,7 @@ async fn copy(
             value.to_string(),
         )]));
     }
-    let mut copy = request(input, Method::PUT, members.user_on(on), node.bucket().await);
+    let mut copy = request(input, Method::PUT, user, node.bucket().await);
     let header = format!("{BUCKET}/{source}");
     copy.headers
         .insert("x-amz-copy-source", header.parse().unwrap());
@@ -356,6 +366,35 @@ async fn copy_streams_source() {
         origin_of(&members, 1, "k/dst").await,
         global_copy(&members, &source)
     );
+}
+
+// A copy signed with a run's workspace credential records the run, on every copy path.
+#[tokio::test]
+async fn copy_records_run() {
+    use aruna_core::structs::execution::job::{JobId, workspace_credential_id};
+    use aruna_core::structs::storage::origin::VersionOrigin;
+    let members = members(3, &["h", "p"], 0).await;
+    let job_id = JobId::from_bytes([7; 16]);
+    let user = UserAccess {
+        access_key: workspace_credential_id(job_id),
+        ..members.user_on(0)
+    };
+    // The source sorts into a range this member, the coordinator or only a holder keeps.
+    for (source, dest) in [("a/src", "k/a"), ("k/src", "k/k"), ("q/src", "k/q")] {
+        let version = put(&members, 0, source, b"run").await;
+        copy_as(&members, (0, user.clone()), (source, dest), None)
+            .await
+            .unwrap();
+        let Some(VersionOrigin::Copy { job_id: run, .. }) = origin_of(&members, 1, dest).await
+        else {
+            panic!("{dest} records its copy");
+        };
+        assert_eq!(
+            run,
+            Some(ulid::Ulid::from_bytes([7; 16])),
+            "{source} {version}"
+        );
+    }
 }
 
 // When only the destination's coordinator keeps the source, it copies from its own records.

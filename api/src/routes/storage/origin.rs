@@ -17,6 +17,7 @@ use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, UploadClient, VersionOrigin,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
+use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::distribution::guard::{
     GuardError, copy_readers, read_coordinator, route_read,
 };
@@ -938,7 +939,8 @@ Without a token, READ granted by public roles applies, and a refusal answers 401
 **Behavior**
 - Asked on a node that holds the bucket; another node answers 404. A distributed bucket is
   answered from the ranges this node holds, so `complete` is false for it.
-- Runs are newest first. Files that a later upload replaced count no more.
+- Runs are newest first. Files that a later upload replaced count no more, and neither do files
+  the caller may not read.
 
 **Limits**
 - At most 5000 current files are read and at most 50 runs named; `complete` is false when
@@ -981,7 +983,13 @@ pub async fn get_bucket_runs(
     ensure_permission(&state, &auth, path, Permission::READ)
         .await
         .map_err(hidden)?;
-    let found = bucket_runs(state.get_ctx().as_ref(), &bucket, &params.prefix)
+    let context = state.get_ctx();
+    let access = BucketAccess::load(&context, &auth, (realm_id, info.group_id, node_id), &bucket)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    // A file the caller may not read, as a listing hides it, names no run.
+    let read = |key: &str| access.allows(Some(key), &Permission::READ);
+    let found = bucket_runs(context.as_ref(), &bucket, &params.prefix, read)
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let runs = found.run_ids.iter().map(|run_id| BucketRunBody {

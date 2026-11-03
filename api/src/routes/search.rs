@@ -487,6 +487,8 @@ pub async fn bucket_search(
             auth: auth.clone(),
             bearer_token: bearer.clone(),
             query: query.to_string(),
+            key: None,
+            extras: None,
             limit: params
                 .limit
                 .unwrap_or(DEFAULT_SEARCH_LIMIT)
@@ -527,8 +529,9 @@ restrictions and request policies before it can be returned.
   holds the next matches in key order and an index answers no more hits once a page comes back
   without a cursor. A page can still return a cursor with few or no hits when the caller may not
   read the matches, or when a range is only partly indexed. A prefix query without terms
-  examines a bounded number of keys per page. Substring queries match whole name parts of
-  the key, split at `/`, `.`, `-`, `_` and other separators. `coverage.incomplete_ranges` counts
+  examines a bounded number of keys per page. Substring queries match name parts of the key,
+  split at `/`, `.`, `-`, `_` and other separators: a word of at least 3 characters matches the
+  parts that start with it, a shorter word only a whole part. `coverage.incomplete_ranges` counts
   ranges whose index is missing or still being built (and, in `local` mode, ranges another
   member coordinates); they are never scanned, and `complete` is false while any remain.
   A range whose index is still being built answers for the keys indexed so far and is listed in
@@ -539,7 +542,8 @@ restrictions and request policies before it can be returned.
   the error message says how many ranges and about how many keys are still to be indexed.
 - `match=metadata` matches object metadata instead of keys, for objects whose version names
   searchable columns in `aruna-search-text` and `aruna-search-exact` (table imports set both).
-  Words of `q` must all appear in the text columns (case-insensitive, whole words); terms
+  Words of `q` must all appear in the text columns (case-insensitive; a word of at least 3
+  characters also matches the words that start with it, a shorter word only a whole word); terms
   `column=value` must equal an exact column, with quotes around values with spaces, as in
   `coli taxid=562 assembly_level="Complete Genome"`. Each hit carries the object's kept metadata
   columns in `metadata`, after the same authorization as every hit. A distributed bucket finds the
@@ -947,6 +951,8 @@ async fn run_buckets(
             auth: auth.clone(),
             bearer_token: bearer_token.clone(),
             query: query.to_string(),
+            key: None,
+            extras: None,
             limit: limit.min(MAX_BUCKET_LIMIT),
             group_id: None,
             cursor: None,

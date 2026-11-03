@@ -292,7 +292,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "ahash",
  "aruna-blob",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "aruna-core",
  "aruna-kpabe",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "rustix",
  "serde_json",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "ahash",
  "aruna",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "aes-gcm 0.11.1",
  "bls12_381_plus",
@@ -611,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe-wasm"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "aruna-kpabe",
  "blake3",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -699,6 +699,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "spareval",
  "spargebra",
  "sysinfo",
  "tantivy",
@@ -717,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-registry"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -747,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -764,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.143"
+version = "3.0.0-alpha.144"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -2187,7 +2188,7 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.3.2"
-source = "git+https://github.com/arunaengine/craqle?rev=9a21ab6fb1cf535ccf412db2ba35583f41d62ddf#9a21ab6fb1cf535ccf412db2ba35583f41d62ddf"
+source = "git+https://github.com/arunaengine/craqle?rev=07c9e80bf813ff671d55c6a439ba8c651a7b09ae#542793585b0582e31f8caf58e33e63e960f1f6e1"
 dependencies = [
  "blake3",
  "chrono",

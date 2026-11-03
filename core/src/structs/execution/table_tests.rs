@@ -624,3 +624,19 @@ fn mirror_paths_canonical() {
         assert!(mirror_path(bad, None).is_err(), "{bad}");
     }
 }
+
+// Free text words of at least three characters match by their start; exact terms never do.
+#[test]
+fn metadata_prefixes_match() {
+    let metadata = std::collections::HashMap::from([
+        (SEARCH_TEXT_KEY.to_string(), "biosample".to_string()),
+        ("biosample".to_string(), "SAMD00012345".to_string()),
+        (SEARCH_EXACT_KEY.to_string(), "taxid".to_string()),
+        ("taxid".to_string(), "562".to_string()),
+    ]);
+    assert!(metadata_matches(&metadata, "samd", &[]));
+    assert!(metadata_matches(&metadata, "SAMD0001", &[]));
+    assert!(!metadata_matches(&metadata, "sa", &[]));
+    assert!(!metadata_matches(&metadata, "amd0", &[]));
+    assert!(!metadata_matches(&metadata, "", &["taxid=56".to_string()]));
+}

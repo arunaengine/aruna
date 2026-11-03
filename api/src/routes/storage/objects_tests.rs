@@ -16,6 +16,7 @@ async fn store(node: &Node, keys: &[&str]) {
     let info = bucket_info(&node.state, BUCKET).await.unwrap();
     for key in keys {
         let input = WriteObjectInput {
+            node_id: None,
             bucket: BUCKET.to_string(),
             key: key.to_string(),
             text: "x".to_string(),

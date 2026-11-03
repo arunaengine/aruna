@@ -397,21 +397,24 @@ pub enum RunDelete {
     Unfinished(JobState),
     /// The run's container cleanup is still queued.
     CleanupPending,
+    /// The run's deletion could not be recorded in its replicated family, so it was kept.
+    Unrecorded(String),
 }
 
-/// Removes a finished run of `user_id` from this node in one transaction: its
-/// row, its list index and every local row pruning removes. The replicated
-/// family records stay, so its history remains readable by id.
+/// Removes a finished run of `user_id` from this node in one transaction: its row, list index
+/// and every local row pruning removes. An execution run goes only once its deletion was
+/// `recorded` in its replicated family, whose records stay.
 pub async fn delete_finished_run(
     storage: &StorageHandle,
     user_id: UserId,
     job_id: JobId,
+    recorded: bool,
 ) -> Result<RunDelete, JobMutationError> {
     for attempt in 0..MUTATE_MAX_ATTEMPTS {
         let txn_id = start_write_txn(storage)
             .await
             .map_err(JobMutationError::Storage)?;
-        match Box::pin(run_delete_txn(storage, txn_id, user_id, job_id)).await {
+        match Box::pin(run_delete_txn(storage, txn_id, (user_id, job_id), recorded)).await {
             Ok(RunDelete::Deleted) => match commit_txn(storage, txn_id).await {
                 CommitResult::Committed => return Ok(RunDelete::Deleted),
                 CommitResult::Conflict if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
@@ -434,8 +437,8 @@ pub async fn delete_finished_run(
 async fn run_delete_txn(
     storage: &StorageHandle,
     txn_id: TxnId,
-    user_id: UserId,
-    job_id: JobId,
+    (user_id, job_id): (UserId, JobId),
+    recorded: bool,
 ) -> Result<RunDelete, JobMutationError> {
     let Some(record) = read_job_record(storage, job_id, Some(txn_id))
         .await
@@ -459,6 +462,12 @@ async fn run_delete_txn(
         .is_some_and(|cleanup| !cleanup.state.is_terminal())
     {
         return Ok(RunDelete::CleanupPending);
+    }
+    // A run became deletable after its eligibility was read, so no deletion was recorded yet.
+    if !recorded {
+        return Ok(RunDelete::Unrecorded(
+            "the run settled while it was deleted; retry".to_string(),
+        ));
     }
     let mut deletes = prune_delete_entries(&record);
     let mut start_after = None;

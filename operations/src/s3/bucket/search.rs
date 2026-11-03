@@ -17,7 +17,9 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path, incarnation};
+use aruna_core::structs::storage::blob::{
+    BucketInfo, bucket_permission_path, incarnation, object_permission_path,
+};
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, StoredMetadata};
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::replication::ArunaArn;
@@ -39,6 +41,11 @@ pub struct SearchBucketsInput {
     pub realm_id: RealmId,
     pub node_id: NodeId,
     pub query: String,
+    /// Admits a bucket by READ on this key or key prefix inside it instead of on its root.
+    pub key: Option<String>,
+    /// An MCP tool's policy context, operation and parameters, whose policies must also allow
+    /// each hit on each node before members merge; it only adds to the mandatory read check.
+    pub extras: Option<PolicyRequestExtras>,
     pub limit: usize,
     /// Keeps only the buckets of this group.
     pub group_id: Option<GroupId>,
@@ -125,6 +132,8 @@ pub enum SearchBucketsError {
     Unavailable,
     #[error("bucket search position is not valid here")]
     Position,
+    #[error("bucket search policy context is not an MCP tool's")]
+    Extras,
 }
 
 #[derive(Debug, PartialEq)]
@@ -264,12 +273,8 @@ impl SearchBucketsOperation {
             return self.fail(SearchBucketsError::NotFinished);
         };
         self.state = SearchBucketsState::CheckPermission;
-        let path = bucket_permission_path(
-            self.input.realm_id,
-            candidate.info.group_id,
-            self.input.node_id,
-            &candidate.bucket,
-        );
+        let (group_id, node_id) = (candidate.info.group_id, self.input.node_id);
+        let path = candidate_path(&self.input, group_id, node_id, &candidate.bucket);
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: self.input.auth.clone(),
@@ -424,6 +429,13 @@ async fn search_with_budget(
     input: SearchBucketsInput,
     max_scan_rows: usize,
 ) -> Result<BucketPage, SearchBucketsError> {
+    if input
+        .extras
+        .as_ref()
+        .is_some_and(|extras| !extras_valid(extras))
+    {
+        return Err(SearchBucketsError::Extras);
+    }
     let limit = input.limit.clamp(1, SearchBucketsOperation::MAX_LIMIT);
     let mut evaluators: HashMap<(RealmId, GroupId), PolicyEvaluator> = HashMap::new();
     let mut visible: Vec<BucketSearchHit> = Vec::with_capacity(limit);
@@ -495,6 +507,26 @@ async fn search_with_budget(
     }
 }
 
+/// Whether a caller's policy context may join a bucket search: an MCP tool's operation and
+/// parameters only, so it adds a check and never stands in for the mandatory bucket read.
+fn extras_valid(extras: &PolicyRequestExtras) -> bool {
+    let tool = extras.operation.strip_prefix("mcp:");
+    tool.is_some_and(|tool| !tool.is_empty()) && extras.headers.is_empty() && extras.body.is_none()
+}
+
+/// The path a candidate's READ is checked on: the asked key inside the bucket, else its root.
+fn candidate_path(
+    input: &SearchBucketsInput,
+    group_id: GroupId,
+    node_id: NodeId,
+    bucket: &str,
+) -> String {
+    match input.key.as_deref() {
+        Some(key) => object_permission_path(input.realm_id, group_id, node_id, bucket, key),
+        None => bucket_permission_path(input.realm_id, group_id, node_id, bucket),
+    }
+}
+
 /// Whether a caller without a login may read the bucket, deny policies included.
 async fn anonymous_reads(
     context: &DriverContext,
@@ -524,16 +556,14 @@ fn policy_allows(
     input: &SearchBucketsInput,
     hit: &BucketSearchHit,
 ) -> bool {
-    let path = bucket_permission_path(input.realm_id, hit.group_id, hit.node_id, &hit.bucket);
-    let request = policy_request_with(
-        &path,
-        &Permission::READ,
-        Some(&input.auth),
-        PolicyRequestExtras::operation("s3.ListBuckets"),
-    );
-    evaluators
-        .get(&(input.realm_id, hit.group_id))
-        .is_some_and(|evaluator| evaluator.evaluate(&request).is_ok())
+    let path = candidate_path(input, hit.group_id, hit.node_id, &hit.bucket);
+    let mandatory = PolicyRequestExtras::operation("s3.ListBuckets");
+    let checks = std::iter::once(mandatory).chain(input.extras.clone());
+    let evaluator = evaluators.get(&(input.realm_id, hit.group_id));
+    checks.into_iter().all(|extras| {
+        let request = policy_request_with(&path, &Permission::READ, Some(&input.auth), extras);
+        evaluator.is_some_and(|evaluator| evaluator.evaluate(&request).is_ok())
+    })
 }
 
 impl Operation for SearchBucketsOperation {
@@ -612,6 +642,8 @@ mod tests {
             realm_id,
             node_id: iroh::SecretKey::from_bytes(&[10u8; 32]).public(),
             query: query.to_string(),
+            key: None,
+            extras: None,
             limit,
             group_id: None,
             start_after: None,
@@ -921,6 +953,8 @@ mod tests {
                 realm_id,
                 node_id,
                 query: "DATA".to_string(),
+                key: None,
+                extras: None,
                 limit: 50,
                 group_id: None,
                 start_after: None,
@@ -971,6 +1005,8 @@ mod tests {
                 realm_id,
                 node_id,
                 query: String::new(),
+                key: None,
+                extras: None,
                 limit: 50,
                 group_id: None,
                 start_after: None,
@@ -997,6 +1033,8 @@ mod tests {
             realm_id,
             node_id,
             query: "DATA".to_string(),
+            key: None,
+            extras: None,
             limit: 50,
             group_id: None,
             start_after: None,
@@ -1024,5 +1062,27 @@ mod tests {
         // A position this node cannot open retires its scan instead of failing every page.
         let retired = search_local_buckets(&context, forged).await.unwrap();
         assert!(retired.retired && retired.hits.is_empty() && retired.scanned_to.is_none());
+    }
+
+    #[test]
+    fn extras_only_add() {
+        // A node takes a caller's policy context only as an MCP tool's; it can never name the
+        // mandatory bucket read or carry headers or a body into the check.
+        let tool = |operation: &str| PolicyRequestExtras {
+            params: [("cursor".to_string(), "c".to_string())].into(),
+            ..PolicyRequestExtras::operation(operation)
+        };
+        assert!(super::extras_valid(&tool("mcp:list_buckets")));
+        for operation in ["s3.ListBuckets", "mcp:", "rest"] {
+            assert!(!super::extras_valid(&tool(operation)), "{operation}");
+        }
+        let mut headers = tool("mcp:list_buckets");
+        headers.headers.insert("x".to_string(), "y".to_string());
+        assert!(!super::extras_valid(&headers));
+        let body = PolicyRequestExtras {
+            body: Some(serde_json::json!({})),
+            ..tool("mcp:list_buckets")
+        };
+        assert!(!super::extras_valid(&body));
     }
 }

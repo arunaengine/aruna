@@ -10,6 +10,7 @@ pub mod storage;
 
 mod assistant_chat;
 mod assistant_provider;
+mod central_assistant;
 pub mod checksum;
 mod info;
 mod path_claim;
@@ -26,6 +27,10 @@ pub use assistant_chat::{
 pub use assistant_provider::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
     AssistantProviderStatus, AssistantSecretError,
+};
+pub use central_assistant::{
+    AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, QuotaReached, SESSION_HEADER,
+    USER_HEADER, charge, secs_to_midnight, utc_day,
 };
 pub use info::{
     BackendState, BlobState, ConnectionAddressState, ConnectionAddressStatus,

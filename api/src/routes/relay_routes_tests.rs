@@ -1,4 +1,5 @@
-//! Tests that the relay middleware forwards to a management node and stops on a hop header.
+//! Tests that the relay middleware forwards to a management node, whatever hop header a client
+//! sends, and refuses a call that would circle.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -21,6 +22,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::from_fn_with_state;
 use axum::routing::get;
+use axum::routing::post;
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -313,20 +315,65 @@ async fn no_management_target() {
 }
 
 #[tokio::test]
-async fn hop_stays_local() {
-    // A request already carrying a hop is answered locally, never relayed on.
+async fn client_hop_ignored() {
+    // A device passes registration, merges and attaches on even when a client claims a hop;
+    // the management node sees the claimed hop with this node appended.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().fallback(|headers: HeaderMap| async move {
+        headers[RELAY_HOP_HEADER].to_str().unwrap().to_string()
+    });
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    let fixture = setup(vec![upstream]).await;
+    let local = || async { StatusCode::IM_A_TEAPOT };
+    let routes = [
+        "/access/users/register",
+        "/access/users/me/merge",
+        "/access/users/me/subjects",
+    ];
+    let mut device = Router::new();
+    for route in routes {
+        device = device.route(route, post(local));
+    }
+    let device = device
+        .layer(from_fn_with_state(fixture.state.clone(), relay_middleware))
+        .with_state(fixture.state.clone());
+    for route in routes {
+        let request = Request::builder()
+            .method("POST")
+            .uri(route)
+            .header(RELAY_HOP_HEADER, "peer")
+            .body(Body::empty())
+            .unwrap();
+        let response = device.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let own = fixture.state.get_node_id();
+        assert_eq!(body, format!("peer,{own}").as_bytes(), "{route}");
+    }
+    handle.abort();
+}
+
+#[tokio::test]
+async fn circling_call_refused() {
+    // A call that already passed this node would circle, so it is refused, never answered here.
     let fixture = setup(vec!["http://127.0.0.1:1".to_string()]).await;
+    let passed = format!("peer,{}", fixture.state.get_node_id());
     let request = Request::builder()
         .method("GET")
         .uri("/access/token")
-        .header(RELAY_HOP_HEADER, "peer")
+        .header(RELAY_HOP_HEADER, passed)
         .body(Body::empty())
         .unwrap();
     let response = relay_app(fixture.state.clone())
         .oneshot(request)
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 // A device runs no document sync: its listing shows the names a realm node last served it.

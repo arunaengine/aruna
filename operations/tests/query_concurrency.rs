@@ -605,6 +605,36 @@ async fn query_cache_invalidates() -> Result<(), BoxError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_order_by() -> Result<(), BoxError> {
+    let harness = build_harness(None).await?;
+    let mut records = Vec::new();
+    for index in [1usize, 2, 0] {
+        let graph_iri = create_crate_graph(&harness, index).await?;
+        records.push(registry_record(harness.group_id, index, Some(graph_iri)));
+    }
+    write_registry_records(&harness, &records).await?;
+
+    let results = harness
+        .handle
+        .query_authorized_local(
+            None,
+            None,
+            "SELECT ?name WHERE { ?s a schema:Dataset ; schema:name ?name } ORDER BY DESC(?name)"
+                .to_string(),
+        )
+        .await?;
+    let MetadataQueryResults::Solutions(rows) = results else {
+        return Err("expected solutions".into());
+    };
+    let names: Vec<_> = rows.iter().filter_map(|row| row.get("name")).collect();
+    let expected: Vec<_> = [2, 1, 0]
+        .map(|index| format!("\"{}\"", crate_name(index)))
+        .to_vec();
+    assert_eq!(names, expected.iter().collect::<Vec<_>>());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lazy_matches_eager() -> Result<(), BoxError> {
     let harness = build_harness(None).await?;
     let group_id = harness.group_id;

@@ -4,8 +4,8 @@
 
 use super::data::{WriteObjectInput, write_text};
 use super::{
-    JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
-    parse_ulid, request_auth, server_error, tool_extras,
+    JsonPayload, McpServer, bad_request, empty_extras, explained, internal_error, parse_ulid,
+    request_auth, server_error, tool_extras,
 };
 use aruna_core::compute::runtimes::{
     QUICK_RUNTIMES, QuickRuntime, SESSION_RUNTIMES, SESSION_TAG, SESSION_TAG_NOTEBOOK,
@@ -13,9 +13,7 @@ use aruna_core::compute::runtimes::{
 };
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::storage::blob::{
-    CONTENT_TYPE_KEY, group_permission_path, key_content_type,
-};
+use aruna_core::structs::storage::blob::{CONTENT_TYPE_KEY, key_content_type};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget,
@@ -557,6 +555,7 @@ impl McpServer {
             self,
             &auth,
             WriteObjectInput {
+                node_id: None,
                 bucket: plan
                     .request
                     .workspace
@@ -582,6 +581,7 @@ impl McpServer {
                 self,
                 &auth,
                 WriteObjectInput {
+                    node_id: None,
                     bucket,
                     key,
                     text,
@@ -778,24 +778,8 @@ impl McpServer {
                 )
             })
             .transpose()?;
-        match group_id {
-            Some(group_id) => {
-                authorize_tool(
-                    &self.state,
-                    &auth,
-                    group_permission_path(
-                        self.state.get_realm_id(),
-                        group_id,
-                        self.state.get_node_id(),
-                    ),
-                    Permission::READ,
-                    extras,
-                )
-                .await
-                .map_err(server_error)?;
-            }
-            None => compute_probe(self, &auth, Permission::READ, extras).await?,
-        }
+        // Only the caller's own jobs are listed, so a group filter needs no group grant.
+        compute_probe(self, &auth, Permission::READ, extras).await?;
         let state_filter = input.state.as_deref().map(parse_job_state).transpose()?;
         let limit = input
             .limit

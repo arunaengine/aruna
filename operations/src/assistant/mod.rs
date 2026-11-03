@@ -13,6 +13,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
+pub mod central;
 mod heads;
 pub mod provider;
 #[cfg(test)]

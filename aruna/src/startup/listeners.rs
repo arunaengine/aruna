@@ -391,7 +391,10 @@ async fn bind_portal(
     state: Arc<ServerState>,
     shutdown: &Shutdown,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, Box<dyn std::error::Error>> {
-    let PortalConfig::Artifact { socket_addr, .. } = portal else {
+    let PortalConfig::Artifact {
+        socket_addr, login, ..
+    } = portal
+    else {
         return Ok(None);
     };
     let Some(api_public_url) = api_public_url else {
@@ -404,6 +407,7 @@ async fn bind_portal(
         api_public_url: api_public_url.to_string(),
         csp,
         registry_url,
+        login: login.clone(),
     };
     let token = shutdown.token();
     let handle = tokio::spawn(async move {

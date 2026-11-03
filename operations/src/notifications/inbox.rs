@@ -9,11 +9,11 @@ use aruna_core::effects::IterStart;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
+use aruna_core::keyspaces::{NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
 use aruna_core::storage_entries::{inbox_delete_entries, inbox_write_entries};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord, TRANSIENT_USER_CAP,
-    notification_inbox_key, notification_inbox_prefix,
+    notification_cutoff_key, notification_inbox_key, notification_inbox_prefix,
 };
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use aruna_storage::StorageHandle;
@@ -24,14 +24,15 @@ pub(crate) enum UpsertFailure {
     Fatal(String),
 }
 
-/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen
-/// order, recipients that gained or lost a record, so a caller can wake each once;
-/// a pure redelivery reports zero writes. `purged` counts records a bucket deletion removed.
+/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen order, those that
+/// gained or lost a record, so a caller wakes each once; a pure redelivery reports zero writes.
+/// `purged` counts records a bucket deletion removed, `cutoffs` the deletion times it stored.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InboxWriteOutcome {
     pub written: usize,
     pub recipients: Vec<UserId>,
     pub purged: usize,
+    pub cutoffs: usize,
 }
 
 /// Idempotent holder-local upsert: existing primary keys are skipped inside the
@@ -92,7 +93,7 @@ async fn upsert_once(
             return Err(error);
         }
     };
-    if outcome.written == 0 && outcome.purged == 0 {
+    if outcome.written == 0 && outcome.purged == 0 && outcome.cutoffs == 0 {
         abort_txn(storage, txn_id).await;
         return Ok(outcome);
     }
@@ -114,16 +115,26 @@ pub(crate) async fn upsert_transactionally(
     records: &[NotificationRecord],
     txn_id: TxnId,
 ) -> Result<InboxWriteOutcome, UpsertFailure> {
-    // A bucket deletion is never stored: it removes the notices about its bucket instead.
+    // A bucket deletion is never stored: it removes the notices about its bucket instead, and
+    // keeps its time, so a notice from before it that arrives late is dropped too.
     let (purges, records): (Vec<&NotificationRecord>, Vec<&NotificationRecord>) = records
         .iter()
         .partition(|record| matches!(record.kind, NotificationKind::BucketDeleted { .. }));
-    let records: Vec<&NotificationRecord> = records
-        .into_iter()
-        .filter(|record| !purges.iter().any(|purge| purge.purges(record)))
-        .collect();
+    let mut kept = Vec::new();
+    for record in records {
+        let cutoff = match cutoff_key(record) {
+            Some(key) => read_cutoff(storage, key, txn_id).await?,
+            None => None,
+        };
+        let late = cutoff.is_some_and(|cutoff| record.created_at_ms <= cutoff);
+        if !late && !purges.iter().any(|purge| purge.purges(record)) {
+            kept.push(record);
+        }
+    }
+    let records = kept;
     let mut outcome = InboxWriteOutcome::default();
     let mut deletes = Vec::new();
+    let mut times = BTreeMap::new();
     for purge in &purges {
         let purged = purged_records(storage, purge, txn_id).await?;
         if !purged.is_empty() && !outcome.recipients.contains(&purge.recipient) {
@@ -131,6 +142,36 @@ pub(crate) async fn upsert_transactionally(
         }
         outcome.purged += purged.len();
         deletes.extend(purged.iter().flat_map(inbox_delete_entries));
+        if let Some(key) = cutoff_key(purge) {
+            let time = times.entry(key).or_insert(purge.created_at_ms);
+            *time = (*time).max(purge.created_at_ms);
+        }
+    }
+    let mut cutoffs = Vec::new();
+    for (key, time) in times {
+        let stored = read_cutoff(storage, key.clone(), txn_id).await?;
+        if stored.is_none_or(|stored| stored < time) {
+            let time = time.to_be_bytes().to_vec();
+            cutoffs.push((NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key, time.into()));
+            outcome.cutoffs += 1;
+        }
+    }
+    if !cutoffs.is_empty() {
+        match storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes: cutoffs,
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
+            other => {
+                return Err(UpsertFailure::Fatal(format!(
+                    "unexpected storage event: {other:?}"
+                )));
+            }
+        }
     }
     if !deletes.is_empty() {
         match storage
@@ -285,6 +326,34 @@ async fn count_transient(
             Some(next) => start_after = Some(next),
             None => return Ok(count),
         }
+    }
+}
+
+/// The deletion cutoff row of the bucket a notice names, if it names one.
+fn cutoff_key(record: &NotificationRecord) -> Option<Key> {
+    let (node_id, bucket) = record.kind.bucket()?;
+    Some(notification_cutoff_key(record.recipient, node_id, bucket))
+}
+
+/// The newest deletion time stored for a recipient's bucket.
+async fn read_cutoff(
+    storage: &StorageHandle,
+    key: Key,
+    txn_id: TxnId,
+) -> Result<Option<u64>, UpsertFailure> {
+    let read = StorageEffect::Read {
+        key_space: NOTIFICATION_CUTOFF_KEYSPACE.to_string(),
+        key,
+        txn_id: Some(txn_id),
+    };
+    match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
+            .and_then(|value| <[u8; 8]>::try_from(value.as_ref()).ok())
+            .map(u64::from_be_bytes)),
+        Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
+        other => Err(UpsertFailure::Fatal(format!(
+            "unexpected storage event: {other:?}"
+        ))),
     }
 }
 
@@ -470,6 +539,45 @@ mod tests {
         // A redelivered deletion finds nothing left.
         let again = upsert_with_report(&storage, &[deletion]).await.unwrap();
         assert_eq!(again, InboxWriteOutcome::default());
+    }
+
+    /// A notice from before a bucket's deletion that arrives after it stays dropped, while a
+    /// later notice about a bucket of the same name is stored.
+    #[tokio::test]
+    async fn late_notice_dropped() {
+        let (_dir, storage) = temp_storage();
+        let recipient = user(1, 2);
+        let node_id = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let group_id = ulid::Ulid::from_parts(1, 1);
+        let record =
+            |kind, at| NotificationRecord::new(recipient, NotificationClass::Direct, kind, at);
+        let notice = |bucket: &str, at| {
+            let kind = NotificationKind::ShareUpload {
+                share_id: ulid::Ulid::generate(),
+                node_id,
+                group_id,
+                bucket: bucket.to_string(),
+                key: "key".to_string(),
+                size_bytes: 1,
+            };
+            record(kind, at)
+        };
+        let deleted = NotificationKind::BucketDeleted {
+            bucket: "raw".to_string(),
+            node_id,
+            group_id,
+        };
+        let deletion = upsert_with_report(&storage, &[record(deleted, 2_000)]).await;
+        assert_eq!(deletion.unwrap().cutoffs, 1);
+
+        let late = upsert_with_report(&storage, &[notice("raw", 1_500)]).await;
+        assert_eq!(late.unwrap().written, 0);
+        let kept = [notice("raw", 2_500), notice("other", 1_500)];
+        assert_eq!(upsert_inbox_records(&storage, &kept).await, Ok(2));
+        assert_eq!(
+            count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
+            2
+        );
     }
 
     #[tokio::test]

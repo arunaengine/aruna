@@ -6,8 +6,8 @@ mod read;
 mod write;
 
 pub(crate) use self::read::{
-    AuthFailure, ReadDecision, apply_document_query, apply_forwarded_export,
-    apply_forwarded_profile, export_profile_routed, reduce_holder_reads,
+    AuthFailure, PROFILE_DOCUMENT_PREFIX, ReadDecision, apply_document_query,
+    apply_forwarded_export, apply_forwarded_profile, export_profile_routed, reduce_holder_reads,
 };
 pub use self::read::{
     admits_profile_peer, export_profile_local, export_rocrate_here, export_rocrate_routed,

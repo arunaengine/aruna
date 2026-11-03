@@ -370,3 +370,68 @@ async fn deletion_hides_family() {
         .expect("deletion publishes");
     assert!(matches!(read().await, Some(Err(JobRouteError::NotFound))));
 }
+
+#[tokio::test]
+async fn unrecorded_deletion_kept() {
+    // A node that cannot record the deletion in the run's family keeps the run, so a retried
+    // delete records it again; a holder records it before the run goes.
+    use crate::jobs::service::delete_owned_run;
+    use crate::jobs::store::{RunDelete, insert_job};
+    use crate::tests::records::secret;
+    use aruna_core::structs::execution::job::{
+        ComputeResources, ExecutionSpec, JobPayload, JobRecord,
+    };
+    let family = Family::new([45u8; 32]);
+    let job_id = family.spec().job_id;
+    let finished = |node| {
+        let spec = ExecutionSpec {
+            group_id: ulid::Ulid::from_bytes([2u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        };
+        let payload = JobPayload::Execution(spec);
+        let mut record = JobRecord::new(job_id, payload, user(), node, 1_000, 1_000, None);
+        record.state = JobState::Succeeded;
+        record.finished_at_ms = Some(2_000);
+        record
+    };
+    let owner = auth(user());
+
+    let outsider = secret(9);
+    let (_dir, ctx) = node_context(&family, &outsider).await;
+    seed_family(&ctx, &family).await;
+    insert_job(&ctx.storage_handle, &finished(outsider.public()))
+        .await
+        .expect("run row written");
+    let kept = delete_owned_run(&ctx, &owner, job_id)
+        .await
+        .expect("delete runs");
+    assert!(matches!(kept, RunDelete::Unrecorded(_)), "{kept:?}");
+    let row = read_job_record(&ctx.storage_handle, job_id, None).await;
+    assert!(row.expect("run row read").is_some());
+
+    let (_dir, ctx) = node_context(&family, &family.holder).await;
+    seed_family(&ctx, &family).await;
+    insert_job(&ctx.storage_handle, &finished(family.holder.public()))
+        .await
+        .expect("run row written");
+    let deleted = delete_owned_run(&ctx, &owner, job_id)
+        .await
+        .expect("delete runs");
+    assert_eq!(deleted, RunDelete::Deleted);
+    let cancels = load_kind_complete(&ctx, family.family(), JobRecordKind::Cancel).await;
+    assert_eq!(cancels.expect("cancel records load").len(), 1);
+}
