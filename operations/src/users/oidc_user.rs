@@ -1005,4 +1005,66 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(operation.finalize().unwrap(), existing_user);
     }
+
+    #[tokio::test]
+    async fn subject_skips_scan() {
+        // A known subject signs in to its own account, though its email and name match it.
+        let realm_id = aruna_core::structs::identity::realm::RealmId([5u8; 32]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[6u8; 32]).public(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        let subject = oidc_subject_key("https://issuer.example", "subject-3").unwrap();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let existing_user = User {
+            user_id,
+            name: "Aruna Admin".to_string(),
+            subject_ids: vec![subject.clone()],
+            alias_user_ids: Default::default(),
+            attributes: [(
+                aruna_core::user::validation::EMAIL_HASH_ATTRIBUTE.to_string(),
+                "hash".to_string(),
+            )]
+            .into(),
+        };
+        let mut operation = ResolveOidcOperation::new(ResolveOidcInput {
+            actor: actor.clone(),
+            issuer: "https://issuer.example".to_string(),
+            subject_id: "subject-3".to_string(),
+            name: "Aruna Admin".to_string(),
+            user_id: UserId::local(Ulid::generate(), realm_id),
+            email_hash: Some("hash".to_string()),
+            create_new: false,
+        });
+
+        operation.start();
+        let txn_id = TxnId::generate();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    subject.into_bytes().into(),
+                    Some(user_id.to_storage_key().into()),
+                ),
+                (ByteView::from(*realm_id.as_bytes()), None),
+            ],
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { .. })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: user_id.to_bytes().into(),
+            value: Some(existing_user.to_bytes(&actor).unwrap().into()),
+        }));
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Storage(StorageEffect::CommitTransaction { .. }))
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert_eq!(operation.finalize().unwrap(), existing_user);
+    }
 }
