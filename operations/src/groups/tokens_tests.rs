@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::list::{GroupTokensConfig, ListTokensOperation};
+use super::list::{GroupTokensConfig, ListTokensOperation, TokenPage};
 use super::revoke::{RevokeTarget, RevokeTokensConfig, RevokeTokensOperation};
-use super::{GroupTokensError, TokenKind, TokenStatus};
+use super::{GroupTokensError, TokenCursor, TokenKind, TokenStatus};
 use crate::driver::{DriverContext, drive};
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use crate::session::index::encode_index;
@@ -251,17 +251,36 @@ fn auth(user_id: UserId) -> AuthContext {
 }
 
 impl Fixture {
+    async fn page(
+        &self,
+        (caller, group_id): (UserId, GroupId),
+        cursor: Option<TokenCursor>,
+        limit: usize,
+    ) -> Result<TokenPage, GroupTokensError> {
+        let config = GroupTokensConfig {
+            auth_context: auth(caller),
+            group_id,
+            now: self.now,
+            cursor,
+            limit,
+        };
+        drive(ListTokensOperation::new(config), &self.context).await
+    }
+
     async fn list(
         &self,
         caller: UserId,
         group_id: GroupId,
     ) -> Result<Vec<super::GroupToken>, GroupTokensError> {
-        let config = GroupTokensConfig {
-            auth_context: auth(caller),
-            group_id,
-            now: self.now,
-        };
-        drive(ListTokensOperation::new(config), &self.context).await
+        let (mut tokens, mut cursor) = (Vec::new(), None);
+        loop {
+            let page = self.page((caller, group_id), cursor, 1_000).await?;
+            tokens.extend(page.tokens);
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(tokens),
+            }
+        }
     }
 
     async fn revoke(
@@ -332,6 +351,30 @@ async fn admin_lists_own() {
     // The admin of group A administers nothing in group B.
     let foreign = fixture.list(fixture.admin_a, fixture.group_b).await;
     assert_eq!(foreign, Err(GroupTokensError::Refused));
+}
+
+/// Pages of one token list every token of the group once, and a cursor survives its byte form.
+#[tokio::test]
+async fn pages_cover_all() {
+    let fixture = fixture().await;
+    let mut expected = BTreeSet::new();
+    for _ in 0..3 {
+        expected.insert(seed_credential(&fixture.context, fixture.member, fixture.group_a).await);
+    }
+    seed_credential(&fixture.context, fixture.member, fixture.group_b).await;
+    expected.insert(seed_session(&fixture.context, fixture.account, fixture.now).await);
+    let (mut seen, mut cursor) = (Vec::new(), None);
+    loop {
+        let caller = (fixture.admin_a, fixture.group_a);
+        let page = fixture.page(caller, cursor, 1).await.unwrap();
+        assert!(page.tokens.len() <= 1);
+        seen.extend(page.tokens.into_iter().map(|token| token.id));
+        let Some(next) = page.next else { break };
+        cursor = Some(TokenCursor::from_bytes(&next.to_bytes()).unwrap());
+    }
+    assert_eq!(seen.len(), expected.len());
+    assert_eq!(seen.into_iter().collect::<BTreeSet<_>>(), expected);
+    assert_eq!(TokenCursor::from_bytes(&[9, 1]), None);
 }
 
 #[tokio::test]

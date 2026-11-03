@@ -14,15 +14,18 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::revoke_token::RevokeTokenError;
 use aruna_operations::driver::drive;
+use aruna_operations::groups::tokens::TokenCursor;
 use aruna_operations::groups::tokens::list::{GroupTokensConfig, ListTokensOperation};
 use aruna_operations::groups::tokens::revoke::{
     RevokeTarget, RevokeTokensConfig, RevokeTokensOperation,
 };
 use aruna_operations::groups::tokens::{GroupToken, GroupTokensError, TokenKind, TokenStatus};
 use aruna_operations::users::revoke_all::{RevokeAllConfig, RevokeAllError, RevokeAllOperation};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{OpenApi, ToSchema};
@@ -57,6 +60,31 @@ pub struct GroupTokenResponse {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct GroupTokensResponse {
     pub tokens: Vec<GroupTokenResponse>,
+    /// Pass back as `cursor` for the next page; absent after the last page.
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TokenPageQuery {
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Default and largest page of the token listing.
+pub(crate) const TOKEN_PAGE: (u32, u32) = (100, 1_000);
+
+fn parse_cursor(cursor: Option<&str>) -> ServerResult<Option<TokenCursor>> {
+    cursor
+        .map(|cursor| {
+            URL_SAFE_NO_PAD
+                .decode(cursor)
+                .ok()
+                .and_then(|bytes| TokenCursor::from_bytes(&bytes))
+                .ok_or_else(|| ServerError::BadRequestReason("invalid cursor".to_string()))
+        })
+        .transpose()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -176,11 +204,20 @@ async fn run_revocation(
 - Personal bearer sessions of members are not listed: they are bound to the user, not the group.
 - Tokens issued before their owner's revocation cutoff are listed as `revoked`.
 - No secret, token or token hash is ever returned.
+- `session` entries cannot be revoked through the group routes, because a service account's
+  session may reach other groups.
+- Tokens come a page at a time: sessions first, then S3 credentials, then S3 sessions. Pass
+  `next_cursor` back as `cursor` for the next page. A page holds at most `limit` tokens, except
+  that one service account's sessions are never split, and it may be empty while a cursor follows.
 
 **Limits**
 - Sessions and S3 keys live on the node that issued them, so each node lists only its own.
 - `last_used_at` is known only for S3 sessions."#,
-    params(("id" = String, Path, description = "Group id as a 26-character ULID")),
+    params(
+        ("id" = String, Path, description = "Group id as a 26-character ULID"),
+        ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` of the previous page; omit for the first page"),
+        ("limit" = Option<u32>, Query, description = "Tokens per page; defaults to 100 and is clamped to the range 1-1000")
+    ),
     responses(
         (status = 200, description = "The group's tokens held by this node", body = GroupTokensResponse,
             example = json!({
@@ -192,9 +229,10 @@ async fn run_revocation(
                     "expires_at": "2027-04-09T12:00:00Z",
                     "last_used_at": null,
                     "status": "active"
-                }]
+                }],
+                "next_cursor": "AQExSkFLRVkwMTIzNDU2Nzg5QUJDREVGR0hK"
             })),
-        (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
+        (status = 400, description = "The group id is not a ULID, or the cursor is invalid", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller does not administer the group", body = ErrorResponse)
     ),
@@ -204,22 +242,35 @@ pub async fn list_group_tokens(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
+    Query(query): Query<TokenPageQuery>,
 ) -> ServerResult<(StatusCode, Json<GroupTokensResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
+    let cursor = parse_cursor(query.cursor.as_deref())?;
+    let (default, largest) = TOKEN_PAGE;
+    let limit = query.limit.unwrap_or(default).clamp(1, largest) as usize;
     ensure_group_admin(&state, &auth, group_id).await?;
-    let tokens = drive(
+    let page = drive(
         ListTokensOperation::new(GroupTokensConfig {
             auth_context: auth,
             group_id,
             now: unix_timestamp_secs(),
+            cursor,
+            limit,
         }),
         &state.get_ctx(),
     )
     .await
     .map_err(map_tokens_error)?;
-    let tokens = tokens.into_iter().map(token_response).collect();
-    Ok((StatusCode::OK, Json(GroupTokensResponse { tokens })))
+    Ok((
+        StatusCode::OK,
+        Json(GroupTokensResponse {
+            tokens: page.tokens.into_iter().map(token_response).collect(),
+            next_cursor: page
+                .next
+                .map(|cursor| URL_SAFE_NO_PAD.encode(cursor.to_bytes())),
+        }),
+    ))
 }
 
 #[utoipa::path(

@@ -1,4 +1,4 @@
-//! Collects the tokens this node holds that grant access to one group, for its administrators.
+//! Pages through the tokens this node holds that grant access to one group, for its admins.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -97,48 +97,86 @@ pub enum GroupTokensError {
 enum ScanStep {
     Config,
     Users,
-    Owners,
+    Owner,
     Sessions,
     Credentials,
     S3Sessions,
 }
 
-/// Reads the realm cutoffs, the group's service account sessions, then every S3 credential and
-/// S3 session of this node, keeping those bound to the group.
+/// Where a listing page stopped: the keyspace and the last key handled there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenCursor {
+    step: ScanStep,
+    after: Key,
+}
+
+impl TokenCursor {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let step = match self.step {
+            ScanStep::Credentials => 1,
+            ScanStep::S3Sessions => 2,
+            _ => 0,
+        };
+        let mut bytes = vec![step];
+        bytes.extend_from_slice(self.after.as_ref());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (step, after) = bytes.split_first()?;
+        let step = match step {
+            0 => ScanStep::Users,
+            1 => ScanStep::Credentials,
+            2 => ScanStep::S3Sessions,
+            _ => return None,
+        };
+        (!after.is_empty()).then(|| Self {
+            step,
+            after: after.to_vec().into(),
+        })
+    }
+}
+
+/// Reads one page of the group's tokens: the sessions of its service accounts, then the S3
+/// credentials and S3 sessions of this node bound to it, stopping once `limit` are found.
 #[derive(Debug, PartialEq)]
 pub(crate) struct TokenScan {
     realm_id: RealmId,
     group_id: GroupId,
     now: u64,
+    limit: usize,
+    start: Option<TokenCursor>,
     step: ScanStep,
     config: Option<RealmConfigDocument>,
-    accounts: Vec<UserId>,
-    session_ids: Vec<String>,
+    /// Service accounts of the current user page still to read, last first.
+    accounts: Vec<(Key, UserId)>,
+    /// The last key of the current user page, and whether another page follows.
+    page_end: Option<(Key, bool)>,
+    current: Option<(Key, UserId)>,
     pub(crate) tokens: Vec<GroupToken>,
-}
-
-fn unix_secs(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
-}
-
-fn key_time(key_id: &str) -> Option<u64> {
-    Ulid::from_string(key_id)
-        .ok()
-        .map(|id| id.timestamp_ms() / 1000)
+    pub(crate) next: Option<TokenCursor>,
 }
 
 impl TokenScan {
-    pub(crate) fn new(realm_id: RealmId, group_id: GroupId, now: u64) -> Self {
+    pub(crate) fn new(
+        (realm_id, group_id): (RealmId, GroupId),
+        now: u64,
+        start: Option<TokenCursor>,
+        limit: usize,
+    ) -> Self {
         Self {
             realm_id,
             group_id,
             now,
+            limit: limit.max(1),
+            start,
             step: ScanStep::Config,
             config: None,
             accounts: Vec::new(),
-            session_ids: Vec::new(),
+            page_end: None,
+            current: None,
             tokens: Vec::new(),
+            next: None,
         }
     }
 
@@ -147,9 +185,13 @@ impl TokenScan {
         smallvec![read_config(self.realm_id)]
     }
 
-    fn iter(&mut self, step: ScanStep, key_space: &str, start: Option<Key>) -> Effects {
+    fn iter(&mut self, step: ScanStep, start: Option<Key>) -> Effects {
         self.step = step;
-        let prefix = (step == ScanStep::Users).then(|| UserId::storage_prefix(self.realm_id));
+        let (key_space, prefix) = match step {
+            ScanStep::Credentials => (USER_ACCESS_KEYSPACE, None),
+            ScanStep::S3Sessions => (S3_SESSION_KEYSPACE, None),
+            _ => (USER_KEYSPACE, Some(UserId::storage_prefix(self.realm_id))),
+        };
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: key_space.to_string(),
             prefix,
@@ -157,6 +199,15 @@ impl TokenScan {
             limit: PAGE,
             txn_id: None,
         })]
+    }
+
+    fn full(&self) -> bool {
+        self.tokens.len() >= self.limit
+    }
+
+    fn stop(&mut self, step: ScanStep, after: Key) -> Option<Effects> {
+        self.next = Some(TokenCursor { step, after });
+        None
     }
 
     fn unexpected(&self, expected: &'static str, event: Event) -> GroupTokensError {
@@ -167,7 +218,7 @@ impl TokenScan {
         }
     }
 
-    /// The next effects, or `None` once every keyspace was read.
+    /// The next effects, or `None` once the page is full or every keyspace was read.
     pub(crate) fn step(&mut self, event: Event) -> Result<Option<Effects>, GroupTokensError> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(error.into());
@@ -175,76 +226,109 @@ impl TokenScan {
         match self.step {
             ScanStep::Config => {
                 self.config = parse_config(event)?;
-                Ok(Some(self.iter(ScanStep::Users, USER_KEYSPACE, None)))
+                let (step, after) = match self.start.take() {
+                    Some(cursor) => (cursor.step, Some(cursor.after)),
+                    None => (ScanStep::Users, None),
+                };
+                Ok(Some(self.iter(step, after)))
             }
             ScanStep::Users => {
-                let (values, next) = self.page(event, "user page")?;
-                for (_, value) in values {
+                let (values, more) = self.page(event, "user page")?;
+                self.page_end = values.last().map(|(key, _)| (key.clone(), more.is_some()));
+                for (key, value) in values {
                     let user = User::from_bytes(&value)?;
                     if user.service_group() == Some(self.group_id) {
-                        self.accounts.push(user.user_id);
+                        self.accounts.push((key, user.user_id));
                     }
                 }
-                Ok(Some(match next {
-                    Some(start) => self.iter(ScanStep::Users, USER_KEYSPACE, Some(start)),
-                    None => self.read_owners(),
-                }))
+                self.accounts.reverse();
+                Ok(self.next_account())
             }
-            ScanStep::Owners => {
-                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
+            ScanStep::Owner => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return Err(self.unexpected("session owner index read", event));
                 };
-                for (_, value) in values {
-                    self.session_ids.extend(decode_index(value.as_ref())?);
+                let reads: Vec<_> = decode_index(value.as_ref())?
+                    .into_iter()
+                    .map(|sid| (USER_SESSION_KEYSPACE.to_string(), sid.into_bytes().into()))
+                    .collect();
+                if reads.is_empty() {
+                    return Ok(self.after_account());
                 }
-                Ok(Some(self.read_sessions()))
+                self.step = ScanStep::Sessions;
+                Ok(Some(smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads,
+                    txn_id: None,
+                })]))
             }
             ScanStep::Sessions => {
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return Err(self.unexpected("session read", event));
                 };
+                let account = self.current.as_ref().map(|(_, account)| *account);
                 for (key, value) in values {
                     let Some(value) = value else { continue };
                     let session = UserSession::from_bytes(&value)?;
-                    if session.sid.as_bytes() == key.as_ref()
-                        && self.accounts.contains(&session.user_id)
-                    {
-                        self.push_session(session);
+                    if session.sid.as_bytes() == key.as_ref() && Some(session.user_id) == account {
+                        let token = self.cutoffs().session(session);
+                        self.tokens.push(token);
                     }
                 }
-                Ok(Some(self.iter(
-                    ScanStep::Credentials,
-                    USER_ACCESS_KEYSPACE,
-                    None,
-                )))
+                Ok(self.after_account())
             }
-            ScanStep::Credentials => {
-                let (values, next) = self.page(event, "credential page")?;
-                for (_, value) in values {
+            ScanStep::Credentials | ScanStep::S3Sessions => self.walk(event),
+        }
+    }
+
+    fn next_account(&mut self) -> Option<Effects> {
+        if let Some((key, account)) = self.accounts.pop() {
+            self.current = Some((key, account));
+            self.step = ScanStep::Owner;
+            return Some(smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: USER_OWNER_KEYSPACE.to_string(),
+                key: owner_key(account),
+                txn_id: None,
+            })]);
+        }
+        match self.page_end.take() {
+            Some((last, _)) if self.full() => self.stop(ScanStep::Users, last),
+            Some((last, true)) => Some(self.iter(ScanStep::Users, Some(last))),
+            _ => Some(self.iter(ScanStep::Credentials, None)),
+        }
+    }
+
+    /// An account's sessions are listed whole, so a page may exceed `limit` by up to one account.
+    fn after_account(&mut self) -> Option<Effects> {
+        match self.current.take() {
+            Some((key, _)) if self.full() => self.stop(ScanStep::Users, key),
+            _ => self.next_account(),
+        }
+    }
+
+    fn walk(&mut self, event: Event) -> Result<Option<Effects>, GroupTokensError> {
+        let step = self.step;
+        let (values, more) = self.page(event, "token page")?;
+        for (key, value) in values {
+            let token = match step {
+                ScanStep::Credentials => {
                     let access = UserAccess::from_bytes(&value)?;
-                    if access.group_id == self.group_id {
-                        self.push_credential(access);
-                    }
+                    (access.group_id == self.group_id).then(|| self.cutoffs().credential(access))
                 }
-                Ok(Some(match next {
-                    Some(start) => {
-                        self.iter(ScanStep::Credentials, USER_ACCESS_KEYSPACE, Some(start))
-                    }
-                    None => self.iter(ScanStep::S3Sessions, S3_SESSION_KEYSPACE, None),
-                }))
-            }
-            ScanStep::S3Sessions => {
-                let (values, next) = self.page(event, "S3 session page")?;
-                for (_, value) in values {
+                _ => {
                     let session = S3Session::from_bytes(&value)?;
-                    if session.group_id == self.group_id {
-                        self.push_s3_session(session);
-                    }
+                    (session.group_id == self.group_id).then(|| self.cutoffs().s3_session(session))
                 }
-                Ok(next
-                    .map(|start| self.iter(ScanStep::S3Sessions, S3_SESSION_KEYSPACE, Some(start))))
+            };
+            self.tokens.extend(token);
+            if self.full() {
+                return Ok(self.stop(step, key));
             }
         }
+        Ok(match (more, step) {
+            (Some(start), _) => Some(self.iter(step, Some(start))),
+            (None, ScanStep::Credentials) => Some(self.iter(ScanStep::S3Sessions, None)),
+            (None, _) => None,
+        })
     }
 
     fn page(&self, event: Event, expected: &'static str) -> Result<Page, GroupTokensError> {
@@ -257,59 +341,23 @@ impl TokenScan {
         }
     }
 
-    fn read_owners(&mut self) -> Effects {
-        if self.accounts.is_empty() {
-            return self.iter(ScanStep::Credentials, USER_ACCESS_KEYSPACE, None);
-        }
-        self.step = ScanStep::Owners;
-        let reads = self
-            .accounts
-            .iter()
-            .map(|account| (USER_OWNER_KEYSPACE.to_string(), owner_key(*account)))
-            .collect();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
-    }
-
-    fn read_sessions(&mut self) -> Effects {
-        if self.session_ids.is_empty() {
-            return self.iter(ScanStep::Credentials, USER_ACCESS_KEYSPACE, None);
-        }
-        self.step = ScanStep::Sessions;
-        let reads = self
-            .session_ids
-            .iter()
-            .map(|sid| (USER_SESSION_KEYSPACE.to_string(), sid.as_bytes().into()))
-            .collect();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
-    }
-
-    fn push_session(&mut self, session: UserSession) {
-        let token = self.cutoffs().session(session);
-        self.tokens.push(token);
-    }
-
-    fn push_credential(&mut self, access: UserAccess) {
-        let token = self.cutoffs().credential(access);
-        self.tokens.push(token);
-    }
-
-    fn push_s3_session(&mut self, session: S3Session) {
-        let token = self.cutoffs().s3_session(session);
-        self.tokens.push(token);
-    }
-
     fn cutoffs(&self) -> Cutoffs<'_> {
         Cutoffs {
             config: self.config.as_ref(),
             now: self.now,
         }
     }
+}
+
+fn unix_secs(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn key_time(key_id: &str) -> Option<u64> {
+    Ulid::from_string(key_id)
+        .ok()
+        .map(|id| id.timestamp_ms() / 1000)
 }
 
 /// Reads the realm configuration that holds the owners' revocation cutoffs.

@@ -817,6 +817,7 @@ async fn policy_denies_admins() {
             State(state.clone()),
             Extension(Some(member_auth(user))),
             Path(group_id.to_string()),
+            Query(Default::default()),
         )
     };
     let overview =

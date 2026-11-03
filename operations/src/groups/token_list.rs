@@ -9,7 +9,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 
-use super::{GroupToken, GroupTokensError, TokenScan};
+use super::{GroupToken, GroupTokensError, TokenCursor, TokenScan};
 use crate::groups::admin_check::{AdminCheckOperation, authorization_event};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -18,6 +18,17 @@ pub struct GroupTokensConfig {
     pub group_id: GroupId,
     /// Unix seconds that decide expiry and cutoffs.
     pub now: u64,
+    /// Where the previous page stopped; `None` starts at the beginning.
+    pub cursor: Option<TokenCursor>,
+    /// Tokens per page; one service account's sessions are never split across pages.
+    pub limit: usize,
+}
+
+/// One page of tokens and the cursor of the next page, absent after the last.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TokenPage {
+    pub tokens: Vec<GroupToken>,
+    pub next: Option<TokenCursor>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,12 +45,13 @@ pub struct ListTokensOperation {
     config: GroupTokensConfig,
     scan: TokenScan,
     state: ListTokensState,
-    output: Option<Result<Vec<GroupToken>, GroupTokensError>>,
+    output: Option<Result<TokenPage, GroupTokensError>>,
 }
 
 impl ListTokensOperation {
     pub fn new(config: GroupTokensConfig) -> Self {
-        let scan = TokenScan::new(config.auth_context.realm_id, config.group_id, config.now);
+        let scope = (config.auth_context.realm_id, config.group_id);
+        let scan = TokenScan::new(scope, config.now, config.cursor.clone(), config.limit);
         Self {
             config,
             scan,
@@ -81,7 +93,7 @@ pub(crate) fn admin_check(auth_context: &AuthContext, group_id: GroupId) -> Effe
 }
 
 impl Operation for ListTokensOperation {
-    type Output = Vec<GroupToken>;
+    type Output = TokenPage;
     type Error = GroupTokensError;
 
     fn start(&mut self) -> Effects {
@@ -102,7 +114,10 @@ impl Operation for ListTokensOperation {
                 Ok(Some(effects)) => effects,
                 Ok(None) => {
                     self.state = ListTokensState::Finish;
-                    self.output = Some(Ok(std::mem::take(&mut self.scan.tokens)));
+                    self.output = Some(Ok(TokenPage {
+                        tokens: std::mem::take(&mut self.scan.tokens),
+                        next: self.scan.next.take(),
+                    }));
                     smallvec![]
                 }
                 Err(error) => self.fail(error),

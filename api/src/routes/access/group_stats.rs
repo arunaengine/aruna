@@ -4,6 +4,7 @@
 
 use crate::auth::{ensure_permission, parse_group_id, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::access::admin_tokens::TOKEN_PAGE;
 use crate::routes::access::groups::{ensure_group_admin, load_group};
 use crate::routes::info::{GroupQuotaStatus, distinct_buckets, load_realm_usage};
 use crate::server::state::ServerState;
@@ -17,8 +18,8 @@ use aruna_core::types::GroupId;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::admin_check::{AdminCheckOperation, realm_groups_path};
 use aruna_operations::groups::list_groups::ListGroupOperation;
-use aruna_operations::groups::tokens::TokenStatus;
 use aruna_operations::groups::tokens::list::{GroupTokensConfig, ListTokensOperation};
+use aruna_operations::groups::tokens::{GroupTokensError, TokenStatus};
 use aruna_operations::jobs::recent::RecentJobsOperation;
 use aruna_operations::node::usage_stats::RealmUsageScope;
 use aruna_operations::realm::get_config::GetConfigOperation;
@@ -225,20 +226,39 @@ pub async fn get_group_statistics(
     let (group, auth_doc) = load_group(&state, group_id).await?;
     let context = stats_context(&state).await;
     let mut response = group_stats(&state, &context, group, auth_doc).await?;
-    let tokens = ListTokensOperation::new(GroupTokensConfig {
-        auth_context: auth,
-        group_id,
-        now: unix_timestamp_secs(),
-    });
-    response.active_tokens = drive(tokens, &state.get_ctx())
+    response.active_tokens = active_tokens(&state, auth, group_id)
         .await
         .inspect_err(|error| warn!(error = %error, "group tokens unavailable for statistics"))
-        .ok()
-        .map(|tokens| {
-            let active = tokens.iter().filter(|t| t.status == TokenStatus::Active);
-            active.count() as u64
-        });
+        .ok();
     Ok((StatusCode::OK, Json(response)))
+}
+
+/// Counts page by page, so only one page of tokens is held at a time.
+async fn active_tokens(
+    state: &ServerState,
+    auth: AuthContext,
+    group_id: GroupId,
+) -> Result<u64, GroupTokensError> {
+    let (now, mut cursor, mut active) = (unix_timestamp_secs(), None, 0);
+    loop {
+        let page = drive(
+            ListTokensOperation::new(GroupTokensConfig {
+                auth_context: auth.clone(),
+                group_id,
+                now,
+                cursor,
+                limit: TOKEN_PAGE.1 as usize,
+            }),
+            &state.get_ctx(),
+        )
+        .await?;
+        let tokens = page.tokens.iter();
+        active += tokens.filter(|t| t.status == TokenStatus::Active).count() as u64;
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => return Ok(active),
+        }
+    }
 }
 
 #[utoipa::path(
