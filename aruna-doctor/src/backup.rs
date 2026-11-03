@@ -5,15 +5,34 @@
 
 use crate::error::CliError;
 use crate::storage::{ImportKeyspaceState, ensure_target_path};
-use aruna::backup::{BACKUP_SOCKET, GIT_KEYSPACE, MAIN_PREFIX, METADATA_PREFIX, SYNC_PREFIX};
+use aruna::backup::{GIT_KEYSPACE, PREFIXES};
+use aruna_core::keyspaces::{CHECK_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE};
+use aruna_core::structs::storage::broken::StorageCheck;
 use aruna_storage::snapshot::{SnapshotError, SnapshotReader, SnapshotRecord, SnapshotStats};
 use craqle::{CraqleNode, CraqleOptions, SearchStorage};
-use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, PersistMode};
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
-use std::os::unix::net::UnixStream;
+use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, PersistMode, Readable};
+use std::fs::File;
+use std::io::BufReader;
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use {
+    aruna::backup::BACKUP_SOCKET,
+    std::fs::OpenOptions,
+    std::io::{BufWriter, Write},
+    std::os::unix::fs::OpenOptionsExt,
+    std::os::unix::net::UnixStream,
+};
 
+#[cfg(not(unix))]
+pub async fn backup(_storage_path: String, _target_path: String) -> Result<(), CliError> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "live backups need the node's Unix socket, which this platform does not have",
+    )
+    .into())
+}
+
+#[cfg(unix)]
 pub async fn backup(storage_path: String, target_path: String) -> Result<(), CliError> {
     let socket = PathBuf::from(storage_path).join(BACKUP_SOCKET);
     let target = PathBuf::from(target_path);
@@ -34,11 +53,16 @@ pub async fn restore(backup_path: String, target_path: String) -> Result<(), Cli
         "Backup restored: keyspaces={}, entries={}, created_at={}",
         stats.keyspace_count, stats.entry_count, stats.created_unix_seconds,
     );
+    println!(
+        "Blob contents are not part of a backup. The node checks every bucket after its start; \
+         GET /data/buckets/{{bucket}}/storage/check lists versions whose blob is missing."
+    );
     Ok(())
 }
 
 /// Copies the node's backup stream to `<target>.partial`, checks the whole file and only then
-/// moves it to `target`, so `target` never holds a cut-off backup.
+/// moves it to `target`, so `target` never holds a cut-off backup. Only the owner may read it.
+#[cfg(unix)]
 pub fn backup_file(socket: &Path, target: &Path) -> Result<(u64, SnapshotStats), SnapshotError> {
     if target.exists() {
         return Err(SnapshotError::SnapshotPathExists(target.to_path_buf()));
@@ -49,6 +73,7 @@ pub fn backup_file(socket: &Path, target: &Path) -> Result<(u64, SnapshotStats),
     let file = OpenOptions::new()
         .create_new(true)
         .write(true)
+        .mode(0o600)
         .open(&partial)?;
     let result = receive_backup(socket, file, &partial);
     match result {
@@ -63,6 +88,7 @@ pub fn backup_file(socket: &Path, target: &Path) -> Result<(u64, SnapshotStats),
     }
 }
 
+#[cfg(unix)]
 fn receive_backup(
     socket: &Path,
     file: File,
@@ -80,10 +106,30 @@ fn receive_backup(
 
 /// Builds a new storage directory from a backup: the node database at `target`, document sync
 /// in `document-sync`, the metadata store in `craqle/store` and the Git repositories in `git`.
+/// It is built in `<target>.partial` and moved to `target` only after the whole file checked.
 pub fn restore_backup(backup: &Path, target: &Path) -> Result<SnapshotStats, SnapshotError> {
     ensure_target_path(target)?;
+    let mut partial = target.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    ensure_target_path(&partial)?;
     let mut reader = SnapshotReader::new(BufReader::new(File::open(backup)?))?;
-    std::fs::create_dir(target)?;
+    std::fs::create_dir(&partial)?;
+    match restore_into(&mut reader, &partial) {
+        Ok(()) => std::fs::rename(&partial, target)?,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&partial);
+            return Err(error);
+        }
+    }
+    Ok(reader.stats())
+}
+
+/// Writes all records into the new directory `target` and closes its databases again.
+fn restore_into(
+    reader: &mut SnapshotReader<impl std::io::Read>,
+    target: &Path,
+) -> Result<(), SnapshotError> {
     let databases = open_targets(target)?;
     let git_root = target.join("git");
     let mut section = None;
@@ -105,18 +151,38 @@ pub fn restore_backup(backup: &Path, target: &Path) -> Result<SnapshotStats, Sna
             }
         }
     }
+    queue_checks(&databases[0])?;
     for database in &databases {
         database.persist(PersistMode::SyncAll)?;
     }
-    Ok(reader.stats())
+    Ok(())
+}
+
+/// Queues a storage check of every bucket, as a backup holds no blob contents: the node then
+/// records each current version whose blob is missing as broken.
+fn queue_checks(main: &OptimisticTxDatabase) -> Result<(), SnapshotError> {
+    let db = main.inner();
+    let open = |name| db.keyspace(name, KeyspaceCreateOptions::default);
+    let (buckets, checks, queue) = (
+        open(S3_BUCKET_KEYSPACE)?,
+        open(STORAGE_CHECK_KEYSPACE)?,
+        open(CHECK_QUEUE_KEYSPACE)?,
+    );
+    let record = StorageCheck::new(aruna_core::time::unix_timestamp_millis())
+        .to_bytes()
+        .map_err(std::io::Error::other)?;
+    for entry in db.snapshot().iter(&buckets) {
+        let bucket = entry.key()?;
+        checks.insert(bucket.clone(), &record)?;
+        queue.insert(bucket, b"")?;
+    }
+    Ok(())
 }
 
 enum Section {
     Store(usize, ImportKeyspaceState),
     Git,
 }
-
-const PREFIXES: [&str; 3] = [MAIN_PREFIX, SYNC_PREFIX, METADATA_PREFIX];
 
 /// Opens the three target databases in `PREFIXES` order. Irokle and Craqle first create their
 /// keyspaces, since Fjall keeps the options a keyspace was created with.
@@ -181,13 +247,12 @@ fn write_git(root: &Path, key: &[u8], value: &[u8]) -> Result<(), SnapshotError>
 
 #[cfg(test)]
 mod tests {
-    use super::{backup_file, restore_backup};
+    use super::restore_backup;
     use aruna::backup::{BackupSources, GIT_KEYSPACE, write_backup};
+    use aruna_core::keyspaces::{CHECK_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE};
     use aruna_storage::snapshot::SnapshotWriter;
     use craqle::CraqleNode;
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
-    use std::io::Write;
-    use std::os::unix::net::UnixListener;
     use std::path::Path;
 
     struct Source {
@@ -213,6 +278,11 @@ mod tests {
                 .unwrap();
             keyspace.insert("key", value).unwrap();
         }
+        main.inner()
+            .keyspace(S3_BUCKET_KEYSPACE, KeyspaceCreateOptions::default)
+            .unwrap()
+            .insert("photos", "info")
+            .unwrap();
         let repo = root.join("git/one.git");
         std::fs::create_dir_all(repo.join("objects")).unwrap();
         std::fs::create_dir_all(repo.join("refs/heads")).unwrap();
@@ -238,15 +308,16 @@ mod tests {
         bytes
     }
 
-    fn read_test_value(db: &fjall::Database) -> Vec<u8> {
+    fn read_value(db: &fjall::Database, keyspace: &str, key: &str) -> Option<Vec<u8>> {
         let keyspace = db
-            .keyspace("backup-test", KeyspaceCreateOptions::default)
+            .keyspace(keyspace, KeyspaceCreateOptions::default)
             .unwrap();
-        db.snapshot()
-            .get(&keyspace, "key")
-            .unwrap()
-            .unwrap()
-            .to_vec()
+        let value = db.snapshot().get(&keyspace, key).unwrap();
+        value.map(|value| value.to_vec())
+    }
+
+    fn read_test_value(db: &fjall::Database) -> Vec<u8> {
+        read_value(db, "backup-test", "key").unwrap()
     }
 
     #[test]
@@ -261,8 +332,12 @@ mod tests {
         let stats = restore_backup(&file, &target).unwrap();
         assert_eq!(stats.created_unix_seconds, 11);
 
+        assert!(!dir.path().join("restored.partial").exists());
         let main = OptimisticTxDatabase::builder(&target).open().unwrap();
         assert_eq!(read_test_value(main.inner()), b"main");
+        let queued = read_value(main.inner(), CHECK_QUEUE_KEYSPACE, "photos");
+        assert_eq!(queued.as_deref(), Some(&b""[..]));
+        assert!(read_value(main.inner(), STORAGE_CHECK_KEYSPACE, "photos").is_some());
         let sync = OptimisticTxDatabase::builder(target.join("document-sync"))
             .open()
             .unwrap();
@@ -284,8 +359,14 @@ mod tests {
         assert!(!repo.join("index.lock").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_cut_stream() {
+        use super::backup_file;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
         let dir = tempfile::tempdir().unwrap();
         let source_root = dir.path().join("source");
         let source = open_source(&source_root);
@@ -311,6 +392,8 @@ mod tests {
             if len == bytes.len() {
                 assert_eq!(result.unwrap().0, bytes.len() as u64);
                 assert_eq!(std::fs::read(&target).unwrap(), bytes);
+                let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
             } else {
                 assert!(result.is_err());
                 assert!(!target.exists());
@@ -331,5 +414,21 @@ mod tests {
         let target = dir.path().join("restored");
         assert!(restore_backup(&file, &target).is_err());
         assert!(!dir.path().join("escaped").exists());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn rejects_cut_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_root = dir.path().join("source");
+        let source = open_source(&source_root);
+        let bytes = backup_bytes(&source_root, &source);
+        let file = dir.path().join("cut.backup");
+        std::fs::write(&file, &bytes[..bytes.len() - 1]).unwrap();
+
+        let target = dir.path().join("restored");
+        assert!(restore_backup(&file, &target).is_err());
+        assert!(!target.exists());
+        assert!(!dir.path().join("restored.partial").exists());
     }
 }

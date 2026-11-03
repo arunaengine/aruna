@@ -63,12 +63,14 @@ pub enum Commands {
         target_path: String,
     },
     /// Write a consistent backup of the running node that uses `storage_path` to a new file,
-    /// read from its `backup.sock`. The node keeps serving while the backup runs.
+    /// read from its `backup.sock` (Unix only). The node keeps serving while the backup runs.
+    /// Blob contents (`BLOB_ROOT` and other storage backends) are not included.
     Backup {
         storage_path: String,
         target_path: String,
     },
-    /// Build a new storage directory from a backup file. Start the node on that directory.
+    /// Build a new storage directory from a backup file. Start the node on that directory; it
+    /// then checks every bucket and lists versions whose blob is missing.
     Restore {
         backup_path: String,
         target_path: String,

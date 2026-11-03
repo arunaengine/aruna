@@ -2,15 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::io::{BufWriter, ErrorKind, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-use aruna_core::shutdown::Shutdown;
-use aruna_operations::driver::DriverContext;
 use aruna_storage::snapshot::{SnapshotError, SnapshotStats, SnapshotWriter, consistent_snapshots};
-use tokio::net::UnixListener;
-use tracing::{info, warn};
+use tracing::warn;
+#[cfg(unix)]
+use {
+    aruna_core::shutdown::Shutdown,
+    aruna_operations::driver::DriverContext,
+    std::io::BufWriter,
+    std::os::unix::fs::{FileTypeExt, PermissionsExt},
+    tokio::net::UnixListener,
+    tracing::info,
+};
 
 /// File name of the backup socket in the node's storage directory.
 pub const BACKUP_SOCKET: &str = "backup.sock";
@@ -95,6 +100,7 @@ fn write_files(
 
 /// Listens on `<storage>/backup.sock` and writes one backup to each connection, one at a
 /// time. Only the socket's owner may connect. A bind failure leaves the node running.
+#[cfg(unix)]
 pub(crate) fn serve(storage_path: &Path, ctx: &DriverContext, shutdown: &Shutdown) {
     let Some(sources) = node_sources(storage_path, ctx) else {
         return;
@@ -145,6 +151,7 @@ pub(crate) fn serve(storage_path: &Path, ctx: &DriverContext, shutdown: &Shutdow
 }
 
 /// The stores of a node with its storage, document sync and metadata databases open.
+#[cfg(unix)]
 fn node_sources(storage_path: &Path, ctx: &DriverContext) -> Option<BackupSources> {
     Some(BackupSources {
         main: ctx.storage_handle.database()?,
@@ -160,6 +167,7 @@ fn node_sources(storage_path: &Path, ctx: &DriverContext) -> Option<BackupSource
 }
 
 /// Binds the socket with owner-only access, replacing a socket left by an earlier process.
+#[cfg(unix)]
 fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path)?,
