@@ -2,15 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::groups::storage_routing::load_group_inputs;
+use crate::groups::storage_routing::{load_group_inputs, refuse_folder};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::routing::{
-    RoutingError, StorageRoutingRule, validate_tenant_rules,
+    RoutingError, RoutingTarget, StorageRoutingRule, validate_tenant_rules,
 };
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
@@ -126,13 +126,30 @@ impl Operation for PutRoutingOperation {
                         received: event,
                     });
                 };
-                let owned = match result {
-                    Ok(inputs) => inputs.backend_ids,
+                let inputs = match result {
+                    Ok(inputs) => inputs,
                     Err(error) => {
                         return self.fail(PutRoutingError::InputsUnavailable(error));
                     }
                 };
-                if let Err(error) = validate_tenant_rules(&self.rules, &owned) {
+                if let Err(error) = validate_tenant_rules(&self.rules, &inputs.backend_ids) {
+                    return self.fail(error.into());
+                }
+                // A folder backend takes only the rule its import rule wrote for this bucket.
+                let imported = |rule: &StorageRoutingRule| {
+                    inputs.imports.iter().any(|import| {
+                        import.bucket == self.bucket
+                            && import.key_prefix == rule.key_prefix
+                            && !rule.exact
+                            && rule.target
+                                == RoutingTarget::Backend(BackendRef::Group(import.write_backend()))
+                    })
+                };
+                let refused = self.rules.iter().find_map(|rule| {
+                    let refused = refuse_folder(&rule.target, &inputs.folder_ids).err();
+                    refused.filter(|_| !imported(rule))
+                });
+                if let Some(error) = refused {
                     return self.fail(error.into());
                 }
                 self.state = PutRoutingState::StartTransaction;

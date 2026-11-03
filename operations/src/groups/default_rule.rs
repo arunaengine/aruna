@@ -15,8 +15,8 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::group_backend::{
-    BUCKET_PREFIX, BUCKET_STATE, BUCKET_TEMPLATE, DEFAULT_BUCKET, GroupStorage, LAYOUT_BUCKET,
-    template_bucket, valid_bucket,
+    BUCKET_PREFIX, BUCKET_STATE, BUCKET_TEMPLATE, DEFAULT_BUCKET, GroupBackendKind, GroupStorage,
+    LAYOUT_BUCKET, template_bucket, valid_bucket,
 };
 use aruna_core::structs::storage::routing::{GroupStorageRouting, RoutingError, RoutingTarget};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -110,6 +110,9 @@ impl PutDefaultOperation {
             return Err(PutGroupError::Invalid(
                 "The storage is disabled.".to_string(),
             ));
+        }
+        if record.kind == GroupBackendKind::Fs {
+            return Err(RoutingError::FolderTarget(self.backend_id).into());
         }
         Ok(record)
     }
