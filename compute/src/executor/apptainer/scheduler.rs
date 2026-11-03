@@ -20,6 +20,7 @@ use crate::executor::config::SlurmConfig;
 pub(super) struct JobState {
     pub(super) state: String,
     pub(super) exit_code: Option<i32>,
+    pub(super) signal: Option<i32>,
     pub(super) started_at_ms: Option<u64>,
     pub(super) finished_at_ms: Option<u64>,
 }
@@ -112,6 +113,7 @@ impl<'a> Scheduler<'a> {
             return Ok(Some(JobState {
                 state,
                 exit_code: None,
+                signal: None,
                 started_at_ms: None,
                 finished_at_ms: None,
             }));
@@ -177,12 +179,16 @@ pub(super) fn parse_accounted(line: &str) -> Option<JobState> {
     let mut fields = line.split('|');
     // A cancelled state reads `CANCELLED by <uid>`.
     let state = fields.next()?.split_whitespace().next()?.to_string();
-    let exit_code = fields.next()?.split(':').next()?.parse().ok();
+    // `ExitCode` reads `code:signal`.
+    let mut exit = fields.next()?.split(':');
+    let exit_code = exit.next().and_then(|code| code.parse().ok());
+    let signal = exit.next().and_then(|signal| signal.parse().ok());
     let started_at_ms = fields.next().and_then(parse_time);
     let finished_at_ms = fields.next().and_then(parse_time);
     Some(JobState {
         state,
         exit_code,
+        signal,
         started_at_ms,
         finished_at_ms,
     })
@@ -205,9 +211,15 @@ pub(super) fn job_phase(job: &JobState, cancel_requested: bool) -> AttemptPhase 
         "PENDING" | "CONFIGURING" | "REQUEUED" | "REQUEUE_HOLD" | "REQUEUE_FED"
         | "RESV_DEL_HOLD" | "SUSPENDED" => AttemptPhase::Submitted,
         "RUNNING" | "COMPLETING" | "STAGE_OUT" | "SIGNALING" | "RESIZING" => AttemptPhase::Running,
-        "COMPLETED" | "FAILED" => match job.exit_code {
-            Some(code) => AttemptPhase::Exited { code },
-            None => AttemptPhase::SystemError {
+        "COMPLETED" | "FAILED" => match (job.exit_code, job.signal) {
+            (Some(_), Some(signal)) if signal != 0 => AttemptPhase::Failed {
+                reason: format!("the task ended on signal {signal}"),
+            },
+            (Some(0), Some(0)) if job.state == "FAILED" => AttemptPhase::Failed {
+                reason: "Slurm reports the job as failed".to_string(),
+            },
+            (Some(code), Some(_)) => AttemptPhase::Exited { code },
+            _ => AttemptPhase::SystemError {
                 reason: format!("Slurm reports {} without an exit code", job.state),
             },
         },
@@ -300,6 +312,7 @@ mod tests {
         let job = parse_accounted("CANCELLED by 1000|0:15|2026-11-03T10:00:00|Unknown").unwrap();
         assert_eq!(job.state, "CANCELLED");
         assert_eq!(job.exit_code, Some(0));
+        assert_eq!(job.signal, Some(15));
         assert!(job.started_at_ms.is_some());
         assert_eq!(job.finished_at_ms, None);
         assert_eq!(parse_accounted(""), None);
@@ -310,6 +323,7 @@ mod tests {
         let job = |state: &str, exit_code| JobState {
             state: state.to_string(),
             exit_code,
+            signal: exit_code.map(|_| 0),
             started_at_ms: None,
             finished_at_ms: None,
         };
@@ -321,6 +335,23 @@ mod tests {
             job_phase(&job("FAILED", Some(3)), false),
             AttemptPhase::Exited { code: 3 }
         );
+        assert_eq!(
+            job_phase(&job("COMPLETED", Some(0)), false),
+            AttemptPhase::Exited { code: 0 }
+        );
+        // A signal or a failed state never reads as success.
+        let killed = JobState {
+            signal: Some(9),
+            ..job("FAILED", Some(0))
+        };
+        assert!(matches!(
+            job_phase(&killed, false),
+            AttemptPhase::Failed { .. }
+        ));
+        assert!(matches!(
+            job_phase(&job("FAILED", Some(0)), false),
+            AttemptPhase::Failed { .. }
+        ));
         assert!(matches!(
             job_phase(&job("TIMEOUT", Some(0)), false),
             AttemptPhase::Failed { .. }
