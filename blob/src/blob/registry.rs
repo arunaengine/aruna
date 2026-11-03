@@ -12,7 +12,7 @@ use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendRef, BlobTimeoutConfig, ResolvedBackend,
 };
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
-use aruna_core::structs::storage::group_backend::DEFAULT_BUCKET;
+use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, GroupBackendKind};
 use aruna_core::structs::storage::routing::{BackendCatalog, NodeRouting, NodeRoutingRule};
 use opendal::Operator;
 use std::collections::{BTreeMap, HashMap};
@@ -20,9 +20,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use ulid::Ulid;
 
-/// A group storage without a pinned bucket: the first folder of each path is the bucket.
+/// A group storage without a pinned bucket: the first folder of each path is the bucket. A
+/// local folder has no buckets at all.
 pub(super) fn splits(config: &BackendConfig) -> bool {
-    matches!(config.backend_type, Backend::Group(_))
+    matches!(config.backend_type, Backend::Group(kind) if kind != GroupBackendKind::Fs)
         && !config.service_config.contains_key("bucket")
 }
 
