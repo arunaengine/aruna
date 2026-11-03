@@ -625,5 +625,7 @@ pub(crate) fn upstream_of(crate_json: &Value) -> Vec<Identifier> {
         .collect()
 }
 
+pub mod publish;
+
 #[cfg(test)]
 mod tests;
