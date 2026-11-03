@@ -4,12 +4,14 @@
 
 use super::*;
 use crate::auth::handle_token;
+use crate::routes::access::audit::{AdminAuditQuery, list_admin_audit};
 use crate::tests::routes::{seed_group_docs, test_context, test_state, test_storage};
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::users::account_status::{AccountStatusConfig, AccountStatusOperation};
+use axum::extract::Query;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -201,4 +203,64 @@ async fn deactivated_gets_nothing() {
         token(&fixture, &account.id, None).await,
         Err(ServerError::Conflict(_))
     ));
+}
+
+#[tokio::test]
+async fn audit_rows_scoped() {
+    // Group administrators page through their group's rows; other scopes stay closed.
+    let fixture = fixture().await;
+    let account = create(&fixture, &fixture.admin).await.unwrap();
+    drive(
+        AccountStatusOperation::new(AccountStatusConfig {
+            actor: Actor {
+                node_id: fixture.state.get_node_id(),
+                user_id: fixture.admin.user_id,
+                realm_id: fixture.admin.realm_id,
+            },
+            auth_context: fixture.admin.clone(),
+            target: UserId::from_string(&account.id).unwrap(),
+            active: false,
+            now: unix_timestamp_secs(),
+        }),
+        &fixture.state.get_ctx(),
+    )
+    .await
+    .unwrap();
+    let read = |auth: &AuthContext, group_id: Option<String>, cursor: Option<String>| {
+        list_admin_audit(
+            State(fixture.state.clone()),
+            Extension(Some(auth.clone())),
+            Query(AdminAuditQuery {
+                group_id,
+                cursor,
+                limit: Some(1),
+            }),
+        )
+    };
+    let group = Some(fixture.group.clone());
+    let Json(first) = read(&fixture.admin, group.clone(), None).await.unwrap();
+    assert!(first.partial);
+    assert_eq!(first.records[0].action, "service_account_created");
+    assert_eq!(first.records[0].target, account.id);
+    assert_eq!(first.records[0].actor, fixture.admin.user_id.to_string());
+    let Json(second) = read(&fixture.admin, group.clone(), first.next_cursor)
+        .await
+        .unwrap();
+    assert_eq!(second.records[0].action, "account_deactivated");
+    assert_eq!(second.records[0].group_id, group);
+    assert_eq!(second.next_cursor, None);
+
+    let stranger = AuthContext {
+        user_id: UserId::local(Ulid::generate(), fixture.admin.realm_id),
+        ..fixture.admin.clone()
+    };
+    let other_group = Some(Ulid::generate().to_string());
+    for (caller, scope) in [
+        (&stranger, group.clone()),
+        (&fixture.admin, None),
+        (&fixture.admin, other_group),
+    ] {
+        let denied = read(caller, scope, None).await;
+        assert!(matches!(denied, Err(ServerError::Forbidden)));
+    }
 }
