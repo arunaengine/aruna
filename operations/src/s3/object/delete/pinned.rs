@@ -148,19 +148,18 @@ pub async fn refuse_pinned(
 /// Whether a release of `prefix` may pin a key the purge `scope` deletes, and the key prefix
 /// to look for in it.
 fn reach<'a>(scope: &'a StoragePurgeScope, prefix: &str) -> Option<&'a str> {
-    let wanted = scope.list_prefix()?;
+    let wanted = scope.list_prefix().unwrap_or_default();
     (wanted.starts_with(prefix) || prefix.starts_with(wanted)).then_some(wanted)
 }
 
-/// Refuses a file or prefix purge while a release pins a version under it. A bucket purge
-/// deletes the releases with their files, so it is never refused.
+/// Refuses a file, prefix or bucket purge while a release pins a version in it.
 pub async fn refuse_scope(
     context: &DriverContext,
     scope: BucketScope<'_>,
     auth: &AuthContext,
     purge: &StoragePurgeScope,
 ) -> Result<(), PinnedError> {
-    if purge.is_bucket() || scope.info.distribution.is_some() {
+    if scope.info.distribution.is_some() {
         return Ok(());
     }
     let output = retained(context, scope, auth, &[]).await?;

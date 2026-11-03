@@ -120,6 +120,13 @@ pub enum NotificationKind {
         key: String,
         size_bytes: u64,
     },
+    /// The bucket was deleted: the inbox holder drops the recipient's earlier notices about
+    /// it and never stores this record.
+    BucketDeleted {
+        bucket: String,
+        node_id: NodeId,
+        group_id: GroupId,
+    },
 }
 
 impl NotificationKind {
@@ -140,6 +147,7 @@ impl NotificationKind {
             | NotificationKind::BucketRecoveryDegraded { .. }
             | NotificationKind::BucketKeyPending { .. } => "bucket.encryption",
             NotificationKind::ShareUpload { .. } => "share.upload",
+            NotificationKind::BucketDeleted { .. } => "bucket.deleted",
         }
     }
 
@@ -159,6 +167,38 @@ impl NotificationKind {
             NotificationKind::BucketRecoveryDegraded { .. } => "bucket_recovery_degraded",
             NotificationKind::BucketKeyPending { .. } => "bucket_key_pending",
             NotificationKind::ShareUpload { .. } => "share_upload",
+            NotificationKind::BucketDeleted { .. } => "bucket_deleted",
+        }
+    }
+
+    /// The node and bucket a notice is about, if it names one.
+    pub fn bucket(&self) -> Option<(NodeId, &str)> {
+        match self {
+            NotificationKind::DataUploaded {
+                node_id, bucket, ..
+            }
+            | NotificationKind::SyncCompleted {
+                node_id, bucket, ..
+            }
+            | NotificationKind::SyncFailed {
+                node_id, bucket, ..
+            }
+            | NotificationKind::BucketRestartLocked {
+                node_id, bucket, ..
+            }
+            | NotificationKind::BucketRecoveryDegraded {
+                node_id, bucket, ..
+            }
+            | NotificationKind::BucketKeyPending {
+                node_id, bucket, ..
+            }
+            | NotificationKind::ShareUpload {
+                node_id, bucket, ..
+            }
+            | NotificationKind::BucketDeleted {
+                node_id, bucket, ..
+            } => Some((*node_id, bucket)),
+            _ => None,
         }
     }
 }
@@ -218,6 +258,18 @@ impl NotificationRecord {
             read_at_ms: None,
             watch_authorization: None,
         }
+    }
+
+    /// True when this is a bucket deletion that removes `other`: a notice of the same recipient
+    /// about the deleted bucket, made no later than the deletion.
+    pub fn purges(&self, other: &NotificationRecord) -> bool {
+        let NotificationKind::BucketDeleted { .. } = &self.kind else {
+            return false;
+        };
+        self.recipient == other.recipient
+            && other.created_at_ms <= self.created_at_ms
+            && other.kind.bucket().is_some()
+            && other.kind.bucket() == self.kind.bucket()
     }
 
     pub fn expires_at_ms(&self) -> u64 {
@@ -709,5 +761,40 @@ mod tests {
         assert_eq!(data_uploaded.name(), "data_uploaded");
         assert_eq!(sync_completed.name(), "sync_completed");
         assert_eq!(sync_failed.name(), "sync_failed");
+    }
+
+    #[test]
+    fn deletion_purges_notices() {
+        let (recipient, node_id, group_id) = (user(1, 2), make_node_id(3), Ulid::generate());
+        let upload = |bucket: &str, node_id| NotificationKind::ShareUpload {
+            share_id: Ulid::generate(),
+            node_id,
+            group_id,
+            bucket: bucket.to_string(),
+            key: "key".to_string(),
+            size_bytes: 1,
+        };
+        let deleted = NotificationRecord::new(
+            recipient,
+            NotificationClass::Direct,
+            NotificationKind::BucketDeleted {
+                bucket: "raw".to_string(),
+                node_id,
+                group_id,
+            },
+            100,
+        );
+        let notice = |recipient, kind, at| {
+            NotificationRecord::new(recipient, NotificationClass::Direct, kind, at)
+        };
+        assert!(deleted.purges(&notice(recipient, upload("raw", node_id), 100)));
+        // Later notices belong to a new bucket of the name; others name another bucket or user.
+        assert!(!deleted.purges(&notice(recipient, upload("raw", node_id), 101)));
+        assert!(!deleted.purges(&notice(recipient, upload("other", node_id), 50)));
+        assert!(!deleted.purges(&notice(recipient, upload("raw", make_node_id(4)), 50)));
+        assert!(!deleted.purges(&notice(user(1, 9), upload("raw", node_id), 50)));
+        assert!(!deleted.purges(&notice(recipient, added(3), 50)));
+        let upload = notice(recipient, upload("raw", node_id), 50);
+        assert!(!upload.purges(&upload.clone()));
     }
 }

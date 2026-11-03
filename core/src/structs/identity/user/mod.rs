@@ -9,7 +9,9 @@ use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::identity::auth::Actor;
 use crate::types::GroupId;
-use crate::user::validation::{DEACTIVATED_ATTRIBUTE, SERVICE_GROUP_ATTRIBUTE};
+use crate::user::validation::{
+    DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, SERVICE_GROUP_ATTRIBUTE,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -49,6 +51,25 @@ impl User {
         self.attributes
             .get(SERVICE_GROUP_ATTRIBUTE)
             .and_then(|group| group.parse().ok())
+    }
+
+    /// The account this one was merged into; a merged account stays deactivated.
+    pub fn merged_into(&self) -> Option<UserId> {
+        self.attributes
+            .get(MERGED_INTO_ATTRIBUTE)
+            .and_then(|user_id| UserId::from_string(user_id).ok())
+    }
+
+    /// The secondary accounts merged into this primary account, in id order.
+    pub fn merged_user_ids(&self) -> Vec<UserId> {
+        let mut merged: Vec<_> = self
+            .attributes
+            .iter()
+            .filter(|(key, _)| key.starts_with(MERGED_PREFIX))
+            .filter_map(|(_, user_id)| UserId::from_string(user_id).ok())
+            .collect();
+        merged.sort();
+        merged
     }
 
     /// Whether `via` opens sessions of this account: it is linked, and replication left no

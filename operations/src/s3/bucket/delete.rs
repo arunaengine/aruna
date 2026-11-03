@@ -8,17 +8,23 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, ABE_REKEY_KEYSPACE, BACKEND_IMPORT_KEYSPACE,
-    BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE,
-    BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
-    GROUP_ENCRYPTED_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORT_REMOVAL_KEYSPACE,
-    KEY_COPY_KEYSPACE, LINKED_JOB_KEYSPACE, MIGRATION_AHEAD_KEYSPACE, NODE_VAULT_KEYSPACE,
-    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, RENAME_MOVE_KEYSPACE,
+    ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, ABE_REKEY_KEYSPACE, AUTH_KEYSPACE,
+    BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BUCKET_CREATION_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
+    BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
+    IMPORT_REMOVAL_KEYSPACE, KEY_COPY_KEYSPACE, LINKED_JOB_KEYSPACE, MIGRATION_AHEAD_KEYSPACE,
+    NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, RENAME_MOVE_KEYSPACE,
     RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE,
     UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
+use aruna_core::storage_entries::outbox_write_entry;
+use aruna_core::structs::execution::notification::{
+    NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
+};
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::backend_import::{BackendImport, ProviderCleanup, RemovalMark};
 use aruna_core::structs::storage::blob::{
     BlobCleanupWork, BlobHeadKey, BucketInfo, VersionKey, incarnation,
@@ -31,9 +37,11 @@ use aruna_core::structs::storage::usage::{UsageDelta, usage_bucket_key};
 use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use aruna_core::{NodeId, UserId};
 use smallvec::smallvec;
 use thiserror::Error;
 
+use crate::notifications::outbox::schedule_drain_effect;
 use crate::sync::mirror_repair::mirror_delete_entry;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +64,9 @@ pub enum DeleteBucketState {
     UpdateUsage,
     /// Queues the drop of the bucket's delete trail with the delete.
     QueueTrail,
+    /// Reads the group members whose notices about the bucket go with it.
+    ReadMembers,
+    QueueNotices,
     CommitTransaction,
     Finish,
     Error,
@@ -106,6 +117,9 @@ pub struct DeleteBucketOperation {
     links: Vec<BackendImport>,
     /// A set deletion deletes only the member bucket of this binding.
     member: Option<DistributionBinding>,
+    /// This node and its realm, set when the group members' notices about the bucket go too.
+    notices: Option<(NodeId, RealmId)>,
+    notified: bool,
     output: Option<Result<(), DeleteBucketError>>,
 }
 
@@ -127,8 +141,16 @@ impl DeleteBucketOperation {
             key_deletes: Vec::new(),
             links: Vec::new(),
             member: None,
+            notices: None,
+            notified: false,
             output: None,
         }
+    }
+
+    /// Removes, through their inboxes, the notices the members of the group got about the bucket.
+    pub fn purge_notices(mut self, origin: Option<(NodeId, RealmId)>) -> Self {
+        self.notices = origin;
+        self
     }
 
     /// Deletes the bucket only while it carries `binding`'s set, member and incarnation, read
@@ -723,6 +745,64 @@ impl DeleteBucketOperation {
         })]
     }
 
+    fn read_members(&mut self, txn_id: TxnId) -> Effects {
+        let Some(group_id) = self.group_id.filter(|_| self.notices.is_some()) else {
+            return self.commit(txn_id);
+        };
+        self.state = DeleteBucketState::ReadMembers;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: AUTH_KEYSPACE.to_string(),
+            key: group_id.to_bytes().to_vec().into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn queue_notices(&mut self, value: Option<Value>, txn_id: TxnId) -> Effects {
+        let (Some((node_id, realm_id)), Some(group_id)) = (self.notices, self.group_id) else {
+            return self.commit(txn_id);
+        };
+        let members = match value
+            .map(|value| GroupAuthorizationDocument::from_bytes(&value))
+            .transpose()
+        {
+            Ok(document) => document.map(|document| group_members(&document, realm_id)),
+            Err(error) => return self.emit_error(error.into()),
+        };
+        let mut writes = Vec::new();
+        for member in members.unwrap_or_default() {
+            let kind = NotificationKind::BucketDeleted {
+                bucket: self.bucket.clone(),
+                node_id,
+                group_id,
+            };
+            let outbox_id = ulid::Ulid::generate();
+            let record = NotificationRecord::new(
+                member,
+                NotificationClass::Direct,
+                kind,
+                outbox_id.timestamp_ms(),
+            );
+            match outbox_write_entry(&NotificationOutboxRecord { outbox_id, record }) {
+                Ok(entry) => writes.push(entry),
+                Err(error) => return self.emit_error(error.into()),
+            }
+        }
+        if writes.is_empty() {
+            return self.commit(txn_id);
+        }
+        self.notified = true;
+        self.state = DeleteBucketState::QueueNotices;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn commit(&mut self, txn_id: TxnId) -> Effects {
+        self.state = DeleteBucketState::CommitTransaction;
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
@@ -736,6 +816,9 @@ impl DeleteBucketOperation {
         self.state = DeleteBucketState::Finish;
         self.output = Some(Ok(()));
         let mut effects = smallvec![schedule_snapshot_publish()];
+        if self.notified {
+            effects.push(schedule_drain_effect());
+        }
         // The registry frees the slots of the deleted bucket id; nothing can read it any more.
         if let Some(bucket_id) = self.bucket_id {
             effects.push(Effect::Blob(BlobEffect::LockKey {
@@ -801,12 +884,31 @@ impl Operation for DeleteBucketOperation {
             DeleteBucketState::UpdateUsage => self.handle_usage_update(event),
             DeleteBucketState::QueueTrail => match (event, self.txn_id) {
                 (Event::Storage(StorageEvent::WriteResult { .. }), Some(txn_id)) => {
-                    self.state = DeleteBucketState::CommitTransaction;
-                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    self.read_members(txn_id)
                 }
                 (event, _) => self.emit_error(DeleteBucketError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "Event::Storage(StorageEvent::WriteResult)",
+                    received: event,
+                }),
+            },
+            DeleteBucketState::ReadMembers => match (event, self.txn_id) {
+                (Event::Storage(StorageEvent::ReadResult { value, .. }), Some(txn_id)) => {
+                    self.queue_notices(value, txn_id)
+                }
+                (event, _) => self.emit_error(DeleteBucketError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::Storage(StorageEvent::ReadResult)",
+                    received: event,
+                }),
+            },
+            DeleteBucketState::QueueNotices => match (event, self.txn_id) {
+                (Event::Storage(StorageEvent::BatchWriteResult { .. }), Some(txn_id)) => {
+                    self.commit(txn_id)
+                }
+                (event, _) => self.emit_error(DeleteBucketError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::Storage(StorageEvent::BatchWriteResult)",
                     received: event,
                 }),
             },
@@ -836,6 +938,19 @@ impl Operation for DeleteBucketOperation {
             smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         })
     }
+}
+
+/// The group's members of the serving realm; users of other realms have no inbox here.
+fn group_members(document: &GroupAuthorizationDocument, realm_id: RealmId) -> Vec<UserId> {
+    let mut members: Vec<UserId> = document
+        .roles
+        .values()
+        .flat_map(|role| role.assigned_users.iter().copied())
+        .filter(|user| !user.is_nil() && user.realm_id == realm_id)
+        .collect();
+    members.sort();
+    members.dedup();
+    members
 }
 
 #[cfg(test)]
@@ -990,6 +1105,79 @@ mod link_tests {
         }));
         assert_eq!(operation.finalize(), Ok(()));
         (writes, deletes, effects)
+    }
+
+    /// Members of the serving realm each get one bucket deletion record, drained after commit.
+    #[test]
+    fn queues_member_purges() {
+        let realm = RealmId([1; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let (first, second) = (
+            UserId::new(Ulid::from_parts(5, 1), realm),
+            UserId::new(Ulid::from_parts(5, 2), realm),
+        );
+        let foreign = UserId::new(Ulid::from_parts(5, 3), RealmId([2; 32]));
+        let mut document = GroupAuthorizationDocument::default_group_doc(first, realm, GROUP);
+        for role in document.roles.values_mut() {
+            role.assigned_users.extend([first, second, foreign]);
+        }
+        let actor = aruna_core::structs::identity::auth::Actor {
+            node_id,
+            user_id: first,
+            realm_id: realm,
+        };
+        let txn_id = TxnId::default();
+        let mut operation =
+            DeleteBucketOperation::new("x".to_string()).purge_notices(Some((node_id, realm)));
+        operation.txn_id = Some(txn_id);
+        operation.group_id = Some(GROUP);
+        operation.state = DeleteBucketState::QueueTrail;
+
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: Key::from(Vec::new()),
+        }));
+        let [Effect::Storage(StorageEffect::Read { key_space, key, .. })] = effects.as_slice()
+        else {
+            panic!("expected the group read, got {effects:?}");
+        };
+        assert_eq!(
+            (key_space.as_str(), key.as_ref()),
+            (AUTH_KEYSPACE, &GROUP.to_bytes()[..])
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: key.clone(),
+            value: Some(document.to_bytes(&actor).unwrap().into()),
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the outbox rows, got {effects:?}");
+        };
+        let mut recipients: Vec<UserId> = writes
+            .iter()
+            .map(|(_, _, value)| {
+                let row = NotificationOutboxRecord::from_bytes(value).unwrap();
+                let expected = NotificationKind::BucketDeleted {
+                    bucket: "x".to_string(),
+                    node_id,
+                    group_id: GROUP,
+                };
+                assert_eq!(row.record.kind, expected);
+                row.record.recipient
+            })
+            .collect();
+        recipients.sort();
+        assert_eq!(recipients, vec![first, second]);
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert!(effects.contains(&schedule_drain_effect()), "{effects:?}");
+        assert_eq!(operation.finalize(), Ok(()));
     }
 
     /// The provider bucket the link's removal mark still has to delete.

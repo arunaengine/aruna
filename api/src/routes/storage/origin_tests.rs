@@ -295,6 +295,7 @@ fn view_keeps_fields() {
         created_at: SystemTime::UNIX_EPOCH,
         origin: Some(VersionOrigin::Copy {
             from: OriginVersion::Global(global.clone()),
+            job_id: None,
         }),
         hop: Some(SyncHop {
             relationship_id: Ulid::from_bytes([47; 16]),
@@ -315,11 +316,13 @@ fn view_keeps_fields() {
                     url: Some("https://s3.example.org/a".to_string()),
                     path: "a".to_string(),
                     connector_id: None,
+                    connector_name: None,
                 },
                 aruna_operations::s3::object::origin::SourcePlace {
                     url: Some("https://mirror.example.org/a".to_string()),
                     path: "a".to_string(),
                     connector_id: Some(Ulid::from_bytes([48; 16])),
+                    connector_name: Some("Mirror".to_string()),
                 },
             ],
         }),
@@ -340,7 +343,7 @@ fn view_keeps_fields() {
     assert_eq!(response.global_id, Some(global.to_url()));
     assert!(matches!(
         response.origin,
-        Some(OriginBody::Copy { ref from }) if *from == global.to_url()
+        Some(OriginBody::Copy { ref from, .. }) if *from == global.to_url()
     ));
     assert_eq!(response.hop.unwrap().from, global.to_url());
     let source = response.source.unwrap();
@@ -369,6 +372,7 @@ fn view_keeps_fields() {
     assert_eq!(mirror.url.as_deref(), Some("https://mirror.example.org/a"));
     let connector = Ulid::from_bytes([48; 16]).to_string();
     assert_eq!(mirror.connector_id.as_deref(), Some(connector.as_str()));
+    assert_eq!(mirror.connector_name.as_deref(), Some("Mirror"));
     assert_eq!(response.projection.len(), 2);
     assert!(matches!(
         response.projection[1],
@@ -376,21 +380,35 @@ fn view_keeps_fields() {
     ));
 }
 
+// Each kind answers with its client, job or starter under the names the portal reads.
 #[test]
 fn origin_kinds_named() {
     let upload = VersionOrigin::Upload {
         node_id: node(),
         device: Some("laptop".to_string()),
+        client: Some(UploadClient::Device),
     };
+    let job = Ulid::from_bytes([53; 16]);
+    let user = UserId::local(Ulid::from_bytes([54; 16]), realm());
+    let from = OriginVersion::Global(GlobalId::Version {
+        realm_id: realm(),
+        version_id: Ulid::from_bytes([55; 16]),
+    });
     let kinds = [
         upload,
-        VersionOrigin::Source,
+        VersionOrigin::Source { job_id: Some(job) },
         VersionOrigin::Storage {
             backend_id: Ulid::from_bytes([50; 16]),
             key: "share/a.txt".to_string(),
+            job_id: Some(job),
         },
         VersionOrigin::Job {
             run_id: Ulid::from_bytes([51; 16]),
+            started_by: Some(user),
+        },
+        VersionOrigin::Copy {
+            from: from.clone(),
+            job_id: None,
         },
     ];
     let view = |origin| OriginView {
@@ -411,16 +429,31 @@ fn origin_kinds_named() {
         .into_iter()
         .map(|origin| OriginResponse::from(view(origin)).origin.unwrap())
         .collect();
-    assert!(matches!(
-        &bodies[0],
-        OriginBody::Upload { device: Some(device), .. } if device == "laptop"
-    ));
-    assert!(matches!(&bodies[1], OriginBody::Source));
-    assert!(matches!(
-        &bodies[2],
-        OriginBody::Storage { key, .. } if key == "share/a.txt"
-    ));
-    assert!(matches!(&bodies[3], OriginBody::Job { .. }));
+    let json: Vec<_> = (bodies.iter())
+        .map(|body| serde_json::to_value(body).unwrap())
+        .collect();
+    let job = job.to_string();
+    assert_eq!(
+        json,
+        vec![
+            serde_json::json!({
+                "kind": "upload", "node_id": node().to_string(), "device": "laptop",
+                "client": "device",
+            }),
+            serde_json::json!({"kind": "source", "job_id": job}),
+            serde_json::json!({
+                "kind": "storage", "backend_id": Ulid::from_bytes([50; 16]).to_string(),
+                "key": "share/a.txt", "job_id": job,
+            }),
+            serde_json::json!({
+                "kind": "job", "run_id": Ulid::from_bytes([51; 16]).to_string(),
+                "started_by": user.to_string(),
+            }),
+            serde_json::json!({"kind": "copy", "from": from.to_id(), "job_id": null}),
+        ]
+    );
+    let portal = serde_json::to_value(UploadClientBody::from(UploadClient::Portal)).unwrap();
+    assert_eq!(portal, "portal");
 }
 
 async fn seed_sources(node: &Node) {
@@ -676,4 +709,178 @@ async fn reads_global_version() {
         missing,
         Err(ServerError::NotFound | ServerError::ServiceUnavailableReason(_))
     ));
+}
+
+/// Marks the current version of `key` as a result of `run`.
+async fn written_by(node: &Node, key: &str, run: u8) {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+    use aruna_core::structs::storage::blob::{
+        BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
+    };
+    let context = node.state.get_ctx();
+    let read = |key_space: &str, key: Vec<u8>| {
+        let read = StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            txn_id: None,
+        };
+        let storage = context.storage_handle.clone();
+        async move {
+            match storage.send_storage_effect(read).await {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => value.unwrap().to_vec(),
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    let head = BlobHeadKey::new(BUCKET, key).to_bytes().unwrap();
+    let pointer = CurrentVersionPointer::from_bytes(&read(BLOB_HEAD_KEYSPACE, head).await);
+    let row = VersionKey::new(BUCKET, key, pointer.unwrap().version_id).to_bytes();
+    let row = row.unwrap();
+    let mut version = BlobVersion::from_bytes(&read(BLOB_VERSIONS_KEYSPACE, row.clone()).await);
+    let version = version.as_mut().unwrap();
+    version.origin = Some(VersionOrigin::Job {
+        run_id: Ulid::from_bytes([run; 16]),
+        started_by: None,
+    });
+    let bytes = version.to_bytes().unwrap();
+    crate::tests::distributed::write(&node.state, BLOB_VERSIONS_KEYSPACE, row, bytes).await;
+}
+
+#[tokio::test]
+async fn lists_writing_runs() {
+    // The runs that wrote current files under a prefix are named once each, newest first.
+    let node = node_state().await;
+    for key in ["out/a/1.txt", "out/a/2.txt", "out/b/1.txt", "in/x.txt"] {
+        store(&node, key).await;
+    }
+    written_by(&node, "out/a/1.txt", 1).await;
+    written_by(&node, "out/a/2.txt", 1).await;
+    written_by(&node, "out/b/1.txt", 2).await;
+    let runs = |auth: Option<AuthContext>, prefix: &str| {
+        get_bucket_runs(
+            State(node.state.clone()),
+            Extension(auth),
+            Path(BUCKET.to_string()),
+            Query(BucketRunsParams {
+                prefix: prefix.to_string(),
+            }),
+        )
+    };
+    let named = |response: BucketRunsResponse| {
+        let runs = response.runs.into_iter().map(|run| run.run_id);
+        (runs.collect::<Vec<_>>(), response.complete)
+    };
+    let id = |run: u8| Ulid::from_bytes([run; 16]).to_string();
+    let Json(all) = runs(Some(node.owner.clone()), "").await.unwrap();
+    assert_eq!(named(all), (vec![id(2), id(1)], true));
+    let Json(one) = runs(Some(node.owner.clone()), "out/a/").await.unwrap();
+    assert_eq!(named(one), (vec![id(1)], true));
+    let Json(none) = runs(Some(node.owner.clone()), "in/").await.unwrap();
+    assert_eq!(named(none), (Vec::new(), true));
+    let stranger = runs(Some(node.stranger.clone()), "").await;
+    assert!(matches!(stranger, Err(ServerError::Forbidden)));
+    assert!(matches!(
+        runs(None, "").await,
+        Err(ServerError::Unauthorized)
+    ));
+}
+
+// Credentials in a connector endpoint never reach the origin answer or its projection.
+#[tokio::test]
+async fn hides_endpoint_credentials() {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_core::structs::storage::blob::{
+        BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
+    };
+    use std::collections::HashMap;
+    let node = node_state().await;
+    let endpoint = "https://reader:hunter2@s3.example.org?token=t0ken&X-Amz-Signature=s1g";
+    let descriptor = PortableSourceDescriptor {
+        kind: SourceConnectorKind::S3,
+        public_config: HashMap::from([
+            ("endpoint".to_string(), endpoint.to_string()),
+            ("bucket".to_string(), "lab".to_string()),
+            ("skip_signature".to_string(), "true".to_string()),
+        ]),
+        source_path: "a.txt".to_string(),
+        version_selector: None,
+        capabilities: Vec::new(),
+        origin_node_id: None,
+        namespace: None,
+        root: None,
+    };
+    let binding = VersionSourceBinding {
+        strategy: StagingStrategy::Reference,
+        descriptor,
+        connector_id: None,
+        mirrors: Vec::new(),
+    };
+    let metadata = SourceMetadata {
+        content_length: 1,
+        content_type: None,
+        etag: None,
+        last_modified: None,
+        source_version: None,
+        digests: Default::default(),
+    };
+    let created = SystemTime::UNIX_EPOCH;
+    let version = BlobVersion::reference(binding, metadata, created, node.owner.user_id, created)
+        .with_origin(Some(VersionOrigin::Source { job_id: None }));
+    let version_id = Ulid::generate();
+    let rows = [
+        (
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new(BUCKET, "ref.txt").to_bytes().unwrap(),
+            CurrentVersionPointer::new(version_id).to_bytes().unwrap(),
+        ),
+        (
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(BUCKET, "ref.txt", version_id)
+                .to_bytes()
+                .unwrap(),
+            version.to_bytes().unwrap(),
+        ),
+    ];
+    for (key_space, key, value) in rows {
+        let effect = StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        node.state
+            .get_ctx()
+            .storage_handle
+            .send_storage_effect(effect)
+            .await;
+    }
+    let answer = origin(
+        &node,
+        &node.owner,
+        HeaderMap::new(),
+        BUCKET,
+        "ref.txt",
+        None,
+    )
+    .await
+    .unwrap();
+    let bare = "https://s3.example.org/lab/a.txt";
+    let source = answer.source.as_ref().unwrap();
+    assert_eq!(source.url.as_deref(), Some(bare));
+    assert_eq!(source.sources[0].url.as_deref(), Some(bare));
+    let text = serde_json::to_string(&answer).unwrap();
+    for secret in ["reader", "hunter2", "t0ken", "s1g", "token", "Signature"] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    let based_on =
+        |item: &ProjectionBody| matches!(item, ProjectionBody::BasedOn { id } if id == bare);
+    assert!(answer.projection.iter().any(based_on), "{text}");
 }

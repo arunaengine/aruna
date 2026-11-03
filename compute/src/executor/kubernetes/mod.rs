@@ -52,9 +52,9 @@ mod status;
 use manifest::{
     HELPER_PATH, PolicyManifest, StageMarker, WORKSPACE_PATH, data_node_manifest, data_pv_manifest,
     data_pvc_manifest, helper_name, helper_pod, job_manifest, marker_manifest, marker_name,
-    mount_buckets, mount_pv_manifest, mount_pvc_manifest, needs_workspace, network_policies,
-    policy_manifests, pvc_manifest, secret_manifest, secret_name, session_mount,
-    session_node_manifest, workspace_name,
+    mount_buckets, mount_pv_manifest, mount_pvc_manifest, mount_secret_manifest, mount_secret_name,
+    needs_workspace, network_policies, policy_manifests, pvc_manifest, secret_manifest,
+    secret_name, session_mount, session_node_manifest, workspace_name,
 };
 use status::{
     job_pending, job_status, pod_started, pod_stuck_reason, task_started, task_state,
@@ -189,12 +189,20 @@ impl KubernetesBackend {
         spec: &TaskSpec,
     ) -> Result<(), BackendError> {
         let secret = secret_manifest(context, &self.config, spec)?;
+        self.create_secret(context, secret).await
+    }
+
+    async fn create_secret(
+        &self,
+        context: &FenceContext,
+        secret: Secret,
+    ) -> Result<(), BackendError> {
         match self.secrets().create(&PostParams::default(), &secret).await {
             Ok(_) => Ok(()),
             Err(error) if api_code(&error) == Some(409) => {
                 let existing = self
                     .secrets()
-                    .get(&secret_name(&context.attempt.external_name()))
+                    .get(&secret.name_any())
                     .await
                     .map_err(kube_error)?;
                 let epoch = existing
@@ -294,6 +302,8 @@ impl KubernetesBackend {
         };
         let bucket = &workspace.bucket_name;
         if self.config.kubedal.is_some() {
+            let secret = mount_secret_manifest(context, &self.config, spec)?;
+            self.create_secret(context, secret).await?;
             let value = session_node_manifest(context, &self.config, bucket)?;
             return self.ensure_data_node(context, value, bucket).await;
         }
@@ -1509,6 +1519,11 @@ impl KubernetesBackend {
             &secret_name(&context.attempt.external_name()),
         )
         .await?;
+        delete_named(
+            self.secrets(),
+            &mount_secret_name(&context.attempt.external_name()),
+        )
+        .await?;
         delete_named(self.markers(), &logs_name(&context.attempt.external_name())).await?;
         delete_named(
             self.markers(),
@@ -2520,6 +2535,7 @@ mod tests {
         for accessory in [
             "DELETE /api/v1/namespaces/compute/persistentvolumeclaims/aruna-job-a1-ws",
             "DELETE /api/v1/namespaces/compute/secrets/aruna-job-a1-env",
+            "DELETE /api/v1/namespaces/compute/secrets/aruna-job-a1-mount",
             "DELETE /api/v1/namespaces/compute/configmaps/aruna-job-a1-logs",
             "DELETE /api/v1/namespaces/compute/configmaps/aruna-job-a1-staged",
         ] {
@@ -2662,6 +2678,9 @@ mod tests {
                 ("POST", path) if path == nodes => {
                     (201, core_object("DataNode", "aruna-job-a1-data"))
                 }
+                ("POST", "/api/v1/namespaces/compute/secrets") => {
+                    (201, core_object("Secret", "aruna-job-a1-mount"))
+                }
                 _ => (404, status_json(404)),
             }
         });
@@ -2692,7 +2711,10 @@ mod tests {
         backend.ensure_data(&context(), &spec).await.unwrap();
         assert_eq!(
             seen.lock().expect("read requests").clone(),
-            [format!("POST {nodes}")]
+            [
+                "POST /api/v1/namespaces/compute/secrets".to_string(),
+                format!("POST {nodes}")
+            ]
         );
     }
 

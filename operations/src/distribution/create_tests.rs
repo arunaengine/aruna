@@ -73,6 +73,20 @@ fn shard_plan_alternates() {
 }
 
 #[test]
+fn shard_needs_boundaries() {
+    // Without a boundary the second member coordinates no range, so the plan names the cause.
+    let layout = LayoutKind::Sharding {
+        boundaries: Vec::new(),
+        replicas: 1,
+    };
+    let refused = plan_layout(Ulid::from_bytes([3; 16]), &input(layout, Vec::new()));
+    let Err(DistributionError::Malformed(reason)) = refused else {
+        panic!("a sharding layout without boundaries is refused: {refused:?}");
+    };
+    assert!(reason.contains("boundary"), "{reason}");
+}
+
+#[test]
 fn copy_edges_refused() {
     let edges = vec![(node(3), DataStrategy::Copy)];
     let set_id = Ulid::from_bytes([3; 16]);

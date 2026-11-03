@@ -59,6 +59,8 @@ async fn joiner_bootstraps_documents() -> TestResult<()> {
             name: "Seed Admin".to_string(),
             subject_id: seed.user_id.to_string(),
             issuer: format!("issuer_of_{}", seed.user_id),
+            email_hash: None,
+            create_new: false,
         }),
         seed.context.as_ref(),
     )
@@ -151,6 +153,8 @@ async fn second_joiner_onboards() -> TestResult<()> {
             name: "Seed Admin".to_string(),
             subject_id: seed.user_id.to_string(),
             issuer: format!("issuer_of_{}", seed.user_id),
+            email_hash: None,
+            create_new: false,
         }),
         seed.context.as_ref(),
     )

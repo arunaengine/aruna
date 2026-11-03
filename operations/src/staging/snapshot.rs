@@ -45,6 +45,8 @@ pub struct MaterializeSnapshotInput {
     pub restrictions: Option<Vec<PathRestriction>>,
     /// Digests the read bytes must match before they are kept, such as manifest digests.
     pub expected_checksums: Vec<ExpectedChecksum>,
+    /// The import job that copies the file in, recorded in its origin.
+    pub job_id: Option<Ulid>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -147,7 +149,9 @@ pub async fn stage_snapshot_blob(
     })
     .with_bucket_guard(input.expected_bucket)
     .with_restrictions(input.restrictions.clone())
-    .with_version_origin(Some(VersionOrigin::Source));
+    .with_version_origin(Some(VersionOrigin::Source {
+        job_id: input.job_id,
+    }));
     if let Some(gate) = gate {
         operation = operation.with_gate(gate);
     }
@@ -265,6 +269,7 @@ mod tests {
         let expected_bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
         let input = MaterializeSnapshotInput {
+            job_id: None,
             group_id,
             user_id,
             realm_id,

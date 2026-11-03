@@ -69,6 +69,8 @@ pub struct RevokeTokenOperation {
     state: RevokeTokenState,
     output: Option<Result<RealmConfigDocument, RevokeTokenError>>,
     cutoff_raised: bool,
+    /// Runs inside the caller's transaction, which the caller commits or aborts.
+    joined: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +163,17 @@ impl RevokeTokenOperation {
             state: RevokeTokenState::Init,
             output: None,
             cutoff_raised: false,
+            joined: false,
+        }
+    }
+
+    /// Writes the revocation inside `txn_id`, so it commits or aborts with the caller's changes.
+    /// The caller schedules the outbox drain and marks epochs due after its commit.
+    pub fn joined(config: RevokeTokenConfig, txn_id: TxnId) -> Self {
+        Self {
+            txn_id: Some(txn_id),
+            joined: true,
+            ..Self::new(config)
         }
     }
 
@@ -548,6 +561,10 @@ impl RevokeTokenOperation {
         if self.output.is_none() {
             self.output = Some(Ok(document.clone()));
         }
+        if self.joined {
+            self.state = RevokeTokenState::Finish;
+            return smallvec![];
+        }
         self.state = RevokeTokenState::CommitNoop { document };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -564,6 +581,10 @@ impl RevokeTokenOperation {
         let Some(txn_id) = self.txn_id else {
             return self.fail(RevokeTokenError::MissingTransaction);
         };
+        if self.joined {
+            self.state = RevokeTokenState::Finish;
+            return smallvec![];
+        }
         self.state = RevokeTokenState::CommitTransaction { document };
         if self.cutoff_raised {
             return smallvec![crate::abe::mark_due(None, txn_id)];
@@ -593,6 +614,9 @@ impl Operation for RevokeTokenOperation {
     type Error = RevokeTokenError;
 
     fn start(&mut self) -> Effects {
+        if let (true, Some(txn_id)) = (self.joined, self.txn_id) {
+            return self.emit_read_current(txn_id);
+        }
         self.state = RevokeTokenState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -862,6 +886,10 @@ impl Operation for RevokeTokenOperation {
     }
 
     fn abort(&mut self) -> Effects {
+        if self.joined {
+            self.txn_id = None;
+            return smallvec![];
+        }
         match self.txn_id.take() {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
             None => smallvec![],
@@ -1092,6 +1120,39 @@ mod tests {
             .await
             .unwrap();
         assert!(read.token_revoked(&token_hash, 1_000));
+    }
+
+    #[tokio::test]
+    async fn revocation_follows_caller() {
+        // Inside the caller's transaction the revocation commits or aborts with the caller.
+        let (_dir, context, actor) = setup_realm().await;
+        let start = || async {
+            match context
+                .storage_handle
+                .send_storage_effect(StorageEffect::StartTransaction { read: false })
+                .await
+            {
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        };
+        for commit in [false, true] {
+            let token_hash = bearer_token_hash(&format!("joined-{commit}"));
+            let txn_id = start().await;
+            let config = revocation(&actor, &token_hash, 2_000, 1_000);
+            drive(RevokeTokenOperation::joined(config, txn_id), &context)
+                .await
+                .unwrap();
+            let end = match commit {
+                true => StorageEffect::CommitTransaction { txn_id },
+                false => StorageEffect::AbortTransaction { txn_id },
+            };
+            context.storage_handle.send_storage_effect(end).await;
+            let read = drive(GetConfigOperation::new(actor.realm_id), &context)
+                .await
+                .unwrap();
+            assert_eq!(read.token_revoked(&token_hash, 1_000), commit);
+        }
     }
 
     #[tokio::test]

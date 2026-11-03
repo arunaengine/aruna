@@ -376,6 +376,7 @@ pub(super) async fn stage_item(
                 inherited_policies: Vec::new(),
                 restrictions: spec.auth_context.path_restrictions.clone(),
                 mirrors,
+                job_id: Some(ctx.job_id.as_ulid()),
             },
         )
         .await
@@ -386,6 +387,7 @@ pub(super) async fn stage_item(
             stage_snapshot_blob(
                 &ctx.driver,
                 MaterializeSnapshotInput {
+                    job_id: Some(ctx.job_id.as_ulid()),
                     group_id: spec.group_id,
                     user_id: spec.auth_context.user_id,
                     realm_id: spec.auth_context.realm_id,

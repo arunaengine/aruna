@@ -1,4 +1,4 @@
-//! Tests identifiers on origin reads: the bucket's current metadata and its rules apply.
+//! Tests origin reads: identifiers from the bucket's current metadata, and connector names.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -109,25 +109,114 @@ async fn seed(context: &DriverContext, actor: &Actor, listed: bool) -> Ulid {
     version_id
 }
 
+fn test_context(temp: &tempfile::TempDir) -> DriverContext {
+    DriverContext {
+        storage_handle: aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    }
+}
+
+fn actor() -> Actor {
+    let realm_id = RealmId::from_bytes([1; 32]);
+    Actor {
+        node_id: iroh::SecretKey::from_bytes(&[7; 32]).public(),
+        user_id: UserId::local(Ulid::from_bytes([8; 16]), realm_id),
+        realm_id,
+    }
+}
+
+// A source names its connector by display name and its import job, never the connector's settings.
+#[tokio::test]
+async fn connector_name_read() {
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::StagingStrategy;
+    let temp = tempfile::tempdir().unwrap();
+    let context = test_context(&temp);
+    let actor = actor();
+    seed(&context, &actor, true).await;
+    let (group_id, connector_id) = (Ulid::from_bytes([2; 16]), Ulid::from_bytes([5; 16]));
+    let endpoint = "https://reader:hunter2@s3.example.org/?token=letmein";
+    let connector = SourceConnector::new(
+        connector_id,
+        group_id,
+        "BakRep mirror".to_string(),
+        SourceConnectorKind::S3,
+        std::collections::HashMap::from([
+            ("endpoint".to_string(), endpoint.to_string()),
+            ("bucket".to_string(), "bakrep".to_string()),
+        ]),
+        SystemTime::UNIX_EPOCH,
+        SystemTime::UNIX_EPOCH,
+        actor.user_id,
+    );
+    let key = source_connector_key(group_id, connector_id).to_vec();
+    put(
+        &context,
+        SOURCE_INDEX_KEYSPACE,
+        key,
+        connector.to_bytes().unwrap(),
+    )
+    .await;
+    let observed = aruna_core::structs::execution::source_access::SourceMetadata {
+        content_length: 3,
+        content_type: None,
+        etag: None,
+        last_modified: None,
+        source_version: None,
+        digests: Default::default(),
+    };
+    let binding = crate::staging::descriptor::build_source_binding(
+        StagingStrategy::Reference,
+        &connector,
+        &observed,
+        "genes/b.faa".to_string(),
+        Some(actor.node_id),
+        Some(connector_id),
+    );
+    let job_id = Some(Ulid::from_bytes([6; 16]));
+    let origin = VersionOrigin::Source { job_id };
+    let now = SystemTime::UNIX_EPOCH;
+    let version = BlobVersion::reference(binding, observed, now, actor.user_id, now)
+        .with_origin(Some(origin.clone()));
+    let version_id = Ulid::from_bytes([4; 16]);
+    let row = VersionKey::new(BUCKET, "b.faa", version_id)
+        .to_bytes()
+        .unwrap();
+    put(
+        &context,
+        BLOB_VERSIONS_KEYSPACE,
+        row,
+        version.to_bytes().unwrap(),
+    )
+    .await;
+
+    let scope = (actor.realm_id, actor.node_id);
+    let view = read_origin(&context, scope, BUCKET, "b.faa", Some(version_id))
+        .await
+        .unwrap();
+    assert_eq!(view.origin, Some(origin.clone()));
+    let place = &view.source.as_ref().unwrap().sources[0];
+    assert_eq!(place.connector_id, Some(connector_id));
+    assert_eq!(place.connector_name.as_deref(), Some("BakRep mirror"));
+    for recorded in [
+        format!("{:?}", view.origin),
+        format!("{:?}", place.connector_name),
+    ] {
+        assert!(!recorded.contains("hunter2") && !recorded.contains("letmein"));
+    }
+}
+
 #[tokio::test]
 async fn database_identifiers_read() {
     for listed in [true, false] {
         let temp = tempfile::tempdir().unwrap();
-        let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(temp.path().to_str().unwrap())
-                .unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let actor = Actor {
-            node_id: iroh::SecretKey::from_bytes(&[7; 32]).public(),
-            user_id: UserId::local(Ulid::from_bytes([8; 16]), realm_id),
-            realm_id,
-        };
+        let context = test_context(&temp);
+        let actor = actor();
+        let realm_id = actor.realm_id;
         let version_id = seed(&context, &actor, listed).await;
         let scope = (realm_id, actor.node_id);
         let view = read_origin(&context, scope, BUCKET, KEY, Some(version_id))

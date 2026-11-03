@@ -38,6 +38,7 @@ use std::sync::Arc;
 #[utoipa::path(
     get,
     path = "/metadata/{document_id}/rocrate",
+    operation_id = "export_metadata_rocrate",
     tag = "metadata/rocrate",
     summary = "Export a metadata document as RO-Crate",
     description = r#"Exports a metadata document as an RO-Crate in the requested view.
@@ -62,6 +63,8 @@ unreadable one because both answer 404.
 - The pagination fields are only populated for the `page` view, and in the `summary` and `page`
   views the crate's root identifier is rewritten to carry the requested view and cursor, so a
   partial crate is not mistaken for the full one.
+- A client whose `Accept` ranks `application/ld+json` above `application/json` gets a projected
+  view as the bare RO-Crate document, typed `application/ld+json`, without the wrapper object.
 
 **Limits**: an export larger than this node's configured metadata byte limit is refused rather than
 truncated."#,
@@ -186,6 +189,27 @@ truncated."#,
     ),
     security((), ("bearer_auth" = []))
 )]
+pub async fn negotiated_rocrate(
+    state: State<Arc<ServerState>>,
+    auth: Extension<Option<AuthContext>>,
+    bearer_token: Extension<Option<ValidatedBearer>>,
+    headers: axum::http::HeaderMap,
+    document_id: Path<String>,
+    params: Query<RoCrateExportParams>,
+) -> ServerResult<axum::response::Response> {
+    use axum::http::header::{CONTENT_TYPE, VARY};
+    use axum::response::IntoResponse;
+    let bare = crate::routes::pid::ranks_above(&headers, "application/ld+json", "application/json");
+    let vary = [(VARY, "accept")];
+    match export_metadata_rocrate(state, auth, bearer_token, document_id, params).await? {
+        (_, Json(MetadataRoCrateResponse::Projected(projected))) if bare => {
+            let typed = [(CONTENT_TYPE, "application/ld+json")];
+            Ok((vary, typed, Json(projected.rocrate)).into_response())
+        }
+        (status, response) => Ok((status, vary, response).into_response()),
+    }
+}
+
 pub async fn export_metadata_rocrate(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,

@@ -15,7 +15,7 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::origin::VersionOrigin;
+use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::{
@@ -516,6 +516,7 @@ async fn records_pull_origin() -> TestResult<()> {
         Some(VersionOrigin::Upload {
             node_id: server.node_id(),
             device: Some(device_id.clone()),
+            client: Some(UploadClient::Device),
         }),
         "the version's origin names the device"
     );

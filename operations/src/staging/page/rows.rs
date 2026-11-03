@@ -204,12 +204,22 @@ pub(crate) struct PageGuards {
 }
 
 /// The rows of one page, its usage change and its outcome.
+#[derive(Debug, PartialEq)]
 pub(crate) struct PageRows {
     pub writes: Vec<(KeySpace, Key, Value)>,
     pub delta: UsageDelta,
     pub result: PageImportResult,
     /// The inventory changes of a distributed bucket, one per registered key.
     pub inventory: Vec<InventoryChange>,
+}
+
+/// A page's rows built in a read snapshot before its turn, with the guards, heads and versions
+/// they were built from; the page writes them only if its transaction reads the same.
+#[derive(Debug, PartialEq)]
+pub struct PreparedRows {
+    pub(crate) guards: PageGuards,
+    pub(crate) versions: Vec<Option<BlobVersion>>,
+    pub(crate) rows: PageRows,
 }
 
 /// What the page does with one entry, decided against the head inside the transaction.
@@ -567,7 +577,9 @@ fn register_rows(
         input.user_id,
         input.now,
     )
-    .with_origin(Some(VersionOrigin::Source))
+    .with_origin(Some(VersionOrigin::Source {
+        job_id: Some(input.job_id.as_ulid()),
+    }))
     .with_metadata(entry.metadata.clone().into_iter().collect())
     .with_policies(guards.policies.clone())?;
     let version_key = VersionKey::new(&input.bucket, &entry.target_key, version_id);

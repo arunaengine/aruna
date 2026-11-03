@@ -228,6 +228,27 @@ where
     Ok(auth)
 }
 
+/// A bucket search without a bearer reads as Everyone, and only from a configured member.
+pub(super) async fn search_reader_auth<S>(
+    state: &S,
+    storage_handle: &StorageHandle,
+    peer: NodeId,
+    local_realm_id: Option<RealmId>,
+    auth_token: Option<AuthToken>,
+) -> Result<AuthContext, MetadataReadError>
+where
+    S: ArunaValidationState + ?Sized,
+{
+    if auth_token.is_some() {
+        return bucket_search_auth(state, storage_handle, peer, local_realm_id, auth_token).await;
+    }
+    let realm_id = local_realm_id.ok_or(MetadataReadError::Unavailable)?;
+    ensure_peer_configured(storage_handle, peer, realm_id, PeerTrust::Member)
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?;
+    Ok(AuthContext::anonymous(realm_id))
+}
+
 /// A release membership request: a bearer this node validates itself, from a realm
 /// infrastructure node only, never a device.
 pub(super) async fn release_auth<S>(

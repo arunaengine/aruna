@@ -53,6 +53,18 @@ impl DriverContext {
             .map_or(fallback, |net| *net.realm_id())
     }
 
+    /// This node and the realm it serves; `None` on a node without a net transport.
+    pub fn node_and_realm(
+        &self,
+    ) -> Option<(
+        aruna_core::NodeId,
+        aruna_core::structs::identity::realm::RealmId,
+    )> {
+        self.net_handle
+            .as_ref()
+            .map(|net| (net.node_id(), *net.realm_id()))
+    }
+
     /// This context with its storage effects and metadata reads on the bulk lane, so
     /// background work never delays request traffic.
     pub fn bulk(&self) -> Self {

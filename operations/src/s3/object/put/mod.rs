@@ -1459,10 +1459,11 @@ impl PutObjectOperation {
             .with_metadata(self.metadata.clone())
             .with_origin(Some(self.version_origin.clone().unwrap_or(
                 match self.config.version_source {
-                    Some(_) => VersionOrigin::Source,
+                    Some(_) => VersionOrigin::Source { job_id: None },
                     None => VersionOrigin::Upload {
                         node_id: self.config.node_id,
                         device: None,
+                        client: None,
                     },
                 },
             )));

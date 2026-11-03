@@ -7,9 +7,12 @@ use std::time::SystemTime;
 
 use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SOURCE_INDEX_KEYSPACE,
+};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::source_access::{SourceDigest, SourceStats};
+use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::identifier::{CompiledParser, Identifier};
 use aruna_core::structs::identity::realm::RealmId;
@@ -26,6 +29,7 @@ use aruna_core::{NodeId, UserId};
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::connectors::repository::source_connector_key;
 use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use crate::driver::{DriverContext, drive};
 use crate::effect_adapters::dispatch_effect;
@@ -62,6 +66,8 @@ pub struct SourcePlace {
     pub path: String,
     /// This node's connector the source reads through; `None` for a public or native source.
     pub connector_id: Option<Ulid>,
+    /// The connector's display name, read when the origin is read; never its settings.
+    pub connector_name: Option<String>,
 }
 
 fn places(source: &VersionSourceBinding) -> Vec<SourcePlace> {
@@ -76,6 +82,7 @@ fn place(single: &VersionSourceBinding) -> SourcePlace {
         url: public_source_url(&single.descriptor),
         path: single.descriptor.source_path.clone(),
         connector_id: single.connector_id,
+        connector_name: None,
     }
 }
 
@@ -194,6 +201,13 @@ pub async fn read_origin(
     let size = version_size(context, &version).await?;
     let mut view = view(version_id, global, version);
     view.size = size;
+    for place in view
+        .source
+        .iter_mut()
+        .flat_map(|source| source.sources.iter_mut())
+    {
+        place.connector_name = connector_name(context, info.group_id, place.connector_id).await?;
+    }
     let source_url = view
         .source
         .as_ref()
@@ -284,6 +298,70 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
 }
 
 /// Reads `version_id`, or the current version, of a local bucket's key, with its source root.
+/// Current files one runs lookup reads at most; a larger scope answers incomplete.
+pub const RUN_SCAN_LIMIT: usize = 5000;
+/// Runs one lookup names at most.
+pub const RUN_LIMIT: usize = 50;
+
+/// The runs whose results are current files of a bucket under a prefix, newest first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BucketRuns {
+    pub run_ids: Vec<Ulid>,
+    /// Every current file under the prefix was read and no run was left out.
+    pub complete: bool,
+}
+
+/// The runs that wrote the current files of `bucket` under `prefix`, from their origins.
+pub async fn bucket_runs(
+    context: &DriverContext,
+    bucket: &str,
+    prefix: &str,
+) -> Result<BucketRuns, OriginError> {
+    let storage =
+        |error: aruna_core::errors::ConversionError| OriginError::Storage(error.to_string());
+    let scope = BlobHeadKey::object_prefix(bucket, prefix).map_err(storage)?;
+    let (mut runs, mut after, mut scanned) = (std::collections::BTreeSet::new(), None, 0);
+    let complete = loop {
+        let page = RUN_SCAN_LIMIT.saturating_sub(scanned).min(500);
+        let iter = StorageEffect::Iter {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: Some(scope.clone().into()),
+            start: after.take().map(aruna_core::effects::IterStart::After),
+            limit: page,
+            txn_id: None,
+        };
+        let (heads, next) = match context.storage_handle.send_storage_effect(iter).await {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            other => return Err(OriginError::Storage(format!("{other:?}"))),
+        };
+        scanned += heads.len();
+        for (head, pointer) in heads {
+            let key = BlobHeadKey::from_bytes(&head).map_err(storage)?;
+            let pointer = CurrentVersionPointer::from_bytes(&pointer).map_err(storage)?;
+            let row = VersionKey::new(bucket, &key.key, pointer.version_id).to_bytes();
+            let Some(value) = read(context, BLOB_VERSIONS_KEYSPACE, row.map_err(storage)?).await?
+            else {
+                continue;
+            };
+            let version = BlobVersion::from_bytes(&value).map_err(storage)?;
+            if let Some(VersionOrigin::Job { run_id, .. }) = version.origin {
+                runs.insert(run_id);
+            }
+        }
+        match next {
+            None => break true,
+            Some(_) if scanned >= RUN_SCAN_LIMIT => break false,
+            next => after = next,
+        }
+    };
+    let complete = complete && runs.len() <= RUN_LIMIT;
+    let run_ids = runs.into_iter().rev().take(RUN_LIMIT).collect();
+    Ok(BucketRuns { run_ids, complete })
+}
+
 async fn read_version(
     context: &DriverContext,
     bucket: &str,
@@ -339,6 +417,24 @@ async fn version_size(
     let location = BackendLocation::from_bytes(&value)
         .map_err(|error| OriginError::Storage(error.to_string()))?;
     Ok(Some(location.blob_size))
+}
+
+/// The display name of a connector of the bucket's group on this node, when it is here.
+async fn connector_name(
+    context: &DriverContext,
+    group_id: GroupId,
+    connector_id: Option<Ulid>,
+) -> Result<Option<String>, OriginError> {
+    let Some(connector_id) = connector_id else {
+        return Ok(None);
+    };
+    let key = source_connector_key(group_id, connector_id).to_vec();
+    let Some(value) = read(context, SOURCE_INDEX_KEYSPACE, key).await? else {
+        return Ok(None);
+    };
+    SourceConnector::from_bytes(&value)
+        .map(|connector| Some(connector.name))
+        .map_err(|error| OriginError::Storage(error.to_string()))
 }
 
 async fn read(

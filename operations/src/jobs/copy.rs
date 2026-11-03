@@ -71,6 +71,7 @@ pub async fn run_copy_job(ctx: &JobContext, spec: &CopyJobSpec) -> JobRunOutcome
             metadata: None,
             restrictions: spec.auth_context.path_restrictions.clone(),
             references: CopyReferences::Materialize,
+            job_id: Some(ctx.job_id.as_ulid()),
         },
         Some(pulled.clone()),
     );

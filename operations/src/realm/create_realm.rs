@@ -271,6 +271,13 @@ impl CreateRealmOperation {
                 )?);
             }
         }
+        // The creating node runs account merges until it hands that role on.
+        config_events.push(config_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::MergeCoordinatorSet {
+                node_id: self.config.actor.node_id,
+            },
+        )?);
 
         let realm_auth_target = DocumentTarget::RealmAuthorization { realm_id };
         let realm_config_target = DocumentTarget::RealmConfig { realm_id };
@@ -819,7 +826,7 @@ mod test {
             .into_iter()
             .map(|value| postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(outbox_records.len(), 26);
+        assert_eq!(outbox_records.len(), 27);
         assert!(outbox_records.iter().any(|record| {
             record.target == DocumentTarget::RealmAuthorization { realm_id }
                 && matches!(
@@ -1016,7 +1023,17 @@ mod test {
                         candidate_map_epoch: 1,
                     },
                 ),
+                (
+                    26,
+                    AdminDocumentOperation::MergeCoordinatorSet {
+                        node_id: actor.node_id,
+                    },
+                ),
             ]
+        );
+        assert_eq!(
+            config_state.materialized_merge_coordinator(),
+            Some(actor.node_id)
         );
     }
 

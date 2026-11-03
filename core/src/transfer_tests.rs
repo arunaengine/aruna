@@ -29,6 +29,8 @@ fn descriptor(seed: u8, issued_at: u64) -> Signed<RealmDescriptor> {
         description: String::new(),
         api_url: url.clone(),
         portal_url: url,
+        contact: None,
+        login_providers: Vec::new(),
         issued_at,
     };
     Signed::sign(descriptor, &capabilities(seed)).unwrap()

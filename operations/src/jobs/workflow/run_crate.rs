@@ -1674,6 +1674,55 @@ mod pure_tests {
     }
 
     #[test]
+    fn hides_pin_credentials() {
+        // Credentials in a connector endpoint never reach a pin or the run crate.
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_core::structs::execution::staging::PortableSourceDescriptor;
+        use aruna_core::structs::storage::origin::SourcePin;
+        let endpoint = "https://reader:hunter2@data.example.org/api?token=t0ken&sig=s1g";
+        let mut descriptor = PortableSourceDescriptor {
+            kind: SourceConnectorKind::S3,
+            public_config: std::collections::HashMap::from([
+                ("endpoint".to_string(), endpoint.to_string()),
+                ("skip_signature".to_string(), "true".to_string()),
+            ]),
+            source_path: "in.txt".to_string(),
+            version_selector: None,
+            namespace: None,
+            capabilities: Vec::new(),
+            origin_node_id: None,
+            root: None,
+        };
+        let source_pin = Some(SourcePin::of(&descriptor));
+        descriptor.kind = SourceConnectorKind::Http;
+        let served_by = Some(SourcePin::served(&descriptor));
+        let (mut record, spec) = execution_record();
+        record.captured_inputs.push(CapturedInput {
+            destination_key: "inputs/in.txt".to_string(),
+            source_node_id: record.owner_node_id,
+            version_id: Ulid::from_bytes([13; 16]),
+            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            bytes: 3,
+            policies: Vec::new(),
+            source_group_id: Default::default(),
+            public: false,
+            link: None,
+            source_pin,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
+            served_by,
+        });
+        let rendered = parse(&record, &spec).to_string();
+        assert!(rendered.contains("https://data.example.org/api/in.txt"));
+        assert!(rendered.contains("\"https://data.example.org\""));
+        for secret in ["reader", "hunter2", "t0ken", "s1g", "token"] {
+            assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+        }
+    }
+
+    #[test]
     fn names_by_content() {
         // Known digests become content addresses; the same content twice keeps one address,
         // and each entity keeps its own exact version as a second `contentUrl`.

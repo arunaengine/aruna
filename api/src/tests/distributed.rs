@@ -180,6 +180,7 @@ pub(crate) async fn hidden_link(node: &Node, key: &str) {
         group_id: ulid::Ulid::from_parts(9, 9),
     };
     let write = ReferenceWrite {
+        job_id: None,
         preassigned_version_id: None,
         group_id: node.group_id,
         user_id: node.owner.user_id,

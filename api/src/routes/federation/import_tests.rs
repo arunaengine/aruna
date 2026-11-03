@@ -150,6 +150,8 @@ async fn fixture(with_blob: bool) -> Fixture {
         description: String::new(),
         api_url: url("https://b.example.org/api/v1"),
         portal_url: url("https://b.example.org"),
+        contact: None,
+        login_providers: Vec::new(),
         issued_at: 1,
     };
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -159,6 +161,9 @@ async fn fixture(with_blob: bool) -> Fixture {
     let signed = Signed::sign(descriptor.clone(), state.node_capabilities()).unwrap();
     config.federation = Some(FederationSettings {
         name: "B".to_string(),
+        description: String::new(),
+        contact: None,
+        login_providers: Vec::new(),
         api_url: descriptor.api_url,
         portal_url: descriptor.portal_url,
         registry_url: None,

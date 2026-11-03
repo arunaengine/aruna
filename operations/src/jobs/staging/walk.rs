@@ -55,6 +55,7 @@ use crate::staging::list_source::{
 };
 use crate::staging::page::import::{
     PageEntry, PageImportError, PageImportInput, PageImportOperation, PageImportResult,
+    PreparePageOperation,
 };
 use crate::staging::page::rows::MAX_ERROR_SAMPLE;
 
@@ -558,6 +559,21 @@ pub(super) async fn coordinated(
     Ok(ranges.iter().map(Option::is_some).collect())
 }
 
+/// The range turn each of `keys` is written in, `None` for a key this node does not import; a
+/// bucket without ranges needs no turn.
+pub(super) async fn key_turns(
+    ctx: &JobContext,
+    bucket: &BucketInfo,
+    keys: &[&str],
+) -> Result<Vec<Option<BTreeSet<(Ulid, Ulid)>>>, String> {
+    let Some(binding) = bucket.distribution.as_ref() else {
+        return Ok(vec![Some(BTreeSet::new()); keys.len()]);
+    };
+    let ranges = local_ranges(ctx, binding, keys).await?;
+    let turn = |range| BTreeSet::from([(binding.set_id, range)]);
+    Ok(ranges.into_iter().map(|range| range.map(turn)).collect())
+}
+
 /// The range of each of `keys` if this node coordinates it, else `None`.
 async fn local_ranges(
     ctx: &JobContext,
@@ -890,13 +906,20 @@ pub(super) async fn import_page(
         ranges: None,
         mirror_connectors,
     };
+    // The rows are built before the turn, so pages of other jobs build theirs meanwhile; a page
+    // whose reads changed by its turn builds them again. A failed preparation only costs time.
+    let preparing = drive(PreparePageOperation::new(input.clone()), &ctx.driver);
+    let mut prepared = preparing.await.ok();
     let result = {
         // Listing and the reads above run in parallel; the page transactions take turns.
         let _turn = match turn {
             Some(turn) => Some(turn.lock().await),
             None => None,
         };
-        let run = |input| drive(PageImportOperation::new(input), &ctx.driver);
+        let run = |input| {
+            let page = PageImportOperation::new(input).with_prepared(prepared.take());
+            drive(page, &ctx.driver)
+        };
         retry_page(ctx, (input, &ranges), run).await
     };
     match result {

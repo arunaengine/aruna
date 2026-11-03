@@ -8,8 +8,10 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::UserId;
 use crate::id::NodeId;
 use crate::structs::execution::staging::PortableSourceDescriptor;
+use crate::structs::identity::s3_session::S3Session;
 use crate::structs::storage::global_id::GlobalId;
 use crate::structs::storage::replication::VersionedObjectArn;
 
@@ -42,7 +44,28 @@ impl OriginVersion {
     }
 }
 
-/// How a version's content got into its bucket.
+/// The kind of client an upload came through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum UploadClient {
+    /// S3 signed with a temporary session credential, which only the portal requests.
+    Portal,
+    /// S3 signed with a stored access key.
+    S3,
+    /// A desktop device published the file and this node pulled it.
+    Device,
+}
+
+impl UploadClient {
+    /// The client of an S3 upload, by the kind of credential that signed it.
+    pub fn from_access_key(access_key: &str) -> Self {
+        match S3Session::is_session_key(access_key) {
+            true => Self::Portal,
+            false => Self::S3,
+        }
+    }
+}
+
+/// How a version's content got into its bucket. `job_id` names the system job that wrote it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum VersionOrigin {
     /// A client wrote the bytes; the uploader and time are the version's creator and time.
@@ -50,19 +73,47 @@ pub enum VersionOrigin {
         node_id: NodeId,
         /// The authenticated device the file came from, when known.
         device: Option<String>,
+        client: Option<UploadClient>,
     },
     /// An external source, registered without copying or copied in. The source root, path and
     /// observation are the version's own source binding, never copied here.
-    Source,
+    Source { job_id: Option<Ulid> },
     /// CopyObject or a snapshot copy minted this version from another one.
-    Copy { from: OriginVersion },
+    Copy {
+        from: OriginVersion,
+        job_id: Option<Ulid>,
+    },
     /// Registered in place from a storage backend folder of the group.
-    Storage { backend_id: Ulid, key: String },
+    Storage {
+        backend_id: Ulid,
+        key: String,
+        job_id: Option<Ulid>,
+    },
     /// A compute job wrote the version as a result.
-    Job { run_id: Ulid },
+    Job {
+        run_id: Ulid,
+        /// The person who submitted the job; `None` when the system started it.
+        started_by: Option<UserId>,
+    },
 }
 
 impl VersionOrigin {
+    /// The origin of an S3 write: a run's workspace credential writes as its job.
+    pub fn s3_write(node_id: NodeId, access_key: &str, user_id: UserId) -> Self {
+        use crate::structs::execution::job::credential_job_id;
+        match credential_job_id(access_key) {
+            Some(job_id) => Self::Job {
+                run_id: Ulid::from_bytes(job_id.to_bytes()),
+                started_by: Some(user_id).filter(|user| !user.is_nil()),
+            },
+            None => Self::Upload {
+                node_id,
+                device: None,
+                client: Some(UploadClient::from_access_key(access_key)),
+            },
+        }
+    }
+
     /// Whether the record stays within its size budget.
     pub fn bounded(&self) -> bool {
         match self {
@@ -72,8 +123,9 @@ impl VersionOrigin {
             Self::Storage { key, .. } => key.len() <= MAX_KEY_BYTES,
             Self::Copy {
                 from: OriginVersion::Node(arn),
+                ..
             } => arn.key.len() <= MAX_KEY_BYTES,
-            Self::Source | Self::Copy { .. } | Self::Job { .. } => true,
+            Self::Source { .. } | Self::Copy { .. } | Self::Job { .. } => true,
         }
     }
 }
@@ -107,6 +159,19 @@ impl SourcePin {
             source_version: descriptor.version_selector.clone(),
         }
     }
+
+    /// The pin of a source that served a read: an HTTP source without a public URL is named
+    /// by its server only, never by its path, credentials or query.
+    pub fn served(descriptor: &PortableSourceDescriptor) -> Self {
+        use crate::structs::execution::source_connector::SourceConnectorKind;
+        let mut pin = Self::of(descriptor);
+        if pin.url.is_none() && descriptor.kind == SourceConnectorKind::Http {
+            pin.url = (bare_endpoint(descriptor).map(|url| url.origin()))
+                .filter(url::Origin::is_tuple)
+                .map(|origin| origin.ascii_serialization());
+        }
+        pin
+    }
 }
 
 /// What a dataset may say about a file's origin, read from the same pinned version. Uploads
@@ -134,13 +199,13 @@ pub fn project(
 ) -> Vec<OriginProjection> {
     let mut projection = Vec::new();
     match origin {
-        Some(VersionOrigin::Source) => {
+        Some(VersionOrigin::Source { .. }) => {
             projection.extend(source_url.map(|id| OriginProjection::BasedOn { id }));
         }
-        Some(VersionOrigin::Copy { from }) if from.publishable() => {
+        Some(VersionOrigin::Copy { from, .. }) if from.publishable() => {
             projection.push(OriginProjection::BasedOn { id: from.to_id() })
         }
-        Some(VersionOrigin::Job { run_id }) => {
+        Some(VersionOrigin::Job { run_id, .. }) => {
             projection.push(OriginProjection::CreatedBy { run_id: *run_id })
         }
         Some(
@@ -186,8 +251,10 @@ pub fn public_source_url(descriptor: &PortableSourceDescriptor) -> Option<String
         return None;
     }
     let config = &descriptor.public_config;
-    let endpoint = config.get("endpoint")?.trim_end_matches('/');
-    let mut url = endpoint.to_string();
+    let mut url = bare_endpoint(descriptor)?
+        .as_str()
+        .trim_end_matches('/')
+        .to_string();
     for part in ["bucket", "root"]
         .iter()
         .filter_map(|name| config.get(*name))
@@ -200,6 +267,16 @@ pub fn public_source_url(descriptor: &PortableSourceDescriptor) -> Option<String
         url.push('/');
         url.push_str(part);
     }
+    Some(url)
+}
+
+/// The source endpoint without user info, query or fragment, which may carry credentials.
+fn bare_endpoint(descriptor: &PortableSourceDescriptor) -> Option<url::Url> {
+    let mut url = url::Url::parse(descriptor.public_config.get("endpoint")?).ok()?;
+    url.set_username("").ok()?;
+    url.set_password(None).ok()?;
+    url.set_query(None);
+    url.set_fragment(None);
     Some(url)
 }
 

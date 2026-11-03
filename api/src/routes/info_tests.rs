@@ -1222,6 +1222,9 @@ async fn admin_sets_quota() {
 fn federation_body(name: &str) -> RealmFederation {
     RealmFederation {
         name: name.to_string(),
+        description: None,
+        contact: None,
+        login_providers: Vec::new(),
         api_url: "https://api.example.org/api/v1".to_string(),
         portal_url: "https://portal.example.org/".to_string(),
         registry_url: Some("https://registry.example.org/".to_string()),
@@ -1369,7 +1372,11 @@ async fn realm_gates_detail() {
             .unwrap();
         assert_eq!(info.realm_id, realm_id.to_string());
         assert_eq!(info.description, "Realm");
-        assert!(info.nodes.is_empty(), "realm topology is not public");
+        // A visitor sees nodes by name and presence only.
+        assert!(info.nodes.iter().all(|node| node.kind != NodeKindInfo::User
+            && node.owner.is_none()
+            && node.placement.is_none()
+            && node.info.is_none()));
         assert!(info.is_management_node, "the node kind is public");
         assert_eq!(
             info.management_urls,
@@ -1443,24 +1450,40 @@ async fn anonymous_realm_overview() {
 
     let (status, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
     assert_eq!(status, StatusCode::OK);
-    assert!(info.nodes.is_empty());
+    // A visitor sees the infrastructure nodes, never owners, placement or node documents.
+    assert_eq!(info.nodes.len(), 1);
+    let node = &info.nodes[0];
+    assert!(node.kind != NodeKindInfo::User && node.present);
+    assert!(node.owner.is_none() && node.placement.is_none() && node.info.is_none());
     assert!(info.discovery.is_none());
     assert!(info.quota.is_none());
     let overview = info.public_overview.as_ref().expect("public overview");
     assert_eq!(overview.live_datasets, None);
     assert_eq!(overview.groups, Some(1));
     assert_eq!(overview.nodes_configured, Some(1));
+    // Realm totals reach a visitor as numbers only.
+    assert!(overview.objects.is_some() && overview.data_bytes.is_some());
 
     let body = serde_json::to_value(&info).unwrap();
     assert_eq!(
         key_set(&body["public_overview"]),
-        std::collections::HashSet::from(["live_datasets", "groups", "nodes_configured",])
+        std::collections::HashSet::from([
+            "live_datasets",
+            "groups",
+            "nodes_configured",
+            "objects",
+            "data_bytes",
+        ])
     );
     assert!(body["public_overview"]["live_datasets"].is_null());
     assert_ne!(body["public_overview"]["live_datasets"], 0);
     assert!(body.get("discovery").is_none());
     assert!(body.get("quota").is_none());
-    assert_eq!(body["nodes"], serde_json::json!([]));
+    assert!(
+        body["nodes"][0]
+            .get("info")
+            .is_none_or(serde_json::Value::is_null)
+    );
     assert!(!body.to_string().contains("Protected group title"));
 }
 
@@ -1530,7 +1553,7 @@ async fn management_urls_follow() {
             api_url: "https://mgmt.example/api/v1".to_string(),
         }]
     );
-    assert!(info.nodes.is_empty());
+    assert!(info.nodes.iter().all(|node| node.info.is_none()));
 }
 
 #[tokio::test]
@@ -2239,4 +2262,59 @@ fn openapi_registers_names() {
     assert!(devices.get("patch").is_some() && devices.get("delete").is_some());
     let node = &openapi["components"]["schemas"]["RealmNodeInfoResponse"]["properties"];
     assert!(node.get("display_name").is_some());
+}
+
+#[tokio::test]
+async fn visitor_realm_totals() {
+    // A visitor sees the realm's objects and data bytes, private data included, as sums only.
+    use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
+    use aruna_core::structs::storage::usage::{
+        NodeUsageSnapshot, UsageCounters, global_shard_key, usage_global_key,
+    };
+    let (state, _, _, _tempdir) = setup_management_state().await;
+    let storage = state.get_ctx().storage_handle.clone();
+    let local = UsageCounters {
+        objects: 3,
+        logical_bytes: 5,
+        ..Default::default()
+    };
+    let remote = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+    let snapshot = NodeUsageSnapshot {
+        node_id: remote,
+        counters: UsageCounters {
+            objects: 7,
+            logical_bytes: 100,
+            referenced_bytes: 20,
+            ..Default::default()
+        },
+        replicas: Default::default(),
+        revisions: Default::default(),
+    };
+    let rows = [
+        (
+            USAGE_STATS_KEYSPACE,
+            global_shard_key(0),
+            local.to_bytes().unwrap(),
+        ),
+        (
+            NODE_STATS_KEYSPACE,
+            usage_global_key(remote),
+            snapshot.to_bytes().unwrap(),
+        ),
+    ];
+    for (key_space, key, value) in rows {
+        let write = StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        };
+        storage.send_storage_effect(write).await;
+    }
+    let (_, Json(info)) = get_realm_info(State(state), Extension(None)).await.unwrap();
+    let overview = info.public_overview.expect("public overview");
+    assert_eq!(
+        (overview.objects, overview.data_bytes),
+        (Some(10), Some(125))
+    );
 }

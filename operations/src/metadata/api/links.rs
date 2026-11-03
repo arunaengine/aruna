@@ -7,10 +7,13 @@
 // document id and say whether they are complete.
 
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
-use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, VersionKey};
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, CurrentVersionPointer, VersionKey, bucket_permission_path, object_permission_path,
+};
 use aruna_core::structs::storage::data::link::{DataLink, LinkScope};
 
 use aruna_core::structs::storage::data::link::LinkPosting;
+use aruna_core::types::GroupId;
 
 use super::{
     ApiQueryMode, AuthContext, BTreeMap, BlobVersion, Deserialize, DriverContext, Event,
@@ -563,6 +566,8 @@ pub struct PartTarget {
     /// The node of an ordinary bucket; a distributed bucket is browsed on any member.
     pub node_id: Option<NodeId>,
     pub held_here: bool,
+    /// The permission paths whose READ lets a caller list the part, as far as this node knows.
+    pub read_paths: Vec<String>,
 }
 
 /// Resolves a bucket or prefix identifier to the bucket that holds its files. A set this node
@@ -578,23 +583,31 @@ pub async fn resolve_part(
     let prefix = prefix.to_string();
     match scope {
         LinkScope::Node {
+            realm_id,
             node_id: owner,
             bucket,
-            ..
         } => {
-            let held_here = owner == node_id
-                && crate::driver::drive(GetBucketOperation::new(bucket.clone()), context)
+            let local = match owner == node_id {
+                true => crate::driver::drive(GetBucketOperation::new(bucket.clone()), context)
                     .await
-                    .is_ok_and(|info| info.distribution.is_none());
+                    .ok()
+                    .filter(|info| info.distribution.is_none()),
+                false => None,
+            };
+            let read_paths = local
+                .iter()
+                .map(|info| read_path(realm_id, info.group_id, owner, &bucket, &prefix))
+                .collect();
             Ok(PartTarget {
                 link,
+                held_here: local.is_some(),
                 bucket: Some(bucket),
                 prefix,
                 node_id: Some(owner),
-                held_here,
+                read_paths,
             })
         }
-        LinkScope::Set { set_id, .. } => {
+        LinkScope::Set { realm_id, set_id } => {
             let record = read_row(
                 context,
                 aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
@@ -605,7 +618,15 @@ pub async fn resolve_part(
                 aruna_core::structs::storage::distribution::DistributionView::from_bytes(&value)
                     .ok()
             });
-            let bucket = record.map(|view| view.snapshot().config.bucket.clone());
+            let config = record.map(|view| view.snapshot().config.clone());
+            let read_paths = config.iter().flat_map(|config| {
+                config.members.iter().map(|member| {
+                    let group = config.owner_group;
+                    read_path(realm_id, group, member.node_id, &config.bucket, &prefix)
+                })
+            });
+            let read_paths = read_paths.collect();
+            let bucket = config.map(|config| config.bucket);
             let held_here = match &bucket {
                 Some(name) => crate::driver::drive(GetBucketOperation::new(name.clone()), context)
                     .await
@@ -621,8 +642,17 @@ pub async fn resolve_part(
                 prefix,
                 node_id: None,
                 held_here,
+                read_paths,
             })
         }
+    }
+}
+
+/// The path whose READ lists `prefix` of a bucket, or the whole bucket.
+fn read_path(realm: RealmId, group: GroupId, node: NodeId, bucket: &str, prefix: &str) -> String {
+    match prefix.is_empty() {
+        true => bucket_permission_path(realm, group, node, bucket),
+        false => object_permission_path(realm, group, node, bucket, prefix),
     }
 }
 

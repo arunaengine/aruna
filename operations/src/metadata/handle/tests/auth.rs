@@ -7,7 +7,7 @@ use super::super::peer_auth::{authorize_peer, remote_auth_context, replay_author
 use super::*;
 use crate::auth::bearer_token::decode_bearer_token;
 use crate::auth::bearer_token::validate_bearer_token;
-use crate::metadata::handle::peer_auth::bucket_search_auth;
+use crate::metadata::handle::peer_auth::{bucket_search_auth, search_reader_auth};
 use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataReadError;
 use aruna_core::effects::StorageEffect;
@@ -526,4 +526,18 @@ async fn replay_respects_cutoff() {
         replay_authority(&storage, replay(cutoff, (cutoff - 1) * 1000)).await,
         Err(WritePeerError::Unauthorized)
     ));
+}
+
+#[tokio::test]
+async fn signed_out_search() {
+    // A bucket search without a bearer reads as Everyone, from a configured member only.
+    let realm_id = RealmId([23u8; 32]);
+    let (peer, stranger) = (node_id_seed(24), node_id_seed(25));
+    let (_dir, storage) = auth_storage();
+    persist_auth_state(&storage, REALMS_LIST_KEY, &HashSet::from([realm_id])).await;
+    persist_realm_config(&storage, realm_id, &[peer]).await;
+    let state = AuthValidationState::new(storage.clone(), Some(realm_id));
+    let reader = |node| search_reader_auth(&state, &storage, node, Some(realm_id), None);
+    assert_eq!(reader(peer).await, Ok(AuthContext::anonymous(realm_id)));
+    assert_eq!(reader(stranger).await, Err(MetadataReadError::Unavailable));
 }

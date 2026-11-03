@@ -10,6 +10,7 @@ use aruna_core::structs::execution::job::{
     JobClaim, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, StagingJobPrefix,
 };
 use aruna_core::structs::execution::table::{SEARCH_EXACT_KEY, TableImport};
+use aruna_core::structs::storage::origin::VersionOrigin;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
@@ -223,12 +224,17 @@ impl Fixture {
     }
 
     async fn context(&self, seed: u8) -> JobContext {
+        self.context_for(&self.spec, seed).await
+    }
+
+    /// A claimed job of `spec`.
+    async fn context_for(&self, spec: &StagingJobSpec, seed: u8) -> JobContext {
         let (job_id, claim_token) = (JobId::from_bytes([seed; 16]), Ulid::from_bytes([seed; 16]));
-        let owner = self.spec.auth_context.user_id;
-        let payload = JobPayload::Staging(self.spec.clone());
-        let mut record = JobRecord::new(job_id, payload, owner, self.spec.node_id, 1, 1, None);
+        let owner = spec.auth_context.user_id;
+        let payload = JobPayload::Staging(spec.clone());
+        let mut record = JobRecord::new(job_id, payload, owner, spec.node_id, 1, 1, None);
         record.claim = Some(JobClaim {
-            holder_node_id: self.spec.node_id,
+            holder_node_id: spec.node_id,
             claim_token,
             lease_expires_ms: u64::MAX,
         });
@@ -304,8 +310,19 @@ impl Fixture {
         &self,
         key: &str,
     ) -> aruna_core::structs::execution::source_access::SourceMetadata {
+        use aruna_core::structs::storage::blob::BlobVersionState;
+        match self.version(key).await.state {
+            BlobVersionState::Reference {
+                cached_metadata, ..
+            } => cached_metadata,
+            _ => panic!("the version must be a reference"),
+        }
+    }
+
+    /// The current version of `key` in the job's bucket.
+    async fn version(&self, key: &str) -> aruna_core::structs::storage::blob::BlobVersion {
         use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
-        use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
+        use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
         let bucket = self.spec.bucket.clone();
         let (version_id, _) = self.head(&bucket, key).await.unwrap();
         let read = aruna_core::effects::StorageEffect::Read {
@@ -324,12 +341,15 @@ impl Fixture {
         else {
             panic!("the version must exist");
         };
-        match BlobVersion::from_bytes(&value).unwrap().state {
-            BlobVersionState::Reference {
-                cached_metadata, ..
-            } => cached_metadata,
-            _ => panic!("the version must be a reference"),
-        }
+        BlobVersion::from_bytes(&value).unwrap()
+    }
+
+    /// The origin of the current version of `key`.
+    async fn origin(
+        &self,
+        key: &str,
+    ) -> Option<aruna_core::structs::storage::origin::VersionOrigin> {
+        self.version(key).await.origin
     }
 
     /// The whole object read through the ordinary read, or why it was refused.
@@ -389,6 +409,9 @@ async fn summary_imports_folders() {
     let folder = "GCF_000005845.2_ASM584v2/";
     let (folder_version, metadata) = fixture.head(&bucket, folder).await.unwrap();
     assert_eq!(metadata["taxid"], "511145");
+    let job_id = Some(JobId::from_bytes([7; 16]).as_ulid());
+    let origin = fixture.origin(folder).await;
+    assert_eq!(origin, Some(VersionOrigin::Source { job_id }));
     assert_eq!(
         metadata["organism_name"],
         "Escherichia coli str. K-12 substr. MG1655"
@@ -518,7 +541,7 @@ async fn rewritten_gzip_reopens() {
     let mut kept = None;
     let mut offset = 0;
     let failure = loop {
-        match gzip_chunk(&mut kept, (None, None, offset), open).await {
+        match gzip_chunk(&mut kept, (None, None, offset), TABLE_CHUNK, open).await {
             Ok((bytes, _, _)) => offset += bytes.len() as u64,
             Err(failure) => break failure,
         }
@@ -529,7 +552,7 @@ async fn rewritten_gzip_reopens() {
 
     // A freshly opened stream that is no valid gzip stays a lasting failure.
     let broken = || async { Ok((pieces(vec![0xFF; 1024]), None)) };
-    let failure = gzip_chunk(&mut None, (None, None, 0), broken).await;
+    let failure = gzip_chunk(&mut None, (None, None, 0), TABLE_CHUNK, broken).await;
     assert!(matches!(failure, Err(ChunkFailure::Lasting(_))));
 }
 
@@ -729,7 +752,8 @@ async fn record_rows_trusted() {
         .ok()
         .unwrap();
 
-    fixture.run(41).await;
+    // The empty row counts as imported, like the row with a source.
+    assert_eq!(fixture.run(41).await, (2, 0));
     assert!(site.requests.lock().unwrap().is_empty());
     let observation = fixture.observation("coli/sums.txt").await;
     let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_763_401_101);
@@ -740,8 +764,444 @@ async fn record_rows_trusted() {
     let bucket = fixture.spec.bucket.clone();
     let (_, folder) = fixture.head(&bucket, "coli/").await.unwrap();
     assert_eq!(folder["note"], "coli sums");
+    // The empty object is the import's like the reference, not an upload.
+    let job_id = Some(JobId::from_bytes([41; 16]).as_ulid());
+    for key in ["coli/sums.txt", "coli/"] {
+        let origin = fixture.origin(key).await;
+        assert_eq!(origin, Some(VersionOrigin::Source { job_id }));
+    }
     let mut found = fixture.search("sums").await;
     found.sort();
     assert_eq!(found, ["coli/", "coli/sums.txt"]);
     server.abort();
+}
+
+/// Rows per second of a trusted record import into a searched distributed bucket:
+/// `ARUNA_BENCH_ROWS` source rows and `ARUNA_BENCH_EMPTY` empty rows, spread over
+/// `ARUNA_BENCH_JOBS` tables imported at once. Run with `--ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark"]
+async fn record_import_rate() {
+    let count = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let (rows, empty) = (
+        count("ARUNA_BENCH_ROWS", 100_000),
+        count("ARUNA_BENCH_EMPTY", 0),
+    );
+    let jobs = count("ARUNA_BENCH_JOBS", 1).max(1);
+    let background = count("ARUNA_BENCH_BACKGROUND", 1) > 0;
+    // Contiguous key blocks per job, as a split export gives, instead of interleaved rows.
+    let blocks = count("ARUNA_BENCH_BLOCKS", 0) > 0;
+    let ((completed, failed, conflicts), elapsed, index) =
+        import_records(rows, empty, (jobs, blocks), background).await;
+    println!(
+        "record import: {rows} rows, {empty} empty, {jobs} jobs, {completed} completed, \
+         {failed} failed, {conflicts} conflicts, {elapsed:.1} s, {:.0} rows/s, \
+         index caught up {index:.1} s later",
+        (rows + empty) as f64 / elapsed
+    );
+}
+
+// With the drain and the feed beside the import, the catch-up leaves no feed row unapplied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_import_settles() {
+    let ((completed, failed, _), ..) = import_records(300, 0, (2, true), true).await;
+    assert_eq!((completed, failed), (300, 0));
+}
+
+/// The search feed rows still waiting for the feed.
+async fn feed_rows(fixture: &Fixture) -> Vec<(aruna_core::types::Key, aruna_core::types::Value)> {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::SEARCH_FEED_KEYSPACE;
+    let read = StorageEffect::Iter {
+        key_space: SEARCH_FEED_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: 1,
+        txn_id: None,
+    };
+    match fixture
+        .driver
+        .storage_handle
+        .send_storage_effect(read)
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        event => panic!("the feed must be readable: {event:?}"),
+    }
+}
+
+// Empty rows of one job and record rows of another write one range in turns, not in conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_rows_alternate() {
+    assert_eq!(
+        import_records(400, 100, (2, false), false).await.0,
+        (500, 0, 0)
+    );
+}
+
+/// The table line of record row `row`: key `samn<row>/assembly.fna.gz`, size `row`.
+fn record_line(row: usize, meta: &str) -> String {
+    let md5 = format!("{:x}", md5::compute(row.to_le_bytes()));
+    format!(
+        "samn{row:08}/assembly.fna.gz\t{COLI}{row:08}.fna.gz\t{row}\t2025-11-17T17:38:21Z\t\
+         \"{md5}\"\tapplication/gzip\t{md5}\t{meta}\n"
+    )
+}
+
+// A record import of several full pages stopped after its first page resumes there, beside a
+// second job with empty rows on the same bucket: every key once, counters and search right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_pages_resume() {
+    use crate::distribution::index_feed::{FeedLimits, Feeder};
+    use crate::distribution::key_index::{KeyQuery, RangeIndexes};
+    use crate::staging::page::rows::MAX_PAGE_ENTRIES;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+    use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
+    use std::ops::Bound;
+
+    let (endpoint, site, server) = serve(Site::ncbi).await;
+    let table = serde_json::json!({
+        "source": { "object": { "bucket": "lists", "key": "first.tsv" } },
+        "format": { "delimiter": "\t", "quote": null, "nulls": [""] },
+        "rows": { "kind": "record", "source": "{source}", "target": "{key}", "keep": [],
+                  "size": "size", "modified": "modified",
+                  "checksums": [{ "algorithm": "md5", "column": "md5" }] }
+    });
+    let fixture = Fixture::new(&endpoint, table).await;
+    let header = "key\tsource\tsize\tmodified\tetag\tcontent_type\tmd5\tmetadata\n";
+    let meta = r#"{"note":"sample"}"#;
+    let rows = 2 * MAX_PAGE_ENTRIES + 500;
+    let first: String = (0..rows).map(|row| record_line(row, meta)).collect();
+    let second: String = (rows..rows + 300)
+        .map(|row| record_line(row, meta))
+        .chain((0..3).map(|row| format!("samn{row:08}/\t\t0\t\t\t\t\t{meta}\n")))
+        .collect();
+    let ctx = fixture.context(50).await;
+    let (set_id, range_id) = searched_set(&ctx, &fixture.spec).await;
+    let lists = drive(
+        GetBucketOperation::new("lists".to_string()),
+        &fixture.driver,
+    )
+    .await
+    .unwrap();
+    let mut specs = Vec::new();
+    for (key, rows) in [("first.tsv", first), ("second.tsv", second)] {
+        let body = (Bytes::from(format!("{header}{rows}")), &BTreeMap::new());
+        write_object(&ctx, &fixture.spec, ("lists", &lists), key, body)
+            .await
+            .ok()
+            .unwrap();
+        let mut spec = fixture.spec.clone();
+        let import = spec.table.as_mut().unwrap();
+        import.source = serde_json::from_value(serde_json::json!({
+            "object": { "bucket": "lists", "key": key }
+        }))
+        .unwrap();
+        specs.push(spec);
+    }
+
+    // The shutdown comes once the first page is committed, so the job stops after its next one.
+    let (progress, stop) = (ctx.progress.clone(), ctx.shutdown.clone());
+    let watch = async move {
+        while progress.snapshot().current < MAX_PAGE_ENTRIES as u64 {
+            progress.flush_requested().await;
+        }
+        stop.cancel();
+    };
+    let run = crate::jobs::staging::run_staging_job(&ctx, &specs[0]);
+    let (outcome, ()) = tokio::join!(run, watch);
+    assert!(matches!(outcome, JobRunOutcome::Interrupted));
+    let resumed = JobContext {
+        shutdown: CancellationToken::new(),
+        ..ctx
+    };
+    let mut other = fixture.context_for(&specs[1], 51).await;
+    other.range_turns = resumed.range_turns.clone();
+    let (first, second) = tokio::join!(
+        crate::jobs::staging::run_staging_job(&resumed, &specs[0]),
+        crate::jobs::staging::run_staging_job(&other, &specs[1]),
+    );
+    let counts = |outcome| match outcome {
+        JobRunOutcome::Succeeded(JobResultPayload::Staging {
+            completed_items,
+            failed_items,
+        }) => (completed_items, failed_items),
+        JobRunOutcome::Failed(error) | JobRunOutcome::Deferred(error) => {
+            panic!("the import stopped: {error:?}")
+        }
+        _ => panic!("the import did not finish"),
+    };
+    assert_eq!(counts(first), (rows as u64, 0));
+    assert_eq!(counts(second), (303, 0));
+    assert!(site.requests.lock().unwrap().is_empty());
+
+    // One version per key: a page committed twice would add versions, not objects.
+    let read = StorageEffect::Read {
+        key_space: USAGE_STATS_KEYSPACE.to_string(),
+        key: usage_bucket_key(&fixture.spec.bucket).into(),
+        txn_id: None,
+    };
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(value), ..
+    }) = fixture
+        .driver
+        .storage_handle
+        .send_storage_effect(read)
+        .await
+    else {
+        panic!("the bucket's counters must exist");
+    };
+    let counters = BucketCounters::from_bytes(&value).unwrap();
+    let keys = rows as u64 + 303;
+    assert_eq!((counters.objects, counters.versions), (keys, keys));
+    let bytes = (0..rows + 300).map(|row| row as u64).sum::<u64>();
+    assert_eq!(counters.referenced_bytes, bytes);
+    for row in [
+        0,
+        MAX_PAGE_ENTRIES - 1,
+        MAX_PAGE_ENTRIES,
+        rows - 1,
+        rows + 299,
+    ] {
+        let key = format!("samn{row:08}/assembly.fna.gz");
+        assert_eq!(fixture.observation(&key).await.content_length, row as u64);
+    }
+
+    // The feed finds no index at first; the first index generation is built from the heads.
+    let indexes = Arc::new(RangeIndexes::new(fixture._dir.path().join("range-indexes")));
+    let mut feeder = Feeder::new(indexes.clone(), FeedLimits::default());
+    while feeder.pass(&fixture.driver).await {}
+    for row in [0, MAX_PAGE_ENTRIES, rows - 1, rows + 299] {
+        let query = KeyQuery {
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+            names: Some(format!("samn{row:08}")),
+            meta: None,
+            limit: 10,
+        };
+        let found = indexes.search(set_id, range_id, 1, query).await.unwrap();
+        let mut expected = vec![format!("samn{row:08}/assembly.fna.gz")];
+        // The empty rows are the folders of the first rows.
+        if row < 3 {
+            expected.insert(0, format!("samn{row:08}/"));
+        }
+        assert_eq!(found.keys, expected);
+    }
+    server.abort();
+}
+
+/// Imports `rows` record and `empty` empty rows over `jobs` tables at once, in key blocks or
+/// interleaved, with drain and search feed beside them when `background`. Returns completed and
+/// failed rows, storage conflicts, the jobs' seconds and the search index's catch-up seconds.
+async fn import_records(
+    rows: usize,
+    empty: usize,
+    (jobs, blocks): (usize, bool),
+    background: bool,
+) -> ((u64, u64, u64), f64, f64) {
+    let (endpoint, _site, server) = serve(Site::ncbi).await;
+    let table = serde_json::json!({
+        "source": { "object": { "bucket": "lists", "key": "records-0.tsv" } },
+        "format": { "delimiter": "\t", "quote": null, "nulls": [""] },
+        "rows": { "kind": "record", "source": "{source}", "target": "{key}", "keep": [],
+                  "size": "size", "modified": "modified",
+                  "checksums": [{ "algorithm": "md5", "column": "md5" }] }
+    });
+    let fixture = Fixture::new(&endpoint, table.clone()).await;
+    let meta = r#"{"note":"sample"}"#;
+    let header = "key\tsource\tsize\tmodified\tetag\tcontent_type\tmd5\tmetadata\n";
+    let mut tables = vec![String::from(header); jobs];
+    for row in 0..rows {
+        let table = match blocks {
+            true => row * jobs / rows,
+            false => row % jobs,
+        };
+        tables[table].push_str(&record_line(row, meta));
+    }
+    for row in 0..empty {
+        tables[row % jobs].push_str(&format!("samn{row:08}/\t\t0\t\t\t\t\t{meta}\n"));
+    }
+    let ctx = fixture.context(40).await;
+    searched_set(&ctx, &fixture.spec).await;
+    let lists = drive(
+        GetBucketOperation::new("lists".to_string()),
+        &fixture.driver,
+    )
+    .await;
+    let lists = ("lists", &lists.unwrap());
+    let mut runs = Vec::new();
+    for (index, tsv) in tables.into_iter().enumerate() {
+        let key = format!("records-{index}.tsv");
+        let body = (Bytes::from(tsv), &BTreeMap::new());
+        write_object(&ctx, &fixture.spec, lists, &key, body)
+            .await
+            .ok()
+            .unwrap();
+        let mut spec = fixture.spec.clone();
+        let mut import = table.clone();
+        import["source"]["object"]["key"] = key.into();
+        spec.table = Some(serde_json::from_value(import).unwrap());
+        let mut job = fixture.context_for(&spec, 41 + index as u8).await;
+        // Jobs of one node share their range turns.
+        job.range_turns = ctx.range_turns.clone();
+        runs.push((job, spec));
+    }
+
+    // The replication drain and the search feed run beside the import, as on a node, where each
+    // committed page schedules them: here every page a job commits wakes both.
+    let (pages, _) = tokio::sync::watch::channel(0u64);
+    let pages = Arc::new(pages);
+    let watchers: Vec<_> = (runs.iter())
+        .map(|(job, _)| {
+            let (progress, pages) = (job.progress.clone(), pages.clone());
+            tokio::spawn(async move {
+                loop {
+                    progress.flush_requested().await;
+                    pages.send_modify(|count| *count += 1);
+                }
+            })
+        })
+        .collect();
+    let drain = fixture.driver.clone();
+    let mut woken = pages.subscribe();
+    let drain = tokio::spawn(async move {
+        if !background {
+            return;
+        }
+        loop {
+            let drained = crate::replication::queue::process_blob_batch(&drain).await;
+            if !drained.is_ok_and(|drained| drained.has_more_due) && woken.changed().await.is_err()
+            {
+                return;
+            }
+        }
+    });
+    let feed = fixture.driver.clone();
+    let indexes = fixture._dir.path().join("range-indexes");
+    let stop = CancellationToken::new();
+    let stopping = stop.clone();
+    let mut woken = pages.subscribe();
+    let feed = tokio::spawn(async move {
+        use crate::distribution::index_feed::{FeedLimits, Feeder};
+        use crate::distribution::key_index::RangeIndexes;
+        let mut feeder = Feeder::new(Arc::new(RangeIndexes::new(indexes)), FeedLimits::default());
+        while background && !stopping.is_cancelled() {
+            if !feeder.pass(&feed).await {
+                tokio::select! {
+                    _ = stopping.cancelled() => {}
+                    _ = woken.changed() => {}
+                }
+            }
+        }
+        feeder
+    });
+    let storage = &fixture.driver.storage_handle;
+    let conflicts = storage.snapshot_metrics().conflicts_total;
+    let started = std::time::Instant::now();
+    // Each job runs as its own task, as on a node.
+    let runs = runs.into_iter().map(|(job, spec)| {
+        tokio::spawn(async move { crate::jobs::staging::run_staging_job(&job, &spec).await })
+    });
+    let outcomes = futures_util::future::join_all(runs).await;
+    let elapsed = started.elapsed().as_secs_f64();
+    // The catch-up counts from the jobs' end, the feed's pass running then included.
+    let ended = std::time::Instant::now();
+    let conflicts = storage.snapshot_metrics().conflicts_total - conflicts;
+    for watcher in watchers {
+        watcher.abort();
+    }
+    drain.abort();
+    stop.cancel();
+    let mut feeder = feed.await.unwrap();
+    server.abort();
+    // The index catches up with what the jobs wrote.
+    while background && feeder.pass(&fixture.driver).await {}
+    let index = ended.elapsed().as_secs_f64();
+    if background {
+        assert!(
+            feed_rows(&fixture).await.is_empty(),
+            "the catch-up applied every feed row"
+        );
+    }
+    let (mut completed, mut failed) = (0, 0);
+    for outcome in outcomes {
+        let (completed_items, failed_items) = match outcome.unwrap() {
+            JobRunOutcome::Succeeded(JobResultPayload::Staging {
+                completed_items,
+                failed_items,
+            }) => (completed_items, failed_items),
+            JobRunOutcome::Failed(error) | JobRunOutcome::Deferred(error) => {
+                panic!("the table import stopped: {error:?}")
+            }
+            _ => panic!("the table import did not finish"),
+        };
+        (completed, failed) = (completed + completed_items, failed + failed_items);
+    }
+    ((completed, failed, conflicts), elapsed, index)
+}
+
+/// Makes the job's bucket a searched distributed set whose upper range, holding keys from `m`,
+/// this member coordinates, with a full key sample like a large bucket; returns set and range.
+async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
+    use crate::distribution::test_record::{binding, searched, store_record};
+    use crate::distribution::test_store::{begin, commit, install, range};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{KEY_SAMPLE_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::structs::storage::distribution::KeyRange;
+    use aruna_core::structs::storage::distribution::accounting::{
+        RangeCounters, SAMPLE_SIZE, SampleEntry, sample_count_key,
+    };
+    let handle = &ctx.driver.storage_handle;
+    let (snapshot, bytes) = searched();
+    let set_id = snapshot.set_id();
+    store_record(handle, set_id, bytes).await;
+    let mut bucket = pinned_bucket(ctx, spec).await.ok().unwrap();
+    bucket.distribution = Some(binding(&snapshot, 2, 5));
+    let range_id = snapshot.range_for("samn").unwrap().range_id;
+    let ranges = [KeyRange {
+        range_id,
+        ..range(1, "m", None)
+    }];
+    install(handle, set_id, &ranges).await;
+    let full = RangeCounters {
+        sampled: i128::from(SAMPLE_SIZE),
+        ..RangeCounters::default()
+    };
+    let largest = SampleEntry {
+        priority: u64::MAX,
+        key: "largest".to_string(),
+    };
+    let txn_id = begin(handle).await;
+    let effects = [
+        StorageEffect::Write {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: spec.bucket.as_bytes().to_vec().into(),
+            value: bucket.to_bytes().unwrap().into(),
+            txn_id: Some(txn_id),
+        },
+        StorageEffect::AddCounters {
+            key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+            deltas: vec![(sample_count_key(set_id, range_id).into(), full)],
+            txn_id,
+        },
+        StorageEffect::Write {
+            key_space: KEY_SAMPLE_KEYSPACE.to_string(),
+            key: largest.row_key(set_id, range_id).into(),
+            value: Vec::new().into(),
+            txn_id: Some(txn_id),
+        },
+    ];
+    for effect in effects {
+        handle.send_storage_effect(effect).await;
+    }
+    assert!(commit(handle, txn_id).await);
+    (set_id, range_id)
 }

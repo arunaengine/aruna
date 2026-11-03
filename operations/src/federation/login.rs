@@ -437,6 +437,8 @@ mod tests {
             description: String::new(),
             api_url: Url::parse("https://b.example.org").unwrap(),
             portal_url: Url::parse("https://b.example.org").unwrap(),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at: 1,
         };
         IssueHandoffOperation::new(IssueHandoffConfig {

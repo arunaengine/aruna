@@ -55,6 +55,9 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
+#[path = "merge_tests.rs"]
+mod merge;
+
 #[derive(Clone)]
 struct OidcProviderState {
     issuer: String,
@@ -72,6 +75,10 @@ struct TestOidcClaims {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auth_time: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email_verified: Option<bool>,
 }
 
 struct TestNode {
@@ -156,8 +163,6 @@ fn sign_oidc_token(
     name: Option<&str>,
     auth_time: Option<u64>,
 ) -> String {
-    let mut header = Header::new(Algorithm::EdDSA);
-    header.kid = Some(kid.to_string());
     let claims = TestOidcClaims {
         sub: subject.to_string(),
         iss: issuer.to_string(),
@@ -165,13 +170,21 @@ fn sign_oidc_token(
         exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
         name: name.map(str::to_string),
         auth_time,
+        email: None,
+        email_verified: None,
     };
+    sign_claims(kid, signing_key, &claims)
+}
+
+fn sign_claims(kid: &str, signing_key: &SigningKey, claims: &TestOidcClaims) -> String {
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.kid = Some(kid.to_string());
     let key_pem = signing_key
         .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
         .unwrap();
     encode(
         &header,
-        &claims,
+        claims,
         &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
     )
     .unwrap()
@@ -417,7 +430,10 @@ async fn register_via_oidc(
     let register = reqwest::Client::new()
         .post(format!("{}/api/v1/access/users/register", node.base_url))
         .bearer_auth(&oidc_token)
-        .json(&RegisterUserRequest { onboarding_secret })
+        .json(&RegisterUserRequest {
+            onboarding_secret,
+            create_new: false,
+        })
         .send()
         .await
         .unwrap();
@@ -1008,6 +1024,7 @@ async fn registration_consumes_secret() {
         ))
         .json(&RegisterUserRequest {
             onboarding_secret: Some(onboarding_secret),
+            create_new: false,
         })
         .send()
         .await
@@ -1043,6 +1060,7 @@ async fn refuses_local_registration() {
         ))
         .json(&RegisterUserRequest {
             onboarding_secret: None,
+            create_new: false,
         })
         .send()
         .await
@@ -1060,6 +1078,7 @@ async fn register_status(node: &TestNode, oidc_token: &str, onboarding_secret: &
         .bearer_auth(oidc_token)
         .json(&RegisterUserRequest {
             onboarding_secret: Some(onboarding_secret.to_string()),
+            create_new: false,
         })
         .send()
         .await
@@ -1564,6 +1583,7 @@ async fn registered_user_token() {
         .bearer_auth(&oidc_token)
         .json(&RegisterUserRequest {
             onboarding_secret: None,
+            create_new: false,
         })
         .send()
         .await

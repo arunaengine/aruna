@@ -18,7 +18,9 @@ use aruna_net::streams::BiStream;
 use tracing::{Span, field};
 
 use super::effects::metadata_read_error;
-use super::peer_auth::{bucket_search_auth, config_digest_matches, release_auth};
+use super::peer_auth::{
+    bucket_search_auth, config_digest_matches, release_auth, search_reader_auth,
+};
 use super::query::query_local_graphs;
 use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
@@ -433,7 +435,7 @@ impl MetadataHandle {
                 database,
             } => {
                 Box::pin(async {
-                    match bucket_search_auth(
+                    match search_reader_auth(
                         &self.inner.auth_validation,
                         &self.inner.storage_handle,
                         peer,

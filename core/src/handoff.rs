@@ -9,7 +9,7 @@ use ulid::Ulid;
 
 use crate::UserId;
 use crate::federation::{
-    FederationError, FederationSettings, MAX_NAME_LEN, RealmDescriptor, Signable, Signed,
+    FederationError, FederationSettings, Layout, MAX_NAME_LEN, RealmDescriptor, Signable, Signed,
     valid_federation_url,
 };
 use crate::structs::identity::realm::RealmId;
@@ -66,10 +66,16 @@ pub enum HandoffError {
     NameTooLong,
 }
 
-/// Hex SHA-256 over the postcard encoding of the signed descriptor.
+/// Hex SHA-256 over the postcard encoding of the signed descriptor, in the older layout when
+/// only that verifies, so nodes from before the newer descriptor facts compute the same digest.
 pub fn descriptor_digest(descriptor: &Signed<RealmDescriptor>) -> Result<String, FederationError> {
-    let bytes = postcard::to_allocvec(descriptor)
-        .map_err(|error| FederationError::Encoding(error.to_string()))?;
+    let realm_id = descriptor.payload.realm_id;
+    let older = descriptor.verified_layout(&realm_id) == Ok(Layout::Older);
+    let bytes = match descriptor.factless().filter(|_| older) {
+        Some(factless) => postcard::to_allocvec(&factless),
+        None => postcard::to_allocvec(descriptor),
+    }
+    .map_err(|error| FederationError::Encoding(error.to_string()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
@@ -187,10 +193,15 @@ mod tests {
             description: String::new(),
             api_url: url("https://b.example.org/api/v1"),
             portal_url: url("https://b.example.org"),
+            contact: None,
+            login_providers: Vec::new(),
             issued_at,
         };
         FederationSettings {
             name: descriptor.name.clone(),
+            description: String::new(),
+            contact: None,
+            login_providers: Vec::new(),
             api_url: descriptor.api_url.clone(),
             portal_url: descriptor.portal_url.clone(),
             registry_url: None,

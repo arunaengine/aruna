@@ -2,11 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aruna_core::telemetry::duration_ms;
 use fjall::{
@@ -16,6 +17,9 @@ use tracing::{debug, warn};
 
 pub(crate) const DELETE_THRESHOLD: u64 = 5_000;
 pub(crate) const MAX_KEYSPACE_BYTES: u64 = 256 * 1024 * 1024;
+/// Least time between two compactions of one keyspace. Each flushes its memtable while every
+/// commit waits, so a queue that deletes thousands of rows a second must not compact each time.
+pub(crate) const COMPACT_INTERVAL: Duration = Duration::from_secs(60);
 /// Key a checkpoint writes back unchanged, or removes while it is absent.
 const CHECKPOINT: &[u8] = b"\xffcheckpoint";
 /// Journal count that calls for a sweep, about twice Fjall's own 512 MiB journal limit.
@@ -36,19 +40,107 @@ pub(crate) struct Compactor {
     pub(crate) stopping: Arc<AtomicBool>,
 }
 
+/// Keeps the compactions of one keyspace an interval apart, from the end of one to the start of
+/// the next. Work that comes sooner waits, merged per keyspace; sweeps never wait.
+pub(crate) struct Spacing {
+    interval: Duration,
+    /// When the last compaction of each keyspace ended.
+    last: HashMap<String, Instant>,
+    waiting: HashMap<String, CompactionJob>,
+}
+
+impl Spacing {
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: HashMap::new(),
+            waiting: HashMap::new(),
+        }
+    }
+
+    fn due_at(&self, key_space: &str) -> Option<Instant> {
+        self.last.get(key_space).map(|last| *last + self.interval)
+    }
+
+    /// The job to run now, or `None` when it waits for its keyspace's interval.
+    pub(crate) fn offer(&mut self, job: CompactionJob, now: Instant) -> Option<CompactionJob> {
+        if job.key_space == SWEEP {
+            return Some(job);
+        }
+        if let Some(waiting) = self.waiting.get_mut(&job.key_space) {
+            waiting.deletes = waiting.deletes.saturating_add(job.deletes);
+            return None;
+        }
+        if self.due_at(&job.key_space).is_some_and(|due| now < due) {
+            self.waiting.insert(job.key_space.clone(), job);
+            return None;
+        }
+        Some(job)
+    }
+
+    /// The waiting jobs whose interval has passed at `now`.
+    pub(crate) fn due(&mut self, now: Instant) -> Vec<CompactionJob> {
+        let ready: Vec<String> = (self.waiting.keys())
+            .filter(|key_space| self.due_at(key_space).is_none_or(|due| due <= now))
+            .cloned()
+            .collect();
+        (ready.iter())
+            .filter_map(|key_space| self.waiting.remove(key_space))
+            .collect()
+    }
+
+    /// When the first waiting job becomes due; `None` while nothing waits.
+    pub(crate) fn next_due(&self) -> Option<Instant> {
+        (self.waiting.keys())
+            .filter_map(|key_space| self.due_at(key_space))
+            .min()
+    }
+
+    /// Notes that a compaction of `key_space` ended at `now`.
+    pub(crate) fn finished(&mut self, key_space: &str, now: Instant) {
+        if key_space != SWEEP {
+            self.last.insert(key_space.to_string(), now);
+        }
+    }
+}
+
 impl Compactor {
     pub(crate) fn spawn() -> Self {
+        Self::spaced(COMPACT_INTERVAL)
+    }
+
+    /// A compactor whose thread keeps compactions of one keyspace `interval` apart.
+    pub(crate) fn spaced(interval: Duration) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel::<CompactionJob>();
         let active = Arc::new(Mutex::new(HashSet::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let running = active.clone();
         let stop = stopping.clone();
         let thread = thread::spawn(move || {
-            while let Ok(job) = receiver.recv() {
-                if stop.load(Ordering::Acquire) {
-                    break;
+            let mut spacing = Spacing::new(interval);
+            loop {
+                // Waiting work wakes the thread once due, even if no other job arrives.
+                let received = match spacing.next_due() {
+                    Some(due) => {
+                        receiver.recv_timeout(due.saturating_duration_since(Instant::now()))
+                    }
+                    None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                };
+                let offered = match received {
+                    Ok(job) => Some(job),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+                let now = Instant::now();
+                let ready = offered.and_then(|job| spacing.offer(job, now));
+                for job in ready.into_iter().chain(spacing.due(now)) {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let key_space = job.key_space.clone();
+                    run_job(job, &running);
+                    spacing.finished(&key_space, Instant::now());
                 }
-                run_job(job, &running);
             }
         });
         Self {
@@ -79,8 +171,10 @@ impl Compactor {
         }
     }
 
+    /// Hands a keyspace's compaction to the thread, which runs it once its interval allows; a
+    /// compaction of the keyspace that has not started yet covers these deletes as well.
     pub(crate) fn submit(
-        &self,
+        &mut self,
         key_space: &str,
         deletes: u64,
         db: OptimisticTxDatabase,
@@ -230,10 +324,89 @@ pub(crate) fn run_job(job: CompactionJob, active: &Arc<Mutex<HashSet<String>>>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        CompactionJob, Compactor, DELETE_THRESHOLD, JOURNAL_LIMIT, MAX_KEYSPACE_BYTES, compactable,
-        sweep_due,
+        CompactionJob, Compactor, DELETE_THRESHOLD, JOURNAL_LIMIT, MAX_KEYSPACE_BYTES, SWEEP,
+        Spacing, compactable, sweep_due,
     };
     use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    fn job(key_space: &str, deletes: u64) -> CompactionJob {
+        CompactionJob {
+            key_space: key_space.to_string(),
+            deletes,
+            run: Box::new(|| Ok(())),
+        }
+    }
+
+    // Work that comes within the interval waits, merged per keyspace, and is due once the
+    // interval passed; other keyspaces and sweeps do not wait.
+    #[test]
+    fn waiting_work_due() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut spacing = Spacing::new(Duration::from_secs(60));
+        let first = spacing.offer(job("queue", 5_000), at(0));
+        spacing.finished(&first.expect("the first runs at once").key_space, at(0));
+
+        assert!(spacing.offer(job("queue", 5_000), at(10)).is_none());
+        assert!(spacing.offer(job("queue", 3_000), at(20)).is_none());
+        assert!(spacing.offer(job("other", 1), at(20)).is_some());
+        assert!(spacing.offer(job(SWEEP, 0), at(20)).is_some());
+        assert_eq!(spacing.next_due(), Some(at(60)));
+        assert!(spacing.due(at(59)).is_empty());
+        let due = spacing.due(at(60));
+        let due: Vec<_> = due
+            .iter()
+            .map(|job| (job.key_space.as_str(), job.deletes))
+            .collect();
+        assert_eq!(due, [("queue", 8_000)]);
+        assert_eq!(spacing.next_due(), None);
+    }
+
+    // A compaction that ran long, or started late behind another keyspace, is followed by the
+    // next one only an interval after it ended.
+    #[test]
+    fn spaced_from_end() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut spacing = Spacing::new(Duration::from_secs(60));
+        assert!(spacing.offer(job("queue", 1), at(0)).is_some());
+        spacing.finished("queue", at(100));
+
+        assert!(spacing.offer(job("queue", 1), at(110)).is_none());
+        assert_eq!(spacing.next_due(), Some(at(160)));
+        assert!(spacing.due(at(159)).is_empty());
+        assert_eq!(spacing.due(at(160)).len(), 1);
+    }
+
+    // The thread runs waiting work once its interval passed, though no further job arrives.
+    #[test]
+    fn deferred_job_runs() {
+        let mut compactor = Compactor::spaced(Duration::from_millis(20));
+        let sender = compactor.sender.clone().expect("compactor accepts jobs");
+        let (ran, runs) = std::sync::mpsc::channel();
+        for deletes in [1, 2] {
+            let ran = ran.clone();
+            let run = Box::new(move || {
+                ran.send(deletes).expect("test receives the run");
+                Ok(())
+            });
+            let key_space = "queue".to_string();
+            let job = CompactionJob {
+                key_space,
+                deletes,
+                run,
+            };
+            sender.send(job).expect("job is queued");
+        }
+        // No job follows the second.
+        drop(sender);
+        // The caps only detect a job that never runs.
+        let cap = Duration::from_secs(60);
+        assert_eq!(runs.recv_timeout(cap), Ok(1));
+        assert_eq!(runs.recv_timeout(cap), Ok(2));
+        compactor.shutdown();
+    }
 
     #[test]
     fn size_gate() {

@@ -4698,3 +4698,79 @@ async fn lookup_hides_private() {
         ])
     );
 }
+
+#[tokio::test]
+async fn negotiates_bare_crate() {
+    // A client asking for JSON-LD gets the crate itself; others keep the wrapper object.
+    use axum::http::{HeaderMap, HeaderValue, header};
+    let test = setup_state().await;
+    let link = "https://example.org/negotiated/";
+    let document_id = crate::tests::datasets::describe(&test, "negotiated", true, link).await;
+    let export = |accept: &'static str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
+        negotiated_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Extension(None),
+            headers,
+            Path(document_id.to_string()),
+            Query(RoCrateExportParams {
+                view: None,
+                limit: None,
+                offset: None,
+                after: None,
+                here: false,
+            }),
+        )
+    };
+    let read = |response: axum::response::Response| async move {
+        let typed = response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (typed, serde_json::from_slice::<Value>(&body).unwrap())
+    };
+    let (typed, bare) = read(export("application/ld+json").await.unwrap()).await;
+    assert_eq!(typed, "application/ld+json");
+    assert!(bare.get("@graph").is_some(), "{bare}");
+    let (typed, wrapped) = read(export("application/json").await.unwrap()).await;
+    assert_eq!(typed, "application/json");
+    assert!(wrapped["rocrate"].get("@graph").is_some(), "{wrapped}");
+}
+
+#[tokio::test]
+async fn visitor_lists_public() {
+    // Signed out, the realm-wide list in recent order pages through public datasets only.
+    use crate::tests::datasets::describe;
+    let test = setup_state().await;
+    let first = describe(&test, "visible/one", true, "https://example.org/one/").await;
+    describe(&test, "hidden/two", false, "https://example.org/two/").await;
+    let second = describe(&test, "visible/three", true, "https://example.org/three/").await;
+    let page = |offset| {
+        list_all_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Query(ListMetadataQuery {
+                limit: Some(1),
+                offset: Some(offset),
+                order: Some("recent".to_string()),
+                ..Default::default()
+            }),
+        )
+    };
+    let mut seen = Vec::new();
+    for offset in 0..3 {
+        let (_, Json(listed)) = page(offset).await.unwrap();
+        seen.extend(
+            listed
+                .documents
+                .into_iter()
+                .map(|document| document.document_id),
+        );
+    }
+    assert_eq!(seen, vec![second.to_string(), first.to_string()]);
+}

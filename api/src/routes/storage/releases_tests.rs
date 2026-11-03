@@ -441,10 +441,11 @@ async fn purge_keeps_pinned() {
         "a folder holding the release"
     );
     assert_eq!(purge(folder("other/")).await, Ok(()));
+    // The whole bucket holds the release, so its purge is refused alike.
     let bucket = StoragePurgeScope::Bucket {
         bucket: BUCKET.to_string(),
     };
-    assert_eq!(purge(bucket).await, Ok(()));
+    assert_eq!(purge(bucket).await, Err(PinnedError::Scope));
 
     let submitted = submit_purge(
         State(node.state.clone()),

@@ -372,12 +372,14 @@ fn page_registers_atomically() {
     assert_eq!(result.checkpoint.items_succeeded, 2);
 }
 
-// An imported version records its external source as its origin.
+// An imported version records its external source and its import job as its origin.
 #[test]
 fn origin_marks_source() {
     use aruna_core::structs::storage::blob::BlobVersion;
     use aruna_core::structs::storage::origin::VersionOrigin;
-    let mut operation = PageImportOperation::new(input(vec![entry("a")]));
+    let input = input(vec![entry("a")]);
+    let job_id = Some(input.job_id.as_ulid());
+    let mut operation = PageImportOperation::new(input);
 
     let writes = run_to_writes(&mut operation, vec![None], None);
 
@@ -385,7 +387,7 @@ fn origin_marks_source() {
         .find(|(space, ..)| space == BLOB_VERSIONS_KEYSPACE)
         .unwrap();
     let version = BlobVersion::from_bytes(value).unwrap();
-    assert_eq!(version.origin, Some(VersionOrigin::Source));
+    assert_eq!(version.origin, Some(VersionOrigin::Source { job_id }));
 }
 
 #[test]
@@ -416,6 +418,65 @@ fn replay_counts_once() {
     );
     let result = operation.finalize().unwrap();
     assert_eq!((result.registered, result.unchanged), (0, 1));
+}
+
+/// Prepares the rows of `entries` in a read snapshot where no key has a head yet.
+fn prepare(entries: Vec<PageEntry>) -> PreparedRows {
+    let heads = entries.iter().map(|_| None).collect();
+    let mut operation = PreparePageOperation::new(input(entries));
+    assert!(matches!(
+        operation.start().as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction {
+            read: true
+        })]
+    ));
+    operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: txn(),
+    }));
+    operation.step(guards(None, &record(token())));
+    answer_heads(&mut operation.0, heads);
+    operation.step(relationships(1));
+    // The snapshot ends without a write.
+    assert!(matches!(
+        operation.step(no_secret()).as_slice(),
+        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+    ));
+    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id: txn(),
+    }));
+    operation.finalize().unwrap()
+}
+
+// Rows prepared before the turn are written when the transaction reads what they were built
+// from; a head written meanwhile has the page build its rows anew.
+#[test]
+fn prepared_rows_checked() {
+    let entries = vec![entry("a"), entry("b")];
+    let prepared = prepare(entries.clone());
+    let expected = prepared.rows.writes.clone();
+    let mut operation =
+        PageImportOperation::new(input(entries.clone())).with_prepared(Some(prepared));
+    assert_eq!(
+        run_to_writes(&mut operation, vec![None, None], None),
+        expected
+    );
+
+    let prepared = prepare(entries.clone());
+    let expected = prepared.rows.writes.clone();
+    let mut operation = PageImportOperation::new(input(entries)).with_prepared(Some(prepared));
+    let other = reference("data/x", observation("x"), false);
+    let heads = vec![head(Ulid::from_parts(JOB_CREATED_MS - 5, 1)), None];
+    let writes = run_to_writes(&mut operation, heads, Some(vec![other]));
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 2);
+    let versions = |writes: &[(KeySpace, Key, Value)]| -> Vec<Key> {
+        let rows = writes
+            .iter()
+            .filter(|(space, ..)| space == BLOB_VERSIONS_KEYSPACE);
+        rows.map(|(_, key, _)| key.clone()).collect()
+    };
+    // Every version is minted anew, none taken from the stale preparation.
+    let stale = versions(&expected);
+    assert!(versions(&writes).iter().all(|key| !stale.contains(key)));
 }
 
 #[test]

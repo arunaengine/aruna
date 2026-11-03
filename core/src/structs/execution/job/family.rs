@@ -518,6 +518,9 @@ pub enum CancelAuthority {
     /// The publishing node checked cancel permission on the stored group when it
     /// published the record, and its envelope signature is that statement.
     GroupAdmin,
+    /// The stored submitter deleted the finished run; every holder rechecks this and then
+    /// answers the run as absent.
+    Deletion,
 }
 
 /// Replicated cancellation intent for one `(submission_id, request_digest)`
@@ -1341,10 +1344,12 @@ impl JobRecordEnvelope {
             return Err(JobRecordError::Unauthorized);
         }
         match cancel.authority {
-            CancelAuthority::Submitter => match cancel.requested_by == spec.created_by {
-                true => Ok(RecordVerdict::Authentic),
-                false => Err(JobRecordError::Unauthorized),
-            },
+            CancelAuthority::Submitter | CancelAuthority::Deletion => {
+                match cancel.requested_by == spec.created_by {
+                    true => Ok(RecordVerdict::Authentic),
+                    false => Err(JobRecordError::Unauthorized),
+                }
+            }
             // The publishing holder's signature is its statement that it checked
             // group cancel permission; the payload field alone grants nothing.
             CancelAuthority::GroupAdmin => Ok(RecordVerdict::Authentic),

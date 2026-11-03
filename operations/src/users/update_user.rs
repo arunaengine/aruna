@@ -19,6 +19,7 @@ use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
     sync_revision_entry, sync_revision_key,
 };
+use aruna_core::storage_entries::{subject_index_key, subject_index_value};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
@@ -27,10 +28,13 @@ use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis as current_timestamp_ms;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId};
 use aruna_core::user::validation::{
-    UserAttributeError, is_reserved_attribute, validate_attribute_count, validate_attribute_key,
-    validate_attribute_value,
+    UserAttributeError, counted_attributes, is_reserved_attribute, validate_attribute_count,
+    validate_attribute_key, validate_attribute_value,
 };
-use aruna_core::{DOCUMENT_STATE_KEYSPACE, SYNC_REVISION_KEYSPACE, USER_KEYSPACE};
+use aruna_core::{
+    DOCUMENT_STATE_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
+    SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
+};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -59,6 +63,8 @@ pub struct UpdateUserInput {
     pub system: bool,
     /// Links or unlinks a login of another realm, with its ownership claims in the same commit.
     pub alias: Option<AliasChange>,
+    /// Attaches a new sign-in subject key with its index entry; only system callers do.
+    pub subject: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +167,8 @@ pub enum UpdateUserError {
     AliasNotAdmitted,
     #[error("the login was cut off after it was confirmed")]
     AliasCutOff,
+    #[error("the sign-in already belongs to another account")]
+    SubjectClaimed,
     #[error(transparent)]
     AuthorizationError(#[from] AuthorizationError),
     #[error(transparent)]
@@ -328,6 +336,13 @@ impl UpdateUserOperation {
                 let key = aruna_core::link::alias_claims_key(&change.alias());
                 (FEDERATION_KEYSPACE.to_string(), ByteView::from(key))
             }))
+            .chain(self.input.subject.iter().flat_map(|subject| {
+                let key = subject_index_key(subject);
+                [
+                    (SUBJECT_CLAIMS_KEYSPACE.to_string(), key.clone()),
+                    (SUBJECT_INDEX_KEYSPACE.to_string(), key),
+                ]
+            }))
             .collect(),
             txn_id: Some(txn_id),
         })]
@@ -352,14 +367,14 @@ impl UpdateUserOperation {
             );
         };
 
-        let claims = claims.first().and_then(|(_, value)| value.clone());
+        let claims = claims.to_vec();
         match self.emit_write_user(
             txn_id,
             user_value.clone(),
             reducer_state_value.clone(),
             revision_value.clone(),
             realm_config_value.clone(),
-            claims,
+            &claims,
         ) {
             Ok(effects) => effects,
             Err(error) => self.fail(error),
@@ -373,8 +388,10 @@ impl UpdateUserOperation {
         reducer_state_value: Option<ByteView>,
         revision_value: Option<ByteView>,
         realm_config_value: Option<ByteView>,
-        claims_value: Option<ByteView>,
+        extra: &[(ByteView, Option<ByteView>)],
     ) -> Result<Effects, UpdateUserError> {
+        let (alias_rows, subject_rows) = extra.split_at(usize::from(self.input.alias.is_some()));
+        let claims_value = alias_rows.first().and_then(|(_, value)| value.clone());
         let current = user_value.ok_or(UpdateUserError::UserNotFound)?;
         let mut user = User::from_bytes(&current)?;
         if Some(user.user_id) != self.target_user_id {
@@ -421,7 +438,20 @@ impl UpdateUserOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(admin_target));
-        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
+        let mut admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
+        let subject_claims = match self.input.subject.as_ref() {
+            Some(_) if !self.input.system => return Err(UpdateUserError::Unauthorized),
+            Some(subject) => attach_subject(&mut user, subject, subject_rows)?,
+            None => None,
+        };
+        if let (Some(subject), Some(_)) = (self.input.subject.as_ref(), subject_claims.as_ref()) {
+            admin_events.push(reducer_state.apply_operation(
+                &self.input.actor,
+                AdminDocumentOperation::SubjectIdAdded {
+                    subject_id: subject.clone(),
+                },
+            )?);
+        }
         let previous_document_revision = revision_value
             .as_ref()
             .map(|value| {
@@ -473,6 +503,20 @@ impl UpdateUserOperation {
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
+        if let (Some(subject), Some(claims)) = (self.input.subject.as_ref(), subject_claims) {
+            let key = subject_index_key(subject);
+            let value = postcard::to_allocvec(&claims).map_err(ConversionError::from)?;
+            writes.push((
+                SUBJECT_CLAIMS_KEYSPACE.to_string(),
+                key.clone(),
+                value.into(),
+            ));
+            writes.push((
+                SUBJECT_INDEX_KEYSPACE.to_string(),
+                key,
+                subject_index_value(user.user_id),
+            ));
+        }
         if let (Some(change), Some(claims)) = (self.input.alias, claims) {
             let key = ByteView::from(aruna_core::link::alias_claims_key(&change.alias()));
             if claims.is_empty() {
@@ -741,7 +785,7 @@ impl Operation for UpdateUserOperation {
     }
 }
 
-fn local_sync_change(
+pub(crate) fn local_sync_change(
     previous_change: Option<&DocumentChange>,
     actor: &Actor,
     placement: PlacementRef,
@@ -883,6 +927,34 @@ fn apply_alias(
     Ok(claims)
 }
 
+/// Adds `subject` to the account and returns its new claims, or `None` when it already belongs
+/// to the account. A subject any other account claims is refused.
+fn attach_subject(
+    user: &mut User,
+    subject: &str,
+    rows: &[(ByteView, Option<ByteView>)],
+) -> Result<Option<BTreeSet<UserId>>, UpdateUserError> {
+    let [(_, claims), (_, index)] = rows else {
+        return Err(UpdateUserError::SubjectClaimed);
+    };
+    let claims = match (claims, index) {
+        (Some(bytes), _) => {
+            postcard::from_bytes::<BTreeSet<UserId>>(bytes).map_err(ConversionError::from)?
+        }
+        (None, Some(bytes)) => BTreeSet::from([UserId::from_storage_key(bytes)?]),
+        (None, None) => BTreeSet::new(),
+    };
+    // A repeat leaves the account unchanged, whatever stale claim another node's merge left.
+    if user.subject_ids.iter().any(|known| known == subject) {
+        return Ok(None);
+    }
+    if claims.iter().any(|owner| *owner != user.user_id) {
+        return Err(UpdateUserError::SubjectClaimed);
+    }
+    user.subject_ids.push(subject.to_string());
+    Ok(Some(BTreeSet::from([user.user_id])))
+}
+
 fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateUserError> {
     if let Some(name) = input.name.as_ref() {
         let trimmed = name.trim();
@@ -917,7 +989,7 @@ fn apply_updates(user: &mut User, input: &UpdateUserInput) -> Result<(), UpdateU
         user.attributes.insert(key.clone(), value.clone());
     }
 
-    validate_attribute_count(user.attributes.len())?;
+    validate_attribute_count(counted_attributes(user.attributes.keys()))?;
 
     Ok(())
 }
@@ -982,6 +1054,7 @@ mod pure_tests {
             remove_attributes: vec!["old".to_string()],
             system: false,
             alias: None,
+            subject: None,
         }
     }
 
@@ -1068,6 +1141,26 @@ mod pure_tests {
             revocation_floor: 0,
             revocation_next_expiry: None,
         }
+    }
+
+    #[test]
+    fn stale_claim_ignored() {
+        // A merge elsewhere may leave the merged account's claim here for a while.
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let owner = UserId::local(Ulid::from_bytes([4u8; 16]), realm_id);
+        let merged = UserId::local(Ulid::from_bytes([5u8; 16]), realm_id);
+        let mut user = stored_user(owner);
+        user.subject_ids.push("subject".to_string());
+        let claims = postcard::to_allocvec(&BTreeSet::from([owner, merged])).unwrap();
+        let rows = [
+            (ByteView::from(Vec::new()), Some(ByteView::from(claims))),
+            (ByteView::from(Vec::new()), None),
+        ];
+        assert_eq!(super::attach_subject(&mut user, "subject", &rows), Ok(None));
+        assert_eq!(
+            super::attach_subject(&mut user, "other", &rows),
+            Err(UpdateUserError::SubjectClaimed)
+        );
     }
 
     #[test]

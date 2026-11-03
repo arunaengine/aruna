@@ -617,6 +617,7 @@ async fn relayed_bounds(
     description = r#"Returns one page of a bucket's current objects in key order, with size, ETag, last change, content type and content address.
 
 **Authentication**: realm bearer token with READ on the bucket, or on the prefix it lists.
+Without a token, READ granted by public roles applies, and a refusal answers 401.
 
 **Behavior**
 - `prefix` narrows the keys; `delimiter` groups keys below the prefix into `prefixes`.
@@ -656,12 +657,12 @@ async fn relayed_bounds(
             })
         ),
         (status = 400, description = "Invalid cursor or range bounds", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 401, description = "Invalid bearer token, or no public READ without one", body = ErrorResponse),
         (status = 403, description = "No READ on the bucket or the listed prefix", body = ErrorResponse),
         (status = 404, description = "No such bucket", body = ErrorResponse),
         (status = 503, description = "A key range of a distributed bucket had no reachable holder", body = ErrorResponse)
     ),
-    security(("bearer_auth" = []))
+    security(("bearer_auth" = []), ())
 )]
 pub async fn list_objects(
     State(state): State<Arc<ServerState>>,
@@ -671,16 +672,25 @@ pub async fn list_objects(
     Path(bucket): Path<String>,
     Query(query): Query<ObjectListQuery>,
 ) -> ServerResult<Json<ObjectListResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
+    // Signed out, only public roles grant READ, and a refusal hides whether the bucket exists.
+    let signed_out = auth.is_none();
+    let auth = auth.unwrap_or_else(|| AuthContext::anonymous(state.get_realm_id()));
+    let auth = require_realm_auth(&state, Some(auth))?;
+    let hidden = |error| match error {
+        ServerError::NotFound | ServerError::Forbidden if signed_out => ServerError::Unauthorized,
+        error => error,
+    };
     let expiry = bearer.as_ref().map_or(0, ValidatedBearer::expires_at_secs);
-    let info = bucket_info(&state, &bucket).await?;
+    let info = bucket_info(&state, &bucket).await.map_err(hidden)?;
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     // READ on the browsed prefix suffices, as for the group's data paths.
     let path = match query.prefix.as_deref().filter(|prefix| !prefix.is_empty()) {
         Some(prefix) => object_permission_path(realm_id, info.group_id, node_id, &bucket, prefix),
         None => bucket_permission_path(realm_id, info.group_id, node_id, &bucket),
     };
-    ensure_permission(&state, &auth, path, Permission::READ).await?;
+    ensure_permission(&state, &auth, path, Permission::READ)
+        .await
+        .map_err(hidden)?;
     // A start key resumes like a cursor after that key, past the whole common prefix it names.
     let start = (query.start_after.clone().filter(|key| !key.is_empty()))
         .map(|key| {

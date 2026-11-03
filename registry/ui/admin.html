@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Aruna realm registry admin</title>
+  <link rel="stylesheet" href="/admin/admin.css">
+  <script src="/admin/admin.js" defer></script>
+</head>
+<body>
+  <header class="bar">
+    <div>
+      <h1>Realm registry</h1>
+      <p class="tagline">aruna data orchestration engine</p>
+    </div>
+    <div class="bar-actions">
+      <span id="who" class="muted"></span>
+      <button id="theme" type="button" class="ghost" title="Switch light and dark">Theme</button>
+      <button id="signout" type="button" class="ghost" hidden>Sign out</button>
+    </div>
+  </header>
+  <main>
+    <section id="signin" class="card narrow" hidden>
+      <h2>Sign in</h2>
+      <p class="muted">Enter the registry admin token. It stays in this browser tab only.</p>
+      <form id="signin-form">
+        <label for="token">Admin token</label>
+        <input id="token" type="password" autocomplete="off" required>
+        <button type="submit" class="primary">Sign in</button>
+      </form>
+    </section>
+    <p id="message" class="message" role="status" hidden></p>
+    <section id="realms" hidden>
+      <div class="toolbar">
+        <h2>Realms</h2>
+        <label class="inline"><input id="show-all" type="checkbox"> Show hidden, retired and expired</label>
+        <button id="reload" type="button" class="ghost">Reload</button>
+      </div>
+      <div id="list"></div>
+    </section>
+  </main>
+</body>
+</html>

@@ -479,7 +479,7 @@ pub async fn load_direct_inputs(
 /// back, so a public source is named by its URL; without its root it stays unnamed.
 async fn serving_pin(context: &DriverContext, source: VersionSourceBinding) -> SourcePin {
     let Some(digest) = source.descriptor.root else {
-        return SourcePin::of(&source.descriptor);
+        return SourcePin::served(&source.descriptor);
     };
     let event = context
         .storage_handle
@@ -492,7 +492,7 @@ async fn serving_pin(context: &DriverContext, source: VersionSourceBinding) -> S
     if full.is_none() {
         warn!("The source root of a served input is missing; its pin names no URL");
     }
-    SourcePin::of(&full.unwrap_or(source).descriptor)
+    SourcePin::served(&full.unwrap_or(source).descriptor)
 }
 
 /// Keeps which source delivered each staged reference input of this preparation, for the run
@@ -1072,6 +1072,7 @@ async fn put_file_output(
     .with_version_origin(Some(
         aruna_core::structs::storage::origin::VersionOrigin::Job {
             run_id: ulid::Ulid::from_bytes(record.job_id.to_bytes()),
+            started_by: Some(record.created_by).filter(|user| !user.is_nil()),
         },
     ));
     if let Some(gate) = gate {
