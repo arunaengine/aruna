@@ -18,13 +18,6 @@ ignore = [
     "RUSTSEC-2026-0194", # quick-xml quadratic parse via RDF stack (upstream craqle)
     "RUSTSEC-2026-0195", # quick-xml namespace allocation via RDF stack (upstream craqle)
     "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained via rudof_rdf/tabled (upstream craqle)
-    # Yanked; via ro-crate-rs (craqle) and the utoipa-swagger-ui build script, no zip 9 upstream yet
-    { crate = "zip@8.6.0", reason = "yanked; waiting for upstream to move to zip 9" },
-    # zip 8 extract() advisories; ro-crate-rs and utoipa-swagger-ui never call extract()
-    "RUSTSEC-2026-0367", # zip extract keeps SUID/SGID bits
-    "RUSTSEC-2026-0368", # zip extract creates symlinks outside the target
-    "RUSTSEC-2026-0369", # zip extract applies permissions through symlinks
-    "RUSTSEC-2026-0429", # zip extract aborts on a large symlink entry; ro-crate-rs only, zip 9 pending
 ]
 
 [licenses]

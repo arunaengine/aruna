@@ -637,7 +637,8 @@ mod tests {
         let max = aruna_core::federation::MAX_TOTAL;
         let large = send_totals(&state, realm_id(), signed_totals(realm_id(), max + 1, now)).await;
         assert!(matches!(large, Err(RegistryError::BadTotals(_))));
-        let future = now + crate::store::MAX_FUTURE_SECS + 1;
+        // The handler reads the clock later, so stay far beyond the limit on slow runs.
+        let future = now + crate::store::MAX_FUTURE_SECS + 3600;
         let ahead = send_totals(&state, realm_id(), signed_totals(realm_id(), 5, future)).await;
         assert!(matches!(
             ahead,
