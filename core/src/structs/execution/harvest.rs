@@ -4,6 +4,7 @@
 
 use crate::UserId;
 use crate::errors::ConversionError;
+use crate::structs::execution::job::JobId;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -201,6 +202,8 @@ pub struct HarvestSource {
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     pub created_by: UserId,
+    /// The run started last, recorded with its job so one source never runs twice at once.
+    pub last_job: Option<JobId>,
 }
 
 impl HarvestSource {
@@ -229,6 +232,7 @@ impl HarvestSource {
             created_at,
             updated_at: created_at,
             created_by,
+            last_job: None,
         }
     }
 
