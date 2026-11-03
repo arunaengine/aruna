@@ -1,3 +1,4 @@
+//! Tests table imports: row mapping, resumed and bad rows, comments, headers and bounds.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

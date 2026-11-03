@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn binds_tokens_and_views() {
+    fn tokens_and_views() {
         // A token and a view bucket belong to one run only.
         let token = encode_token("in-a", "db/sub/");
         assert_eq!(decode_token("in-a", &token).as_deref(), Some("db/sub/"));

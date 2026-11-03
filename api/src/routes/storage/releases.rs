@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, release_members};
-use aruna_operations::s3::bucket::release_publish::{
-    self, PublishError, PublishInput, ReleaseSpec,
+use aruna_operations::s3::bucket::release::publish::{
+    self as release_publish, PublishError, PublishInput, ReleaseSpec,
 };
+use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, release_members};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};

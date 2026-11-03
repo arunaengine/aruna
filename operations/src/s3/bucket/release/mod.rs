@@ -154,10 +154,9 @@ enum MembersState {
     Error,
 }
 
-/// Decides which releases pin the queried versions. Only a range's coordinator answers for it,
-/// since a copy may not have received a release yet: this node for the ranges it coordinates,
-/// the coordinator itself for the others, asked with the caller's bearer. A release crate
-/// counts only when the caller may read it and its exact version carries the release tag.
+/// Decides which releases pin the queried versions. Only a range's coordinator answers, since a
+/// copy may lack a release: this node for its ranges, others asked with the caller's bearer. A
+/// crate counts only when the caller may read it and its exact version carries the release tag.
 #[derive(Debug, PartialEq)]
 pub struct ReleaseMembersOperation {
     config: MembersConfig,
@@ -627,5 +626,4 @@ pub(crate) fn upstream_of(crate_json: &Value) -> Vec<Identifier> {
 }
 
 #[cfg(test)]
-#[path = "release_tests.rs"]
 mod tests;

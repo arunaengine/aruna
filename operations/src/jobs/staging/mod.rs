@@ -288,10 +288,9 @@ fn initial_checkpoint(spec: &StagingJobSpec) -> StagingJobCheckpoint {
     }
 }
 
-/// Where a job a range's new coordinator takes over goes on: the former job's position without
-/// its counters, errors or directory queue. A flat walk keeps its listing cursor and reads its
-/// manifest again; a manifest read, a table or a directory walk, whose queue stays behind, starts
-/// over.
+/// Where a job taken over by a range's new coordinator goes on: the former position without
+/// counters, errors or directory queue. A flat walk keeps its cursor and rereads its manifest;
+/// a manifest read, a table or a directory walk, whose queue stays behind, starts over.
 pub(crate) fn handed_checkpoint(
     spec: &StagingJobSpec,
     at: &StagingJobCheckpoint,

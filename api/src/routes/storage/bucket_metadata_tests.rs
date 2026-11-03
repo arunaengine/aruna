@@ -14,7 +14,7 @@ async fn put(node: &Node, body: serde_json::Value) -> ServerResult<BucketMetadat
         .header("content-type", "application/json")
         .body(axum::body::Body::from(body.to_string()))
         .unwrap();
-    let parsed = Json::<PutBucketMetadataRequest>::from_request(request, &()).await;
+    let parsed = Json::<PutMetadataRequest>::from_request(request, &()).await;
     put_bucket_metadata(
         State(node.state.clone()),
         Extension(Some(node.owner.clone())),

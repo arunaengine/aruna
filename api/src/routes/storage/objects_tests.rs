@@ -425,7 +425,7 @@ async fn hides_link_folders() {
 }
 
 #[tokio::test]
-async fn merged_passes_hidden_run() {
+async fn merges_past_hidden() {
     // A local range that starts with more hidden entries than one request examines goes on
     // from this member's sealed cursor inside the merged cursor, then on to the peer's range.
     use aruna_operations::s3::object::visible::SCAN_BUDGET;
@@ -510,7 +510,7 @@ async fn sealed_copy_page() -> (Node, String, String) {
 }
 
 #[tokio::test]
-async fn copy_cursor_names_copy() {
+async fn cursor_names_copy() {
     // A copy that sealed its range is named as a copy, so a member resuming there asks it as
     // one while the coordinator is down.
     let (_node, cursor, _) = sealed_copy_page().await;
