@@ -278,6 +278,9 @@ stays responsible for its own data.
   new container with the same `docker run` command as above.
 - **Local and NFS folders**: groups can import folders of the node in place. In a container, the
   folder must be mounted, and its path is the path inside the container.
+- **Release check**: `bash scripts/alpha_check.sh --image "$IMAGE"` installs an image on one host,
+  uses the API and S3, restarts the node and starts a new container on a copy of its data folder.
+  It needs `docker`, `curl` and `python3`.
 - **Realm registry**: a realm with public addresses lists itself in the global registry. Set
   `FEDERATION_REGISTRY_URL=` (empty) before the first start to opt out.
 
