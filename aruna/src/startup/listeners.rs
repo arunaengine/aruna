@@ -225,6 +225,12 @@ async fn bind_all(
 ) -> Result<ServerBindings, Box<dyn std::error::Error>> {
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
+    #[cfg(unix)]
+    crate::backup::serve(
+        std::path::Path::new(&config.storage_path),
+        &driver_ctx,
+        shutdown,
+    );
     let s3_timeouts = config.s3_timeouts();
     // A wildcard S3 bind already answers on the gateway, so it needs no second
     // listener. Session containers still target the gateway address.

@@ -92,6 +92,17 @@ pub struct StorageHandle {
     pub(super) worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     pub(super) secret_key: Arc<OnceLock<CredentialEncryptionKey>>,
     pub(super) vault_key: Arc<OnceLock<NodeVaultKey>>,
+    pub(super) database: Arc<OnceLock<OpenDatabase>>,
+}
+
+/// The opened node database; Fjall's handle has no `Debug`.
+#[derive(Clone)]
+pub(super) struct OpenDatabase(pub(super) fjall::Database);
+
+impl std::fmt::Debug for OpenDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpenDatabase")
+    }
 }
 
 #[derive(Debug)]
@@ -148,9 +159,16 @@ impl StorageHandle {
                 worker: Arc::new(Mutex::new(None)),
                 secret_key: Arc::new(OnceLock::new()),
                 vault_key: Arc::new(OnceLock::new()),
+                database: Arc::new(OnceLock::new()),
             },
             StorageReceivers { foreground, bulk },
         )
+    }
+
+    /// The opened node database, for consistent read snapshots such as live backups. `None`
+    /// on a handle without opened storage behind it.
+    pub fn database(&self) -> Option<fjall::Database> {
+        self.database.get().map(|database| database.0.clone())
     }
 
     /// New channels sharing this handle's metrics, for test proxies that forward effects to

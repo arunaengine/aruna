@@ -7,6 +7,8 @@
 #![allow(clippy::result_large_err)]
 
 pub mod application;
+#[cfg(unix)]
+pub mod backup;
 pub mod bootstrap;
 pub mod compute_setup;
 pub mod config;

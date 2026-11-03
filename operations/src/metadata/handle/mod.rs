@@ -471,6 +471,11 @@ impl std::fmt::Debug for MetadataHandle {
 }
 
 impl MetadataHandle {
+    /// The metadata store's Fjall database, for consistent read snapshots such as live backups.
+    pub fn store_database(&self) -> fjall::Database {
+        self.inner.node.store_database()
+    }
+
     pub fn new(
         path: impl AsRef<Path>,
         node_id: NodeId,

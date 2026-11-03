@@ -84,7 +84,7 @@ chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 # Pinned to craqle 0.3.2 main with Irokle 0.3.2; it resolves the irokle below.
-craqle = { git = "https://github.com/arunaengine/craqle", rev = "84bb30e394a04590b726f9eba04fbd5c59a33e79", features = [
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "e440ec277cb5d162837243f00f6536f58acf1080", features = [
     "iroh",
     "shacl-core",
 ] }
@@ -96,7 +96,7 @@ csv = "1.4.0"
 dirs = "7.0.0"
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "3.0.0", features = ["pem"] }
-fjall = "3.1.12"
+fjall = "3.1.13"
 flate2 = "1.1.10"
 futures = "0.3.34"
 futures-core = "0.3.34"
@@ -209,7 +209,7 @@ sysinfo = { version = "0.39.6", default-features = false, features = [
 ] }
 tar = "0.4.46"
 # The version craqle resolves, so one tantivy is compiled.
-tantivy = "0.26.2"
+tantivy = "0.27.0"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 thiserror-core = { package = "thiserror", version = "2.0.21", default-features = false }
