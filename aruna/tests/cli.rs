@@ -225,6 +225,34 @@ async fn data_round_trip() -> TestResult<()> {
 }
 
 #[tokio::test]
+async fn revokes_unusable_session() -> TestResult<()> {
+    let dir = tempfile::tempdir()?;
+    let config = dir.path().join("config");
+    let (seed, group, token) = signed_in(&config, "cli-revoke").await?;
+    let result = async {
+        // Without --s3-endpoint the session has no endpoint, so the CLI must revoke it.
+        let error = cli(&config, &["s3", "env", "--group", &group])
+            .await
+            .err()
+            .ok_or("s3 env worked without an S3 endpoint")?;
+        assert!(error.to_string().contains("s3 failed"), "{error}");
+        let listed: Value = reqwest::Client::new()
+            .get(format!("{}/api/v1/access/s3/sessions", seed.base_url))
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(listed["sessions"], serde_json::json!([]), "{listed}");
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test]
 async fn metadata_round_trip() -> TestResult<()> {
     let dir = tempfile::tempdir()?;
     let config = dir.path().join("config");

@@ -89,7 +89,13 @@ async fn request_session(
     let mut session: S3Session = api.send(Method::POST, "access/s3/sessions", &body).await?;
     session.endpoint = match session.issuer_node.s3_endpoint.clone() {
         Some(endpoint) => endpoint,
-        None => node_endpoint(api, fallback, &session.issuer_node.node_id).await?,
+        None => match node_endpoint(api, fallback, &session.issuer_node.node_id).await {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                revoke_session(api, &session).await;
+                return Err(error);
+            }
+        },
     };
     Ok(session)
 }
