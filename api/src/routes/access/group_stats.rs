@@ -5,7 +5,7 @@
 use crate::auth::{ensure_permission, parse_group_id, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::admin_tokens::TOKEN_PAGE;
-use crate::routes::access::groups::{ensure_group_admin, load_group};
+use crate::routes::access::groups::{PaginationParams, ensure_group_admin, load_group};
 use crate::routes::info::{GroupQuotaStatus, distinct_buckets, load_realm_usage};
 use crate::server::state::ServerState;
 use aruna_core::UserId;
@@ -23,7 +23,7 @@ use aruna_operations::groups::tokens::{GroupTokensError, TokenStatus};
 use aruna_operations::jobs::recent::RecentJobsOperation;
 use aruna_operations::node::usage_stats::RealmUsageScope;
 use aruna_operations::realm::get_config::GetConfigOperation;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -277,7 +277,12 @@ async fn active_tokens(
   any group's data.
 
 **Limits**
-- Groups are listed in group id order, up to 10,000."#,
+- Groups are listed in group id order, a page at a time: `offset` skips groups and `limit` sets
+  the page size. A page shorter than `limit` is the last one."#,
+    params(
+        ("limit" = Option<u32>, Query, description = "Maximum number of groups to return; defaults to 100 and is clamped to the range 1-1000"),
+        ("offset" = Option<u32>, Query, description = "Number of groups to skip from the start of the directory; defaults to 0")
+    ),
     responses(
         (status = 200, description = "Every group's statistics", body = GroupStatsList,
             example = json!({
@@ -303,10 +308,14 @@ async fn active_tokens(
 pub async fn list_group_statistics(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Query(page): Query<PaginationParams>,
 ) -> ServerResult<(StatusCode, Json<GroupStatsList>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
     ensure_permission(&state, &auth, realm_groups_path(&auth), Permission::WRITE).await?;
-    let groups = drive(ListGroupOperation::new(), &state.get_ctx())
+    let limit = page.limit_or(100).clamp(1, 1_000) as usize;
+    let offset = page.offset_or(0) as usize;
+    let groups = ListGroupOperation::with_pagination(limit, offset);
+    let groups = drive(groups, &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let context = stats_context(&state).await;

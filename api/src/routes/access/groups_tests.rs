@@ -760,20 +760,34 @@ async fn realm_admin_statistics() {
     };
     let (_, Json(single)) = stats(admin).await.unwrap();
     assert_eq!((single.members, single.admins), (1, 1));
-    let (_, Json(all)) =
-        list_group_statistics(State(state.clone()), Extension(Some(member_auth(admin))))
-            .await
-            .unwrap();
-    assert!(
-        all.groups
-            .iter()
-            .any(|group| group.group_id == group_id.to_string())
-    );
+    let overview = |user: UserId, offset: u32| {
+        list_group_statistics(
+            State(state.clone()),
+            Extension(Some(member_auth(user))),
+            Query(super::PaginationParams {
+                limit: Some(1),
+                offset: Some(offset),
+            }),
+        )
+    };
+    // One group per page: the two pages hold both groups, and the third is empty.
+    let second = seed_group(&state, owner).await;
+    let mut listed = Vec::new();
+    for offset in 0..3 {
+        let (_, Json(page)) = overview(admin, offset).await.unwrap();
+        assert_eq!(page.groups.len(), usize::from(offset < 2));
+        listed.extend(page.groups.into_iter().map(|group| group.group_id));
+    }
+    listed.sort();
+    let mut expected = vec![group_id.to_string(), second.to_string()];
+    expected.sort();
+    assert_eq!(listed, expected);
     // The group's own admin reads its statistics but not the realm overview.
     assert!(stats(owner).await.is_ok());
-    let overview =
-        list_group_statistics(State(state.clone()), Extension(Some(member_auth(owner)))).await;
-    assert!(matches!(overview, Err(ServerError::Forbidden)));
+    assert!(matches!(
+        overview(owner, 0).await,
+        Err(ServerError::Forbidden)
+    ));
     assert!(matches!(stats(outsider).await, Err(ServerError::Forbidden)));
 
     let node = state.get_node_id();
@@ -820,8 +834,13 @@ async fn policy_denies_admins() {
             Query(Default::default()),
         )
     };
-    let overview =
-        || list_group_statistics(State(state.clone()), Extension(Some(member_auth(admin))));
+    let overview = || {
+        list_group_statistics(
+            State(state.clone()),
+            Extension(Some(member_auth(admin))),
+            Query(Default::default()),
+        )
+    };
     let revoke_all = || {
         revoke_user_tokens(
             State(state.clone()),
