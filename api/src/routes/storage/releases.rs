@@ -20,7 +20,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::bucket_metadata::BucketIdentifierBody;
+use super::bucket::metadata::BucketIdentifierBody;
 use super::deletion::bucket_info;
 use super::relay::{relay_json, rest_target};
 use crate::auth::{ValidatedBearer, require_realm_auth};

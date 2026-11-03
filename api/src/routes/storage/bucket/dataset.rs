@@ -29,11 +29,11 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::bucket_metadata::{
+use super::super::deletion::bucket_info;
+use super::super::routing::ensure_group_admin;
+use super::metadata::{
     BucketIdentifierBody, BucketMetadataBody, DatasetDescriptionBody, write_metadata,
 };
-use super::deletion::bucket_info;
-use super::routing::ensure_group_admin;
 use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{forwarded_auth_token, local_write_record, run_create_metadata};
@@ -41,10 +41,10 @@ use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi()]
-pub struct BucketDatasetApiDoc;
+pub struct DatasetApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BucketDatasetApiDoc::openapi()).routes(routes!(describe_bucket))
+    OpenApiRouter::with_openapi(DatasetApiDoc::openapi()).routes(routes!(describe_bucket))
 }
 
 /// What the new dataset says about the bucket.
@@ -360,5 +360,5 @@ fn dataset_crate(
 }
 
 #[cfg(test)]
-#[path = "bucket_dataset_tests.rs"]
+#[path = "dataset_tests.rs"]
 mod tests;

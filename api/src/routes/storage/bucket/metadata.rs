@@ -25,9 +25,9 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::deletion::bucket_info;
-use super::distributed::map_create_error;
-use super::routing::ensure_group_admin;
+use super::super::deletion::bucket_info;
+use super::super::distributed::map_create_error;
+use super::super::routing::ensure_group_admin;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
@@ -369,5 +369,5 @@ pub async fn put_bucket_metadata(
 }
 
 #[cfg(test)]
-#[path = "bucket_metadata_tests.rs"]
+#[path = "metadata_tests.rs"]
 mod tests;

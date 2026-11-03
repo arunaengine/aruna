@@ -6,8 +6,6 @@
 pub mod abe;
 pub mod blobs;
 pub mod bucket;
-pub mod bucket_dataset;
-pub mod bucket_metadata;
 pub mod checks;
 pub mod compression;
 pub mod connectors;

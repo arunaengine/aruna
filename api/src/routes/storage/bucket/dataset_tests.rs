@@ -12,7 +12,7 @@ use axum::extract::FromRequest;
 
 use super::*;
 use crate::routes::metadata::tests::{TestState, drain_metadata_background, setup_network_state};
-use crate::routes::storage::bucket_metadata::get_bucket_metadata;
+use crate::routes::storage::bucket::metadata::get_bucket_metadata;
 
 const BUCKET: &str = "lab-db";
 
