@@ -12,12 +12,13 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{
     NodeCapabilities, PathRestriction, SessionKind, SessionRef,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::session::UserSession;
-use aruna_core::types::{Effects, TxnId};
+use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -101,6 +102,8 @@ pub struct CreateSessionOperation {
     token: Option<Secret>,
     txn_id: Option<TxnId>,
     state: CreateSessionState,
+    /// Who issued a restricted session for another account, and the group owning that account.
+    issuer: Option<(UserId, Option<GroupId>)>,
     output: Option<Result<CreatedSession, CreateSessionError>>,
 }
 
@@ -133,8 +136,15 @@ impl CreateSessionOperation {
             token: None,
             txn_id: None,
             state: CreateSessionState::Init,
+            issuer: None,
             output: None,
         }
+    }
+
+    /// Records `actor` instead of the session owner as the issuer of a restricted session.
+    pub fn issued_by(mut self, actor: UserId, group_id: Option<GroupId>) -> Self {
+        self.issuer = Some((actor, group_id));
+        self
     }
 
     fn emit_error(&mut self, error: CreateSessionError) -> Effects {
@@ -322,20 +332,34 @@ impl CreateSessionOperation {
             Ok(bytes) => bytes,
             Err(error) => return self.emit_error(error.into()),
         };
+        let mut writes = vec![
+            (
+                USER_SESSION_KEYSPACE.to_string(),
+                self.sid.as_bytes().into(),
+                session_bytes.into(),
+            ),
+            (
+                USER_OWNER_KEYSPACE.to_string(),
+                owner_key(self.config.user_id),
+                index_bytes,
+            ),
+        ];
+        if self.config.restrictions.is_some() {
+            let (actor, group_id) = self.issuer.unwrap_or((self.config.user_id, None));
+            let mut audit = AdminAuditRecord::new(
+                AdminAuditAction::RestrictedTokenIssued,
+                actor,
+                self.config.user_id,
+            );
+            (audit.group_id, audit.session_id) = (group_id, Some(self.sid.clone()));
+            match audit.entries() {
+                Ok(entries) => writes.extend(entries),
+                Err(error) => return self.emit_error(error.into()),
+            }
+        }
         self.state = CreateSessionState::WriteSession;
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (
-                    USER_SESSION_KEYSPACE.to_string(),
-                    self.sid.as_bytes().into(),
-                    session_bytes.into(),
-                ),
-                (
-                    USER_OWNER_KEYSPACE.to_string(),
-                    owner_key(self.config.user_id),
-                    index_bytes,
-                ),
-            ],
+            writes,
             txn_id: Some(txn_id),
         })]
     }
@@ -484,6 +508,8 @@ pub async fn create_making_room(
 mod pure_tests {
     use super::*;
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::structs::identity::auth::Permission;
+    use aruna_core::types::{Key, Value};
 
     fn session_config() -> CreateSessionConfig {
         let signing_key = generate_signing_key();
@@ -604,6 +630,46 @@ mod pure_tests {
             decode_index(Some(stored_index)).unwrap(),
             BTreeSet::from([pending_sid])
         );
+    }
+
+    fn written_rows(mut operation: CreateSessionOperation) -> Vec<(String, Key, Value)> {
+        begin_read(&mut operation, &BTreeSet::new(), Ulid::from_parts(9, 9));
+        let sid = operation.sid.clone();
+        let written = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(sid.as_bytes().into(), None)],
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = written.as_slice() else {
+            panic!("the session must be written");
+        };
+        writes.clone()
+    }
+
+    #[test]
+    fn restricted_session_audited() {
+        use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
+        let mut config = session_config();
+        let rows = written_rows(CreateSessionOperation::new(config.clone()));
+        assert!(rows.iter().all(|row| row.0 != ADMIN_AUDIT_KEYSPACE));
+
+        config.restrictions = Some(vec![PathRestriction {
+            pattern: "/**".to_string(),
+            permission: Permission::READ,
+        }]);
+        let admin = UserId::local(Ulid::from_bytes([5; 16]), config.realm_id);
+        let group = Ulid::from_bytes([6; 16]);
+        let operation = CreateSessionOperation::new(config.clone()).issued_by(admin, Some(group));
+        let sid = operation.sid.clone();
+        let rows = written_rows(operation);
+        let audit: Vec<_> = rows
+            .iter()
+            .filter(|row| row.0 == ADMIN_AUDIT_KEYSPACE)
+            .collect();
+        assert_eq!(audit.len(), 2, "one realm row and one group row");
+        let record = AdminAuditRecord::from_bytes(&audit[1].2).unwrap();
+        assert_eq!(record.action, AdminAuditAction::RestrictedTokenIssued);
+        assert_eq!((record.actor, record.target), (admin, config.user_id));
+        assert_eq!(record.group_id, Some(group));
+        assert_eq!(record.session_id, Some(sid));
     }
 
     #[test]
