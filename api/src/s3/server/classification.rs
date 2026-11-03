@@ -241,7 +241,7 @@ mod tests {
 
     // An in-cluster service host is path-style here too, so transfers keep the bulk lane.
     #[test]
-    fn service_host_path_style() {
+    fn service_host_lane() {
         let path = request_path(Some("node-2.aruna.svc:1337"), "/data/key", "s3.example");
         assert!(
             matches!(path, Some(s3s::path::S3Path::Object { bucket, .. }) if &*bucket == "data")

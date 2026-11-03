@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_sources_split_evenly() {
+    fn equal_sources_split() {
         let unmeasured = Candidate {
             stats: SourceStats::default(),
             ..measured(0.0, 0.0)
@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn load_moves_to_idle() {
+    fn load_favors_idle() {
         let mut busy = measured(50.0, 10.0 * MB);
         busy.stats.in_flight = 3;
         let shares = shares(&[busy, measured(50.0, 10.0 * MB)], 20_000);
@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn extreme_weights_stay_numbers() {
+    fn extreme_weights_finite() {
         // Huge, invalid or unmeasurable inputs never turn the shares into NaN.
         let mut huge = measured(50.0, 10.0 * MB);
         huge.weight = 1e308;
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn ineligible_waits_its_turn() {
+    fn ineligible_waits_turn() {
         // An ineligible source is never first but stays a fallback before failing ones.
         let mut mirror = measured(5.0, 100.0 * MB);
         mirror.eligible = false;

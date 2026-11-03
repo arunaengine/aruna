@@ -780,7 +780,7 @@ fn quota_event_replays() {
 }
 
 #[test]
-fn node_name_sets_clears() {
+fn name_clear_wins() {
     // A later clear must win, or a removed name would keep showing on every node.
     let mut state = realm_config_state();
     let named = AdminDocumentOperation::NodeNameSet {
@@ -817,7 +817,7 @@ fn node_name_sets_clears() {
 }
 
 #[test]
-fn node_place_sets_clears() {
+fn place_clear_wins() {
     use crate::structs::identity::realm::{NodeCoordinates, NodePlace};
     let mut state = realm_config_state();
     let place = NodePlace {

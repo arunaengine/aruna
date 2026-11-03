@@ -17,7 +17,6 @@ pub mod put;
 mod refresh_mint;
 mod refresh_observe;
 pub mod search;
-mod source_choice;
-pub mod source_edit;
+pub mod source;
 pub mod versions;
 pub mod visible;

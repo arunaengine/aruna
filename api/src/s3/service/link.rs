@@ -163,7 +163,7 @@ impl ArunaS3Service {
                 "Links in a distributed bucket are not supported"
             ));
         }
-        let header = aruna_core::structs::storage::link::COPY_SOURCE_NODE_HEADER;
+        let header = aruna_core::structs::storage::link::SOURCE_NODE_HEADER;
         let node_id = match req.headers.get(header) {
             Some(value) => value
                 .to_str()

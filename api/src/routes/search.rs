@@ -282,10 +282,10 @@ pub struct BucketHit {
     pub set_id: Option<String>,
     /// The bucket's current metadata, if it has any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<crate::routes::storage::bucket_metadata::BucketMetadataBody>,
+    pub metadata: Option<crate::routes::storage::bucket::metadata::BucketMetadataBody>,
     /// What a database's linked dataset says now, read with the caller's access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<crate::routes::storage::bucket_metadata::DatasetDescriptionBody>,
+    pub description: Option<crate::routes::storage::bucket::metadata::DatasetDescriptionBody>,
     /// Anyone, also without a login, may read the bucket; in a `database=true` search only.
     #[serde(default)]
     pub public: bool,

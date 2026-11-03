@@ -13,7 +13,7 @@ use aruna_core::structs::identity::realm::NodeCoordinates;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::node_name::{
-    NameScope, NodeChange, SetNodeNameConfig, SetNodeNameError, SetNodeNameOperation,
+    NameScope, NodeChange, NodeNameConfig, NodeNameError, NodeNameOperation,
 };
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -216,7 +216,7 @@ async fn set_name(
     let coordinates = match request.coordinates {
         Some(Some(body)) => Some(Some(
             NodeCoordinates::from_degrees(body.lat, body.lon).ok_or_else(|| {
-                ServerError::BadRequestReason(SetNodeNameError::InvalidCoordinates.to_string())
+                ServerError::BadRequestReason(NodeNameError::InvalidCoordinates.to_string())
             })?,
         )),
         Some(None) => Some(None),
@@ -227,7 +227,7 @@ async fn set_name(
         place: request.place,
         coordinates,
     };
-    let config = SetNodeNameConfig {
+    let config = NodeNameConfig {
         actor: Actor {
             node_id: state.get_node_id(),
             user_id: auth.user_id,
@@ -238,7 +238,7 @@ async fn set_name(
         change,
         scope,
     };
-    let shown = drive(SetNodeNameOperation::new(config), &state.get_ctx())
+    let shown = drive(NodeNameOperation::new(config), &state.get_ctx())
         .await
         .map_err(map_name_error)?;
     let place = shown.place.unwrap_or_default();
@@ -253,21 +253,17 @@ async fn set_name(
     ))
 }
 
-fn map_name_error(error: SetNodeNameError) -> ServerError {
+fn map_name_error(error: NodeNameError) -> ServerError {
     match error {
-        error @ (SetNodeNameError::InvalidName
-        | SetNodeNameError::InvalidCoordinates
-        | SetNodeNameError::EmptyChange) => ServerError::BadRequestReason(error.to_string()),
-        SetNodeNameError::UnknownNode { .. } | SetNodeNameError::ConfigMissing => {
-            ServerError::NotFound
-        }
-        SetNodeNameError::Unauthorized | SetNodeNameError::NotManagementNode => {
-            ServerError::Forbidden
-        }
-        SetNodeNameError::StorageError(StorageError::TransactionConflict) => {
+        error @ (NodeNameError::InvalidName
+        | NodeNameError::InvalidCoordinates
+        | NodeNameError::EmptyChange) => ServerError::BadRequestReason(error.to_string()),
+        NodeNameError::UnknownNode { .. } | NodeNameError::ConfigMissing => ServerError::NotFound,
+        NodeNameError::Unauthorized | NodeNameError::NotManagementNode => ServerError::Forbidden,
+        NodeNameError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm configuration update; retry".to_string())
         }
-        SetNodeNameError::StorageError(StorageError::CleanupCapacity) => {
+        NodeNameError::StorageError(StorageError::CleanupCapacity) => {
             ServerError::ServiceUnavailableReason(
                 "storage cleanup capacity exhausted; retry".to_string(),
             )

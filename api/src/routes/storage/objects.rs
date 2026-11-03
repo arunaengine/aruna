@@ -97,10 +97,9 @@ pub struct ObjectListResponse {
     pub stale_ranges: Vec<String>,
 }
 
-/// Where a merged page continues: after a listed key or common prefix, or at the first key of
-/// a range when a page visited its bound number of ranges before any entry, or inside the range
-/// starting at `lower`, from the sealed cursor of the member that stopped there among hidden
-/// entries.
+/// Where a merged page continues: after a listed key or common prefix, at the first key of a
+/// range when a page visited its bound of ranges before any entry, or inside the range at
+/// `lower`, from the sealed cursor of the member that stopped there among hidden entries.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum Resume {
     After {

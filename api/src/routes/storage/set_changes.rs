@@ -1,6 +1,5 @@
-//! Serves the routes that change a distributed bucket after its creation: join and leave of
-//! members, new copies and splits of ranges, fenced transfers of ranges, bucket-wide settings
-//! and deletion of the set.
+//! Serves the routes that change a distributed bucket after its creation: member joins and
+//! leaves, range copies, splits and fenced transfers, bucket-wide settings and set deletion.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

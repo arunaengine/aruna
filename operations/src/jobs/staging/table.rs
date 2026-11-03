@@ -976,7 +976,7 @@ mod tests {
 
     // Rows naming one key alike import once; rows naming it differently fail, not overwrite.
     #[test]
-    fn duplicate_targets_kept_once() {
+    fn duplicate_targets_once() {
         let entry = |source: &str, target: &str| TableEntry {
             source_path: source.to_string(),
             target: target.to_string(),

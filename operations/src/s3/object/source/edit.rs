@@ -456,5 +456,5 @@ impl Operation for SourceEditOperation {
 }
 
 #[cfg(test)]
-#[path = "source_edit_tests.rs"]
+#[path = "edit_tests.rs"]
 mod tests;

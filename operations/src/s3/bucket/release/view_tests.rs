@@ -16,7 +16,7 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 
 use super::*;
 use crate::distribution::test_record::secret;
-use crate::s3::bucket::release_publish::{ReleaseSpec, release_crate};
+use crate::s3::bucket::release::publish::{ReleaseSpec, release_crate};
 
 fn realm() -> RealmId {
     RealmId::from_bytes([1; 32])

@@ -265,7 +265,7 @@ async fn refuses_bad_creates() {
 }
 
 #[tokio::test]
-async fn visit_stays_in_scope() {
+async fn visit_stays_scoped() {
     let node = node_state().await;
     put_text(&node, "shared/a.txt", "alpha").await;
     put_text(&node, "shared/deep/b.txt", "beta").await;
@@ -438,7 +438,7 @@ async fn grant(node: &Node, user: aruna_core::UserId, rules: &[(&str, Permission
 }
 
 #[tokio::test]
-async fn upload_authorizes_final_name() {
+async fn upload_authorizes_name() {
     // The creator may write `report.txt` only; a renamed upload must not slip past that.
     let node = node_state().await;
     put_text(&node, "drop/report.txt", "original").await;
@@ -466,7 +466,7 @@ async fn upload_authorizes_final_name() {
 }
 
 #[tokio::test]
-async fn uploads_never_share_a_name() {
+async fn unique_upload_names() {
     let node = node_state().await;
     let link = create(
         &node,
@@ -511,7 +511,7 @@ async fn uploads_never_share_a_name() {
 }
 
 #[tokio::test]
-async fn only_uploads_take_large_bodies() {
+async fn large_upload_bodies() {
     use tower::ServiceExt;
     let node = node_state().await;
     let link = create(
@@ -548,7 +548,7 @@ async fn only_uploads_take_large_bodies() {
 }
 
 #[tokio::test]
-async fn ticket_ends_with_visit() {
+async fn visit_ends_ticket() {
     let node = node_state().await;
     put_text(&node, "shared/a.txt", "alpha").await;
     let link = create(
@@ -578,7 +578,7 @@ async fn ticket_ends_with_visit() {
 }
 
 #[tokio::test]
-async fn owner_sees_use_counts() {
+async fn owner_sees_counts() {
     let node = node_state().await;
     put_text(&node, "drop/a.txt", "alpha").await;
     let link = create(
@@ -614,7 +614,7 @@ async fn owner_sees_use_counts() {
 }
 
 #[tokio::test]
-async fn deactivated_creator_ends_open() {
+async fn deactivation_ends_open() {
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::Effect;
     use aruna_core::structs::identity::auth::Actor;

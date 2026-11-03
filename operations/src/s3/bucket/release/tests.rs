@@ -1,6 +1,5 @@
-//! Tests the release membership operation with hand-fed events: pinned versions, the caller's
-//! access, gone or untagged crates, and coordinators asked for the ranges this node does not
-//! coordinate.
+//! Tests the release membership operation with hand-fed events: pinned versions, access, gone
+//! or untagged crates, and coordinators asked for the ranges this node does not coordinate.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -247,7 +246,7 @@ async fn pins_exact_versions() {
 }
 
 #[tokio::test]
-async fn checks_access_and_tags() {
+async fn access_and_tags() {
     let fixture = fixture().await;
     let info = info(fixture.group_id);
     let crate_id = Ulid::from_bytes([20; 16]);

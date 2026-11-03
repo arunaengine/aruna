@@ -1,3 +1,4 @@
+//! Tests the share link records: link tokens, secrets and their scope.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -26,7 +27,7 @@ fn link(secret: u8) -> ShareLink {
 }
 
 #[test]
-fn link_token_opens_own_link() {
+fn token_opens_link() {
     let own = link(7);
     let token = ShareToken::parse(&own.link_token()).unwrap();
     assert!(own.admits(&token, 500));
@@ -59,7 +60,7 @@ fn visit_token_bounded() {
 }
 
 #[test]
-fn link_secret_signs_nothing() {
+fn secret_signs_nothing() {
     // Whoever holds the link URL must not mint a visit token that skips the password.
     let own = link(7);
     let forged = blake3::Hasher::new_keyed(&own.secret)

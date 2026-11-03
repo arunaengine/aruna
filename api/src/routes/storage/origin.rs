@@ -40,7 +40,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::routes::identifiers::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
-use crate::routes::storage::bucket_metadata::{
+use crate::routes::storage::bucket::metadata::{
     BucketIdentifierBody, BucketMetadataBody, DatasetDescriptionBody, describe_bucket,
 };
 use crate::routes::storage::deletion::bucket_info;

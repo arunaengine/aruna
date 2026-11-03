@@ -88,7 +88,7 @@ pub(crate) async fn dispatch_effect_until(
         )),
         // Release crate reads and holder requests need the runner's handles.
         Effect::Net(NetEffect::Release(effect)) => Event::Net(NetEvent::Release(
-            Box::pin(crate::s3::bucket::release_publish::dispatch_release(
+            Box::pin(crate::s3::bucket::release::publish::dispatch_release(
                 context, *effect,
             ))
             .await,

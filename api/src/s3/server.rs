@@ -1054,7 +1054,7 @@ mod tests {
 
     // An in-cluster service host is path-style, not a bucket name (batch run S3 access).
     #[test]
-    fn foreign_host_path_style() {
+    fn cluster_host_paths() {
         use s3s::host::S3Host;
         let host = s3_host("s3.example.org").unwrap();
         let service = host

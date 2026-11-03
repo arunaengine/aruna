@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_under_bucket_group() {
+    async fn uses_bucket_group() {
         // The bucket's own group decides, whichever group a run executes in.
         let (_directory, context, owner) = setup(false).await;
         assert_eq!(read(&context, &owner, "genome.fna").await, Ok(scope().1));
@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applies_rules_and_policies() {
+    async fn rules_and_policies() {
         // A deny rule and a request policy refuse a read the group role alone would allow.
         let (_directory, context, owner) = setup(false).await;
         assert_eq!(

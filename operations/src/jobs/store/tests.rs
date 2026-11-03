@@ -706,7 +706,7 @@ async fn success_clears_error() {
 
 // A pause shown while the attempt runs is gone once the attempt fails or is cancelled.
 #[tokio::test]
-async fn pause_cleared_on_finish() {
+async fn finish_clears_pause() {
     let (_dir, storage) = temp_storage();
     let paused = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(60));
     for (seed, cancel) in [(0x46u8, false), (0x47u8, true)] {
