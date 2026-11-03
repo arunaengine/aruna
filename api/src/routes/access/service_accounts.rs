@@ -286,7 +286,8 @@ async fn create_token(
             via: None,
             auth_time: None,
             cutoff: None,
-        }),
+        })
+        .issued_by(auth.user_id, Some(group_id)),
         &state.get_ctx(),
     )
     .await
