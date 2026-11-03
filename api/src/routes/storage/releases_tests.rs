@@ -22,6 +22,7 @@ use axum::extract::Query;
 async fn store(node: &Node, key: &str, text: &str) {
     let info = bucket_info(&node.state, BUCKET).await.unwrap();
     let input = WriteObjectInput {
+        node_id: None,
         bucket: BUCKET.to_string(),
         key: key.to_string(),
         text: text.to_string(),

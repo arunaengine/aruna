@@ -14,7 +14,8 @@ use axum::middleware::{from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -36,6 +37,38 @@ pub struct PortalConfig {
     pub csp: PortalCspConfig,
     /// The registry the portal lists while the realm has no federation settings.
     pub registry_url: Option<String>,
+    pub login: Option<PortalLogin>,
+}
+
+/// Login choices the portal offers in its login chooser, served unchanged as `login`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PortalLogin {
+    /// Replaces the plain realm sign-in row; an option without `params` is that sign-in.
+    #[serde(default)]
+    pub options: Vec<LoginOption>,
+    /// Page of the identity provider that lists and removes linked logins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoginOption {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
+    /// A copy of the logo for light backgrounds, for logos drawn in white.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo_light: Option<String>,
+    /// Extra authorization request parameters, such as `kc_idp_hint`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
+    /// Extra parameters that link this login to the signed-in account; empty means not linkable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub link_params: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -43,6 +76,7 @@ struct PortalState {
     server: Arc<ServerState>,
     api_base_url: Arc<str>,
     registry_url: Option<String>,
+    login: Option<PortalLogin>,
 }
 
 pub fn router(state: Arc<ServerState>, config: PortalConfig) -> Router {
@@ -59,6 +93,7 @@ pub fn router(state: Arc<ServerState>, config: PortalConfig) -> Router {
             server: state,
             api_base_url: Arc::from(api_base_url),
             registry_url: config.registry_url,
+            login: config.login,
         })
 }
 
@@ -87,6 +122,8 @@ struct PortalRuntimeConfig<'a> {
     api_base_url: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     registry_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    login: Option<&'a PortalLogin>,
 }
 
 async fn portal_config(State(state): State<PortalState>) -> Response {
@@ -110,6 +147,7 @@ async fn portal_config(State(state): State<PortalState>) -> Response {
     Json(PortalRuntimeConfig {
         api_base_url: &state.api_base_url,
         registry_url,
+        login: state.login.as_ref(),
     })
     .into_response()
 }
@@ -354,6 +392,7 @@ mod tests {
                 api_public_url: TEST_API_URL.to_string(),
                 csp: PortalCspConfig::new(vec!["https://peer.test/".to_string()]),
                 registry_url: None,
+                login: None,
             },
         );
 
@@ -541,6 +580,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_login_options() {
+        let tempdir = tempdir().unwrap();
+        let (state, _state_dir) = setup_state().await;
+        std::fs::write(tempdir.path().join("index.html"), "<html>portal</html>").unwrap();
+        enable_portal(&state, tempdir.path()).await;
+        let login: super::PortalLogin = serde_json::from_value(serde_json::json!({
+            "options": [{"name": "Example SSO", "params": {"kc_idp_hint": "example"}}],
+            "accountUrl": "https://idp.example.org/account"
+        }))
+        .unwrap();
+        let router = super::router(
+            state,
+            PortalConfig {
+                api_public_url: TEST_API_URL.to_string(),
+                csp: PortalCspConfig::new(Vec::new()),
+                registry_url: None,
+                login: Some(login),
+            },
+        );
+
+        let response = router
+            .oneshot(request(Method::GET, "/portal-config.json"))
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            config["login"],
+            serde_json::json!({
+                "options": [{"name": "Example SSO", "params": {"kc_idp_hint": "example"}}],
+                "accountUrl": "https://idp.example.org/account"
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn serves_registry_url() {
         // The realm picker reads the registry from the settings, and the node default while unset.
         let tempdir = tempdir().unwrap();
@@ -572,6 +647,7 @@ mod tests {
                 api_public_url: TEST_API_URL.to_string(),
                 csp: PortalCspConfig::new(Vec::new()),
                 registry_url: Some("https://default.example.org/".to_string()),
+                login: None,
             },
         );
         assert_eq!(

@@ -15,6 +15,7 @@ use super::{
 };
 
 use super::distributed::run_search_distributed;
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::index_feed::IndexProgress;
 use crate::metadata::search_cursor::{SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE};
 
@@ -57,6 +58,11 @@ pub struct BucketSearchRequest {
     pub bearer_token: Option<String>,
     /// An empty query lists every readable bucket.
     pub query: String,
+    /// Admits a bucket by READ on this key or key prefix inside it instead of on its root.
+    pub key: Option<String>,
+    /// An MCP tool's policy context, operation and parameters, whose policies must also allow
+    /// each hit on each node before members merge; it only adds to the mandatory read check.
+    pub extras: Option<PolicyRequestExtras>,
     pub limit: usize,
     /// Only buckets of this group.
     pub group_id: Option<GroupId>,

@@ -1621,6 +1621,15 @@ fn openapi_metadata_complete() {
             .unwrap()
             .contains("best-effort")
     );
+    for path in [
+        "/metadata/{document_id}/sparql/query",
+        "/metadata/sparql/query",
+    ] {
+        let description = openapi["paths"][path]["post"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains("`ORDER BY`"));
+    }
 
     let search_params = openapi["paths"]["/metadata/search"]["get"]["parameters"]
         .as_array()

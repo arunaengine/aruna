@@ -1364,3 +1364,77 @@ async fn purge_keeps_released() {
     ));
     assert!(row().await.is_some());
 }
+
+/// A release crate that sorts into an earlier batch than its pinned file is kept: the purge
+/// checks its whole scope before it deletes anything.
+#[tokio::test]
+async fn purge_keeps_crate() {
+    use aruna_core::structs::storage::bucket_metadata::{RELEASE_PREFIX_TAG, RELEASE_TAG};
+    use aruna_core::structs::storage::replication::VersionedObjectArn;
+
+    let context = setup_context().await;
+    let file = drive(
+        put_operation(&context, "db/z.fasta", b">z"),
+        &context.driver,
+    )
+    .await
+    .unwrap();
+    let arn = VersionedObjectArn::new(
+        context.realm_id,
+        context.node_id,
+        "bucket",
+        "db/z.fasta",
+        file.version_id,
+    )
+    .unwrap();
+    let pinned = serde_json::json!({
+        "@graph": [{"@type": "File", "@id": arn.to_w3id(), "name": "db/z.fasta"}]
+    });
+    let tags = HashMap::from([
+        (RELEASE_TAG.to_string(), "6.0".to_string()),
+        (RELEASE_PREFIX_TAG.to_string(), "db/".to_string()),
+    ]);
+    let bytes = serde_json::to_vec(&pinned).unwrap();
+    let release = put_operation(&context, "db/a.json", &bytes).with_metadata(tags);
+    let crate_version = drive(release, &context.driver).await.unwrap();
+    // The crate and these fill the first batch, so the pinned file sorts into the second.
+    for index in 0..999 {
+        let key = format!("db/m{index:04}");
+        drive(put_operation(&context, &key, b"m"), &context.driver)
+            .await
+            .unwrap();
+    }
+    let spec = StoragePurgeSpec {
+        scope: StoragePurgeScope::Prefix {
+            bucket: "bucket".to_string(),
+            prefix: "db/".to_string(),
+        },
+        group_id: context.group_id,
+        auth_context: auth(&context),
+        node_id: context.node_id,
+    };
+    let job = claimed_job(
+        context.driver.clone(),
+        JobId::from_bytes([0xDB; 16]),
+        spec.clone(),
+    )
+    .await;
+
+    let outcome = run_storage_purge(&job, &spec, false).await;
+
+    assert!(matches!(
+        outcome,
+        JobRunOutcome::Failed(error) if error.message.contains("pinned by a release")
+    ));
+    let storage = &context.driver.storage_handle;
+    for (key, version_id) in [
+        ("db/a.json", crate_version.version_id),
+        ("db/z.fasta", file.version_id),
+    ] {
+        let row = VersionKey::new("bucket", key, version_id)
+            .to_bytes()
+            .unwrap();
+        let value = read_value(storage, BLOB_VERSIONS_KEYSPACE, row).await;
+        assert!(value.is_some(), "{key} is kept");
+    }
+}

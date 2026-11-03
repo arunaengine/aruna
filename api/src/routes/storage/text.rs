@@ -62,7 +62,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
             "key": "notes/summary.md",
             "version_id": "01JMPRT0123456789ABCDEFGHJ",
             "size": 10,
-            "content_type": "text/markdown"
+            "content_type": "text/markdown",
+            "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"
         })),
         (status = 400, description = "The key is not a valid object key", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
@@ -111,6 +112,7 @@ pub async fn write_text_object(
         return Ok(Json(answer));
     }
     let input = WriteObjectInput {
+        node_id: None,
         bucket,
         key: request.key,
         text: request.text,

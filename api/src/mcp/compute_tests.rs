@@ -224,3 +224,22 @@ async fn accepted_carries_urls() {
         format!("https://owner.example/api/v1/compute/jobs/{job_id}")
     );
 }
+
+// Only the caller's own jobs are listed, so a group filter needs no grant in that group, as the
+// REST job list asks for none.
+#[tokio::test]
+async fn filters_without_grant() {
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = crate::tests::distributed::node_state().await;
+    let server = McpServer::new(node.state.clone());
+    let (mut parts, ()) = http::Request::new(()).into_parts();
+    parts.extensions.insert(Some(node.stranger.clone()));
+    let input = ListJobsInput {
+        group_id: Some(node.group_id.to_string()),
+        state: None,
+        limit: None,
+    };
+    let listed = server.list_jobs(Extension(parts), Parameters(input)).await;
+    let listed = listed.expect("a group filter of the caller's own jobs").0.0;
+    assert_eq!(listed["jobs"], serde_json::json!([]));
+}

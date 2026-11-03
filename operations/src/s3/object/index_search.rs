@@ -23,7 +23,7 @@ use ulid::Ulid;
 use super::{
     HeadCandidate, ObjectKeyMatch, SEARCH_MAX_LIMIT, SearchNodeHit, SearchNodePage,
     SearchObjectsError, SearchObjectsInput, authorize, batch_read, build_hits, finish_read,
-    load_live, start_read,
+    load_live, retain_matches, start_read,
 };
 use crate::auth::request_policy::PolicyEvaluator;
 use crate::distribution::index_feed::{range_progress, state_key};
@@ -373,7 +373,9 @@ async fn resolve_heads(
             cursor_key: key.to_vec(),
         });
     }
-    let live = load_live(context, input, candidates, txn_id).await?;
+    let mut live = load_live(context, input, candidates, txn_id).await?;
+    // The index leaves very common metadata prefixes out, so versions are matched again here.
+    retain_matches(input, &mut live);
     build_hits(context, input, live, txn_id).await
 }
 

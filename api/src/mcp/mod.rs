@@ -24,6 +24,7 @@ use std::sync::Arc;
 mod compute;
 mod context;
 pub(crate) mod data;
+mod forward;
 mod metadata;
 mod prompts;
 mod resources;
@@ -429,6 +430,37 @@ mod tests {
             missing.is_empty(),
             "MCP input properties without a description: {missing:?}"
         );
+    }
+
+    #[test]
+    fn realm_totals_named() {
+        // Asked how many objects the realm holds, a model must reach the realm-wide totals
+        // rather than read one group's or one node's figures as the answer.
+        let tools = all_tools();
+        let text = |name: &str| {
+            let tool = tools.iter().find(|tool| tool.name == name);
+            tool.and_then(|tool| tool.description.as_deref())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let realm = text("get_realm_info");
+        for total in [
+            "public_overview.objects",
+            "public_overview.data_bytes",
+            "null",
+        ] {
+            assert!(realm.contains(total), "{realm}");
+        }
+        for (name, scope) in [
+            ("get_group_usage", "one group"),
+            ("get_node_info", "one node"),
+        ] {
+            let local = text(name);
+            assert!(
+                local.contains(scope) && local.contains("get_realm_info"),
+                "{local}"
+            );
+        }
     }
 
     #[test]

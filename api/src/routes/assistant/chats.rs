@@ -109,7 +109,7 @@ fn map_chat_error(error: ChatStoreError) -> ServerError {
     }
 }
 
-fn check_chat_id(id: String) -> ServerResult<String> {
+pub(super) fn check_chat_id(id: String) -> ServerResult<String> {
     let valid = !id.is_empty()
         && id.len() <= MAX_ID_CHARS
         && id

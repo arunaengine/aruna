@@ -13,7 +13,7 @@ use aruna_core::structs::execution::job::{
     ArtifactRef, CopyJobSpec, ExecutionSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId,
     JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
     RunCrateStatus, SessionReportDetail, SessionReportRow, StagingJobCheckpoint, StagingJobSpec,
-    WorkspaceMode, pid_dedup_key, user_dedup_key,
+    WorkspaceMode, cleanup_job_id, pid_dedup_key, user_dedup_key,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{JobOwnerError, RealmId};
@@ -56,7 +56,7 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::StorageReadError;
 
-use super::lifecycle::cancel::cancel_family;
+use super::lifecycle::cancel::{self, cancel_family};
 use super::lifecycle::ids::session_of;
 use super::lifecycle::routing::{family_of_alias, family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
@@ -650,16 +650,16 @@ pub async fn list_owned_jobs(
 /// Removes the caller's finished run from this node's lists; see [`delete_finished_run`].
 pub async fn delete_owned_run(
     context: &DriverContext,
-    user_id: UserId,
+    auth: &AuthContext,
     job_id: JobId,
 ) -> Result<RunDelete, JobMutationError> {
     let storage = &context.storage_handle;
-    let mut outcome = delete_finished_run(storage, user_id, job_id).await?;
+    let mut outcome = delete_recorded(context, auth, job_id).await?;
     // A queued job is cancelled first; one that never ran settles at once and goes with it.
     if let RunDelete::Unfinished(JobState::Queued | JobState::AwaitingKey) = outcome {
         let cancelled = set_cancel_requested(storage, job_id, unix_timestamp_millis()).await?;
         if let CancelRequestOutcome::Cancelled(_) = cancelled {
-            outcome = delete_finished_run(storage, user_id, job_id).await?;
+            outcome = delete_recorded(context, auth, job_id).await?;
         }
     }
     // A deleted job other than a run is pruned by the timer, which is moved up here.
@@ -669,6 +669,31 @@ pub async fn delete_owned_run(
         super::prune::restore_prune_timer(&context.storage_handle, task_handle).await;
     }
     Ok(outcome)
+}
+
+/// Records a deletable run's deletion in its replicated family before its rows go, so a failed
+/// record keeps the run listed and a retry records it again.
+async fn delete_recorded(
+    context: &DriverContext,
+    auth: &AuthContext,
+    job_id: JobId,
+) -> Result<RunDelete, JobMutationError> {
+    let storage = &context.storage_handle;
+    let read = |job_id| read_job_record(storage, job_id, None);
+    let record = read(job_id).await.map_err(JobMutationError::Storage)?;
+    let deletable = record.is_some_and(|record| {
+        record.created_by == auth.user_id
+            && record.state.is_terminal()
+            && matches!(record.payload, JobPayload::Execution(_))
+    });
+    let cleanup = read(cleanup_job_id(job_id))
+        .await
+        .map_err(JobMutationError::Storage)?;
+    let recorded = deletable && cleanup.is_none_or(|cleanup| cleanup.state.is_terminal());
+    if recorded && let Err(error) = cancel::publish_deletion(context, auth, job_id).await {
+        return Ok(RunDelete::Unrecorded(error.to_string()));
+    }
+    delete_finished_run(storage, auth.user_id, job_id, recorded).await
 }
 
 pub async fn read_owned_job(

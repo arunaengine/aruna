@@ -11,7 +11,10 @@ use aruna_core::handle::Handle;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults};
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms};
 use async_trait::async_trait;
-use craqle::{ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, GraphId, RoCrateError};
+use craqle::{
+    ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, CraqleRequestDurability, GraphId,
+    PolicyWrite, RoCrateError,
+};
 use tracing::{Instrument, Span, debug_span, field, warn};
 
 use super::entity_convert::{
@@ -680,10 +683,14 @@ fn policy_effect(
             let started = Instant::now();
             let result = call_span
                 .in_scope(|| {
-                    node.set_graph_policy(
+                    // Every holder applies the policy; publishing it would mint a rival topic genesis.
+                    node.set_policy_with(
                         auth,
-                        &GraphId::new(&graph_iri),
-                        craqle_graph_policy(policy),
+                        PolicyWrite {
+                            graph: &GraphId::new(&graph_iri),
+                            policy: craqle_graph_policy(policy),
+                            durability: CraqleRequestDurability::WalAlreadyDurable,
+                        },
                     )
                 })
                 .map(|_| MetadataEvent::GraphPolicySet {

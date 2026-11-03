@@ -368,7 +368,7 @@ async fn exhausted_job_cancels() {
     };
     assert_eq!(cancelled.state, JobState::Cancelled);
     assert!(!cancelled.locally_exhausted && cancelled.cancel_requested);
-    let deleted = delete_finished_run(&storage, record.created_by, record.job_id).await;
+    let deleted = delete_finished_run(&storage, record.created_by, record.job_id, true).await;
     assert_eq!(deleted.unwrap(), RunDelete::Deleted);
 }
 
@@ -1530,7 +1530,7 @@ async fn run_delete_rules() {
     .await
     .unwrap();
 
-    let delete = |user, job| delete_finished_run(&storage, user, job);
+    let delete = |user, job| delete_finished_run(&storage, user, job, true);
     assert_eq!(
         delete(other, finished.job_id).await.unwrap(),
         RunDelete::NotFound
@@ -1548,6 +1548,9 @@ async fn run_delete_rules() {
         delete(owner, probe.job_id).await.unwrap(),
         RunDelete::NotFound
     );
+    // A run whose deletion was not recorded first stays, whatever state it settled in since.
+    let unrecorded = delete_finished_run(&storage, owner, finished.job_id, false).await;
+    assert!(matches!(unrecorded, Ok(RunDelete::Unrecorded(_))));
     assert_eq!(
         delete(owner, finished.job_id).await.unwrap(),
         RunDelete::Deleted

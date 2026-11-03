@@ -37,7 +37,7 @@ pub struct NodeHeartbeat {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningJobs {
     pub total: u32,
-    /// The staging imports among `total`.
+    /// The imports among `total`: staging, record imports and storage imports.
     pub imports: u32,
 }
 

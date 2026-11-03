@@ -194,6 +194,8 @@ pub struct CompiledPolicySet {
     pub needs_params: bool,
     /// Whether an enabled policy reads `request`, the session of the caller.
     pub needs_session: bool,
+    /// Whether an enabled policy reads `path`.
+    pub needs_path: bool,
 }
 
 /// The offending policy when a set fails to compile.
@@ -298,6 +300,7 @@ impl CompiledPolicySet {
         let mut needs_body = false;
         let mut needs_params = false;
         let mut needs_session = false;
+        let mut needs_path = false;
         for policy in policies {
             let program = compile_program(policy, &policy.expression)?;
             let when = match &policy.when {
@@ -311,6 +314,7 @@ impl CompiledPolicySet {
                     needs_params |=
                         references.has_variable("params") || references.has_variable("headers");
                     needs_session |= references.has_variable("request");
+                    needs_path |= references.has_variable("path");
                 }
             }
             compiled.push(CompiledPolicy {
@@ -327,6 +331,7 @@ impl CompiledPolicySet {
             needs_body,
             needs_params,
             needs_session,
+            needs_path,
         })
     }
 

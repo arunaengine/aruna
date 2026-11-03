@@ -714,7 +714,7 @@ pub(super) fn ensure_export_limit(
 
 /// The only document path the Profile validation channel serves. Serving
 /// nothing else is the whole authorization of a fetch that asserts no user.
-pub(super) const PROFILE_DOCUMENT_PREFIX: &str = "profiles/";
+pub(crate) const PROFILE_DOCUMENT_PREFIX: &str = "profiles/";
 
 /// Reads one registered Profile at an exact revision so a holder can validate a
 /// Dataset without a caller. Infrastructure nodes use the user-less purpose-bound

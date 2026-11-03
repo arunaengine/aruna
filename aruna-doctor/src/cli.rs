@@ -50,6 +50,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: TopicCommands,
     },
+    Metadata {
+        #[command(subcommand)]
+        command: MetadataCommands,
+    },
     NodeState {
         #[arg(long)]
         database_path: String,
@@ -149,6 +153,43 @@ pub enum TopicCommands {
         database_path: String,
         #[arg(long)]
         id: Option<String>,
+    },
+    /// Delete one document sync topic with its cursors, quarantine rows and queued publishes, so
+    /// the node joins the realm's topic again. Run with the node stopped; without `--apply` it
+    /// only lists what it would delete.
+    Purge {
+        #[arg(long)]
+        database_path: String,
+        /// Topic id as 64 hex characters.
+        #[arg(long)]
+        id: String,
+        /// Document sync store; defaults to `<database_path>/document-sync`.
+        #[arg(long)]
+        sync_path: Option<String>,
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MetadataCommands {
+    /// Move one metadata graph's sync cursor from a replaced genesis onto the current one. Refuses
+    /// when the genesis is unchanged or actor sequences could collide. Run with the node stopped;
+    /// without `--apply` it only reports both branches and every actor the graph applied.
+    RepairCursor {
+        #[arg(long)]
+        database_path: String,
+        /// Graph IRI of the metadata document.
+        #[arg(long)]
+        graph: String,
+        /// Craqle store; defaults to `<database_path>/craqle`.
+        #[arg(long)]
+        craqle_path: Option<String>,
+        /// Document sync store; defaults to `<database_path>/document-sync`.
+        #[arg(long)]
+        sync_path: Option<String>,
+        #[arg(long)]
+        apply: bool,
     },
 }
 

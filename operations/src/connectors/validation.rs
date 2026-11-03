@@ -50,6 +50,16 @@ pub enum ValidationError {
     InvalidWeight,
     #[error("endpoint must be spelled as the http client parses it")]
     AmbiguousEndpoint,
+    #[error(
+        "endpoint must not carry a user name, password or fragment; put credentials in the \
+         connector's secret settings"
+    )]
+    EndpointCredentials,
+    #[error(
+        "Endpoint addresses cannot carry a query. Put the server address in the endpoint and the \
+         file path in the source path."
+    )]
+    EndpointQuery,
     #[error("bucket `{0}` must not contain `/`, `\\`, `?`, `#` or `@`")]
     UnsafeBucket(String),
     #[error("credentials must not be set when `skip_signature` is enabled")]
@@ -136,6 +146,16 @@ pub fn validate_connector_input(
         && !endpoint_screening::is_canonical(endpoint)
     {
         return Err(ValidationError::AmbiguousEndpoint);
+    }
+    if let Some(url) = (public_config.get("endpoint")).and_then(|url| url::Url::parse(url).ok()) {
+        // Version and source root records copy the endpoint, and listings show it.
+        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+            return Err(ValidationError::EndpointCredentials);
+        }
+        // Reads append the source path to the endpoint, so a query would come before it.
+        if url.query().is_some() {
+            return Err(ValidationError::EndpointQuery);
+        }
     }
     if let Some(bucket) = public_config.get("bucket")
         && endpoint_screening::breaks_authority(bucket)
@@ -461,6 +481,36 @@ mod pure_tests {
                 "{weight}"
             );
         }
+    }
+
+    #[test]
+    fn refuses_endpoint_credentials() {
+        let refused = |endpoint: &str, expected: &ValidationError| {
+            let public = HashMap::from([("endpoint".to_string(), endpoint.to_string())]);
+            for kind in [SourceConnectorKind::Http, SourceConnectorKind::Webdav] {
+                let error = validate_connector_input("source", kind, &public, &HashMap::new());
+                assert_eq!(error.err().as_ref(), Some(expected), "{endpoint}");
+            }
+        };
+        for endpoint in [
+            "https://reader:canary-11@example.org/data",
+            "https://reader@example.org/data",
+            "https://example.org/data#canary-11",
+        ] {
+            refused(endpoint, &ValidationError::EndpointCredentials);
+        }
+        let error = ValidationError::EndpointCredentials.to_string();
+        assert!(error.contains("secret settings") && !error.contains("canary"));
+        // The source path would follow a query, so every query is refused, a public one too.
+        for endpoint in [
+            "https://example.org/data?download=1",
+            "https://example.org/data?token=canary-11",
+            "https://example.org/data?X-Amz-Credential=canary-11",
+        ] {
+            refused(endpoint, &ValidationError::EndpointQuery);
+        }
+        let error = ValidationError::EndpointQuery.to_string();
+        assert!(error.contains("cannot carry a query") && error.contains("source path"));
     }
 
     #[test]

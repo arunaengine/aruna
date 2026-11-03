@@ -133,6 +133,10 @@ pub const ASSISTANT_PROVIDER_KEYSPACE: &str = "assistant_providers";
 pub const PROVIDER_OWNER_KEYSPACE: &str = "assistant_provider_owner";
 pub const CHAT_HEAD_KEYSPACE: &str = "assistant_chat_heads";
 pub const CHAT_TURN_KEYSPACE: &str = "assistant_chat_turns";
+/// The realm's central assistant provider on its holder node, one row.
+pub const CENTRAL_ASSISTANT_KEYSPACE: &str = "assistant_central";
+/// Central assistant calls of each user on the current UTC day, keyed by user.
+pub const ASSISTANT_USAGE_KEYSPACE: &str = "assistant_usage";
 
 // Blob + S3 keyspaces
 pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";
@@ -284,6 +288,8 @@ pub const PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_prune_index";
 pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
 pub const WATCH_SUBSCRIPTIONS_KEYSPACE: &str = "notification_watch_subscriptions";
 pub const WATCH_INTEREST_KEYSPACE: &str = "notification_watch_interest";
+/// The newest deletion time of a bucket per recipient, which drops older notices about it.
+pub const NOTIFICATION_CUTOFF_KEYSPACE: &str = "notification_bucket_cutoff";
 
 pub const STORAGE_ROUTING_KEYSPACE: &str = "group_storage_routing";
 
@@ -619,6 +625,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     PROVIDER_OWNER_KEYSPACE,
     CHAT_HEAD_KEYSPACE,
     CHAT_TURN_KEYSPACE,
+    CENTRAL_ASSISTANT_KEYSPACE,
+    ASSISTANT_USAGE_KEYSPACE,
     BLOB_LOCATIONS_KEYSPACE,
     BLOB_CLEANUP_KEYSPACE,
     BLOB_RECLAIM_KEYSPACE,
@@ -692,6 +700,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NOTIFICATION_OUTBOX_KEYSPACE,
     WATCH_SUBSCRIPTIONS_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,
+    NOTIFICATION_CUTOFF_KEYSPACE,
     STORAGE_ROUTING_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
     BACKEND_SECRET_KEYSPACE,

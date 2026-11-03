@@ -51,6 +51,27 @@ enum State {
 /// Versions from before a source binding could name its root by digest.
 pub(super) const BEFORE_ROOT: Layout = &[("PortableSourceDescriptor", 7)];
 
+/// Versions before origins named the upload client, the job of a source, copy or storage import
+/// and the person who started a run. Struct variants are named by their fields; a source was a
+/// unit variant then.
+pub(super) const BEFORE_JOBS: Layout = &[
+    ("job_id", 0),
+    ("node_id,device,client", 2),
+    ("from,job_id", 1),
+    ("backend_id,key,job_id", 2),
+    ("run_id,started_by", 1),
+];
+
+/// Versions before both source root digests and the origin job fields.
+const BEFORE_BOTH: Layout = &[
+    ("PortableSourceDescriptor", 7),
+    ("job_id", 0),
+    ("node_id,device,client", 2),
+    ("from,job_id", 1),
+    ("backend_id,key,job_id", 2),
+    ("run_id,started_by", 1),
+];
+
 /// Versions before the distributed bucket fields, whose sources had no digests or namespace.
 pub(super) const LAYOUT: Layout = &[
     ("BlobVersion", 6),
@@ -106,8 +127,10 @@ fn current_version(value: &[u8]) -> Result<(BlobVersion, bool), postcard::Error>
     if let Ok(version) = session_refs::decode::<BlobVersion>(value, &[]) {
         return Ok((version, false));
     }
-    if let Ok(version) = session_refs::decode::<BlobVersion>(value, BEFORE_ROOT) {
-        return Ok((version, true));
+    for layout in [BEFORE_JOBS, BEFORE_ROOT, BEFORE_BOTH] {
+        if let Ok(version) = session_refs::decode::<BlobVersion>(value, layout) {
+            return Ok((version, true));
+        }
     }
     match session_refs::decode::<BlobVersion>(value, LAYOUT) {
         Ok(version) => Ok((version, true)),
@@ -152,7 +175,9 @@ pub(super) fn broken_version(value: &[u8]) -> Result<Option<Vec<u8>>, postcard::
     if session_refs::decode::<BrokenVersion>(value, &[]).is_ok() {
         return Ok(None);
     }
-    let broken = session_refs::decode::<BrokenVersion>(value, BEFORE_ROOT)
+    let broken = session_refs::decode::<BrokenVersion>(value, BEFORE_JOBS)
+        .or_else(|_| session_refs::decode::<BrokenVersion>(value, BEFORE_ROOT))
+        .or_else(|_| session_refs::decode::<BrokenVersion>(value, BEFORE_BOTH))
         .or_else(|_| session_refs::decode::<BrokenVersion>(value, LAYOUT))?;
     Ok(Some(postcard::to_allocvec(&broken)?))
 }
@@ -237,6 +262,155 @@ mod tests {
         let key = version.location_key().expect("materialized");
         assert_eq!(key.encoding, EncodingClass::Raw);
         assert_eq!(key.blake3_hash, [4; 32]);
+        let again = migrate_output(database).expect("migration repeats");
+        assert_eq!(again.versions_rewritten, 0);
+    }
+
+    #[test]
+    fn pads_origin_jobs() {
+        // Origins stored before the upload client, the copy and import job and the run's
+        // starter decode after the migration, with those fields empty.
+        use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
+        use aruna_core::structs::storage::replication::VersionedObjectArn;
+        let realm_id = RealmId([1; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let arn = VersionedObjectArn::new(realm_id, node_id, "b", "k", ulid::Ulid::nil());
+        let origins = [
+            VersionOrigin::Upload {
+                node_id,
+                device: None,
+                client: None,
+            },
+            VersionOrigin::Copy {
+                from: OriginVersion::Node(arn.expect("arn")),
+                job_id: None,
+            },
+            VersionOrigin::Storage {
+                backend_id: ulid::Ulid::nil(),
+                key: "k".to_string(),
+                job_id: None,
+            },
+            VersionOrigin::Job {
+                run_id: ulid::Ulid::nil(),
+                started_by: None,
+            },
+        ];
+        let now = SystemTime::UNIX_EPOCH;
+        let versions: Vec<BlobVersion> = (origins.iter())
+            .map(|origin| BlobVersion {
+                origin: Some(origin.clone()),
+                ..BlobVersion::deleted(now, UserId::default())
+            })
+            .collect();
+        let keys = [b"upload".as_slice(), b"copy", b"storage", b"job"];
+        let rows = (keys.iter().zip(&versions))
+            .map(|(key, version)| {
+                let current = version.to_bytes().expect("encodes");
+                let origin = version.origin.as_ref().expect("origin");
+                let nested = postcard::to_allocvec(origin).expect("encodes");
+                (*key, strip(&current, &nested, 1))
+            })
+            .collect();
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let database = path.to_str().expect("path");
+        write(&path, BLOB_VERSIONS_KEYSPACE, rows);
+        let stored = read(&path, BLOB_VERSIONS_KEYSPACE);
+        assert!(BlobVersion::from_bytes(&stored[b"copy".as_slice()]).is_err());
+
+        let output = migrate_output(database).expect("migration runs");
+
+        assert_eq!(output.versions_rewritten, 4);
+        let rows = read(&path, BLOB_VERSIONS_KEYSPACE);
+        for (key, version) in keys.iter().zip(&versions) {
+            assert_eq!(
+                &BlobVersion::from_bytes(&rows[*key]).expect("decodes"),
+                version
+            );
+        }
+        let again = migrate_output(database).expect("migration repeats");
+        assert_eq!(again.versions_rewritten, 0);
+    }
+
+    #[test]
+    fn pads_unit_source() {
+        // A source origin stored as a unit variant, with and without a hop, gains an empty job;
+        // a source origin that named a database entry keeps its bytes. A second pass is a no-op.
+        use aruna_core::structs::storage::origin::{OriginVersion, SyncHop, VersionOrigin};
+        use aruna_core::structs::storage::replication::VersionedObjectArn;
+        let realm_id = RealmId([1; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let arn = VersionedObjectArn::new(realm_id, node_id, "b", "k", ulid::Ulid::nil());
+        let hop = SyncHop {
+            relationship_id: ulid::Ulid::from_parts(5, 5),
+            from: OriginVersion::Node(arn.expect("arn")),
+        };
+        let now = SystemTime::UNIX_EPOCH;
+        let source = |hop: Option<SyncHop>| BlobVersion {
+            origin: Some(VersionOrigin::Source { job_id: None }),
+            hop,
+            ..BlobVersion::deleted(now, UserId::default())
+        };
+        // The unit variant's bytes: the origin's variant index without the job field.
+        let unit = |version: &BlobVersion| {
+            let current = version.to_bytes().expect("encodes");
+            let origin = postcard::to_allocvec(&version.origin).expect("encodes");
+            let hop = postcard::to_allocvec(&version.hop).expect("encodes");
+            let head = current.len() - origin.len() - hop.len();
+            [&current[..head], &origin[..origin.len() - 1], &hop].concat()
+        };
+        let (bare, hopped) = (source(None), source(Some(hop)));
+        let descriptor = PortableSourceDescriptor {
+            kind: SourceConnectorKind::Http,
+            public_config: HashMap::new(),
+            source_path: "data/a.csv".to_string(),
+            version_selector: None,
+            capabilities: Vec::new(),
+            origin_node_id: None,
+            namespace: None,
+            root: None,
+        };
+        let binding = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: descriptor.clone(),
+            connector_id: None,
+            mirrors: Vec::new(),
+        };
+        let metadata = SourceMetadata {
+            content_length: 1,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: BTreeMap::new(),
+        };
+        let listed = BlobVersion {
+            origin: Some(VersionOrigin::Source {
+                job_id: Some(ulid::Ulid::from_parts(6, 6)),
+            }),
+            ..BlobVersion::reference(binding, metadata, now, UserId::default(), now)
+        };
+        let descriptor = postcard::to_allocvec(&descriptor).expect("encodes");
+        let old_listed = strip(&listed.to_bytes().expect("encodes"), &descriptor, 1);
+        let rows = vec![
+            (b"bare".as_slice(), unit(&bare)),
+            (b"hopped".as_slice(), unit(&hopped)),
+            (b"listed".as_slice(), old_listed),
+        ];
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let database = path.to_str().expect("path");
+        write(&path, BLOB_VERSIONS_KEYSPACE, rows);
+
+        let output = migrate_output(database).expect("migration runs");
+
+        assert_eq!(output.versions_rewritten, 3);
+        let rows = read(&path, BLOB_VERSIONS_KEYSPACE);
+        let decoded = |key: &[u8]| BlobVersion::from_bytes(&rows[key]).expect("decodes");
+        assert_eq!(decoded(b"bare"), bare);
+        assert_eq!(decoded(b"hopped"), hopped);
+        let (listed, _) = compact_version(listed).expect("compacts");
+        assert_eq!(decoded(b"listed"), listed);
         let again = migrate_output(database).expect("migration repeats");
         assert_eq!(again.versions_rewritten, 0);
     }

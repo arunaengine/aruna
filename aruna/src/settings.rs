@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use aruna_api::portal::PortalLogin;
 use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::federation::valid_federation_url;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -624,6 +625,7 @@ fn portal_config_env(env: &dyn SettingsEnv) -> Result<PortalConfig, SetupError> 
                     portal_dir,
                 },
                 socket_addr,
+                login: portal_login_env(env)?,
             })
         }
         _ => Err(invalid_config_value(
@@ -632,6 +634,28 @@ fn portal_config_env(env: &dyn SettingsEnv) -> Result<PortalConfig, SetupError> 
             "expected one of: disabled, artifact",
         )),
     }
+}
+
+/// `PORTAL_LOGIN` is the portal's login chooser as JSON; unset keeps the plain realm sign-in.
+fn portal_login_env(env: &dyn SettingsEnv) -> Result<Option<PortalLogin>, SetupError> {
+    const KEY: &str = "PORTAL_LOGIN";
+    let Some(value) = optional_nonempty_env(env, KEY)? else {
+        return Ok(None);
+    };
+    let login: PortalLogin = serde_json::from_str(&value)
+        .map_err(|error| invalid_config_value(KEY, value.clone(), error))?;
+    if login
+        .options
+        .iter()
+        .any(|option| option.name.trim().is_empty())
+    {
+        return Err(invalid_config_value(
+            KEY,
+            value,
+            "every option needs a name",
+        ));
+    }
+    Ok(Some(login))
 }
 
 fn optional_nonempty_env(
@@ -1233,10 +1257,12 @@ mod tests {
         let PortalConfig::Artifact {
             socket_addr,
             artifact,
+            login,
         } = settings.portal
         else {
             panic!("artifact portal must parse");
         };
+        assert_eq!(login, None);
         assert_eq!(socket_addr.to_string(), "127.0.0.1:8080");
         assert_eq!(
             artifact.artifact_url.as_deref(),
@@ -1263,6 +1289,37 @@ mod tests {
             parse(&without_public).unwrap_err(),
             SetupError::MissingConfigValue("API_PUBLIC_URL")
         ));
+    }
+
+    #[test]
+    fn portal_login_parses() {
+        let base = [
+            ("PORTAL_MODE", "artifact"),
+            ("PORTAL_DIR", "/var/lib/aruna/portal"),
+            ("PORTAL_SOCKET_ADDRESS", "127.0.0.1:8080"),
+            ("API_PUBLIC_URL", "https://api.example"),
+        ];
+        let login = |value: &'static str| {
+            let mut pairs = base.to_vec();
+            pairs.push(("PORTAL_LOGIN", value));
+            parse(&pairs).map(|settings| match settings.portal {
+                PortalConfig::Artifact { login, .. } => login,
+                PortalConfig::Disabled => panic!("artifact portal must parse"),
+            })
+        };
+
+        let parsed = login(r#"{"options":[{"name":"SSO","params":{"kc_idp_hint":"sso"}}]}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.options[0].params["kc_idp_hint"], "sso");
+        assert_eq!(login("").unwrap(), None);
+        for invalid in [
+            r#"{"options":[{"name":" "}]}"#,
+            r#"{"option":[]}"#,
+            "not json",
+        ] {
+            assert_eq!(invalid_key(login(invalid).unwrap_err()), "PORTAL_LOGIN");
+        }
     }
 
     #[test]

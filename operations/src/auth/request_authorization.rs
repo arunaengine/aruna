@@ -77,6 +77,23 @@ pub async fn authorize(
     Ok(())
 }
 
+/// Authorizes reading the metadata document at `path`: a public one needs only the request
+/// policies, as every metadata read decides it, a private one also READ by role.
+pub async fn authorize_document(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: &AuthContext,
+    (path, public): (&str, bool),
+    extras: PolicyRequestExtras,
+) -> Result<(), AuthorizeError> {
+    if !public {
+        return authorize(context, realm_id, auth, path, &Permission::READ, extras).await;
+    }
+    let request = policy_request_with(path, &Permission::READ, Some(auth), extras);
+    enforce_policies(context, realm_id, &request).await?;
+    Ok(())
+}
+
 /// One caller's rules and policies for a bucket, loaded once to decide many of its keys.
 pub struct BucketAccess {
     auth: AuthContext,
@@ -119,5 +136,15 @@ impl BucketAccess {
         let extras = PolicyRequestExtras::rest();
         let request = policy_request_with(&path, permission, Some(&self.auth), extras);
         self.rules.allows(&path, permission) && self.policies.evaluate(&request).is_ok()
+    }
+
+    /// Whether the caller may read every key that starts with `prefix`: READ by a grant on all
+    /// of them, no role deny or path restriction below, and no policy that decides by path.
+    pub fn reads_below(&self, prefix: &str) -> bool {
+        let key = (!prefix.is_empty()).then_some(prefix);
+        let below = format!("{}/{prefix}", self.bucket_path);
+        self.allows(key, &Permission::READ)
+            && self.rules.reads_below(&below)
+            && !self.policies.reads_path()
     }
 }

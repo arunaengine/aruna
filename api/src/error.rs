@@ -50,6 +50,13 @@ pub enum ServerError {
     ComputeQuotaDenied(aruna_core::compute::quota::QuotaDenied),
     #[error("{0}")]
     PayloadTooLarge(String),
+    /// The caller used up today's central assistant calls; retry after the next UTC midnight.
+    #[error("daily assistant limit reached")]
+    AssistantQuota {
+        used: u32,
+        limit: u32,
+        retry_after: u64,
+    },
     /// The record existed and was deleted; unlike a 404 it will not come back.
     #[error("{0}")]
     Gone(String),
@@ -193,7 +200,7 @@ pub struct ErrorResponse {
     /// How many further findings the capped findings list leaves out.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub omitted_findings: Option<usize>,
-    /// The exact standing-quota refusal behind a 409, when one caused it.
+    /// The exact quota refusal behind a 409 or 429, when one caused it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<QuotaDeniedResponse>,
 }
@@ -202,9 +209,10 @@ pub struct ErrorResponse {
 /// decision used. Group totals are approximate across partitions.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QuotaDeniedResponse {
-    /// `job` for a per-job ceiling, `group` for the group's standing cap.
+    /// `job` for a per-job ceiling, `group` for the group's standing cap, `user` for a daily
+    /// per-user count.
     pub scope: String,
-    /// `jobs`, `cpu_cores`, `ram_bytes`, `disk_bytes` or `walltime_ms`.
+    /// `jobs`, `cpu_cores`, `ram_bytes`, `disk_bytes`, `walltime_ms` or `assistant_requests`.
     pub dimension: String,
     pub observed: u64,
     pub requested: u64,
@@ -367,6 +375,11 @@ impl IntoResponse for ServerError {
                 axum::http::HeaderValue::from_static("1"),
             );
         }
+        if let ServerError::AssistantQuota { retry_after, .. } = &self {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, (*retry_after).into());
+        }
         response
     }
 }
@@ -388,6 +401,15 @@ impl ServerError {
         if let ServerError::ComputeQuotaDenied(denied) = self {
             body = body.with_quota((*denied).into());
         }
+        if let ServerError::AssistantQuota { used, limit, .. } = self {
+            body = body.with_quota(QuotaDeniedResponse {
+                scope: "user".to_string(),
+                dimension: "assistant_requests".to_string(),
+                observed: u64::from(*used),
+                requested: 1,
+                limit: u64::from(*limit),
+            });
+        }
         body
     }
 
@@ -403,6 +425,7 @@ impl ServerError {
             | ServerError::ComputeQuotaDenied(_) => StatusCode::CONFLICT,
             ServerError::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             ServerError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ServerError::AssistantQuota { .. } => StatusCode::TOO_MANY_REQUESTS,
             ServerError::Gone(_) => StatusCode::GONE,
             ServerError::BadRequest
             | ServerError::ReservedLabel(_)
@@ -441,6 +464,7 @@ impl ServerError {
             ServerError::ComputeQuotaDenied(_) => "compute_quota_denied".to_string(),
             ServerError::PreconditionFailed(_) => "Precondition failed".to_string(),
             ServerError::PayloadTooLarge(_) => "Payload too large".to_string(),
+            ServerError::AssistantQuota { .. } => "assistant_quota_exhausted".to_string(),
             ServerError::Gone(_) => "Gone".to_string(),
             ServerError::ReservedLabel(_) => "reserved_label".to_string(),
             ServerError::BadRequest

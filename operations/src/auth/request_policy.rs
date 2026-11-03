@@ -138,6 +138,12 @@ impl PolicyEvaluator {
     }
 
     /// Evaluates the realm then the group scope; either may deny, neither grants.
+    /// Whether an enabled policy decides by the request path, so a decision at one path says
+    /// nothing about the paths below it.
+    pub fn reads_path(&self) -> bool {
+        self.realm.needs_path || self.group.as_ref().is_some_and(|group| group.needs_path)
+    }
+
     pub fn evaluate(&self, request: &PolicyRequest) -> Result<(), PolicyEnforcementError> {
         decide(&self.realm, request, "realm")?;
         if let Some(group) = &self.group {

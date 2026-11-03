@@ -81,6 +81,7 @@ async fn exports_local_version() {
     let node = node_state().await;
     let info = bucket_info(&node.state, BUCKET).await.unwrap();
     let input = WriteObjectInput {
+        node_id: None,
         bucket: BUCKET.to_string(),
         key: "notes/a.md".to_string(),
         text: "x".to_string(),
@@ -155,6 +156,7 @@ async fn revoked_token_stops() {
     let node = node_state().await;
     let info = bucket_info(&node.state, BUCKET).await.unwrap();
     let input = WriteObjectInput {
+        node_id: None,
         bucket: BUCKET.to_string(),
         key: "a.md".to_string(),
         text: "x".to_string(),
@@ -322,6 +324,7 @@ async fn nests_release_crates() {
     let node = node_state().await;
     let info = bucket_info(&node.state, BUCKET).await.unwrap();
     let input = WriteObjectInput {
+        node_id: None,
         bucket: BUCKET.to_string(),
         key: "db/a.fasta".to_string(),
         text: ">a".to_string(),

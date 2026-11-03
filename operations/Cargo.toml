@@ -49,6 +49,7 @@ schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
+spareval = { workspace = true }
 spargebra = { workspace = true }
 sysinfo = { workspace = true }
 tantivy = { workspace = true }

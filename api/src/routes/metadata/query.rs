@@ -42,6 +42,7 @@ both answer 404.
   accepted may not be visible yet.
 - `kind` is `Solutions` with one object per row (variable name to lexical value, unbound
   variables omitted) for a `SELECT`, or `Boolean` for an `ASK`.
+- `ORDER BY` is supported; without it the row order is undefined and may change between calls.
 - `complete` is false when a selected partition is missing, and `failed_partitions` names the node
   ids that failed, plus `partition-discovery` when the realm view itself was unavailable.
 
@@ -172,6 +173,8 @@ caller may read, so an anonymous request sees the public documents alone.
   just-accepted write can be missing for a moment.
 - `kind` is `Solutions` with one object per row (variable name to lexical value, unbound
   variables omitted) for a `SELECT`, or `Boolean` for an `ASK`.
+- Without `ORDER BY` the row order is undefined and may change between calls. With `ORDER BY`
+  the merged partition rows are sorted by the query's keys before `LIMIT` is applied.
 
 **Limits**
 - Only `SELECT` and `ASK` are accepted.
@@ -179,10 +182,11 @@ caller may read, so an anonymous request sees the public documents alone.
 - A `LIMIT` above 10000 rows is rejected.
 - `SERVICE` clauses are refused.
 - A distributed query must be union-safe: only an `ASK` or a `SELECT DISTINCT` over a single
-  pattern, without `OFFSET`, can be merged across partitions."#,
+  pattern, without `OFFSET`, can be merged across partitions. Such a `SELECT` may use `ORDER BY`
+  with `ASC` or `DESC` keys that are projected variables."#,
     request_body(
         content = SparqlQueryRequest,
-        description = "A SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` evaluates the current node's authorized graph union. `mode=distributed` accepts only union-safe `ASK` or `SELECT DISTINCT` single-pattern queries, merges partition sets, and is best-effort by default; set `allow_partial=false` to fail when a partition is unavailable.",
+        description = "A SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` evaluates the current node's authorized graph union. `mode=distributed` accepts only union-safe `ASK` or `SELECT DISTINCT` single-pattern queries, optionally ordered by projected variables, merges partition sets, and is best-effort by default; set `allow_partial=false` to fail when a partition is unavailable.",
         examples(
             (
                 "SelectDatasets" = (
@@ -244,7 +248,7 @@ caller may read, so an anonymous request sees the public documents alone.
                 )
             )
         ),
-        (status = 400, description = "Malformed body, a query that is not SELECT or ASK, a query over the size or row limits, a SERVICE clause, or a distributed query that is not union-safe", body = ErrorResponse),
+        (status = 400, description = "Malformed body, a query that is not SELECT or ASK, a query over the size or row limits, a SERVICE clause, a distributed query that is not union-safe, or an ordered distributed query too long to run across the realm", body = ErrorResponse),
         (status = 501, description = "Unsupported query mode; not reachable today because both local and distributed are supported", body = ErrorResponse)
     ),
     security((), ("bearer_auth" = []))

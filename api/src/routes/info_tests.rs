@@ -1344,6 +1344,48 @@ async fn federation_no_config() {
     assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
 }
 
+#[tokio::test]
+async fn accepted_realms_public() {
+    // A visitor learns which realms may log in: none without settings, then exactly what is set.
+    let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+    let auth = admin_auth(realm_id, admin);
+    let public = || async {
+        let info = run_realm_info(&state, None).await.unwrap();
+        serde_json::to_value(info).unwrap()["accepted_realms"].clone()
+    };
+    assert_eq!(public().await, serde_json::json!({"mode": "none"}));
+
+    let other = RealmId::from_bytes([9; 32]).to_string();
+    let only = RealmFederation {
+        accepted_realms: AcceptedRealmsSetting::Only {
+            realms: vec![other.clone()],
+        },
+        ..federation_body("Realm")
+    };
+    let (headers, _) = set_realm_federation(
+        State(state.clone()),
+        Extension(Some(auth.clone())),
+        first_setup(),
+        Json(only),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        public().await,
+        serde_json::json!({"mode": "only", "realms": [other]})
+    );
+
+    let _ = set_realm_federation(
+        State(state.clone()),
+        Extension(Some(auth)),
+        HeaderMap::from_iter([(header::IF_MATCH, headers[header::ETAG].clone())]),
+        Json(federation_body("Realm")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(public().await, serde_json::json!({"mode": "any"}));
+}
+
 /// Anonymous callers keep what they need to authenticate; realm topology,
 /// discovery and quota policy need a token of this realm.
 #[tokio::test]

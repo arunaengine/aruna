@@ -349,11 +349,7 @@ async fn scan_candidates(
     let (heads, next_start) =
         scan_heads(context, input, start, scan_limit, txn_id, distributed).await?;
     let mut live = load_live(context, input, heads, txn_id).await?;
-    // Without a range index, metadata is matched on the versions the scan loaded.
-    if input.key_match == ObjectKeyMatch::Metadata {
-        let (text, exact) = query_terms(&input.query);
-        live.retain(|head| metadata_matches(&head.version.metadata, &text, &exact));
-    }
+    retain_matches(input, &mut live);
     let candidates = build_hits(context, input, live, txn_id).await?;
 
     Ok(CandidateBatch {
@@ -454,6 +450,14 @@ async fn learn_buckets(
         distributed.insert(name, bound);
     }
     Ok(())
+}
+
+/// Keeps the heads whose loaded version matches a metadata query; key queries keep every head.
+fn retain_matches(input: &SearchObjectsInput, live: &mut Vec<LiveHead>) {
+    if input.key_match == ObjectKeyMatch::Metadata {
+        let (text, exact) = query_terms(&input.query);
+        live.retain(|head| metadata_matches(&head.version.metadata, &text, &exact));
+    }
 }
 
 async fn load_live(
@@ -834,7 +838,7 @@ mod tests {
         key: &str,
         created_at: SystemTime,
         hash_byte: u8,
-    ) {
+    ) -> Ulid {
         let version_id = Ulid::generate();
         let blob_hash = [hash_byte; 32];
         write_value(
@@ -883,6 +887,7 @@ mod tests {
             location.to_bytes().unwrap(),
         )
         .await;
+        version_id
     }
 
     async fn seed_deleted(fixture: &Fixture, bucket: &str, key: &str) {

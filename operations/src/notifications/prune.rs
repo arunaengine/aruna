@@ -5,16 +5,19 @@
 use std::time::Duration;
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
+use aruna_core::keyspaces::{
+    NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE,
+};
 use aruna_core::structs::execution::notification::{
     DIRECT_TTL_MS, NotificationClass, NotificationRecord, TRANSIENT_TTL_MS, TRANSIENT_USER_CAP,
     notification_inbox_key, notification_prune_key, parse_prune_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::warn;
@@ -68,6 +71,7 @@ pub(crate) async fn process_prune_page(
     let now_ms = unix_timestamp_millis();
     let phase_a = prune_expired_rows(storage, now_ms, page_size).await?;
     let phase_b = sweep_primary_keyspace(storage, now_ms, page_size).await?;
+    sweep_cutoffs(storage, now_ms, page_size).await?;
     Ok(NotificationPruneOutcome {
         expired: phase_a.expired.saturating_add(phase_b.expired),
         capped: phase_b.capped,
@@ -246,6 +250,105 @@ async fn sweep_primary_keyspace(
     }
 
     Ok(PhaseBOutcome { expired, capped })
+}
+
+/// Removes the bucket deletion times every notice they could drop has outlived.
+async fn sweep_cutoffs(
+    storage: &StorageHandle,
+    now_ms: u64,
+    page_size: usize,
+) -> Result<(), String> {
+    let mut start_after = None;
+    loop {
+        let (values, next_start_after) = iter_page(
+            storage,
+            NOTIFICATION_CUTOFF_KEYSPACE,
+            start_after,
+            page_size,
+        )
+        .await?;
+        let candidates = (values.into_iter())
+            .filter(|(_, value)| cutoff_expired(Some(value), now_ms))
+            .map(|(key, _)| key)
+            .collect();
+        delete_expired(storage, candidates, now_ms).await?;
+        match next_start_after {
+            Some(next) => start_after = Some(next),
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Whether a stored deletion time has outlived every notice it could drop; a malformed one has.
+fn cutoff_expired(value: Option<&Value>, now_ms: u64) -> bool {
+    let longest = DIRECT_TTL_MS.max(TRANSIENT_TTL_MS);
+    value.is_some_and(|value| {
+        <[u8; 8]>::try_from(value.as_ref())
+            .ok()
+            .map(u64::from_be_bytes)
+            .is_none_or(|cutoff| cutoff.saturating_add(longest) <= now_ms)
+    })
+}
+
+/// Deletes the `keys` still expired when read again in one transaction, so a bucket deletion
+/// that renewed one meanwhile keeps it; a conflict leaves all of them to the next sweep.
+async fn delete_expired(
+    storage: &StorageHandle,
+    keys: Vec<Key>,
+    now_ms: u64,
+) -> Result<(), String> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let start = StorageEffect::StartTransaction { read: false };
+    let txn_id = match storage.send_storage_effect(start).await {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(format!("unexpected storage event: {other:?}")),
+    };
+    let space = || NOTIFICATION_CUTOFF_KEYSPACE.to_string();
+    let reads = keys.into_iter().map(|key| (space(), key)).collect();
+    let read = StorageEffect::BatchRead {
+        reads,
+        txn_id: Some(txn_id),
+    };
+    let deletes: Vec<(KeySpace, Key)> = match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => (values.into_iter())
+            .filter(|(_, value)| cutoff_expired(value.as_ref(), now_ms))
+            .map(|(key, _)| (space(), key))
+            .collect(),
+        other => {
+            abort_txn(storage, txn_id).await;
+            return Err(format!("unexpected storage event: {other:?}"));
+        }
+    };
+    if !deletes.is_empty() {
+        let delete = StorageEffect::BatchDelete {
+            deletes,
+            txn_id: Some(txn_id),
+        };
+        if let other @ Event::Storage(StorageEvent::Error { .. }) =
+            storage.send_storage_effect(delete).await
+        {
+            abort_txn(storage, txn_id).await;
+            return Err(format!("unexpected storage event: {other:?}"));
+        }
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }) => Ok(()),
+        other => Err(format!("unexpected storage event: {other:?}")),
+    }
+}
+
+async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
+    let _ = storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
 }
 
 async fn first_prune_delay(storage: &StorageHandle) -> Result<Duration, String> {
@@ -510,6 +613,41 @@ mod tests {
         assert!(!index_exists(&storage, &expired).await);
         assert!(primary_exists(&storage, &live).await);
         assert!(index_exists(&storage, &live).await);
+    }
+
+    #[tokio::test]
+    async fn outlived_cutoffs_pruned() {
+        // A deletion time goes once every notice it could drop has expired.
+        let (_dir, storage) = temp_storage();
+        let now = unix_timestamp_millis();
+        let row = |seed: u8, at: u64| {
+            let key = vec![seed; 4].into();
+            let value = at.to_be_bytes().to_vec().into();
+            (NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key, value)
+        };
+        let writes = vec![row(1, now - 91 * DAY_MS), row(2, now - DAY_MS)];
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        storage.send_storage_effect(write).await;
+
+        process_prune_batch(&context(&storage))
+            .await
+            .expect("prune succeeds");
+
+        let key = |seed: u8| vec![seed; 4].into();
+        assert!(!key_exists(&storage, NOTIFICATION_CUTOFF_KEYSPACE, key(1)).await);
+        assert!(key_exists(&storage, NOTIFICATION_CUTOFF_KEYSPACE, key(2)).await);
+
+        // A deletion renews a time the sweep saw expired: the renewed time stays.
+        let renewed = StorageEffect::BatchWrite {
+            writes: vec![row(3, now)],
+            txn_id: None,
+        };
+        storage.send_storage_effect(renewed).await;
+        delete_expired(&storage, vec![key(3)], now).await.unwrap();
+        assert!(key_exists(&storage, NOTIFICATION_CUTOFF_KEYSPACE, key(3)).await);
     }
 
     #[tokio::test]

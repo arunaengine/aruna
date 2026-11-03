@@ -31,6 +31,9 @@ use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperati
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::get_config::GetConfigOperation;
@@ -151,6 +154,15 @@ async fn setup_fixture() -> Fixture {
     )
     .await
     .unwrap();
+    // Presence lets the realm bucket search discover this node.
+    let presence = AnnouncePresenceConfig {
+        realm_id,
+        node_id,
+        schedule_refresh: false,
+    };
+    drive(AnnouncePresenceOperation::new(presence), &context)
+        .await
+        .unwrap();
     let capabilities = NodeCapabilities::management_node(realm_key).unwrap();
     let state = Arc::new(
         ServerState::new(
@@ -1160,5 +1172,133 @@ async fn authoring_docs_resource() {
     client.cancel().await.unwrap();
     shutdown.cancel();
     task.await.unwrap().unwrap();
+    fixture.net.shutdown().await;
+}
+
+/// Publishes `api` as the api address of `node_id`.
+async fn publish_api(state: &ServerState, node_id: aruna_core::NodeId, api: &str) {
+    use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+    use aruna_core::structs::storage::node_info::{
+        AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
+    };
+    let document = NodeInfoDocument {
+        node_id,
+        executors: Vec::new(),
+        labels: Default::default(),
+        urls: NodeUrls {
+            api: Some(api.to_string()),
+            s3: None,
+        },
+        utilization: NodeUtilization {
+            storage_bytes_used: 0,
+            documents_held: None,
+            load_permille: None,
+            heartbeat_at_ms: 1,
+            download_slots: None,
+            storage_capacity_bytes: None,
+        },
+        updated_at_ms: 1,
+        epoch: AdvertisementEpoch::default(),
+        compute_draining: false,
+        leaving: false,
+        demand: Default::default(),
+        reservation: Default::default(),
+    };
+    let value = document.to_bytes().unwrap();
+    write_value(state, NODE_INFO_KEYSPACE, node_info_key(node_id), value).await;
+}
+
+// A data tool call naming another server node runs on that node's /mcp over HTTP with the
+// caller's token and its answer names that node; one without an address fails naming it.
+#[tokio::test]
+async fn forwards_to_holder() {
+    let fixture = setup_fixture().await;
+    // A second node over the same storage trusts the same token and holds the same bucket.
+    let holder = iroh::SecretKey::from_bytes(&[34u8; 32]).public();
+    let realm_key = SigningKey::from_bytes(&[31u8; 32]);
+    let other = ServerState::new(
+        fixture.state.get_ctx(),
+        fixture.actor.realm_id,
+        holder,
+        NodeCapabilities::management_node(realm_key).unwrap(),
+        false,
+        None,
+        JobsRuntime::new(),
+    )
+    .await;
+    let (other_url, other_stop, other_task) = start_server(Arc::new(other)).await;
+    // Only server nodes of the realm receive a forwarded call; the silent one has no address.
+    let silent = iroh::SecretKey::from_bytes(&[35u8; 32]).public();
+    let realm_id = fixture.state.get_realm_id();
+    let mut realm = drive(GetConfigOperation::new(realm_id), &fixture.state.get_ctx())
+        .await
+        .unwrap();
+    for node_id in [holder, silent] {
+        realm.ensure_node(
+            node_id,
+            aruna_core::structs::identity::realm::RealmNodeKind::Server,
+        );
+    }
+    let realm = realm.to_bytes(&fixture.actor).unwrap();
+    write_value(
+        &fixture.state,
+        REALM_CONFIG_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        realm,
+    )
+    .await;
+    let base = other_url.trim_end_matches("/mcp");
+    publish_api(&fixture.state, holder, &format!("{base}/api/v1")).await;
+    let (url, shutdown, task) = start_server(fixture.state.clone()).await;
+    let client = connect(&url, &fixture.token).await;
+
+    let named = holder.to_string();
+    let listed = call(
+        &client,
+        "list_objects",
+        json!({ "bucket": "mcp-data", "node_id": named }),
+    )
+    .await;
+    assert!(!is_error(&listed), "{listed:?}");
+    assert_eq!(
+        listed.structured_content.as_ref().unwrap()["node_id"],
+        named
+    );
+
+    let missing = call(
+        &client,
+        "read_object",
+        json!({ "bucket": "mcp-data", "key": "nope.txt", "node_id": named }),
+    )
+    .await;
+    assert_eq!(code(&missing), "Not found");
+    let text = missing.structured_content.as_ref().unwrap()["error"].to_string();
+    assert!(text.contains(&named), "{text}");
+
+    let unknown = call(
+        &client,
+        "stat_object",
+        json!({ "bucket": "mcp-data", "key": "nope.txt", "node_id": silent.to_string() }),
+    )
+    .await;
+    assert_eq!(code(&unknown), "Service unavailable");
+
+    // A node that is not a server of the realm never gets the caller's token.
+    let outsider = iroh::SecretKey::from_bytes(&[36u8; 32])
+        .public()
+        .to_string();
+    let refused = call(
+        &client,
+        "stat_object",
+        json!({ "bucket": "mcp-data", "key": "nope.txt", "node_id": outsider }),
+    )
+    .await;
+    assert_eq!(code(&refused), "Bad request");
+
+    client.cancel().await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+    other_stop.cancel();
+    other_task.await.unwrap().unwrap();
     fixture.net.shutdown().await;
 }

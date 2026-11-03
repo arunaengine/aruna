@@ -61,19 +61,36 @@ pub(super) fn cursor_key(topic_id: &TopicId) -> Vec<u8> {
     [b"topic-cursor/".as_slice(), topic_id.as_bytes()].concat()
 }
 
+/// The realm of the node, or `None` before it joined one.
+pub(super) fn node_realm(db: &OptimisticTxDatabase) -> Result<Option<RealmId>, ExplorerError> {
+    Ok(persisted_node_state(db)?.map(|state| state.realm_id))
+}
+
+/// The node's stored identity, or `None` before it has one.
+pub(super) fn persisted_node_state(
+    db: &OptimisticTxDatabase,
+) -> Result<Option<PersistedNodeState>, ExplorerError> {
+    // Opening a missing keyspace would create it.
+    if !db.keyspace_exists(NODE_STATE_KEYSPACE) {
+        return Ok(None);
+    }
+    let states = db.keyspace(NODE_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let Some(state) = db.read_tx().get(&states, NODE_STATE_KEY)? else {
+        return Ok(None);
+    };
+    postcard::from_bytes::<PersistedNodeState>(&state)
+        .map(Some)
+        .map_err(|error| ExplorerError::Decode(error.to_string()))
+}
+
 pub(super) fn info_cleanup(
     db: &OptimisticTxDatabase,
     sync_path: &Path,
     rows: InfoRows<'_>,
 ) -> Result<InfoCleanup, ExplorerError> {
-    let states = db.keyspace(NODE_STATE_KEYSPACE, KeyspaceCreateOptions::default)?;
-    let read = db.read_tx();
-    let Some(state) = read.get(&states, NODE_STATE_KEY)? else {
+    let Some(realm_id) = node_realm(db)? else {
         return Ok(InfoCleanup::default());
     };
-    let realm_id = postcard::from_bytes::<PersistedNodeState>(&state)
-        .map_err(|error| ExplorerError::Decode(error.to_string()))?
-        .realm_id;
     let topics = info_topics(realm_id);
     if !sync_path.exists()
         || FjallStorage::open(sync_path)?
@@ -82,6 +99,19 @@ pub(super) fn info_cleanup(
     {
         return Ok(InfoCleanup::default());
     }
+    topic_rows(db, &topics, rows, |record| {
+        matches!(record.target, DocumentTarget::NodeInfo { .. })
+    })
+}
+
+/// Collects the cursor, quarantine and `queued` outbox rows of `topics` in the node database.
+pub(super) fn topic_rows(
+    db: &OptimisticTxDatabase,
+    topics: &[TopicId],
+    rows: InfoRows<'_>,
+    queued: impl Fn(&DocumentOutboxRecord) -> bool,
+) -> Result<InfoCleanup, ExplorerError> {
+    let read = db.read_tx();
     let mut cleanup = InfoCleanup {
         topics: topics.to_vec(),
         ..InfoCleanup::default()
@@ -91,7 +121,7 @@ pub(super) fn info_cleanup(
             .map_err(|error| ExplorerError::Decode(error.to_string()))?,
         None => SyncQuarantineUsage::default(),
     };
-    for topic_id in &topics {
+    for topic_id in topics {
         if read.get(rows.applied, cursor_key(topic_id))?.is_some() {
             cleanup.cursors.push(cursor_key(topic_id));
         }
@@ -111,9 +141,8 @@ pub(super) fn info_cleanup(
     }
     for entry in read.iter(rows.outbox) {
         let (key, value) = entry.into_inner()?;
-        let node_info = postcard::from_bytes::<DocumentOutboxRecord>(&value)
-            .is_ok_and(|record| matches!(record.target, DocumentTarget::NodeInfo { .. }));
-        if node_info {
+        if postcard::from_bytes::<DocumentOutboxRecord>(&value).is_ok_and(|record| queued(&record))
+        {
             cleanup.outbox.push(key.to_vec());
         }
     }
@@ -151,7 +180,7 @@ pub(super) fn purge_topics(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::migrate_output;
     use super::super::tests::{node_state, read, write};
     use super::*;
@@ -171,11 +200,11 @@ mod tests {
 
     const REALM: RealmId = RealmId([3u8; 32]);
 
-    fn node(seed: u8) -> aruna_core::NodeId {
+    pub(in crate::migrate) fn node(seed: u8) -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    fn genesis(storage: &FjallStorage, topic_id: TopicId) {
+    pub(in crate::migrate) fn genesis(storage: &FjallStorage, topic_id: TopicId) {
         let signer = Ed25519Signer::from_bytes(&[5u8; 32]);
         let genesis = TopicGenesis {
             event_type_id: "test".to_string(),
@@ -192,7 +221,7 @@ mod tests {
             .unwrap();
     }
 
-    fn outbox(target: DocumentTarget) -> Vec<u8> {
+    pub(in crate::migrate) fn outbox(target: DocumentTarget) -> Vec<u8> {
         let change = DocumentChange {
             base: None,
             current: DocumentSyncRevision {

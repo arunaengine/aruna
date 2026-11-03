@@ -336,3 +336,75 @@ async fn versions_roundtrip() {
         serde_json::json!("https://w3id.org/ro/crate/1.3")
     );
 }
+
+/// A holder that materializes a visibility change before it joins the graph topic must not
+/// mint its own genesis: it names no peers, so it can never merge with the holders' topic.
+#[tokio::test]
+async fn policy_mints_nothing() {
+    let (_storage_dir, storage) = auth_storage();
+    let dir = tempdir().expect("metadata dir");
+    let sync_node = irokle::Irokle::builder()
+        .with_fjall_path(dir.path().join("sync"))
+        .and_then(|builder| builder.build())
+        .expect("sync node builds");
+    let handle = MetadataHandle::new_with_options(
+        dir.path().join("metadata"),
+        node_id_seed(9),
+        storage,
+        None,
+        Some(sync_node),
+        None,
+        MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
+    )
+    .expect("metadata handle opens");
+    let graph_iri = "urn:fixture:aruna:policy:restored";
+    let policy = |public| MetadataGraphPolicy {
+        public,
+        permission_paths: vec!["/groups/demo/datasets/restored".to_string()],
+    };
+    assert!(matches!(
+        handle
+            .send_metadata_effect(MetadataEffect::CreateCrate {
+                request: MetadataCrateRequest {
+                    graph_iri: graph_iri.to_string(),
+                    name: "Restored".to_string(),
+                    description: "Created private, then made public".to_string(),
+                    date_published: "2026-11-01".to_string(),
+                    license: None,
+                    policy: policy(false),
+                    durability: MetadataRequestDurability::WalAlreadyDurable,
+                    deterministic_actor: Some([7; 32]),
+                },
+            })
+            .await,
+        Event::Metadata(MetadataEvent::CreateCrateResult { .. })
+    ));
+
+    let event = handle
+        .send_metadata_effect(MetadataEffect::SetGraphPolicy {
+            graph_iri: graph_iri.to_string(),
+            policy: policy(true),
+        })
+        .await;
+
+    assert!(
+        matches!(event, Event::Metadata(MetadataEvent::GraphPolicySet { .. })),
+        "{event:?}"
+    );
+    let event = handle
+        .send_metadata_effect(MetadataEffect::GetGraphPolicy {
+            graph_iri: graph_iri.to_string(),
+        })
+        .await;
+    assert!(
+        matches!(&event, Event::Metadata(MetadataEvent::GraphPolicyResult { policy: set, .. })
+            if *set == policy(true)),
+        "{event:?}"
+    );
+    let topic = handle
+        .inner
+        .node
+        .bind_irokle_topic(&GraphId::new(graph_iri))
+        .expect("topic lookup");
+    assert_eq!(topic, None);
+}

@@ -1360,7 +1360,7 @@ impl S3 for ArunaS3Service {
                 source_auth_context,
                 restrictions: replication_auth.path_restrictions.clone(),
                 references: CopyReferences::Preserve,
-                job_id: None,
+                job_id: VersionOrigin::copy_job(&user_access.access_key),
             },
             token,
         )

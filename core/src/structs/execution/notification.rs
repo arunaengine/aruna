@@ -345,6 +345,14 @@ pub fn notification_inbox_key(recipient: UserId, created_at_ms: u64, notificatio
     ByteView::from(bytes)
 }
 
+/// The deletion cutoff row of one recipient for the bucket a notice names.
+pub fn notification_cutoff_key(recipient: UserId, node_id: NodeId, bucket: &str) -> Key {
+    let mut bytes = recipient.to_storage_key();
+    bytes.extend_from_slice(node_id.as_bytes());
+    bytes.extend_from_slice(bucket.as_bytes());
+    ByteView::from(bytes)
+}
+
 pub fn notification_inbox_prefix(recipient: UserId) -> Key {
     ByteView::from(recipient.to_storage_key())
 }

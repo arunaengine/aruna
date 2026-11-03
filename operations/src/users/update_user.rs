@@ -47,6 +47,7 @@ use crate::sync::document_outbox::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
+use crate::users::merge::{Coordinator, coordinator};
 
 const MAX_USER_LEN: usize = 256;
 
@@ -169,6 +170,8 @@ pub enum UpdateUserError {
     AliasCutOff,
     #[error("the sign-in already belongs to another account")]
     SubjectClaimed,
+    #[error("this node does not run account merges")]
+    NotCoordinator,
     #[error(transparent)]
     AuthorizationError(#[from] AuthorizationError),
     #[error(transparent)]
@@ -338,9 +341,15 @@ impl UpdateUserOperation {
             }))
             .chain(self.input.subject.iter().flat_map(|subject| {
                 let key = subject_index_key(subject);
+                let realm_id = self.input.actor.realm_id;
+                let config = AdminDocumentTarget::RealmConfig { realm_id };
                 [
                     (SUBJECT_CLAIMS_KEYSPACE.to_string(), key.clone()),
                     (SUBJECT_INDEX_KEYSPACE.to_string(), key),
+                    (
+                        DOCUMENT_STATE_KEYSPACE.to_string(),
+                        reducer_state_key(&config),
+                    ),
                 ]
             }))
             .collect(),
@@ -441,7 +450,27 @@ impl UpdateUserOperation {
         let mut admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
         let subject_claims = match self.input.subject.as_ref() {
             Some(_) if !self.input.system => return Err(UpdateUserError::Unauthorized),
-            Some(subject) => attach_subject(&mut user, subject, subject_rows)?,
+            Some(subject) => {
+                let (rows, coordinator_row) = subject_rows.split_at(subject_rows.len().min(2));
+                let state = (coordinator_row
+                    .first()
+                    .and_then(|(_, value)| value.as_deref()))
+                .map(|bytes| {
+                    aruna_core::reducer::decode_reducer_state(bytes).map_err(ConversionError::from)
+                })
+                .transpose()?;
+                // Like a merge, an attach commits only on the pinned coordinator, so the two
+                // never commit on two nodes at once.
+                let pinned = Coordinator::Pinned(self.input.actor.node_id);
+                if realm_config
+                    .as_ref()
+                    .map(|config| coordinator(config, state.as_ref()))
+                    != Some(pinned)
+                {
+                    return Err(UpdateUserError::NotCoordinator);
+                }
+                attach_subject(&mut user, subject, rows)?
+            }
             None => None,
         };
         if let (Some(subject), Some(_)) = (self.input.subject.as_ref(), subject_claims.as_ref()) {
@@ -1161,6 +1190,63 @@ mod pure_tests {
             super::attach_subject(&mut user, "other", &rows),
             Err(UpdateUserError::SubjectClaimed)
         );
+    }
+
+    #[test]
+    fn attach_needs_coordinator() {
+        // An attach commits only on the pinned merge coordinator, whatever routed it here.
+        use aruna_core::admin_documents::AdminDocumentOperation;
+        use aruna_core::storage_entries::reducer_state_entry;
+        use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([4u8; 16]), realm_id);
+        let local = actor(realm_id, user_id);
+        let other = node(5);
+        let mut realm = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        realm.ensure_node(local.node_id, RealmNodeKind::Management);
+        realm.ensure_node(other, RealmNodeKind::Management);
+        let realm_bytes = ByteView::from(realm.to_bytes(&local).unwrap());
+        let pinned = |node_id| {
+            let config = AdminDocumentTarget::RealmConfig { realm_id };
+            let mut state = AdminDocumentState::new(config);
+            let pin = AdminDocumentOperation::MergeCoordinatorSet { node_id };
+            state.apply_operation(&local, pin).unwrap();
+            reducer_state_entry(&state).unwrap().2
+        };
+        let user_bytes = ByteView::from(stored_user(user_id).to_bytes(&local).unwrap());
+        for (coordinator, refused) in [(other, true), (local.node_id, false)] {
+            let mut operation = UpdateUserOperation::new(UpdateUserInput {
+                name: None,
+                set_attributes: HashMap::new(),
+                remove_attributes: Vec::new(),
+                system: true,
+                subject: Some("subject".to_string()),
+                ..input(realm_id, user_id, user_id)
+            });
+            operation.start();
+            let txn_id = TxnId::generate();
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+            let values = [
+                Some(user_bytes.clone()),
+                None,
+                None,
+                Some(realm_bytes.clone()),
+                None,
+                None,
+                Some(pinned(coordinator)),
+            ];
+            let empty = || ByteView::from(Vec::new());
+            let values = values.into_iter().map(|value| (empty(), value)).collect();
+            let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+            let aborted = matches!(
+                effects.first(),
+                Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
+            );
+            assert_eq!(aborted, refused);
+            if refused {
+                assert_eq!(operation.finalize(), Err(UpdateUserError::NotCoordinator));
+            }
+        }
     }
 
     #[test]

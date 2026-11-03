@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::heartbeat::RunningJobs;
+use aruna_core::jobs::{JobKind, RunningJobView};
 use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::execution::job::{
     JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload, JobRecord, JobState,
@@ -52,8 +53,9 @@ struct RunningJob {
     /// zombie's `finish` cannot evict the newer execution that replaced it.
     nonce: u64,
     class: JobExecutionClass,
-    /// A staging import, counted apart in the node's telemetry.
-    import: bool,
+    view: RunningJobView,
+    /// The live counter of an in-process job; external attempts report elsewhere.
+    progress: Option<ProgressReporter>,
     cancel: CancellationToken,
     completion: watch::Sender<bool>,
     claim_token: ulid::Ulid,
@@ -166,14 +168,40 @@ impl JobsRuntime {
         self.state().running.len()
     }
 
-    /// Jobs running here and the staging imports among them, as counts for the node telemetry.
+    /// Jobs running here and the imports among them, as counts for the node telemetry.
     pub fn running_jobs(&self) -> RunningJobs {
         let state = self.state();
-        let imports = state.running.values().filter(|job| job.import).count();
+        let imports = state
+            .running
+            .values()
+            .filter(|job| {
+                matches!(
+                    job.view.kind,
+                    JobKind::Staging | JobKind::ImportRoCrate | JobKind::BackendImport
+                )
+            })
+            .count();
         RunningJobs {
             total: u32::try_from(state.running.len()).unwrap_or(u32::MAX),
             imports: u32::try_from(imports).unwrap_or(u32::MAX),
         }
+    }
+
+    /// Jobs running here with live progress where the job counts something.
+    pub fn running_list(&self) -> Vec<RunningJobView> {
+        let state = self.state();
+        state
+            .running
+            .values()
+            .map(|job| RunningJobView {
+                progress: job
+                    .progress
+                    .as_ref()
+                    .map(ProgressReporter::snapshot)
+                    .filter(|progress| progress.current > 0 || progress.total.is_some()),
+                ..job.view.clone()
+            })
+            .collect()
     }
 
     pub(crate) fn is_started(&self) -> bool {
@@ -243,7 +271,9 @@ impl JobsRuntime {
             return;
         };
         let class = record.execution_class;
-        let import = matches!(record.payload, JobPayload::Staging(_));
+        let view = RunningJobView::new(&record, unix_timestamp_millis());
+        let progress = (class != JobExecutionClass::ExternalAttempt)
+            .then(|| ProgressReporter::from_progress(&record.progress));
         let nonce = self.next_nonce.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let (completion, _) = watch::channel(false);
@@ -265,7 +295,8 @@ impl JobsRuntime {
                 RunningJob {
                     nonce,
                     class,
-                    import,
+                    view,
+                    progress: progress.clone(),
                     cancel: cancel.clone(),
                     completion,
                     claim_token,
@@ -282,7 +313,7 @@ impl JobsRuntime {
                 context.clone(),
                 record,
                 claim_token,
-                cancel,
+                (cancel, progress),
                 (shutdown, turns),
             ))
             .catch_unwind()
@@ -338,7 +369,8 @@ impl JobsRuntime {
                 RunningJob {
                     nonce,
                     class,
-                    import: false,
+                    view: RunningJobView::new(record, unix_timestamp_millis()),
+                    progress: None,
                     cancel: cancel.clone(),
                     completion,
                     claim_token,
@@ -463,7 +495,17 @@ impl JobsRuntime {
             RunningJob {
                 nonce,
                 class,
-                import: false,
+                view: RunningJobView {
+                    kind: JobKind::Probe,
+                    target: None,
+                    group_id: None,
+                    created_by: aruna_core::UserId::nil(
+                        aruna_core::structs::identity::realm::RealmId([0; 32]),
+                    ),
+                    progress: None,
+                    started_at_ms: 0,
+                },
+                progress: None,
                 cancel: CancellationToken::new(),
                 completion,
                 claim_token: ulid::Ulid::generate(),
@@ -608,7 +650,7 @@ async fn run_job(
     context: Arc<DriverContext>,
     record: JobRecord,
     token: ulid::Ulid,
-    cancel: CancellationToken,
+    (cancel, progress): (CancellationToken, Option<ProgressReporter>),
     (shutdown, range_turns): (CancellationToken, RangeTurns),
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
@@ -667,7 +709,7 @@ async fn run_job(
         }
     }
 
-    let progress = ProgressReporter::from_progress(&record.progress);
+    let progress = progress.unwrap_or_else(|| ProgressReporter::from_progress(&record.progress));
     let ctx = JobContext {
         // Bulk lane: imports and other background payloads must not delay API requests.
         driver: Arc::new(context.bulk()),
@@ -1215,7 +1257,7 @@ mod tests {
             ctx,
             claimed,
             token,
-            CancellationToken::new(),
+            (CancellationToken::new(), None),
             (CancellationToken::new(), RangeTurns::default()),
         )
         .await;
@@ -1260,7 +1302,7 @@ mod tests {
             ctx,
             claimed,
             token,
-            CancellationToken::new(),
+            (CancellationToken::new(), None),
             (CancellationToken::new(), RangeTurns::default()),
         )
         .await;
@@ -1288,7 +1330,7 @@ mod tests {
             ctx,
             claimed,
             stale_token,
-            cancel.clone(),
+            (cancel.clone(), None),
             (CancellationToken::new(), RangeTurns::default()),
         ));
         for _ in 0..100 {
@@ -1920,16 +1962,58 @@ mod tests {
         assert_eq!(runtime.running_jobs(), RunningJobs::default());
 
         let nonce = runtime.register_test_execution(job_id, JobExecutionClass::InProcess);
-        runtime.state().running.get_mut(&job_id).unwrap().import = true;
-        assert_eq!(
-            runtime.running_jobs(),
-            RunningJobs {
-                total: 1,
-                imports: 1
-            }
-        );
+        for kind in [
+            JobKind::Staging,
+            JobKind::ImportRoCrate,
+            JobKind::BackendImport,
+        ] {
+            runtime.state().running.get_mut(&job_id).unwrap().view.kind = kind;
+            assert_eq!(
+                runtime.running_jobs(),
+                RunningJobs {
+                    total: 1,
+                    imports: 1
+                }
+            );
+        }
         runtime.finish(&context(storage), job_id, nonce).await;
         assert_eq!(runtime.running_jobs(), RunningJobs::default());
+    }
+
+    // The list carries what an import works on, and progress only once the job counts.
+    #[tokio::test]
+    async fn lists_running_jobs() {
+        let runtime = JobsRuntime::new();
+        let job_id = JobId::from_bytes([0x6C; 16]);
+        runtime.register_test_execution(job_id, JobExecutionClass::InProcess);
+        let reporter = ProgressReporter::from_progress(
+            &aruna_core::structs::execution::job::JobProgress::new("entries"),
+        );
+        {
+            let mut state = runtime.state();
+            let job = state.running.get_mut(&job_id).unwrap();
+            job.view = RunningJobView::new(&import_record(job_id), 42);
+            job.progress = Some(reporter.clone());
+        }
+        let listed = runtime.running_list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, JobKind::ImportRoCrate);
+        assert_eq!(
+            listed[0].target,
+            Some(aruna_core::jobs::JobTarget::Bucket {
+                bucket: "target".to_string(),
+                path: Some("crate".to_string()),
+                exact: false,
+            })
+        );
+        assert_eq!(listed[0].group_id, Some(Ulid::from_bytes([4u8; 16])));
+        assert_eq!(listed[0].started_at_ms, 42);
+        assert_eq!(listed[0].progress, None, "nothing counted yet");
+
+        reporter.set_total(20);
+        reporter.set_current(14);
+        let progress = runtime.running_list()[0].progress.clone().unwrap();
+        assert_eq!((progress.current, progress.total), (14, Some(20)));
     }
 
     #[derive(Default)]

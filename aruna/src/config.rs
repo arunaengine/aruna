@@ -136,6 +136,7 @@ pub enum PortalConfig {
     Artifact {
         artifact: PortalArtifactConfig,
         socket_addr: SocketAddr,
+        login: Option<aruna_api::portal::PortalLogin>,
     },
 }
 

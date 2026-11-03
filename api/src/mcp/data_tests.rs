@@ -305,6 +305,7 @@ async fn lists_readable_objects() {
         .unwrap();
     for key in ["a.md", "secret.md", "z.md"] {
         let input = WriteObjectInput {
+            node_id: None,
             bucket: bucket.to_string(),
             key: key.to_string(),
             text: "x".to_string(),
@@ -343,6 +344,7 @@ async fn lists_readable_objects() {
             .extensions
             .insert(None::<crate::auth::ValidatedBearer>);
         let input = ListObjectsInput {
+            node_id: None,
             bucket: bucket.to_string(),
             prefix: None,
             cursor: cursor.take(),
@@ -401,6 +403,7 @@ mod distributed {
 
     fn write(key: &str) -> WriteObjectInput {
         WriteObjectInput {
+            node_id: None,
             bucket: BUCKET.to_string(),
             key: key.to_string(),
             text: "noted".to_string(),
@@ -466,6 +469,7 @@ mod distributed {
         // A link to a target the caller cannot read stays out of the range's listing.
         hidden_link(&members, "a/secret").await;
         let input = ListObjectsInput {
+            node_id: None,
             bucket: BUCKET.to_string(),
             prefix: Some("a/".to_string()),
             cursor: None,
@@ -516,4 +520,442 @@ mod distributed {
         let head = drive(HeadObjectOperation::new(input), &node.context).await;
         assert!(head.is_err(), "nothing is stored on the relaying member");
     }
+}
+
+fn caller(auth: &AuthContext) -> http::request::Parts {
+    let (mut parts, ()) = http::Request::new(()).into_parts();
+    parts.extensions.insert(Some(auth.clone()));
+    parts
+        .extensions
+        .insert(None::<crate::auth::ValidatedBearer>);
+    parts
+}
+
+// The bucket list shows what the bucket search shows: a public bucket of another group joins
+// the caller's own; a closed bucket or one a deny policy hides, also for MCP only, is left out.
+#[tokio::test]
+async fn lists_readable_buckets() {
+    use crate::tests::distributed::{bucket_info, node_state, write};
+    use crate::tests::routes::{open_paths, seed_group_docs};
+    use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = node_state().await;
+    let (state, realm_id) = (&node.state, node.state.get_realm_id());
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: node.owner.user_id,
+        realm_id,
+    };
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.ensure_node(state.get_node_id(), RealmNodeKind::Server);
+    config.request_policies = vec![
+        RequestPolicy {
+            policy_id: ulid::Ulid::from_parts(3, 3),
+            name: "hide-bucket".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "path.endsWith('/hidden')".to_string(),
+            enabled: true,
+        },
+        RequestPolicy {
+            policy_id: ulid::Ulid::from_parts(3, 4),
+            name: "hide-from-mcp".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: "operation == 'mcp:list_buckets' && path.endsWith('/closed-data')"
+                .to_string(),
+            enabled: true,
+        },
+    ];
+    let config = config.to_bytes(&actor).unwrap();
+    write(
+        state,
+        REALM_CONFIG_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        config,
+    )
+    .await;
+    let other = ulid::Ulid::from_bytes([21; 16]);
+    let stranger = Actor {
+        user_id: node.stranger.user_id,
+        ..actor
+    };
+    let context = state.get_ctx();
+    seed_group_docs(
+        &context,
+        realm_id,
+        &stranger,
+        other,
+        "other",
+        stranger.user_id,
+    )
+    .await;
+    for (bucket, group_id) in [
+        ("hidden", node.group_id),
+        ("open-data", other),
+        ("closed-data", other),
+    ] {
+        let info = bucket_info(group_id, None).to_bytes().unwrap();
+        write(state, S3_BUCKET_KEYSPACE, bucket.as_bytes().to_vec(), info).await;
+    }
+    let open = bucket_permission_path(realm_id, other, state.get_node_id(), "open-data");
+    open_paths(&context, &stranger, other, &[open]).await;
+    let server = McpServer::new(state.clone());
+    for (auth, expected) in [
+        (&node.owner, &["open-data", "routed"][..]),
+        (&node.stranger, &["open-data"][..]),
+    ] {
+        let input = Parameters(ListBucketsInput::default());
+        let listed = server.list_buckets(Extension(caller(auth)), input).await;
+        let listed = listed.unwrap().0;
+        let names: Vec<&str> = listed
+            .buckets
+            .iter()
+            .map(|hit| hit.bucket.as_str())
+            .collect();
+        assert_eq!(names, expected);
+        assert_eq!(listed.buckets[0].node_id, state.get_node_id().to_string());
+    }
+}
+
+/// Writes `key` as a reference to an external file, which keeps no blob on this node.
+async fn external_reference(node: &crate::tests::distributed::Node, key: &str) {
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::execution::staging::{
+        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    let descriptor = PortableSourceDescriptor {
+        kind: SourceConnectorKind::Http,
+        public_config: HashMap::new(),
+        source_path: "https://ftp.ncbi.nlm.nih.gov/genomes/all/x.fna".to_string(),
+        version_selector: None,
+        capabilities: Vec::new(),
+        origin_node_id: None,
+        namespace: None,
+        root: None,
+    };
+    let write = ReferenceWrite {
+        job_id: None,
+        preassigned_version_id: None,
+        group_id: node.group_id,
+        user_id: node.owner.user_id,
+        realm_id: node.owner.realm_id,
+        node_id: node.state.get_node_id(),
+        bucket: crate::tests::distributed::BUCKET.to_string(),
+        key: key.to_string(),
+        expected_bucket: None,
+        version_source: VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor,
+            connector_id: None,
+            mirrors: Vec::new(),
+        },
+        metadata: SourceMetadata {
+            content_length: 7,
+            content_type: Some("text/plain".to_string()),
+            etag: Some("ref".to_string()),
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        },
+        inherited_policies: Vec::new(),
+        connector_guard: None,
+        restrictions: None,
+        mirror_guards: Vec::new(),
+    };
+    write_reference_version(&node.state.get_ctx(), write)
+        .await
+        .unwrap();
+}
+
+// READ that a public role grants on a prefix lists that prefix, external references included,
+// as the REST listing does; the bucket root stays refused.
+#[tokio::test]
+async fn lists_public_prefix() {
+    use crate::tests::distributed::{BUCKET, node_state};
+    use aruna_core::structs::identity::auth::Actor;
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = node_state().await;
+    let info = crate::routes::storage::deletion::bucket_info(&node.state, BUCKET)
+        .await
+        .unwrap();
+    for key in ["closed.md", "open/b.md"] {
+        let input = WriteObjectInput {
+            node_id: None,
+            bucket: BUCKET.to_string(),
+            key: key.to_string(),
+            text: "x".to_string(),
+            content_type: None,
+        };
+        store_text(&node.state, &node.owner, &info, input, Default::default())
+            .await
+            .unwrap();
+    }
+    external_reference(&node, "open/ref.fna").await;
+    let state = &node.state;
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let open = object_permission_path(realm_id, node.group_id, node_id, BUCKET, "open/**");
+    let actor = Actor {
+        node_id,
+        user_id: node.owner.user_id,
+        realm_id,
+    };
+    crate::tests::routes::open_paths(&state.get_ctx(), &actor, node.group_id, &[open]).await;
+    let server = McpServer::new(state.clone());
+    let list = |prefix: Option<&str>| ListObjectsInput {
+        node_id: None,
+        bucket: BUCKET.to_string(),
+        prefix: prefix.map(str::to_string),
+        cursor: None,
+        limit: None,
+    };
+    let stranger = || Extension(caller(&node.stranger));
+    let listed = server.list_objects(stranger(), Parameters(list(Some("open/"))));
+    let listed = listed.await.unwrap().0;
+    let keys: Vec<&str> = listed
+        .objects
+        .iter()
+        .map(|object| object.key.as_str())
+        .collect();
+    assert_eq!(keys, ["open/b.md", "open/ref.fna"]);
+    let root = server
+        .list_objects(stranger(), Parameters(list(None)))
+        .await;
+    let Err(root) = root else {
+        panic!("the bucket root stays refused");
+    };
+    assert_eq!(body(root)["code"], "Forbidden");
+    let aggregate = AggregateObjectsInput {
+        node_id: None,
+        bucket: BUCKET.to_string(),
+        prefix: Some("open/".to_string()),
+        bucket_by: BucketUnit::Day,
+        since: None,
+        until: None,
+        max_buckets: None,
+    };
+    let counted = server.aggregate_objects(stranger(), Parameters(aggregate));
+    assert_eq!(counted.await.unwrap().0.scanned, 2);
+    let stat = StatObjectInput {
+        node_id: None,
+        bucket: BUCKET.to_string(),
+        key: "open/ref.fna".to_string(),
+        version_id: None,
+    };
+    let stat = server
+        .stat_object(stranger(), Parameters(stat))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!((stat.size, stat.content_type.as_str()), (7, "text/plain"));
+}
+
+// An exact grant on one key admits that key as a prefix, but the aggregate counts only what the
+// caller may read, as the REST listing shows it, not a longer key behind the same prefix.
+#[tokio::test]
+async fn aggregate_hides_keys() {
+    use crate::tests::distributed::{BUCKET, node_state};
+    use aruna_core::structs::identity::auth::Actor;
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = node_state().await;
+    let info = crate::routes::storage::deletion::bucket_info(&node.state, BUCKET)
+        .await
+        .unwrap();
+    for key in ["open.txt", "open.txt.secret"] {
+        let input = WriteObjectInput {
+            node_id: None,
+            bucket: BUCKET.to_string(),
+            key: key.to_string(),
+            text: "x".to_string(),
+            content_type: None,
+        };
+        store_text(&node.state, &node.owner, &info, input, Default::default())
+            .await
+            .unwrap();
+    }
+    let state = &node.state;
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let open = object_permission_path(realm_id, node.group_id, node_id, BUCKET, "open.txt");
+    let actor = Actor {
+        node_id,
+        user_id: node.owner.user_id,
+        realm_id,
+    };
+    crate::tests::routes::open_paths(&state.get_ctx(), &actor, node.group_id, &[open]).await;
+    let server = McpServer::new(state.clone());
+    let aggregate = AggregateObjectsInput {
+        node_id: None,
+        bucket: BUCKET.to_string(),
+        prefix: Some("open.txt".to_string()),
+        bucket_by: BucketUnit::Day,
+        since: None,
+        until: None,
+        max_buckets: None,
+    };
+    let counted =
+        server.aggregate_objects(Extension(caller(&node.stranger)), Parameters(aggregate));
+    let counted = counted.await.unwrap().0;
+    assert_eq!((counted.scanned, counted.total_count), (1, 1));
+}
+
+// A mostly unreadable bucket ends the aggregate after a bounded number of listing pages, hidden
+// entries included, and reports it as truncated without saying how many entries were hidden.
+#[tokio::test]
+async fn aggregate_work_bounded() {
+    use crate::tests::distributed::{BUCKET, node_state, write};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, VersionKey};
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = node_state().await;
+    let state = &node.state;
+    let info = crate::routes::storage::deletion::bucket_info(state, BUCKET)
+        .await
+        .unwrap();
+    let input = WriteObjectInput {
+        node_id: None,
+        bucket: BUCKET.to_string(),
+        key: "a.md".to_string(),
+        text: "x".to_string(),
+        content_type: None,
+    };
+    let stored = store_text(state, &node.owner, &info, input, Default::default());
+    let version_id = ulid::Ulid::from_string(&stored.await.unwrap().version_id).unwrap();
+    let row = VersionKey::new(BUCKET, "a.md", version_id)
+        .to_bytes()
+        .unwrap();
+    let read = StorageEffect::Read {
+        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+        key: row.into(),
+        txn_id: None,
+    };
+    let event = state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(read)
+        .await;
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(version),
+        ..
+    }) = event
+    else {
+        panic!("the stored version is readable");
+    };
+    // More hidden keys than the aggregate may examine, each a version of the same stored blob.
+    for index in 0..MAX_SCAN_OBJECTS + 1 {
+        let key = format!("a.md.{index:06}");
+        let version_id = ulid::Ulid::generate();
+        let head = BlobHeadKey::new(BUCKET, &key).to_bytes().unwrap();
+        let pointer = CurrentVersionPointer::new(version_id).to_bytes().unwrap();
+        write(state, BLOB_HEAD_KEYSPACE, head, pointer).await;
+        let row = VersionKey::new(BUCKET, &key, version_id)
+            .to_bytes()
+            .unwrap();
+        write(state, BLOB_VERSIONS_KEYSPACE, row, version.to_vec()).await;
+    }
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let open = object_permission_path(realm_id, node.group_id, node_id, BUCKET, "a.md");
+    let actor = Actor {
+        node_id,
+        user_id: node.owner.user_id,
+        realm_id,
+    };
+    crate::tests::routes::open_paths(&state.get_ctx(), &actor, node.group_id, &[open]).await;
+    let server = McpServer::new(state.clone());
+    let aggregate = AggregateObjectsInput {
+        node_id: None,
+        bucket: BUCKET.to_string(),
+        prefix: Some("a.md".to_string()),
+        bucket_by: BucketUnit::Day,
+        since: None,
+        until: None,
+        max_buckets: None,
+    };
+    let counted =
+        server.aggregate_objects(Extension(caller(&node.stranger)), Parameters(aggregate));
+    let counted = counted.await.unwrap().0;
+    assert_eq!((counted.scanned, counted.truncated), (1, true));
+}
+
+// A group policy on the MCP tool's parameters applies to every listed bucket of the group: a
+// deny of continuation pages hides the group's buckets there, while the first page lists them.
+#[tokio::test]
+async fn continuation_policy_applies() {
+    use crate::tests::distributed::{bucket_info, node_state, write};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    use rmcp::handler::server::wrapper::Parameters;
+    let node = node_state().await;
+    let (state, realm_id) = (&node.state, node.state.get_realm_id());
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: node.owner.user_id,
+        realm_id,
+    };
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.ensure_node(state.get_node_id(), RealmNodeKind::Server);
+    let config = config.to_bytes(&actor).unwrap();
+    write(
+        state,
+        REALM_CONFIG_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        config,
+    )
+    .await;
+    let owner = node.owner.user_id;
+    let mut group = GroupAuthorizationDocument::default_group_doc(owner, realm_id, node.group_id);
+    group.policies = vec![RequestPolicy {
+        policy_id: ulid::Ulid::from_parts(8, 8),
+        name: "first-page-only".to_string(),
+        kind: PolicyKind::Deny,
+        when: None,
+        expression: "operation == 'mcp:list_buckets' && 'cursor' in params".to_string(),
+        enabled: true,
+    }];
+    let group = group.to_bytes(&actor).unwrap();
+    write(
+        state,
+        AUTH_KEYSPACE,
+        node.group_id.to_bytes().to_vec(),
+        group,
+    )
+    .await;
+    // More buckets than one page holds, so the first page ends with a cursor.
+    for index in 0..BUCKET_PAGE {
+        let info = bucket_info(node.group_id, None).to_bytes().unwrap();
+        let name = format!("page-{index:03}");
+        write(state, S3_BUCKET_KEYSPACE, name.into_bytes(), info).await;
+    }
+    let server = McpServer::new(state.clone());
+    let first = Parameters(ListBucketsInput::default());
+    let first = server
+        .list_buckets(Extension(caller(&node.owner)), first)
+        .await;
+    let first = first.unwrap().0;
+    assert_eq!(first.buckets.len(), BUCKET_PAGE);
+    let cursor = first.next_cursor.expect("a second page follows");
+    let next = Parameters(ListBucketsInput {
+        cursor: Some(cursor),
+    });
+    let next = server
+        .list_buckets(Extension(caller(&node.owner)), next)
+        .await;
+    let names: Vec<String> = next
+        .unwrap()
+        .0
+        .buckets
+        .into_iter()
+        .map(|hit| hit.bucket)
+        .collect();
+    assert!(names.is_empty(), "{names:?}");
 }

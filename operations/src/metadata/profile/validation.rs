@@ -10,16 +10,16 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::VALIDATION_STATUS_KEYSPACE;
 use aruna_core::metadata::{
-    MetadataError, MetadataRawRevision, MetadataValidationViolation, ProfileValidationCompleteness,
-    ProfileValidationFinding, ProfileValidationSeverity, ProfileValidationState,
-    ProfileValidationStatus, is_rocrate_specification,
+    MetadataBatch, MetadataError, MetadataQuadOp, MetadataRawRevision, MetadataValidationViolation,
+    ProfileValidationCompleteness, ProfileValidationFinding, ProfileValidationSeverity,
+    ProfileValidationState, ProfileValidationStatus, is_rocrate_specification,
 };
 use aruna_core::storage_entries::{profile_validation_entry, profile_validation_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis as now_ms;
 use aruna_core::types::{GroupId, TxnId};
 use craqle::{CrateViolation, ShaclValidationResult};
-use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Quad, Term};
 use oxttl::NQuadsParser;
 use ulid::Ulid;
 
@@ -27,9 +27,9 @@ use crate::driver::DriverContext;
 use crate::metadata::MetadataHandle;
 use crate::metadata::api::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
-use crate::metadata::forward::export_profile_routed;
+use crate::metadata::forward::{PROFILE_DOCUMENT_PREFIX, export_profile_routed};
 use crate::metadata::profile::shacl::{
-    ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
+    CRAQLE_BASE_IRI, ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
 };
 use crate::metadata::raw_revision::load_raw_revision;
 use crate::metadata::repository::{StorageReadError, parse_registry_read, read_document_registry};
@@ -161,6 +161,37 @@ pub(crate) fn submission_profile_tag(jsonld: &str) -> bool {
     data_graph(jsonld)
         .map(|(data, root)| !profile_tags(&data, &root).is_empty())
         .unwrap_or(true)
+}
+
+/// Refuses a Profile root outside `profiles/`, the only path clients list as Profiles.
+pub(crate) fn profile_path_rule(
+    document_path: &str,
+    profile: impl FnOnce() -> bool,
+) -> Result<(), MetadataError> {
+    let path = MetadataRegistryRecord::normalize_document_path(document_path);
+    if path.starts_with(PROFILE_DOCUMENT_PREFIX) || !profile() {
+        return Ok(());
+    }
+    Err(MetadataError::InvalidInput(
+        "Profiles must be stored under profiles/; use a document path that starts with profiles/"
+            .to_string(),
+    ))
+}
+
+pub(crate) fn crate_is_profile(jsonld: &str) -> bool {
+    data_graph(jsonld).is_ok_and(|(data, root)| has_type(&data, &root, DX_PROFILE))
+}
+
+pub(crate) fn batch_adds_profile(batch: &MetadataBatch) -> bool {
+    let (root, rdf_type, profile) = (
+        format!("<{}>", batch.graph_iri),
+        format!("<{RDF_TYPE}>"),
+        format!("<{DX_PROFILE}>"),
+    );
+    batch.ops.iter().any(|op| {
+        matches!(op, MetadataQuadOp::Add { subject, predicate, object, .. }
+            if *subject == root && *predicate == rdf_type && *object == profile)
+    })
 }
 
 pub async fn validate_submission(
@@ -942,11 +973,14 @@ fn data_graph(jsonld: &str) -> Result<(Dataset, NamedOrBlankNode), MetadataError
     Ok((dataset, root))
 }
 
+/// The entity the metadata descriptor is `about`; an `about` of any other entity names no root.
 fn crate_root(dataset: &Dataset) -> Option<NamedOrBlankNode> {
     for predicate in [SCHEMA_ABOUT, SCHEMA_HTTPS_ABOUT] {
         let predicate = NamedNode::new_unchecked(predicate);
         for quad in dataset.quads_for_predicate(&predicate) {
-            if !quad.graph_name.is_default_graph() {
+            let descriptor = matches!(quad.subject, NamedOrBlankNodeRef::NamedNode(subject)
+                if subject.as_str().strip_prefix(CRAQLE_BASE_IRI) == Some("ro-crate-metadata.json"));
+            if !quad.graph_name.is_default_graph() || !descriptor {
                 continue;
             }
             if let Some(root) = term_as_node(quad.object.into_owned()) {
@@ -1201,6 +1235,47 @@ mod tests {
             ]
         })
         .to_string()
+    }
+
+    #[test]
+    fn root_from_descriptor() {
+        // An `about` of another entity never picks the root, so a Profile root stays a Profile.
+        let mut graph = vec![
+            serde_json::json!({
+                "@id": "ro-crate-metadata.json",
+                "@type": "CreativeWork",
+                "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+                "about": {"@id": "https://example.test/profile"}
+            }),
+            serde_json::json!({"@id": "https://example.test/profile", "@type": DX_PROFILE}),
+        ];
+        for index in 0..16 {
+            let note = format!("https://example.test/note/{index}");
+            let other = format!("https://example.test/other/{index}");
+            graph.push(serde_json::json!({"@id": note, "about": {"@id": other.clone()}}));
+            graph.push(serde_json::json!({"@id": other, "@type": "Thing"}));
+        }
+        let context = "https://w3id.org/ro/crate/1.2/context";
+        let jsonld = serde_json::json!({"@context": context, "@graph": graph}).to_string();
+        assert!(crate_is_profile(&jsonld));
+        // A subject whose name only ends like the descriptor's names no root either.
+        let mut graph =
+            vec![serde_json::json!({"@id": "https://example.test/profile", "@type": DX_PROFILE})];
+        for index in 0..16 {
+            let other = format!("https://example.test/other/{index}");
+            graph.push(serde_json::json!({
+                "@id": format!("note-{index}-ro-crate-metadata.json"),
+                "about": {"@id": other.clone()}
+            }));
+            graph.push(serde_json::json!({"@id": other, "@type": "Thing"}));
+        }
+        graph.push(serde_json::json!({
+            "@id": "ro-crate-metadata.json",
+            "@type": "CreativeWork",
+            "about": {"@id": "https://example.test/profile"}
+        }));
+        let jsonld = serde_json::json!({"@context": context, "@graph": graph}).to_string();
+        assert!(crate_is_profile(&jsonld));
     }
 
     #[test]
