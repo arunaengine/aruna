@@ -6623,9 +6623,8 @@ checksum = "13bee6c73da26345c729282832b60b0363cf3dd9f4bfd81d8551b7a1c889a113"
 
 [[package]]
 name = "pithos_lib"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "344739af0ec94bb61014f8123a76ed3ff1b6f593c6cb5739a0f6e7cab74356ad"
+version = "0.8.1"
+source = "git+https://github.com/arunaengine/pithos?rev=2996df4269dd93fff3421e516fdd11f1a47c3be7#2996df4269dd93fff3421e516fdd11f1a47c3be7"
 dependencies = [
  "aes-gcm 0.11.1",
  "blake3",
