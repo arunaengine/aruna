@@ -194,7 +194,7 @@ async fn create_credential(
 }
 
 #[test]
-fn expiry_bounded_by_bearer() {
+fn bearer_bounds_expiry() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let bearer = 1_000_000 + 3_600;
     let expiry = credential_expiry(now, None, bearer).unwrap();

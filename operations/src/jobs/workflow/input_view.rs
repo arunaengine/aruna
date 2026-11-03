@@ -680,7 +680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caches_plain_local_copies() {
+    async fn caches_local_copies() {
         use aruna_core::effects::StorageEffect;
         use aruna_core::structs::storage::encryption::EncryptionMode;
 
@@ -746,7 +746,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_needs_object_reads() {
+    async fn manifest_needs_reads() {
         // A rule that denies only GetObject keeps an input out of the file list.
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;

@@ -393,7 +393,7 @@ mod pure_tests {
 
     // A full revocation set never keeps a session alive: the user's cutoff moves past it.
     #[test]
-    fn full_set_raises_cutoff() {
+    fn full_revocation_cutoff() {
         let realm_id = RealmId::from_bytes([3; 32]);
         let user_id = UserId::new(Ulid::from_bytes([4; 16]), realm_id);
         let session_id = Ulid::from_bytes([5; 16]).to_string();
