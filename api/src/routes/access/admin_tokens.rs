@@ -2,12 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{parse_group_id, require_unrestricted_auth};
+use crate::auth::{ensure_permission, parse_group_id, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::access::groups::ensure_group_admin;
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::revoke_token::RevokeTokenError;
 use aruna_operations::driver::drive;
@@ -130,6 +131,7 @@ async fn run_revocation(
     group_id: ulid::Ulid,
     target: RevokeTarget,
 ) -> ServerResult<RevocationResponse> {
+    ensure_group_admin(state, &auth, group_id).await?;
     let revocation = drive(
         RevokeTokensOperation::new(RevokeTokensConfig {
             actor: actor_for(state, &auth),
@@ -198,6 +200,7 @@ pub async fn list_group_tokens(
 ) -> ServerResult<(StatusCode, Json<GroupTokensResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
+    ensure_group_admin(&state, &auth, group_id).await?;
     let tokens = drive(
         ListTokensOperation::new(GroupTokensConfig {
             auth_context: auth,
@@ -337,6 +340,8 @@ pub async fn revoke_user_tokens(
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let target = UserId::from_string(&id).map_err(|_| ServerError::BadRequest)?;
+    let path = format!("/{}/admin/u/{target}", auth.realm_id);
+    ensure_permission(&state, &auth, path, Permission::WRITE).await?;
     drive(
         RevokeAllOperation::new(RevokeAllConfig {
             actor: actor_for(&state, &auth),

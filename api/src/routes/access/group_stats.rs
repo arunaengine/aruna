@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{parse_group_id, require_unrestricted_auth};
+use crate::auth::{ensure_permission, parse_group_id, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::access::groups::load_group;
+use crate::routes::access::groups::{ensure_group_admin, load_group};
 use crate::routes::info::{GroupQuotaStatus, distinct_buckets, load_realm_usage};
 use crate::server::state::ServerState;
 use aruna_core::UserId;
@@ -14,9 +14,6 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::types::GroupId;
-use aruna_operations::auth::check_permissions::{
-    CheckPermissionsConfig, CheckPermissionsOperation,
-};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::admin_check::{AdminCheckOperation, realm_groups_path};
 use aruna_operations::groups::list_groups::ListGroupOperation;
@@ -215,6 +212,7 @@ pub async fn get_group_statistics(
 ) -> ServerResult<(StatusCode, Json<GroupStatsResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
+    ensure_group_admin(&state, &auth, group_id).await?;
     let allowed = drive(
         AdminCheckOperation::new(auth.clone(), group_id),
         &state.get_ctx(),
@@ -287,17 +285,7 @@ pub async fn list_group_statistics(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<GroupStatsList>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
-        path: realm_groups_path(&auth),
-        auth_context: auth,
-        required_permission: Permission::WRITE,
-    });
-    let allowed = drive(check, &state.get_ctx())
-        .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    if !allowed {
-        return Err(ServerError::Forbidden);
-    }
+    ensure_permission(&state, &auth, realm_groups_path(&auth), Permission::WRITE).await?;
     let groups = drive(ListGroupOperation::new(), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.to_string()))?;

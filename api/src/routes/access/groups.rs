@@ -890,7 +890,7 @@ pub async fn update_group(
 
 /// The operation decides again; the boundary refuses early for anyone who is
 /// neither a group admin nor a realm groups administrator.
-async fn ensure_group_admin(
+pub(crate) async fn ensure_group_admin(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,

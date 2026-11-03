@@ -796,6 +796,69 @@ async fn realm_admin_statistics() {
     assert!(matches!(usage, Err(ServerError::Forbidden)));
 }
 
+/// Request policies that deny the admin paths also close the token and statistics routes.
+#[tokio::test]
+async fn policy_denies_admins() {
+    use crate::routes::access::admin_tokens::{list_group_tokens, revoke_user_tokens};
+    use crate::routes::access::group_stats::{get_group_statistics, list_group_statistics};
+    let (state, admin, _tempdir) = setup_admin_state().await;
+    let realm_id = state.get_realm_id();
+    let owner = UserId::local(Ulid::generate(), realm_id);
+    let group_id = seed_group(&state, owner).await;
+    let stats = |user: UserId| {
+        get_group_statistics(
+            State(state.clone()),
+            Extension(Some(member_auth(user))),
+            Path(group_id.to_string()),
+        )
+    };
+    let tokens = |user: UserId| {
+        list_group_tokens(
+            State(state.clone()),
+            Extension(Some(member_auth(user))),
+            Path(group_id.to_string()),
+        )
+    };
+    let overview =
+        || list_group_statistics(State(state.clone()), Extension(Some(member_auth(admin))));
+    let revoke_all = || {
+        revoke_user_tokens(
+            State(state.clone()),
+            Extension(Some(member_auth(admin))),
+            Path(owner.to_string()),
+        )
+    };
+    assert!(stats(owner).await.is_ok() && tokens(owner).await.is_ok());
+    assert!(stats(admin).await.is_ok() && overview().await.is_ok());
+    assert!(revoke_all().await.is_ok());
+
+    let denied = [
+        format!("/{realm_id}/g/{group_id}/admin"),
+        format!("/{realm_id}/admin/groups"),
+        format!("/{realm_id}/admin/u/{owner}"),
+    ];
+    update_config(&state, |config| {
+        for path in &denied {
+            config
+                .request_policies
+                .push(aruna_core::request_policy::RequestPolicy {
+                    policy_id: Ulid::generate(),
+                    name: format!("deny {path}"),
+                    kind: aruna_core::request_policy::PolicyKind::Deny,
+                    when: None,
+                    expression: format!("path == '{path}'"),
+                    enabled: true,
+                });
+        }
+    })
+    .await;
+    assert!(matches!(stats(owner).await, Err(ServerError::Forbidden)));
+    assert!(matches!(tokens(owner).await, Err(ServerError::Forbidden)));
+    assert!(matches!(stats(admin).await, Err(ServerError::Forbidden)));
+    assert!(matches!(overview().await, Err(ServerError::Forbidden)));
+    assert!(matches!(revoke_all().await, Err(ServerError::Forbidden)));
+}
+
 async fn seed_bucket(state: &ServerState, bucket: &str, group_id: Ulid) {
     let info = BucketInfo {
         group_id,
