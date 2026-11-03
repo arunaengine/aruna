@@ -915,6 +915,7 @@ mod tests {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         }
     }
 

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::password::{ARGON2_NAME, Kdf, PBKDF2_NAME};
 use crate::recovery_code::{RecoveryCodeError, parse_recovery};
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Nonce, Payload};
@@ -16,10 +17,6 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 pub const VAULT_VERSION: u32 = 1;
-pub const KDF_NAME: &str = "pbkdf2-sha256";
-pub const VAULT_ITERATIONS: u32 = 600_000;
-/// Rounds a payload may ask for, so a stored payload cannot stall a client.
-pub const MAX_ITERATIONS: u32 = 10_000_000;
 /// Associated data of every AES-GCM seal in a version 1 payload.
 pub const VAULT_AAD: &[u8] = b"aruna user vault v1";
 pub const X25519_KIND: &str = "x25519";
@@ -41,10 +38,22 @@ pub enum VaultFormatError {
     Seal,
 }
 
+/// A key derivation function as the payload names it: `argon2id`, or `pbkdf2-sha256` before.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KdfParams {
+    pub name: String,
+    /// Rounds of pbkdf2, or passes of argon2id.
+    pub iterations: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_kib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultKdf {
-    pub name: String,
-    pub iterations: u32,
+    #[serde(flatten)]
+    pub params: KdfParams,
     pub salt: String,
 }
 
@@ -59,6 +68,9 @@ pub struct RecoveryBlock {
     pub salt: String,
     pub nonce: String,
     pub wrapped: String,
+    /// The recovery wrap's own function when it differs from the passphrase function.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kdf: Option<KdfParams>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,10 +142,10 @@ impl MasterKey {
         &self,
         secret: &[u8],
         salt: &[u8],
-        iterations: u32,
+        kdf: Kdf,
         nonce: [u8; 12],
     ) -> Result<WrappedMaster, VaultFormatError> {
-        let kek = derive_kek(secret, salt, iterations);
+        let kek = derive_kek(secret, salt, kdf)?;
         Ok(WrappedMaster {
             nonce: STANDARD.encode(nonce),
             wrapped: STANDARD.encode(seal(&kek, &nonce, self.0.as_slice())?),
@@ -188,8 +200,13 @@ impl VaultPayload {
         if payload.version != VAULT_VERSION {
             return Err(VaultFormatError::Version(payload.version));
         }
-        if payload.kdf.name != KDF_NAME || !(1..=MAX_ITERATIONS).contains(&payload.kdf.iterations) {
-            return Err(VaultFormatError::Unreadable);
+        payload.kdf.params.kdf()?;
+        if let Some(params) = payload
+            .recovery
+            .as_ref()
+            .and_then(|block| block.kdf.as_ref())
+        {
+            params.kdf()?;
         }
         let mut fields = vec![
             &payload.kdf.salt,
@@ -214,20 +231,59 @@ impl VaultPayload {
         let kek = derive_kek(
             passphrase.as_bytes(),
             &decode(&self.kdf.salt)?,
-            self.kdf.iterations,
-        );
+            self.kdf.params.kdf()?,
+        )?;
         unwrap_master(&kek, &self.master.nonce, &self.master.wrapped)
     }
 
     pub fn unlock_recovery(&self, code: &str) -> Result<MasterKey, VaultFormatError> {
         let recovery = self.recovery.as_ref().ok_or(VaultFormatError::NoRecovery)?;
         let code = parse_recovery(code)?;
-        let kek = derive_kek(
-            code.as_slice(),
-            &decode(&recovery.salt)?,
-            self.kdf.iterations,
-        );
+        let params = recovery.kdf.as_ref().unwrap_or(&self.kdf.params);
+        let kek = derive_kek(code.as_slice(), &decode(&recovery.salt)?, params.kdf()?)?;
         unwrap_master(&kek, &recovery.nonce, &recovery.wrapped)
+    }
+}
+
+impl KdfParams {
+    /// The function these parameters name, checked against the readable range.
+    pub fn kdf(&self) -> Result<Kdf, VaultFormatError> {
+        let kdf = match (self.name.as_str(), self.memory_kib, self.parallelism) {
+            (ARGON2_NAME, Some(memory_kib), Some(lanes)) => Kdf::Argon2id {
+                memory_kib,
+                passes: self.iterations,
+                lanes,
+            },
+            (PBKDF2_NAME, None, None) => Kdf::Pbkdf2Sha256 {
+                rounds: self.iterations,
+            },
+            _ => return Err(VaultFormatError::Unreadable),
+        };
+        kdf.validate().map_err(|_| VaultFormatError::Unreadable)?;
+        Ok(kdf)
+    }
+}
+
+impl From<Kdf> for KdfParams {
+    fn from(kdf: Kdf) -> Self {
+        match kdf {
+            Kdf::Argon2id {
+                memory_kib,
+                passes,
+                lanes,
+            } => Self {
+                name: ARGON2_NAME.to_string(),
+                iterations: passes,
+                memory_kib: Some(memory_kib),
+                parallelism: Some(lanes),
+            },
+            Kdf::Pbkdf2Sha256 { rounds } => Self {
+                name: PBKDF2_NAME.to_string(),
+                iterations: rounds,
+                memory_kib: None,
+                parallelism: None,
+            },
+        }
     }
 }
 
@@ -236,10 +292,13 @@ pub fn key_fingerprint(public: &[u8; 32]) -> [u8; 32] {
     Sha256::digest(public).into()
 }
 
-fn derive_kek(secret: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[u8; 32]> {
-    let mut kek = Zeroizing::new([0u8; 32]);
-    pbkdf2::pbkdf2_hmac::<Sha256>(secret, salt, iterations, kek.as_mut_slice());
-    kek
+fn derive_kek(
+    secret: &[u8],
+    salt: &[u8],
+    kdf: Kdf,
+) -> Result<Zeroizing<[u8; 32]>, VaultFormatError> {
+    kdf.derive(secret, salt)
+        .map_err(|_| VaultFormatError::Unreadable)
 }
 
 fn unwrap_master(
@@ -359,12 +418,12 @@ mod tests {
         let payload = &vector.payload;
         let master = MasterKey::from_bytes(vector.master);
         let salt = decode(&payload.kdf.salt).unwrap();
-        let iterations = payload.kdf.iterations;
+        let kdf = payload.kdf.params.kdf().unwrap();
         let wrapped = master
             .wrap(
                 vector.passphrase.as_bytes(),
                 &salt,
-                iterations,
+                kdf,
                 nonce(&payload.master.nonce),
             )
             .unwrap();
@@ -410,6 +469,73 @@ mod tests {
         );
     }
 
+    fn argon2_payload() -> VaultPayload {
+        let all: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/vault.json")).unwrap();
+        VaultPayload::parse(all["argon2_vault"]["payload"].as_str().unwrap()).unwrap()
+    }
+
+    const VECTOR_KDF: Kdf = Kdf::Argon2id {
+        memory_kib: 1024,
+        passes: 2,
+        lanes: 1,
+    };
+
+    /// The portal's upgrade on unlock: re-wrap under argon2id, keep the recovery wrap readable.
+    fn upgrade_passphrase(
+        payload: &VaultPayload,
+        passphrase: &str,
+        salt: [u8; 16],
+        nonce: [u8; 12],
+    ) -> VaultPayload {
+        let master = payload.unlock_passphrase(passphrase).unwrap();
+        let mut next = payload.clone();
+        next.master = master
+            .wrap(passphrase.as_bytes(), &salt, VECTOR_KDF, nonce)
+            .unwrap();
+        next.kdf = VaultKdf {
+            params: KdfParams::from(VECTOR_KDF),
+            salt: STANDARD.encode(salt),
+        };
+        if let Some(recovery) = next.recovery.as_mut() {
+            recovery.kdf = Some(payload.kdf.params.clone());
+        }
+        next
+    }
+
+    #[test]
+    fn reproduces_upgraded_vector() {
+        // The shared argon2id vector is the pbkdf2 vector after this upgrade; both still open.
+        let vector = vector();
+        let salt: [u8; 16] = std::array::from_fn(|index| 16 + index as u8);
+        let nonce: [u8; 12] = std::array::from_fn(|index| 40 + index as u8);
+        let upgraded = upgrade_passphrase(&vector.payload, &vector.passphrase, salt, nonce);
+        assert_eq!(upgraded, argon2_payload());
+        let master = upgraded.unlock_passphrase(&vector.passphrase).unwrap();
+        assert_eq!(*master.0, vector.master);
+        let recovered = upgraded.unlock_recovery(&vector.code).unwrap();
+        assert_eq!(*recovered.0, vector.master);
+        let text = serde_json::to_string(&upgraded).unwrap();
+        assert_eq!(VaultPayload::parse(&text).unwrap(), upgraded);
+    }
+
+    #[test]
+    fn refuses_unknown_kdf() {
+        let payload = argon2_payload();
+        let mut value = serde_json::to_value(&payload).unwrap();
+        value["kdf"]["name"] = "scrypt".into();
+        assert_eq!(
+            VaultPayload::parse(&value.to_string()).err(),
+            Some(VaultFormatError::Unreadable)
+        );
+        let mut value = serde_json::to_value(&payload).unwrap();
+        value["kdf"].as_object_mut().unwrap().remove("memory_kib");
+        assert_eq!(
+            VaultPayload::parse(&value.to_string()).err(),
+            Some(VaultFormatError::Unreadable)
+        );
+    }
+
     fn parse_changed(
         payload: &VaultPayload,
         change: impl Fn(&mut serde_json::Value),
@@ -429,7 +555,7 @@ mod tests {
             Some(VaultFormatError::Version(2))
         );
         let rounds = |value: &mut serde_json::Value| {
-            value["kdf"]["iterations"] = (MAX_ITERATIONS + 1).into()
+            value["kdf"]["iterations"] = (crate::password::MAX_PBKDF2_ROUNDS + 1).into()
         };
         assert_eq!(parse(rounds), Some(VaultFormatError::Unreadable));
         let sealed = |value: &mut serde_json::Value| value["data"]["sealed"] = "not base64!".into();

@@ -14,7 +14,7 @@ use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, CopyOwner,
     CurrentVersionPointer, HashIndex, VersionKey,
 };
-use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key};
+use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key, release_marker};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -194,8 +194,9 @@ pub fn write_version_effect(
     }))
 }
 
-/// The release row a version's own tags declare: written in the same transaction as the
-/// version, on every node that commits it, so a tagged release is never missing its row.
+/// The release row a version's own tags declare and the bucket's release marker: written in the
+/// same transaction as the version, on every node that commits it, so a tagged release is never
+/// missing its row.
 pub fn release_row_effect(
     version_key: &VersionKey,
     version: &BlobVersion,
@@ -204,10 +205,15 @@ pub fn release_row_effect(
     let Some(pointer) = ReleasePointer::of(&version_key.key, &version.metadata) else {
         return Ok(None);
     };
-    Ok(Some(Effect::Storage(StorageEffect::Write {
-        key_space: BUCKET_RELEASE_KEYSPACE.to_string(),
-        key: release_key(&version_key.bucket, version_key.version_id).into(),
-        value: pointer.to_bytes()?.into(),
+    let space = BUCKET_RELEASE_KEYSPACE.to_string();
+    let key = release_key(&version_key.bucket, version_key.version_id).into();
+    let marker = release_marker(&version_key.bucket).into();
+    let id = version_key.version_id.to_bytes().to_vec().into();
+    Ok(Some(Effect::Storage(StorageEffect::BatchWrite {
+        writes: vec![
+            (space.clone(), key, pointer.to_bytes()?.into()),
+            (space, marker, id),
+        ],
         txn_id,
     })))
 }

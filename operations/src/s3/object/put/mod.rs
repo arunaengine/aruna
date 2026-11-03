@@ -1502,14 +1502,9 @@ impl PutObjectOperation {
                         value,
                         txn_id,
                     }),
-                    Some(Effect::Storage(StorageEffect::Write {
-                        key_space: row_space,
-                        key: row_key,
-                        value: row_value,
-                        ..
-                    })),
+                    Some(Effect::Storage(StorageEffect::BatchWrite { writes: rows, .. })),
                 ) => smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes: vec![(key_space, key, value), (row_space, row_key, row_value)],
+                    writes: [vec![(key_space, key, value)], rows].concat(),
                     txn_id,
                 })],
                 (effect, _) => smallvec![effect],

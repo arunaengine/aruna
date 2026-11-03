@@ -342,7 +342,9 @@ impl Tending<'_> {
             (snapshot.config.ranges.iter()).find(|range| range.range_id == self.range_id)?;
         let moving =
             (snapshot.lifecycle.transfers.iter()).any(|open| open.range_id == range.range_id);
-        let open = snapshot.serving() && snapshot.lifecycle.deletion.is_none() && !moving;
+        let filling = (snapshot.lifecycle.fills.iter()).any(|fill| fill.range_id == range.range_id);
+        let open =
+            snapshot.serving() && snapshot.lifecycle.deletion.is_none() && !moving && !filling;
         (open && range.coordinator == member.member_id).then_some((member, range))
     }
 
@@ -367,7 +369,7 @@ impl Tending<'_> {
         {
             return Tended::Idle;
         }
-        let keys = match self.sample(context).await {
+        let keys = match range_sample(context, self.set_id(), self.range_id).await {
             Some(keys) if !needs_refill(keys.len(), counters.objects) => keys,
             _ => return self.refill(context).await,
         };
@@ -405,28 +407,32 @@ impl Tending<'_> {
             }
         }
     }
+}
 
-    /// The keys of the range's sample, in key order; `None` when it cannot be read.
-    async fn sample(&self, context: &DriverContext) -> Option<Vec<String>> {
-        let iter = StorageEffect::Iter {
-            key_space: KEY_SAMPLE_KEYSPACE.to_string(),
-            prefix: Some(sample_prefix(self.set_id(), self.range_id).into()),
-            start: None,
-            limit: usize::from(SAMPLE_SIZE) * 2,
-            txn_id: None,
-        };
-        let Event::Storage(StorageEvent::IterResult { values, .. }) =
-            context.storage_handle.send_storage_effect(iter).await
-        else {
-            return None;
-        };
-        let mut keys: Vec<String> = values
-            .iter()
-            .filter_map(|(key, _)| SampleEntry::decode(key).map(|entry| entry.key))
-            .collect();
-        keys.sort();
-        Some(keys)
-    }
+/// The keys of this node's sample of a range, in key order; `None` when it cannot be read.
+pub(crate) async fn range_sample(
+    context: &DriverContext,
+    set_id: Ulid,
+    range_id: Ulid,
+) -> Option<Vec<String>> {
+    let iter = StorageEffect::Iter {
+        key_space: KEY_SAMPLE_KEYSPACE.to_string(),
+        prefix: Some(sample_prefix(set_id, range_id).into()),
+        start: None,
+        limit: usize::from(SAMPLE_SIZE) * 2,
+        txn_id: None,
+    };
+    let Event::Storage(StorageEvent::IterResult { values, .. }) =
+        context.storage_handle.send_storage_effect(iter).await
+    else {
+        return None;
+    };
+    let mut keys: Vec<String> = values
+        .iter()
+        .filter_map(|(key, _)| SampleEntry::decode(key).map(|entry| entry.key))
+        .collect();
+    keys.sort();
+    Some(keys)
 }
 
 /// A split key near the sample's median at a folder boundary: the deepest folder of the

@@ -768,6 +768,11 @@ impl IntoS3Error for DeleteObjectError {
             DeleteObjectError::UsageUpdateError(ref error) => usage_update_error(error),
             DeleteObjectError::Distribution(ref error) => guard_error(error),
             error @ DeleteObjectError::DistributedVersion => s3_error!(InvalidRequest, "{error}"),
+            // A release was added while the delete ran; a retry checks its pins again.
+            DeleteObjectError::FenceTaken => s3_error!(
+                ServiceUnavailable,
+                "a release of the bucket changed during the delete; retry"
+            ),
             err => internal_error(err),
         }
     }

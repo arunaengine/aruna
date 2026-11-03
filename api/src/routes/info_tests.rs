@@ -4,11 +4,11 @@
 
 use super::{
     GroupCapOverride, InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeKindInfo,
-    PeerContacts, RealmBinding, RealmBindingScope, RealmConnectionStatus, RealmPlacementOverride,
-    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, RealmQuotaOverride,
-    ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info, get_realm_placement,
-    get_usage, map_handle_error, map_placement_error, map_quota_error, map_realm_nodes,
-    mutate_realm_placement, presence_nodes, run_realm_info, set_realm_quota,
+    PeerContacts, PublicNode, RealmBinding, RealmBindingScope, RealmConnectionStatus,
+    RealmPlacementOverride, RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig,
+    RealmQuotaOverride, ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info,
+    get_realm_placement, get_usage, map_handle_error, map_placement_error, map_quota_error,
+    map_realm_nodes, mutate_realm_placement, presence_nodes, run_realm_info, set_realm_quota,
 };
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
@@ -1522,6 +1522,15 @@ async fn management_urls_follow() {
         info.management_urls,
         vec!["https://mgmt.example/api/v1".to_string()]
     );
+    // Anonymous callers find each node's api url, and nothing else about it.
+    assert_eq!(
+        info.public_nodes,
+        vec![PublicNode {
+            node_id: node_id.to_string(),
+            api_url: "https://mgmt.example/api/v1".to_string(),
+        }]
+    );
+    assert!(info.nodes.is_empty());
 }
 
 #[tokio::test]

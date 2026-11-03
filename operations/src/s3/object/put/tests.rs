@@ -1583,7 +1583,7 @@ async fn release_row_committed() {
     // A version tagged as a release commits its release row; an untagged one writes none.
     use aruna_core::keyspaces::BUCKET_RELEASE_KEYSPACE;
     use aruna_core::structs::storage::bucket_metadata::{
-        RELEASE_PREFIX_TAG, RELEASE_TAG, ReleasePointer, release_key,
+        RELEASE_PREFIX_TAG, RELEASE_TAG, ReleasePointer, release_key, release_marker,
     };
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
@@ -1631,6 +1631,17 @@ async fn release_row_committed() {
     .expect("the release row commits with the version");
     let pointer = ReleasePointer::from_bytes(row.as_ref()).unwrap();
     assert_eq!(pointer.key, "db/release.json");
+    // The bucket's release marker names the newest release crate version.
+    let marker = read_value(
+        &context,
+        BUCKET_RELEASE_KEYSPACE,
+        release_marker("mybucket"),
+    )
+    .await;
+    assert_eq!(
+        marker.as_deref(),
+        Some(tagged.version_id.to_bytes().as_slice())
+    );
     assert_eq!(
         (pointer.label.as_str(), pointer.prefix.as_str()),
         ("6.0", "db/")

@@ -353,6 +353,7 @@ async fn link(node: &Node, key: &str, target: aruna_core::structs::storage::link
         inherited_policies: Vec::new(),
         connector_guard: None,
         restrictions: None,
+        mirror_guards: Vec::new(),
     };
     write_reference_version(&node.state.get_ctx(), write)
         .await

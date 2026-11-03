@@ -131,6 +131,9 @@ pub struct MembersConfig {
     pub queries: Vec<MembershipQuery>,
     /// A holder answers for exactly these ranges and asks nobody else.
     pub ranges: Option<Vec<Ulid>>,
+    /// Counts every release, whatever the caller may read, for a check that keeps pinned
+    /// versions; its answers must never be shown to the caller.
+    pub retention: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -307,7 +310,8 @@ impl ReleaseMembersOperation {
                     query.key.starts_with(&pointer.prefix) && query.key != pointer.key
                 });
             // A crate the caller may not read is never opened, so nothing of it shows.
-            let readable = (self.config.access.0).allows(Some(&pointer.key), &Permission::READ);
+            let readable = self.config.retention
+                || (self.config.access.0).allows(Some(&pointer.key), &Permission::READ);
             if held && wanted && readable {
                 self.candidates.push((Ulid::from_bytes(id), pointer));
             }
@@ -323,12 +327,16 @@ impl ReleaseMembersOperation {
             return self.next_holder();
         };
         self.state = MembersState::Crate;
+        let mut auth = self.config.auth.clone();
+        if self.config.retention {
+            auth.path_restrictions = None;
+        }
         let read = CrateRead {
             bucket: self.config.bucket.clone(),
             key: pointer.key.clone(),
             version_id: *version_id,
             group_id: self.config.info.group_id,
-            auth: self.config.auth.clone(),
+            auth,
             realm_id: self.config.realm_id,
             node_id: self.config.node_id,
         };
@@ -575,6 +583,7 @@ pub async fn release_members(
         bearer: caller.bearer.map(str::to_string),
         queries: queries.to_vec(),
         ranges: None,
+        retention: false,
     };
     drive(ReleaseMembersOperation::new(config), context).await
 }

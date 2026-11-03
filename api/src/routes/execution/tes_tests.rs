@@ -1219,6 +1219,7 @@ fn family_pins_inputs() {
         releases: Vec::new(),
         releases_complete: false,
         grant: None,
+        served_by: None,
     }];
     let task = project_task(
         &family_record(&report),
@@ -2042,6 +2043,7 @@ fn projects_input_identity() {
         releases: Vec::new(),
         releases_complete: false,
         grant: None,
+        served_by: None,
     }];
     let task = project_task(
         &record,

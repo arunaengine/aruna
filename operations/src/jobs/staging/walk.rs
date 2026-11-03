@@ -215,6 +215,8 @@ pub(super) struct StagedFile {
     pub(super) metadata: BTreeMap<String, String>,
     /// A table row's modification time; it replaces the one a HEAD reports.
     pub(super) modified: Option<SystemTime>,
+    /// Further sources a table row names, each with its connector, as the row renders them.
+    pub(super) mirrors: Vec<(Ulid, String)>,
 }
 
 /// Lists one page of the current walk and records it, with the walk's next position and the
@@ -841,12 +843,16 @@ pub(super) async fn import_page(
             Err(failure) => Err(failure),
         };
         match observation {
-            Ok(observation) => entries.push(PageEntry {
-                source_path: file.source_path,
-                target_key: file.target_key,
-                observation,
-                metadata: file.metadata,
-            }),
+            Ok(observation) => entries.push((
+                PageEntry {
+                    source_path: file.source_path,
+                    target_key: file.target_key,
+                    observation,
+                    metadata: file.metadata,
+                    mirrors: Vec::new(),
+                },
+                file.mirrors,
+            )),
             Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
                 record_failure(&mut next, &file.source_path, &file.target_key, message)
             }
@@ -854,6 +860,8 @@ pub(super) async fn import_page(
             Err(ItemFailure::Lasting(message)) => return Err(PageFailure::Permanent(message)),
         }
     }
+    let (entries, mirror_connectors) =
+        super::mirrors::add_mirrors(ctx, (spec, &rules), &mut next, entries).await?;
     // Files a table row describes are not headed; the page then resolves its connector itself.
     let source = match (source, entries.first()) {
         (Some(source), _) => source,
@@ -880,6 +888,7 @@ pub(super) async fn import_page(
         deletes,
         now: SystemTime::now(),
         ranges: None,
+        mirror_connectors,
     };
     let result = {
         // Listing and the reads above run in parallel; the page transactions take turns.
@@ -1136,6 +1145,7 @@ fn map_source_entry(
             source_path: entry_path,
             target_key: target,
             size: entry.size,
+            mirrors: Vec::new(),
         }),
         SourceEntryKind::Directory => MappedEntry::Directory(StagingJobDirectory {
             source_path: directory_list_path(&entry_path),
@@ -1199,9 +1209,18 @@ fn join_target_prefix(prefix: &str, relative: &str) -> String {
 }
 
 pub(super) fn source_permission_path(spec: &StagingJobSpec, source_path: &str) -> String {
+    connector_permission_path(spec, spec.connector_id, source_path)
+}
+
+/// The permission path of `source_path` below another connector of the job's group.
+pub(super) fn connector_permission_path(
+    spec: &StagingJobSpec,
+    connector_id: Ulid,
+    source_path: &str,
+) -> String {
     let root = format!(
         "/{}/g/{}/data/{}/_sources/{}",
-        spec.auth_context.realm_id, spec.group_id, spec.node_id, spec.connector_id
+        spec.auth_context.realm_id, spec.group_id, spec.node_id, connector_id
     );
     if source_path.is_empty() {
         root

@@ -195,6 +195,10 @@ pub struct CapturedInput {
     pub link: Option<crate::structs::storage::replication::VersionedObjectArn>,
     /// The external source of a reference version.
     pub source_pin: Option<crate::structs::storage::origin::SourcePin>,
+    /// The source that delivered a reference input's bytes when this node staged them; one of
+    /// the version's equal sources. Mounted inputs read per range and name none.
+    #[serde(default)]
+    pub served_by: Option<crate::structs::storage::origin::SourcePin>,
     /// The source bucket's metadata and its dataset's description at admission.
     pub database: Option<crate::structs::storage::bucket_metadata::CapturedDatabase>,
     pub releases: Vec<crate::structs::storage::bucket_metadata::ReleaseRef>,
@@ -256,6 +260,9 @@ pub struct StagingJobSpec {
     pub checksum_manifest: Option<String>,
     /// A table whose rows name the files or folders to import, instead of items and prefixes.
     pub table: Option<crate::structs::execution::table::TableImport>,
+    /// Further sources each imported file gets, mapped from its source path.
+    #[serde(default)]
+    pub mirrors: Vec<crate::structs::execution::staging::SourceMapping>,
 }
 
 /// One server-side object copy run outside a request, for a source whose bytes

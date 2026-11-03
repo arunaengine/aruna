@@ -299,7 +299,8 @@ fn verify_node_origin(records: &[NotificationRecord], peer: NodeId) -> Result<()
     let foreign = records.iter().any(|record| match &record.kind {
         NotificationKind::BucketRestartLocked { node_id, .. }
         | NotificationKind::BucketRecoveryDegraded { node_id, .. }
-        | NotificationKind::BucketKeyPending { node_id, .. } => *node_id != peer,
+        | NotificationKind::BucketKeyPending { node_id, .. }
+        | NotificationKind::ShareUpload { node_id, .. } => *node_id != peer,
         _ => false,
     });
     match foreign {
@@ -603,6 +604,16 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
             // The waiting member may be a user of another realm; the recipient stays local.
             if member_user_id.is_nil() {
                 return Err("notification record has empty member_user_id".to_string());
+            }
+        }
+        NotificationKind::ShareUpload {
+            bucket,
+            group_id,
+            key,
+            ..
+        } => {
+            if bucket.is_empty() || group_id.is_nil() || key.is_empty() {
+                return Err("share upload notification has empty bucket, group or key".to_string());
             }
         }
     }

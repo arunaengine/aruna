@@ -1533,6 +1533,7 @@ mod tests {
                     root: None,
                 },
                 connector_id: Some(Ulid::generate()),
+                mirrors: Vec::new(),
             }),
             multipart: None,
             reference_intent: true,

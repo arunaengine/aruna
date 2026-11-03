@@ -160,6 +160,30 @@ fn foreign_paths_fail() {
     assert_eq!(mapper.target_key(&failed).as_deref(), Some("samples/a.fq"));
 }
 
+// Each mirror template renders another source of the row's file; a null value gives none.
+#[test]
+fn rows_render_mirrors() {
+    let mut import = files();
+    let connector_id = Ulid::from_bytes([7; 16]);
+    import.rows.mirrors = vec![MirrorColumn {
+        connector_id,
+        source: "{sample}/{url|basename}".to_string(),
+    }];
+    import.validate().unwrap();
+    let columns = ["url", "sample", "description"].map(str::to_string);
+    let mapper = RowMapper::new(&import.rows, &columns).unwrap();
+    let row = |sample: Option<&str>| {
+        let url = Some("https://data.example.org/files/a/b.fq".to_string());
+        vec![url, sample.map(str::to_string), None]
+    };
+    let base = Some("https://data.example.org/files/");
+    let entry = imported(mapper.map(&row(Some("s1")), base));
+    assert_eq!(entry.mirrors, [(connector_id, "s1/b.fq".to_string())]);
+    assert!(imported(mapper.map(&row(None), base)).mirrors.is_empty());
+    import.rows.kind = RowKind::Folder;
+    assert!(import.validate().is_err());
+}
+
 // Quoted fields may hold delimiters and newlines; a row cut by the chunk end waits.
 #[test]
 fn quoted_rows_resume() {
@@ -585,4 +609,17 @@ fn record_kind_appended() {
     assert_eq!(postcard::to_allocvec(&RowKind::File).unwrap(), [0]);
     assert_eq!(postcard::to_allocvec(&RowKind::Folder).unwrap(), [1]);
     assert_eq!(postcard::to_allocvec(&RowKind::Record).unwrap(), [2]);
+}
+
+// A further source's path names exactly the file its READ check names: a segment a server
+// would trim or a repeated separator is refused.
+#[test]
+fn mirror_paths_canonical() {
+    assert_eq!(
+        mirror_path("/refseq/a.fna", None).as_deref(),
+        Ok("refseq/a.fna")
+    );
+    for bad in [" private/file", "private /file", "private//file", "a/../b"] {
+        assert!(mirror_path(bad, None).is_err(), "{bad}");
+    }
 }

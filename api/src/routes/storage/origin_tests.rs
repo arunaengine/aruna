@@ -310,6 +310,18 @@ fn view_keeps_fields() {
                 (ChecksumAlgorithm::Sha256, full),
                 (ChecksumAlgorithm::Sha1, listing),
             ],
+            sources: vec![
+                aruna_operations::s3::object::origin::SourcePlace {
+                    url: Some("https://s3.example.org/a".to_string()),
+                    path: "a".to_string(),
+                    connector_id: None,
+                },
+                aruna_operations::s3::object::origin::SourcePlace {
+                    url: Some("https://mirror.example.org/a".to_string()),
+                    path: "a".to_string(),
+                    connector_id: Some(Ulid::from_bytes([48; 16])),
+                },
+            ],
         }),
         projection: vec![
             OriginProjection::BasedOn {
@@ -351,6 +363,12 @@ fn view_keeps_fields() {
             ("full_object", "listing_etag", "abcd"),
         ]
     );
+    // Every source is listed, the mirror with the connector it reads through.
+    let mirror = &source.sources[1];
+    assert_eq!(source.sources.len(), 2);
+    assert_eq!(mirror.url.as_deref(), Some("https://mirror.example.org/a"));
+    let connector = Ulid::from_bytes([48; 16]).to_string();
+    assert_eq!(mirror.connector_id.as_deref(), Some(connector.as_str()));
     assert_eq!(response.projection.len(), 2);
     assert!(matches!(
         response.projection[1],

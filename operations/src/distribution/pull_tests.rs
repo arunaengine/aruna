@@ -57,6 +57,7 @@ fn native(config: &str, value: &str) -> VersionSourceBinding {
             root: None,
         },
         connector_id: None,
+        mirrors: Vec::new(),
     }
 }
 

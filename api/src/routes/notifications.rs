@@ -127,6 +127,8 @@ pub struct NotificationResponse {
     pub versions_synced: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -275,6 +277,7 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
         relationship_id: None,
         versions_synced: None,
         error: None,
+        share_id: None,
     };
     match &record.kind {
         NotificationKind::GroupJoinRequested {
@@ -396,6 +399,21 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
             response.node_id = Some(node_id.to_string());
             response.group_id = Some(group_id.to_string());
             response.member_user_id = Some(member_user_id.to_string());
+        }
+        NotificationKind::ShareUpload {
+            share_id,
+            node_id,
+            group_id,
+            bucket,
+            key,
+            size_bytes,
+        } => {
+            response.share_id = Some(share_id.to_string());
+            response.node_id = Some(node_id.to_string());
+            response.group_id = Some(group_id.to_string());
+            response.bucket = Some(bucket.clone());
+            response.key = Some(key.clone());
+            response.size_bytes = Some(*size_bytes);
         }
     }
     response

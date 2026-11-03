@@ -162,7 +162,7 @@ impl StorageHandle {
         (handle, receivers)
     }
 
-    /// Seals repository connector secret rows with `key` from now on, for this
+    /// Seals connector secret and share link rows with `key` from now on, for this
     /// handle and all its clones. Set once at startup; a later key is ignored.
     pub fn seal_secrets(&self, key: CredentialEncryptionKey) {
         let _ = self.secret_key.set(key);

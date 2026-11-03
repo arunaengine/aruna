@@ -297,7 +297,7 @@ fn draft_files(rocrate: &JsonValue) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-fn is_file(value: &JsonValue) -> bool {
+pub(crate) fn is_file(value: &JsonValue) -> bool {
     match value {
         JsonValue::String(value) => FILE_TYPES.contains(&value.as_str()),
         JsonValue::Array(values) => values.iter().any(is_file),

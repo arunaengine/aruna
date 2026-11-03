@@ -173,16 +173,15 @@ pub(super) fn reference_rows(
         let BlobVersionState::Reference { source, .. } = &version.state else {
             continue;
         };
-        if source.connector_id.is_none() {
+        if source.connector_ids().is_empty() {
             continue;
         }
-        let row = VersionKey::from_bytes(key)
+        let written = VersionKey::from_bytes(key)
             .and_then(|version_key| connector_reference_write(&version, &version_key));
-        let Some((_, row, value)) = row.map_err(|error| decode_error(name, key, error))? else {
-            continue;
-        };
-        if read.get(index, row.as_ref())?.is_none() {
-            rows.push((row.to_vec(), value.to_vec()));
+        for (_, row, value) in written.map_err(|error| decode_error(name, key, error))? {
+            if read.get(index, row.as_ref())?.is_none() {
+                rows.push((row.to_vec(), value.to_vec()));
+            }
         }
     }
     Ok(Rewrites {
@@ -268,6 +267,7 @@ mod tests {
             strategy: StagingStrategy::Reference,
             descriptor: descriptor.clone(),
             connector_id: None,
+            mirrors: Vec::new(),
         };
         let now = SystemTime::UNIX_EPOCH;
         let reference =
@@ -329,6 +329,7 @@ mod tests {
                     root: None,
                 },
                 connector_id: Some(ulid::Ulid::from_bytes([6; 16])),
+                mirrors: Vec::new(),
             };
             let metadata = SourceMetadata {
                 content_length: 3,
@@ -411,6 +412,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(connector_id),
+            mirrors: Vec::new(),
         };
         let metadata = SourceMetadata {
             content_length: 1,
@@ -461,6 +463,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(ulid::Ulid::from_bytes([6; 16])),
+            mirrors: Vec::new(),
         };
         let metadata = SourceMetadata {
             content_length: 1234,
@@ -492,7 +495,7 @@ mod tests {
                 let id = ulid::Ulid::from_parts(at as u64, 7);
                 let version = imported(&name);
                 let key = VersionKey::new("bucket", &name, id);
-                let (_, row, _) = connector_reference_write(&version, &key).unwrap().unwrap();
+                let (_, row, _) = connector_reference_write(&version, &key).unwrap().remove(0);
                 txn.insert(&index, row.to_vec(), b"");
                 let value = version.to_bytes().unwrap();
                 txn.insert(&versions, key.to_bytes().unwrap(), value);

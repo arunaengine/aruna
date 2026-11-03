@@ -20,6 +20,7 @@ use aruna_core::structs::storage::distribution::accounting::account_key;
 use aruna_core::structs::storage::distribution::capacity::{
     MemberNeed, MemberReservation, RangeSize, member_need,
 };
+use aruna_core::structs::storage::distribution::snapshot::RangeFill;
 use aruna_core::structs::storage::distribution::{
     DataStrategy, KeyRange, MetadataCoverage, SignedStatement, Statement, StatementClaim,
 };
@@ -54,6 +55,8 @@ pub struct AdmitConfig {
     pub sizes: Vec<RangeSize>,
     /// The bytes this node may store, the sum of its backend quotas; `None` without quotas.
     pub capacity: Option<u64>,
+    /// The member's new copies not admitted yet; the admission then states them instead.
+    pub fills: Vec<RangeFill>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -110,6 +113,9 @@ pub struct AdmitOperation {
     /// The ranges to open and what the member needs for them.
     missing: Vec<KeyRange>,
     need: MemberNeed,
+    /// Open ranges the member now copies, and the bytes already reserved for them.
+    grown: Vec<Ulid>,
+    held: u64,
     /// Bucket and reserved bytes of every member this node admitted, by set.
     reserved: BTreeMap<Ulid, (Option<String>, u64)>,
     signed: Option<SignedStatement>,
@@ -125,6 +131,8 @@ impl AdmitOperation {
             pending: None,
             missing: Vec::new(),
             need: MemberNeed::default(),
+            grown: Vec::new(),
+            held: 0,
             reserved: BTreeMap::new(),
             signed: None,
             output: None,
@@ -155,7 +163,8 @@ impl AdmitOperation {
     }
 
     /// The bucket must carry this member's binding for its own incarnation; ranges without an
-    /// account row are opened, never while this node's usage counters are being rebuilt.
+    /// account row are opened, never while this node's usage counters are being rebuilt. An open
+    /// range the member gains a copy of reserves its bytes too.
     fn plan(&mut self, mut values: Vec<Option<Value>>) -> Result<Effects, AdmitError> {
         let rebuilding = values.pop().flatten().is_some();
         let mut values = values.into_iter();
@@ -174,34 +183,46 @@ impl AdmitOperation {
         {
             return Err(changed());
         }
-        let missing: Vec<KeyRange> = self
-            .config
-            .ranges
-            .iter()
-            .zip(values)
-            .filter(|(_, account)| account.is_none())
-            .map(|(range, _)| range.clone())
-            .collect();
-        let statement = Statement::admit(
-            self.config.realm_id,
-            self.config.set_id,
-            self.config.member_id,
-            binding.incarnation,
-            self.config.intent,
-        );
+        let config = &self.config;
+        let copied = |range: &KeyRange| (config.fills.iter()).any(|f| f.range_id == range.range_id);
+        let (mut missing, mut grown) = (Vec::new(), Vec::new());
+        for (range, account) in config.ranges.iter().zip(values) {
+            match account {
+                None => missing.push(range.clone()),
+                Some(_) if copied(range) => grown.push(range.clone()),
+                Some(_) => {}
+            }
+        }
+        let statement = match config.fills.is_empty() {
+            true => Statement::admit(
+                config.realm_id,
+                config.set_id,
+                config.member_id,
+                binding.incarnation,
+                config.intent,
+            ),
+            false => Statement::copy_admitted(
+                config.realm_id,
+                config.set_id,
+                (config.member_id, binding.incarnation, config.intent),
+                config.fills.iter().map(|fill| fill.fill_id).collect(),
+            ),
+        };
         let claim = StatementClaim {
             signer: self.config.node_id,
             statement,
         };
-        if missing.is_empty() {
+        if missing.is_empty() && grown.is_empty() {
             return Ok(self.sign(claim));
         }
         if rebuilding {
             return Err(AdmitError::UsageIncomplete);
         }
         let config = &self.config;
-        self.need = member_need(config.member_id, config.strategy, &missing, &config.sizes)
+        let needed = [missing.as_slice(), grown.as_slice()].concat();
+        self.need = member_need(config.member_id, config.strategy, &needed, &config.sizes)
             .map_err(AdmitError::SizeUnknown)?;
+        self.grown = grown.iter().map(|range| range.range_id).collect();
         self.missing = missing;
         self.pending = Some(claim);
         match config.capacity {
@@ -242,6 +263,12 @@ impl AdmitOperation {
                 }
                 _ => u64::from_be_bytes(value.as_ref().try_into().map_err(|_| invalid())?),
             };
+            let config = &self.config;
+            let grown =
+                (self.grown.iter()).any(|id| key.as_ref() == account_key(config.set_id, *id));
+            if grown {
+                self.held = self.held.saturating_add(bytes);
+            }
             entry.1 = entry.1.saturating_add(bytes);
         }
         if let Some(next) = next {
@@ -291,14 +318,15 @@ impl AdmitOperation {
                 .map_or(0, |counters| counters.logical_bytes);
             used = used.saturating_add(reserved.saturating_sub(stored));
         }
-        let (need, free) = (self.need.total(), capacity.saturating_sub(used));
+        let need = self.need.total().saturating_sub(self.held);
+        let free = capacity.saturating_sub(used);
         if need > free {
             return Err(AdmitError::InsufficientCapacity { need, free });
         }
         self.write()
     }
 
-    /// Opens the missing ranges and reserves what the member needs for them.
+    /// Opens the missing ranges and reserves what the member needs for them and its new copies.
     fn write(&mut self) -> Result<Effects, AdmitError> {
         let txn_id = self.txn_id.ok_or(AdmitError::NotFinished)?;
         let set_id = self.config.set_id;
@@ -311,7 +339,9 @@ impl AdmitOperation {
             let key_space = CAPACITY_RESERVATION_KEYSPACE.to_string();
             (key_space, Key::from(key), Value::from(value))
         };
-        writes.push(row(set_id.to_bytes().to_vec(), member.to_bytes()?));
+        if !self.missing.is_empty() {
+            writes.push(row(set_id.to_bytes().to_vec(), member.to_bytes()?));
+        }
         for (range_id, bytes) in &self.need.ranges {
             let key = account_key(set_id, *range_id);
             writes.push(row(key, bytes.to_be_bytes().to_vec()));

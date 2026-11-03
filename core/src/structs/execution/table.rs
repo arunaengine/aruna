@@ -9,6 +9,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::structs::checksum::ChecksumAlgorithm;
 
@@ -242,6 +243,16 @@ pub struct TableRows {
     /// Column of a file's modification time: RFC 3339, or a date that is only checked.
     #[serde(default)]
     pub modified: Option<String>,
+    /// Further sources of each file: a path or URL template read through another connector.
+    #[serde(default)]
+    pub mirrors: Vec<MirrorColumn>,
+}
+
+/// A template of another source of a row's file, such as `{aws_path}`, below `connector_id`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirrorColumn {
+    pub connector_id: Ulid,
+    pub source: String,
 }
 
 /// A column holding a file's checksum; `algorithm` is `md5`, `sha1` or `sha256`.
@@ -374,6 +385,13 @@ impl TableImport {
         if rows.kind == RowKind::Folder && (described || !rows.checksums.is_empty()) {
             let reason = "size, checksums and modified describe file rows only";
             return Err(TableError::Mapping(reason.to_string()));
+        }
+        if rows.kind == RowKind::Folder && !rows.mirrors.is_empty() {
+            let reason = "mirror templates describe file rows only; folders use job mappings";
+            return Err(TableError::Mapping(reason.to_string()));
+        }
+        for mirror in &rows.mirrors {
+            template_parts(&mirror.source)?;
         }
         if rows.kind == RowKind::Record && rows.size.is_none() {
             let reason = "record rows need a size column";
@@ -604,14 +622,19 @@ pub struct TableEntry {
     pub modified: Option<SystemTime>,
     pub etag: Option<String>,
     pub content_type: Option<String>,
+    /// Further sources as the row renders them, each with its connector; a null value gives none.
+    pub mirrors: Vec<(Ulid, String)>,
 }
+
+/// A template's parts, each column with its index in the table.
+type Template = Vec<(Part, Option<usize>)>;
 
 /// The row mapping resolved against one table's columns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowMapper {
     kind: RowKind,
-    source: Vec<(Part, Option<usize>)>,
-    target: Vec<(Part, Option<usize>)>,
+    source: Template,
+    target: Template,
     filters: Vec<(usize, BTreeSet<String>)>,
     /// Column index and metadata key of each kept column.
     kept: Vec<(usize, String)>,
@@ -621,6 +644,7 @@ pub struct RowMapper {
     modified: Option<usize>,
     /// Columns of a record row's ETag, content type and metadata object.
     record: [Option<usize>; 3],
+    mirrors: Vec<(Ulid, Template)>,
 }
 
 impl RowMapper {
@@ -697,6 +721,9 @@ impl RowMapper {
                 let found = columns.iter().position(|column| column == name);
                 found.filter(|_| rows.kind == RowKind::Record)
             }),
+            mirrors: (rows.mirrors.iter())
+                .map(|mirror| Ok((mirror.connector_id, resolve(&mirror.source)?)))
+                .collect::<Result<_, TableError>>()?,
         })
     }
 
@@ -772,6 +799,9 @@ impl RowMapper {
             modified,
             etag: etag.map(str::to_string),
             content_type: content_type.map(str::to_string),
+            mirrors: (self.mirrors.iter())
+                .filter_map(|(connector_id, parts)| Some((*connector_id, render(parts, &value)?)))
+                .collect(),
         })
     }
 
@@ -865,6 +895,18 @@ fn render<'a>(
 pub fn source_path(value: &str, base: Option<&str>) -> Result<String, String> {
     let path = connector_path(value, base)?;
     canonical_path(&path).ok_or_else(|| format!("the source `{value}` is not a canonical path"))
+}
+
+/// A further source's path: canonical, with no segment a server would trim, so its READ check
+/// and its reads name the same file.
+pub fn mirror_path(value: &str, base: Option<&str>) -> Result<String, String> {
+    let path = source_path(value, base)?;
+    match path.split('/').all(|segment| segment.trim() == segment) {
+        true => Ok(path),
+        false => Err(format!(
+            "the source `{value}` has a segment with outer spaces"
+        )),
+    }
 }
 
 fn connector_path(value: &str, base: Option<&str>) -> Result<String, String> {

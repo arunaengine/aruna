@@ -356,6 +356,7 @@ fn accepts_copy_pin() {
         releases: Vec::new(),
         releases_complete: false,
         grant: None,
+        served_by: None,
     };
     let pin = PlannedInput {
         destination_key: captured.destination_key.clone(),

@@ -27,7 +27,9 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::execution::source_connector::SourceConnector;
-use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+use aruna_core::structs::execution::staging::{
+    SourceMirror, StagingStrategy, VersionSourceBinding,
+};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -68,6 +70,8 @@ pub struct PageEntry {
     pub observation: SourceMetadata,
     /// Metadata the version carries, such as the columns of a table row.
     pub metadata: BTreeMap<String, String>,
+    /// Further sources of the same file, equal to the connector's.
+    pub mirrors: Vec<SourceMirror>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -84,6 +88,8 @@ pub struct PageImportInput {
     pub expected_bucket: BucketInfo,
     /// The connector as resolved for the listing, re-checked at commit.
     pub connector: SourceConnector,
+    /// The connectors of the entries' further sources, re-checked at commit as well.
+    pub mirror_connectors: Vec<SourceConnector>,
     pub secret_fingerprint: Option<[u8; 16]>,
     pub entries: Vec<PageEntry>,
     /// The checkpoint after this page; the page's outcome is added before it is written.
@@ -230,7 +236,11 @@ pub(crate) fn guard_reads(
         ),
         (JOB_CLAIM_KEYSPACE.to_string(), job_record_key(input.job_id)),
     ];
-    Ok(reads)
+    let mirrors = (input.mirror_connectors.iter()).map(|connector| {
+        let key = source_connector_key(connector.group_id, connector.connector_id);
+        (SOURCE_INDEX_KEYSPACE.to_string(), key)
+    });
+    Ok(reads.into_iter().chain(mirrors).collect())
 }
 
 fn head_keys(input: &PageImportInput) -> Result<Vec<Vec<u8>>, ConversionError> {
@@ -299,7 +309,7 @@ pub(crate) fn check_guards(
     input: &PageImportInput,
     values: Vec<(Key, Option<Value>)>,
 ) -> Result<PageGuards, PageImportError> {
-    if values.len() != GUARD_READS {
+    if values.len() != GUARD_READS + input.mirror_connectors.len() {
         return Err(StorageError::ReadError("short guard read".to_string()).into());
     }
     let mut values = values.into_iter().map(|(_, value)| value);
@@ -341,6 +351,14 @@ pub(crate) fn check_guards(
         .transpose()?
         .filter(|claim| claim.claim_token == input.claim_token)
         .ok_or(PageImportError::ClaimLost)?;
+    // A further source's connector replaced or removed since the page resolved it stops the page.
+    for expected in &input.mirror_connectors {
+        let found = values.next().flatten();
+        let found = found.map(|value| SourceConnector::from_bytes(value.as_ref()));
+        if found.transpose()?.as_ref() != Some(expected) {
+            return Err(PageImportError::ConnectorChanged);
+        }
+    }
     Ok(PageGuards {
         policies,
         job_created_ms: claim.created_at_ms,
@@ -388,6 +406,8 @@ fn plan_entry(
         && source.connector_id == Some(input.connector.connector_id)
         && source.descriptor.source_path == entry.source_path
         && same_observation(input, entry, (source, cached_metadata))
+        // An import naming no further sources leaves those a key has.
+        && (entry.mirrors.is_empty() || source.mirrors == entry.mirrors)
         && version.metadata.len() == entry.metadata.len()
         && (entry.metadata.iter()).all(|(key, value)| version.metadata.get(key) == Some(value))
     {
@@ -419,7 +439,9 @@ fn same_observation(
         Some(input.node_id),
         Some(connector.connector_id),
     );
-    stored == &entry.observation && RootEntry::same_source(source, &binding)
+    let first = source.source_at(0);
+    stored == &entry.observation
+        && first.is_some_and(|first| RootEntry::same_source(&first, &binding))
 }
 
 /// Builds the page's rows: versions, heads and connector reference rows of new entries,
@@ -528,7 +550,7 @@ fn register_rows(
     head: Option<&CurrentVersionPointer>,
 ) -> Result<EntryRows, PageImportError> {
     let connector = &input.connector;
-    let binding = build_source_binding(
+    let mut binding = build_source_binding(
         StagingStrategy::Reference,
         connector,
         &entry.observation,
@@ -536,6 +558,7 @@ fn register_rows(
         Some(input.node_id),
         Some(connector.connector_id),
     );
+    binding.mirrors = entry.mirrors.clone();
     let version_id = mint_version(guards.set_hint);
     let version = BlobVersion::reference(
         binding,

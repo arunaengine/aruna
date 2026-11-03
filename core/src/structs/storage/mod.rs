@@ -33,6 +33,7 @@ pub mod read_grant;
 pub mod release;
 pub mod replication;
 pub mod routing;
+pub mod share;
 pub mod storage_purge;
 pub mod transition;
 pub mod usage;

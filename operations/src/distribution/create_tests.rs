@@ -83,3 +83,19 @@ fn copy_edges_refused() {
 fn forbidden_hints_globs() {
     assert!(refusal_text(&SyncRefusal::Forbidden).contains("node glob"));
 }
+
+/// Admission waits for the accepted revision: an older head, or another head of the same
+/// number, has not reached it; the revision itself or a later one has.
+#[test]
+fn reached_accepted() {
+    use crate::distribution::test_record::{record, replicated, split_lower};
+
+    let (head, _) = record(true);
+    let (later, _) = split_lower(0, "f");
+    let (other, _) = replicated(true, 1);
+    assert!(later.number > head.number && other.number == head.number);
+    assert!(reached(&head, &head.revision()));
+    assert!(reached(&later, &head.revision()));
+    assert!(!reached(&head, &later.revision()));
+    assert!(!reached(&other, &head.revision()));
+}

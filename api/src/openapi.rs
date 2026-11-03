@@ -6,7 +6,7 @@ use serde_json::json;
 use utoipa::openapi::header::Header;
 use utoipa::openapi::response::{Response, ResponseBuilder};
 use utoipa::openapi::schema::{Object, Type};
-use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme};
 use utoipa::openapi::{Content, Ref, RefOr};
 use utoipa::{Modify, OpenApi};
 
@@ -66,6 +66,13 @@ impl Modify for SecurityAddon {
             components.add_security_scheme(
                 "basic_auth",
                 SecurityScheme::Http(Http::new(HttpAuthScheme::Basic)),
+            );
+            components.add_security_scheme(
+                "share_token",
+                SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                    "Authorization",
+                    "`Share <token>`: a share link token for opening, a visit token afterwards",
+                ))),
             );
         }
     }

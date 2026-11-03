@@ -1065,6 +1065,7 @@ mod tests {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
         let version = BlobVersion::reference(
             source,
@@ -1185,6 +1186,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(Ulid::generate()),
+            mirrors: Vec::new(),
         };
 
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle

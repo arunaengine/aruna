@@ -173,6 +173,7 @@ impl RootEntry {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         }
     }
 
@@ -231,6 +232,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(Ulid::from_bytes([1; 16])),
+            mirrors: Vec::new(),
         }
     }
 

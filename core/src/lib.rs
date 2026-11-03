@@ -34,6 +34,7 @@ pub mod metrics;
 pub mod node_vault;
 pub mod onboarding;
 pub mod operation;
+pub mod password;
 pub mod permission_path;
 pub mod recovery_code;
 pub mod reducer;
