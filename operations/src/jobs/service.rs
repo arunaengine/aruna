@@ -9,6 +9,7 @@ use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::MintPersistentSpec;
+use aruna_core::structs::execution::harvest::HarvestJobSpec;
 use aruna_core::structs::execution::job::{
     ArtifactRef, CopyJobSpec, ExecutionSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId,
     JobPayload, JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
@@ -375,6 +376,35 @@ pub async fn submit_import_job(
             dedup_key,
             now_ms: unix_timestamp_millis(),
             retention_ms,
+            workspace_mode: WorkspaceMode::default(),
+            workspace_bucket: None,
+            active_cap: None,
+        },
+        job_id,
+    )
+    .await
+}
+
+/// Queues one run of a harvest source for `created_by`. Provenance keeps a rerun idempotent.
+pub async fn submit_harvest_job(
+    context: &DriverContext,
+    spec: HarvestJobSpec,
+    created_by: UserId,
+    realm_id: RealmId,
+    owner_node_id: NodeId,
+    idempotency_key: Option<String>,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
+    let job_id = mint_local_job(context, realm_id, owner_node_id, dedup_key.as_deref()).await?;
+    submit_local_job(
+        context,
+        SubmitJobSpec {
+            payload: JobPayload::Harvest(spec),
+            created_by,
+            owner_node_id,
+            dedup_key,
+            now_ms: unix_timestamp_millis(),
+            retention_ms: crate::jobs::JOB_RETENTION_MS,
             workspace_mode: WorkspaceMode::default(),
             workspace_bucket: None,
             active_cap: None,
