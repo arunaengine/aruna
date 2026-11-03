@@ -17,6 +17,7 @@ default = ["docker", "apptainer", "kubernetes"]
 docker = ["aruna-compute/docker"]
 apptainer = ["aruna-compute/apptainer"]
 kubernetes = ["aruna-compute/kubernetes"]
+slurm = ["aruna-compute/slurm"]
 
 [dependencies]
 # Aruna modules

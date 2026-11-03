@@ -17,6 +17,8 @@ mod apptainer;
 mod docker;
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
+#[cfg(feature = "slurm")]
+mod slurm;
 
 use aruna_compute::ExecutorRegistry;
 use aruna_core::compute::ResourceEnvelope;
@@ -70,6 +72,7 @@ pub(super) enum BackendSettings {
     Docker(DockerSettings),
     Apptainer(ApptainerSettings),
     Kubernetes(Box<KubernetesSettings>),
+    Slurm(SlurmSettings),
 }
 
 /// The operator's compute inputs, parsed at one boundary. Builders consume
@@ -126,6 +129,17 @@ pub(super) struct KubernetesSettings {
     pub(super) pull_deadline: Duration,
 }
 
+/// Read only by the Slurm builder, which the non-default `slurm` feature compiles.
+#[cfg_attr(not(feature = "slurm"), allow(dead_code))]
+#[derive(Clone, Debug, Default)]
+pub(super) struct SlurmSettings {
+    pub(super) state_root: PathBuf,
+    pub(super) partition: Option<String>,
+    pub(super) account: Option<String>,
+    pub(super) execution_location: String,
+    pub(super) execution_labels: std::collections::BTreeMap<String, String>,
+}
+
 /// The compute side of the node: the built registry plus every value listener
 /// assembly needs, resolved once from the same typed settings.
 pub(crate) struct ComputeSetup {
@@ -173,6 +187,7 @@ pub(crate) async fn build_registry(
         BackendSettings::Kubernetes(kubernetes) => {
             build_kubernetes(settings, kubernetes, config).await
         }
+        BackendSettings::Slurm(slurm) => build_slurm(settings, slurm, config).await,
     };
     let registry = match result {
         Ok(registry) => Some(Arc::new(registry)),
@@ -232,6 +247,19 @@ async fn build_kubernetes(
 ) -> Result<ExecutorRegistry, ComputeBuildError> {
     Err(ComputeBuildError::Unsupported(
         "Kubernetes executor feature is not compiled".to_string(),
+    ))
+}
+
+#[cfg(feature = "slurm")]
+use slurm::build as build_slurm;
+#[cfg(not(feature = "slurm"))]
+async fn build_slurm(
+    _settings: &ComputeSettings,
+    _slurm: &SlurmSettings,
+    _config: &Config,
+) -> Result<ExecutorRegistry, ComputeBuildError> {
+    Err(ComputeBuildError::Unsupported(
+        "Slurm executor feature is not compiled".to_string(),
     ))
 }
 

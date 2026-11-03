@@ -18,6 +18,7 @@ pub(super) enum SelectedBackend {
     Docker,
     Apptainer,
     Kubernetes,
+    Slurm,
 }
 
 /// Parses the operator's backend choice. Pure so the accepted spellings are
@@ -30,6 +31,7 @@ pub(super) fn selected_backend(selected: &str) -> Result<SelectedBackend, Comput
         "docker" => Ok(SelectedBackend::Docker),
         "apptainer" => Ok(SelectedBackend::Apptainer),
         "kubernetes" => Ok(SelectedBackend::Kubernetes),
+        "slurm" => Ok(SelectedBackend::Slurm),
         other => Err(ComputeBuildError::Invalid(format!(
             "unknown ARUNA_COMPUTE_EXECUTOR `{other}`"
         ))),
@@ -52,6 +54,7 @@ pub(super) fn collect(
         SelectedBackend::Kubernetes => {
             BackendSettings::Kubernetes(Box::new(collect_kubernetes(env)?))
         }
+        SelectedBackend::Slurm => BackendSettings::Slurm(collect_slurm(env)?),
     };
     let has_backend = !matches!(backend, BackendSettings::None);
     Ok(ComputeSettings {
@@ -121,6 +124,33 @@ fn collect_apptainer(
             "ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE",
             env.var("ARUNA_COMPUTE_APPTAINER_PULL_DEADLINE").as_deref(),
             300,
+        )?,
+    })
+}
+
+fn collect_slurm(
+    env: &dyn crate::settings::SettingsEnv,
+) -> Result<super::SlurmSettings, ComputeBuildError> {
+    // Compute nodes read the staged inputs and write logs there, so no default fits.
+    let state_root = env
+        .var("ARUNA_COMPUTE_SLURM_STATE_ROOT")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            ComputeBuildError::Invalid(
+                "Slurm executor requires ARUNA_COMPUTE_SLURM_STATE_ROOT on a shared filesystem"
+                    .to_string(),
+            )
+        })?;
+    Ok(super::SlurmSettings {
+        state_root,
+        partition: parse_nonempty(env.var("ARUNA_COMPUTE_SLURM_PARTITION").as_deref()),
+        account: parse_nonempty(env.var("ARUNA_COMPUTE_SLURM_ACCOUNT").as_deref()),
+        execution_location: env
+            .var("ARUNA_COMPUTE_SLURM_EXECUTION_LOCATION")
+            .unwrap_or_default(),
+        execution_labels: parse_labels(
+            "ARUNA_COMPUTE_SLURM_EXECUTION_LABELS",
+            env.var("ARUNA_COMPUTE_SLURM_EXECUTION_LABELS").as_deref(),
         )?,
     })
 }
@@ -583,6 +613,7 @@ mod pure_tests {
             selected_backend("kubernetes").unwrap(),
             SelectedBackend::Kubernetes
         );
+        assert_eq!(selected_backend("slurm").unwrap(), SelectedBackend::Slurm);
         let error = selected_backend("podman").unwrap_err();
         assert!(
             matches!(&error, ComputeBuildError::Invalid(message) if message.contains("podman")),
