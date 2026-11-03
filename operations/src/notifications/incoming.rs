@@ -43,6 +43,7 @@ use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE, create_holder_watch,
     delete_holder_watch,
 };
+use crate::notifications::webhook::enqueue_webhooks;
 
 const MAX_FUTURE_SKEW: u64 = 5 * 60 * 1000;
 const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -115,6 +116,9 @@ async fn build_response(
             match upsert_with_report(&context.storage_handle, &records).await {
                 Ok(outcome) => {
                     wake_recipients(net_handle, &outcome.recipients);
+                    if outcome.written > 0 {
+                        enqueue_webhooks(context, local_node_id, &records).await;
+                    }
                     NotificationTransportMessage::DeliverAck {
                         written: outcome.written as u32,
                     }

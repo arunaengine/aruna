@@ -826,6 +826,14 @@ impl OperationsTaskHandler {
                         for recipient in &outcome.recipients {
                             net_handle.notify_inbox_activity(*recipient);
                         }
+                        if outcome.written > 0 {
+                            crate::notifications::webhook::enqueue_webhooks(
+                                &self.context,
+                                local_node_id,
+                                &local_records,
+                            )
+                            .await;
+                        }
                         if let Err(error) =
                             delete_outbox_records(&self.context.storage_handle, local_keys).await
                         {
