@@ -15,6 +15,7 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::startup::RecoveryStatus;
+use aruna_operations::notifications::email::SmtpMailer;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_tasks::TaskHandle;
@@ -345,6 +346,11 @@ async fn fill(
         .open_vault(aruna_core::node_vault::NodeVaultKey::derive(
             &config.node_state.net_secret_key,
         ));
+    if let Some(smtp) = &config.smtp {
+        let mailer = SmtpMailer::new(smtp)?;
+        acquired.jobs_runtime.set_mailer(Arc::new(mailer));
+        info!("email notifications are configured");
+    }
     if matches!(
         config.startup_mode,
         crate::config::StartupMode::JoinRealm {
