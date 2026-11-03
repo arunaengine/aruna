@@ -205,6 +205,10 @@ pub enum JobResultPayload {
         skipped: u64,
         failed: u64,
     },
+    /// The receiver's HTTP status; `None` when the subscription was gone and nothing was sent.
+    Webhook {
+        status: Option<u16>,
+    },
 }
 
 impl JobResultPayload {
@@ -223,6 +227,7 @@ impl JobResultPayload {
             JobResultPayload::CopyObject { .. } => "copy_object",
             JobResultPayload::Identifiers { .. } => "identifiers",
             JobResultPayload::BackendImport { .. } => "backend_import",
+            JobResultPayload::Webhook { .. } => "webhook",
         }
     }
 
@@ -419,6 +424,7 @@ impl JobResultPayload {
                 "skipped": skipped,
                 "failed": failed,
             }),
+            JobResultPayload::Webhook { status } => serde_json::json!({ "status": status }),
         }
     }
 }

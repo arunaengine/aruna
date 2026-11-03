@@ -20,6 +20,8 @@ pub enum VaultPurpose {
     GroupBackend,
     /// The node copy of a `node_managed` bucket key, under its key record id.
     BucketKey,
+    /// The signing secret of a webhook subscription, under its subscription id.
+    Webhook,
 }
 
 impl VaultPurpose {
@@ -28,6 +30,7 @@ impl VaultPurpose {
             Self::SourceConnector => 1,
             Self::GroupBackend => 2,
             Self::BucketKey => 3,
+            Self::Webhook => 4,
         }
     }
 }

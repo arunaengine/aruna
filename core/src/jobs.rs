@@ -33,6 +33,7 @@ pub enum JobKind {
     CopyObject,
     RegisterIdentifiers,
     BackendImport,
+    WebhookDelivery,
 }
 
 impl JobKind {
@@ -51,6 +52,7 @@ impl JobKind {
             Self::CopyObject => "copy_object",
             Self::RegisterIdentifiers => "register_identifiers",
             Self::BackendImport => "backend_import",
+            Self::WebhookDelivery => "webhook_delivery",
         }
     }
 
@@ -82,6 +84,7 @@ impl From<&JobPayload> for JobKind {
             JobPayload::CopyObject(_) => Self::CopyObject,
             JobPayload::RegisterIdentifiers(_) => Self::RegisterIdentifiers,
             JobPayload::BackendImport(_) => Self::BackendImport,
+            JobPayload::WebhookDelivery(_) => Self::WebhookDelivery,
         }
     }
 }
@@ -236,6 +239,7 @@ impl RunningJobView {
             ),
             JobPayload::RegisterIdentifiers(spec) => (dataset(spec.document_id), None),
             JobPayload::BackendImport(spec) => (None, Some(spec.group_id)),
+            JobPayload::WebhookDelivery(_) => (None, None),
         };
         Self {
             kind: JobKind::from(&record.payload),

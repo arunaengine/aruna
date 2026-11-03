@@ -564,6 +564,7 @@ dependencies = [
  "getrandom 0.4.3",
  "globset",
  "hex",
+ "hmac 0.13.0",
  "hpke",
  "ipnet",
  "iroh",

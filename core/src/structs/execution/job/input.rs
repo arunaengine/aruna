@@ -716,6 +716,8 @@ pub enum JobPayload {
     BackendImport(crate::structs::storage::backend_import::BackendImportSpec),
     /// A purge that also deletes the linked-storage files of the purged versions.
     StoragePurgeFiles(StoragePurgeSpec),
+    /// One webhook delivery of one notification. Safe to requeue: receivers deduplicate by id.
+    WebhookDelivery(crate::structs::execution::webhook::WebhookDeliverySpec),
 }
 
 impl ExecutionSpec {
@@ -748,7 +750,8 @@ impl JobPayload {
             | Self::TerminalCleanup { .. }
             | Self::ExportRoCrate(_)
             | Self::MintPersistentId(_)
-            | Self::RegisterIdentifiers(_) => None,
+            | Self::RegisterIdentifiers(_)
+            | Self::WebhookDelivery(_) => None,
         }
     }
 
@@ -769,6 +772,7 @@ impl JobPayload {
             JobPayload::RegisterIdentifiers(_) => "register_identifiers",
             JobPayload::BackendImport(_) => "backend_import",
             JobPayload::StoragePurgeFiles(_) => "storage_purge_files",
+            JobPayload::WebhookDelivery(_) => "webhook_delivery",
         }
     }
 
@@ -787,7 +791,8 @@ impl JobPayload {
             JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. }
-            | JobPayload::RegisterIdentifiers(_) => "steps",
+            | JobPayload::RegisterIdentifiers(_)
+            | JobPayload::WebhookDelivery(_) => "steps",
         }
     }
 
@@ -807,7 +812,8 @@ impl JobPayload {
             | JobPayload::TerminalCleanup { .. }
             | JobPayload::CopyObject(_)
             | JobPayload::RegisterIdentifiers(_)
-            | JobPayload::BackendImport(_) => JobExecutionClass::InProcess,
+            | JobPayload::BackendImport(_)
+            | JobPayload::WebhookDelivery(_) => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
         }
     }
