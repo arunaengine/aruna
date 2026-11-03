@@ -24,10 +24,9 @@ pub(crate) enum UpsertFailure {
     Fatal(String),
 }
 
-/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen
-/// order, recipients that gained or lost a record, so a caller can wake each once;
-/// a pure redelivery reports zero writes. `purged` counts records a bucket deletion removed,
-/// `cutoffs` the deletion times it stored.
+/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen order, those that
+/// gained or lost a record, so a caller wakes each once; a pure redelivery reports zero writes.
+/// `purged` counts records a bucket deletion removed, `cutoffs` the deletion times it stored.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InboxWriteOutcome {
     pub written: usize,

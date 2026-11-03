@@ -206,7 +206,7 @@ async fn visitor_is_refused() {
 }
 
 #[tokio::test]
-async fn setup_is_admin_only() {
+async fn setup_admin_only() {
     let fixture = fixture().await;
     let refused = put_central(
         State(fixture.state.clone()),
@@ -329,7 +329,7 @@ async fn bad_session_refused() {
 }
 
 #[tokio::test]
-async fn quota_refuses_at_limit() {
+async fn quota_refuses_overuse() {
     let fixture = fixture().await;
     let (base_url, _seen, calls) = mock_provider().await;
     set_up(&fixture, &base_url, Some(1)).await;
@@ -526,7 +526,7 @@ async fn concurrent_charges_count() {
 }
 
 #[test]
-fn empty_tools_no_session() {
+fn empty_tools_sessionless() {
     // Open WebUI treats a null or empty tool list as none and would add its own server tools.
     let central = compatible_central();
     for tools in [serde_json::Value::Null, serde_json::json!([])] {
@@ -548,7 +548,7 @@ fn empty_tools_no_session() {
 }
 
 #[test]
-fn forwards_chat_fields_only() {
+fn forwards_chat_fields() {
     // Folder context, terminals, skills and any field Open WebUI adds later stay with the caller.
     let central = compatible_central();
     let body = rewritten(
@@ -605,7 +605,7 @@ fn relayed_chat(hop: &str) -> Request {
 }
 
 #[tokio::test]
-async fn hop_still_reaches_holder() {
+async fn hop_reaches_holder() {
     // A hop header, from a client or a former holder, never makes a non-holder answer itself.
     let fixture = fixture().await;
     let (base_url, mut seen, _) = mock_provider().await;
@@ -663,7 +663,7 @@ async fn charge_survives_conflicts() {
 }
 
 #[tokio::test]
-async fn busy_charge_retries_later() {
+async fn busy_charge_retries() {
     // Conflicts that never end, a start failure among them, end in a retryable refusal.
     let mut attempts = 0;
     let refused = retry_conflicts(0, || {

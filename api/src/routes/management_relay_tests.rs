@@ -57,7 +57,7 @@ fn matches_allowlisted_routes() {
 }
 
 #[test]
-fn central_goes_to_holder() {
+fn central_reaches_holder() {
     let proxy = Some("/api/v1/system/assistant/providers/{id}/proxy/{*path}");
     let central: Uri = "/api/v1/system/assistant/providers/central/proxy/v1/messages"
         .parse()

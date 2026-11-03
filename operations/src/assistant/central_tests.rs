@@ -175,7 +175,7 @@ fn refused_charge_aborts() {
 }
 
 #[test]
-fn charge_resets_next_day() {
+fn charge_resets_daily() {
     // The last second of day 9 is refused; the first second of day 10 counts from zero.
     let last = 86_400 * 10 - 1;
     let mut operation = ChargeUsageOperation::new(user(), utc_day(last), Some(2));
@@ -194,7 +194,7 @@ fn charge_resets_next_day() {
 }
 
 #[test]
-fn reads_central_and_usage() {
+fn reads_central_usage() {
     let mut operation = GetCentralOperation::new(user());
     let effects = operation.start();
     assert!(matches!(

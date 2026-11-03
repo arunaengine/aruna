@@ -211,7 +211,7 @@ fn ties_cut_consistently() {
 }
 
 #[test]
-fn equal_values_cut_consistently() {
+fn equal_values_cut() {
     // Tied engine picks vary per process, so distinct trials make a wrong cut show reliably.
     let query = "SELECT DISTINCT ?n WHERE { ?s <urn:k> ?n } ORDER BY ?n LIMIT 1";
     let (partition, _) = ordered_query(query).unwrap().unwrap();
@@ -554,7 +554,7 @@ async fn row_limit_fetch() {
 }
 
 #[tokio::test]
-async fn ties_stop_at_limit() {
+async fn ties_stop_limit() {
     // The tie group at the cut runs past the row limit, so the partition keeps what fits.
     let limit = QUERY_MAX_ROWS - 1;
     let query = format!("SELECT DISTINCT ?k WHERE {{ ?s <urn:k> ?k }} ORDER BY ?k LIMIT {limit}");

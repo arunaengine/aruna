@@ -141,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn clock_back_keeps_day() {
+    fn backward_clock_day() {
         // A clock stepped back across midnight must not reset today's count.
         let usage = AssistantUsage { day: 10, count: 50 };
         assert_eq!(

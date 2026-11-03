@@ -402,7 +402,7 @@ async fn signed_out_parts() {
 }
 
 #[tokio::test]
-async fn signed_out_remote_part() {
+async fn anonymous_remote_part() {
     // Signed out, a part of another node's bucket resolves as that node answers, since only
     // it knows the bucket's group and roles; its refusal stays a refusal.
     use crate::tests::distributed::{PEER, mock_peer, node_id, publish_api};

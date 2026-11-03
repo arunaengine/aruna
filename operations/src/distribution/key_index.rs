@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_budget_falls_back() {
+    async fn range_budget_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let indexes = RangeIndexes::new(dir.path()).with_range_bytes(0);
         let indexes = Arc::new(indexes);
