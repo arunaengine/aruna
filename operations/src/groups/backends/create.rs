@@ -2,20 +2,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::validation::{GroupBackendError, validate_backend_input};
+use super::validation::{GroupBackendError, check_import_root, validate_backend_input};
 use super::{RecordReadError, record_writes};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::operation::Operation;
+use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
@@ -29,6 +30,8 @@ pub struct CreateBackendInput {
     pub public_config: HashMap<String, String>,
     pub secret_config: HashMap<String, String>,
     pub cleanup: CleanupStrategy,
+    /// This node's import roots, which a local folder backend must name.
+    pub import_roots: BTreeMap<String, ImportRoot>,
 }
 
 /// Shows only the secret keys; the values are live credentials.
@@ -45,6 +48,7 @@ impl std::fmt::Debug for CreateBackendInput {
                 &self.secret_config.keys().collect::<Vec<_>>(),
             )
             .field("cleanup", &self.cleanup)
+            .field("import_roots", &self.import_roots)
             .finish()
     }
 }
@@ -122,6 +126,11 @@ impl CreateBackendOperation {
             Ok(normalized) => normalized,
             Err(error) => return self.fail(error.into()),
         };
+        let (kind, roots) = (self.input.kind, &self.input.import_roots);
+        if let Err(error) = check_import_root(kind, &normalized.public, self.input.group_id, roots)
+        {
+            return self.fail(error.into());
+        }
 
         let now = SystemTime::now();
         let backend_id = Ulid::generate();
@@ -265,6 +274,7 @@ mod pure_tests {
                 ("secret_access_key".to_string(), "canary-2f9b".to_string()),
             ]),
             cleanup: CleanupStrategy::Retain,
+            import_roots: Default::default(),
         }
     }
 

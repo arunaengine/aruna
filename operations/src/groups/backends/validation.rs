@@ -3,9 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::endpoint_screening;
+use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_core::structs::storage::blob::ensure_confined_path;
-use aruna_core::structs::storage::group_backend::{BUCKET_DELETE, GroupBackendKind, GroupStorage};
-use std::collections::{HashMap, HashSet};
+use aruna_core::structs::storage::group_backend::{
+    BUCKET_DELETE, GroupBackendKind, GroupStorage, plain_folder,
+};
+use aruna_core::types::GroupId;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
 
@@ -60,6 +64,10 @@ pub enum GroupBackendError {
     InvalidDelete,
     #[error("`{0}` is fixed after create; register a new backend instead")]
     Immutable(String),
+    #[error("folder `{0}` must be relative and end with `/`, without empty, `.` or `..` names")]
+    UnsafeFolder(String),
+    #[error("import root `{0}` is not offered to this group on this node")]
+    UnknownRoot(String),
 }
 
 /// The normalized, storable configs: keys lowercased so the record matches what
@@ -79,6 +87,7 @@ const fn identity_keys(kind: GroupBackendKind) -> &'static [&'static str] {
         GroupBackendKind::Azblob => &["endpoint", "container", "account_name", "root"],
         GroupBackendKind::Azdls => &["endpoint", "filesystem", "account_name", "root"],
         GroupBackendKind::B2 => &["bucket", "bucket_id", "root"],
+        GroupBackendKind::Fs => &["root", "folder"],
     }
 }
 
@@ -152,6 +161,31 @@ pub const fn rules_for_kind(kind: GroupBackendKind) -> GroupBackendRules {
             required_secret: &["application_key_id", "application_key"],
             one_of_secret: &[],
         },
+        // `root` names an import root of this node, never a path; there are no secrets.
+        GroupBackendKind::Fs => GroupBackendRules {
+            required_public: &["root"],
+            allowed_public: &["root", "folder"],
+            allowed_secret: &[],
+            required_secret: &[],
+            one_of_secret: &[],
+        },
+    }
+}
+
+/// A local folder names an import root of this node that lists the group.
+pub fn check_import_root(
+    kind: GroupBackendKind,
+    public: &HashMap<String, String>,
+    group_id: GroupId,
+    roots: &BTreeMap<String, ImportRoot>,
+) -> Result<(), GroupBackendError> {
+    if kind != GroupBackendKind::Fs {
+        return Ok(());
+    }
+    let name = public.get("root").cloned().unwrap_or_default();
+    match roots.get(&name) {
+        Some(root) if root.allows(group_id) => Ok(()),
+        _ => Err(GroupBackendError::UnknownRoot(name)),
     }
 }
 
@@ -222,10 +256,15 @@ pub fn validate_backend_input(
     {
         return Err(GroupBackendError::UnsafeBucket(bucket.clone()));
     }
-    if let Some(root) = public.get("root")
+    if let Some(root) = public.get("root").filter(|_| kind != GroupBackendKind::Fs)
         && ensure_confined_path(Path::new(root.trim_start_matches('/'))).is_err()
     {
         return Err(GroupBackendError::UnsafeRoot(root.clone()));
+    }
+    if let Some(folder) = public.get("folder")
+        && !plain_folder(folder)
+    {
+        return Err(GroupBackendError::UnsafeFolder(folder.clone()));
     }
     if let Some(value) = public.get("force_path_style")
         && value.parse::<bool>().is_err()
@@ -271,7 +310,9 @@ fn normalize(
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{GroupBackendError, validate_backend_input};
+    use super::{GroupBackendError, check_import_root, validate_backend_input};
+    use aruna_core::structs::storage::backends::ImportRoot;
+    use std::collections::BTreeMap;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
     use std::collections::HashMap;
 
@@ -421,7 +462,8 @@ mod pure_tests {
     #[test]
     fn requires_static_credentials() {
         // Without these the provider chain falls back to the node's identity.
-        for kind in GroupBackendKind::ALL {
+        let remote = GroupBackendKind::ALL.into_iter();
+        for kind in remote.filter(|kind| *kind != GroupBackendKind::Fs) {
             let error = validate_backend_input("tenant", kind, &kind_public(kind), &HashMap::new())
                 .unwrap_err();
             assert!(
@@ -558,6 +600,7 @@ mod pure_tests {
                 ("account_name", "acct"),
             ]),
             GroupBackendKind::B2 => config(&[("bucket", "data"), ("bucket_id", "abc")]),
+            GroupBackendKind::Fs => config(&[("root", "projects"), ("folder", "raw/")]),
         }
     }
 
@@ -569,6 +612,44 @@ mod pure_tests {
             GroupBackendKind::B2 => {
                 config(&[("application_key_id", "id"), ("application_key", "key")])
             }
+            GroupBackendKind::Fs => HashMap::new(),
         }
+    }
+
+    #[test]
+    fn checks_local_folders() {
+        let fs = GroupBackendKind::Fs;
+        assert!(validate_backend_input("lab", fs, &kind_public(fs), &HashMap::new()).is_ok());
+        for folder in ["raw", "../raw/", "raw/./", "/raw/"] {
+            let public = config(&[("root", "projects"), ("folder", folder)]);
+            let error = validate_backend_input("lab", fs, &public, &HashMap::new()).unwrap_err();
+            assert_eq!(error, GroupBackendError::UnsafeFolder(folder.to_string()));
+        }
+        let secret = config(&[("account_key", "key")]);
+        let error = validate_backend_input("lab", fs, &kind_public(fs), &secret).unwrap_err();
+        assert!(matches!(error, GroupBackendError::UnknownSecretKey { .. }));
+        let error = validate_backend_input("lab", fs, &config(&[]), &HashMap::new()).unwrap_err();
+        assert!(matches!(error, GroupBackendError::MissingPublicKey { .. }));
+    }
+
+    #[test]
+    fn checks_import_roots() {
+        let group = ulid::Ulid::from_bytes([1u8; 16]);
+        let root = ImportRoot {
+            path: "/srv/share".to_string(),
+            groups: vec![group],
+            writable: false,
+        };
+        let roots = BTreeMap::from([("projects".to_string(), root)]);
+        let fs = GroupBackendKind::Fs;
+
+        assert!(check_import_root(fs, &kind_public(fs), group, &roots).is_ok());
+        let other = ulid::Ulid::nil();
+        let error = check_import_root(fs, &kind_public(fs), other, &roots).unwrap_err();
+        assert_eq!(error, GroupBackendError::UnknownRoot("projects".to_string()));
+        let unknown = config(&[("root", "scratch")]);
+        assert!(check_import_root(fs, &unknown, group, &roots).is_err());
+        let s3 = GroupBackendKind::S3;
+        assert!(check_import_root(s3, &s3_public(), other, &BTreeMap::new()).is_ok());
     }
 }
