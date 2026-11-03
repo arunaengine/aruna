@@ -10,6 +10,7 @@ pub mod merge;
 pub mod oidc_user;
 pub mod read_document;
 pub mod resolve_users;
+pub mod revoke_all;
 pub mod search_users;
 pub mod service_account;
 pub mod subject_index;
