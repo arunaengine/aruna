@@ -19,6 +19,7 @@ runs:
 
     # .cargo/config.toml links with clang and mold; GNU ld is slower and needs more memory.
     - name: Install mold
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update -qq
