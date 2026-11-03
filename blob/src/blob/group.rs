@@ -110,7 +110,11 @@ fn folder_entry(
     Ok(NodeBackend::new(
         BackendConfig {
             backend_type: Backend::Group(GroupBackendKind::Fs),
-            root: record.public_config.get("folder").cloned().unwrap_or_default(),
+            root: record
+                .public_config
+                .get("folder")
+                .cloned()
+                .unwrap_or_default(),
             service_config,
             bucket_prefix: None,
             max_bucket_size: None,
@@ -634,13 +638,12 @@ fn probe_message(label: &str, name: &str, error: &opendal::Error, delete: bool) 
 #[cfg(test)]
 mod tests {
     use super::{
-        bucket_answer, check_folder, container_label, group_entry, group_ids, probe,
-        probe_message,
+        bucket_answer, check_folder, container_label, group_entry, group_ids, probe, probe_message,
     };
-    use aruna_core::structs::storage::backends::ImportRoot;
     use aruna_core::effects::BlobEffect;
     use aruna_core::errors::BlobError;
     use aruna_core::events::BlobEvent;
+    use aruna_core::structs::storage::backends::ImportRoot;
     use aruna_core::structs::storage::blob::{
         Backend, BackendRef, BlobTimeoutConfig, ResolvedBackend,
     };
@@ -741,7 +744,13 @@ mod tests {
     fn entry_without_bucket() {
         // Aruna's own keys never reach the service config.
         let mut storage = record(GroupBackendKind::S3, &[("endpoint", "https://s3.lab")]);
-        let entry = group_entry(&storage, &secret(), &BTreeMap::new(), BlobTimeoutConfig::default()).unwrap();
+        let entry = group_entry(
+            &storage,
+            &secret(),
+            &BTreeMap::new(),
+            BlobTimeoutConfig::default(),
+        )
+        .unwrap();
         assert!(!entry.config.service_config.contains_key("bucket"));
         assert_eq!(entry.config.multipart_bucket, None);
 
@@ -749,7 +758,13 @@ mod tests {
         storage
             .public_config
             .insert("bucket:lab-raw".to_string(), "created".to_string());
-        let entry = group_entry(&storage, &secret(), &BTreeMap::new(), BlobTimeoutConfig::default()).unwrap();
+        let entry = group_entry(
+            &storage,
+            &secret(),
+            &BTreeMap::new(),
+            BlobTimeoutConfig::default(),
+        )
+        .unwrap();
         assert_eq!(entry.config.multipart_bucket.as_deref(), Some("lab-raw"));
         storage
             .public_config
@@ -757,7 +772,13 @@ mod tests {
         storage
             .public_config
             .insert("layout:lab-old".to_string(), "true".to_string());
-        let entry = group_entry(&storage, &secret(), &BTreeMap::new(), BlobTimeoutConfig::default()).unwrap();
+        let entry = group_entry(
+            &storage,
+            &secret(),
+            &BTreeMap::new(),
+            BlobTimeoutConfig::default(),
+        )
+        .unwrap();
         assert_eq!(
             entry.config.multipart_bucket.as_deref(),
             Some("lab-default")
@@ -770,7 +791,15 @@ mod tests {
         );
         // Other kinds still need their container.
         let azure = record(GroupBackendKind::Azblob, &[("endpoint", "https://az")]);
-        assert!(group_entry(&azure, &secret(), &BTreeMap::new(), BlobTimeoutConfig::default()).is_err());
+        assert!(
+            group_entry(
+                &azure,
+                &secret(),
+                &BTreeMap::new(),
+                BlobTimeoutConfig::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -837,7 +866,10 @@ mod tests {
         assert_eq!(entry.config.root, "raw/");
         assert_eq!(entry.config.service_config["path"], "/srv/share");
         assert_eq!(entry.config.service_config["writable"], "true");
-        assert_eq!(entry.config.multipart_bucket.as_deref(), Some("_aruna_parts"));
+        assert_eq!(
+            entry.config.multipart_bucket.as_deref(),
+            Some("_aruna_parts")
+        );
         let other = import_roots("/srv/share", vec![Ulid::nil()], true);
         assert!(group_entry(&storage, &secret(), &other, timeouts).is_err());
         assert!(group_entry(&storage, &secret(), &BTreeMap::new(), timeouts).is_err());
@@ -852,13 +884,13 @@ mod tests {
         let entry = group_entry(&storage, &secret(), &roots, BlobTimeoutConfig::default());
         let mut config = entry.unwrap().config.service_config;
         config.insert("root".to_string(), folder.to_string());
-        let guard = crate::egress::EgressGuard::new(
-            aruna_core::egress::EgressPolicy::loopback(),
-        )
-        .unwrap();
+        let guard =
+            crate::egress::EgressGuard::new(aruna_core::egress::EgressPolicy::loopback()).unwrap();
         let operator =
             crate::opendal::build_group_service(GroupBackendKind::Fs, config, &guard).unwrap();
-        check_folder(&operator, storage.backend_id, folder).await.is_ok()
+        check_folder(&operator, storage.backend_id, folder)
+            .await
+            .is_ok()
     }
 
     #[tokio::test]

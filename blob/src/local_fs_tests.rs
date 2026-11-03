@@ -233,7 +233,10 @@ async fn creates_only_once() {
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::ConditionNotMatch);
     assert_eq!(std::fs::read(root.path().join("taken")).unwrap(), b"first");
-    op.write_with("free", "new").if_not_exists(true).await.unwrap();
+    op.write_with("free", "new")
+        .if_not_exists(true)
+        .await
+        .unwrap();
     assert_eq!(std::fs::read(root.path().join("free")).unwrap(), b"new");
     // Neither write leaves a temporary file behind.
     let mut names: Vec<_> = std::fs::read_dir(root.path())
@@ -288,12 +291,18 @@ async fn writes_never_follow_symlinks() {
     op.delete("folder/secret").await.unwrap();
     op.delete("file").await.unwrap();
     assert!(!outside.path().join("new").exists());
-    assert_eq!(std::fs::read(outside.path().join("secret")).unwrap(), b"secret");
+    assert_eq!(
+        std::fs::read(outside.path().join("secret")).unwrap(),
+        b"secret"
+    );
     // A create-only write finds the symlink's name taken; a plain one replaces the link.
     let error = op.write_with("file", "x").if_not_exists(true).await;
     assert_eq!(error.unwrap_err().kind(), ErrorKind::ConditionNotMatch);
     op.write("file", "own").await.unwrap();
-    assert_eq!(std::fs::read(outside.path().join("secret")).unwrap(), b"secret");
+    assert_eq!(
+        std::fs::read(outside.path().join("secret")).unwrap(),
+        b"secret"
+    );
 }
 
 #[tokio::test]

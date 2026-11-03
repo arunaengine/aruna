@@ -418,7 +418,10 @@ impl Spool {
         let (folder, name) = core.parent_of(path, true)?;
         let temp = format!("{TEMP_PREFIX}{}", Ulid::generate());
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true).follow(FollowSymlinks::No);
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
         let file = folder.open_with(&temp, &options).map_err(io_error)?;
         Ok(Self {
             name: name.to_string(),
@@ -455,7 +458,10 @@ impl Spool {
         match placed {
             Ok(()) => Ok(self.size),
             Err(error) if if_not_exists && error.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(Error::new(ErrorKind::ConditionNotMatch, "the path is taken"))
+                Err(Error::new(
+                    ErrorKind::ConditionNotMatch,
+                    "the path is taken",
+                ))
             }
             Err(error) => Err(io_error(error)),
         }
