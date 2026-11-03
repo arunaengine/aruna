@@ -1215,26 +1215,78 @@ mod pure_tests {
         // Two full turnovers with grace, while old holder 9 never answers: the cutover needs
         // the operator's force, holder 9 stays retained without its drain report, and the next
         // turnover adds only its own departing holders until they drain.
-        use aruna_core::structs::placement::transition::{BucketCompletion, BucketDrain};
+        use aruna_core::structs::placement::transition::{
+            BucketCompletion, BucketDrain, FrozenStrategySelector, PlacementTransition,
+        };
         let (mut config, placement) = config_and_placement();
         let strategy_id = placement.strategy_id;
-        let base = resolve_shard_holders(&config, &placement);
-        let extra = |config: &RealmConfigDocument, now_ms: u64| {
-            let membership = bucket_membership(config, &placement, now_ms);
-            let added = |nodes: Vec<NodeId>| {
-                let added = nodes.into_iter().filter(|node_id| !base.contains(node_id));
-                added.collect::<Vec<_>>()
-            };
-            (added(membership.members), added(membership.publishers))
+        // Map 1 places bucket 7 on 9 and 10, map 2 on 12 and 13, map 3 on 14 and 15.
+        let map = |epoch: u64, seeds: [u8; 2]| CandidatePlacementMap {
+            epoch,
+            nodes: seeds
+                .iter()
+                .map(|seed| CandidateMapNode {
+                    node_id: node(*seed),
+                    kind: RealmNodeKind::Server,
+                    location: "eu".to_string(),
+                    weight: 100,
+                    full: false,
+                    draining: false,
+                    labels: std::collections::BTreeMap::new(),
+                })
+                .collect(),
+            selectors: vec![FrozenStrategySelector {
+                strategy_id,
+                replica_count: Some(2),
+                distinct_locations: false,
+                affinity: Vec::new(),
+            }],
+            shard_overrides: Vec::new(),
         };
+        config.candidate_maps = vec![map(1, [9, 10]), map(2, [12, 13]), map(3, [14, 15])];
+        config.placement_activations = vec![PlacementActivation {
+            strategy_id,
+            shard: 7,
+            activation_epoch: 1,
+            candidate_map_epoch: 1,
+            transition_id: None,
+        }];
+        // The cutover rule of the reducer: a ready bucket planned on the current epoch advances.
+        let activate = |config: &mut RealmConfigDocument, transition: &PlacementTransition| {
+            let plan = transition.plan.bucket_plan(7).expect("bucket 7 planned");
+            let activation = &mut config.placement_activations[0];
+            assert!(transition.bucket_ready(7));
+            assert_eq!(plan.predecessor_epoch, activation.activation_epoch);
+            activation.candidate_map_epoch = transition.plan.target_map_epoch;
+            activation.activation_epoch += 1;
+        };
+        let sorted = |seeds: &[u8]| {
+            let mut nodes: Vec<NodeId> = seeds.iter().map(|seed| node(*seed)).collect();
+            nodes.sort_by_key(|node_id| *node_id.as_bytes());
+            nodes
+        };
+        let sets = |config: &RealmConfigDocument, now_ms: u64| {
+            let membership = bucket_membership(config, &placement, now_ms);
+            let mut members = membership.members;
+            let mut publishers = membership.publishers;
+            members.sort_by_key(|node_id| *node_id.as_bytes());
+            publishers.sort_by_key(|node_id| *node_id.as_bytes());
+            (members, publishers)
+        };
+        let both = |seeds: &[u8]| (sorted(seeds), sorted(seeds));
+        let active = |config: &RealmConfigDocument| {
+            let mut holders = resolve_shard_holders(config, &placement);
+            holders.sort_by_key(|node_id| *node_id.as_bytes());
+            holders
+        };
+        assert_eq!(active(&config), sorted(&[9, 10]));
 
-        let mut first = full_turnover(strategy_id, 2, (&[9, 10], &[12, 13], &[10]));
+        let mut first = full_turnover(strategy_id, 1, (&[9, 10], &[12, 13], &[10]));
         assert_eq!(
             first.forced.len(),
             1,
             "a missing barrier needs a forced cutover"
         );
-        assert!(first.bucket_ready(7));
         first.completed.push(BucketCompletion {
             bucket: 7,
             completed_at_ms: 100,
@@ -1243,16 +1295,19 @@ mod pure_tests {
             bucket: 7,
             reported_by: node(10),
         });
+        activate(&mut config, &first);
         config.placement_transitions.push(first);
         assert_eq!(
-            extra(&config, 500),
-            (vec![node(9), node(10)], vec![node(9), node(10)])
+            active(&config),
+            sorted(&[12, 13]),
+            "the replacements are active"
         );
-        assert_eq!(extra(&config, 1_100), (vec![node(9)], vec![node(9)]));
+        assert_eq!(sets(&config, 500), both(&[9, 10, 12, 13]));
+        assert_eq!(sets(&config, 1_100), both(&[9, 12, 13]));
         assert!(config.placement_transitions[0].is_terminal());
         assert!(!config.placement_transitions[0].released(u64::MAX));
 
-        let mut second = full_turnover(strategy_id, 3, (&[12, 13], &[14, 15], &[12, 13]));
+        let mut second = full_turnover(strategy_id, 2, (&[12, 13], &[14, 15], &[12, 13]));
         assert!(second.forced.is_empty(), "every old holder froze");
         second.completed.push(BucketCompletion {
             bucket: 7,
@@ -1264,10 +1319,15 @@ mod pure_tests {
                 reported_by: node(holder),
             });
         }
+        activate(&mut config, &second);
         config.placement_transitions.push(second);
-        let (members, _) = extra(&config, 2_500);
-        assert_eq!(members, vec![node(9), node(12), node(13)]);
-        assert_eq!(extra(&config, 3_100), (vec![node(9)], vec![node(9)]));
+        assert_eq!(
+            active(&config),
+            sorted(&[14, 15]),
+            "the replacements are active"
+        );
+        assert_eq!(sets(&config, 2_500), both(&[9, 12, 13, 14, 15]));
+        assert_eq!(sets(&config, 3_100), both(&[9, 14, 15]));
         assert!(config.placement_transitions[1].released(3_100));
         assert!(
             drain_pending(&config, 3_100),
