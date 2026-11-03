@@ -7,7 +7,7 @@ use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::errors::BlobError;
 use aruna_core::structs::Status;
-use aruna_core::structs::storage::backends::{NodeBackendEntry, NodeBackendsConfig};
+use aruna_core::structs::storage::backends::{ImportRoot, NodeBackendEntry, NodeBackendsConfig};
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendRef, BlobTimeoutConfig, ResolvedBackend,
 };
@@ -72,6 +72,7 @@ pub struct BackendRegistry {
     default_name: String,
     rules: Arc<[NodeRoutingRule]>,
     serve_group_backends: bool,
+    import_roots: Arc<BTreeMap<String, ImportRoot>>,
 }
 
 impl BackendRegistry {
@@ -88,6 +89,7 @@ impl BackendRegistry {
             default_name: BackendRef::DEFAULT_NODE_NAME.to_string(),
             rules: Arc::from([]),
             serve_group_backends: true,
+            import_roots: Arc::default(),
         }
     }
 
@@ -102,6 +104,7 @@ impl BackendRegistry {
         Ok(Self {
             rules: Arc::from(config.rules.clone()),
             serve_group_backends: config.serve_group_backends,
+            import_roots: Arc::new(config.served_roots()),
             ..registry
         })
     }
@@ -121,6 +124,7 @@ impl BackendRegistry {
             default_name,
             rules: Arc::from([]),
             serve_group_backends: true,
+            import_roots: Arc::default(),
         })
     }
 
@@ -157,6 +161,11 @@ impl BackendRegistry {
             .get(&self.default_name)
             .expect("registry always holds its default backend")
             .config
+    }
+
+    /// The folders `fs` group backends may serve; empty while group backends are withdrawn.
+    pub fn import_roots(&self) -> &BTreeMap<String, ImportRoot> {
+        &self.import_roots
     }
 
     pub fn timeouts(&self) -> BlobTimeoutConfig {

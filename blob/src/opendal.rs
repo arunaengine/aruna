@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::egress::EgressGuard;
+use crate::local_fs::LocalFsBuilder;
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::source_access::{
@@ -94,7 +95,20 @@ pub(crate) fn build_group_service(
         GroupBackendKind::Azblob => build_service::<services::Azblob>(config, layer),
         GroupBackendKind::Azdls => build_service::<services::Azdls>(config, layer),
         GroupBackendKind::B2 => build_service::<services::B2>(config, layer),
+        GroupBackendKind::Fs => build_service::<LocalFsBuilder>(folder_config(config), None),
     }
+}
+
+/// A folder storage serves its folder, the operator's `root`, below the import root's `path`.
+fn folder_config(mut config: HashMap<String, String>) -> HashMap<String, String> {
+    let folder = config.remove("root").unwrap_or_default();
+    let path = config.remove("path").unwrap_or_default();
+    let writable = config.remove("writable").unwrap_or_else(|| false.to_string());
+    HashMap::from([
+        ("root".to_string(), path),
+        ("folder".to_string(), folder),
+        ("writable".to_string(), writable),
+    ])
 }
 
 // gcs is the only tenant kind with explicit kill-switches; both are forced so

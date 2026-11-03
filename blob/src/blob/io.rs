@@ -204,7 +204,8 @@ pub(super) fn compose_chunk(backend: &Backend, total: u64, framed: bool) -> Opti
         Backend::S3 | Backend::Group(GroupBackendKind::S3) if !framed => return None,
         Backend::S3 | Backend::Group(GroupBackendKind::S3) => 10_000,
         Backend::Group(GroupBackendKind::Azblob | GroupBackendKind::Azdls) => 50_000,
-        Backend::FileSystem | Backend::Group(GroupBackendKind::Gcs | GroupBackendKind::B2) => {
+        Backend::FileSystem
+        | Backend::Group(GroupBackendKind::Gcs | GroupBackendKind::B2 | GroupBackendKind::Fs) => {
             10_000
         }
     };

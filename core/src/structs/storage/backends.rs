@@ -172,6 +172,14 @@ impl NodeBackendsConfig {
             import_roots: BTreeMap::new(),
         }
     }
+
+    /// The import roots groups may use: none while the node withdraws group backends.
+    pub fn served_roots(&self) -> BTreeMap<String, ImportRoot> {
+        match self.serve_group_backends {
+            true => self.import_roots.clone(),
+            false => BTreeMap::new(),
+        }
+    }
 }
 
 /// Looks up the credentials of one backend. Credentials never live in the file,
