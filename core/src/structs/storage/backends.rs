@@ -8,6 +8,7 @@ use crate::structs::storage::cleanup::CleanupStrategy;
 use crate::structs::storage::routing::{
     NodeRoutingRule, RoutingTarget, validate_node_rules, validate_storage_class,
 };
+use crate::types::GroupId;
 use ipnet::IpNet;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -26,6 +27,24 @@ pub struct BackendsFile {
     pub routing: Vec<RoutingEntry>,
     #[serde(default)]
     pub egress: EgressEntry,
+    #[serde(default)]
+    pub import_root: BTreeMap<String, ImportRoot>,
+}
+
+/// A folder the operator lets the listed groups import in place as `fs` group backends.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ImportRoot {
+    pub path: String,
+    pub groups: Vec<GroupId>,
+    #[serde(default)]
+    pub writable: bool,
+}
+
+impl ImportRoot {
+    pub fn allows(&self, group: GroupId) -> bool {
+        self.groups.contains(&group)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -131,6 +150,7 @@ pub struct NodeBackendsConfig {
     pub rules: Vec<NodeRoutingRule>,
     pub serve_group_backends: bool,
     pub extra_deny: Vec<IpNet>,
+    pub import_roots: BTreeMap<String, ImportRoot>,
 }
 
 impl NodeBackendsConfig {
@@ -149,6 +169,7 @@ impl NodeBackendsConfig {
             rules: Vec::new(),
             serve_group_backends: true,
             extra_deny: Vec::new(),
+            import_roots: BTreeMap::new(),
         }
     }
 }
@@ -245,12 +266,26 @@ impl BackendsFile {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        for (name, root) in &self.import_root {
+            if !std::path::Path::new(&root.path).is_absolute() {
+                return Err(ConversionError::FromStrError(format!(
+                    "import root `{name}` must set an absolute path"
+                )));
+            }
+            if root.groups.is_empty() {
+                return Err(ConversionError::FromStrError(format!(
+                    "import root `{name}` must list at least one group"
+                )));
+            }
+        }
+
         Ok(NodeBackendsConfig {
             backends,
             default_name,
             rules,
             serve_group_backends: self.egress.serve_group_backends,
             extra_deny,
+            import_roots: self.import_root.clone(),
         })
     }
 }
@@ -734,6 +769,47 @@ default = true
                     .is_err(),
                 "{entry}"
             );
+        }
+    }
+
+    fn with_roots(roots: &str) -> Result<super::NodeBackendsConfig, crate::errors::ConversionError> {
+        let file = format!("{FILE}\n{roots}");
+        BackendsFile::parse(&file)?.resolve(&secrets, BlobTimeoutConfig::default())
+    }
+
+    #[test]
+    fn resolves_import_roots() {
+        let path = std::env::temp_dir();
+        let path = path.to_str().unwrap();
+        let group = "01JC0000000000000000000000";
+        let config = with_roots(&format!(
+            "[import_root.projects]\npath = '{path}'\ngroups = [\"{group}\"]\n\n\
+             [import_root.scratch]\npath = '{path}'\ngroups = [\"{group}\"]\nwritable = true\n"
+        ))
+        .unwrap();
+
+        let projects = &config.import_roots["projects"];
+        assert_eq!(projects.path, path);
+        assert!(projects.allows(group.parse().unwrap()));
+        assert!(!projects.allows(ulid::Ulid::nil()));
+        assert!(!projects.writable);
+        assert!(config.import_roots["scratch"].writable);
+    }
+
+    #[test]
+    fn rejects_bad_roots() {
+        let path = std::env::temp_dir();
+        let path = path.to_str().unwrap();
+        let group = "01JC0000000000000000000000";
+        for roots in [
+            format!("[import_root.a]\npath = 'relative/folder'\ngroups = [\"{group}\"]\n"),
+            format!("[import_root.a]\npath = '{path}'\ngroups = []\n"),
+            format!("[import_root.a]\npath = '{path}'\n"),
+            format!("[import_root.a]\ngroups = [\"{group}\"]\n"),
+            format!("[import_root.a]\npath = '{path}'\ngroups = [\"not-a-group\"]\n"),
+            format!("[import_root.a]\npath = '{path}'\ngroups = [\"{group}\"]\nmode = \"rw\"\n"),
+        ] {
+            assert!(with_roots(&roots).is_err(), "{roots}");
         }
     }
 
