@@ -38,6 +38,10 @@ pub(crate) use index_search::{open_position, seal_position};
 
 const HEAD_SCAN_BATCH: usize = 1_000;
 pub const SEARCH_MAX_LIMIT: usize = 100;
+/// Changed keys one node page passes at most; the page then ends at the last of them.
+const CHANGED_PAGE_CAP: usize = SEARCH_MAX_LIMIT;
+/// Oldest versions read to learn whether a changed key existed at the snapshot.
+const OLDEST_VERSIONS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ObjectKeyMatch {
@@ -121,6 +125,10 @@ pub struct SearchNodePage {
     /// The distributed buckets this realm-wide page skipped, each counted in `incomplete_ranges`.
     #[serde(default)]
     pub skipped_buckets: Vec<String>,
+    /// Cursor keys of readable keys this page passed whose head was replaced or deleted after
+    /// `as_of`; they are counted, not shown.
+    #[serde(default)]
+    pub changed: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Error)]
@@ -142,6 +150,14 @@ struct LiveHead {
     head: BlobHeadKey,
     cursor_key: Vec<u8>,
     version: BlobVersion,
+    /// The key existed at `as_of`, but its head was replaced or deleted since.
+    changed: bool,
+}
+
+#[derive(Debug)]
+struct Candidate {
+    hit: SearchNodeHit,
+    changed: bool,
 }
 
 #[derive(Debug)]
@@ -153,7 +169,7 @@ struct HeadCandidate {
 
 #[derive(Debug)]
 struct CandidateBatch {
-    candidates: Vec<SearchNodeHit>,
+    candidates: Vec<Candidate>,
     next_start: Option<IterStart>,
 }
 
@@ -186,6 +202,7 @@ pub async fn search_local_objects(
     let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
     let mut start = (input.start_after.clone()).map(|key| IterStart::After(key.into()));
     let mut visible = Vec::with_capacity(limit + 1);
+    let mut changed = Vec::new();
     let mut evaluators: HashMap<(RealmId, GroupId), PolicyEvaluator> = HashMap::new();
     let mut distributed = HashMap::new();
 
@@ -200,22 +217,31 @@ pub async fn search_local_objects(
         .await?;
 
         for candidate in batch.candidates {
-            if !authorize(context, &input, &mut evaluators, &candidate).await? {
+            if !authorize(context, &input, &mut evaluators, &candidate.hit).await? {
                 continue;
             }
-            visible.push(candidate);
+            if candidate.changed {
+                changed.push(candidate.hit.cursor_key);
+                if changed.len() >= CHANGED_PAGE_CAP {
+                    let next_start_after = changed.last().cloned();
+                    return Ok(node_page(visible, changed, next_start_after, &distributed));
+                }
+                continue;
+            }
+            visible.push(candidate.hit);
             if visible.len() > limit {
                 let next_start_after = visible
                     .get(limit - 1)
                     .map(|candidate| candidate.cursor_key.clone());
                 visible.truncate(limit);
-                return Ok(node_page(visible, next_start_after, &distributed));
+                changed_until(&mut changed, next_start_after.as_deref());
+                return Ok(node_page(visible, changed, next_start_after, &distributed));
             }
         }
 
         match batch.next_start {
             Some(next) => start = Some(next),
-            None => return Ok(node_page(visible, None, &distributed)),
+            None => return Ok(node_page(visible, changed, None, &distributed)),
         }
     }
 }
@@ -224,6 +250,7 @@ pub async fn search_local_objects(
 /// range indexes cover them.
 fn node_page(
     hits: Vec<SearchNodeHit>,
+    changed: Vec<Vec<u8>>,
     next_start_after: Option<Vec<u8>>,
     distributed: &HashMap<String, bool>,
 ) -> SearchNodePage {
@@ -241,6 +268,14 @@ fn node_page(
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
         skipped_buckets,
+        changed,
+    }
+}
+
+/// Keeps the changed keys up to `next`, after which the following page starts again.
+pub(crate) fn changed_until(changed: &mut Vec<Vec<u8>>, next: Option<&[u8]>) {
+    if let Some(next) = next {
+        changed.retain(|key| key.as_slice() <= next);
     }
 }
 
@@ -456,7 +491,8 @@ async fn learn_buckets(
 fn retain_matches(input: &SearchObjectsInput, live: &mut Vec<LiveHead>) {
     if input.key_match == ObjectKeyMatch::Metadata {
         let (text, exact) = query_terms(&input.query);
-        live.retain(|head| metadata_matches(&head.version.metadata, &text, &exact));
+        // A changed head's metadata at `as_of` is unknown, so it is kept as a possible match.
+        live.retain(|head| head.changed || metadata_matches(&head.version.metadata, &text, &exact));
     }
 }
 
@@ -494,16 +530,53 @@ async fn load_live(
             continue;
         };
         let version = BlobVersion::from_bytes(value.as_ref())?;
-        if version.is_deleted() || version.created_at > input.as_of {
+        let changed = version.created_at > input.as_of;
+        if changed {
+            // A key whose first version is newer than the snapshot did not exist at it.
+            if !existed_at(context, &candidate.head, input.as_of, txn_id).await? {
+                continue;
+            }
+        } else if version.is_deleted() {
             continue;
         }
         live.push(LiveHead {
             head: candidate.head,
             cursor_key: candidate.cursor_key,
             version,
+            changed,
         });
     }
     Ok(live)
+}
+
+/// Whether one of the oldest kept versions of `head` was created by `as_of`. Ids sort by
+/// time, but ids of one millisecond may swap, so a few are read.
+async fn existed_at(
+    context: &DriverContext,
+    head: &BlobHeadKey,
+    as_of: SystemTime,
+    txn_id: TxnId,
+) -> Result<bool, SearchObjectsError> {
+    let prefix = VersionKey::object_prefix(&head.bucket, &head.key)?;
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: OLDEST_VERSIONS,
+            txn_id: Some(txn_id),
+        })
+        .await;
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+        return Err(storage_event_error(event));
+    };
+    for (_, value) in values {
+        if BlobVersion::from_bytes(value.as_ref())?.created_at <= as_of {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn build_hits(
@@ -511,7 +584,7 @@ async fn build_hits(
     input: &SearchObjectsInput,
     live: Vec<LiveHead>,
     txn_id: TxnId,
-) -> Result<Vec<SearchNodeHit>, SearchObjectsError> {
+) -> Result<Vec<Candidate>, SearchObjectsError> {
     if live.is_empty() {
         return Ok(Vec::new());
     }
@@ -569,6 +642,8 @@ async fn build_hits(
         };
         let bucket = BucketInfo::from_bytes(bucket.as_ref())?;
         let (content_w3id, checksum, size, updated_at) = match &candidate.version.state {
+            // Only its key is used: it is authorized and counted, never shown.
+            _ if candidate.changed => (None, None, None, None),
             BlobVersionState::Materialized { blob_hash, .. } => {
                 let digest = hex::encode(blob_hash);
                 (
@@ -599,7 +674,7 @@ async fn build_hits(
             }
             BlobVersionState::Deleted => continue,
         };
-        candidates.push(SearchNodeHit {
+        let hit = SearchNodeHit {
             cursor_key: candidate.cursor_key,
             hit: ObjectInventoryHit {
                 node_id: input.node_id,
@@ -615,7 +690,9 @@ async fn build_hits(
                     ObjectKeyMatch::Substring | ObjectKeyMatch::Prefix => BTreeMap::new(),
                 },
             },
-        });
+        };
+        let changed = candidate.changed;
+        candidates.push(Candidate { hit, changed });
     }
 
     Ok(candidates)
@@ -890,7 +967,7 @@ mod tests {
         version_id
     }
 
-    async fn seed_deleted(fixture: &Fixture, bucket: &str, key: &str) {
+    async fn seed_deleted(fixture: &Fixture, bucket: &str, key: &str, created_at: SystemTime) {
         let version_id = Ulid::generate();
         write_value(
             &fixture.context,
@@ -903,7 +980,7 @@ mod tests {
             &fixture.context,
             BLOB_VERSIONS_KEYSPACE,
             VersionKey::new(bucket, key, version_id).to_bytes().unwrap(),
-            BlobVersion::deleted(UNIX_EPOCH + Duration::from_secs(10), fixture.owner)
+            BlobVersion::deleted(created_at, fixture.owner)
                 .to_bytes()
                 .unwrap(),
         )
@@ -1012,7 +1089,8 @@ mod tests {
     async fn deleted_heads_excluded() {
         let fixture = setup().await;
         seed_materialized(&fixture, "visible", "state-live", UNIX_EPOCH, 5).await;
-        seed_deleted(&fixture, "visible", "state-deleted").await;
+        let deleted_at = UNIX_EPOCH + Duration::from_secs(10);
+        seed_deleted(&fixture, "visible", "state-deleted", deleted_at).await;
 
         let page = search_local_objects(
             &fixture.context,
@@ -1081,6 +1159,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["page-echo"]
         );
+        assert_eq!(second.next_start_after, None);
+    }
+
+    #[tokio::test]
+    async fn counts_changed_keys() {
+        // Keys replaced or deleted after the snapshot are counted on the page that passes them.
+        let fixture = setup().await;
+        for (key, hash_byte) in [
+            ("page-alpha", 11),
+            ("page-bravo", 12),
+            ("page-charlie", 13),
+            ("page-delta", 14),
+            ("page-echo", 15),
+        ] {
+            seed_materialized(&fixture, "visible", key, UNIX_EPOCH, hash_byte).await;
+        }
+        let auth = AuthContext {
+            user_id: fixture.owner,
+            realm_id: fixture.realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let as_of = SystemTime::now();
+        let later = as_of + Duration::from_secs(1);
+        seed_materialized(&fixture, "visible", "page-bravo", later, 16).await;
+        seed_deleted(&fixture, "visible", "page-delta", later).await;
+        seed_materialized(&fixture, "visible", "page-foxtrot", later, 17).await;
+        let keys = |page: &SearchNodePage| {
+            let hits = page.hits.iter().map(|hit| hit.hit.key.clone()).collect();
+            let changed = page.changed.iter();
+            let changed = changed.map(|key| String::from_utf8(key.clone()).unwrap());
+            (hits, changed.collect())
+        };
+
+        let mut first_input = input(&fixture, auth.clone(), "page-", 2);
+        first_input.as_of = as_of;
+        let first = search_local_objects(&fixture.context, first_input)
+            .await
+            .unwrap();
+        let (hits, changed): (Vec<String>, Vec<String>) = keys(&first);
+        assert_eq!(hits, ["page-alpha", "page-charlie"]);
+        assert_eq!(changed, ["visible/page-bravo"]);
+
+        let mut second_input = input(&fixture, auth, "page-", 2);
+        second_input.as_of = as_of;
+        second_input.start_after = first.next_start_after;
+        let second = search_local_objects(&fixture.context, second_input)
+            .await
+            .unwrap();
+        let (hits, changed): (Vec<String>, Vec<String>) = keys(&second);
+        assert_eq!(hits, ["page-echo"]);
+        assert_eq!(changed, ["visible/page-delta"]);
         assert_eq!(second.next_start_after, None);
     }
 }

@@ -121,6 +121,7 @@ fn keeps_bucket_continuation() {
             false,
             0,
             pending,
+            0,
             signer,
             |bytes| secret.sign(bytes),
         )
@@ -156,6 +157,7 @@ fn rejects_cursor_tampering() {
         false,
         0,
         &[],
+        0,
         signer,
         |bytes| secret.sign(bytes),
     )

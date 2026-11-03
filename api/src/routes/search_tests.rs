@@ -968,9 +968,12 @@ fn search_maps_partiality() {
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
         complete: false,
+        changed_keys: 2,
+        page_changed: 1,
     };
 
     let response = map_search_response(result, ObjectMode::DistributedBestEffort);
+    assert_eq!(response.coverage.changed_keys, 2);
     assert_eq!(response.hits.len(), 1);
     assert_eq!(response.coverage.scope, ObjectScope::Realm);
     assert!(!response.coverage.complete);

@@ -21,9 +21,9 @@ use futures_util::future::join_all;
 use ulid::Ulid;
 
 use super::{
-    HeadCandidate, ObjectKeyMatch, SEARCH_MAX_LIMIT, SearchNodeHit, SearchNodePage,
-    SearchObjectsError, SearchObjectsInput, authorize, batch_read, build_hits, finish_read,
-    load_live, retain_matches, start_read,
+    CHANGED_PAGE_CAP, Candidate, HeadCandidate, ObjectKeyMatch, SEARCH_MAX_LIMIT, SearchNodeHit,
+    SearchNodePage, SearchObjectsError, SearchObjectsInput, authorize, batch_read, build_hits,
+    changed_until, finish_read, load_live, retain_matches, start_read,
 };
 use crate::auth::request_policy::PolicyEvaluator;
 use crate::distribution::index_feed::{range_progress, state_key};
@@ -75,8 +75,8 @@ async fn readable(
     evaluators: &mut HashMap<(RealmId, GroupId), PolicyEvaluator>,
     key: &str,
 ) -> Result<bool, SearchObjectsError> {
-    for hit in resolve_keys(context, input, bucket, &[key.to_string()]).await? {
-        if authorize(context, input, evaluators, &hit).await? {
+    for candidate in resolve_keys(context, input, bucket, &[key.to_string()]).await? {
+        if authorize(context, input, evaluators, &candidate.hit).await? {
             return Ok(true);
         }
     }
@@ -97,7 +97,7 @@ async fn range_page(
     let record = read_record(context, set_id).await;
     let Some(view) = record.map_err(SearchObjectsError::Storage)? else {
         // Without the record the ranges are unknown, so nothing is covered.
-        return Ok(page(Vec::new(), None, 1, 0));
+        return Ok(page(Vec::new(), Vec::new(), None, 1, 0));
     };
     let after = match input.start_after.as_deref() {
         Some(position) => Some(BlobHeadKey::from_bytes(&open_position(position)?)?.key),
@@ -127,6 +127,7 @@ async fn range_page(
     });
     let mut evaluators = HashMap::new();
     let mut visible = Vec::with_capacity(limit + 1);
+    let mut changed = Vec::new();
     let (mut examined, mut incomplete) = (0, 0);
     for chunk in local.chunks(RANGE_CONCURRENCY) {
         let query = KeyQuery {
@@ -155,14 +156,23 @@ async fn range_page(
             let (mut keys, last) = (found.keys, found.last);
             keys.retain(|key| input.key_match.matches(key, &input.query));
             for candidate in resolve_keys(context, input, &bucket, &keys).await? {
-                if !authorize(context, input, &mut evaluators, &candidate).await? {
+                if !authorize(context, input, &mut evaluators, &candidate.hit).await? {
                     continue;
                 }
-                visible.push(candidate);
+                if candidate.changed {
+                    changed.push(candidate.hit.cursor_key);
+                    if changed.len() >= CHANGED_PAGE_CAP {
+                        let next = changed.last().cloned();
+                        return Ok(page(visible, changed, next, incomplete, remote));
+                    }
+                    continue;
+                }
+                visible.push(candidate.hit);
                 if visible.len() > limit {
                     let next = visible.get(limit - 1).map(|hit| hit.cursor_key.clone());
                     visible.truncate(limit);
-                    return Ok(page(visible, next, incomplete, remote));
+                    changed_until(&mut changed, next.as_deref());
+                    return Ok(page(visible, changed, next, incomplete, remote));
                 }
             }
             if let Some(last) = last {
@@ -171,6 +181,7 @@ async fn range_page(
                 let position = BlobHeadKey::new(bucket.as_str(), last).to_bytes()?;
                 return Ok(page(
                     visible,
+                    changed,
                     Some(seal_position(&position)?),
                     incomplete,
                     remote,
@@ -178,7 +189,7 @@ async fn range_page(
             }
         }
     }
-    Ok(page(visible, None, incomplete, remote))
+    Ok(page(visible, changed, None, incomplete, remote))
 }
 
 /// Queries the indexes of `chunk` at once; `None` for a range without a searchable one. A
@@ -312,6 +323,7 @@ fn overlaps(range: &KeyRange, start: &Bound<String>, end: &Bound<String>) -> boo
 
 fn page(
     hits: Vec<SearchNodeHit>,
+    changed: Vec<Vec<u8>>,
     next_start_after: Option<Vec<u8>>,
     incomplete_ranges: usize,
     remote_ranges: usize,
@@ -325,6 +337,7 @@ fn page(
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
         skipped_buckets: Vec::new(),
+        changed,
     }
 }
 
@@ -335,7 +348,7 @@ async fn resolve_keys(
     input: &SearchObjectsInput,
     bucket: &str,
     keys: &[String],
-) -> Result<Vec<SearchNodeHit>, SearchObjectsError> {
+) -> Result<Vec<Candidate>, SearchObjectsError> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -350,7 +363,7 @@ async fn resolve_heads(
     bucket: &str,
     keys: &[String],
     txn_id: TxnId,
-) -> Result<Vec<SearchNodeHit>, SearchObjectsError> {
+) -> Result<Vec<Candidate>, SearchObjectsError> {
     let heads: Vec<_> = (keys.iter())
         .map(|key| BlobHeadKey::new(bucket, key.as_str()))
         .collect();

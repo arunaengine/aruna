@@ -452,6 +452,7 @@ fn search_assembly_order() {
         discovery_failed: false,
         omitted_partitions: 0,
         pending: Vec::new(),
+        changed_keys: 0,
     };
     let page = |node_id, key: Option<&str>| SearchNodePage {
         hits: key
@@ -479,6 +480,7 @@ fn search_assembly_order() {
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
         skipped_buckets: Vec::new(),
+        changed: Vec::new(),
     };
     let stats = || MetadataFanoutStats {
         nodes_queried: 2,
@@ -555,4 +557,22 @@ fn search_assembly_order() {
     );
     assert!(execution.complete);
     assert!(execution.next_cursor.is_none());
+
+    // Changed keys of finished pages add to the total the earlier pages carried.
+    let changed = |node_id, key: Option<&str>, changed: &str| SearchNodePage {
+        changed: vec![changed.as_bytes().to_vec()],
+        ..page(node_id, key)
+    };
+    let carried = ObjectSearchPartitions {
+        changed_keys: 3,
+        ..partitions()
+    };
+    let parts = vec![
+        (first, changed(first, Some("b"), "a")),
+        (second, changed(second, None, "z")),
+    ];
+    let execution = assemble_object_execution(&test.context, &plan, carried, parts, stats())
+        .expect("exhausted partitions assemble without a net handle");
+    assert_eq!(execution.page_changed, 2);
+    assert_eq!(execution.changed_keys, 5);
 }

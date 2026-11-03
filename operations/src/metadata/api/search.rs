@@ -18,6 +18,7 @@ use super::distributed::run_search_distributed;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::index_feed::IndexProgress;
 use crate::metadata::search_cursor::{SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE};
+use crate::s3::object::search::changed_until;
 
 const OBJECT_CURSOR_VERSION: u8 = 1;
 
@@ -137,6 +138,10 @@ pub struct ObjectExecution {
     /// Incomplete ranges answered up to a key, by their coordinator.
     pub partial_ranges: Vec<(NodeId, ulid::Ulid, Option<String>)>,
     pub complete: bool,
+    /// Readable keys of the first page's snapshot replaced or deleted since, through this page.
+    pub changed_keys: usize,
+    /// The part of `changed_keys` this page passed.
+    pub page_changed: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +168,7 @@ pub(super) struct ObjectCursorPayload {
     pub(super) discovery_failed: bool,
     pub(super) omitted_partitions: usize,
     pub(super) pending: Vec<PendingBucket>,
+    pub(super) changed_keys: usize,
 }
 
 /// A distributed bucket a realm-wide search still owes: its name and the cursor of its own
@@ -292,6 +298,7 @@ impl SignedCursor<ObjectCursorPayload> {
         discovery_failed: bool,
         omitted_partitions: usize,
         pending: &[PendingBucket],
+        changed_keys: usize,
         signer: NodeId,
         sign: impl FnOnce(&[u8]) -> iroh::Signature,
     ) -> Result<Self, postcard::Error> {
@@ -319,6 +326,7 @@ impl SignedCursor<ObjectCursorPayload> {
                 discovery_failed,
                 omitted_partitions,
                 pending: pending.to_vec(),
+                changed_keys,
             },
             signer,
             sign,
@@ -346,6 +354,8 @@ pub(super) struct ObjectSearchPartitions {
     pub(super) discovery_failed: bool,
     pub(super) omitted_partitions: usize,
     pub(super) pending: Vec<PendingBucket>,
+    /// Changed keys the earlier pages passed.
+    pub(super) changed_keys: usize,
 }
 
 pub async fn search_objects(
@@ -419,7 +429,10 @@ async fn search_until(
         partitions.pending.pop();
         failed += 1;
     }
+    let found_changed = found.iter().map(|page| page.page_changed).sum::<usize>();
+    partitions.changed_keys += found_changed;
     let mut execution = assemble_object_execution(context, &plan, partitions, parts, fanout_stats)?;
+    execution.page_changed += found_changed;
     for page in found {
         execution.hits.extend(page.hits);
         execution.incomplete_ranges += page.incomplete_ranges;
@@ -519,7 +532,7 @@ pub(super) async fn resolve_object_partitions(
     plan: &ObjectSearchPlan,
     deadline: tokio::time::Instant,
 ) -> Result<ObjectSearchPartitions, MetadataApiError> {
-    let (as_of, partitions, failed_partitions, discovery_failed, omitted_partitions, pending) =
+    let (as_of, partitions, failed_partitions, discovery_failed, omitted_partitions, carried) =
         match plan.cursor.as_deref() {
             Some(raw) => {
                 let authorized_signers = match plan.mode {
@@ -547,7 +560,7 @@ pub(super) async fn resolve_object_partitions(
                     cursor.failed_nodes()?,
                     cursor.payload.discovery_failed,
                     cursor.payload.omitted_partitions,
-                    cursor.payload.pending.clone(),
+                    (cursor.payload.pending.clone(), cursor.payload.changed_keys),
                 )
             }
             None => {
@@ -603,10 +616,12 @@ pub(super) async fn resolve_object_partitions(
                     Vec::new(),
                     discovery_failed,
                     omitted_partitions,
-                    Vec::new(),
+                    (Vec::new(), 0),
                 )
             }
         };
+    // The pending buckets and the changed keys the earlier pages passed.
+    let (pending, changed_keys) = carried;
 
     if plan.mode == ObjectQueryMode::DistributedStrict
         && (discovery_failed || omitted_partitions > 0 || !failed_partitions.is_empty())
@@ -625,6 +640,7 @@ pub(super) async fn resolve_object_partitions(
         discovery_failed,
         omitted_partitions,
         pending,
+        changed_keys,
     })
 }
 
@@ -745,6 +761,7 @@ pub(super) fn assemble_object_execution(
         discovery_failed,
         omitted_partitions,
         pending,
+        changed_keys,
     } = partitions;
     let newly_failed = fanout_stats.failed_partitions.clone();
     failed_partitions.extend(newly_failed.iter().copied());
@@ -781,17 +798,20 @@ pub(super) fn assemble_object_execution(
     let mut pages = parts.into_iter().collect::<HashMap<_, _>>();
     let mut hits = Vec::with_capacity(plan.limit);
     let mut remaining = plan.limit;
+    let mut page_changed = 0;
     for partition in &mut partitions {
         if partition.exhausted {
             continue;
         }
-        let Some(page) = pages.remove(&partition.node_id) else {
+        let Some(mut page) = pages.remove(&partition.node_id) else {
             continue;
         };
         partition.observed_at = Some(page.observed_at);
         if remaining == 0 {
+            // A page the next one asks again counts its changed keys then.
             if page.hits.is_empty() && page.next_start_after.is_none() {
                 partition.exhausted = true;
+                page_changed += page.changed.len();
             }
             continue;
         }
@@ -810,11 +830,14 @@ pub(super) fn assemble_object_execution(
                 .get(consumed.saturating_sub(1))
                 .map(|candidate| candidate.cursor_key.clone());
             partition.exhausted = false;
+            changed_until(&mut page.changed, partition.start_after.as_deref());
         } else if consumed > 0 || page.hits.is_empty() {
             partition.start_after = page.next_start_after;
             partition.exhausted = partition.start_after.is_none();
         }
+        page_changed += page.changed.len();
     }
+    let changed_keys = changed_keys + page_changed;
 
     let unfinished = partitions.iter().any(|partition| !partition.exhausted);
     let next_cursor = if unfinished || !pending.is_empty() {
@@ -832,6 +855,7 @@ pub(super) fn assemble_object_execution(
                 discovery_failed,
                 omitted_partitions,
                 &pending,
+                changed_keys,
                 net.node_id(),
                 |bytes| net.sign(bytes),
             )
@@ -870,6 +894,8 @@ pub(super) fn assemble_object_execution(
         index_progress,
         partial_ranges,
         complete,
+        changed_keys,
+        page_changed,
     })
 }
 

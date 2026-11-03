@@ -225,6 +225,10 @@ pub struct ObjectCoverage {
     pub complete: bool,
     pub truncated: bool,
     pub partitions: Vec<ObjectPartitionCoverage>,
+    /// Readable matching keys of the first page's snapshot (`as_of`) that were replaced or
+    /// deleted later, counted through this page and not shown. Zero on the last page means
+    /// the pages together list that snapshot, within the reported coverage.
+    pub changed_keys: usize,
 }
 
 /// How far a coordinator's search index of one range is.
@@ -560,7 +564,7 @@ restrictions and request policies before it can be returned.
         ("match" = Option<ObjectMatchMode>, Query, description = "Match mode: substring (default) or prefix on keys, or metadata"),
         ("mode" = Option<ObjectMode>, Query, description = "Coverage mode: distributed_best_effort (default), distributed_strict, or local"),
         ("limit" = Option<usize>, Query, description = "Maximum merged hits (default 10, clamped to 1..=100)"),
-        ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same query, bucket, match type, and mode")
+        ("cursor" = Option<String>, Query, description = "Opaque continuation token from the same query, bucket, match type, and mode; later pages keep the first page's `as_of` snapshot")
     ),
     responses(
         (
@@ -607,7 +611,8 @@ restrictions and request policies before it can be returned.
                             "observed_at": "2026-08-22T12:00:00Z",
                             "truncated": false
                         }
-                    ]
+                    ],
+                    "changed_keys": 0
                 }
             })
         ),
@@ -754,6 +759,7 @@ fn map_search_response(result: ObjectExecution, mode: ObjectMode) -> ObjectRespo
                     truncated: partition.truncated,
                 })
                 .collect(),
+            changed_keys: result.changed_keys,
         },
     }
 }
