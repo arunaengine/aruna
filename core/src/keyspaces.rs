@@ -121,6 +121,8 @@ pub const TASK_TIMER_KEYSPACE: &str = "task_timers";
 pub const USER_KEYSPACE: &str = "users";
 pub const SUBJECT_INDEX_KEYSPACE: &str = "user_subject_index";
 pub const SUBJECT_CLAIMS_KEYSPACE: &str = "user_subject_claims";
+/// Node-local administrative audit rows by realm or group scope, then audit id.
+pub const ADMIN_AUDIT_KEYSPACE: &str = "admin_audit";
 pub const USER_SESSION_KEYSPACE: &str = "user_sessions";
 pub const USER_OWNER_KEYSPACE: &str = "user_session_owner";
 /// Current vault heads a holder keeps, keyed by user and revision id.
@@ -616,6 +618,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     USER_KEYSPACE,
     SUBJECT_INDEX_KEYSPACE,
     SUBJECT_CLAIMS_KEYSPACE,
+    ADMIN_AUDIT_KEYSPACE,
     USER_SESSION_KEYSPACE,
     USER_OWNER_KEYSPACE,
     VAULT_REVISION_KEYSPACE,
