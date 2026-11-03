@@ -99,6 +99,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(execution::compute::router())
         .merge(storage::connectors::router())
         .merge(access::admin_tokens::router())
+        .merge(access::audit::router())
         .merge(access::credentials::router())
         .merge(device::router())
         .merge(execution::device_compute::router())
@@ -257,6 +258,7 @@ pub(crate) mod tests {
         ("DELETE", "/access/groups/{id}/roles/{role_id}"),
         ("DELETE", "/metadata/{document_id}"),
         ("POST", "/data/archives"),
+        ("GET", "/access/audit"),
         (
             "DELETE",
             "/metadata/groups/{group_id}/repositories/{connector_id}",
