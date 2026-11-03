@@ -20,6 +20,7 @@ use aruna_core::storage_entries::{
     sync_revision_entry, sync_revision_key,
 };
 use aruna_core::storage_entries::{subject_index_key, subject_index_value};
+use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
@@ -97,6 +98,7 @@ pub struct UpdateUserOperation {
     state: UpdateUserState,
     output: Option<Result<User, UpdateUserError>>,
     deactivating: bool,
+    audit: Option<AdminAuditRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -213,7 +215,14 @@ impl UpdateUserOperation {
             state: UpdateUserState::Init,
             output: None,
             deactivating: false,
+            audit: None,
         }
+    }
+
+    /// Commits the audit rows of `record` in the same transaction as the user change.
+    pub fn audited(mut self, record: AdminAuditRecord) -> Self {
+        self.audit = Some(record);
+        self
     }
 
     fn fail(&mut self, error: UpdateUserError) -> Effects {
@@ -554,6 +563,9 @@ impl UpdateUserOperation {
                 let value = postcard::to_allocvec(&claims).map_err(ConversionError::from)?;
                 writes.push((FEDERATION_KEYSPACE.to_string(), key, ByteView::from(value)));
             }
+        }
+        if let Some(audit) = &self.audit {
+            writes.extend(audit.entries()?);
         }
 
         self.state = UpdateUserState::WriteStateRevision {
@@ -1447,6 +1459,54 @@ mod pure_tests {
         assert!(revision.current.generation > previous_revision.current.generation);
         assert!(revision.current.updated_at_ms > 0);
         assert_eq!(revision.kind, DocumentChangeKind::Upsert);
+    }
+
+    #[test]
+    fn audit_shares_transaction() {
+        use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
+        use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let original = stored_user(user_id);
+        let mut record =
+            AdminAuditRecord::new(AdminAuditAction::AccountDeactivated, user_id, user_id);
+        record.group_id = Some(Ulid::from_bytes([4u8; 16]));
+        let mut operation =
+            UpdateUserOperation::new(input(realm_id, user_id, user_id)).audited(record.clone());
+        operation.start();
+        let txn_id = TxnId::generate();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    user_id.to_bytes().into(),
+                    Some(original.to_bytes(&actor(realm_id, user_id)).unwrap().into()),
+                ),
+                (
+                    reducer_state_key(&AdminDocumentTarget::User { user_id }),
+                    None,
+                ),
+                (sync_revision_key(&DocumentTarget::User { user_id }), None),
+                (ByteView::from(*realm_id.as_bytes()), None),
+            ],
+        }));
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(write_txn),
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected the user write, got {effects:?}");
+        };
+        assert_eq!(*write_txn, txn_id);
+        assert!(writes.iter().any(|row| row.0 == USER_KEYSPACE));
+        let audit: Vec<_> = writes
+            .iter()
+            .filter(|row| row.0 == ADMIN_AUDIT_KEYSPACE)
+            .collect();
+        assert_eq!(audit.len(), 2, "one realm row and one group row");
+        assert_eq!(AdminAuditRecord::from_bytes(&audit[0].2).unwrap(), record);
     }
 
     #[test]
