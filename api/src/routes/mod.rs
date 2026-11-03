@@ -16,6 +16,7 @@ pub mod assistant;
 pub mod audit;
 pub mod device;
 pub mod drs;
+pub mod emails;
 pub mod execution;
 pub mod federation;
 pub mod git;
@@ -124,6 +125,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(node_names::router())
         .merge(notifications::router())
         .merge(webhooks::router())
+        .merge(emails::router())
         .merge(policies::router())
         .merge(portal::router())
         .merge(oidc_providers::router())
@@ -266,6 +268,9 @@ pub(crate) mod tests {
         ("GET", "/system/notifications/webhook"),
         ("PUT", "/system/notifications/webhook"),
         ("DELETE", "/system/notifications/webhook"),
+        ("GET", "/system/notifications/email"),
+        ("PUT", "/system/notifications/email"),
+        ("DELETE", "/system/notifications/email"),
         (
             "DELETE",
             "/metadata/groups/{group_id}/repositories/{connector_id}",
