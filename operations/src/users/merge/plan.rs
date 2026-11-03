@@ -32,6 +32,9 @@ pub(super) fn check_accounts(survivor: &User, merged: &User) -> Result<bool, Mer
     Ok(false)
 }
 
+/// Per document: the roles handed to the survivor, then all roles `merged` holds there.
+type Handover = (Vec<RoleId>, Vec<RoleId>);
+
 /// The roles of `merged` per document and those handed to `survivor`, realm first: grants above
 /// the survivor's level and every deny of `merged` overlapping one. A handed deny overlapping any
 /// survivor grant (`others` are documents without a `merged` role) is refused, naming its role.
@@ -40,7 +43,7 @@ pub(super) fn hand_over(
     others: &[&HashMap<RoleId, Role>],
     survivor: UserId,
     merged: UserId,
-) -> Result<Vec<(Vec<RoleId>, Vec<RoleId>)>, MergeError> {
+) -> Result<Vec<Handover>, MergeError> {
     let holds = |user: UserId| {
         documents
             .iter()
