@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::storage::distribution::inventory::head_position;
 use aruna_core::structs::storage::format::Compression;
 use tempfile::TempDir;
 
@@ -22,6 +23,7 @@ struct Distributed {
     _index_dir: TempDir,
     indexes: Arc<RangeIndexes>,
     binding: DistributionBinding,
+    lower: Ulid,
 }
 
 /// A bucket "spire" whose lower range (keys before "m") member 1 coordinates; `keys` get
@@ -80,6 +82,7 @@ async fn distributed(state: IndexState, keys: &[&str]) -> Distributed {
         _index_dir: index_dir,
         indexes,
         binding,
+        lower,
     }
 }
 
@@ -100,6 +103,22 @@ impl Distributed {
             budget,
         };
         (search_ranges(&self.fixture.context, &input, search).await).unwrap()
+    }
+
+    /// Marks the lower range's index as building, with every head up to `key` written.
+    async fn building_through(&self, key: &str) {
+        let state = IndexState::Building {
+            generation: 1,
+            cursor: Some(head_position(self.binding.set_id, key)),
+        };
+        let row = state_key(self.binding.set_id, self.lower);
+        write_value(
+            &self.fixture.context,
+            SEARCH_INDEX_KEYSPACE,
+            row,
+            state.to_bytes().unwrap(),
+        )
+        .await;
     }
 
     fn input(&self, auth: AuthContext, query: &str) -> SearchObjectsInput {
@@ -190,6 +209,111 @@ async fn building_range_incomplete() {
     assert!(page.hits.is_empty(), "a building index is not searched");
     assert_eq!(page.incomplete_ranges, 1);
     assert_eq!(page.next_start_after, None);
+}
+
+#[tokio::test]
+async fn building_range_partial() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["a/needle-1", "b/needle-2", "c/needle-3"]).await;
+    test.building_through("b/needle-2").await;
+    let page = test
+        .search(test.input(owner(&test.fixture), "needle"), 100)
+        .await;
+    assert_eq!(
+        keys(&page),
+        ["a/needle-1", "b/needle-2"],
+        "keys past the cursor wait"
+    );
+    assert_eq!(page.incomplete_ranges, 1);
+    let through = Some("b/needle-2".to_string());
+    assert_eq!(page.partial_ranges, [(test.lower, through)]);
+    assert_eq!(page.next_start_after, None);
+}
+
+#[tokio::test]
+async fn partial_hides_key() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["a/needle-1", "b/needle-2"]).await;
+    test.building_through("b/needle-2").await;
+    let fixture = &test.fixture;
+    let allowed = object_permission_path(
+        fixture.realm_id,
+        fixture.visible_group,
+        fixture.node_id,
+        "spire",
+        "a/needle-1",
+    );
+    let narrow = AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: allowed,
+            permission: Permission::READ,
+        }]),
+        ..owner(fixture)
+    };
+    let page = test.search(test.input(narrow, "needle"), 100).await;
+    assert_eq!(keys(&page), ["a/needle-1"]);
+    assert_eq!(
+        page.partial_ranges,
+        [(test.lower, None)],
+        "a hidden key is never named"
+    );
+}
+
+#[tokio::test]
+async fn prefix_below_cursor() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["job/a", "job/b", "job0/c", "jz/d"]).await;
+    test.building_through("job0/c").await;
+    let mut prefix = test.input(owner(&test.fixture), "job/");
+    prefix.key_match = ObjectKeyMatch::Prefix;
+    let page = test.search(prefix.clone(), 100).await;
+    assert_eq!(keys(&page), ["job/a", "job/b"]);
+    assert_eq!(
+        page.incomplete_ranges, 0,
+        "every key of the prefix is indexed"
+    );
+    assert!(page.partial_ranges.is_empty());
+
+    prefix.query = "jz/".to_string();
+    let page = test.search(prefix, 100).await;
+    assert!(page.hits.is_empty(), "the prefix lies past the cursor");
+    assert_eq!(page.incomplete_ranges, 1);
+}
+
+#[tokio::test]
+async fn hidden_cursor_incomplete() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["job/a", "job/b", "job0/c", "jz/d"]).await;
+    test.building_through("job0/c").await;
+    let fixture = &test.fixture;
+    let only = |key: &str| AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: object_permission_path(
+                fixture.realm_id,
+                fixture.visible_group,
+                fixture.node_id,
+                "spire",
+                key,
+            ),
+            permission: Permission::READ,
+        }]),
+        ..owner(fixture)
+    };
+    for query in ["job/", "jz/"] {
+        let mut prefix = test.input(only("job/a"), query);
+        prefix.key_match = ObjectKeyMatch::Prefix;
+        let page = test.search(prefix, 100).await;
+        assert_eq!(
+            page.incomplete_ranges, 1,
+            "{query} must not reveal the cursor"
+        );
+        assert_eq!(page.partial_ranges, [(test.lower, None)]);
+    }
+
+    let mut prefix = test.input(only("job0/c"), "job/");
+    prefix.key_match = ObjectKeyMatch::Prefix;
+    let page = test.search(prefix, 100).await;
+    assert_eq!(page.incomplete_ranges, 0, "a readable cursor still covers");
 }
 
 #[tokio::test]

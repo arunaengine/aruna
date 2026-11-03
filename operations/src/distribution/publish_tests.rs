@@ -159,9 +159,13 @@ fn head_outbox_atomic() {
             DOCUMENT_STATE_KEYSPACE,
             DISTRIBUTION_ACCEPT_KEYSPACE,
             SYNC_OUTBOX_KEYSPACE,
-            DISTRIBUTION_PUBLISHER_KEYSPACE
+            DISTRIBUTION_PUBLISHER_KEYSPACE,
+            aruna_core::keyspaces::NODE_STATS_KEYSPACE
         ]
     );
+    // The record and the publisher's replica share marker commit together.
+    let share = aruna_core::structs::storage::usage::dirty_share_key(root().owner_group);
+    assert_eq!(writes.last().unwrap().1.as_ref(), share);
     // Nothing is published before the commit; the drain follows it.
     let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),

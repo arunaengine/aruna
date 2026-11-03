@@ -1530,6 +1530,7 @@ mod tests {
                     capabilities: Vec::new(),
                     origin_node_id: None,
                     namespace: None,
+                    root: None,
                 },
                 connector_id: Some(Ulid::generate()),
             }),

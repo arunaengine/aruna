@@ -32,6 +32,7 @@ pub mod pid;
 pub mod placement;
 pub mod policies;
 pub mod portal;
+pub mod promotion;
 pub mod repository;
 pub mod rocrate_import;
 pub mod search;
@@ -106,6 +107,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(notifications::router())
         .merge(policies::router())
         .merge(portal::router())
+        .merge(promotion::router())
         .merge(search::router())
         .merge(access::service_accounts::router())
         .merge(access::sessions::router())
@@ -274,6 +276,7 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/sources"),
         ("GET", "/data/databases"),
         ("POST", "/system/realm/databases"),
+        ("POST", "/system/realm/nodes/{node_id}/promote"),
         ("DELETE", "/system/realm/databases/{entry_id}"),
         ("GET", "/system/realm/databases/requests"),
         (

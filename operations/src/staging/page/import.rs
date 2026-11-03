@@ -4,19 +4,25 @@
 
 use crate::connectors::repository::{parse_secret_read, read_secret_effect};
 use crate::connectors::resolver::secret_fingerprint;
-use crate::distribution::guard::{authority_read, authority_rows, write_epoch};
-use crate::node::usage_stats::{UsageCounterUpdate, schedule_snapshot_publish};
+use crate::distribution::guard::{authority_read, authority_rows, write_epochs};
+use crate::node::usage_stats::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 use crate::replication::queue::schedule_blob_drain;
 use crate::staging::page::rows::{
-    MAX_PAGE_ENTRIES, PageGuards, check_guards, guard_reads, page_rows, version_reads,
+    MAX_PAGE_ENTRIES, PageGuards, check_guards, decode_heads, guard_reads, head_range, head_reads,
+    interval_heads, page_rows, version_reads,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BlobVersion;
+use aruna_core::structs::storage::blob::CurrentVersionPointer;
+use aruna_core::structs::sync_relationship_prefix;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
+use std::collections::BTreeSet;
+use ulid::Ulid;
 
 pub use crate::staging::page::rows::{
     PageEntry, PageImportError, PageImportInput, PageImportResult, PageImportState,
@@ -69,6 +75,40 @@ impl PageImportOperation {
         )])
     }
 
+    /// One relationship row is enough; read in the transaction, it conflicts with a
+    /// relationship created before the page commits.
+    fn read_relationships(&mut self) -> Result<Effects, PageImportError> {
+        self.state = PageImportState::ReadRelationships;
+        let prefix = sync_relationship_prefix(&self.input.bucket);
+        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: None,
+            limit: 1,
+            txn_id: Some(self.txn()?),
+        })])
+    }
+
+    /// Takes the page's heads and reads what replicates the bucket's versions.
+    fn take_heads(
+        &mut self,
+        heads: Vec<Option<CurrentVersionPointer>>,
+    ) -> Result<Effects, PageImportError> {
+        let guards = self.guards.as_mut().ok_or(PageImportError::NotFinished)?;
+        guards.heads = heads;
+        // Read in the page transaction, so a fence or record set meanwhile conflicts.
+        let txn_id = self.txn_id;
+        let record =
+            (guards.binding.as_ref()).map(|binding| authority_read(binding.set_id, txn_id));
+        match record {
+            Some(read) => {
+                self.state = PageImportState::ReadRecord;
+                Ok(smallvec![read])
+            }
+            None => self.read_relationships(),
+        }
+    }
+
     fn txn(&self) -> Result<TxnId, PageImportError> {
         self.txn_id.ok_or(StorageError::TransactionNotFound.into())
     }
@@ -94,7 +134,9 @@ impl PageImportOperation {
         let guards = self.guards.as_ref().ok_or(PageImportError::NotFinished)?;
         let rows = page_rows(&self.input, guards, versions)?;
         if rows.result.registered > 0 {
-            let usage = UsageCounterUpdate::for_group(self.input.group_id, rows.delta);
+            let usage = UsageCounterUpdate::for_group(self.input.group_id, rows.delta)
+                .in_bucket(&self.input.bucket, RowChange::Kept)
+                .with_versions(rows.result.registered);
             self.usage = Some(usage.with_inventories(rows.inventory));
         }
         self.result = Some(rows.result);
@@ -154,20 +196,35 @@ impl PageImportOperation {
                 PageImportState::ReadGuards,
                 Event::Storage(StorageEvent::BatchReadResult { values }),
             ) => {
-                let guards = check_guards(&self.input, values)?;
-                // Read in the page transaction, so a fence or record set meanwhile conflicts.
-                let txn_id = self.txn_id;
-                let record =
-                    (guards.binding.as_ref()).map(|binding| authority_read(binding.set_id, txn_id));
-                self.guards = Some(guards);
-                match record {
+                self.guards = Some(check_guards(&self.input, values)?);
+                match head_range(&self.input, self.txn()?)? {
                     Some(read) => {
-                        self.state = PageImportState::ReadRecord;
-                        Ok(smallvec![read])
+                        self.state = PageImportState::ReadHeads;
+                        Ok(smallvec![Effect::Storage(read)])
                     }
-                    None => self.read_secret(),
+                    None => self.take_heads(Vec::new()),
                 }
             }
+            (
+                PageImportState::ReadHeads,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => match next_start_after {
+                Some(_) => {
+                    self.state = PageImportState::ReadHeadKeys;
+                    Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: head_reads(&self.input)?,
+                        txn_id: Some(self.txn()?),
+                    })])
+                }
+                None => self.take_heads(interval_heads(&self.input, values)?),
+            },
+            (
+                PageImportState::ReadHeadKeys,
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+            ) => self.take_heads(decode_heads(values.into_iter().map(|(_, value)| value))?),
             (
                 PageImportState::ReadRecord,
                 event @ Event::Storage(StorageEvent::BatchReadResult { .. }),
@@ -179,15 +236,32 @@ impl PageImportOperation {
                     .as_ref()
                     .ok_or(PageImportError::NotFinished)?;
                 // Every key of the page must lie in a range this member coordinates.
-                guards.epochs = self
+                let keys = self
                     .input
                     .entries
                     .iter()
-                    .map(|entry| {
-                        let key = &entry.target_key;
-                        write_epoch(binding, key, record.as_deref(), fence.as_deref())
-                    })
-                    .collect::<Result<_, _>>()?;
+                    .map(|entry| entry.target_key.as_str());
+                let (routes, search) =
+                    write_epochs(binding, keys, record.as_deref(), fence.as_deref())?;
+                let resolved: BTreeSet<Ulid> = routes.iter().map(|(range, _)| *range).collect();
+                if self
+                    .input
+                    .ranges
+                    .as_ref()
+                    .is_some_and(|held| *held != resolved)
+                {
+                    return Err(PageImportError::RangesMoved(resolved));
+                }
+                guards.epochs = routes.into_iter().map(|(_, epoch)| epoch).collect();
+                guards.search = search;
+                self.read_secret()
+            }
+            (
+                PageImportState::ReadRelationships,
+                Event::Storage(StorageEvent::IterResult { values, .. }),
+            ) => {
+                let guards = self.guards.as_mut().ok_or(PageImportError::NotFinished)?;
+                guards.downstream = !values.is_empty();
                 self.read_secret()
             }
             (
@@ -272,9 +346,13 @@ impl PageImportOperation {
 fn expected_event(state: PageImportState) -> &'static str {
     match state {
         PageImportState::StartTransaction => "TransactionStarted",
-        PageImportState::ReadGuards | PageImportState::ReadVersions => "BatchReadResult",
+        PageImportState::ReadGuards
+        | PageImportState::ReadHeadKeys
+        | PageImportState::ReadVersions => "BatchReadResult",
+        PageImportState::ReadHeads => "IterResult",
         PageImportState::ReadSecret => "VaultResult",
         PageImportState::ReadRecord => "ReadResult",
+        PageImportState::ReadRelationships => "IterResult",
         PageImportState::WriteRows | PageImportState::UpdateUsage => "BatchWriteResult",
         PageImportState::DeleteRows => "BatchDeleteResult",
         PageImportState::Commit => "TransactionCommitted",

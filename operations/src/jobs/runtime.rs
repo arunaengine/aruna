@@ -26,13 +26,15 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::executor::{JobContext, JobRunOutcome, ProgressReporter, dispatch_payload, run_cleanup};
+use super::executor::{
+    JobContext, JobRunOutcome, ProgressReporter, RangeTurns, dispatch_payload, run_cleanup,
+};
 use super::reconcile::ExternalReconciler;
 use super::store::{
     AwaitOutcome, JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job,
     complete_job, defer_job, fail_job, flush_progress, handoff_external_attempt, iter_prefix_page,
-    park_job, read_job_record, release_job, renew_lease, requeue_job, satisfy_key_wait,
-    transition_to_running,
+    park_job, read_job_record, release_job, renew_lease, requeue_job, requeue_progressed,
+    satisfy_key_wait, transition_to_running,
 };
 use super::submit::schedule_drain_effect;
 use super::{
@@ -87,6 +89,7 @@ pub struct JobsRuntime {
     /// user asked for a `Cancelled` job and runs cleanup handlers, while this one only
     /// means "stop here"; in-process jobs re-queue and external attempts hand off.
     shutdown: CancellationToken,
+    range_turns: RangeTurns,
 }
 
 impl std::fmt::Debug for JobsRuntime {
@@ -137,6 +140,7 @@ impl JobsRuntime {
             reconciler: Mutex::new(reconciler),
             claim_producer_barrier: RwLock::new(()),
             shutdown: CancellationToken::new(),
+            range_turns: RangeTurns::default(),
         })
     }
 
@@ -255,6 +259,7 @@ impl JobsRuntime {
         }
         let runtime = self.clone();
         let shutdown = self.shutdown.clone();
+        let turns = self.range_turns.clone();
         tokio::spawn(async move {
             // A panicking payload is turned into a failure inside `supervise`; this guard
             // still runs `finish` on other unwinds, so a panic cannot leak the slot.
@@ -263,7 +268,7 @@ impl JobsRuntime {
                 record,
                 claim_token,
                 cancel,
-                shutdown,
+                (shutdown, turns),
             ))
             .catch_unwind()
             .await;
@@ -587,7 +592,7 @@ async fn run_job(
     record: JobRecord,
     token: ulid::Ulid,
     cancel: CancellationToken,
-    shutdown: CancellationToken,
+    (shutdown, range_turns): (CancellationToken, RangeTurns),
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
     // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
@@ -655,6 +660,7 @@ async fn run_job(
         cancel: cancel.clone(),
         shutdown,
         progress: progress.clone(),
+        range_turns,
     };
 
     // Capture the timestamp AFTER the payload runs, so finished_at, backoff, and
@@ -680,15 +686,7 @@ async fn run_job(
         SuperviseResult::Outcome(JobRunOutcome::Failed(error)) => {
             if error.kind == JobErrorKind::Retryable {
                 // External attempts return before supervision and cannot reach this requeue.
-                if let Err(error) = requeue_job(
-                    storage,
-                    job_id,
-                    Some(token),
-                    unix_timestamp_millis(),
-                    None,
-                    Some(error),
-                )
-                .await
+                if let Err(error) = requeue_failed(storage, job_id, token, error, &progress).await
                     && !matches!(error, JobMutationError::TokenMismatch)
                 {
                     warn!(job_id = %job_id, error = %error, "Failed to requeue job");
@@ -895,6 +893,21 @@ async fn supervise(
     }
 }
 
+/// A transient failure after a durable checkpoint advanced spends no attempt of a long job.
+async fn requeue_failed(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: ulid::Ulid,
+    error: JobError,
+    progress: &ProgressReporter,
+) -> Result<RequeueOutcome, JobMutationError> {
+    let now = unix_timestamp_millis();
+    match progress.checkpointed() {
+        true => requeue_progressed(storage, job_id, token, now, error).await,
+        false => requeue_job(storage, job_id, Some(token), now, None, Some(error)).await,
+    }
+}
+
 fn handle_panic(ctx: &JobContext) -> JobRunOutcome {
     warn!(job_id = %ctx.job_id, "Job payload panicked; failing the attempt");
     JobRunOutcome::Failed(JobError::retryable("job payload panicked"))
@@ -925,7 +938,11 @@ async fn heartbeat_loop(
                     Err(error) => warn!(job_id = %job_id, error = %error, "Lease renew failed"),
                 }
             }
-            _ = flush.tick() => {
+            // A committed checkpoint is persisted at once, so the record keeps up with its rows.
+            _ = futures_util::future::select(
+                Box::pin(flush.tick()),
+                Box::pin(progress.flush_requested()),
+            ) => {
                 match flush_progress(&storage, job_id, token, progress.snapshot(), unix_timestamp_millis()).await {
                     Ok(renew) => if renew.cancel_requested { cancel.cancel(); }
                     Err(JobMutationError::TokenMismatch) => return,
@@ -1181,7 +1198,7 @@ mod tests {
             claimed,
             token,
             CancellationToken::new(),
-            CancellationToken::new(),
+            (CancellationToken::new(), RangeTurns::default()),
         )
         .await;
 
@@ -1226,7 +1243,7 @@ mod tests {
             claimed,
             token,
             CancellationToken::new(),
-            CancellationToken::new(),
+            (CancellationToken::new(), RangeTurns::default()),
         )
         .await;
 
@@ -1254,7 +1271,7 @@ mod tests {
             claimed,
             stale_token,
             cancel.clone(),
-            CancellationToken::new(),
+            (CancellationToken::new(), RangeTurns::default()),
         ));
         for _ in 0..100 {
             if marker.exists() {
@@ -1483,6 +1500,60 @@ mod tests {
         assert_eq!(record.state, JobState::Queued);
         assert!(record.claim.is_none());
         assert_eq!(record.attempts, 0);
+    }
+
+    // A committed checkpoint asks the heartbeat to persist its progress without waiting.
+    #[test]
+    fn checkpoint_requests_flush() {
+        let record = probe_record(JobId::from_bytes([0x17; 16]), 1, 0, None);
+        let progress = ProgressReporter::from_progress(&record.progress);
+        assert!(progress.flush_requested().now_or_never().is_none());
+        progress.checkpoint();
+        assert!(progress.flush_requested().now_or_never().is_some());
+        assert!(progress.checkpointed());
+    }
+
+    // Transient failures after a committed checkpoint never exhaust a long job; failures
+    // without progress still do.
+    #[tokio::test]
+    async fn progress_spares_attempts() {
+        let (_dir, storage) = temp_storage();
+        let job_id = JobId::from_bytes([0x16; 16]);
+        insert_job(&storage, &probe_record(job_id, 1, 0, None))
+            .await
+            .unwrap();
+        let failure = JobError::retryable("source timed out");
+
+        for failure_no in 0..(JOB_MAX_ATTEMPTS + 2) {
+            let claimed = reclaim(&storage, job_id).await;
+            let token = claimed.claim.unwrap().claim_token;
+            let progress = ProgressReporter::from_progress(&claimed.progress);
+            progress.checkpoint();
+            let outcome = requeue_failed(&storage, job_id, token, failure.clone(), &progress)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, RequeueOutcome::Requeued(_)),
+                "failure {failure_no}"
+            );
+        }
+
+        for _ in 2..JOB_MAX_ATTEMPTS {
+            let claimed = reclaim(&storage, job_id).await;
+            let token = claimed.claim.unwrap().claim_token;
+            let progress = ProgressReporter::from_progress(&claimed.progress);
+            let outcome = requeue_failed(&storage, job_id, token, failure.clone(), &progress)
+                .await
+                .unwrap();
+            assert!(matches!(outcome, RequeueOutcome::Requeued(_)));
+        }
+        let claimed = reclaim(&storage, job_id).await;
+        let token = claimed.claim.unwrap().claim_token;
+        let progress = ProgressReporter::from_progress(&claimed.progress);
+        let outcome = requeue_failed(&storage, job_id, token, failure, &progress)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RequeueOutcome::Exhausted(_)));
     }
 
     // Rolling restarts must never exhaust JOB_MAX_ATTEMPTS on a job that never failed.
@@ -1738,6 +1809,7 @@ mod tests {
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&record.progress),
+            range_turns: RangeTurns::default(),
         };
 
         let JobRunOutcome::Failed(error) = handle_panic(&ctx) else {

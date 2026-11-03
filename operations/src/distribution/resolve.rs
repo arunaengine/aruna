@@ -149,7 +149,7 @@ fn ready_here(snapshot: &DistributionSnapshot, local: NodeId) -> bool {
 
 /// The snapshots of this node's records that `keep` accepts, at most `wanted` of them, and
 /// whether accepted records were dropped or records left unread because [`MAX_SETS`] were read.
-async fn scan_sets(
+pub(crate) async fn scan_sets(
     context: &DriverContext,
     keep: impl Fn(&DistributionSnapshot) -> bool,
     wanted: usize,

@@ -717,6 +717,7 @@ pub(crate) async fn unheld_bucket(
         progress: super::executor::ProgressReporter::from_progress(
             &aruna_core::structs::execution::job::JobProgress::new("entries"),
         ),
+        range_turns: Default::default(),
     };
     resolve_entries(
         &ctx,
@@ -1456,9 +1457,9 @@ fn snapshot_read_failure(error: MetadataApiError) -> ExportFailure {
         MetadataApiError::PlacementUnavailable(error) => {
             ExportFailure::Retryable(error.to_string())
         }
-        MetadataApiError::InvalidCursor(message) | MetadataApiError::Internal(message) => {
-            ExportFailure::Retryable(message)
-        }
+        MetadataApiError::InvalidCursor(message)
+        | MetadataApiError::SearchIncomplete(message)
+        | MetadataApiError::Internal(message) => ExportFailure::Retryable(message),
     }
 }
 

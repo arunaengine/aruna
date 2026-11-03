@@ -18,7 +18,7 @@ use aruna_operations::distribution::create::{
 use aruna_operations::distribution::forward::PublishRefusal;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::status::{
-    DeletionStatus, DistributionStatus, Reach, read_status,
+    DeletionStatus, DistributionStatus, Reach, add_progress, read_status,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -177,6 +177,36 @@ pub struct RangeResponse {
     /// When this node last heard from the unreachable coordinator, in Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreachable_since_ms: Option<u64>,
+    /// This node's search index of the range; omitted when it keeps none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_index: Option<SearchIndexResponse>,
+    /// What the coordinator still owes each member it publishes the range to; only the
+    /// coordinator's node lists them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copies: Vec<CopyResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SearchIndexResponse {
+    /// Searches cover the range; until then they report it in `incomplete_ranges`.
+    pub ready: bool,
+    pub indexed_keys: u64,
+    /// Keys of the range by this node's range counters, an estimate.
+    pub keys: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct CopyResponse {
+    pub member_id: String,
+    /// The member keeps the bytes; otherwise it receives records only.
+    pub bytes: bool,
+    /// Nothing is queued for the member, and the queues were read to their end.
+    pub caught_up: bool,
+    /// Versions still queued for the member; a lower bound unless `copies_counted`.
+    pub pending_versions: u64,
+    /// Age of the oldest queued version, from its write time; omitted when none is queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_lag_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -198,6 +228,12 @@ pub struct DistributedResponse {
     pub configuration_changes_unavailable: bool,
     /// At least one range has an unreachable coordinator.
     pub degraded: bool,
+    /// A member still has versions to receive from a range this node coordinates.
+    #[serde(default)]
+    pub copies_behind: bool,
+    /// This node read its copy queues to their end, so `pending_versions` counts are exact.
+    #[serde(default)]
+    pub copies_counted: bool,
     pub members: Vec<MemberResponse>,
     pub ranges: Vec<RangeResponse>,
     /// The node glob grant that covers this bucket on every member node.
@@ -366,6 +402,7 @@ fn phase_name(phase: SetPhase, deletion: Option<&DeletionStatus>) -> &'static st
 }
 
 pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse {
+    let now_ms = aruna_core::time::unix_timestamp_millis();
     let members = status
         .members
         .into_iter()
@@ -398,8 +435,24 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
                 Some(Reach::Unreachable { since_ms }) => since_ms,
                 _ => None,
             },
+            search_index: range.search_index.map(|index| SearchIndexResponse {
+                ready: index.ready,
+                indexed_keys: index.indexed,
+                keys: index.keys,
+            }),
+            copies: (range.copies.iter())
+                .map(|copy| CopyResponse {
+                    member_id: copy.member_id.to_string(),
+                    bytes: copy.bytes,
+                    caught_up: copy.lag.pending == 0 && status.copies_counted,
+                    pending_versions: copy.lag.pending,
+                    oldest_lag_ms: (copy.lag.oldest_ms).map(|ms| now_ms.saturating_sub(ms)),
+                })
+                .collect(),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let copies_behind =
+        (ranges.iter()).any(|range| range.copies.iter().any(|copy| copy.pending_versions > 0));
     DistributedResponse {
         set_id: status.set_id.to_string(),
         bucket: status.bucket,
@@ -411,6 +464,8 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
         conflicted: status.conflicted,
         configuration_changes_unavailable: status.configuration_unavailable,
         degraded: status.degraded,
+        copies_behind,
+        copies_counted: status.copies_counted,
         members,
         ranges,
         recommended_grant: status.recommended_grant,
@@ -499,8 +554,18 @@ const STATUS_EXAMPLE: &str = r#"{
         "coordinator_node": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
         "epoch": 1,
         "replicas": [],
-        "degraded": false
+        "degraded": false,
+        "search_index": {"ready": false, "indexed_keys": 1200000, "keys": 14600000},
+        "copies": [{
+            "member_id": "01JMPRT3123456789ABCDEFGHJ",
+            "bytes": true,
+            "caught_up": false,
+            "pending_versions": 4096,
+            "oldest_lag_ms": 25200000
+        }]
     }],
+    "copies_behind": true,
+    "copies_counted": false,
     "recommended_grant": "/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/g/01JABCDEF0123456789ABCDEFG/data/*/spire/**"
 }"#;
 
@@ -667,7 +732,13 @@ pub(crate) async fn owned_status(
   node that may publish: data service continues, but admissions and other configuration
   changes wait.
 - `recommended_grant` is the node glob grant that lets reads that pull from another member
-  pass that member's own check."#,
+  pass that member's own check.
+- `search_index` shows this node's search index of a range: whether it is ready, the keys
+  indexed so far and the range's key count.
+- `copies` lists, on the coordinator's node only, each member the range is published to: the
+  versions still queued for it and the age of the oldest. The count reads a bounded part of
+  the queues; `copies_counted` is false when they held more, and the counts are lower bounds.
+  `copies_behind` is true while any listed member has versions queued."#,
     params(
         ("group_id" = String, Path, description = "Owner group id"),
         ("set_id" = String, Path, description = "Distributed bucket set id")
@@ -686,7 +757,7 @@ pub async fn get_distributed(
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<Json<DistributedResponse>> {
     let auth = require_realm_auth(&state, auth)?;
-    let status = owned_status(&state, group_id, set_id).await?;
+    let mut status = owned_status(&state, group_id, set_id).await?;
     let path = bucket_permission_path(
         state.get_realm_id(),
         group_id,
@@ -694,6 +765,7 @@ pub async fn get_distributed(
         &status.bucket,
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
+    add_progress(&state.get_ctx(), &mut status).await;
     Ok(Json(status_response(status)))
 }
 
@@ -733,7 +805,8 @@ pub async fn get_bucket_distribution(
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
     let binding = info.distribution.ok_or(ServerError::NotFound)?;
-    let status = owned_status(&state, info.group_id, binding.set_id).await?;
+    let mut status = owned_status(&state, info.group_id, binding.set_id).await?;
+    add_progress(&state.get_ctx(), &mut status).await;
     Ok(Json(status_response(status)))
 }
 

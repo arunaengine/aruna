@@ -13,7 +13,8 @@ use aruna_core::structs::storage::blob::Backend;
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use opendal::layers::{LoggingLayer, RetryLayer};
+use opendal::layers::{DefaultLoggingInterceptor, LoggingInterceptor, LoggingLayer, RetryLayer};
+use opendal::raw::{Operation, ServiceInfo};
 use opendal::{Builder, EntryMode, OperationContext, Operator, services};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -624,6 +625,9 @@ async fn build_source_operator<'access>(
                     build_service::<services::Http>(config.clone(), Some(guard.context()))
                         .map_err(staging_creation_error)?
                 }
+                SourceConnectorKind::S3 if s3_region(config, environment_variable).is_none() => {
+                    return Err(StagingSourceError::MissingSetting("region"));
+                }
                 SourceConnectorKind::S3 => build_service::<services::S3>(
                     s3_operator_config(config.clone()),
                     Some(guard.context()),
@@ -652,6 +656,31 @@ fn is_invenio(access: &ResolvedSourceAccess) -> bool {
     *kind == SourceConnectorKind::Invenio
 }
 
+/// Logs like opendal's default, except a stat of a missing object: listings probe their
+/// inclusive lower key that way, so that miss is expected and logged at debug level only.
+#[derive(Clone, Copy, Debug)]
+struct QuietMissing;
+
+impl LoggingInterceptor for QuietMissing {
+    fn log(
+        &self,
+        info: &ServiceInfo,
+        operation: Operation,
+        context: &[(&str, &str)],
+        message: &str,
+        err: Option<&opendal::Error>,
+    ) {
+        match err {
+            Some(error)
+                if operation == Operation::Stat && error.kind() == opendal::ErrorKind::NotFound =>
+            {
+                tracing::debug!(service = %info.scheme(), %operation, %error, "Source object not found");
+            }
+            _ => DefaultLoggingInterceptor.log(info, operation, context, message, err),
+        }
+    }
+}
+
 fn build_service<B>(
     config: HashMap<String, String>,
     guard: Option<OperationContext>,
@@ -661,7 +690,7 @@ where
 {
     let operator = Operator::from_iter::<B>(config)
         .map_err(|error| error.to_string())?
-        .layer(LoggingLayer::default())
+        .layer(LoggingLayer::new(QuietMissing))
         .layer(RetryLayer::new());
     Ok(match guard {
         Some(guard) => operator.with_context(guard),

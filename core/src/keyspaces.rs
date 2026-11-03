@@ -376,6 +376,9 @@ pub const SYNC_RECEIPT_KEYSPACE: &str = "sync_pull_receipts";
 pub const SYNC_ORIGIN_KEYSPACE: &str = "sync_local_origins";
 
 pub const SOURCE_INDEX_KEYSPACE: &str = "source_connector_index";
+/// The group of each connector id this node holds, written with the connector, so two groups
+/// registering one id at the same time conflict instead of sharing it.
+pub const SOURCE_ID_KEYSPACE: &str = "source_connector_ids";
 pub const SOURCE_SECRET_KEYSPACE: &str = "source_connector_secret";
 /// One row per reference version bound to a connector, keyed by connector id first.
 pub const CONNECTOR_REFERENCE_KEYSPACE: &str = "source_connector_references";
@@ -412,6 +415,8 @@ pub const RUN_CRATE_KEYSPACE: &str = "job_run_crate";
 /// keyed like `job_run_crate`. Device-local and never replicated.
 pub const RUN_PUBLISH_KEYSPACE: &str = "job_run_publish";
 pub const ATTEMPT_CONTROL_KEYSPACE: &str = "job_attempt_control";
+/// The live claim of an unsettled job, keyed like `jobs`; rewritten only when the claim changes.
+pub const JOB_CLAIM_KEYSPACE: &str = "job_claims";
 /// Signed immutable output records, keyed by ExecutionId.
 pub const OUTPUT_RECORD_KEYSPACE: &str = "job_output_records";
 pub const JOB_ENTRY_KEYSPACE: &str = "job_entries";
@@ -469,6 +474,8 @@ pub const FEDERATION_KEYSPACE: &str = "federation_publication";
 pub const NODE_VAULT_KEYSPACE: &str = "node_vault";
 /// The one row of `NODE_STATE_KEYSPACE` that holds the node's identity.
 pub const NODE_STATE_KEY: &[u8] = b"node_state";
+/// Realm signing key a promotion handed to this node; its next start moves it into the identity.
+pub const PROMOTED_KEY_ROW: &[u8] = b"promoted_realm_key";
 pub const ONBOARDING_KEYSPACE: &str = "onboarding";
 pub const DHT_KEYSPACE: &str = "dht_v2";
 pub const CRAQLE_TERMS_KEYSPACE: &str = "terms";
@@ -483,6 +490,9 @@ pub const DISTRIBUTION_LIFECYCLE_KEYSPACE: &str = "distribution_lifecycle";
 pub const DISTRIBUTION_PURGE_KEYSPACE: &str = "distribution_purge";
 /// Source roots of a set's external references by set id and root digest, with check markers.
 pub const SOURCE_ROOT_KEYSPACE: &str = "distribution_source_roots";
+/// The source roots stored versions name by digest: kind, public settings and login namespace,
+/// kept once per node instead of in every version.
+pub const ROOT_RECORD_KEYSPACE: &str = "source_root_records";
 /// IRI index postings by document first, so a materialization replaces exactly its own rows.
 pub const DOCUMENT_IRI_KEYSPACE: &str = "metadata_document_iris";
 /// Head changes of distributed buckets waiting for the range search indexes, by head position.
@@ -681,6 +691,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SYNC_RECEIPT_KEYSPACE,
     SYNC_ORIGIN_KEYSPACE,
     SOURCE_INDEX_KEYSPACE,
+    SOURCE_ID_KEYSPACE,
     SOURCE_SECRET_KEYSPACE,
     CONNECTOR_REFERENCE_KEYSPACE,
     CONNECTOR_PRUNE_KEYSPACE,
@@ -702,6 +713,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     RUN_CRATE_KEYSPACE,
     RUN_PUBLISH_KEYSPACE,
     ATTEMPT_CONTROL_KEYSPACE,
+    JOB_CLAIM_KEYSPACE,
     OUTPUT_RECORD_KEYSPACE,
     JOB_ENTRY_KEYSPACE,
     FAMILY_RECORD_KEYSPACE,
@@ -752,6 +764,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DISTRIBUTION_LIFECYCLE_KEYSPACE,
     DISTRIBUTION_PURGE_KEYSPACE,
     SOURCE_ROOT_KEYSPACE,
+    ROOT_RECORD_KEYSPACE,
     BUCKET_FREE_INDEX,
     CONTENT_INDEX_KEYSPACE,
     DOCUMENT_IRI_KEYSPACE,

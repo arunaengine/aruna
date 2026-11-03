@@ -229,6 +229,8 @@ Most problems with a new node come from a few settings. These tips help you avoi
 - **Decide how changes are saved.** By default, Aruna favors speed: the last few changes can be
   lost if the machine loses power. Set `ARUNA_FJALL_PERSIST_MODE=sync_all` if that is not
   acceptable for you.
+- **Size the database cache.** `ARUNA_FJALL_CACHE_MIB` sets the block cache of the node database
+  (default 256). Nodes with much memory and slow disks read less from disk with a larger cache.
 - **Keep notebook networks separate.** Notebook sessions run in their own network so they can only
   reach your data. Make sure this network (`ARUNA_COMPUTE_DOCKER_SESSION_SUBNET`) does not overlap
   with other networks on the host.

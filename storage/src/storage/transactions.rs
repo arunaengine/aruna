@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::Arc;
+
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
@@ -14,7 +16,7 @@ use fjall::Readable;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::compaction::{DELETE_THRESHOLD, compactable};
+use crate::compaction::{DELETE_THRESHOLD, compactable, sweep_due};
 
 use super::rebuild::shadow_row;
 
@@ -205,7 +207,7 @@ impl FjallStorage {
             Txn::Read(self.store.db.read_tx())
         } else {
             match self.store.db.write_tx() {
-                Ok(txn) => Txn::Write(Box::new(
+                Ok(txn) => Txn::Write(Arc::new(
                     txn.durability(Some(self.persist_policy.as_fjall())),
                 )),
                 Err(_) => {
@@ -250,12 +252,9 @@ impl FjallStorage {
         self.txn_rows.remove(&txn_id);
         self.usage_views.remove(&txn_id);
         self.config_txns.remove(&txn_id);
+        // A read still running in the transaction drops the last handle, which rolls it back.
         match self.txns.remove(&txn_id) {
-            Some(Txn::Write(txn)) => {
-                txn.rollback();
-                StorageEvent::TransactionAborted { txn_id }
-            }
-            Some(Txn::Read(_)) => StorageEvent::TransactionAborted { txn_id },
+            Some(Txn::Write(_) | Txn::Read(_)) => StorageEvent::TransactionAborted { txn_id },
             None => StorageEvent::Error {
                 error: StorageError::TransactionNotFound,
             },
@@ -304,7 +303,15 @@ impl FjallStorage {
         let rows = self.txn_rows.remove(&txn_id).unwrap_or_default();
         match self.txns.remove(&txn_id) {
             Some(Txn::Read(_)) => StorageEvent::TransactionCommitted { txn_id },
-            Some(Txn::Write(mut txn)) => {
+            Some(Txn::Write(txn)) => {
+                // A commit never waits for a read still running in the transaction.
+                let Ok(mut txn) = Arc::try_unwrap(txn) else {
+                    self.take_txn_deletes(txn_id, false);
+                    self.txn_usage.remove(&txn_id);
+                    return StorageEvent::Error {
+                        error: StorageError::TransactionConflict,
+                    };
+                };
                 let rows = rows.iter().map(|(space, key)| (space.as_str(), key));
                 let staged = self.keep_preimages(&mut txn, rows);
                 if let Err(error) = staged.and_then(|()| self.stage_usage(txn_id, &mut txn)) {
@@ -342,6 +349,15 @@ impl FjallStorage {
         }
     }
 
+    /// Sweeps the keyspaces once journals pile up, as Fjall waits on any that compacted away.
+    pub(super) fn check_journals(&mut self) {
+        let (due, swept) = sweep_due(self.store.db.journal_count(), self.swept);
+        self.swept = swept;
+        if due {
+            self.compactor.sweep(self.store.db.clone());
+        }
+    }
+
     pub(super) fn note_deletes(&mut self, key_space: &str, count: u64) {
         let total = self.deletes.entry(key_space.to_string()).or_default();
         *total += count;
@@ -362,7 +378,8 @@ impl FjallStorage {
                     );
                     return;
                 }
-                self.compactor.submit(key_space, deletes, keyspace);
+                self.compactor
+                    .submit(key_space, deletes, self.store.db.clone(), keyspace);
             }
             Err(error) => warn!(
                 event = "storage.keyspace.compact_failed",

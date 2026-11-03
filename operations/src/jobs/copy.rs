@@ -234,6 +234,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(Ulid::generate()),
         };
@@ -271,6 +272,7 @@ mod tests {
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("bytes")),
+            range_turns: Default::default(),
         }
     }
 

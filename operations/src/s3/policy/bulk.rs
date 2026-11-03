@@ -1,10 +1,11 @@
-//! Applies a bucket default to current heads in bounded pages, one target per transaction.
-//! Each mint runs the single object sub-operation, which unions refs and never removes them.
+//! Applies a bucket default to current heads in bounded pages, one target per transaction; each
+//! mint unions refs, never removes them, and in a distributed bucket only in this node's ranges.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::records::HeadAliasContext;
+use crate::distribution::guard::{GuardError, authority_read, authority_rows, write_authority};
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy::successor::{
@@ -27,9 +28,9 @@ use aruna_core::structs::placement::policy::{
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::structs::storage::distribution::{DistributionBinding, RouteError};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -77,6 +78,8 @@ pub struct BulkReport {
     pub cursor: Option<Key>,
     /// True when this pass exhausted the bounded local iterator.
     pub complete: bool,
+    /// Heads of ranges another node coordinates; that node's pass applies the default there.
+    pub elsewhere: usize,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -96,6 +99,8 @@ pub enum BulkError {
     ForeignPolicy { policy_id: Ulid },
     #[error("the run was captured against a different bucket record")]
     BucketChanged,
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
     #[error("unexpected event during the bulk pass")]
     InvalidEvent,
 }
@@ -110,6 +115,8 @@ enum BulkState {
     WriteRun,
     CommitCapture,
     Resolve,
+    /// Reads the set record and this node's fence before the heads, so only owned keys mint.
+    ReadRecord,
     ScanHeads,
     ReadVersions,
     ResolveUnion,
@@ -166,6 +173,9 @@ pub struct PolicyBulkOperation {
     group_id: Option<Ulid>,
     /// The set hint of a distributed bucket, so planned successor ids carry it.
     set_hint: Option<SetHint>,
+    /// The bucket's membership in a distributed set, and the set record and fence rows.
+    binding: Option<DistributionBinding>,
+    authority: (Option<Value>, Option<Value>),
     run: Option<PolicyBulkRun>,
     resolver: Option<PolicySetResolver>,
     resolved: BTreeMap<Ulid, PolicyResolution>,
@@ -194,6 +204,7 @@ impl PolicyBulkOperation {
             blocked: Vec::new(),
             cursor: None,
             complete: false,
+            elsewhere: 0,
         };
         Self {
             config,
@@ -201,6 +212,8 @@ impl PolicyBulkOperation {
             txn_id: None,
             group_id: None,
             set_hint: None,
+            binding: None,
+            authority: (None, None),
             run: None,
             resolver: None,
             resolved: BTreeMap::new(),
@@ -311,6 +324,7 @@ impl PolicyBulkOperation {
         };
         self.group_id = Some(bucket.group_id);
         self.set_hint = bucket.distribution.as_ref().map(DistributionBinding::hint);
+        self.binding = bucket.distribution.clone();
         self.report.generation = bucket.placement_policy_generation;
         self.report.target_refs = bucket.placement_policies.clone();
 
@@ -410,9 +424,50 @@ impl PolicyBulkOperation {
                 }
                 match foreign_owner(&self.resolved, self.config.group_id) {
                     Some(policy_id) => self.fail(BulkError::ForeignPolicy { policy_id }),
-                    None => self.scan_heads(),
+                    None => self.read_record(),
                 }
             }
+        }
+    }
+
+    /// Each mint checks the authority again inside its own transaction; this read only
+    /// selects the keys to plan.
+    fn read_record(&mut self) -> Effects {
+        let Some(binding) = self.binding.as_ref() else {
+            return self.scan_heads();
+        };
+        self.state = BulkState::ReadRecord;
+        smallvec![authority_read(binding.set_id, None)]
+    }
+
+    fn handle_record(&mut self, event: Event) -> Effects {
+        match authority_rows(event) {
+            Ok(rows) => {
+                self.authority = rows;
+                self.scan_heads()
+            }
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    /// Whether this node plans `key`: always in an ordinary bucket, and in a distributed one only
+    /// while it coordinates the key's range. A range that moves or is fenced waits for a later pass.
+    fn owns(&mut self, key: &str) -> Result<bool, BulkError> {
+        let Some(binding) = self.binding.as_ref() else {
+            return Ok(true);
+        };
+        let (record, fence) = (self.authority.0.as_deref(), self.authority.1.as_deref());
+        match write_authority(binding, key, record, fence) {
+            Ok(_) => Ok(true),
+            Err(GuardError::NotCoordinator { .. }) => {
+                self.report.elsewhere += 1;
+                Ok(false)
+            }
+            Err(error) if error.moved_away() => {
+                self.report.replanned += 1;
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -450,6 +505,11 @@ impl PolicyBulkOperation {
                 Ok(head) => head,
                 Err(error) => return self.fail(error.into()),
             };
+            match self.owns(&head.key) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => return self.fail(error),
+            }
             let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
                 Ok(pointer) => pointer,
                 Err(error) => return self.fail(error.into()),
@@ -466,6 +526,9 @@ impl PolicyBulkOperation {
                 refs: Vec::new(),
                 intent: None,
             });
+        }
+        if reads.is_empty() {
+            return self.after_page();
         }
         self.state = BulkState::ReadVersions;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -688,6 +751,14 @@ impl PolicyBulkOperation {
                 | SuccessorError::IntentConflict
                 | SuccessorError::Storage(StorageError::TransactionConflict),
             ) => self.report.replanned += 1,
+            // The range moved or was fenced after the scan: the mint refused it, nothing was
+            // written, and a later pass plans the key only if this node coordinates it again.
+            Err(SuccessorError::Distribution(error))
+                if error.moved_away()
+                    || matches!(error, GuardError::Route(RouteError::StaleRange(_))) =>
+            {
+                self.report.replanned += 1
+            }
             // A head that lost its version or became a delete marker is retained
             // as a blocked gap: the pass must not claim it as completed.
             Err(SuccessorError::HeadDeleted | SuccessorError::VersionMissing) => {
@@ -869,6 +940,7 @@ impl Operation for PolicyBulkOperation {
                 let step = resolver.step(event);
                 self.after_resolve(step)
             }
+            BulkState::ReadRecord => self.handle_record(event),
             BulkState::ScanHeads => self.handle_heads(event),
             BulkState::ReadVersions => self.handle_versions(event),
             BulkState::ResolveUnion => {
@@ -1491,6 +1563,140 @@ mod tests {
         assert_eq!(second.minted, 0);
         assert_eq!(second.covered, 1);
         assert_eq!(second.status, PolicyStatus::Completed);
+    }
+
+    /// Binds the bucket to member 1 of the two-shard test set: it coordinates the keys below "m".
+    async fn distribute(context: &DriverContext) -> Ulid {
+        use crate::distribution::test_record::{binding, record, store_record};
+        let (snapshot, bytes) = record(true);
+        store_record(&context.storage_handle, snapshot.set_id(), bytes).await;
+        // The inventory a mint keeps current needs the set's ranges opened on this member.
+        crate::distribution::test_store::install(
+            &context.storage_handle,
+            snapshot.set_id(),
+            &snapshot.config.ranges,
+        )
+        .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(stored),
+            ..
+        }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: BUCKET.as_bytes().to_vec().into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("the bucket is stored");
+        };
+        let mut bucket = BucketInfo::from_bytes(&stored).expect("bucket decodes");
+        bucket.distribution = Some(binding(&snapshot, 1, 5));
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: BUCKET.as_bytes().to_vec().into(),
+                value: bucket.to_bytes().expect("bucket encodes").into(),
+                txn_id: None,
+            })
+            .await;
+        snapshot.set_id()
+    }
+
+    #[tokio::test]
+    async fn mints_own_ranges() {
+        // Member 1 coordinates "a" but not "x": only the coordinator of a range mints there.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let own = put_object(&context, &fixture, "a").await;
+        let other = put_object(&context, &fixture, "x").await;
+        distribute(&context).await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+            &context,
+        )
+        .await
+        .expect("pass runs");
+
+        assert_eq!(
+            (report.minted, report.elsewhere, report.observed),
+            (1, 1, 1)
+        );
+        assert_ne!(read_head(&context, "a").await.version_id, own);
+        assert_eq!(read_head(&context, "x").await.version_id, other);
+        assert_eq!(count_versions(&context, "x").await, 1);
+        assert_eq!(report.status, PolicyStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn fenced_range_waits() {
+        // A range fenced for a transfer is not minted; the run stays open for a later pass.
+        use aruna_core::keyspaces::DISTRIBUTION_FENCE_KEYSPACE;
+        use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let own = put_object(&context, &fixture, "a").await;
+        let set_id = distribute(&context).await;
+        let (snapshot, _) = crate::distribution::test_record::record(true);
+        let mut fence = LocalFence::default();
+        fence.fence_range(RangeFence {
+            range_id: snapshot.config.ranges[0].range_id,
+            transfer_id: Ulid::from_bytes([3; 16]),
+            epoch: 1,
+            since_ms: 0,
+            uploads_open: false,
+        });
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+                key: set_id.to_bytes().to_vec().into(),
+                value: fence.to_bytes().expect("fence encodes").into(),
+                txn_id: None,
+            })
+            .await;
+        set_default(
+            &context,
+            &fixture,
+            vec![policy(fixture.node_id).policy_ref()],
+        )
+        .await;
+
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+            &context,
+        )
+        .await
+        .expect("pass runs");
+
+        assert_eq!((report.minted, report.replanned), (0, 1));
+        assert_eq!(read_head(&context, "a").await.version_id, own);
+        assert_eq!(report.status, PolicyStatus::Active);
+    }
+
+    #[test]
+    fn moved_range_replans() {
+        // A mint the range authority refused inside its transaction wrote nothing; the next
+        // key goes on and a later pass decides the refused key again.
+        use crate::distribution::guard::GuardError;
+        use crate::s3::policy::successor::SuccessorError;
+        use aruna_core::structs::storage::distribution::RouteError;
+        let range_id = Ulid::from_bytes([7; 16]);
+        for refusal in [
+            GuardError::Route(RouteError::StaleRange(range_id)),
+            GuardError::Route(RouteError::Moving(range_id)),
+        ] {
+            let mut operation = PolicyBulkOperation::new(bulk_config(Ulid::generate()));
+            operation.state = BulkState::Mint;
+            operation.record_outcome(Err(SuccessorError::Distribution(refusal)));
+            assert_eq!(operation.report.replanned, 1);
+            assert_ne!(operation.state, BulkState::Error);
+        }
     }
 
     #[tokio::test]

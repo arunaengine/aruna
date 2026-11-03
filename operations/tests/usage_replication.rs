@@ -95,6 +95,7 @@ async fn snapshot_reaches_peer() -> Result<(), Box<dyn std::error::Error>> {
                 RealmUsageScope::Global,
             )
             .await
+            .map(|usage| usage.counters)
             .unwrap_or_default();
             let group = load_realm_usage(
                 node_b.context.as_ref(),
@@ -102,6 +103,7 @@ async fn snapshot_reaches_peer() -> Result<(), Box<dyn std::error::Error>> {
                 RealmUsageScope::Group(group_id),
             )
             .await
+            .map(|usage| usage.counters)
             .unwrap_or_default();
             Ok(usize::from(
                 !(received && global.buckets == 1 && group.buckets == 1),
@@ -116,14 +118,16 @@ async fn snapshot_reaches_peer() -> Result<(), Box<dyn std::error::Error>> {
         node_b.net.node_id(),
         RealmUsageScope::Global,
     )
-    .await?;
+    .await?
+    .counters;
     assert_eq!(realm_global.buckets, 1, "realm global should include A");
     let realm_group = load_realm_usage(
         node_b.context.as_ref(),
         node_b.net.node_id(),
         RealmUsageScope::Group(group_id),
     )
-    .await?;
+    .await?
+    .counters;
     assert_eq!(realm_group.buckets, 1, "realm group should include A");
 
     // Ingest is counter-neutral: B's node-local usage keyspace is untouched.
@@ -182,6 +186,7 @@ async fn snapshot_ingest_neutral() -> Result<(), Box<dyn std::error::Error>> {
                 RealmUsageScope::Global,
             )
             .await
+            .map(|usage| usage.counters)
             .unwrap_or_default();
             let group = load_realm_usage(
                 node_b.context.as_ref(),
@@ -189,6 +194,7 @@ async fn snapshot_ingest_neutral() -> Result<(), Box<dyn std::error::Error>> {
                 RealmUsageScope::Group(group_id),
             )
             .await
+            .map(|usage| usage.counters)
             .unwrap_or_default();
             Ok(usize::from(
                 !(received && global.objects == rich.objects && group.objects == rich.objects),
@@ -203,7 +209,8 @@ async fn snapshot_ingest_neutral() -> Result<(), Box<dyn std::error::Error>> {
         node_b.net.node_id(),
         RealmUsageScope::Global,
     )
-    .await?;
+    .await?
+    .counters;
     assert_eq!(
         realm_global, rich,
         "realm global aggregate must equal A's snapshot"
@@ -213,7 +220,8 @@ async fn snapshot_ingest_neutral() -> Result<(), Box<dyn std::error::Error>> {
         node_b.net.node_id(),
         RealmUsageScope::Group(group_id),
     )
-    .await?;
+    .await?
+    .counters;
     assert_eq!(
         realm_group, rich,
         "realm group aggregate must equal A's snapshot"
@@ -304,6 +312,8 @@ async fn bootstrap_usage_genesis(
     let snapshot = NodeUsageSnapshot {
         node_id,
         counters: UsageCounters::default(),
+        replicas: Default::default(),
+        revisions: Default::default(),
     };
     match publisher
         .context

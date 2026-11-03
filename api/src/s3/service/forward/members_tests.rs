@@ -11,6 +11,7 @@ use s3s::{S3, S3Request};
 
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 
+use super::reads::STALE_HEADER;
 use crate::tests::members::{BUCKET, Members, members};
 
 /// A request the access hook admitted for `user` on `bucket`.
@@ -715,6 +716,158 @@ async fn listing_incomplete_holder() {
     assert!(page(&members, 0, near).await.is_ok());
 }
 
+// Copies here never receive their records, as a lagging copy; every node still lists all keys.
+#[tokio::test]
+async fn copies_defer_listing() {
+    use s3s::dto::ListObjectsInput;
+    let members = members(3, &["h", "p"], 1).await;
+    for key in SPREAD {
+        put(&members, 0, key, key.as_bytes()).await;
+    }
+    for on in 0..3 {
+        let (keys, _, next) = page(&members, on, list_input(100)).await.unwrap();
+        assert_eq!((keys, next), (SPREAD.map(String::from).to_vec(), None));
+        let node = &members.nodes[on];
+        let input = ListObjectsInput {
+            bucket: BUCKET.to_string(),
+            ..Default::default()
+        };
+        let list = request(input, Method::GET, members.user_on(on), node.bucket().await);
+        let output = node.service.list_objects(list).await.unwrap().output;
+        let keys: Vec<String> = (output.contents.unwrap_or_default().into_iter())
+            .filter_map(|object| object.key)
+            .collect();
+        assert_eq!(keys, SPREAD);
+    }
+}
+
+// A miss on a copy that has not received the key yet goes on to the range's coordinator.
+#[tokio::test]
+async fn copy_miss_forwards() {
+    let members = members(3, &["h", "p"], 1).await;
+    for key in SPREAD {
+        put(&members, 0, key, key.as_bytes()).await;
+    }
+    for on in 0..3 {
+        let node = &members.nodes[on];
+        for key in SPREAD {
+            assert_eq!(read(&members, on, key).await.0, key.as_bytes());
+            let input = s3s::dto::HeadObjectInput {
+                bucket: BUCKET.to_string(),
+                key: key.to_string(),
+                ..Default::default()
+            };
+            let head = request(
+                input,
+                Method::HEAD,
+                members.user_on(on),
+                node.bucket().await,
+            );
+            let output = node.service.head_object(head).await.unwrap().output;
+            assert_eq!(output.content_length, Some(key.len() as i64));
+        }
+    }
+    assert_eq!(
+        *get_error(&members, 0, "q/none").await.code(),
+        s3s::S3ErrorCode::NoSuchKey
+    );
+}
+
+/// Copies the object rows of node `from` to node `to`, as a copy that received them.
+async fn copy_rows(members: &Members, from: usize, to: usize) {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    };
+    for key_space in [
+        BLOB_HEAD_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE,
+        BLOB_LOCATIONS_KEYSPACE,
+    ] {
+        let iter = StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: None,
+            start: None,
+            limit: 1000,
+            txn_id: None,
+        };
+        let storage = &members.nodes[from].context.storage_handle;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) =
+            storage.send_storage_effect(iter).await
+        else {
+            panic!("rows of {key_space} read");
+        };
+        for (key, value) in values {
+            let write = StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key,
+                value,
+                txn_id: None,
+            };
+            let storage = &members.nodes[to].context.storage_handle;
+            storage.send_storage_effect(write).await;
+        }
+    }
+}
+
+// A copy that still holds an older version never answers a read of the current one.
+#[tokio::test]
+async fn stale_copy_skipped() {
+    let members = members(3, &["h", "p"], 1).await;
+    let old = put(&members, 0, "q/1", b"old").await;
+    copy_rows(&members, 2, 0).await;
+    put(&members, 0, "q/1", b"newer").await;
+    assert_eq!(read(&members, 0, "q/1").await.0, b"newer");
+    let node = &members.nodes[0];
+    let input = s3s::dto::HeadObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "q/1".to_string(),
+        ..Default::default()
+    };
+    let head = request(input, Method::HEAD, members.user_on(0), node.bucket().await);
+    let output = node.service.head_object(head).await.unwrap().output;
+    assert_eq!(output.content_length, Some(5));
+    // A pinned version is the same everywhere, so the copy still answers it.
+    let input = s3s::dto::HeadObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "q/1".to_string(),
+        version_id: Some(old),
+        ..Default::default()
+    };
+    let head = request(input, Method::HEAD, members.user_on(0), node.bucket().await);
+    let output = node.service.head_object(head).await.unwrap().output;
+    assert_eq!(output.content_length, Some(3));
+}
+
+// A copy of the current version reads its source from the coordinator, never a stale copy.
+#[tokio::test]
+async fn stale_copy_source() {
+    let members = members(3, &["h", "p"], 1).await;
+    put(&members, 0, "q/src", b"old").await;
+    copy_rows(&members, 2, 0).await;
+    put(&members, 0, "q/src", b"newer").await;
+    // Node 0 keeps the stale copy; node 1 hands the copy to node 0, which keeps it too.
+    copy(&members, 0, ("q/src", "k/dst"), None).await.unwrap();
+    copy(&members, 1, ("q/src", "a/dst"), None).await.unwrap();
+    assert_eq!(read(&members, 1, "k/dst").await.0, b"newer");
+    assert_eq!(read(&members, 0, "a/dst").await.0, b"newer");
+    // A copy node 0 writes itself is refused with the source's coordinator named.
+    let error = copy(&members, 0, ("q/src", "a/own"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        *error.code(),
+        s3s::S3ErrorCode::Custom("CopySourceNotHeld".into())
+    );
+    let coordinator = members.nodes[2].node_id().to_string();
+    assert!(
+        error
+            .message()
+            .is_some_and(|text| text.contains(&coordinator))
+    );
+}
+
 // Versions list across ranges newest first per key, delete markers included, and the
 // markers of a short page resume the next one.
 #[tokio::test]
@@ -1042,4 +1195,109 @@ async fn uploads_need_caller() {
         .await
         .unwrap_err();
     assert_eq!(*error.code(), missing);
+}
+
+// While a range's coordinator is down, its copy answers reads and listings marked stale, and
+// a copy's miss says the key may exist; node 1 coordinates range [h, p), node 2 copies it.
+#[tokio::test]
+async fn copies_answer_stale() {
+    let mut members = members(3, &["h", "p"], 1).await;
+    put(&members, 0, "k/1", b"k/1").await;
+    copy_rows(&members, 1, 2).await;
+    members.nodes[1].stop().await;
+    let binding = members.nodes[2].bucket().await.distribution.unwrap();
+    let snapshot = members.nodes[2].service.snapshot(&binding).await.unwrap();
+    let range_id = snapshot.config.ranges[1].range_id;
+    let stale = format!("range={range_id}");
+    for on in [0, 2] {
+        let node = &members.nodes[on];
+        let input = s3s::dto::HeadObjectInput {
+            bucket: BUCKET.to_string(),
+            key: "k/1".to_string(),
+            ..Default::default()
+        };
+        let head = request(
+            input,
+            Method::HEAD,
+            members.user_on(on),
+            node.bucket().await,
+        );
+        let answer = node.service.head_object(head).await.unwrap();
+        assert_eq!(answer.output.content_length, Some(3));
+        assert_eq!(answer.headers.get(STALE_HEADER).unwrap(), stale.as_str());
+
+        let error = get_error(&members, on, "k/none").await;
+        assert_eq!(*error.code(), s3s::S3ErrorCode::NoSuchKey);
+        assert!(
+            error
+                .message()
+                .is_some_and(|text| text.contains("may be behind"))
+        );
+        let headers = error.headers().unwrap();
+        assert_eq!(headers.get(STALE_HEADER).unwrap(), stale.as_str());
+
+        let input = s3s::dto::ListObjectsV2Input {
+            prefix: Some("k/".to_string()),
+            ..list_input(100)
+        };
+        let list = request(input, Method::GET, members.user_on(on), node.bucket().await);
+        let answer = node.service.list_objects_v2(list).await.unwrap();
+        let keys: Vec<String> = (answer.output.contents.unwrap_or_default().into_iter())
+            .filter_map(|object| object.key)
+            .collect();
+        assert_eq!(keys, ["k/1"]);
+        assert_eq!(answer.headers.get(STALE_HEADER).unwrap(), stale.as_str());
+    }
+    // A range whose coordinator answers is never marked.
+    put(&members, 0, "a/1", b"a/1").await;
+    let (keys, _, _) = page(
+        &members,
+        0,
+        s3s::dto::ListObjectsV2Input {
+            prefix: Some("a/".to_string()),
+            ..list_input(100)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(keys, ["a/1"]);
+}
+
+// A current read delegated to a member that does not coordinate the key's range is refused,
+// unless the sender asked it as a copy; node 1 coordinates range [h, p), node 2 copies it.
+#[tokio::test]
+async fn copy_read_marked() {
+    use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
+    let members = members(3, &["h", "p"], 1).await;
+    put(&members, 0, "k/1", b"k/1").await;
+    copy_rows(&members, 1, 2).await;
+    let binding = members.nodes[0].bucket().await.distribution.unwrap();
+    let snapshot = members.nodes[0].service.snapshot(&binding).await.unwrap();
+    let copy = super::Forward {
+        set_id: binding.set_id,
+        range_id: snapshot.config.ranges[1].range_id,
+        node_id: members.nodes[2].node_id(),
+    };
+    let read = || {
+        super::reads::read_request(
+            Method::GET,
+            "GetObject",
+            BUCKET,
+            "k/1",
+            None,
+            &HeaderMap::new(),
+        )
+    };
+    let service = &members.nodes[0].service;
+    let error = service
+        .forward_read(&members.user_on(0), &copy, read())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "WrongCoordinator");
+    let mut marked = read();
+    (marked.headers).push((COPY_READ_HEADER.to_string(), "1".to_string()));
+    let answer = service
+        .forward_read(&members.user_on(0), &copy, marked)
+        .await;
+    assert_eq!(answer.unwrap().bytes().await.unwrap().as_ref(), b"k/1");
 }

@@ -1,14 +1,14 @@
-//! Tests the system info routes for realm status, placement changes, quota and usage.
+//! Tests the system info routes for realm status, placement changes, quota, usage and promotion.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
     GroupCapOverride, InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeKindInfo,
     PeerContacts, RealmBinding, RealmBindingScope, RealmConnectionStatus, RealmPlacementOverride,
-    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, ServiceStatus, TelemetryState,
-    UsageResponse, get_info, get_realm_info, get_realm_placement, get_usage, map_handle_error,
-    map_placement_error, map_quota_error, map_realm_nodes, mutate_realm_placement, presence_nodes,
-    set_realm_quota,
+    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, RealmQuotaOverride,
+    ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info, get_realm_placement,
+    get_usage, map_handle_error, map_placement_error, map_quota_error, map_realm_nodes,
+    mutate_realm_placement, presence_nodes, set_realm_quota,
 };
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
@@ -16,6 +16,7 @@ use crate::routes::federation::{
     AcceptedRealmsSetting, RealmFederation, RegistrationSetting, get_realm_federation,
     set_realm_federation,
 };
+use crate::routes::promotion::promote_server_node;
 use crate::server::state::ServerState;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
@@ -41,7 +42,7 @@ use aruna_operations::realm::set_quota::SetQuotaError;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use axum::body::Body;
-use axum::extract::{FromRequest, State};
+use axum::extract::{FromRequest, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::{Extension, Json};
 use std::collections::{BTreeMap, HashSet};
@@ -334,6 +335,8 @@ async fn seed_usage_state(state: &Arc<ServerState>) {
                     buckets: 3,
                     ..Default::default()
                 },
+                replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap()
@@ -1176,6 +1179,19 @@ async fn admin_sets_quota() {
     body.devices_per_user = Some(3);
     body.device_request_rate = Some(600);
     body.device_concurrent_pulls = Some(8);
+    body.count_replicas = true;
+    let group_id = Ulid::from_bytes([6; 16]).to_string();
+    let over: RealmQuotaOverride =
+        serde_json::from_value(serde_json::json!({"group_id": group_id, "quota_bytes": 1}))
+            .unwrap();
+    assert_eq!(
+        over.count_replicas, None,
+        "an omitted override keeps the realm's setting"
+    );
+    body.group_overrides = vec![RealmQuotaOverride {
+        count_replicas: Some(false),
+        ..over
+    }];
 
     let (status, Json(stored)) = set_realm_quota(
         State(state.clone()),
@@ -1189,6 +1205,8 @@ async fn admin_sets_quota() {
     assert_eq!(stored.devices_per_user, Some(3));
     assert_eq!(stored.device_request_rate, Some(600));
     assert_eq!(stored.device_concurrent_pulls, Some(8));
+    assert!(stored.count_replicas);
+    assert_eq!(stored.group_overrides[0].count_replicas, Some(false));
 
     let (status, Json(info)) = get_realm_info(State(state), Extension(Some(auth)))
         .await
@@ -1197,6 +1215,7 @@ async fn admin_sets_quota() {
     let quota = info.quota.expect("realm token sees quota");
     assert_eq!(quota.default_quota_bytes, Some(4096));
     assert_eq!(quota.devices_per_user, Some(3));
+    assert!(quota.count_replicas);
 }
 
 fn federation_body(name: &str) -> RealmFederation {
@@ -1885,4 +1904,60 @@ fn group_omits_stored() {
     let realm = body["realm"].as_object().expect("object");
     assert!(!realm.contains_key("stored_blobs"));
     assert!(!realm.contains_key("stored_bytes"));
+}
+
+#[tokio::test]
+async fn counts_distributed_once() {
+    use crate::tests::distributed::{BUCKET, distribute, node_state};
+    // The set has a member bucket on this node and on the peer: a node total of 5 is 4 buckets.
+    let node = node_state().await;
+    distribute(&node.state, node.group_id, BUCKET).await;
+    assert_eq!(super::distinct_buckets(&node.state, None, 5).await, Some(4));
+    assert_eq!(
+        super::distinct_buckets(&node.state, Some(node.group_id), 5).await,
+        Some(4)
+    );
+    assert_eq!(
+        super::distinct_buckets(&node.state, Some(ulid::Ulid::nil()), 5).await,
+        Some(5)
+    );
+}
+
+#[tokio::test]
+async fn promotion_requires_admin() {
+    let (state, realm_id, _admin, _tempdir) = setup_management_state().await;
+    let stranger = AuthContext {
+        user_id: UserId::local(Ulid::generate(), realm_id),
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let node = iroh::SecretKey::generate().public().to_string();
+
+    let error = promote_server_node(State(state), Extension(Some(stranger)), Path(node))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ServerError::Forbidden));
+}
+
+#[tokio::test]
+async fn promotion_needs_server() {
+    let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+    let auth = Some(admin_auth(realm_id, admin));
+    let unknown = iroh::SecretKey::generate().public().to_string();
+
+    let error = promote_server_node(State(state.clone()), Extension(auth.clone()), Path(unknown))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ServerError::NotFound));
+
+    let own = state.get_node_id().to_string();
+    let error = promote_server_node(State(state), Extension(auth), Path(own))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ServerError::Conflict(_)),
+        "a node never promotes itself"
+    );
 }

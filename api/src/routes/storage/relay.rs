@@ -10,11 +10,14 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::distribution::WriteRoute;
+use aruna_core::structs::storage::distribution::{ReadRoute, WriteRoute};
 use aruna_operations::distribution::delegate::node_urls;
-use aruna_operations::distribution::guard::route_write;
+use aruna_operations::distribution::guard::{read_coordinator, route_read, route_write};
+use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::status::node_reach;
+use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::Response;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::warn;
@@ -28,6 +31,8 @@ use crate::server::state::ServerState;
 
 const API_PREFIX: &str = "/api/v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a holder may take to start its answer; the body then streams without a bound.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// The distributed bucket a relayed request is meant for; its target refuses another bucket.
 pub(crate) const RELAY_SET_HEADER: &str = "x-aruna-relay-set";
 /// Bytes of a node's answer read at most; a longer answer fails instead of filling memory.
@@ -104,6 +109,146 @@ pub(crate) async fn rest_target(
         })),
         Err(error) => Err(map_guard_error(error)),
     }
+}
+
+/// The holders a REST read of `key` goes to, coordinator last, when this member keeps no
+/// records of the key's range, or `None` when this node answers it. A relayed read stays here.
+pub(crate) async fn read_holders(
+    state: &ServerState,
+    bucket: &BucketInfo,
+    key: &str,
+    headers: &HeaderMap,
+) -> ServerResult<Option<Vec<RestForward>>> {
+    relayed_set(bucket, headers)?;
+    let Some(binding) = bucket.distribution.as_ref() else {
+        return Ok(None);
+    };
+    if headers.contains_key(RELAY_HOP_HEADER) {
+        return Ok(None);
+    }
+    let context = state.get_ctx();
+    let route = route_read(context.as_ref(), binding, key, false).await;
+    let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? else {
+        return Ok(None);
+    };
+    let mut holders = key_holders(context.as_ref(), binding.set_id, key).await;
+    holders.retain(|holder| *holder != state.get_node_id() && *holder != node_id);
+    holders.push(node_id);
+    let forward = |node_id| RestForward {
+        set_id: binding.set_id,
+        range_id,
+        node_id,
+    };
+    Ok(Some(holders.into_iter().map(forward).collect()))
+}
+
+/// `route` with the query `pairs`, for a holder.
+pub(crate) fn query_path(route: &str, pairs: &[(&str, &str)]) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.extend_pairs(pairs);
+    format!("{route}?{}", query.finish())
+}
+
+/// 404 from a copy that answered for range `range_id` while its coordinator could not.
+pub(crate) fn stale_miss(range_id: Ulid) -> ServerError {
+    ServerError::Refused(
+        StatusCode::NOT_FOUND,
+        "stale_not_found",
+        format!(
+            "not found on a copy of range {range_id}, which answered because the range's \
+             coordinator could not; the copy may be behind, so the object may exist"
+        ),
+    )
+}
+
+/// 503 for a read no holder of the range answered.
+fn no_holder(holders: &[RestForward]) -> ServerError {
+    let (range, set) = holders
+        .first()
+        .map(|forward| (forward.range_id.to_string(), forward.set_id.to_string()))
+        .unwrap_or_default();
+    ServerError::ServiceUnavailableReason(format!(
+        "no holder of range {range} of distributed bucket {set} answered"
+    ))
+}
+
+/// The coordinator a local copy's miss of `key` goes on to, as a copy may lag behind it;
+/// `None` when this node coordinates the range or the read was relayed here.
+pub(crate) async fn copy_miss(
+    state: &ServerState,
+    bucket: &BucketInfo,
+    key: &str,
+    headers: &HeaderMap,
+) -> ServerResult<Option<Vec<RestForward>>> {
+    let Some(binding) = bucket.distribution.as_ref() else {
+        return Ok(None);
+    };
+    if headers.contains_key(RELAY_HOP_HEADER) {
+        return Ok(None);
+    }
+    let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, key).await;
+    Ok(coordinator
+        .map_err(map_guard_error)?
+        .map(|(range_id, node_id)| {
+            vec![RestForward {
+                set_id: binding.set_id,
+                range_id,
+                node_id,
+            }]
+        }))
+}
+
+/// The JSON answer of the first of `holders` that answers a GET of `path`; a copy's miss goes
+/// on, the coordinator's, asked last, decides.
+pub(crate) async fn relay_read<T: DeserializeOwned>(
+    state: &ServerState,
+    holders: &[RestForward],
+    path: &str,
+    bearer: Option<&ValidatedBearer>,
+) -> ServerResult<T> {
+    for (index, forward) in holders.iter().enumerate() {
+        match relay_get(state, forward, path, bearer, HeaderMap::new()).await {
+            Ok(Some(answer)) => return Ok(answer),
+            Ok(None) => {}
+            Err(ServerError::NotFound) if index + 1 < holders.len() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(no_holder(holders))
+}
+
+/// Streams the answer of the first of `holders` that answers a GET of `path` with `sent`
+/// headers, keeping its status, content headers and body; a copy's miss goes on.
+pub(crate) async fn relay_stream(
+    state: &ServerState,
+    holders: &[RestForward],
+    path: &str,
+    bearer: Option<&ValidatedBearer>,
+    sent: HeaderMap,
+) -> ServerResult<Response> {
+    for (index, forward) in holders.iter().enumerate() {
+        let Some(answer) = send_get(state, forward, path, bearer, sent.clone()).await? else {
+            continue;
+        };
+        if answer.status() == StatusCode::NOT_FOUND && index + 1 < holders.len() {
+            continue;
+        }
+        let mut response = Response::builder().status(answer.status());
+        for name in [
+            header::CONTENT_TYPE,
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+        ] {
+            if let Some(value) = answer.headers().get(&name) {
+                response = response.header(name, value);
+            }
+        }
+        return response
+            .body(Body::from_stream(answer.bytes_stream()))
+            .map_err(|error| ServerError::InternalError(error.to_string()));
+    }
+    Err(no_holder(holders))
 }
 
 /// `reach` says since when this node has not heard from the coordinator.
@@ -211,14 +356,31 @@ async fn answer<T: DeserializeOwned>(
     Ok((status, answer))
 }
 
-/// Sends a GET of `path` to the forward's node with the caller's bearer token and decodes its
-/// answer; `None` when the node did not answer, so the caller may ask another holder.
+/// Sends a GET of `path` with `sent` headers to the forward's node with the caller's bearer
+/// token and decodes its answer; `None` when the node did not answer, so the caller may ask
+/// another holder.
 pub(crate) async fn relay_get<T: DeserializeOwned>(
     state: &ServerState,
     forward: &RestForward,
     path: &str,
     bearer: Option<&ValidatedBearer>,
+    sent: HeaderMap,
 ) -> ServerResult<Option<T>> {
+    match send_get(state, forward, path, bearer, sent).await? {
+        Some(response) => Ok(Some(answer(forward, response).await?.1)),
+        None => Ok(None),
+    }
+}
+
+/// Sends a GET of `path` with `sent` headers to the forward's node; `None` when it did not
+/// answer.
+async fn send_get(
+    state: &ServerState,
+    forward: &RestForward,
+    path: &str,
+    bearer: Option<&ValidatedBearer>,
+    sent: HeaderMap,
+) -> ServerResult<Option<reqwest::Response>> {
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let urls = node_urls(state.get_ctx().as_ref(), forward.node_id).await;
     let Some(base) = urls.and_then(|urls| urls.api) else {
@@ -226,14 +388,21 @@ pub(crate) async fn relay_get<T: DeserializeOwned>(
     };
     let response = CLIENT
         .get(relay_url(&base, path))
+        .headers(sent)
         .header(header::AUTHORIZATION, format!("Bearer {}", bearer.as_str()))
         .header(RELAY_HOP_HEADER, state.get_node_id().to_string())
         .header(RELAY_SET_HEADER, forward.set_id.to_string())
-        .send()
-        .await;
-    match response {
-        Ok(response) => Ok(Some(answer(forward, response).await?.1)),
-        Err(error) => {
+        .send();
+    match tokio::time::timeout(ANSWER_TIMEOUT, response).await {
+        Ok(Ok(response)) => Ok(Some(response)),
+        Err(_) => {
+            warn!(
+                node_id = %forward.node_id,
+                "A distributed bucket holder did not start answering a relayed read in time"
+            );
+            Ok(None)
+        }
+        Ok(Err(error)) => {
             warn!(
                 node_id = %forward.node_id,
                 connect = error.is_connect(),
@@ -349,3 +518,7 @@ mod tests {
         assert!(message.contains("degraded"));
     }
 }
+
+#[cfg(test)]
+#[path = "reads_tests.rs"]
+mod reads;

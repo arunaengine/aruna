@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::permission_path::permission_pattern_matches;
+use aruna_core::permission_path::{bind_wildcards, permission_pattern_matches};
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_operations::s3::object::get::ObjectRangeRequest;
 
@@ -28,8 +28,29 @@ pub(super) fn restrictions_reach(
     };
     let inside = format!("{bucket_path}/");
     restrictions.iter().any(|restriction| {
+        let pattern = bind_wildcards(&restriction.pattern, bucket_path);
         restriction.permission != Permission::DENY
-            && (restriction.pattern.starts_with(&inside)
-                || permission_pattern_matches(&restriction.pattern, bucket_path))
+            && (pattern.starts_with(&inside) || permission_pattern_matches(&pattern, bucket_path))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn any_node_reaches() {
+        let restrictions = [PathRestriction {
+            pattern: "/r/g/G/data/*/b/**".to_string(),
+            permission: Permission::READ,
+        }];
+        for node in ["n1", "n2"] {
+            let bucket = format!("/r/g/G/data/{node}/b");
+            assert!(restrictions_reach(Some(&restrictions), &bucket));
+            assert!(!restrictions_reach(
+                Some(&restrictions),
+                &format!("{bucket}x")
+            ));
+        }
+    }
 }

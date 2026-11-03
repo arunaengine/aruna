@@ -4,7 +4,9 @@
 
 mod content;
 mod records;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::storage::relay::{copy_miss, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, ObjectEnvelope};
@@ -16,7 +18,7 @@ use aruna_operations::s3::bucket::get::GetBucketOperation;
 use axum::extract::{Query, State};
 use axum::{Extension, Json};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use http::StatusCode;
+use http::{HeaderMap, StatusCode};
 pub(crate) use records::ScopeView;
 pub(crate) use records::{epoch_due, epoch_run, member_requests};
 use serde::{Deserialize, Serialize};
@@ -33,7 +35,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(records::router())
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct EnvelopeView {
     pub version_id: String,
     pub context: Value,
@@ -110,6 +112,15 @@ async fn authorize_version(
     let version = Ulid::from_string(&query.version_id).map_err(|_| ServerError::BadRequest)?;
     Ok((version, info))
 }
+/// `route` for the same pinned version on a holder.
+fn version_path(route: &str, query: &VersionQuery) -> String {
+    let pairs = [
+        ("bucket", query.bucket.as_str()),
+        ("key", &query.key),
+        ("version_id", &query.version_id),
+    ];
+    crate::routes::storage::relay::query_path(route, &pairs)
+}
 async fn read_envelope(
     state: &ServerState,
     query: &VersionQuery,
@@ -128,20 +139,38 @@ async fn read_envelope(
 **Behavior**
 - Binary fields use padded base64; version ids use ULIDs.
 - A same-bucket copy made while the bucket is locked answers 409 until the next unlock writes
-  its envelope. Copies from other buckets have no envelope and require bucket unlock."#,
+  its envelope. Copies from other buckets have no envelope and require bucket unlock.
+- A member of a distributed bucket that keeps no records of the key's range relays the call to
+  a holder with the caller's token."#,
     params(("bucket" = String, Query, description = "Node-local S3 bucket name"), ("key" = String, Query, description = "Literal object key"), ("version_id" = String, Query, description = "Pinned version ULID")),
     responses((status = 200, body = EnvelopeView, description = "Envelope of the exact authorized version", example = json!({"version_id":"01JABCDEF0123456789ABCDEFG","context":{},"parameters":{},"envelope":{}})),
         (status = 400, body = ErrorResponse, description = "Malformed version"), (status = 401, body = ErrorResponse, description = "Bearer token required"),
         (status = 403, body = ErrorResponse, description = "READ refused"), (status = 404, body = ErrorResponse, description = "Version missing"), (status = 409, body = ErrorResponse, description = "Envelope pending or stale version"),
-        (status = 503, body = ErrorResponse, description = "Storage unavailable")), security(("bearer_auth" = [])))]
+        (status = 503, body = ErrorResponse, description = "Storage unavailable, or no holder of the key's range answered")), security(("bearer_auth" = [])))]
 pub async fn envelope(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: HeaderMap,
     Query(query): Query<VersionQuery>,
 ) -> ServerResult<Json<EnvelopeView>> {
     let auth = crate::auth::require_realm_auth(&state, auth)?;
-    let (version, _) = authorize_version(&state, &auth, &query).await?;
-    let (envelope, _) = read_envelope(&state, &query, version).await?;
+    let (version, info) = authorize_version(&state, &auth, &query).await?;
+    let path = version_path("/data/blobs/envelope", &query);
+    if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {
+        return relay_read(&state, &holders, &path, bearer.as_ref())
+            .await
+            .map(Json);
+    }
+    let read = read_envelope(&state, &query, version).await;
+    if matches!(read, Err(ServerError::NotFound))
+        && let Some(coordinator) = copy_miss(&state, &info, &query.key, &headers).await?
+    {
+        return relay_read(&state, &coordinator, &path, bearer.as_ref())
+            .await
+            .map(Json);
+    }
+    let (envelope, _) = read?;
     let c = &envelope.context;
     let context = json!({"realm_id":c.parameters.realm_id.to_string(), "node_id":c.parameters.node_id.to_string(),
         "bucket_id":c.parameters.key.bucket_id.to_string(), "generation":c.parameters.key.generation,

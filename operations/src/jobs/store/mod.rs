@@ -10,9 +10,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE,
-    DEDUP_INDEX_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE,
-    KEY_WAIT_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE, RUN_CRATE_KEYSPACE,
-    SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
+    DEDUP_INDEX_KEYSPACE, JOB_CLAIM_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
+    JOB_STATE_KEYSPACE, KEY_WAIT_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE,
+    RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
     ActiveJobKind, AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError,
@@ -53,6 +53,44 @@ pub use state::*;
 
 pub(super) type JobWrites = Vec<(KeySpace, Key, Value)>;
 pub(super) type JobDeletes = Vec<(KeySpace, Key)>;
+
+/// The claim row a page import guards on, so lease renewals and progress flushes,
+/// which rewrite only the job record, never conflict with a page commit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClaimGuard {
+    pub claim_token: Ulid,
+    pub created_at_ms: u64,
+}
+
+impl ClaimGuard {
+    pub(crate) fn of(record: &JobRecord) -> Option<Self> {
+        let claim = record.claim.as_ref().filter(|_| !record.is_settled())?;
+        Some(Self {
+            claim_token: claim.claim_token,
+            created_at_ms: record.created_at_ms,
+        })
+    }
+
+    fn write(record: &JobRecord) -> Result<Option<(KeySpace, Key, Value)>, ConversionError> {
+        let Some(guard) = Self::of(record) else {
+            return Ok(None);
+        };
+        let value = ByteView::from(guard.to_bytes()?);
+        Ok(Some((
+            JOB_CLAIM_KEYSPACE.to_string(),
+            job_record_key(record.job_id),
+            value,
+        )))
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactTombstone {
@@ -150,6 +188,7 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
         job_record_key(record.job_id),
         ByteView::from(record.to_bytes()?),
     )];
+    writes.extend(ClaimGuard::write(record)?);
     if let Some(schedule) = job_schedule_key(record) {
         writes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), schedule, empty_value()));
     }
@@ -188,6 +227,10 @@ pub fn job_insert_entries(record: &JobRecord) -> Result<JobWrites, ConversionErr
 pub fn prune_delete_entries(record: &JobRecord) -> JobDeletes {
     let mut deletes = vec![
         (JOB_KEYSPACE.to_string(), job_record_key(record.job_id)),
+        (
+            JOB_CLAIM_KEYSPACE.to_string(),
+            job_record_key(record.job_id),
+        ),
         (RUN_CRATE_KEYSPACE.to_string(), run_crate_key(record.job_id)),
         (
             JOB_INDEX_KEYSPACE.to_string(),
@@ -250,6 +293,12 @@ pub(super) fn index_deltas(
         ByteView::from(new.to_bytes()?),
     )];
     let mut deletes = Vec::new();
+    if ClaimGuard::of(old) != ClaimGuard::of(new) {
+        match ClaimGuard::write(new)? {
+            Some(write) => writes.push(write),
+            None => deletes.push((JOB_CLAIM_KEYSPACE.to_string(), job_record_key(new.job_id))),
+        }
+    }
 
     let old_schedule = job_schedule_key(old);
     let new_schedule = job_schedule_key(new);
@@ -340,8 +389,10 @@ pub enum RunDelete {
     Deleted,
     /// No run of this caller is listed on this node.
     NotFound,
-    /// The run has not finished, or its container cleanup is still queued.
-    Unfinished,
+    /// The job is in this state and still live; it must be cancelled first.
+    Unfinished(JobState),
+    /// The run's container cleanup is still queued.
+    CleanupPending,
 }
 
 /// Removes a finished run of `user_id` from this node in one transaction: its
@@ -388,11 +439,14 @@ async fn run_delete_txn(
     else {
         return Ok(RunDelete::NotFound);
     };
-    if record.created_by != user_id || !matches!(record.payload, JobPayload::Execution(_)) {
+    if record.created_by != user_id || record.payload.is_internal() {
         return Ok(RunDelete::NotFound);
     }
+    if !matches!(record.payload, JobPayload::Execution(_)) {
+        return hide_settled(storage, txn_id, record).await;
+    }
     if !record.state.is_terminal() {
-        return Ok(RunDelete::Unfinished);
+        return Ok(RunDelete::Unfinished(record.state));
     }
     // A queued cleanup still needs this row to fence and remove the container.
     if read_job_record(storage, cleanup_job_id(job_id), Some(txn_id))
@@ -400,7 +454,7 @@ async fn run_delete_txn(
         .map_err(JobMutationError::Storage)?
         .is_some_and(|cleanup| !cleanup.state.is_terminal())
     {
-        return Ok(RunDelete::Unfinished);
+        return Ok(RunDelete::CleanupPending);
     }
     let mut deletes = prune_delete_entries(&record);
     let mut start_after = None;
@@ -425,6 +479,35 @@ async fn run_delete_txn(
             None => break,
         }
     }
+    batch_delete(storage, deletes, Some(txn_id))
+        .await
+        .map_err(JobMutationError::Storage)?;
+    Ok(RunDelete::Deleted)
+}
+
+/// Takes a settled job other than a run off this node's list and makes it due for pruning,
+/// which removes its rows page by page, as staging rows can be too many for one transaction.
+async fn hide_settled(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    record: JobRecord,
+) -> Result<RunDelete, JobMutationError> {
+    if !record.is_settled() {
+        return Ok(RunDelete::Unfinished(record.state));
+    }
+    let listed = owner_index_key(record.created_by, record.created_at_ms, record.job_id);
+    let row = read_raw(storage, JOB_INDEX_KEYSPACE, listed.clone(), Some(txn_id)).await;
+    if row.map_err(JobMutationError::Storage)?.is_none() {
+        return Ok(RunDelete::NotFound);
+    }
+    let mut hidden = record.clone();
+    hidden.retention_ms = 0;
+    let (writes, mut deletes) = index_deltas(&record, &hidden)
+        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    deletes.push((JOB_INDEX_KEYSPACE.to_string(), listed));
+    batch_write(storage, writes, Some(txn_id))
+        .await
+        .map_err(JobMutationError::Storage)?;
     batch_delete(storage, deletes, Some(txn_id))
         .await
         .map_err(JobMutationError::Storage)?;
@@ -591,11 +674,17 @@ pub(crate) async fn put_job_rows(
             .await
             .map_err(JobMutationError::Storage)?;
         let result = async {
-            let record = read_job_record(storage, job_id, Some(txn_id))
+            // The claim row, not the record a progress flush rewrites, fences the write.
+            let key = job_record_key(job_id);
+            let claim = read_raw(storage, JOB_CLAIM_KEYSPACE, key, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?
-                .ok_or(JobMutationError::NotFound)?;
-            guard_token(&record, token)?;
+                .map(|value| ClaimGuard::from_bytes(value.as_ref()))
+                .transpose()
+                .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+            if claim.is_none_or(|claim| claim.claim_token != token) {
+                return Err(JobMutationError::TokenMismatch);
+            }
             batch_write(storage, writes.clone(), Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;

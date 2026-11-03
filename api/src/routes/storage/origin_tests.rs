@@ -5,8 +5,10 @@
 
 use super::*;
 use crate::mcp::data::{WriteObjectInput, store_text};
+use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::tests::distributed::{
-    BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api, write,
+    BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
+    replicate, write,
 };
 use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
@@ -137,7 +139,9 @@ fn answer() -> String {
 #[tokio::test]
 async fn relays_to_holder() {
     let node = node_state().await;
-    distribute(&node.state, node.group_id, BUCKET).await;
+    let set_id = distribute(&node.state, node.group_id, BUCKET)
+        .await
+        .set_id();
     let peer = mock_peer(StatusCode::OK, &answer()).await;
     publish_api(&node.state, node_id(PEER), &peer.url).await;
 
@@ -159,12 +163,93 @@ async fn relays_to_holder() {
     assert!(paths[0].starts_with("/api/v1/data/buckets/routed/objects/origin?key=z.md"));
     assert!(paths[0].contains("version_id="));
 
-    // A relayed call is never relayed again: this node holds no such key.
+    // A relayed call is never relayed again: a current read outside this node's ranges fails.
     let mut hop = HeaderMap::new();
     hop.insert(RELAY_HOP_HEADER, "peer".parse().unwrap());
+    // Without the set it meant, the bucket of this name may be another one.
+    let unnamed = origin(&node, &node.owner, hop.clone(), BUCKET, "z.md", None).await;
+    assert!(matches!(unnamed, Err(ServerError::Conflict(_))));
+    let mut other = hop.clone();
+    other.insert(RELAY_SET_HEADER, Ulid::nil().to_string().parse().unwrap());
+    let stranger = origin(&node, &node.owner, other, BUCKET, "z.md", None).await;
+    assert!(matches!(stranger, Err(ServerError::Conflict(_))));
+    hop.insert(RELAY_SET_HEADER, set_id.to_string().parse().unwrap());
     let local = origin(&node, &node.owner, hop, BUCKET, "z.md", None).await;
-    assert!(matches!(local, Err(ServerError::NotFound)));
+    assert!(matches!(
+        local,
+        Err(ServerError::ServiceUnavailableReason(_))
+    ));
     assert_eq!(peer.paths.lock().unwrap().len(), 1);
+}
+
+// A copy that has not received the version yet asks the range's coordinator.
+#[tokio::test]
+async fn copy_miss_relays() {
+    let node = node_state().await;
+    replicate(&node.state, node.group_id, BUCKET).await;
+    let peer = mock_peer(StatusCode::OK, &answer()).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let relayed = origin(&node, &node.owner, HeaderMap::new(), BUCKET, "a.md", None)
+        .await
+        .unwrap();
+    assert_eq!(relayed.created_by, "peer-user");
+    assert_eq!(peer.paths.lock().unwrap().len(), 1);
+}
+
+// A copy may hold an older version, so a read of the current one goes to the coordinator.
+#[tokio::test]
+async fn stale_copy_relays() {
+    let node = node_state().await;
+    store(&node, "a.md").await;
+    replicate(&node.state, node.group_id, BUCKET).await;
+    let peer = mock_peer(StatusCode::OK, &answer()).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let relayed = origin(&node, &node.owner, HeaderMap::new(), BUCKET, "a.md", None)
+        .await
+        .unwrap();
+    assert_eq!(relayed.created_by, "peer-user");
+    assert_eq!(peer.paths.lock().unwrap().len(), 1);
+}
+
+// While the coordinator cannot answer, this node's copy answers, marked stale, and its miss
+// says the version may exist.
+#[tokio::test]
+async fn down_coordinator_copy() {
+    let node = node_state().await;
+    store(&node, "a.md").await;
+    let snapshot = replicate(&node.state, node.group_id, BUCKET).await;
+    publish_api(&node.state, node_id(PEER), CLOSED_API).await;
+    let range_id = snapshot.config.ranges[0].range_id.to_string();
+    let answer = origin(&node, &node.owner, HeaderMap::new(), BUCKET, "a.md", None)
+        .await
+        .unwrap();
+    assert_eq!(answer.stale_ranges, std::slice::from_ref(&range_id));
+    let missing = origin(&node, &node.owner, HeaderMap::new(), BUCKET, "b.md", None).await;
+    let Err(ServerError::Refused(status, code, message)) = missing else {
+        panic!("a copy's miss is marked");
+    };
+    assert_eq!((status, code), (StatusCode::NOT_FOUND, "stale_not_found"));
+    assert!(message.contains(&range_id));
+}
+
+// A copy refuses a relayed read of the current version unless it was asked as a copy.
+#[tokio::test]
+async fn relayed_copy_read() {
+    let node = node_state().await;
+    store(&node, "a.md").await;
+    let snapshot = replicate(&node.state, node.group_id, BUCKET).await;
+    let mut hop = HeaderMap::new();
+    hop.insert(RELAY_HOP_HEADER, "peer".parse().unwrap());
+    let set_id = snapshot.set_id().to_string();
+    hop.insert(RELAY_SET_HEADER, set_id.parse().unwrap());
+    let refused = origin(&node, &node.owner, hop.clone(), BUCKET, "a.md", None).await;
+    assert!(matches!(
+        refused,
+        Err(ServerError::ServiceUnavailableReason(_))
+    ));
+    hop.insert(COPY_READ_HEADER, "1".parse().unwrap());
+    let answer = origin(&node, &node.owner, hop, BUCKET, "a.md", None).await;
+    assert!(answer.is_ok());
 }
 
 #[tokio::test]

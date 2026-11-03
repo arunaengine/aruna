@@ -6,6 +6,7 @@
 use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
+use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::placement::policy::attachment::{PolicyBlockedReason, PolicyStatus};
@@ -251,8 +252,12 @@ pub struct BulkRunResponse {
     pub blocked: Vec<BlockedGapBody>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
-    /// True only when this pass exhausted the responder's own iterator.
+    /// True only when this pass exhausted the responder's own iterator; for a distributed bucket,
+    /// once the pass of every coordinator did.
     pub complete: bool,
+    /// Coordinators of a distributed bucket that did not run this pass; the cursor asks them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreached: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -298,6 +303,9 @@ pub struct CoverageResponse {
     pub complete: bool,
     /// What this report deliberately does not claim.
     pub limits: Vec<String>,
+    /// Coordinators of a distributed bucket that did not report; the cursor asks them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreached: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -617,6 +625,9 @@ fn map_bulk_error(error: BulkError) -> ServerError {
         BulkError::NoSuchBucket => ServerError::NotFound,
         BulkError::BucketChanged => ServerError::Conflict(error.to_string()),
         BulkError::ForeignPolicy { .. } => foreign_policy(),
+        BulkError::Distribution(error) => {
+            crate::routes::storage::distributed::map_guard_error(error)
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -1106,7 +1117,8 @@ pub async fn put_bucket_placement(
 
 **Behavior**
 - This is a node-local read of the head this node stores: a version written on another node is
-  reported only once it has arrived here.
+  reported only once it has arrived here. A member of a distributed bucket that keeps no records
+  of the key's range relays the call to a holder with the caller's token.
 - `generation` is the head pointer's counter, which `POST /data/buckets/{bucket}/placement/objects`
   takes as `expected_generation`; `version_id` is what it takes as `expected_version_id`.
 - Every reference carries the `name` and `owner_group_id` this node resolved for its id, and null
@@ -1133,13 +1145,16 @@ pub async fn put_bucket_placement(
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the object", body = ErrorResponse),
-        (status = 404, description = "No bucket of that name is known to this node, or the key has no current version here", body = ErrorResponse)
+        (status = 404, description = "No bucket of that name is known to this node, or the key has no current version here", body = ErrorResponse),
+        (status = 503, description = "No holder of the key's range answered", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_object_placement(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: axum::http::HeaderMap,
     Path(bucket): Path<String>,
     Query(query): Query<ObjectPlacementQuery>,
 ) -> ServerResult<Json<ObjectPlacementView>> {
@@ -1158,6 +1173,13 @@ pub async fn get_object_placement(
         aruna_core::structs::identity::auth::Permission::READ,
     )
     .await?;
+    let route = format!("/data/buckets/{bucket}/placement/objects");
+    let path = query_path(&route, &[("key", &query.key)]);
+    if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {
+        return relay_read(&state, &holders, &path, bearer.as_ref())
+            .await
+            .map(Json);
+    }
     let placement = drive(
         ObjectPlacementOperation::new(ObjectPlacementInput {
             bucket: bucket.clone(),
@@ -1169,7 +1191,15 @@ pub async fn get_object_placement(
     .map_err(|error| match error {
         ObjectPlacementError::NoSuchKey => ServerError::NotFound,
         other => ServerError::InternalError(other.to_string()),
-    })?;
+    });
+    if matches!(placement, Err(ServerError::NotFound))
+        && let Some(coordinator) = copy_miss(&state, &info, &query.key, &headers).await?
+    {
+        return relay_read(&state, &coordinator, &path, bearer.as_ref())
+            .await
+            .map(Json);
+    }
+    let placement = placement?;
     let policies = named_refs(&state, auth.realm_id, placement.policies).await?;
     Ok(Json(ObjectPlacementView {
         bucket,
@@ -1363,6 +1393,12 @@ operation.
   policies.
 - `complete` means this node's bounded iterator was exhausted, never that another partition
   converged.
+- In a distributed bucket only the coordinator of a key's range mints its successor. A pass runs
+  on every coordinator: this node relays it to the others with the caller's bearer token, each
+  checks the caller and its own range authority again and mints only the keys of its own ranges,
+  and the answer joins their counts. The cursor holds each coordinator's position; `complete`
+  means every coordinator's pass ended, and `unreached` names coordinators asked again next time.
+  When no pending coordinator answers, the call fails with 503.
 
 **Limits**
 - The default page is 64 heads."#,
@@ -1400,23 +1436,60 @@ operation.
         (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 409, description = "The run was captured against a different bucket record, or the bucket now belongs to another group", body = ErrorResponse),
-        (status = 503, description = "This node advertises no placement subject or is not admitting governed data, so nothing governed can be minted here; the run was not started", body = ErrorResponse)
+        (status = 503, description = "This node advertises no placement subject or is not admitting governed data, so nothing governed can be minted here; the run was not started. For a distributed bucket also: no pending coordinator answered, or this node has no record of the set yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn run_bucket_placement(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<BulkRunRequest>,
 ) -> ServerResult<Json<BulkRunResponse>> {
     let auth = require_realm_auth(&state, auth)?;
     ensure_placement_writer(&state, &auth, &bucket).await?;
-    let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
-    let subject = local_subject(&state, auth.realm_id).await?;
+    crate::routes::storage::relay::relayed_set(&info, &headers)?;
+    Ulid::from_string(&request.operation_id).map_err(|_| ServerError::BadRequest)?;
+    let relayed = headers.contains_key(crate::routes::management_relay::RELAY_HOP_HEADER);
+    let answer = match info.distribution.as_ref().filter(|_| !relayed) {
+        Some(binding) => {
+            let local =
+                async |cursor| run_here(&state, auth, &bucket, &info, &request, cursor).await;
+            coordinators::run_spread(&state, &bucket, binding, bearer.as_ref(), &request, local)
+                .await?
+        }
+        None => {
+            run_here(
+                &state,
+                auth,
+                &bucket,
+                &info,
+                &request,
+                request.cursor.clone(),
+            )
+            .await?
+        }
+    };
+    Ok(Json(answer))
+}
+
+/// One pass over this node's own heads; in a distributed bucket only its own ranges mint.
+async fn run_here(
+    state: &ServerState,
+    auth: AuthContext,
+    bucket: &str,
+    info: &aruna_core::structs::storage::blob::BucketInfo,
+    request: &BulkRunRequest,
+    cursor: Option<String>,
+) -> ServerResult<BulkRunResponse> {
+    let realm_id = auth.realm_id;
+    let subject = local_subject(state, auth.realm_id).await?;
     let operation_id =
         Ulid::from_string(&request.operation_id).map_err(|_| ServerError::BadRequest)?;
+    let bucket = bucket.to_string();
     let report = drive(
         PolicyBulkOperation::new(BulkConfig {
             operation_id,
@@ -1424,7 +1497,7 @@ pub async fn run_bucket_placement(
             group_id: info.group_id,
             auth_context: auth,
             subject,
-            start_after: decode_cursor(request.cursor)?,
+            start_after: decode_cursor(cursor)?,
             limit: request.limit.unwrap_or(BULK_DEFAULT_LIMIT),
             now_ms: now_ms(),
             created_at: SystemTime::now(),
@@ -1433,8 +1506,8 @@ pub async fn run_bucket_placement(
     )
     .await
     .map_err(map_bulk_error)?;
-    let target_policies = named_refs(&state, realm_id, report.target_refs).await?;
-    Ok(Json(BulkRunResponse {
+    let target_policies = named_refs(state, realm_id, report.target_refs).await?;
+    Ok(BulkRunResponse {
         operation_id: report.operation_id.to_string(),
         status: bulk_status(report.status),
         generation: report.generation,
@@ -1453,7 +1526,8 @@ pub async fn run_bucket_placement(
             .collect(),
         cursor: report.cursor.map(hex::encode),
         complete: report.complete,
-    }))
+        unreached: Vec::new(),
+    })
 }
 
 /// Page size a pass uses when the caller names none.
@@ -1480,7 +1554,13 @@ operation.
 - Scope `current` walks current heads; scope `historical` reports versions that are no longer the
   head and lack the default, which is diagnostic only, because minting successors never rewrites
   their immutable references.
-- Reference-only heads are labelled rather than omitted."#,
+- Reference-only heads are labelled rather than omitted.
+- In a distributed bucket each coordinator reports only the ranges it writes, a range fenced for a
+  transfer by its former coordinator until the next one takes over, so every key counts once. This
+  node asks every coordinator with the caller's bearer token and joins their pages: counts and gaps
+  add up, the cursor holds each coordinator's position, `complete` means every coordinator's scan
+  ended, and `unreached` names coordinators that did not report and are asked again next time.
+  When no pending coordinator answers, the call fails with 503."#,
     params(
         ("bucket" = String, Path, description = "Bucket name as used by the S3 surface"),
         CoverageQuery
@@ -1519,17 +1599,51 @@ operation.
         (status = 400, description = "The scope, cursor or limit could not be parsed", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse),
-        (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
+        (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
+        (status = 503, description = "A distributed bucket: no pending coordinator answered, or this node has no record of the set yet", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_placement_coverage(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<CoverageQuery>,
 ) -> ServerResult<Json<CoverageResponse>> {
     let auth = require_realm_auth(&state, auth)?;
+    // Checked before the bucket is read, so a refused caller cannot tell which buckets exist.
+    crate::auth::ensure_permission(
+        &state,
+        &auth,
+        aruna_core::structs::placement::policy::document::policy_admin_path(auth.realm_id),
+        aruna_core::structs::identity::auth::Permission::READ,
+    )
+    .await?;
+    let info = bucket_info(&state, &bucket).await?;
+    crate::routes::storage::relay::relayed_set(&info, &headers)?;
+    let relayed = headers.contains_key(crate::routes::management_relay::RELAY_HOP_HEADER);
+    let answer = match info.distribution.as_ref().filter(|_| !relayed) {
+        Some(binding) => {
+            let local = async |cursor| coverage_here(&state, auth, &bucket, &query, cursor).await;
+            coordinators::coverage_spread(&state, &bucket, binding, bearer.as_ref(), &query, local)
+                .await?
+        }
+        None => coverage_here(&state, auth, &bucket, &query, query.cursor.clone()).await?,
+    };
+    Ok(Json(answer))
+}
+
+/// One coverage page of this node's own heads; in a distributed bucket of its own ranges.
+async fn coverage_here(
+    state: &ServerState,
+    auth: AuthContext,
+    bucket: &str,
+    query: &CoverageQuery,
+    cursor: Option<String>,
+) -> ServerResult<CoverageResponse> {
+    let bucket = bucket.to_string();
     let scope = match query.scope.as_deref() {
         None | Some("current") => CoverageScope::CurrentHeads,
         Some("historical") => CoverageScope::Historical,
@@ -1539,7 +1653,7 @@ pub async fn get_placement_coverage(
         PolicyCoverageOperation::new(CoverageInput {
             bucket: bucket.clone(),
             scope,
-            start_after: decode_cursor(query.cursor)?,
+            start_after: decode_cursor(cursor)?,
             limit: query.limit.unwrap_or(SCAN_DEFAULT_LIMIT),
             auth_context: auth,
         }),
@@ -1549,9 +1663,12 @@ pub async fn get_placement_coverage(
     .map_err(|error| match error {
         CoverageError::Unauthorized => ServerError::Forbidden,
         CoverageError::NoSuchBucket => ServerError::NotFound,
+        CoverageError::Distribution(error) => {
+            crate::routes::storage::distributed::map_guard_error(error)
+        }
         other => ServerError::InternalError(other.to_string()),
     })?;
-    Ok(Json(coverage_response(bucket, report)))
+    Ok(coverage_response(bucket, report))
 }
 
 fn coverage_response(
@@ -1605,10 +1722,12 @@ fn coverage_response(
                     CoverageLimit::BoundedPage => "bounded_page",
                     CoverageLimit::HistoricalExcluded => "historical_excluded",
                     CoverageLimit::ConcurrentWrites => "concurrent_writes",
+                    CoverageLimit::CoordinatedRanges => "coordinated_ranges",
                 }
                 .to_string()
             })
             .collect(),
+        unreached: Vec::new(),
     }
 }
 
@@ -1865,6 +1984,8 @@ fn quarantine_release(request: &QuarantineResolveRequest) -> ServerResult<Option
 
 #[cfg(test)]
 mod tests;
+
+mod coordinators;
 
 #[cfg(test)]
 #[path = "routes_tests.rs"]

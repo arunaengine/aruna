@@ -29,6 +29,8 @@ use crate::connectors::repository::{
     parse_secret_read, read_connector_effect, read_secret_effect,
 };
 use crate::harvest::create_connector::INVENIO_TOKEN;
+use crate::staging::root_record::{parse_root, read_root};
+use aruna_core::structs::storage::distribution::source_root::RootEntry;
 
 pub(crate) const NATIVE_RELATIONSHIP_ID: &str = "relationship_id";
 /// Names the distributed bucket whose holders keep the bytes of a record-only version.
@@ -66,6 +68,8 @@ enum ResolveConnectorState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ResolveBindingState {
     Init,
+    /// Reads the root record a stored compact binding names, to put its settings back.
+    ReadRoot,
     /// Looks for a connector of the group with the reference's source root.
     MatchConnector,
     ReadSecret,
@@ -193,6 +197,10 @@ impl ResolveBindingOperation {
     }
 
     fn handle_init(&mut self) -> Effects {
+        if let Some(digest) = self.input.source.descriptor.root {
+            self.state = ResolveBindingState::ReadRoot;
+            return smallvec![Effect::Storage(read_root(digest, None))];
+        }
         if self.input.source.descriptor.kind == SourceConnectorKind::ArunaNative {
             let access = match build_binding_access(&self.input.source, None) {
                 Ok(access) => access,
@@ -264,6 +272,22 @@ impl ResolveBindingOperation {
                 smallvec![iter_connectors_effect(group_id, Some(next), None)]
             }
             _ => self.emit_error(SourceResolutionError::ResolveFailed),
+        }
+    }
+
+    fn handle_root_read(&mut self, event: Event) -> Effects {
+        let root = match parse_root(event) {
+            Ok(Some(root)) => root,
+            Ok(None) => return self.emit_error(SourceResolutionError::ResolveFailed),
+            Err(error) => return self.emit_error(error.into()),
+        };
+        match RootEntry::hydrate(&self.input.source, &root) {
+            Ok(Some(full)) => {
+                self.input.source = full;
+                self.handle_init()
+            }
+            Ok(None) => self.emit_error(SourceResolutionError::ResolveFailed),
+            Err(error) => self.emit_error(error.into()),
         }
     }
 
@@ -387,6 +411,7 @@ impl Operation for ResolveBindingOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             ResolveBindingState::Init => self.handle_init(),
+            ResolveBindingState::ReadRoot => self.handle_root_read(event),
             ResolveBindingState::MatchConnector => self.handle_match(event),
             ResolveBindingState::ReadSecret => self.handle_secret_read(event),
             ResolveBindingState::ReadOfferedDirectory => self.handle_offered_read(event),
@@ -873,6 +898,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         };
@@ -914,6 +940,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         };
@@ -939,6 +966,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         };
@@ -963,6 +991,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: None,
         };
@@ -1067,6 +1096,84 @@ mod tests {
         assert_eq!(config.get("username").map(String::as_str), Some("alice"));
     }
 
+    // A stored compact binding resolves through the root record its node keeps once; without
+    // the record it does not resolve at all.
+    #[tokio::test]
+    async fn compact_binding_resolves() {
+        use crate::staging::root_record::root_write;
+        use aruna_core::structs::storage::distribution::source_root::RootEntry;
+        let tempdir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let created = drive(
+            SourceConnectorOperation::new(SourceConnectorInput {
+                group_id: Ulid::generate(),
+                created_by: Default::default(),
+                name: "public".to_string(),
+                kind: SourceConnectorKind::S3,
+                public_config: HashMap::from([
+                    ("bucket".to_string(), "bakrep".to_string()),
+                    ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                    ("region".to_string(), "us-east-1".to_string()),
+                    ("skip_signature".to_string(), "true".to_string()),
+                ]),
+                secret_config: HashMap::new(),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let metadata = aruna_core::structs::execution::source_access::SourceMetadata {
+            content_length: 3,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        };
+        let full = build_source_binding(
+            aruna_core::structs::execution::staging::StagingStrategy::Reference,
+            &created.connector,
+            &metadata,
+            "SAMD1/a.gff".to_string(),
+            None,
+            Some(created.connector.connector_id),
+        );
+        let (compact, root) = RootEntry::compact(&full).unwrap().unwrap();
+        assert!(!compact.descriptor.public_config.contains_key("endpoint"));
+        let resolve = |source: VersionSourceBinding| {
+            let input = ResolveBindingInput {
+                source,
+                group_id: None,
+            };
+            drive(ResolveBindingOperation::new(input), &context)
+        };
+        assert_eq!(
+            resolve(compact.clone()).await,
+            Err(SourceResolutionError::ResolveFailed)
+        );
+        let (key_space, key, value) = root_write(&root).unwrap();
+        let write = StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(write).await;
+
+        let resolved = resolve(compact).await.unwrap();
+
+        assert_eq!(resolved, resolve(full).await.unwrap());
+    }
+
     #[test]
     fn rejects_absolute_paths() {
         assert!(validate_source_path("/absolute/file.txt", false).is_err());
@@ -1119,6 +1226,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: Some(origin),
                 namespace: None,
+                root: None,
             },
             connector_id: None,
         };
@@ -1159,6 +1267,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: Some(origin),
                 namespace: None,
+                root: None,
             },
             connector_id: None,
         };
@@ -1183,6 +1292,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id,
         }
@@ -1256,6 +1366,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(connector.connector_id),
         };

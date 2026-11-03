@@ -435,6 +435,52 @@ async fn batch_rejects_node() {
     assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
 }
 
+// Every job store state reads as itself or its collapsed class; nothing settled reads as running.
+#[test]
+fn job_states_mapped() {
+    use aruna_core::structs::execution::job::{JobId, JobRecord, StagingJobSpec};
+    let realm_id = aruna_core::structs::identity::realm::RealmId([1; 32]);
+    let user_id = UserId::new(Ulid::from_bytes([2; 16]), realm_id);
+    let spec = StagingJobSpec {
+        auth_context: AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        group_id: Ulid::from_bytes([3; 16]),
+        node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+        connector_id: Ulid::from_bytes([5; 16]),
+        bucket: "imports".to_string(),
+        bucket_identity: (Ulid::nil(), UNIX_EPOCH, UserId::default()),
+        strategy: StagingStrategy::Reference,
+        items: Vec::new(),
+        prefixes: Vec::new(),
+        checksum_manifest: None,
+    };
+    let node = iroh::SecretKey::from_bytes(&[6; 32]).public();
+    let job_id = JobId::from_bytes([7; 16]);
+    let payload = JobPayload::Staging(spec);
+    let mut record = JobRecord::new(job_id, payload, user_id, node, 1, 1, None);
+    let expected = [
+        (JobState::Queued, "queued"),
+        (JobState::Claimed, "queued"),
+        (JobState::AwaitingKey, "awaiting_key"),
+        (JobState::Preparing, "running"),
+        (JobState::Ready, "running"),
+        (JobState::Running, "running"),
+        (JobState::Cancelling, "cancelling"),
+        (JobState::Indeterminate, "indeterminate"),
+        (JobState::Succeeded, "done"),
+        (JobState::Failed, "failed"),
+        (JobState::Cancelled, "cancelled"),
+    ];
+    for (state, name) in expected {
+        record.state = state;
+        assert_eq!(staging_job_response(&record, None).unwrap().state, name);
+    }
+}
+
 #[tokio::test]
 async fn batch_sync_unimplemented() {
     let test = setup_state().await;
@@ -531,6 +577,7 @@ async fn seed_reference_objects(test: &TestState) -> NodeId {
                     capabilities: Vec::new(),
                     origin_node_id: None,
                     namespace: None,
+                    root: None,
                 },
                 connector_id: Some(test.connector_id),
             },
@@ -565,6 +612,7 @@ async fn seed_reference_objects(test: &TestState) -> NodeId {
                     capabilities: Vec::new(),
                     origin_node_id: Some(origin),
                     namespace: None,
+                    root: None,
                 },
                 connector_id: None,
             },
@@ -870,6 +918,121 @@ mod distributed {
         }
     }
 
+    /// Stores the job's connector on the node, with or without credentials.
+    async fn store_connector(node: &Node, secret: bool) {
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_operations::connectors::create_connector::{
+            SourceConnectorInput, SourceConnectorOperation,
+        };
+        use std::collections::HashMap;
+        let mut public_config = HashMap::from([
+            ("bucket".to_string(), "bakrep".to_string()),
+            ("endpoint".to_string(), "https://s3.example.org".to_string()),
+        ]);
+        let mut secret_config = HashMap::new();
+        match secret {
+            true => secret_config.extend([
+                ("access_key_id".to_string(), "AKIA".to_string()),
+                ("secret_access_key".to_string(), "secret-canary".to_string()),
+            ]),
+            false => {
+                public_config.insert("skip_signature".to_string(), "true".to_string());
+            }
+        }
+        let input = SourceConnectorInput {
+            group_id: node.group_id,
+            created_by: node.owner.user_id,
+            name: "bakrep".to_string(),
+            kind: SourceConnectorKind::S3,
+            public_config,
+            secret_config,
+        };
+        let id = ulid::Ulid::from_string(&connector()).unwrap();
+        let operation = SourceConnectorOperation::with_id(input, id);
+        drive(operation, &node.state.get_ctx()).await.unwrap();
+    }
+
+    /// A coordinator that registers a shared connector and accepts the job, recording each
+    /// request path and body.
+    async fn coordinator(
+        node: &Node,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let group = node.group_id;
+        let answer = move |uri: axum::http::Uri, body: String| {
+            record.lock().unwrap().push((uri.path().to_string(), body));
+            async move {
+                let json = [("content-type", "application/json")];
+                if !uri.path().ends_with("/connectors") {
+                    return (StatusCode::ACCEPTED, json, r#"{"job_id":"j1"}"#.to_string());
+                }
+                let created = serde_json::json!({
+                    "connector_id": connector(), "group_id": group.to_string(),
+                    "name": "bakrep", "kind": "s3", "public_config": {},
+                    "created_at": "", "updated_at": "", "created_by": "",
+                    "has_secret_config": false
+                });
+                (StatusCode::CREATED, json, created.to_string())
+            }
+        };
+        let router = axum::Router::new().fallback(answer);
+        let (url, task) = crate::tests::assistant::spawn_mock(router).await;
+        publish_api(&node.state, node_id(PEER), &url).await;
+        (seen, task)
+    }
+
+    // A connector without credentials is registered on the other coordinator under its id
+    // before the job; credentials never leave the node, and an unknown connector is refused.
+    #[tokio::test]
+    async fn submit_shares_connector() {
+        let node = node_state().await;
+        replicate(&node.state, node.group_id, BUCKET).await;
+        let Err(ServerError::Refused(status, code, _)) =
+            submit(&node, batch(&node, &["data/a.bin"], &[])).await
+        else {
+            panic!("a connector this node does not hold is refused");
+        };
+        assert_eq!(
+            (status, code),
+            (StatusCode::NOT_FOUND, "connector_not_found")
+        );
+
+        store_connector(&node, false).await;
+        let (seen, task) = coordinator(&node).await;
+        let (_, Json(submitted)) = submit(&node, batch(&node, &["data/a.bin"], &[]))
+            .await
+            .unwrap();
+        task.abort();
+        assert_eq!(submitted.job_id, "j1");
+        let seen = seen.lock().unwrap().clone();
+        let paths: Vec<_> = seen.iter().map(|(path, _)| path.as_str()).collect();
+        let shared = format!("/api/v1/data/groups/{}/connectors", node.group_id);
+        assert_eq!(paths, [shared.as_str(), "/api/v1/data/staging/jobs"]);
+        let body: serde_json::Value = serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(body["connector_id"], connector());
+        assert_eq!(body["public_config"]["skip_signature"], "true");
+    }
+
+    #[tokio::test]
+    async fn secret_stays_local() {
+        let node = node_state().await;
+        replicate(&node.state, node.group_id, BUCKET).await;
+        store_connector(&node, true).await;
+        let (seen, task) = coordinator(&node).await;
+        let _ = submit(&node, batch(&node, &["data/a.bin"], &[]))
+            .await
+            .unwrap();
+        task.abort();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "only the job is relayed");
+        assert_eq!(seen[0].0, "/api/v1/data/staging/jobs");
+        assert!(!seen[0].1.contains("secret-canary"));
+    }
+
     async fn submit(
         node: &Node,
         request: StageBatchRequest,
@@ -922,6 +1085,7 @@ mod distributed {
     async fn submit_fans_out() {
         let node = node_state().await;
         replicate(&node.state, node.group_id, BUCKET).await;
+        store_connector(&node, true).await;
         let peer = mock_peer(StatusCode::ACCEPTED, r#"{"job_id":"j1"}"#).await;
         publish_api(&node.state, node_id(PEER), &peer.url).await;
 
@@ -1016,4 +1180,31 @@ mod distributed {
             Err(ServerError::BadRequestReason(_))
         ));
     }
+}
+
+#[tokio::test]
+async fn references_state_completeness() {
+    // A member that keeps only the lower shard lists the whole bucket incompletely.
+    use crate::tests::distributed::{BUCKET, distribute, node_state};
+    let node = node_state().await;
+    distribute(&node.state, node.group_id, BUCKET).await;
+    let page = |prefix: &str| {
+        list_references(
+            State(node.state.clone()),
+            Extension(Some(node.owner.clone())),
+            Query(ReferenceListQuery {
+                bucket: BUCKET.to_string(),
+                prefix: Some(prefix.to_string()),
+                limit: None,
+                cursor: None,
+            }),
+        )
+    };
+    let (_, Json(whole)) = page("").await.unwrap();
+    assert!(!whole.complete);
+    let (_, Json(lower)) = page("apple").await.unwrap();
+    assert!(
+        lower.complete,
+        "a prefix inside the held shard is listed in full"
+    );
 }

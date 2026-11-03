@@ -17,6 +17,7 @@ use aruna_core::events::{Event, NetEvent, SnapshotSignEvent, StorageEvent, SubOp
 use aruna_core::keyspaces::{
     CATCH_UP_KEYSPACE, DISTRIBUTION_ACCEPT_KEYSPACE, DISTRIBUTION_KEYSPACE,
     DISTRIBUTION_LIFECYCLE_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
+    NODE_STATS_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminApplyStatus, AdminDocumentError, AdminDocumentState};
@@ -29,6 +30,7 @@ use aruna_core::structs::storage::distribution::{
     DistributionError, DistributionRequest, DistributionRevision, DistributionSnapshot,
     DistributionView, SetPhase, SignedSnapshot, next_snapshot, publisher_key,
 };
+use aruna_core::structs::storage::usage::dirty_share_key;
 use aruna_core::types::{Effects, TxnId, Value};
 use aruna_core::{TaskEvent, UserId};
 use serde::{Deserialize, Serialize};
@@ -406,6 +408,10 @@ impl PublishOperation {
             let key = set_id.to_bytes().to_vec().into();
             writes.push((DISTRIBUTION_LIFECYCLE_KEYSPACE.to_string(), key, tag.into()));
         }
+        // This node's replica share may shrink with the record: its quota gate stops deducting it.
+        let share = dirty_share_key(view.snapshot().config.owner_group).into();
+        let generation = Ulid::generate().to_bytes().to_vec().into();
+        writes.push((NODE_STATS_KEYSPACE.to_string(), share, generation));
         self.output = Some(Ok(revision));
         self.state = PublishState::Write;
         Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {

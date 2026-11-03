@@ -282,6 +282,7 @@ async fn crate_stays_local() -> TestResult<()> {
         cancel: CancellationToken::new(),
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
+        range_turns: Default::default(),
     };
 
     assert!(matches!(

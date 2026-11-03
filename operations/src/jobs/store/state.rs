@@ -214,6 +214,8 @@ pub async fn complete_job(
         record.updated_at_ms = now_ms;
         record.progress = final_progress.clone();
         record.result = Some(result.clone());
+        // An error of an earlier run is no outcome of the job.
+        record.last_error = None;
         record.claim = None;
         Ok(JobMutation::Persist)
     })
@@ -311,6 +313,7 @@ where
             record.updated_at_ms = now_ms;
             record.progress = final_progress.clone();
             record.result = Some(result.clone());
+            record.last_error = None;
             record.claim = None;
             Ok(JobMutation::Persist)
         },
@@ -469,6 +472,40 @@ pub async fn requeue_job(
     require_expired_before: Option<u64>,
     error: Option<JobError>,
 ) -> Result<RequeueOutcome, JobMutationError> {
+    let expired = require_expired_before;
+    requeue_counted(storage, job_id, token, now_ms, expired, error, false).await
+}
+
+/// Re-queue after a transient failure of an execution that advanced a durable checkpoint:
+/// attempts count consecutive failures without progress, so this one starts a new count.
+pub async fn requeue_progressed(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+    error: JobError,
+) -> Result<RequeueOutcome, JobMutationError> {
+    requeue_counted(
+        storage,
+        job_id,
+        Some(token),
+        now_ms,
+        None,
+        Some(error),
+        true,
+    )
+    .await
+}
+
+async fn requeue_counted(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Option<Ulid>,
+    now_ms: u64,
+    require_expired_before: Option<u64>,
+    error: Option<JobError>,
+    progressed: bool,
+) -> Result<RequeueOutcome, JobMutationError> {
     let mut persisted = false;
     let mut needs_reconcile = false;
     let record = mutate_job(storage, job_id, |record| {
@@ -498,6 +535,9 @@ pub async fn requeue_job(
         }
         if let Some(error) = error.clone() {
             record.last_error = Some(error);
+        }
+        if progressed {
+            record.attempts = 0;
         }
         record.attempts = record.attempts.saturating_add(1);
         record.updated_at_ms = now_ms;

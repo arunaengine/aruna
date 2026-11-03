@@ -312,6 +312,7 @@ fn offered_binding(bucket: &str, path: &str, node_id: NodeId) -> VersionSourceBi
             capabilities: Vec::new(),
             origin_node_id: Some(node_id),
             namespace: None,
+            root: None,
         },
         connector_id: None,
     }

@@ -4,10 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, UserAccess};
+use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionSnapshot, KeyRange,
 };
-use aruna_operations::distribution::guard::{bound_view, lists_interval};
+use aruna_operations::distribution::guard::{
+    bound_view, copies_interval, lists_interval, local_fence,
+};
 use aruna_operations::s3::object::list::{ListBucketInput, ListContinuationToken};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -28,6 +31,8 @@ use crate::s3::service::{ArunaS3Service, URL_ENCODE_SET};
 /// The query parameters a forwarded listing names its key range with.
 const LOWER_PARAM: &str = "aruna-lower";
 const UPPER_PARAM: &str = "aruna-upper";
+/// Asks a copy to list its records while the range's coordinator cannot.
+const COPY_PARAM: &str = "aruna-copy";
 const TOKEN_DOMAIN: &[u8] = b"aruna-distributed-listing-v1";
 
 /// A continuation token of a merged listing, bound to its set and query.
@@ -109,6 +114,12 @@ fn named_bounds(query: Option<&str>) -> Option<(String, Option<String>)> {
         }
     }
     Some((lower?, upper))
+}
+
+/// Whether a forwarded listing asks for a copy's answer.
+fn named_copy(query: Option<&str>) -> bool {
+    let pairs = url::form_urlencoded::parse(query.unwrap_or_default().as_bytes());
+    pairs.into_iter().any(|(name, _)| name == COPY_PARAM)
 }
 
 /// The query of a listing a holder answers for one range.
@@ -216,7 +227,14 @@ impl ArunaS3Service {
             .ok_or_else(|| s3_error!(AccessDenied, "Delegation refused: not a member"))?;
         let (lower, upper) = named_bounds(query)
             .ok_or_else(|| s3_error!(AccessDenied, "Delegation refused: no key range named"))?;
-        match lists_interval(self.state.as_ref(), binding, &lower, upper.as_deref()).await {
+        let state = self.state.as_ref();
+        let held = match lists_interval(state, binding, &lower, upper.as_deref()).await {
+            Ok(false) if named_copy(query) => {
+                copies_interval(state, binding, &lower, upper.as_deref()).await
+            }
+            held => held,
+        };
+        match held {
             Ok(true) => Ok(Some((lower, upper))),
             Ok(false) => {
                 let mut error = S3Error::with_message(
@@ -240,15 +258,31 @@ impl ArunaS3Service {
             .map_err(|error| guard_error(&error))
     }
 
-    /// Asks the holders of `range` in turn; only a range nobody answers ends the listing.
+    pub(in crate::s3::service) async fn fence(
+        &self,
+        binding: &DistributionBinding,
+    ) -> S3Result<LocalFence> {
+        local_fence(self.state.as_ref(), binding.set_id)
+            .await
+            .map_err(|error| guard_error(&error))
+    }
+
+    /// Asks the member that lists `range`, or with `copies` its ready copies, which answer
+    /// while the coordinator cannot; a range none answers ends the listing.
     pub(in crate::s3::service) async fn ask_holders(
         &self,
         user: &UserAccess,
         (binding, snapshot): (&DistributionBinding, &DistributionSnapshot),
-        range: &KeyRange,
+        (range, copies): (&KeyRange, bool),
         (operation, bucket, query): (&'static str, &str, String),
     ) -> S3Result<String> {
-        let holders = snapshot.record_holders(range);
+        let (holders, query) = match copies {
+            true => (
+                snapshot.copy_holders(range),
+                format!("{query}&{COPY_PARAM}=1"),
+            ),
+            false => (snapshot.list_holder(range).into_iter().collect(), query),
+        };
         let others = holders
             .into_iter()
             .filter(|member| member.member_id != binding.member_id);
@@ -267,7 +301,7 @@ impl ArunaS3Service {
                 headers: Vec::new(),
                 body: ForwardBody::Empty,
             };
-            let answer = match self.forward_write(user, &forward, request).await {
+            let answer = match self.forward_read(user, &forward, request).await {
                 Ok(response) => answer_text(response).await,
                 Err(error) => Err(error),
             };
@@ -285,7 +319,7 @@ impl ArunaS3Service {
         &self,
         user: &UserAccess,
         context: (&DistributionBinding, &DistributionSnapshot),
-        range: &KeyRange,
+        (range, copies): (&KeyRange, bool),
         (input, start, remaining): (&ListBucketInput, Option<(&'static str, String)>, usize),
         (owner, url_encoded): (Option<&Owner>, bool),
     ) -> S3Result<ObjectListingPage> {
@@ -303,7 +337,7 @@ impl ArunaS3Service {
         base.extend(start);
         let query = range_query(&base, range);
         let request = ("ListObjectsV2", input.bucket.as_str(), query);
-        let body = self.ask_holders(user, context, range, request).await?;
+        let body = (self.ask_holders(user, context, (range, copies), request)).await?;
         let contents = (elements(&body, "Contents").into_iter())
             .filter_map(|entry| {
                 Some(Object {
@@ -333,7 +367,8 @@ impl ArunaS3Service {
         })
     }
 
-    /// One merged object page over every range under the prefix, at most `max_keys` entries.
+    /// One merged object page over every range under the prefix, at most `max_keys` entries,
+    /// and the ranges a copy listed because their coordinator could not.
     pub(in crate::s3::service) async fn merged_objects(
         &self,
         user: &UserAccess,
@@ -341,8 +376,9 @@ impl ArunaS3Service {
         input: ListBucketInput,
         (owner, url_encoded, scope): (Option<Owner>, bool, Option<&SubpathScope>),
         (from, bounded): (Option<String>, bool),
-    ) -> S3Result<(ObjectListingPage, Option<String>)> {
+    ) -> S3Result<(ObjectListingPage, Option<String>, Vec<Ulid>)> {
         let snapshot = self.snapshot(binding).await?;
+        let fence = self.fence(binding).await?;
         let max = input
             .max_keys
             .unwrap_or(aruna_operations::s3::object::list::ListBucketOperation::DEFAULT_MAX_KEYS);
@@ -382,6 +418,7 @@ impl ArunaS3Service {
         });
         let mut first = true;
         let mut bytes = 0usize;
+        let mut stale = Vec::new();
         for (visited, range) in ranges.enumerate() {
             let remaining =
                 max.saturating_sub(merged.contents.len() + merged.common_prefixes.len());
@@ -394,10 +431,50 @@ impl ArunaS3Service {
                     .continuation_token
                     .is_none()
                     .then(|| range.lower.clone());
-                return Ok((merged, next));
+                return Ok((merged, next, stale));
             }
-            let part = match snapshot.lists_locally(binding.member_id, range) {
-                true => {
+            let remote = match snapshot.lists_locally(binding.member_id, range, &fence) {
+                true => None,
+                false => {
+                    let query = (&input, remote_start(&input, first)?, remaining);
+                    let (context, shape) = ((binding, &snapshot), (owner.as_ref(), url_encoded));
+                    let asked = (range, false);
+                    match self
+                        .remote_objects(user, context, asked, query.clone(), shape)
+                        .await
+                    {
+                        Ok(part) => Some(part),
+                        // The coordinator cannot answer, so this member's copy or another lists.
+                        Err(error) if unreachable(&error) => {
+                            stale.push(range.range_id);
+                            let here = (snapshot.record_holders(range).iter())
+                                .any(|member| member.member_id == binding.member_id);
+                            match here {
+                                true => None,
+                                false => Some(
+                                    (self.remote_objects(
+                                        user,
+                                        context,
+                                        (range, true),
+                                        query,
+                                        shape,
+                                    ))
+                                    .await?,
+                                ),
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            let part = match remote {
+                Some(mut part) => {
+                    if let Some(scope) = scope {
+                        scope_part(&mut part, scope, url_encoded);
+                    }
+                    part
+                }
+                None => {
                     let mut sub = input.clone();
                     sub.max_keys = Some(remaining);
                     if !first {
@@ -406,18 +483,6 @@ impl ArunaS3Service {
                     let bounds = Some((range.lower.clone(), range.upper.clone()));
                     self.run_object_listing(sub, owner.clone(), url_encoded, scope, bounds)
                         .await?
-                }
-                false => {
-                    let start = remote_start(&input, first)?;
-                    let query = (&input, start, remaining);
-                    let context = (binding, &snapshot);
-                    let mut part = self
-                        .remote_objects(user, context, range, query, (owner.as_ref(), url_encoded))
-                        .await?;
-                    if let Some(scope) = scope {
-                        scope_part(&mut part, scope, url_encoded);
-                    }
-                    part
                 }
             };
             first = false;
@@ -448,7 +513,7 @@ impl ArunaS3Service {
                 break;
             }
         }
-        Ok((merged, None))
+        Ok((merged, None, stale))
     }
 }
 

@@ -90,6 +90,7 @@ impl Fixture {
             cancel: cancel.clone(),
             shutdown: shutdown.clone(),
             progress: ProgressReporter::from_progress(&JobProgress::new("records")),
+            range_turns: Default::default(),
         };
         (ctx, cancel, shutdown)
     }

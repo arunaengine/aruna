@@ -2153,7 +2153,7 @@ pub async fn head_job_artifact(
     delete,
     path = "/compute/jobs/{job_id}",
     tag = "compute/jobs",
-    summary = "Delete the caller's finished run",
+    summary = "Delete the caller's finished job",
     description = r#"Removes a finished run from the run and job lists of this node.
 
 **Authentication**: realm bearer token; a path-restricted (delegated) token is refused.
@@ -2169,10 +2169,13 @@ Self-scoped like the status read: only the submitter may delete, and anybody els
   its final state. Captured outputs and the run dataset are not deleted.
 - Repeating the call answers 404 once the run is gone.
 
+- Any other job of the caller, such as a staging import, is taken off the list at once and its
+  rows are removed by the next prune pass, so a read by id may still find it for a moment.
+
 **Limits**
-- Only an execution that succeeded, failed or was cancelled can be deleted; a run still in flight,
-  one with an undecided outcome, or one whose container cleanup is still queued answers 409.
-- System jobs such as imports, exports and copies are not deleted here."#,
+- An execution can be deleted once it succeeded, failed or was cancelled; another job once it
+  stopped, including `indeterminate`. A live job answers 409 naming its state: cancel it first.
+  A run whose container cleanup is still queued answers 409 as well."#,
     params(("job_id" = String, Path, description = "Job id as returned at submission, for example `01JJRSTVWXYZ0123456789ABCD`")),
     responses(
         (status = 204, description = "The run was removed from this node's lists"),
@@ -2180,7 +2183,7 @@ Self-scoped like the status read: only the submitter may delete, and anybody els
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "This node lists no such run of the caller; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
-        (status = 409, description = "The run has not finished, or its container cleanup is still queued; cancel it or retry once it settled", body = ErrorResponse)
+        (status = 409, description = "The job is still live, named by its state, or a run's container cleanup is still queued; cancel it or retry once it settled", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -2197,8 +2200,12 @@ pub async fn delete_job(
     match outcome {
         RunDelete::Deleted => Ok(StatusCode::NO_CONTENT),
         RunDelete::NotFound => Err(ServerError::NotFound),
-        RunDelete::Unfinished => Err(ServerError::Conflict(
-            "the run has not finished or its cleanup is still queued".to_string(),
+        RunDelete::Unfinished(state) => Err(ServerError::Conflict(format!(
+            "the job is {}; cancel it before deleting it",
+            state.name()
+        ))),
+        RunDelete::CleanupPending => Err(ServerError::Conflict(
+            "the run's container cleanup is still queued; retry once it settled".to_string(),
         )),
     }
 }

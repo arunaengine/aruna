@@ -12,6 +12,7 @@ use crate::driver::DriverContext;
 pub mod admit;
 pub mod balance;
 pub mod change;
+pub mod counts;
 pub mod create;
 pub mod delegate;
 mod feed_store;

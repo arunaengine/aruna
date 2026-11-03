@@ -529,6 +529,18 @@ pub async fn set_cancel_requested(
     let mut cancelled_now = false;
     let record = mutate_job(storage, job_id, |record| {
         cancelled_now = false;
+        // A locally exhausted job runs nowhere on this node; a container it may have left is
+        // removed by the cleanup queued when it was exhausted, so cancelling settles it.
+        if record.state == JobState::Indeterminate && record.locally_exhausted {
+            record.cancel_requested = true;
+            record.state = JobState::Cancelled;
+            record.locally_exhausted = false;
+            record.finished_at_ms = Some(now_ms);
+            record.updated_at_ms = now_ms;
+            record.claim = None;
+            cancelled_now = true;
+            return Ok(JobMutation::Persist);
+        }
         if record.is_settled() {
             return Ok(JobMutation::Skip);
         }

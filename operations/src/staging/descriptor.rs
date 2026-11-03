@@ -4,7 +4,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::structs::execution::source_access::SourceMetadata;
-use aruna_core::structs::execution::source_connector::SourceConnector;
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::execution::staging::{
     PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
 };
@@ -16,14 +16,18 @@ pub fn build_source_descriptor(
     source_path: String,
     origin_node_id: Option<NodeId>,
 ) -> PortableSourceDescriptor {
+    // What a source can do follows from its observation, so no capability is stored; only an
+    // Aruna source is read through the node that holds it.
+    let native = connector.kind == SourceConnectorKind::ArunaNative;
     PortableSourceDescriptor {
         kind: connector.kind,
         public_config: connector.public_config.clone(),
         source_path,
         version_selector: source_version_selector(metadata),
-        capabilities: source_capabilities(metadata),
-        origin_node_id,
+        capabilities: Vec::new(),
+        origin_node_id: origin_node_id.filter(|_| native),
         namespace: connector.namespace.clone(),
+        root: None,
     }
 }
 
@@ -44,23 +48,6 @@ pub fn build_source_binding(
 
 fn source_version_selector(metadata: &SourceMetadata) -> Option<String> {
     non_empty(metadata.source_version.as_deref()).map(|version| format!("version:{version}"))
-}
-
-fn source_capabilities(metadata: &SourceMetadata) -> Vec<String> {
-    let mut capabilities = vec!["head".to_string(), "read".to_string()];
-    if non_empty(metadata.source_version.as_deref()).is_some() {
-        capabilities.push("versioned".to_string());
-    }
-    if non_empty(metadata.etag.as_deref()).is_some() {
-        capabilities.push("etag".to_string());
-    }
-    if metadata.last_modified.is_some() {
-        capabilities.push("last_modified".to_string());
-    }
-    if non_empty(metadata.content_type.as_deref()).is_some() {
-        capabilities.push("content_type".to_string());
-    }
-    capabilities
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
@@ -155,16 +142,6 @@ mod pure_tests {
         );
 
         assert_eq!(descriptor.version_selector.as_deref(), Some("version:v42"));
-        assert_eq!(
-            descriptor.capabilities,
-            vec![
-                "head".to_string(),
-                "read".to_string(),
-                "versioned".to_string(),
-                "etag".to_string(),
-                "last_modified".to_string(),
-                "content_type".to_string(),
-            ]
-        );
+        assert!(descriptor.capabilities.is_empty());
     }
 }

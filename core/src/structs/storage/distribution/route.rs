@@ -6,6 +6,7 @@
 use thiserror::Error;
 use ulid::Ulid;
 
+use super::fence::LocalFence;
 use super::{
     DistributionMember, DistributionSnapshot, KeyRange, MemberState, MetadataCoverage,
     OriginalEpoch,
@@ -158,23 +159,56 @@ impl DistributionSnapshot {
             .collect()
     }
 
-    /// Whether `member_id` answers listings of `range` from its own records: it keeps them
-    /// and is not catching up.
-    pub fn lists_locally(&self, member_id: Ulid, range: &KeyRange) -> bool {
-        self.member(member_id).is_some_and(|member| {
-            member.state == MemberState::Ready && keeps_records(range, member)
-        })
+    /// Whether `member_id` answers listings of `range` from its own records; `fence` is its
+    /// node's, so a range it fenced for a transfer is listed by nobody until the record moves on.
+    pub fn lists_locally(&self, member_id: Ulid, range: &KeyRange, fence: &LocalFence) -> bool {
+        self.list_holder(range)
+            .is_some_and(|member| member.member_id == member_id)
+            && fence.check_read(self, range).is_ok()
+    }
+
+    /// The member that lists `range`: its ready coordinator, since copies may lag behind it.
+    pub fn list_holder(&self, range: &KeyRange) -> Option<&DistributionMember> {
+        self.member(range.coordinator)
+            .filter(|member| member.state == MemberState::Ready)
     }
 
     /// Whether `member_id` answers listings of every key in `[lower, upper)` itself.
-    pub fn lists_interval(&self, member_id: Ulid, lower: &str, upper: Option<&str>) -> bool {
-        (self.config.ranges.iter())
-            .filter(|range| {
-                let starts_before = upper.is_none_or(|upper| range.lower.as_str() < upper);
-                let ends_after = range.upper.as_deref().is_none_or(|end| lower < end);
-                starts_before && ends_after
-            })
-            .all(|range| self.lists_locally(member_id, range))
+    pub fn lists_interval(
+        &self,
+        member_id: Ulid,
+        (lower, upper): (&str, Option<&str>),
+        fence: &LocalFence,
+    ) -> bool {
+        (self.overlapping(lower, upper)).all(|range| self.lists_locally(member_id, range, fence))
+    }
+
+    /// Whether `member_id` is a ready copy of every range in `[lower, upper)`, so it can answer
+    /// a listing while their coordinators cannot.
+    pub fn copies_interval(&self, member_id: Ulid, (lower, upper): (&str, Option<&str>)) -> bool {
+        (self.overlapping(lower, upper)).all(|range| {
+            (self.copy_holders(range).iter()).any(|member| member.member_id == member_id)
+        })
+    }
+
+    fn overlapping<'a>(
+        &'a self,
+        lower: &'a str,
+        upper: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a KeyRange> {
+        (self.config.ranges.iter()).filter(move |range| {
+            let starts_before = upper.is_none_or(|upper| range.lower.as_str() < upper);
+            let ends_after = range.upper.as_deref().is_none_or(|end| lower < end);
+            starts_before && ends_after
+        })
+    }
+
+    /// The ready members other than the coordinator that keep the records of `range`; they
+    /// answer for it while the coordinator cannot, possibly behind it.
+    pub fn copy_holders(&self, range: &KeyRange) -> Vec<&DistributionMember> {
+        (self.record_holders(range).into_iter())
+            .filter(|member| member.member_id != range.coordinator)
+            .collect()
     }
 
     /// The ready members that keep the records of `range`, its coordinator last, so reads of
@@ -361,6 +395,52 @@ mod tests {
             created.read_route(member(1), "a/b", false),
             Ok(ReadRoute::Local { catching_up: true }),
             "a created member has not received the range yet"
+        );
+    }
+
+    // A copy may lag behind its coordinator's live publications, so only the coordinator lists.
+    #[test]
+    fn copies_list_remotely() {
+        let mut head = active();
+        head.config.ranges[0].replicas.push(member(2));
+        let lower = head.config.ranges[0].clone();
+        let open = super::super::fence::LocalFence::default();
+        assert!(head.lists_locally(member(1), &lower, &open));
+        assert!(!head.lists_locally(member(2), &lower, &open));
+        assert!(!head.lists_interval(member(2), ("", Some("m")), &open));
+        let holder = head.list_holder(&lower).map(|member| member.member_id);
+        assert_eq!(holder, Some(member(1)));
+        // A coordinator that fenced the range for a transfer may miss newer keys.
+        let mut fenced = super::super::fence::LocalFence::default();
+        fenced.fence_range(super::super::fence::RangeFence {
+            range_id: lower.range_id,
+            transfer_id: Ulid::from_bytes([5; 16]),
+            epoch: lower.epoch,
+            since_ms: 0,
+            uploads_open: false,
+        });
+        assert!(!head.lists_locally(member(1), &lower, &fenced));
+        assert!(!head.lists_interval(member(1), ("", Some("m")), &fenced));
+        head.config.members[0].state = crate::structs::storage::distribution::MemberState::Failed;
+        assert!(head.list_holder(&lower).is_none());
+    }
+
+    // A ready replica answers for a range its coordinator cannot serve; the coordinator never
+    // counts as a copy.
+    #[test]
+    fn copies_answer_ranges() {
+        let mut head = active();
+        head.config.ranges[0].replicas.push(member(2));
+        let lower = head.config.ranges[0].clone();
+        let copies: Vec<_> = (head.copy_holders(&lower).iter())
+            .map(|member| member.member_id)
+            .collect();
+        assert_eq!(copies, [member(2)]);
+        assert!(head.copies_interval(member(2), ("", Some("m"))));
+        assert!(!head.copies_interval(member(1), ("", Some("m"))));
+        assert!(
+            !head.copies_interval(member(2), ("", None)),
+            "member 2 copies no upper range"
         );
     }
 

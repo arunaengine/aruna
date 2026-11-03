@@ -223,9 +223,10 @@ impl Config {
 /// Opens the local store for parsed settings. The caller owns the handle from
 /// here on, before any identity or enrollment I/O needs it.
 pub fn open_storage(settings: &Settings) -> Result<StorageHandle, SetupError> {
-    Ok(FjallStorage::open_with_policy(
+    Ok(FjallStorage::open_with_cache(
         &settings.storage_path,
         settings.fjall_persist_policy,
+        settings.fjall_cache_bytes,
     )?)
 }
 
@@ -299,6 +300,7 @@ pub async fn resolve_config(
         node_labels,
         node_location,
         node_weight,
+        fjall_cache_bytes: _,
     } = settings;
     let bootstrap_timeout = Duration::from_secs(bootstrap_timeout_secs);
     // The store arrived already open and owned; the identity store owns every read and
@@ -345,6 +347,7 @@ pub async fn resolve_config(
 
     let net_secret_key = iroh::SecretKey::from_bytes(&node_state.net_secret_key);
     let node_id = net_secret_key.public();
+    node_state = identity.apply_promotion(node_state, node_id).await?;
     let (realm_id, node_capabilities) = identity.capabilities(&node_state)?;
     if realm_id != node_state.realm_id {
         return Err(SetupError::NodeStateMismatch);

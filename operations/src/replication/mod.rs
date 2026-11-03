@@ -9,6 +9,7 @@ mod error;
 pub mod incoming;
 pub mod locations;
 pub mod members;
+pub mod page;
 pub mod parking;
 pub mod plaintext;
 pub mod protocol;

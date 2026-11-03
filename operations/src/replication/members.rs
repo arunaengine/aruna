@@ -6,6 +6,8 @@
 // A queued job names only the member; what it publishes comes from the record this node
 // holds when it sends, so an ended coordinatorship publishes nothing.
 
+use std::collections::BTreeMap;
+
 use aruna_core::NodeId;
 use aruna_core::effects::IterStart;
 use aruna_core::effects::StorageEffect;
@@ -14,6 +16,7 @@ use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, REPLICATION_OBLIGATION_KEYSPA
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionSnapshot, DistributionView, KeyRange, Publication,
 };
+use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -26,6 +29,8 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 /// Queue rows one check reads per page, and pages it reads before it counts the queue as owing.
 const FANOUT_PAGE: usize = 1024;
 const FANOUT_PAGES: usize = 16;
+/// Queue pages one copy lag count reads.
+const LAG_PAGES: usize = 4;
 
 /// The member of a distributed bucket a queued job publishes to.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -120,21 +125,7 @@ pub(crate) async fn owes_fanout(
     for (key_space, prefix) in [live, obligations] {
         let (mut start, mut read) = (None, false);
         for _ in 0..FANOUT_PAGES {
-            let iter = StorageEffect::Iter {
-                key_space: key_space.to_string(),
-                prefix: Some(prefix.clone().into()),
-                start: start.map(IterStart::After),
-                limit: FANOUT_PAGE,
-                txn_id: None,
-            };
-            let (values, more) = match context.storage_handle.send_storage_effect(iter).await {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => (values, next_start_after.is_some()),
-                Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-                other => return Err(format!("unexpected queue answer {other:?}")),
-            };
+            let (values, more) = queue_page(context, key_space, &prefix, start).await?;
             if values.iter().any(|(_, value)| owed(key_space, value)) {
                 return Ok(true);
             }
@@ -151,6 +142,109 @@ pub(crate) async fn owes_fanout(
         }
     }
     Ok(false)
+}
+
+/// One page of a queue's rows under `prefix` after `start`, and whether more follow.
+async fn queue_page(
+    context: &DriverContext,
+    key_space: &str,
+    prefix: &[u8],
+    start: Option<Key>,
+) -> Result<(Vec<(Key, Value)>, bool), String> {
+    let iter = StorageEffect::Iter {
+        key_space: key_space.to_string(),
+        prefix: Some(prefix.to_vec().into()),
+        start: start.map(IterStart::After),
+        limit: FANOUT_PAGE,
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(iter).await {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => Ok((values, next_start_after.is_some())),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected queue answer {other:?}")),
+    }
+}
+
+/// What a coordinator still owes one member of one range.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CopyLag {
+    /// Versions queued for the member.
+    pub pending: u64,
+    /// When the oldest of them was written, in Unix milliseconds.
+    pub oldest_ms: Option<u64>,
+}
+
+/// The versions `coordinator` still owes, by range it coordinates and receiving member, from at
+/// most [`LAG_PAGES`] pages of each queue; false when a queue held more, so counts are lower
+/// bounds.
+pub async fn copy_lag(
+    context: &DriverContext,
+    snapshot: &DistributionSnapshot,
+    coordinator: Ulid,
+) -> Result<(BTreeMap<(Ulid, Ulid), CopyLag>, bool), String> {
+    let set_id = snapshot.set_id();
+    let [live, _, obligations] =
+        queued_prefixes(&snapshot.config.bucket).map_err(|error| error.to_string())?;
+    let mut lag: BTreeMap<(Ulid, Ulid), CopyLag> = BTreeMap::new();
+    let mut add = |range_id: Ulid, member_id: Ulid, written_ms: u64| {
+        let entry = lag.entry((range_id, member_id)).or_default();
+        entry.pending += 1;
+        entry.oldest_ms = Some(entry.oldest_ms.map_or(written_ms, |ms| ms.min(written_ms)));
+    };
+    let mut counted = true;
+    for (key_space, prefix) in [live, obligations] {
+        let mut start = None;
+        let mut more = true;
+        for _ in 0..LAG_PAGES {
+            let (values, next) = queue_page(context, key_space, &prefix, start).await?;
+            for (_, value) in &values {
+                if key_space == REPLICATION_OBLIGATION_KEYSPACE {
+                    let Ok(owed) = LiveObligationRecord::from_bytes(value) else {
+                        continue;
+                    };
+                    // An obligation whose member jobs are queued is counted through them.
+                    if owed.continuation.as_ref().is_some_and(|c| c.members_done) {
+                        continue;
+                    }
+                    let Some((range, deliveries)) = snapshot.key_deliveries(coordinator, &owed.key)
+                    else {
+                        continue;
+                    };
+                    for delivery in deliveries {
+                        add(
+                            range.range_id,
+                            delivery.member_id,
+                            owed.version_id.timestamp_ms(),
+                        );
+                    }
+                    continue;
+                }
+                let Ok(job) = BlobJobRecord::from_bytes(value) else {
+                    continue;
+                };
+                let (Some(target), ReplicateScopeTarget::Version { key, .. }) =
+                    (&job.distribution, &job.input.target)
+                else {
+                    continue;
+                };
+                let range = snapshot.range_for(key);
+                let range = range.filter(|range| range.coordinator == coordinator);
+                if let Some(range) = range.filter(|_| target.set_id == set_id) {
+                    add(range.range_id, target.member_id, job.owed_since_ms());
+                }
+            }
+            more = next;
+            match (next, values.last()) {
+                (true, Some((last, _))) => start = Some(last.clone()),
+                _ => break,
+            }
+        }
+        counted &= !more;
+    }
+    Ok((lag, counted))
 }
 
 /// The publications of one committed version to the members holding its key's range, while
@@ -279,6 +373,72 @@ mod tests {
         write((job_space, key, value)).await;
         assert!(owes(lower).await, "a queued member job is still owed");
         assert!(!owes(upper).await);
+    }
+
+    #[tokio::test]
+    async fn counts_copy_lag() {
+        // Obligations count for every member until their jobs are queued, then the jobs count.
+        use super::super::queue::{
+            LiveReplicationContinuation, blob_job_key, live_obligation_entry,
+        };
+        use crate::distribution::test_store::open;
+        use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
+        use aruna_core::structs::identity::auth::AuthContext;
+        let (_dir, storage_handle) = open();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let (snapshot, _) = replicated(true, 1);
+        let realm_id = snapshot.statements[0].statement.realm_id;
+        let owed = |key: &str, written_ms: u64| {
+            LiveObligationRecord::new(
+                snapshot.member(member(1)).unwrap().node_id,
+                AuthContext::anonymous(realm_id),
+                "spire".to_string(),
+                key.to_string(),
+                Ulid::from_parts(written_ms, 1),
+                false,
+            )
+        };
+        let mut rows = vec![live_obligation_entry(&owed("a", 2_000)).unwrap()];
+        let mut queued = owed("b", 1_000);
+        for job in member_jobs(&binding(&snapshot, 1, 5), &snapshot, &queued, 9) {
+            let key = blob_job_key(&job).unwrap();
+            rows.push((
+                REPLICATION_JOB_KEYSPACE.to_string(),
+                key,
+                job.to_bytes().unwrap().into(),
+            ));
+        }
+        queued.continuation = Some(LiveReplicationContinuation {
+            members_done: true,
+            ..LiveReplicationContinuation::default()
+        });
+        rows.push(live_obligation_entry(&queued).unwrap());
+        let write = StorageEffect::BatchWrite {
+            writes: rows,
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(write).await;
+
+        let lower = snapshot.config.ranges[0].range_id;
+        let (lag, counted) = copy_lag(&context, &snapshot, member(1)).await.unwrap();
+        assert!(counted);
+        let expected = CopyLag {
+            pending: 2,
+            oldest_ms: Some(1_000),
+        };
+        assert_eq!(lag, BTreeMap::from([((lower, member(2)), expected)]));
+        let (lag, _) = copy_lag(&context, &snapshot, member(2)).await.unwrap();
+        assert!(
+            lag.is_empty(),
+            "the other coordinator owes nothing of the lower range"
+        );
     }
 
     #[test]

@@ -207,9 +207,36 @@ pub struct ObjectCoverage {
     pub omitted_partitions: usize,
     /// Distributed bucket ranges this page could not search; `complete` is false when any.
     pub incomplete_ranges: usize,
+    /// Index progress of the incomplete ranges whose coordinator reported it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index_progress: Vec<RangeIndexProgress>,
+    /// Incomplete ranges whose index, still being built, answered for keys up to a key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_ranges: Vec<PartialRange>,
     pub complete: bool,
     pub truncated: bool,
     pub partitions: Vec<ObjectPartitionCoverage>,
+}
+
+/// How far a coordinator's search index of one range is.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RangeIndexProgress {
+    pub node_id: String,
+    pub range_id: String,
+    /// The index became ready after the page was searched.
+    pub ready: bool,
+    pub indexed_keys: u64,
+    /// Keys of the range by the coordinator's range counters, an estimate.
+    pub keys: u64,
+}
+
+/// A range whose hits are exact for its keys up to `indexed_through` and miss later keys.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PartialRange {
+    pub node_id: String,
+    pub range_id: String,
+    /// The last key the index holds every key up to; `null` if the caller may not read it.
+    pub indexed_through: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -240,6 +267,10 @@ pub struct BucketHit {
     pub group_id: String,
     pub group_name: Option<String>,
     pub created_at: String,
+    /// The distributed bucket this hit is a member of; absent for an ordinary bucket. Hits of one
+    /// set on several nodes are one bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -351,6 +382,8 @@ to its own buckets, so a bucket the caller may not read never appears.
 - The search fans out over the realm's serving nodes under one shared deadline of about 12 seconds.
 - An empty or missing `q` lists every bucket the caller may read; `group_id` keeps only the
   buckets of that group.
+- A member of a distributed bucket carries its `set_id`; every member node answers its own hit,
+  so hits with one `set_id` are one bucket.
 - Hits are ordered by bucket name, then node id. `next_cursor` continues the listing and is absent
   on the last page. It is opaque, holds a scan position per node and is only valid with the same
   `q` and `group_id`; every page checks authorization again.
@@ -459,7 +492,12 @@ restrictions and request policies before it can be returned.
   the key, split at `/`, `.`, `-`, `_` and other separators. `coverage.incomplete_ranges` counts
   ranges whose index is missing or still being built (and, in `local` mode, ranges another
   member coordinates); they are never scanned, and `complete` is false while any remain.
-  `distributed_strict` answers 503 while any remain.
+  A range whose index is still being built answers for the keys indexed so far and is listed in
+  `coverage.partial_ranges` with `indexed_through`, the key up to which its hits are exact; a
+  query that ends at or before that key counts the range as complete.
+  `coverage.index_progress` lists the keys indexed so far and the range's key count for each
+  such range whose coordinator answered. `distributed_strict` answers 503 while any remain, and
+  the error message says how many ranges and about how many keys are still to be indexed.
 - A search without `bucket` skips distributed buckets, which only their key indexes cover;
   each skipped bucket counts in `coverage.incomplete_ranges`.
 - A cursor that continues after keys the caller may not see carries them sealed; a restart of
@@ -635,6 +673,22 @@ fn map_search_response(result: ObjectExecution, mode: ObjectMode) -> ObjectRespo
             failed_partitions,
             omitted_partitions: result.omitted_partitions,
             incomplete_ranges: result.incomplete_ranges,
+            index_progress: (result.index_progress.into_iter())
+                .map(|(node_id, range_id, progress)| RangeIndexProgress {
+                    node_id: node_id.to_string(),
+                    range_id: range_id.to_string(),
+                    ready: progress.ready,
+                    indexed_keys: progress.indexed,
+                    keys: progress.keys,
+                })
+                .collect(),
+            partial_ranges: (result.partial_ranges.into_iter())
+                .map(|(node_id, range_id, indexed_through)| PartialRange {
+                    node_id: node_id.to_string(),
+                    range_id: range_id.to_string(),
+                    indexed_through,
+                })
+                .collect(),
             complete: result.complete,
             truncated,
             partitions: result
@@ -875,6 +929,7 @@ fn map_bucket_section(result: BucketSearchExecution) -> BucketsSection {
                 group_id: hit.group_id.to_string(),
                 group_name: hit.group_name,
                 created_at: chrono::DateTime::<chrono::Utc>::from(hit.created_at).to_rfc3339(),
+                set_id: hit.set_id.map(|set_id| set_id.to_string()),
             })
             .collect(),
         next_cursor: result.next_cursor,

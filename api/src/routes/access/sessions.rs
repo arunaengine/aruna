@@ -165,8 +165,9 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
 - The session carries the caller's own identity, so it grants no permission the caller does not
   already hold.
 - `path_restrictions` narrows the session to the listed scopes. Patterns are absolute permission
-  paths or relative to the realm root, ending in `/**` for a subtree. Every read or write scope
-  must already be allowed to the caller, and deny rules are kept.
+  paths or relative to the realm root, ending in `/**` for a subtree. A group data path may name
+  the node as `*` (`/<realm>/g/<group>/data/*/<bucket>/**`) to apply on every node. Every read or
+  write scope must already be allowed to the caller, and deny rules are kept.
 - A path-restricted caller creates a session with its own restrictions, or narrower ones.
 - A bound assistant or API session can create only its own kind; a portal session and an unbound
   token may create any kind. A federated session creates none.
@@ -196,7 +197,7 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
                 "token": "EXAMPLE-SESSION-TOKEN-PLACEHOLDER",
                 "expires_at": "2026-04-09T12:00:00Z"
             })),
-        (status = 400, description = "Unknown session kind, a lifetime outside the allowed range, or restrictions without a read or write scope", body = ErrorResponse),
+        (status = 400, description = "Unknown session kind, a lifetime outside the allowed range, a malformed restriction, or restrictions without a read or write scope", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A requested scope exceeds the caller's access, the user is deactivated, the caller holds a federated session, or the token belongs to another realm", body = ErrorResponse),
         (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)

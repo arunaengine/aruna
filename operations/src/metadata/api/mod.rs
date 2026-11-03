@@ -185,6 +185,9 @@ pub enum MetadataApiError {
     NotFound,
     #[error("service unavailable")]
     ServiceUnavailable,
+    /// A strict search found ranges it could not search.
+    #[error("{0}")]
+    SearchIncomplete(String),
     /// The bucket has no usable activation, so the request cannot be routed.
     /// Never absence: no holder was resolved to answer it.
     #[error("placement unavailable: {0}")]

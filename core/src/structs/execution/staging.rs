@@ -27,6 +27,9 @@ pub struct PortableSourceDescriptor {
     /// Digest of the credential principal when it selects what the address names, as a login
     /// directory; the same on every node, never a connector id or a secret.
     pub namespace: Option<String>,
+    /// The digest of the source root this node keeps once in `source_root_records`; while set,
+    /// `public_config` holds only the object's own settings and the root holds the rest.
+    pub root: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -54,6 +57,7 @@ mod tests {
             capabilities: vec!["versioned".to_string()],
             origin_node_id: None,
             namespace: None,
+            root: None,
         };
 
         let restored: PortableSourceDescriptor =
@@ -77,6 +81,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(Ulid::from_bytes([4u8; 16])),
         };

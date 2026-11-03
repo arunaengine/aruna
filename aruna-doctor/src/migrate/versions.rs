@@ -1,18 +1,20 @@
-//! Re-encodes blob versions from before materialized versions named their encoding class or
-//! versions carried their distributed bucket fields, and indexes references by connector.
+//! Brings stored blob versions to the current shape, stores external bindings compact with their
+//! root records, and indexes references by connector.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::session_refs::Layout;
+use super::session_refs::{self, Layout};
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, BlobVersionState, VersionKey};
+use aruna_core::structs::storage::broken::BrokenVersion;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::connectors::repository::connector_reference_write;
+use aruna_operations::staging::root_record::{compact_version, root_write};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -45,6 +47,9 @@ enum State {
     },
     Deleted,
 }
+
+/// Versions from before a source binding could name its root by digest.
+pub(super) const BEFORE_ROOT: Layout = &[("PortableSourceDescriptor", 7)];
 
 /// Versions before the distributed bucket fields, whose sources had no digests or namespace.
 pub(super) const LAYOUT: Layout = &[
@@ -95,43 +100,95 @@ impl From<LegacyVersion> for BlobVersion {
     }
 }
 
-/// Connector reference rows missing for reference versions, reading `rewrites` over the stored
-/// rows. References from before the index have none, so connector checks would miss them.
-pub(super) fn reference_rows(
+/// A stored version in the current shape, from whichever shape it was stored in, and whether it
+/// was stored in an older one.
+fn current_version(value: &[u8]) -> Result<(BlobVersion, bool), postcard::Error> {
+    if let Ok(version) = session_refs::decode::<BlobVersion>(value, &[]) {
+        return Ok((version, false));
+    }
+    if let Ok(version) = session_refs::decode::<BlobVersion>(value, BEFORE_ROOT) {
+        return Ok((version, true));
+    }
+    match session_refs::decode::<BlobVersion>(value, LAYOUT) {
+        Ok(version) => Ok((version, true)),
+        Err(_) => Ok((
+            session_refs::decode::<LegacyVersion>(value, LAYOUT)?.into(),
+            true,
+        )),
+    }
+}
+
+/// Root record rows by digest.
+type RootRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Stored versions rewritten into the current shape, an external source binding compact, with
+/// the root records the compact bindings name, by digest.
+pub(super) fn compact_rows(
     db: &OptimisticTxDatabase,
     versions: &OptimisticTxKeyspace,
+    name: &str,
+) -> Result<(Rewrites, RootRows), ExplorerError> {
+    let (mut scanned, mut rows, mut roots) = (0, Vec::new(), BTreeMap::new());
+    for entry in db.read_tx().iter(versions) {
+        let (key, value) = entry.into_inner()?;
+        scanned += 1;
+        let failed = |error: &dyn std::fmt::Display| decode_error(name, &key, error);
+        let (version, relaid) = current_version(&value).map_err(|error| failed(&error))?;
+        let (version, root) = compact_version(version).map_err(|error| failed(&error))?;
+        if let Some(root) = root {
+            let (_, digest, record) = root_write(&root).map_err(|error| failed(&error))?;
+            roots.insert(digest.to_vec(), record.to_vec());
+        } else if !relaid {
+            continue;
+        }
+        let bytes = version.to_bytes().map_err(|error| failed(&error))?;
+        rows.push((key.to_vec(), bytes));
+    }
+    Ok((Rewrites { scanned, rows }, roots.into_iter().collect()))
+}
+
+/// Broken versions keep their full bindings; only their shape is brought up to date.
+pub(super) fn broken_version(value: &[u8]) -> Result<Option<Vec<u8>>, postcard::Error> {
+    if session_refs::decode::<BrokenVersion>(value, &[]).is_ok() {
+        return Ok(None);
+    }
+    let broken = session_refs::decode::<BrokenVersion>(value, BEFORE_ROOT)
+        .or_else(|_| session_refs::decode::<BrokenVersion>(value, LAYOUT))?;
+    Ok(Some(postcard::to_allocvec(&broken)?))
+}
+
+/// Connector reference rows missing for reference versions in `rewrites`. Rows already in the
+/// current shape were written with their index row; older ones may predate the index.
+pub(super) fn reference_rows(
+    db: &OptimisticTxDatabase,
     rewrites: &[(Vec<u8>, Vec<u8>)],
     index: &OptimisticTxKeyspace,
     name: &str,
 ) -> Result<Rewrites, ExplorerError> {
-    let rewrites: BTreeMap<&[u8], &[u8]> = rewrites
-        .iter()
-        .map(|(key, value)| (key.as_slice(), value.as_slice()))
-        .collect();
     let read = db.read_tx();
-    let (mut scanned, mut rows) = (0, Vec::new());
-    for entry in read.iter(versions) {
-        let (key, stored) = entry.into_inner()?;
-        scanned += 1;
-        let value = rewrites.get(key.as_ref()).copied().unwrap_or(&stored);
+    let mut rows = Vec::new();
+    for (key, value) in rewrites {
         let version =
-            BlobVersion::from_bytes(value).map_err(|error| decode_error(name, &key, error))?;
+            BlobVersion::from_bytes(value).map_err(|error| decode_error(name, key, error))?;
         let BlobVersionState::Reference { source, .. } = &version.state else {
             continue;
         };
         if source.connector_id.is_none() {
             continue;
         }
-        let row = VersionKey::from_bytes(&key)
+        let row = VersionKey::from_bytes(key)
             .and_then(|version_key| connector_reference_write(&version, &version_key));
-        let Some((_, row, value)) = row.map_err(|error| decode_error(name, &key, error))? else {
+        let Some((_, row, value)) = row.map_err(|error| decode_error(name, key, error))? else {
             continue;
         };
         if read.get(index, row.as_ref())?.is_none() {
             rows.push((row.to_vec(), value.to_vec()));
         }
     }
-    Ok(Rewrites { scanned, rows })
+    Ok(Rewrites {
+        scanned: rewrites.len(),
+        rows,
+    })
 }
 
 #[cfg(test)]
@@ -197,6 +254,7 @@ mod tests {
             capabilities: Vec::new(),
             origin_node_id: None,
             namespace: None,
+            root: None,
         };
         let metadata = SourceMetadata {
             content_length: 42,
@@ -217,10 +275,11 @@ mod tests {
         let deleted = BlobVersion::deleted(now, UserId::default());
         let current = reference.to_bytes().expect("encodes");
         let head = &current[..current.len() - 5];
+        // The namespace and the root are the descriptor's last two fields.
         let head = strip(
             head,
             &postcard::to_allocvec(&descriptor).expect("encodes"),
-            1,
+            2,
         );
         let old = strip(
             &head,
@@ -241,13 +300,103 @@ mod tests {
 
         assert_eq!(output.versions_rewritten, 2);
         let rows = read(&path, BLOB_VERSIONS_KEYSPACE);
-        assert_eq!(rows[b"reference".as_slice()], current);
+        let (compact, _) = compact_version(reference).expect("compacts");
+        let compact = compact.to_bytes().expect("encodes");
+        assert_eq!(rows[b"reference".as_slice()], compact);
         assert_eq!(rows[b"deleted".as_slice()], gone);
     }
 
     #[test]
+    fn stores_roots_once() {
+        // Two references to one public S3 source, stored before bindings named their root:
+        // both are stored compact and name one root record that gives their settings back.
+        use aruna_core::keyspaces::ROOT_RECORD_KEYSPACE;
+        use aruna_core::structs::storage::distribution::source_root::{RootEntry, SourceRoot};
+        let reference = |path: &str| {
+            let source = VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::S3,
+                    public_config: HashMap::from([
+                        ("bucket".to_string(), "bakrep".to_string()),
+                        ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                    ]),
+                    source_path: path.to_string(),
+                    version_selector: None,
+                    capabilities: vec!["head".to_string(), "read".to_string()],
+                    origin_node_id: None,
+                    namespace: None,
+                    root: None,
+                },
+                connector_id: Some(ulid::Ulid::from_bytes([6; 16])),
+            };
+            let metadata = SourceMetadata {
+                content_length: 3,
+                content_type: None,
+                etag: Some("e".to_string()),
+                last_modified: None,
+                source_version: None,
+                digests: BTreeMap::new(),
+            };
+            let now = SystemTime::UNIX_EPOCH;
+            BlobVersion::reference(source, metadata, now, UserId::default(), now)
+        };
+        let stored = |version: &BlobVersion| {
+            let current = version.to_bytes().expect("encodes");
+            let descriptor = &version.source_binding().expect("bound").descriptor;
+            strip(
+                &current,
+                &postcard::to_allocvec(descriptor).expect("encodes"),
+                1,
+            )
+        };
+        let (first, second) = (reference("a/1.gff"), reference("b/2.gff"));
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let database = path.to_str().expect("path");
+        let key = |name: &str, id: u8| {
+            let key = VersionKey::new("bucket", name, ulid::Ulid::from_bytes([id; 16]));
+            key.to_bytes().expect("key encodes")
+        };
+        let (first_key, second_key) = (key("a/1.gff", 1), key("b/2.gff", 2));
+        let rows = vec![
+            (first_key.as_slice(), stored(&first)),
+            (second_key.as_slice(), stored(&second)),
+        ];
+        write(&path, BLOB_VERSIONS_KEYSPACE, rows);
+
+        let output = migrate_output(database).expect("migration runs");
+
+        assert_eq!(
+            (output.versions_rewritten, output.source_roots_written),
+            (2, 1)
+        );
+        let roots = read(&path, ROOT_RECORD_KEYSPACE);
+        let root = SourceRoot::from_bytes(roots.values().next().expect("one root")).unwrap();
+        let rows = read(&path, BLOB_VERSIONS_KEYSPACE);
+        let compact = BlobVersion::from_bytes(&rows[&first_key]).expect("decodes");
+        let binding = compact.source_binding().expect("bound");
+        assert!(binding.descriptor.public_config.is_empty());
+        let full = RootEntry::hydrate(binding, &root)
+            .unwrap()
+            .expect("its root");
+        let expected = first.source_binding().expect("bound");
+        assert_eq!(
+            full.descriptor.public_config,
+            expected.descriptor.public_config
+        );
+        assert_eq!(full.descriptor.source_path, "a/1.gff");
+        let again = migrate_output(database).expect("migration repeats");
+        assert_eq!(
+            (again.versions_rewritten, again.source_roots_written),
+            (0, 0)
+        );
+    }
+
+    #[test]
     fn indexes_connector_references() {
-        // A reference bound to a connector, stored before the reference index existed.
+        // A reference bound to a connector, stored before bindings named their root and so
+        // possibly before the reference index existed.
         let connector_id = ulid::Ulid::from_bytes([6; 16]);
         let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
@@ -259,6 +408,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(connector_id),
         };
@@ -277,7 +427,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary directory");
         let path = temp.path().join("db");
         let database = path.to_str().expect("path");
-        let value = reference.to_bytes().expect("encodes");
+        let current = reference.to_bytes().expect("encodes");
+        let descriptor = &reference.source_binding().expect("bound").descriptor;
+        let descriptor = postcard::to_allocvec(descriptor).expect("encodes");
+        let value = strip(&current, &descriptor, 1);
         write(&path, BLOB_VERSIONS_KEYSPACE, vec![(key.as_slice(), value)]);
 
         let output = migrate_output(database).expect("migration runs");
@@ -288,5 +441,99 @@ mod tests {
         assert!(rows.contains_key(&row));
         let again = migrate_output(database).expect("migration repeats");
         assert_eq!(again.connector_references_written, 0);
+    }
+
+    /// A compact reference to a public S3 source bound to a connector, as an import stores it.
+    fn imported(path: &str) -> BlobVersion {
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::S3,
+                public_config: HashMap::from([
+                    ("bucket".to_string(), "bakrep".to_string()),
+                    ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                ]),
+                source_path: path.to_string(),
+                version_selector: None,
+                capabilities: vec!["head".to_string(), "read".to_string()],
+                origin_node_id: None,
+                namespace: None,
+                root: None,
+            },
+            connector_id: Some(ulid::Ulid::from_bytes([6; 16])),
+        };
+        let metadata = SourceMetadata {
+            content_length: 1234,
+            content_type: None,
+            etag: Some("etag".to_string()),
+            last_modified: None,
+            source_version: None,
+            digests: BTreeMap::new(),
+        };
+        let now = SystemTime::UNIX_EPOCH;
+        let version = BlobVersion::reference(source, metadata, now, UserId::default(), now);
+        compact_version(version).expect("compacts").0
+    }
+
+    /// Writes `count` imported references with their connector index and head rows.
+    fn write_imported(path: &std::path::Path, count: usize) {
+        use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
+        use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
+        use fjall::KeyspaceCreateOptions;
+        let db = fjall::OptimisticTxDatabase::builder(path).open().unwrap();
+        let open = |name| db.keyspace(name, KeyspaceCreateOptions::default).unwrap();
+        let versions = open(BLOB_VERSIONS_KEYSPACE);
+        let index = open(CONNECTOR_REFERENCE_KEYSPACE);
+        let heads = open(BLOB_HEAD_KEYSPACE);
+        for chunk in (0..count).collect::<Vec<_>>().chunks(50_000) {
+            let mut txn = db.write_tx().unwrap();
+            for &at in chunk {
+                let name = format!("genomes/{at:09}.gff");
+                let id = ulid::Ulid::from_parts(at as u64, 7);
+                let version = imported(&name);
+                let key = VersionKey::new("bucket", &name, id);
+                let (_, row, _) = connector_reference_write(&version, &key).unwrap().unwrap();
+                txn.insert(&index, row.to_vec(), b"");
+                let value = version.to_bytes().unwrap();
+                txn.insert(&versions, key.to_bytes().unwrap(), value);
+                let head = BlobHeadKey::new("bucket", &name).to_bytes().unwrap();
+                let pointer = CurrentVersionPointer::new(id).to_bytes().unwrap();
+                txn.insert(&heads, head, pointer);
+            }
+            txn.commit().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn keeps_current_rows() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        write_imported(&path, 3);
+        let before = read(&path, BLOB_VERSIONS_KEYSPACE);
+
+        let output = migrate_output(path.to_str().expect("path")).expect("migration runs");
+
+        assert_eq!((output.versions_scanned, output.versions_rewritten), (3, 0));
+        assert_eq!(output.connector_references_written, 0);
+        assert!(output.relaid_rows.is_empty());
+        assert_eq!(read(&path, BLOB_VERSIONS_KEYSPACE), before);
+    }
+
+    /// Times a migration over current rows; `MIGRATE_ROWS` sets the count, `TMPDIR` the disk.
+    #[test]
+    #[ignore = "measurement"]
+    fn current_rows_timing() {
+        let count = std::env::var("MIGRATE_ROWS").map_or(2_000_000, |rows| rows.parse().unwrap());
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let started = std::time::Instant::now();
+        write_imported(&path, count);
+        eprintln!("wrote {count} rows in {:?}", started.elapsed());
+
+        let started = std::time::Instant::now();
+        let output = migrate_output(path.to_str().expect("path")).expect("migration runs");
+
+        eprintln!("migrated {count} rows in {:?}", started.elapsed());
+        assert_eq!(output.versions_rewritten, 0);
     }
 }

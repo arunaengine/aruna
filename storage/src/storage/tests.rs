@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::tests_rebuild::{first_dropped, seal_journal};
 use super::{FjallPersistPolicy, FjallStorage, StorageHandle};
 use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
@@ -316,7 +317,7 @@ fn bulk_full_rejects() {
         .manual_journal_persist(true)
         .open()
         .unwrap();
-    let (bulk_sender, _bulk_receiver) = crossfire::mpsc::bounded_blocking(1);
+    let (bulk_sender, _bulk_receiver) = crossfire::mpmc::bounded_blocking(1);
     let mut storage = super::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
@@ -325,13 +326,12 @@ fn bulk_full_rejects() {
             std::collections::BTreeMap::new(),
         )),
         metrics: std::sync::Arc::new(super::StorageMetrics::default()),
-        read_pool: Vec::new(),
-        next_reader: 0,
-        bulk_read_pool: vec![bulk_sender],
-        next_bulk_reader: 0,
+        read_pool: crossfire::mpmc::bounded_blocking(1).0,
+        bulk_read_pool: bulk_sender,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
+        swept: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -351,8 +351,9 @@ fn bulk_full_rejects() {
     let guard = super::InFlightGuard::acquire(&metrics);
     let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
     assert!(
-        storage.bulk_read_pool[0]
-            .try_send((filler, filler_tx, span, Instant::now(), guard))
+        storage
+            .bulk_read_pool
+            .try_send(((filler, filler_tx, span, Instant::now(), guard), None))
             .is_ok(),
         "saturate bulk read pool"
     );
@@ -363,7 +364,7 @@ fn bulk_full_rejects() {
     let (target_tx, mut target_rx) = super::response_channel(super::ResponseToken::empty());
     let mut slow = super::SlowQueueAggregator::default();
     storage.forward_read(
-        (target, target_tx, span, Instant::now(), guard),
+        ((target, target_tx, span, Instant::now(), guard), None),
         StoragePriority::Bulk,
         &mut slow,
     );
@@ -1308,16 +1309,18 @@ fn unknown_commit_runs() {
     let mut storage = super::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
-        txns: std::collections::HashMap::from([(txn_id, super::Txn::Write(Box::new(txn)))]),
+        txns: std::collections::HashMap::from([(
+            txn_id,
+            super::Txn::Write(std::sync::Arc::new(txn)),
+        )]),
         transaction_cleanup,
         metrics: std::sync::Arc::new(super::StorageMetrics::default()),
-        read_pool: Vec::new(),
-        next_reader: 0,
-        bulk_read_pool: Vec::new(),
-        next_bulk_reader: 0,
+        read_pool: crossfire::mpmc::bounded_blocking(1).0,
+        bulk_read_pool: crossfire::mpmc::bounded_blocking(1).0,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
+        swept: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1363,13 +1366,12 @@ fn unknown_commit_retires() {
         txns: std::collections::HashMap::new(),
         transaction_cleanup,
         metrics: std::sync::Arc::new(super::StorageMetrics::default()),
-        read_pool: Vec::new(),
-        next_reader: 0,
-        bulk_read_pool: Vec::new(),
-        next_bulk_reader: 0,
+        read_pool: crossfire::mpmc::bounded_blocking(1).0,
+        bulk_read_pool: crossfire::mpmc::bounded_blocking(1).0,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
+        swept: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1409,16 +1411,18 @@ fn retry_skips_queued() {
     let mut storage = super::FjallStorage {
         store: super::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
-        txns: std::collections::HashMap::from([(txn_id, super::Txn::Write(Box::new(txn)))]),
+        txns: std::collections::HashMap::from([(
+            txn_id,
+            super::Txn::Write(std::sync::Arc::new(txn)),
+        )]),
         transaction_cleanup,
         metrics: std::sync::Arc::new(super::StorageMetrics::default()),
-        read_pool: Vec::new(),
-        next_reader: 0,
-        bulk_read_pool: Vec::new(),
-        next_bulk_reader: 0,
+        read_pool: crossfire::mpmc::bounded_blocking(1).0,
+        bulk_read_pool: crossfire::mpmc::bounded_blocking(1).0,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
+        swept: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -2594,4 +2598,73 @@ async fn aborted_usage_discarded() {
     abort_transaction(&handle, txn_id).await;
 
     assert_eq!(read_usage(&handle, None).await, None);
+}
+
+/// Compaction that empties a keyspace, or keeps only older rows, still lets Fjall delete a
+/// journal that another keyspace held meanwhile.
+#[tokio::test]
+async fn compaction_drops_journals() {
+    for keep in [false, true] {
+        let dir = tempdir().unwrap();
+        let (handle, _receivers) = StorageHandle::new();
+        let mut storage = worker(&dir, &handle);
+        let jobs = stub_compactor(&mut storage);
+        let db = storage.store.db.clone();
+        let open = |name| {
+            db.keyspace(name, fjall::KeyspaceCreateOptions::default)
+                .unwrap()
+        };
+        let drained = open("dht_meta_v2");
+        if keep {
+            drained.inner().insert("older", "row").unwrap();
+        }
+        for index in 0..crate::compaction::DELETE_THRESHOLD {
+            drained.inner().insert(index.to_string(), "row").unwrap();
+        }
+        storage.process_effect(delete_batch(crate::compaction::DELETE_THRESHOLD));
+        // An unflushed row holds the first journal while the compaction runs.
+        let pending = open("pending");
+        pending.inner().insert("pending", "row").unwrap();
+        seal_journal(&db);
+        (jobs.try_recv().expect("compaction is queued").run)().unwrap();
+        pending.inner().rotate_memtable_and_wait().unwrap();
+        first_dropped(dir.path()).await;
+    }
+}
+
+/// Fjall's own compaction can drop every tombstone of a keyspace, which then holds a journal
+/// another keyspace kept meanwhile; a sweep lets that journal go.
+#[tokio::test]
+async fn sweep_drops_journals() {
+    let dir = tempdir().unwrap();
+    let (handle, _receivers) = StorageHandle::new();
+    let mut storage = worker(&dir, &handle);
+    let jobs = stub_compactor(&mut storage);
+    let db = storage.store.db.clone();
+    let open = |name| {
+        db.keyspace(name, fjall::KeyspaceCreateOptions::default)
+            .unwrap()
+    };
+    let drained = open("drained");
+    let drained = drained.inner();
+    drained.insert("owed", "row").unwrap();
+    drained.rotate_memtable_and_wait().unwrap();
+    drained.remove("owed").unwrap();
+    let pending = open("pending");
+    pending.inner().insert("pending", "row").unwrap();
+    seal_journal(&db);
+    // Four level 0 runs make Fjall merge them into the last level, which drops tombstones.
+    for key in ["owed", "a", "b", "c"] {
+        drained.remove(key).unwrap();
+        drained.rotate_memtable_and_wait().unwrap();
+    }
+    let cap = Instant::now() + Duration::from_secs(120);
+    while drained.table_count() > 0 {
+        assert!(Instant::now() < cap, "the keyspace never compacts away");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    pending.inner().rotate_memtable_and_wait().unwrap();
+    storage.compactor.sweep(db.clone());
+    (jobs.try_recv().expect("sweep is queued").run)().unwrap();
+    first_dropped(dir.path()).await;
 }

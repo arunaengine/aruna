@@ -39,6 +39,7 @@ async fn connector_crud_redacts() {
                 ("access_key_id".to_string(), "AKIA".to_string()),
                 ("secret_access_key".to_string(), "super-secret".to_string()),
             ]),
+            connector_id: None,
         }),
     )
     .await
@@ -125,6 +126,7 @@ async fn connectors_require_permission() {
                 "https://example.org".to_string(),
             )]),
             secret_config: HashMap::new(),
+            connector_id: None,
         }),
     )
     .await;
@@ -191,6 +193,22 @@ fn check_maps_unreachable() {
     assert_eq!(check_error_message(&error), "connector is unreachable");
 }
 
+// A missing setting is named; provider text behind other creation failures stays hidden.
+#[test]
+fn check_names_setting() {
+    use aruna_core::errors::StagingSourceError;
+    use aruna_operations::staging::check_source::CheckSourceError;
+    let missing = CheckSourceError::Staging(StagingSourceError::MissingSetting("region"));
+    let failed = StagingSourceError::OperatorCreationFailed("secret-marker".to_string());
+
+    assert_eq!(
+        check_error_message(&missing),
+        "the connector configuration names no region"
+    );
+    let hidden = check_error_message(&CheckSourceError::Staging(failed));
+    assert_eq!(hidden, "connector configuration is invalid");
+}
+
 #[tokio::test]
 async fn stored_check_resolves() {
     let test = setup_state().await;
@@ -209,6 +227,7 @@ async fn stored_check_resolves() {
                 ("access_key_id".to_string(), "AKIA".to_string()),
                 ("secret_access_key".to_string(), "stored-secret".to_string()),
             ]),
+            connector_id: None,
         }),
     )
     .await
@@ -439,6 +458,7 @@ fn requests_hide_secrets() {
                 kind: ApiConnectorKind::Http,
                 public_config: HashMap::new(),
                 secret_config: secret(),
+                connector_id: None,
             }
         ),
         format!(

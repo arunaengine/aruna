@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    API_PREFIX, RELAYED_ROUTES, may_try_next, may_try_response, pinned_route, pinned_targets,
-    relay_route, relay_targets, relay_url, relayed_headers,
+    API_PREFIX, RELAYED_ROUTES, gateway_failed, may_try_next, may_try_response, pinned_route,
+    pinned_targets, relay_route, relay_targets, relay_url, relayed_headers,
 };
 use crate::error::{ErrorResponse, ServerError};
 use axum::body::to_bytes;
@@ -222,6 +222,10 @@ async fn post_failure_stops() {
     // A failure after the connect succeeded may already have minted a secret.
     assert!(!may_try_next(&Method::POST, false));
     assert!(!may_try_next(&Method::DELETE, false));
+    assert!(!gateway_failed(
+        &Method::POST,
+        StatusCode::SERVICE_UNAVAILABLE
+    ));
 
     let response = ServerError::RelayFailed.into_response();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -259,4 +263,12 @@ fn allowlist_matches_router() {
             "{method} {route} must match the relay allowlist"
         );
     }
+}
+
+#[test]
+fn promotion_fits_relay() {
+    // A relayed promotion answers, ready or not, well before the relay gives up on it.
+    let margin = std::time::Duration::from_secs(5);
+    let budget = aruna_operations::realm::promote_node::CALL_BUDGET;
+    assert!(budget + margin <= super::RELAY_TIMEOUT);
 }

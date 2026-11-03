@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -42,6 +42,8 @@ use ulid::Ulid;
 
 use super::bootstrap::{BOOTSTRAP_POLL, bootstrap_waiting, process_bootstrap};
 use super::members::{MemberTarget, bound_record, member_jobs, member_publication};
+use super::page::deliver::{MetadataSender, PageSender, deliver_pages, pageable};
+use super::page::{PAGE_BYTES, PAGE_RECORDS};
 use super::parking::{PARKED_DUE, park_job};
 use super::plaintext::{consent_delete, consent_write, job_consent, plaintext_allowed};
 use super::protocol::{ReferenceAdvance, ReplicationMode, SyncOrigin};
@@ -58,10 +60,15 @@ use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 const REPLICATION_PAGE_SIZE: usize = 512;
 const REPLICATION_BATCH_SIZE: usize = 64;
 const STATS_PAGE_SIZE: usize = 256;
-const OBLIGATION_BATCH_SIZE: usize = 64;
+/// Obligations one pass reads; those without sync work are retired together.
+const OBLIGATION_BATCH_SIZE: usize = super::page::PAGE_RECORDS;
+/// Obligations one pass turns into replication jobs.
+const OBLIGATION_WORK_LIMIT: usize = 64;
 const REPLICATION_JOB_LIMIT: usize = 64;
 const REPLICATION_RELATIONSHIP_LIMIT: usize = 1024;
 const REPLICATION_CURSOR_KEY: &[u8] = b"blob_replication_cursor";
+/// The obligation the next obligation pass continues after, so later ones get their turn.
+const OBLIGATION_CURSOR_KEY: &[u8] = b"live_obligation_cursor";
 
 pub const REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
 pub const REPLICATION_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -154,6 +161,8 @@ struct LiveObligationIdentity<'a> {
 
 struct BlobJobScan {
     jobs: Vec<(Vec<u8>, BlobJobRecord)>,
+    /// The generation the scan started in.
+    generation: u64,
     has_more_due: bool,
     next_due_ms: Option<u64>,
     next_cursor: ReplicationScanCursor,
@@ -190,6 +199,8 @@ struct LiveRepairResult {
     processed: usize,
     queued: usize,
     has_more: bool,
+    /// When the oldest obligation read was written.
+    oldest_ms: Option<u64>,
 }
 
 impl BlobJobRecord {
@@ -250,6 +261,15 @@ impl BlobJobRecord {
     pub fn with_member(mut self, target: MemberTarget) -> Self {
         self.distribution = Some(target);
         self
+    }
+
+    /// When the version this job delivers was written, which dates its obligation; the
+    /// enqueue time for other jobs.
+    pub fn owed_since_ms(&self) -> u64 {
+        match &self.input.target {
+            ReplicateScopeTarget::Version { version_id, .. } => version_id.timestamp_ms(),
+            _ => self.enqueued_at_ms,
+        }
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -1226,6 +1246,15 @@ async fn live_obligations_exist(storage: &StorageHandle) -> Result<bool, BlobQue
 pub async fn process_blob_batch(
     context: &DriverContext,
 ) -> Result<BlobDrainResult, BlobQueueError> {
+    drain_batch(context, &MetadataSender(context)).await
+}
+
+/// One drain: obligations become jobs, member jobs of reference records go out in pages, and
+/// a bounded number of other jobs is delivered one by one.
+pub(crate) async fn drain_batch(
+    context: &DriverContext,
+    sender: &impl PageSender,
+) -> Result<BlobDrainResult, BlobQueueError> {
     let batch_started = Instant::now();
     let repair = process_live_obligations(context).await?;
     let bootstrap = process_bootstrap(context).await.unwrap_or_else(|error| {
@@ -1233,22 +1262,40 @@ pub async fn process_blob_batch(
         true
     });
     let now_ms = unix_timestamp_millis();
-    let scan = scan_due_jobs(&context.storage_handle, now_ms, REPLICATION_BATCH_SIZE).await?;
+    let scan = scan_due_jobs(&context.storage_handle, now_ms, PAGE_RECORDS).await?;
     let mut next_due_ms = scan.next_due_ms;
-    let has_more_due = repair.has_more || scan.has_more_due;
+    let mut has_more_due = repair.has_more || scan.has_more_due;
     let scan_elapsed = batch_started.elapsed();
     let job_count = scan.jobs.len();
-    let oldest_lag_ms = scan
-        .jobs
-        .iter()
-        .map(|(_, job)| now_ms.saturating_sub(job.due_at_ms))
+    // Lag counts from the obligation, which a version's id dates, not from a retry's due time.
+    let oldest_lag_ms = (scan.jobs.iter())
+        .map(|(_, job)| now_ms.saturating_sub(job.owed_since_ms()))
+        .chain(repair.oldest_ms.map(|owed| now_ms.saturating_sub(owed)))
         .max()
         .unwrap_or(0);
 
-    let mut succeeded = 0usize;
-    let mut failed = 0usize;
-    let mut relationships = read_job_relationships(&context.storage_handle, &scan.jobs).await?;
-    for (job_key, job) in scan.jobs {
+    let (paged, mut singles): (Vec<_>, Vec<_>) =
+        (scan.jobs.into_iter()).partition(|(_, job)| pageable(job));
+    let pages = deliver_pages(context, paged, sender).await?;
+    if let Some(due_at_ms) = pages.next_due_ms {
+        next_due_ms = min_due_at(next_due_ms, due_at_ms);
+    }
+    // A record held back for a later page is still due.
+    has_more_due |= pages.later > 0;
+    singles.extend(pages.single);
+    singles.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut next_cursor = scan.next_cursor;
+    // Jobs past the single bound stay due; the next drain continues after the last one sent.
+    if singles.len() > REPLICATION_BATCH_SIZE {
+        singles.truncate(REPLICATION_BATCH_SIZE);
+        next_cursor.generation = scan.generation;
+        next_cursor.after = singles.last().map(|(key, _)| key.clone());
+        has_more_due = true;
+    }
+    let mut succeeded = pages.delivered;
+    let mut failed = pages.failed;
+    let mut relationships = read_job_relationships(&context.storage_handle, &singles).await?;
+    for (job_key, job) in singles {
         let relationship = job.relationship_id.and_then(|relationship_id| {
             relationships
                 .get(&(job.input.bucket.clone(), relationship_id))
@@ -1287,7 +1334,7 @@ pub async fn process_blob_batch(
         }
     }
 
-    advance_replication_cursor(&context.storage_handle, scan.next_cursor).await?;
+    advance_replication_cursor(&context.storage_handle, next_cursor).await?;
 
     if job_count > 0 || repair.processed > 0 {
         info!(
@@ -1866,7 +1913,10 @@ async fn read_job_relationships(
 async fn process_live_obligations(
     context: &DriverContext,
 ) -> Result<LiveRepairResult, BlobQueueError> {
-    let (obligations, has_more) = read_live_obligations(&context.storage_handle).await?;
+    let after = read_obligation_cursor(&context.storage_handle).await?;
+    let (obligations, next) = read_live_obligations(&context.storage_handle, after.clone()).await?;
+    // A pass that started past the first obligation wraps to the start next.
+    let has_more = next.is_some() || after.is_some();
     let mut starts = HashMap::<String, Option<Vec<u8>>>::new();
     for (_, obligation) in &obligations {
         if obligation
@@ -1921,8 +1971,14 @@ async fn process_live_obligations(
     }
     let mut result = LiveRepairResult {
         has_more,
+        oldest_ms: (obligations.iter())
+            .map(|(_, obligation)| obligation.version_id.timestamp_ms())
+            .min(),
         ..Default::default()
     };
+    let mut retired = Vec::new();
+    let mut member_work = Vec::new();
+    let mut worked = 0usize;
 
     for (obligation_key, obligation) in obligations {
         let cursor = obligation.continuation.clone().unwrap_or_default();
@@ -1947,6 +2003,20 @@ async fn process_live_obligations(
             }
             _ => Vec::new(),
         };
+        // A version of a bucket nothing replicates to owes no job: such obligations, one per
+        // imported file, are retired in one transaction instead of one each.
+        let idle = relationships.is_none_or(|page| page.values.is_empty() && page.next.is_none());
+        // Without sync work an obligation owes only its member jobs, queued in one batch.
+        if idle && !hop_exhausted {
+            member_work.extend(members);
+            retired.push((obligation_key, obligation.continuation));
+            continue;
+        }
+        if worked == OBLIGATION_WORK_LIMIT {
+            result.has_more = true;
+            continue;
+        }
+        worked += 1;
         let write =
             write_live_jobs(&context.storage_handle, &obligation, relationships, members).await?;
         if !write.progressed {
@@ -1969,18 +2039,188 @@ async fn process_live_obligations(
         result.processed = result.processed.saturating_add(1);
         result.queued = result.queued.saturating_add(write.queued);
     }
+    result.processed = result.processed.saturating_add(retired.len());
+    result.queued = result.queued.saturating_add(member_work.len());
+    let storage = &context.storage_handle;
+    retire_obligations(storage, retired, member_work, (after, next)).await?;
 
     Ok(result)
 }
 
+/// Queues `jobs` and deletes the obligations, a continued one only while it still holds the
+/// continuation read, with the obligation cursor moved from `cursor.0` to `cursor.1`, in one
+/// transaction.
+async fn retire_obligations(
+    storage: &StorageHandle,
+    obligations: Vec<(Vec<u8>, Option<LiveReplicationContinuation>)>,
+    jobs: Vec<BlobJobRecord>,
+    cursor: (Option<Vec<u8>>, Option<Vec<u8>>),
+) -> Result<(), BlobQueueError> {
+    if obligations.is_empty() && jobs.is_empty() {
+        if cursor.0 != cursor.1 {
+            write_obligation_cursor(storage, cursor.1).await?;
+        }
+        return Ok(());
+    }
+    let unexpected = |other: Event| BlobQueueError::UnexpectedEvent(format!("{other:?}"));
+    // One drain at a time creates or parks member jobs, so this read needs no transaction.
+    let existing = read_existing_jobs(storage, &jobs).await?;
+    // Only a drain sets continuations; any other rewrite owes just the jobs queued here.
+    let (fresh, obligations): (Vec<_>, Vec<_>) =
+        (obligations.into_iter()).partition(|(_, expected)| expected.is_none());
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(unexpected(other)),
+    };
+    let reads: Vec<_> = (obligations.iter())
+        .map(|(key, _)| {
+            let key = ByteView::from(key.clone());
+            (REPLICATION_OBLIGATION_KEYSPACE.to_string(), key)
+        })
+        .collect();
+    let read = StorageEffect::BatchRead {
+        reads,
+        txn_id: Some(txn_id),
+    };
+    let values = match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
+        other => {
+            abort_cursor(storage, txn_id).await;
+            return Err(match other {
+                Event::Storage(StorageEvent::Error { error }) => error.into(),
+                other => unexpected(other),
+            });
+        }
+    };
+    let mut writes = Vec::with_capacity(jobs.len() + 1);
+    for (job, value) in jobs.iter().zip(existing) {
+        let kept = value
+            .as_deref()
+            .and_then(|value| BlobJobRecord::from_bytes(value).ok())
+            .is_some_and(|existing| blob_job_preferred(&existing, job));
+        if !kept {
+            writes.push(blob_job_entry(job)?);
+        }
+    }
+    writes.push(obligation_cursor_entry(cursor.1)?);
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: Some(txn_id),
+    };
+    match storage.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        other => {
+            abort_cursor(storage, txn_id).await;
+            return Err(match other {
+                Event::Storage(StorageEvent::Error { error }) => error.into(),
+                other => unexpected(other),
+            });
+        }
+    }
+    let deletes = (obligations.into_iter().zip(values))
+        .filter(|((_, expected), (_, value))| {
+            value
+                .as_deref()
+                .is_some_and(|value| match LiveObligationRecord::from_bytes(value) {
+                    Ok(record) => record.continuation == *expected,
+                    Err(_) => expected.is_none(),
+                })
+        })
+        .map(|((key, _), _)| key)
+        .chain(fresh.into_iter().map(|(key, _)| key))
+        .map(|key| (REPLICATION_OBLIGATION_KEYSPACE.to_string(), key.into()))
+        .collect();
+    let delete = StorageEffect::BatchDelete {
+        deletes,
+        txn_id: Some(txn_id),
+    };
+    match storage.send_storage_effect(delete).await {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+        other => {
+            abort_cursor(storage, txn_id).await;
+            return Err(match other {
+                Event::Storage(StorageEvent::Error { error }) => error.into(),
+                other => unexpected(other),
+            });
+        }
+    }
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// The stored row of each job, from one range read while the range holds no other rows, as
+/// lookups key by key cost far more than a range in these churned keyspaces.
+async fn read_existing_jobs(
+    storage: &StorageHandle,
+    jobs: &[BlobJobRecord],
+) -> Result<Vec<Option<ByteView>>, BlobQueueError> {
+    let keys = jobs
+        .iter()
+        .map(blob_job_key)
+        .collect::<Result<Vec<_>, _>>()?;
+    let (Some(first), Some(last)) = (keys.iter().min(), keys.iter().max()) else {
+        return Ok(Vec::new());
+    };
+    let range = StorageEffect::IterRange {
+        key_space: REPLICATION_JOB_KEYSPACE.to_string(),
+        start: IterStart::At(first.clone()),
+        end: IterEnd::Through(last.clone()),
+        limit: keys.len(),
+        max_bytes: PAGE_BYTES,
+        txn_id: None,
+    };
+    match storage.send_storage_effect(range).await {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        }) => {
+            let rows: HashMap<_, _> = values.into_iter().collect();
+            return Ok(keys.iter().map(|key| rows.get(key).cloned()).collect());
+        }
+        // A range holding more rows than `jobs` is read key by key.
+        Event::Storage(StorageEvent::IterResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+    }
+    let reads = (keys.into_iter())
+        .map(|key| (REPLICATION_JOB_KEYSPACE.to_string(), key))
+        .collect();
+    match storage
+        .send_storage_effect(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            Ok(values.into_iter().map(|(_, value)| value).collect())
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+    }
+}
+
+/// Obligations after `after`, and the key the next pass continues after; `None` once the
+/// read reached the end.
 async fn read_live_obligations(
     storage: &StorageHandle,
-) -> Result<(Vec<(Vec<u8>, LiveObligationRecord)>, bool), BlobQueueError> {
+    after: Option<Vec<u8>>,
+) -> Result<(Vec<(Vec<u8>, LiveObligationRecord)>, Option<Vec<u8>>), BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
             prefix: None,
-            start: None,
+            start: after.map(|key| IterStart::After(key.into())),
             limit: OBLIGATION_BATCH_SIZE,
             txn_id: None,
         })
@@ -2001,7 +2241,7 @@ async fn read_live_obligations(
                     }
                 }
             }
-            Ok((obligations, next_start_after.is_some()))
+            Ok((obligations, next_start_after.map(|key| key.to_vec())))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
@@ -2466,6 +2706,52 @@ async fn delete_live_obligation(
     }
 }
 
+async fn read_obligation_cursor(
+    storage: &StorageHandle,
+) -> Result<Option<Vec<u8>>, BlobQueueError> {
+    let read = StorageEffect::Read {
+        key_space: NODE_STATE_KEYSPACE.to_string(),
+        key: ByteView::from(OBLIGATION_CURSOR_KEY.to_vec()),
+        txn_id: None,
+    };
+    match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_vec())),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+    }
+}
+
+/// The cursor row; an empty value starts the next pass at the first obligation.
+fn obligation_cursor_entry(
+    after: Option<Vec<u8>>,
+) -> Result<(String, Key, ByteView), BlobQueueError> {
+    Ok((
+        NODE_STATE_KEYSPACE.to_string(),
+        ByteView::from(OBLIGATION_CURSOR_KEY.to_vec()),
+        ByteView::from(after.unwrap_or_default()),
+    ))
+}
+
+async fn write_obligation_cursor(
+    storage: &StorageHandle,
+    after: Option<Vec<u8>>,
+) -> Result<(), BlobQueueError> {
+    let (key_space, key, value) = obligation_cursor_entry(after)?;
+    let write = StorageEffect::Write {
+        key_space,
+        key,
+        value,
+        txn_id: None,
+    };
+    match storage.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+    }
+}
+
 async fn read_replication_cursor(
     storage: &StorageHandle,
 ) -> Result<ReplicationScanCursor, BlobQueueError> {
@@ -2623,7 +2909,7 @@ async fn scan_due_jobs(
             key_space: REPLICATION_JOB_KEYSPACE.to_string(),
             prefix: None,
             start: start_after.map(|key| IterStart::After(ByteView::from(key))),
-            limit: REPLICATION_PAGE_SIZE,
+            limit: PAGE_RECORDS,
             txn_id: None,
         })
         .await;
@@ -2639,6 +2925,8 @@ async fn scan_due_jobs(
     };
     let mut last_key;
     let page_empty = values.is_empty();
+    // The scan meets each key once; only after a key repair may a job already be taken.
+    let mut repaired = false;
 
     for (key, value) in values {
         let mut key = key.to_vec();
@@ -2653,6 +2941,7 @@ async fn scan_due_jobs(
         };
         let canonical_key = blob_job_key(&job)?.to_vec();
         if canonical_key.as_slice() != key.as_slice() {
+            repaired = true;
             warn!(key = ?key, "Repairing blob replication job stored under non-canonical key");
             if let Some(existing) = read_blob_job(storage, &canonical_key).await?
                 && blob_job_preferred(&existing, &job)
@@ -2678,13 +2967,14 @@ async fn scan_due_jobs(
             next_due_ms = min_due_at(next_due_ms, job.due_at_ms);
             continue;
         }
-        if merge_due_job(&mut jobs, key, job, limit) {
+        if merge_due_job(&mut jobs, key, job, (repaired, limit)) {
             return Ok(BlobJobScan {
                 next_cursor: ReplicationScanCursor {
                     generation: cursor.generation,
                     after: last_key,
                     next_due_ms,
                 },
+                generation: cursor.generation,
                 jobs,
                 has_more_due: true,
                 next_due_ms,
@@ -2699,6 +2989,7 @@ async fn scan_due_jobs(
                 after: Some(next.to_vec()),
                 next_due_ms,
             },
+            generation: cursor.generation,
             jobs,
             has_more_due: true,
             next_due_ms,
@@ -2715,6 +3006,7 @@ async fn scan_due_jobs(
             after: None,
             next_due_ms,
         },
+        generation: cursor.generation,
         jobs,
         has_more_due: false,
         next_due_ms,
@@ -2818,12 +3110,13 @@ fn merge_due_job(
     jobs: &mut Vec<(Vec<u8>, BlobJobRecord)>,
     key: Vec<u8>,
     job: BlobJobRecord,
-    limit: usize,
+    (repaired, limit): (bool, usize),
 ) -> bool {
-    if let Some((_, existing)) = jobs
-        .iter_mut()
-        .find(|(existing_key, _)| existing_key.as_slice() == key.as_slice())
-    {
+    let existing = match repaired {
+        true => (jobs.iter_mut()).find(|(existing_key, _)| *existing_key == key),
+        false => None,
+    };
+    if let Some((_, existing)) = existing {
         if blob_job_preferred(&job, existing) {
             *existing = job;
         }
@@ -4769,6 +5062,220 @@ mod tests {
         assert_eq!(second.processed, 2);
         assert_eq!(second.failed, 2);
         assert!(read_obligations(&storage).await.is_empty());
+    }
+
+    /// Writes one obligation per key of `keys` in one batch.
+    async fn write_obligations(storage: &StorageHandle, keys: impl Iterator<Item = String>) {
+        let writes = keys
+            .enumerate()
+            .map(|(index, key)| {
+                let id = Ulid::from_parts(1_700_000_000_000, index as u128);
+                let obligation = LiveObligationRecord::new(
+                    node(1),
+                    auth_context(),
+                    "bucket".to_string(),
+                    key,
+                    id,
+                    false,
+                );
+                live_obligation_entry(&obligation).expect("obligation encodes")
+            })
+            .collect();
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        let event = storage.send_storage_effect(write).await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+    }
+
+    async fn obligation_keys(storage: &StorageHandle) -> Vec<String> {
+        let iter = StorageEffect::Iter {
+            key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 2 * OBLIGATION_BATCH_SIZE,
+            txn_id: None,
+        };
+        let Event::Storage(StorageEvent::IterResult { values, .. }) =
+            storage.send_storage_effect(iter).await
+        else {
+            panic!("obligations are readable");
+        };
+        let records = values
+            .iter()
+            .map(|(_, value)| LiveObligationRecord::from_bytes(value).expect("obligation decodes"));
+        records.map(|obligation| obligation.key).collect()
+    }
+
+    #[tokio::test]
+    async fn obligation_scan_rotates() {
+        // A pass continues after the last obligation the previous one read, so obligations that
+        // sort first and keep arriving never hold back later ones.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        write_bucket(&storage, "bucket").await;
+        let late = (0..=OBLIGATION_BATCH_SIZE).map(|index| format!("z/{index:05}"));
+        write_obligations(&storage, late).await;
+        repair_live(&storage).await;
+        let last = format!("z/{OBLIGATION_BATCH_SIZE:05}");
+        assert_eq!(obligation_keys(&storage).await, vec![last]);
+        let early = (0..OBLIGATION_BATCH_SIZE).map(|index| format!("a/{index:05}"));
+        write_obligations(&storage, early).await;
+        repair_live(&storage).await;
+        let keys = obligation_keys(&storage).await;
+        assert_eq!(
+            keys.len(),
+            OBLIGATION_BATCH_SIZE,
+            "the later one went first"
+        );
+        assert!(keys.iter().all(|key| key.starts_with("a/")));
+        // The next pass wraps to the start.
+        repair_live(&storage).await;
+        assert!(obligation_keys(&storage).await.is_empty());
+    }
+
+    #[test]
+    fn lag_dates_obligation() {
+        // A retried job's lag counts from when its version was written, not from its due time.
+        let version_id = Ulid::from_parts(1_000, 7);
+        let mut input = on_demand_input();
+        input.target = ReplicateScopeTarget::Version {
+            key: "key".to_string(),
+            version_id,
+        };
+        let job = BlobJobRecord::new(input, Some(false), 9_000);
+        assert_eq!(job.owed_since_ms(), 1_000);
+    }
+
+    // A large import into a bucket nothing replicates to leaves one obligation per file; they
+    // are retired in one pass with a fixed number of requests, not one transaction each.
+    #[tokio::test]
+    async fn idle_obligations_retired() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        write_bucket(&storage, "bucket").await;
+        for index in 0..300u64 {
+            let Effect::Storage(effect) = build_live_obligation(
+                node(1),
+                auth_context(),
+                "bucket".to_string(),
+                format!("key-{index:03}"),
+                Ulid::from_parts(index, 1),
+                false,
+                None,
+            )
+            .expect("obligation effect builds") else {
+                panic!("expected storage effect");
+            };
+            storage.send_storage_effect(effect).await;
+        }
+
+        let before = storage.snapshot_metrics().requests_total;
+        repair_live(&storage).await;
+
+        assert!(storage.snapshot_metrics().requests_total - before < 16);
+        let remaining = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            remaining,
+            Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty()
+        ));
+        assert!(read_jobs(&storage).await.is_empty());
+    }
+
+    // Retiring keeps a stored job that is retrying, whether its range holds only the queued jobs
+    // or other jobs too, and keeps an obligation whose continuation changed since it was read.
+    #[tokio::test]
+    async fn retire_keeps_retries() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let job = |key: &str, attempts: u32| {
+            let target = ReplicateScopeTarget::Object {
+                key: key.to_string(),
+            };
+            let input = ReplicateScopeInput {
+                target,
+                ..on_demand_input()
+            };
+            let mut job = BlobJobRecord::new(input, None, 5);
+            job.attempts = attempts;
+            job
+        };
+        let obligation = |key: &str| {
+            LiveObligationRecord::new(
+                node(1),
+                auth_context(),
+                "bucket".to_string(),
+                key.to_string(),
+                Ulid::from_parts(1, 1),
+                false,
+            )
+        };
+        let mut continued = obligation("continued");
+        continued.continuation = Some(LiveReplicationContinuation {
+            relationships_complete: true,
+            ..Default::default()
+        });
+        for record in [obligation("fresh"), continued.clone()] {
+            super::write_live_obligation(&storage, &record)
+                .await
+                .unwrap();
+        }
+        write_blob_job(&storage, &job("a", 3)).await.unwrap();
+        let retired = vec![
+            (
+                live_obligation_key(&obligation("fresh")).unwrap().to_vec(),
+                None,
+            ),
+            (
+                live_obligation_key(&continued).unwrap().to_vec(),
+                Some(LiveReplicationContinuation::default()),
+            ),
+        ];
+        let queued = || vec![job("a", 0), job("c", 0)];
+        retire_obligations(&storage, retired, queued(), (None, None))
+            .await
+            .unwrap();
+        write_blob_job(&storage, &job("b", 0)).await.unwrap();
+        write_blob_job(&storage, &job("c", 2)).await.unwrap();
+        retire_obligations(&storage, Vec::new(), queued(), (None, None))
+            .await
+            .unwrap();
+
+        let attempts: Vec<_> = (read_jobs(&storage).await.into_iter())
+            .map(|(_, job)| job.attempts)
+            .collect();
+        assert_eq!(attempts, [3, 0, 2], "retrying jobs a and c are kept");
+        let remaining = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: REPLICATION_OBLIGATION_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 8,
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = remaining else {
+            panic!("obligations are readable");
+        };
+        let kept: Vec<_> = (values.iter())
+            .map(|(_, value)| LiveObligationRecord::from_bytes(value).unwrap().key)
+            .collect();
+        assert_eq!(kept, ["continued"], "only the changed obligation stays");
     }
 
     #[tokio::test]

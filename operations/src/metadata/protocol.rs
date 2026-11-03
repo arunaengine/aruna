@@ -604,6 +604,35 @@ pub enum MetadataTransportMessage {
     StagingSpecResult {
         result: Result<Box<crate::distribution::imports::HandedImport>, MetadataReadError>,
     },
+    /// Reference records of one range from its coordinator, applied in one transaction.
+    ReferencePage {
+        page: Box<crate::replication::page::ReferencePage>,
+    },
+    ReferencePageAnswer {
+        answer: crate::replication::page::PageAnswer,
+    },
+    /// The realm signing key a management node hands a server node it promotes.
+    HandRealmKey {
+        key: RealmKeyPem,
+    },
+    RealmKeyStored {
+        result: Result<(), MetadataReadError>,
+    },
+    /// Asks a node being promoted whether its next start applies the handed realm key.
+    PromotionCheck,
+    PromotionReady {
+        result: Result<bool, MetadataReadError>,
+    },
+}
+
+/// PKCS8 PEM of the realm signing key; Debug never prints it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealmKeyPem(pub String);
+
+impl std::fmt::Debug for RealmKeyPem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RealmKeyPem(<redacted>)")
+    }
 }
 
 /// One document as a holder serves it to a device.

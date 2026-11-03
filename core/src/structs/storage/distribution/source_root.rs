@@ -18,6 +18,15 @@ use crate::structs::execution::staging::{
 };
 
 const ROOT_DOMAIN: &[u8] = b"aruna-source-root-v1";
+/// Capability names an observation implies, which older versions stored.
+const DERIVED: [&str; 6] = [
+    "head",
+    "read",
+    "versioned",
+    "etag",
+    "last_modified",
+    "content_type",
+];
 /// Follows a root's row key in the row that marks the root checked.
 const CHECKED_TAG: u8 = 0x01;
 /// Public configuration that names one object rather than its source, kept out of the root.
@@ -32,6 +41,14 @@ pub struct SourceRoot {
 }
 
 impl SourceRoot {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
     pub fn digest(&self) -> Result<[u8; 32], ConversionError> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(ROOT_DOMAIN);
@@ -53,6 +70,10 @@ impl RootEntry {
     /// The root of an external reference; native and device-local sources have none.
     pub fn of(source: &VersionSourceBinding) -> Option<Self> {
         let descriptor = &source.descriptor;
+        // A compact binding names its root by digest; its settings are in the node's record.
+        if descriptor.root.is_some() {
+            return None;
+        }
         if matches!(
             descriptor.kind,
             SourceConnectorKind::ArunaNative | SourceConnectorKind::LocalDirectory
@@ -74,6 +95,62 @@ impl RootEntry {
         })
     }
 
+    /// The binding as a node stores it: the root's settings give way to the root's digest, which
+    /// the node keeps once with `root`. `None` for a native, offered or already compact binding.
+    pub fn compact(
+        source: &VersionSourceBinding,
+    ) -> Result<Option<(VersionSourceBinding, SourceRoot)>, ConversionError> {
+        if source.descriptor.root.is_some() {
+            return Ok(None);
+        }
+        let Some(entry) = Self::of(source) else {
+            return Ok(None);
+        };
+        let mut compact = source.clone();
+        compact.descriptor.public_config = entry.probe_config.into_iter().collect();
+        compact.descriptor.namespace = None;
+        compact.descriptor.root = Some(entry.root.digest()?);
+        // Capabilities that follow from the observation and the node id of a source no node
+        // serves are not kept; markers such as a snapshot's retry key stay.
+        (compact.descriptor.capabilities).retain(|name| !DERIVED.contains(&name.as_str()));
+        compact.descriptor.origin_node_id = None;
+        Ok(Some((compact, entry.root)))
+    }
+
+    /// The binding with the settings of `root` back in place; `None` when `root` is not the
+    /// root the binding names.
+    pub fn hydrate(
+        source: &VersionSourceBinding,
+        root: &SourceRoot,
+    ) -> Result<Option<VersionSourceBinding>, ConversionError> {
+        let Some(digest) = source.descriptor.root else {
+            return Ok(Some(source.clone()));
+        };
+        if root.digest()? != digest || root.kind != source.descriptor.kind {
+            return Ok(None);
+        }
+        let mut full = source.clone();
+        let settings = root.public_config.iter();
+        (full.descriptor.public_config).extend(settings.map(|(k, v)| (k.clone(), v.clone())));
+        full.descriptor.namespace = root.namespace.clone();
+        full.descriptor.root = None;
+        Ok(Some(full))
+    }
+
+    /// The binding in the form a node stores, so a compact and a full binding of one source
+    /// compare and hash alike.
+    pub fn normalized(source: &VersionSourceBinding) -> VersionSourceBinding {
+        match Self::compact(source) {
+            Ok(Some((compact, _))) => compact,
+            _ => source.clone(),
+        }
+    }
+
+    /// Whether two bindings name the same source, whichever of them is stored compact.
+    pub fn same_source(left: &VersionSourceBinding, right: &VersionSourceBinding) -> bool {
+        Self::normalized(left) == Self::normalized(right)
+    }
+
     /// The reference a check resolves: the probe path under the root, naming no connector, so
     /// the checking member reads it through its own connector of the root.
     pub fn probe(&self) -> VersionSourceBinding {
@@ -91,6 +168,7 @@ impl RootEntry {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: root.namespace.clone(),
+                root: None,
             },
             connector_id: None,
         }
@@ -148,6 +226,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(Ulid::from_bytes([1; 16])),
         }

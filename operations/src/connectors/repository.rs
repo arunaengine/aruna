@@ -27,6 +27,11 @@ pub fn source_connector_key(group_id: GroupId, connector_id: Ulid) -> Key {
     ByteView::from(bytes)
 }
 
+/// The row naming the group that holds `connector_id` on this node.
+pub fn connector_id_key(connector_id: Ulid) -> Key {
+    ByteView::from(connector_id.to_bytes().to_vec())
+}
+
 /// The reference row of one version bound to `connector_id`; rows of a connector share a prefix.
 pub fn connector_reference_key(
     connector_id: Ulid,

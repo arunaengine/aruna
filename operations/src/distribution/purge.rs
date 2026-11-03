@@ -19,10 +19,12 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::DistributionBinding;
-use aruna_core::structs::storage::distribution::accounting::{Charge, RangeAccount, account_key};
+use aruna_core::structs::storage::distribution::accounting::{
+    Charge, RangeAccount, RangeCounters, account_key,
+};
 use aruna_core::structs::storage::distribution::fence::{ClearCursor, LocalFence, PurgeCursor};
 use aruna_core::structs::storage::distribution::inventory::{
-    Entry, Position, VersionEntry, content_key, head_position, index_key, range_interval,
+    Entry, HeadEntry, Position, VersionEntry, content_key, head_position, index_key, range_interval,
 };
 use aruna_core::structs::storage::distribution::on_use::{
     Attachment, CACHE_TOTALS_KEY, CacheEntry, CacheTotals, attachment_key,
@@ -32,8 +34,10 @@ use ulid::Ulid;
 
 use super::feed_store::split_key;
 use super::imports::drop_resume;
+use super::inventory::{Walk, route};
 use super::pull::drop_copy;
 use crate::driver::{DriverContext, drive, now_ms};
+use crate::node::usage_stats::{dirty_rows, mark_dirty, wake_publish};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
@@ -91,6 +95,8 @@ pub async fn purge_range(
                 (None, false) => (cursor.uploads_done, cursor.after) = (true, None),
                 (None, true) => {
                     clear_range_rows(context, set_id, target.range_id).await?;
+                    // The range leaves this node's replica share with its counter rows.
+                    mark_dirty(context, [target.group_id]).await?;
                     cursor.done = true;
                 }
                 (Some(last), false) => {
@@ -214,7 +220,7 @@ pub async fn purge_rest(context: &DriverContext, target: &PurgeTarget) -> Result
         | ListVersionsItem::DeleteMarker {
             key, version_id, ..
         }) = item;
-        delete_version(context, target, &key, version_id).await?;
+        delete_version(context, target, &key, version_id, false).await?;
     }
     Ok(())
 }
@@ -358,8 +364,8 @@ async fn abort_uploads(
     Ok(())
 }
 
-/// Deletes every version of the page's keys with their kept copies, then the page's
-/// inventory and index rows, which the version deletes do not maintain.
+/// Deletes every version of the page's keys with their kept copies, each with its inventory row
+/// and range counters, then the page's other inventory and index rows.
 async fn purge_keys(
     context: &DriverContext,
     target: &PurgeTarget,
@@ -367,6 +373,7 @@ async fn purge_keys(
 ) -> Result<(), String> {
     let set_id = target.binding.set_id;
     let mut deletes = Vec::with_capacity(rows.len() * 2);
+    let mut left = Vec::with_capacity(rows.len());
     for (row, value) in rows {
         let position = Position::decode(&row).map_err(|error| error.to_string())?;
         if let Entry::Head = position.entry {
@@ -374,7 +381,7 @@ async fn purge_keys(
             deletes.push((SEARCH_FEED_KEYSPACE.to_string(), feed));
         }
         if let Entry::Version { version_id, .. } = position.entry {
-            delete_version(context, target, &position.key, version_id).await?;
+            delete_version(context, target, &position.key, version_id, true).await?;
             drop_attachment(context, set_id, version_id).await?;
             let entry = VersionEntry::from_bytes(&value).map_err(|error| error.to_string())?;
             if let Some(identity) = entry.identity {
@@ -385,16 +392,136 @@ async fn purge_keys(
             let index = index_key(set_id, version_id).into();
             deletes.push((VERSION_INDEX_KEYSPACE.to_string(), index));
         }
-        deletes.push((INVENTORY_KEYSPACE.to_string(), Key::from(row)));
+        deletes.push((INVENTORY_KEYSPACE.to_string(), Key::from(row.clone())));
+        left.push(row);
     }
-    batch_delete(context, deletes).await
+    debit_rows(context, target, deletes, left).await
 }
 
+/// Deletes a page's rows and takes the inventory rows its version deletes left, as a head no
+/// purged version named, off the range's counter rows in one transaction.
+async fn debit_rows(
+    context: &DriverContext,
+    target: &PurgeTarget,
+    deletes: Vec<(String, Key)>,
+    left: Vec<Vec<u8>>,
+) -> Result<(), String> {
+    let storage = &context.storage_handle;
+    let start = StorageEffect::StartTransaction { read: false };
+    let txn_id = match storage.send_storage_effect(start).await {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(format!("unexpected transaction answer {other:?}")),
+    };
+    let debited = match stage_debit(context, target, deletes, left, txn_id).await {
+        Ok(debited) => debited,
+        Err(error) => {
+            let abort = StorageEffect::AbortTransaction { txn_id };
+            storage.send_storage_effect(abort).await;
+            return Err(error);
+        }
+    };
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {}
+        other => return Err(format!("a purge page did not commit: {other:?}")),
+    }
+    if debited {
+        wake_publish(context).await;
+    }
+    Ok(())
+}
+
+/// Stages the page's deletes and the debit of the rows still present; true when it debited.
+async fn stage_debit(
+    context: &DriverContext,
+    target: &PurgeTarget,
+    deletes: Vec<(String, Key)>,
+    left: Vec<Vec<u8>>,
+    txn_id: Ulid,
+) -> Result<bool, String> {
+    let (set_id, range_id) = (target.binding.set_id, target.range_id);
+    let mut reads = vec![(
+        RANGE_ACCOUNT_KEYSPACE.to_string(),
+        account_key(set_id, range_id).into(),
+    )];
+    reads.extend((left.iter()).map(|row| (INVENTORY_KEYSPACE.to_string(), Key::from(row.clone()))));
+    let read = StorageEffect::BatchRead {
+        reads,
+        txn_id: Some(txn_id),
+    };
+    let mut values = match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => values.into_iter(),
+        other => return Err(format!("unexpected read answer {other:?}")),
+    }
+    .map(|(_, value)| value);
+    let account = (values
+        .next()
+        .flatten()
+        .as_deref()
+        .map(RangeAccount::from_bytes))
+    .transpose()
+    .map_err(|error| error.to_string())?;
+    let mut removed = Vec::new();
+    for (row, value) in left.into_iter().zip(values) {
+        // A row a version delete already took is gone with its counters.
+        let Some(value) = value else {
+            continue;
+        };
+        let position = Position::decode(&row).map_err(|error| error.to_string())?;
+        let counted = match position.entry {
+            Entry::Head => HeadEntry::from_bytes(&value).map(|head| RangeCounters::of_head(&head)),
+            Entry::Version { epoch, .. } => VersionEntry::from_bytes(&value)
+                .map(|entry| RangeCounters::of_version(epoch, &entry)),
+            Entry::Upload(_) => continue,
+        };
+        let counted = counted.map_err(|error| error.to_string())?;
+        let counted = counted.negate().map_err(|error| error.to_string())?;
+        removed.push((Walk::Versions, row, counted));
+    }
+    let mut effects = vec![StorageEffect::BatchDelete {
+        deletes,
+        txn_id: Some(txn_id),
+    }];
+    // A cleared or retired account has no rows left to keep in step.
+    let account = account.filter(|a| !matches!(a.charge, Charge::Retired { .. }));
+    let deltas = match account {
+        Some(account) => route(set_id, range_id, &account, removed).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    let debited = !deltas.is_empty();
+    if debited {
+        effects.push(StorageEffect::AddCounters {
+            key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+            deltas,
+            txn_id,
+        });
+        // The share moves without the group counters, so the group is published again.
+        effects.push(StorageEffect::BatchWrite {
+            writes: dirty_rows([target.group_id]),
+            txn_id: Some(txn_id),
+        });
+    }
+    for effect in effects {
+        match context.storage_handle.send_storage_effect(effect).await {
+            Event::Storage(
+                StorageEvent::BatchDeleteResult { .. } | StorageEvent::BatchWriteResult { .. },
+            ) => {}
+            other => return Err(format!("unexpected purge answer {other:?}")),
+        }
+    }
+    Ok(debited)
+}
+
+/// Deletes one version of the member bucket; `inventory` takes its inventory row and range
+/// counters with it, which only a range purge does while the range's account exists.
 async fn delete_version(
     context: &DriverContext,
     target: &PurgeTarget,
     key: &str,
     version_id: Ulid,
+    inventory: bool,
 ) -> Result<(), String> {
     let input = DeleteObjectInput {
         bucket: target.bucket.clone(),
@@ -405,7 +532,10 @@ async fn delete_version(
         node_id: target.node_id,
         deleted_by: UserId::nil(target.realm_id),
     };
-    let delete = DeleteObjectOperation::new(input).purging(target.binding.clone());
+    let mut delete = DeleteObjectOperation::new(input).purging(target.binding.clone());
+    if inventory {
+        delete = delete.in_inventory();
+    }
     match drive(delete, context).await {
         Ok(_) | Err(DeleteObjectError::NoSuchVersion) => Ok(()),
         Err(error) => Err(format!("a purged version was not deleted: {error}")),
@@ -873,6 +1003,149 @@ mod tests {
             .await
             .unwrap();
         assert!(kept.is_some(), "the replacement's inventory stays");
+    }
+
+    /// A bound member bucket "spire" whose one range holds keys "a" and "b", 10 bytes each, and
+    /// the target purging it with its charged counter row.
+    async fn purged_spire(
+        handle: &aruna_storage::storage::StorageHandle,
+        context: &DriverContext,
+    ) -> (PurgeTarget, Vec<u8>) {
+        use crate::distribution::test_store::{apply, counters, exact, install, range, write};
+        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+        use aruna_core::structs::storage::blob::BucketInfo;
+        use aruna_core::structs::storage::distribution::accounting::generation_key;
+        let (snapshot, _) = crate::distribution::test_record::record(true);
+        let binding = crate::distribution::test_record::binding(&snapshot, 1, 5);
+        let (set_id, range_id) = (binding.set_id, Ulid::from_bytes([1; 16]));
+        install(handle, set_id, &[range(1, "", None)]).await;
+        for (seed, key) in [(1, "a"), (2, "b")] {
+            assert!(apply(handle, write(set_id, key, seed, 10)).await.unwrap());
+        }
+        let charged = generation_key(set_id, range_id, 1);
+        assert_eq!(counters(handle, charged.clone()).await, exact(2, 20));
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([2; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: Some(binding.clone()),
+        };
+        let bucket = info.to_bytes().unwrap();
+        super::write(context, S3_BUCKET_KEYSPACE, b"spire".to_vec(), bucket)
+            .await
+            .unwrap();
+        let target = PurgeTarget {
+            realm_id: crate::distribution::test_record::realm(),
+            node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            bucket: "spire".to_string(),
+            group_id: info.group_id,
+            binding,
+            range_id,
+            lower: String::new(),
+            upper: None,
+        };
+        (target, charged)
+    }
+
+    fn emptied() -> RangeCounters {
+        RangeCounters {
+            max_epoch: aruna_core::structs::storage::distribution::OriginalEpoch(1),
+            ..RangeCounters::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_debits_counters() {
+        // A page takes the rows no version delete took off the range's counters, so what is
+        // left of a range being purged stays counted exactly.
+        let (_dir, handle) = open();
+        let context = context(handle.clone());
+        let (target, charged) = purged_spire(&handle, &context).await;
+
+        let rows = page(&context, INVENTORY_KEYSPACE, &target, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 4, "two heads and two versions");
+        purge_keys(&context, &target, rows).await.unwrap();
+
+        let counted = crate::distribution::test_store::counters(&handle, charged).await;
+        assert_eq!(counted, emptied());
+        let rows = page(&context, INVENTORY_KEYSPACE, &target, None)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn version_debits_together() {
+        // A purged version takes its inventory rows and range counters in its own delete, so a
+        // publish never sees the group debit without the range debit.
+        use aruna_core::keyspaces::{
+            BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE,
+        };
+        use aruna_core::structs::storage::blob::{
+            BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
+        };
+        use aruna_core::structs::storage::usage::dirty_group_key;
+        let (_dir, handle) = open();
+        let context = context(handle.clone());
+        let (target, charged) = purged_spire(&handle, &context).await;
+        let version_id = Ulid::from_bytes([1; 16]);
+        let version = BlobVersion::deleted(
+            std::time::SystemTime::UNIX_EPOCH,
+            UserId::nil(target.realm_id),
+        );
+        let row = VersionKey::new("spire", "a", version_id)
+            .to_bytes()
+            .unwrap();
+        super::write(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            row.clone(),
+            version.to_bytes().unwrap(),
+        )
+        .await
+        .unwrap();
+        let head = BlobHeadKey::new("spire", "a").to_bytes().unwrap();
+        let pointer = CurrentVersionPointer::new(version_id).to_bytes().unwrap();
+        super::write(&context, BLOB_HEAD_KEYSPACE, head, pointer)
+            .await
+            .unwrap();
+
+        delete_version(&context, &target, "a", version_id, true)
+            .await
+            .unwrap();
+
+        assert!(
+            read(&context, BLOB_VERSIONS_KEYSPACE, row)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let half = crate::distribution::test_store::exact(1, 10);
+        let counted = crate::distribution::test_store::counters(&handle, charged).await;
+        assert_eq!(
+            counted, half,
+            "key a left the range with its version and head"
+        );
+        let rows = page(&context, INVENTORY_KEYSPACE, &target, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "only key b is left");
+        let marker = read(
+            &context,
+            NODE_STATS_KEYSPACE,
+            dirty_group_key(target.group_id),
+        );
+        assert!(
+            marker.await.unwrap().is_some(),
+            "the group is published again"
+        );
     }
 
     #[tokio::test]

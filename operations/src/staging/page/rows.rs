@@ -7,17 +7,19 @@ use crate::distribution::guard::GuardError;
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::jobs::store::decode_job_record;
+use crate::jobs::store::ClaimGuard;
 use crate::node::usage_stats::UsageUpdateError;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::staging::descriptor::build_source_binding;
+use crate::staging::root_record::{compact_version, root_write};
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
+use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, JOB_KEYSPACE, PURGE_FENCE_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, JOB_CLAIM_KEYSPACE, PURGE_FENCE_KEYSPACE,
     S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
@@ -33,24 +35,31 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::source_root::SourceRoot;
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{GroupId, Key, KeySpace, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
-/// Most entries one page registers.
-pub const MAX_PAGE_ENTRIES: usize = 1000;
+/// Most entries one page registers; a lane gathers several listings into one page.
+pub const MAX_PAGE_ENTRIES: usize = 10_000;
 /// Most bytes one page writes, keys and values together.
-pub const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 /// Most per-entry errors a staging checkpoint keeps; the failed counter counts all of them.
 pub const MAX_ERROR_SAMPLE: usize = 100;
-/// Rows read ahead of the heads: purge fence, bucket, connector and job record.
+/// Rows read ahead of the heads: purge fence, bucket, connector and job claim.
 pub(crate) const GUARD_READS: usize = 4;
+/// Rows of other keys the head read may meet between the page's keys before the page reads its
+/// heads one by one instead.
+const HEAD_SLACK: usize = 1000;
+/// Most bytes the head read takes.
+const HEAD_READ_BYTES: usize = 4 << 20;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PageEntry {
@@ -77,12 +86,16 @@ pub struct PageImportInput {
     pub entries: Vec<PageEntry>,
     /// The checkpoint after this page; the page's outcome is added before it is written.
     pub checkpoint: StagingJobCheckpoint,
+    /// The row the checkpoint is written to: the job's own, or one prefix lane's.
+    pub checkpoint_key: Key,
     /// Further job rows committed with the page, such as directory queue changes.
     pub writes: Vec<(KeySpace, Key, Value)>,
     pub deletes: Vec<(KeySpace, Key)>,
     pub now: SystemTime,
     /// The bucket's database list entry at registration, kept in every version's origin.
     pub database: Option<Ulid>,
+    /// The ranges whose turns the page holds; a page whose keys lie in others ends unwritten.
+    pub ranges: Option<BTreeSet<Ulid>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -101,8 +114,14 @@ pub enum PageImportState {
     Init,
     StartTransaction,
     ReadGuards,
+    /// Reads the heads in the key interval of the page, which proves absent keys absent.
+    ReadHeads,
+    /// Reads the heads key by key, when the interval holds too many other keys.
+    ReadHeadKeys,
     /// Reads a distributed bucket's record: every entry's key must be coordinated here.
     ReadRecord,
+    /// Reads whether an ordinary bucket has a sync relationship that replicates its versions.
+    ReadRelationships,
     ReadSecret,
     ReadVersions,
     WriteRows,
@@ -148,6 +167,8 @@ pub enum PageImportError {
     },
     #[error("page import finished without output")]
     NotFinished,
+    #[error("the page's keys lie in other ranges than the turns it holds")]
+    RangesMoved(BTreeSet<Ulid>),
 }
 
 impl From<StorageReadError> for PageImportError {
@@ -170,6 +191,10 @@ pub(crate) struct PageGuards {
     pub binding: Option<DistributionBinding>,
     /// The coordinator epoch of each entry's key in a distributed bucket, in entry order.
     pub epochs: Vec<OriginalEpoch>,
+    /// Whether anything replicates the bucket's versions: set members or sync relationships.
+    pub downstream: bool,
+    /// Whether a distributed bucket keeps a search index, which the new heads feed.
+    pub search: bool,
 }
 
 /// The rows of one page, its usage change and its outcome.
@@ -193,7 +218,7 @@ pub(crate) fn guard_reads(
     input: &PageImportInput,
 ) -> Result<Vec<(KeySpace, Key)>, ConversionError> {
     let connector = &input.connector;
-    let mut reads = vec![
+    let reads = vec![
         (PURGE_FENCE_KEYSPACE.to_string(), fence_key(&input.bucket)),
         (
             S3_BUCKET_KEYSPACE.to_string(),
@@ -203,22 +228,78 @@ pub(crate) fn guard_reads(
             SOURCE_INDEX_KEYSPACE.to_string(),
             source_connector_key(connector.group_id, connector.connector_id),
         ),
-        (JOB_KEYSPACE.to_string(), job_record_key(input.job_id)),
+        (JOB_CLAIM_KEYSPACE.to_string(), job_record_key(input.job_id)),
     ];
-    for entry in &input.entries {
-        let head = BlobHeadKey::new(&input.bucket, &entry.target_key).to_bytes()?;
-        reads.push((BLOB_HEAD_KEYSPACE.to_string(), head.into()));
-    }
     Ok(reads)
 }
 
+fn head_keys(input: &PageImportInput) -> Result<Vec<Vec<u8>>, ConversionError> {
+    (input.entries.iter())
+        .map(|entry| BlobHeadKey::new(&input.bucket, &entry.target_key).to_bytes())
+        .collect()
+}
+
+/// One read of the head rows between the page's smallest and largest key; `None` for an
+/// empty page. Read in the transaction, a head written in the interval meanwhile conflicts.
+pub(crate) fn head_range(
+    input: &PageImportInput,
+    txn_id: TxnId,
+) -> Result<Option<StorageEffect>, ConversionError> {
+    let keys = head_keys(input)?;
+    let (Some(first), Some(last)) = (keys.iter().min(), keys.iter().max()) else {
+        return Ok(None);
+    };
+    Ok(Some(StorageEffect::IterRange {
+        key_space: BLOB_HEAD_KEYSPACE.to_string(),
+        start: IterStart::At(first.clone().into()),
+        end: IterEnd::Through(last.clone().into()),
+        limit: keys.len() + HEAD_SLACK,
+        max_bytes: HEAD_READ_BYTES,
+        txn_id: Some(txn_id),
+    }))
+}
+
+/// Reads of the page's heads, one per entry in entry order.
+pub(crate) fn head_reads(input: &PageImportInput) -> Result<Vec<(KeySpace, Key)>, ConversionError> {
+    let keys = head_keys(input)?.into_iter();
+    Ok(keys
+        .map(|key| (BLOB_HEAD_KEYSPACE.to_string(), key.into()))
+        .collect())
+}
+
+/// Each entry's head among the rows of the page's key interval.
+pub(crate) fn interval_heads(
+    input: &PageImportInput,
+    rows: Vec<(Key, Value)>,
+) -> Result<Vec<Option<CurrentVersionPointer>>, PageImportError> {
+    let rows: BTreeMap<Vec<u8>, Value> = (rows.into_iter())
+        .map(|(key, value)| (key.to_vec(), value))
+        .collect();
+    let heads = head_keys(input)?
+        .into_iter()
+        .map(|key| rows.get(&key).cloned());
+    decode_heads(heads)
+}
+
+/// The heads of [`head_reads`], in entry order.
+pub(crate) fn decode_heads(
+    values: impl IntoIterator<Item = Option<Value>>,
+) -> Result<Vec<Option<CurrentVersionPointer>>, PageImportError> {
+    let heads = (values.into_iter()).map(|value| {
+        let head = value.map(|value| CurrentVersionPointer::from_bytes(value.as_ref()));
+        head.transpose()
+    });
+    Ok(heads.collect::<Result<_, _>>()?)
+}
+
 /// Checks every guard of a single reference write: purge fence, bucket incarnation,
-/// connector and job claim. Placement defaults come from the bucket row read here.
+/// connector and job claim. Placement defaults come from the bucket row read here; the heads
+/// are read next.
 pub(crate) fn check_guards(
     input: &PageImportInput,
     values: Vec<(Key, Option<Value>)>,
 ) -> Result<PageGuards, PageImportError> {
-    if values.len() != GUARD_READS + input.entries.len() {
+    if values.len() != GUARD_READS {
         return Err(StorageError::ReadError("short guard read".to_string()).into());
     }
     let mut values = values.into_iter().map(|(_, value)| value);
@@ -253,33 +334,22 @@ pub(crate) fn check_guards(
     if connector.as_ref() != Some(&input.connector) {
         return Err(PageImportError::ConnectorChanged);
     }
-    let record = values
+    let claim = values
         .next()
         .flatten()
-        .map(|value| decode_job_record(value.as_ref()))
+        .map(|value| ClaimGuard::from_bytes(value.as_ref()))
         .transpose()?
+        .filter(|claim| claim.claim_token == input.claim_token)
         .ok_or(PageImportError::ClaimLost)?;
-    let claimed = record
-        .claim
-        .as_ref()
-        .is_some_and(|claim| claim.claim_token == input.claim_token);
-    if !claimed || record.is_settled() {
-        return Err(PageImportError::ClaimLost);
-    }
-    let heads = values
-        .map(|value| {
-            value
-                .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
-                .transpose()
-        })
-        .collect::<Result<_, _>>()?;
     Ok(PageGuards {
         policies,
-        job_created_ms: record.created_at_ms,
-        heads,
+        job_created_ms: claim.created_at_ms,
+        heads: Vec::new(),
         set_hint: binding.as_ref().map(DistributionBinding::hint),
         binding,
         epochs: Vec::new(),
+        downstream: true,
+        search: true,
     })
 }
 
@@ -337,6 +407,7 @@ pub(crate) fn page_rows(
     let mut versions = versions.into_iter();
     let mut writes = Vec::new();
     let mut inventory = Vec::new();
+    let mut roots = BTreeMap::new();
     let mut delta = UsageDelta::default();
     let mut result = PageImportResult {
         registered: 0,
@@ -367,8 +438,10 @@ pub(crate) fn page_rows(
             }
             EntryPlan::Register => {
                 let epoch = guards.epochs.get(index).copied().unwrap_or_default();
-                let (rows, change) = register_rows(input, guards, (entry, epoch), head.as_ref())?;
+                let (rows, change, root) =
+                    register_rows(input, guards, (entry, epoch), head.as_ref())?;
                 writes.extend(rows);
+                roots.extend(root);
                 inventory.extend(change);
                 // An offered directory observation is charged only while it is the head.
                 let released = existing
@@ -384,6 +457,9 @@ pub(crate) fn page_rows(
             }
         }
     }
+    for root in roots.values() {
+        writes.push(root_write(root)?);
+    }
     let checkpoint = &mut result.checkpoint;
     checkpoint.items_current = checkpoint
         .items_current
@@ -394,7 +470,7 @@ pub(crate) fn page_rows(
     checkpoint.items_failed = checkpoint.items_failed.saturating_add(result.kept);
     writes.push((
         STAGING_STATE_KEYSPACE.to_string(),
-        ByteView::from(input.job_id.to_bytes().to_vec()),
+        input.checkpoint_key.clone(),
         ByteView::from(postcard::to_allocvec(checkpoint).map_err(ConversionError::from)?),
     ));
     writes.extend(input.writes.iter().cloned());
@@ -414,7 +490,11 @@ pub(crate) fn page_rows(
 }
 
 /// The rows that register one entry and its inventory change in a distributed bucket.
-type EntryRows = (Vec<(KeySpace, Key, Value)>, Option<InventoryChange>);
+type EntryRows = (
+    Vec<(KeySpace, Key, Value)>,
+    Option<InventoryChange>,
+    Option<([u8; 32], SourceRoot)>,
+);
 
 fn register_rows(
     input: &PageImportInput,
@@ -453,7 +533,17 @@ fn register_rows(
         generation: pointer.generation,
         entry: entry_of(&version, entry.observation.content_length),
     };
-    let change = version_written(guards.binding.as_ref(), &entry.target_key, added, true);
+    let change =
+        version_written(guards.binding.as_ref(), &entry.target_key, added, true).map(|change| {
+            InventoryChange {
+                feed: guards.search,
+                ..change
+            }
+        });
+    // The inventory saw the full binding; the stored one names its root by digest.
+    let (version, root) = compact_version(version)?;
+    let root = root.map(|root| root.digest().map(|digest| (digest, root)));
+    let root = root.transpose()?;
     let head_key = BlobHeadKey::new(&input.bucket, &entry.target_key);
     let mut rows = Vec::with_capacity(4);
     rows.extend(connector_reference_write(&version, &version_key)?);
@@ -477,6 +567,9 @@ fn register_rows(
         version_id,
         false,
     );
-    rows.push(live_obligation_entry(&obligation)?);
-    Ok((rows, change))
+    // A bucket nothing replicates owes no replication work for the version.
+    if guards.downstream {
+        rows.push(live_obligation_entry(&obligation)?);
+    }
+    Ok((rows, change, root))
 }

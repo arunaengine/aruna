@@ -59,6 +59,8 @@ pub struct BucketSearchHit {
     pub group_id: GroupId,
     pub group_name: Option<String>,
     pub created_at: SystemTime,
+    /// The distributed bucket this local bucket is a member of; `None` for an ordinary bucket.
+    pub set_id: Option<ulid::Ulid>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -298,6 +300,11 @@ impl SearchBucketsOperation {
             group_id: candidate.info.group_id,
             group_name,
             created_at: candidate.info.created_at,
+            set_id: candidate
+                .info
+                .distribution
+                .as_ref()
+                .map(|binding| binding.set_id),
         });
         self.continue_search()
     }
@@ -458,6 +465,7 @@ mod tests {
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
     use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::distribution::DistributionBinding;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -589,6 +597,46 @@ mod tests {
         let names: Vec<_> = output.hits.iter().map(|hit| hit.bucket.as_str()).collect();
         assert_eq!(names, ["alpha", "gamma"]);
         assert_eq!(output.next_start_after, None);
+    }
+
+    #[test]
+    fn names_member_set() {
+        // Every member node answers its own hit; the set id tells them apart from ordinary ones.
+        let group_id = Ulid::from_bytes([11u8; 16]);
+        let set_id = Ulid::from_bytes([13u8; 16]);
+        let (key, value) = bucket_entry("shared", group_id);
+        let mut info = BucketInfo::from_bytes(&value).unwrap();
+        info.distribution = Some(DistributionBinding {
+            set_id,
+            member_id: Ulid::from_bytes([14u8; 16]),
+            incarnation: 1,
+            revision: Default::default(),
+        });
+        let mut operation = SearchBucketsOperation::new(scan_input("", 10));
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![
+                (key, info.to_bytes().unwrap().into()),
+                bucket_entry("single", group_id),
+            ],
+            next_start_after: None,
+        }));
+        for _ in 0..2 {
+            operation.step(Event::SubOperation(
+                SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+            ));
+            operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: group_id.to_bytes().to_vec().into(),
+                value: None,
+            }));
+        }
+        let output = operation.finalize().unwrap();
+        let sets: Vec<_> = output
+            .hits
+            .iter()
+            .map(|hit| (hit.bucket.as_str(), hit.set_id))
+            .collect();
+        assert_eq!(sets, [("shared", Some(set_id)), ("single", None)]);
     }
 
     async fn write_value(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {

@@ -129,7 +129,9 @@ impl ArunaS3Service {
         base.extend(markers.1.map(|id| ("version-id-marker", id)));
         let query = range_query(&base, range);
         let request = ("ListObjectVersions", input.bucket.as_str(), query);
-        let body = self.ask_holders(user, context, range, request).await?;
+        let body = self
+            .ask_holders(user, context, (range, false), request)
+            .await?;
         let url_encoded = url_of(input);
         let mut part = VersionsPart::default();
         for entry in elements(&body, "Version") {
@@ -187,6 +189,7 @@ impl ArunaS3Service {
         (group_id, max_keys): (Ulid, usize),
     ) -> S3Result<ListObjectVersionsOutput> {
         let snapshot = self.snapshot(binding).await?;
+        let fence = self.fence(binding).await?;
         let url_encoded = url_of(&input);
         let owner = Owner {
             display_name: None,
@@ -223,7 +226,7 @@ impl ArunaS3Service {
             // The key marker skips a common prefix in every range; the id only in the first.
             let start = (marker.clone(), version_marker.clone().filter(|_| first));
             first = false;
-            let part = match snapshot.lists_locally(binding.member_id, range) {
+            let part = match snapshot.lists_locally(binding.member_id, range, &fence) {
                 true => {
                     let id = (start.1.as_deref())
                         .map(Ulid::from_string)

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod lanes;
 mod manifest;
 mod walk;
 
@@ -33,14 +34,27 @@ use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob}
 use crate::staging::snapshot::{MaterializeSnapshotInput, stage_snapshot_blob};
 use aruna_core::structs::checksum::ExpectedChecksum;
 
+/// The job's progress with its open prefix lanes counted in; a lane's prefix reads as not
+/// started yet, as a job handed over goes on from there.
 pub async fn read_staging_checkpoint(
+    context: &crate::driver::DriverContext,
+    job_id: JobId,
+) -> Result<Option<StagingJobCheckpoint>, String> {
+    let Some(main) = read_main(context, job_id).await? else {
+        return Ok(None);
+    };
+    let open = lanes::read_lanes(context, job_id).await?;
+    Ok(Some(lanes::merged(main, open)))
+}
+
+async fn read_main(
     context: &crate::driver::DriverContext,
     job_id: JobId,
 ) -> Result<Option<StagingJobCheckpoint>, String> {
     read_state(
         &context.storage_handle,
         STAGING_STATE_KEYSPACE,
-        staging_checkpoint_key(job_id),
+        checkpoint_key(job_id, None),
         "staging checkpoint read",
     )
     .await
@@ -50,7 +64,7 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
     if spec.strategy == StagingStrategy::Sync {
         return permanent_error("sync is not a staging job strategy");
     }
-    let mut checkpoint = match read_staging_checkpoint(&ctx.driver, ctx.job_id).await {
+    let mut checkpoint = match read_main(&ctx.driver, ctx.job_id).await {
         Ok(Some(checkpoint)) => checkpoint,
         Ok(None) => initial_checkpoint(spec),
         Err(error) => return retryable_error(error),
@@ -72,6 +86,7 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
     if let Err(error) = persist_rows(ctx, &checkpoint, Vec::new(), Vec::new()).await {
         return retryable_error(error);
     }
+    let mut ahead = None;
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -131,9 +146,22 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
             if let Err(error) = persist_rows(ctx, &checkpoint, Vec::new(), Vec::new()).await {
                 return retryable_error(error);
             }
+            ctx.progress.checkpoint();
             continue;
         }
 
+        if lanes::applies(spec, &checkpoint) {
+            match lanes::run_lanes(ctx, spec, &mut checkpoint).await {
+                // Every prefix is walked, so the walk below finds nothing left.
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(PageFailure::Retry(message)) => return retryable_error(message),
+                Err(PageFailure::Conflict(message)) => return conflict_error(message),
+                Err(PageFailure::Permanent(message)) => {
+                    return finish_failed(ctx, permanent_error(message)).await;
+                }
+            }
+        }
         if checkpoint.manifest.is_none() && checkpoint.walk.is_none() {
             match start_walk(ctx, spec, &mut checkpoint).await {
                 Ok(true) => continue,
@@ -143,11 +171,15 @@ pub async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> JobRunO
         }
         let page = match checkpoint.manifest.is_some() {
             true => read_manifest_chunk(ctx, spec, &mut checkpoint).await,
-            false => walk_page(ctx, spec, &mut checkpoint).await,
+            false => {
+                let walking = (&mut ahead, None);
+                walk_page(ctx, spec, (None, None), &mut checkpoint, walking).await
+            }
         };
         if let Err(outcome) = page {
             return match outcome {
                 PageFailure::Retry(message) => retryable_error(message),
+                PageFailure::Conflict(message) => conflict_error(message),
                 PageFailure::Permanent(message) => {
                     finish_failed(ctx, permanent_error(message)).await
                 }
@@ -239,7 +271,7 @@ pub(crate) async fn seed_checkpoint(
     let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
     let write = aruna_core::effects::StorageEffect::Write {
         key_space: STAGING_STATE_KEYSPACE.to_string(),
-        key: staging_checkpoint_key(job_id),
+        key: checkpoint_key(job_id, None),
         value: ByteView::from(value),
         txn_id: None,
     };
@@ -418,13 +450,24 @@ pub(super) fn sync_progress(ctx: &JobContext, checkpoint: &StagingJobCheckpoint)
 pub(super) async fn persist_rows(
     ctx: &JobContext,
     checkpoint: &StagingJobCheckpoint,
+    writes: Vec<(KeySpace, Key, Value)>,
+    deletes: Vec<(KeySpace, Key)>,
+) -> Result<(), String> {
+    persist_slot(ctx, None, checkpoint, writes, deletes).await
+}
+
+/// Writes the checkpoint of the job or of prefix lane `slot` with the given job rows.
+pub(super) async fn persist_slot(
+    ctx: &JobContext,
+    slot: Option<u64>,
+    checkpoint: &StagingJobCheckpoint,
     mut writes: Vec<(KeySpace, Key, Value)>,
     deletes: Vec<(KeySpace, Key)>,
 ) -> Result<(), String> {
     let value = postcard::to_allocvec(checkpoint).map_err(|error| error.to_string())?;
     writes.push((
         STAGING_STATE_KEYSPACE.to_string(),
-        staging_checkpoint_key(ctx.job_id),
+        checkpoint_key(ctx.job_id, slot),
         ByteView::from(value),
     ));
     put_job_rows(
@@ -438,8 +481,13 @@ pub(super) async fn persist_rows(
     .map_err(|error| error.to_string())
 }
 
-fn staging_checkpoint_key(job_id: JobId) -> ByteView {
-    ByteView::from(job_id.to_bytes().to_vec())
+/// The checkpoint row of a job, or of its prefix lane `slot`, which extends the job's key.
+pub(crate) fn checkpoint_key(job_id: JobId, slot: Option<u64>) -> ByteView {
+    let mut key = job_id.to_bytes().to_vec();
+    if let Some(slot) = slot {
+        key.extend_from_slice(&slot.to_be_bytes());
+    }
+    ByteView::from(key)
 }
 
 pub(super) fn queue_key(job_id: JobId, position: u64) -> Key {
@@ -460,6 +508,11 @@ fn retryable_error(message: impl Into<String>) -> JobRunOutcome {
     JobRunOutcome::Failed(JobError::retryable(message.into()))
 }
 
+/// Storage conflicts are transient: the job runs again later without spending an attempt.
+fn conflict_error(message: impl Into<String>) -> JobRunOutcome {
+    JobRunOutcome::Deferred(JobError::retryable(message.into()))
+}
+
 fn permanent_error(message: impl Into<String>) -> JobRunOutcome {
     JobRunOutcome::Failed(JobError::permanent(message.into()))
 }
@@ -471,7 +524,7 @@ mod pure_tests {
     use crate::staging::page::rows::MAX_ERROR_SAMPLE;
     use ulid::Ulid;
 
-    fn test_spec() -> StagingJobSpec {
+    pub(super) fn test_spec() -> StagingJobSpec {
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         StagingJobSpec {
             auth_context: aruna_core::structs::identity::auth::AuthContext {
@@ -612,6 +665,7 @@ mod pure_tests {
             cancel: CancellationToken::new(),
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
+            range_turns: Default::default(),
         };
 
         let pinned = StagingJobSpec {

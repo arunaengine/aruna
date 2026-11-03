@@ -23,6 +23,7 @@ use aruna_core::structs::storage::distribution::inventory::{
 use aruna_core::structs::storage::distribution::search::{IndexState, decode_feed};
 use aruna_core::types::{Key, Value};
 use aruna_storage::storage::StorageHandle;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -31,7 +32,9 @@ use super::feed_store::{
     Located, delete_row, drop_settled, iter, locate, put_row, read_many, split_key, storage_error,
 };
 use super::key_index::{IndexedKey, KeyChange, KeyIndexError, RangeIndexes};
+use super::usage::{held_ranges, sum_held};
 use crate::driver::DriverContext;
+use crate::replication::members::read_record;
 
 /// The key changes of one range and the feed rows they settle.
 type RangeBatch = (Vec<KeyChange>, Vec<(Key, Value)>);
@@ -64,11 +67,11 @@ pub struct FeedLimits {
 impl Default for FeedLimits {
     fn default() -> Self {
         Self {
-            feed_rows: 256,
+            feed_rows: 16_384,
             account_rows: 256,
             state_rows: 64,
-            rebuild_rows: 1_000,
-            rebuild_bytes: 1 << 20,
+            rebuild_rows: 4_096,
+            rebuild_bytes: 4 << 20,
             rebuild_pages: 8,
         }
     }
@@ -101,8 +104,8 @@ impl Feeder {
         let mut changed = 0;
         for (walk, result) in [
             ("feed", self.feed_page(&storage).await),
-            ("open", self.open_page(&storage).await),
-            ("build", self.state_page(&storage).await),
+            ("open", self.open_page(context, &storage).await),
+            ("build", self.state_page(context, &storage).await),
         ] {
             match result {
                 Ok(count) => changed += count,
@@ -166,7 +169,7 @@ impl Feeder {
             let state = state
                 .map(|value| IndexState::from_bytes(&value))
                 .transpose()?;
-            let generation = match state {
+            let (generation, (changes, rows)): (u64, RangeBatch) = match state {
                 // Without an index the build reads the current heads later.
                 None => {
                     settled.extend(rows);
@@ -189,7 +192,15 @@ impl Feeder {
                     settled.extend(rows);
                     continue;
                 }
-                Some(state) => state.generation(),
+                Some(IndexState::Building { generation, cursor }) => {
+                    // The build reads the heads after its cursor itself, so their rows settle.
+                    let read = |key: &Key| cursor.as_deref().is_some_and(|c| key.as_ref() <= c);
+                    let (read, unread): (Vec<_>, Vec<_>) =
+                        (changes.into_iter().zip(rows)).partition(|(_, (key, _))| read(key));
+                    settled.extend(unread.into_iter().map(|(_, row)| row));
+                    (generation, read.into_iter().unzip())
+                }
+                Some(IndexState::Ready { generation }) => (generation, (changes, rows)),
             };
             match self
                 .indexes
@@ -203,8 +214,13 @@ impl Feeder {
         drop_settled(storage, settled).await
     }
 
-    /// Opens a building index for every live range of a page of account rows without one.
-    async fn open_page(&mut self, storage: &StorageHandle) -> Result<usize, FeedError> {
+    /// Opens a building index for every live range of a page of account rows without one,
+    /// in sets that keep a search index.
+    async fn open_page(
+        &mut self,
+        context: &DriverContext,
+        storage: &StorageHandle,
+    ) -> Result<usize, FeedError> {
         let (rows, next) = iter(
             storage,
             RANGE_ACCOUNT_KEYSPACE,
@@ -222,11 +238,15 @@ impl Feeder {
         }
         let states = read_many(storage, SEARCH_INDEX_KEYSPACE, live.clone()).await?;
         let mut opened = 0;
+        let mut searched = BTreeMap::new();
         for (key, state) in live.into_iter().zip(states) {
             if state.is_some() {
                 continue;
             }
             let (set_id, range_id) = split_key(&key)?;
+            if !search_on(context, &mut searched, set_id).await? {
+                continue;
+            }
             // Leftovers of an earlier index of the range would hold stale keys.
             self.indexes.prune(set_id, range_id, None).await?;
             let state = IndexState::Building {
@@ -239,9 +259,14 @@ impl Feeder {
         Ok(opened)
     }
 
-    /// Drops the indexes of ranges without a live account and builds the first building
-    /// index of the page; the walk stays at that range until its index is ready.
-    async fn state_page(&mut self, storage: &StorageHandle) -> Result<usize, FeedError> {
+    /// Drops the indexes of ranges without a live account or whose set keeps no search index,
+    /// and builds the first building index of the page; the walk stays at that range until its
+    /// index is ready.
+    async fn state_page(
+        &mut self,
+        context: &DriverContext,
+        storage: &StorageHandle,
+    ) -> Result<usize, FeedError> {
         let (rows, next) = iter(
             storage,
             SEARCH_INDEX_KEYSPACE,
@@ -253,6 +278,7 @@ impl Feeder {
         let accounts = read_many(storage, RANGE_ACCOUNT_KEYSPACE, keys).await?;
         let mut previous = self.states.take();
         let mut changed = 0;
+        let mut searched = BTreeMap::new();
         for ((key, state), account) in rows.into_iter().zip(accounts) {
             let (set_id, range_id) = split_key(&key)?;
             let account = account
@@ -260,6 +286,10 @@ impl Feeder {
                 .transpose()?;
             let account =
                 account.filter(|account| !matches!(account.charge, Charge::Retired { .. }));
+            let account = match account {
+                Some(account) if search_on(context, &mut searched, set_id).await? => Some(account),
+                _ => None,
+            };
             match (account, IndexState::from_bytes(&state)?) {
                 (None, _) => {
                     self.indexes.prune(set_id, range_id, None).await?;
@@ -288,8 +318,8 @@ impl Feeder {
         Ok(changed)
     }
 
-    /// Adds up to `rebuild_pages` inventory pages of heads to a building index; true once the
-    /// walk reached the range's end and the index switched to ready.
+    /// Adds up to `rebuild_pages` inventory pages of heads to a building index in one commit;
+    /// true once the walk reached the range's end and the index switched to ready.
     async fn build(
         &self,
         storage: &StorageHandle,
@@ -298,6 +328,8 @@ impl Feeder {
         mut cursor: Option<Vec<u8>>,
     ) -> Result<bool, FeedError> {
         let (lower, end) = range_interval(build.set_id, &account.lower, account.upper.as_deref());
+        let mut changes = Vec::new();
+        let mut done = false;
         for _ in 0..self.limits.rebuild_pages.max(1) {
             let start = match &cursor {
                 Some(cursor) => IterStart::After(cursor.clone().into()),
@@ -318,7 +350,6 @@ impl Feeder {
                 }) => (values, next_start_after),
                 event => return Err(storage_error(event)),
             };
-            let mut changes = Vec::new();
             for (key, value) in &rows {
                 let position = Position::decode(key)?;
                 if position.entry == Entry::Head {
@@ -326,38 +357,36 @@ impl Feeder {
                     changes.push(change_of(position.key, Some(head)));
                 }
             }
-            let (set_id, range_id, generation) = (build.set_id, build.range_id, build.generation);
-            self.indexes
-                .apply(set_id, range_id, generation, changes)
-                .await?;
-            let Some(truncated) = truncated else {
-                let state = IndexState::Ready { generation };
-                put_row(
-                    storage,
-                    SEARCH_INDEX_KEYSPACE,
-                    build.key.clone(),
-                    state.to_bytes()?,
-                )
-                .await?;
-                self.indexes
-                    .prune(set_id, range_id, Some(generation))
-                    .await?;
-                return Ok(true);
-            };
-            cursor = Some(truncated.to_vec());
-            let state = IndexState::Building {
-                generation,
-                cursor: cursor.clone(),
-            };
-            put_row(
-                storage,
-                SEARCH_INDEX_KEYSPACE,
-                build.key.clone(),
-                state.to_bytes()?,
-            )
-            .await?;
+            match truncated {
+                Some(truncated) => cursor = Some(truncated.to_vec()),
+                None => {
+                    done = true;
+                    break;
+                }
+            }
         }
-        Ok(false)
+        let (set_id, range_id, generation) = (build.set_id, build.range_id, build.generation);
+        self.indexes
+            .apply(set_id, range_id, generation, changes)
+            .await?;
+        // The cursor moves only after the commit, so a crash repeats pages, never skips them.
+        let state = match done {
+            true => IndexState::Ready { generation },
+            false => IndexState::Building { generation, cursor },
+        };
+        put_row(
+            storage,
+            SEARCH_INDEX_KEYSPACE,
+            build.key.clone(),
+            state.to_bytes()?,
+        )
+        .await?;
+        if done {
+            self.indexes
+                .prune(set_id, range_id, Some(generation))
+                .await?;
+        }
+        Ok(done)
     }
 }
 
@@ -387,6 +416,73 @@ pub fn spawn_index_feed(context: Arc<DriverContext>, shutdown: &Shutdown) {
             }
         }
     });
+}
+
+/// Whether set `set_id` keeps a search index, from this node's record; without one it does not.
+async fn search_on(
+    context: &DriverContext,
+    searched: &mut BTreeMap<Ulid, bool>,
+    set_id: Ulid,
+) -> Result<bool, FeedError> {
+    if let Some(search) = searched.get(&set_id) {
+        return Ok(*search);
+    }
+    let view = read_record(context, set_id)
+        .await
+        .map_err(FeedError::Storage)?;
+    let search = view.is_some_and(|view| view.snapshot().config.settings.search_index);
+    searched.insert(set_id, search);
+    Ok(search)
+}
+
+/// How far this node's search index of one range is.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndexProgress {
+    pub ready: bool,
+    /// Keys in the index as of its last commit.
+    pub indexed: u64,
+    /// Keys of the range by this node's range counters; a split child counts its parent's too.
+    pub keys: u64,
+}
+
+/// The search index progress of every range of `bucket` this node holds, while its set keeps
+/// a search index; a range whose index is not opened yet has none indexed.
+pub async fn range_progress(
+    context: &DriverContext,
+    indexes: &Arc<RangeIndexes>,
+    bucket: &str,
+) -> Result<BTreeMap<Ulid, IndexProgress>, FeedError> {
+    let held = held_ranges(context, bucket).await;
+    let held = held.map_err(|error| FeedError::Storage(error.to_string()))?;
+    let Some((binding, snapshot, held)) = held else {
+        return Ok(BTreeMap::new());
+    };
+    if !snapshot.config.settings.search_index {
+        return Ok(BTreeMap::new());
+    }
+    let set_id = binding.set_id;
+    let keys = (held.iter())
+        .map(|range| state_key(set_id, range.range_id))
+        .collect();
+    let states = read_many(&context.storage_handle, SEARCH_INDEX_KEYSPACE, keys).await?;
+    let mut progress = BTreeMap::new();
+    for (range, state) in held.iter().zip(states) {
+        let state = state
+            .map(|value| IndexState::from_bytes(&value))
+            .transpose()?;
+        let indexed = match &state {
+            Some(state) => (indexes.count(set_id, range.range_id, state.generation())).await?,
+            None => 0,
+        };
+        let counters = sum_held([range]).map_err(|error| FeedError::Storage(error.to_string()))?;
+        let entry = IndexProgress {
+            ready: matches!(state, Some(IndexState::Ready { .. })),
+            indexed,
+            keys: u64::try_from(counters.objects).unwrap_or_default(),
+        };
+        progress.insert(range.range_id, entry);
+    }
+    Ok(progress)
 }
 
 /// The index state row of a range, keyed like its account row.

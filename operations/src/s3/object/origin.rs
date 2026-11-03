@@ -97,6 +97,10 @@ pub async fn read_origin(
         .ok_or(OriginError::VersionMissing)?;
     let version =
         BlobVersion::from_bytes(&value).map_err(|error| OriginError::Storage(error.to_string()))?;
+    // The source's public address comes from the root this node keeps once.
+    let version = crate::staging::root_record::hydrate_version(context, version)
+        .await
+        .map_err(OriginError::Storage)?;
     let global = info.distribution.as_ref().map(|_| GlobalId::Version {
         realm_id,
         version_id,

@@ -743,6 +743,7 @@ async fn claimed_job(
         cancel: CancellationToken::new(),
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
+        range_turns: Default::default(),
     }
 }
 

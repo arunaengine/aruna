@@ -40,6 +40,7 @@ async fn rebuild(handle: &StorageHandle, range_id: Ulid) -> RebuildOutcome {
         page_rows: 2,
         page_bytes: 1 << 20,
         max_pages: 100,
+        group_id: None,
     };
     drive(RebuildOperation::new(config), &context(handle))
         .await
@@ -168,6 +169,7 @@ async fn refuses_bad_splits() {
         page_rows: 2,
         page_bytes: 1 << 20,
         max_pages: 0,
+        group_id: None,
     };
     let paused = drive(RebuildOperation::new(config), &context(&handle)).await;
     assert_eq!(paused, Ok(RebuildOutcome::Paused));

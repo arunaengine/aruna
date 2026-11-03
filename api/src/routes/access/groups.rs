@@ -1253,6 +1253,8 @@ Membership is the only permission check, so a realm administrator who is not a m
 **Behavior**
 - The flat counters report what this node stores for the group, while `realm` reports the totals
   aggregated from the usage summaries the realm's nodes publish, which trail recent writes.
+- `realm.objects`, `realm.logical_bytes` and `realm.referenced_bytes` count each object once: the
+  copies other member nodes hold of a distributed bucket's key range are left out.
 - `stored_blobs` and `stored_bytes` are omitted from both: a blob copy is content-addressed and
   shared by every group referencing it, so it is counted per node and per storage backend only, and
   `/system/usage` reports those node-wide figures.
@@ -1261,9 +1263,12 @@ Membership is the only permission check, so a realm administrator who is not a m
 - Classification reads each live registry record's root-only RO-Crate summary: a root whose `@type`
   contains `http://www.w3.org/ns/dx/prof/Profile` is a Profile, one with exact `conformsTo`
   `https://w3id.org/ro/wfrun/process/0.5` is a Process Run, and every other root is a Dataset.
+- `realm.distinct_buckets` is `realm.buckets` with each distributed bucket of the group counted
+  once instead of once per member node; it is omitted when this node cannot read all its records
+  of the distributed buckets, and while one of the group's distributed buckets is being deleted.
 - `quota` restates the realm quota configuration for this group with a warning flag evaluated
-  against the group's realm-wide logical bytes; it is omitted when the realm configuration cannot be
-  read.
+  against the group's realm-wide logical bytes, plus the copies' logical bytes when the group counts
+  replicas; it is omitted when the realm configuration cannot be read. References never count.
 
 **Limits**
 - The candidate set is bounded by the metadata registry limit and root-summary reads have at most
@@ -1286,6 +1291,7 @@ Membership is the only permission check, so a realm administrator who is not a m
                 "process_run_count": 19,
                 "realm": {
                     "buckets": 5,
+                    "distinct_buckets": 4,
                     "objects": 2048,
                     "logical_bytes": 152882105100_i64,
                     "referenced_bytes": 152882105100_i64
@@ -1335,10 +1341,13 @@ pub(crate) async fn run_group_usage(
     )
     .await?;
 
-    // The QuotaGate enforces against the group's realm-wide logical_bytes, so the
-    // warning threshold is evaluated against the same counter.
-    let group_logical_bytes = realm.logical_bytes;
-    let mut response = crate::routes::info::UsageResponse::for_group(local, realm);
+    // The QuotaGate enforces against the group's realm-wide logical_bytes, the replicas' share
+    // only when the group counts it, so the warning threshold is evaluated against the same sum.
+    let (group_logical_bytes, replica_bytes) =
+        (realm.counters.logical_bytes, realm.replicas.logical_bytes);
+    let mut response = crate::routes::info::UsageResponse::for_group(local, realm.counters);
+    response.realm.distinct_buckets =
+        crate::routes::info::distinct_buckets(state, Some(group_id), response.realm.buckets).await;
     match count_group_purpose(&state.get_ctx(), state.get_realm_id(), group_id).await {
         Ok(Some(counts)) => {
             response.dataset_count = Some(counts.dataset_count);
@@ -1358,10 +1367,14 @@ pub(crate) async fn run_group_usage(
     )
     .await
     {
+        let replicas = match config.replica_quota.counts(&group_id) {
+            true => replica_bytes,
+            false => 0,
+        };
         response.quota = Some(crate::routes::info::GroupQuotaStatus::resolve(
             &config.quota,
             &group_id,
-            group_logical_bytes,
+            group_logical_bytes.saturating_add(replicas),
         ));
     }
     Ok(response)

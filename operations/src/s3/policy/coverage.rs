@@ -1,5 +1,5 @@
-//! Scans this node's heads in pages and reports where a bucket default is not attached yet.
-//! A default only governs versions minted after it, so historical rows are diagnostic only.
+//! Scans this node's heads in pages and reports where a bucket default is not attached yet; in a
+//! distributed bucket only the ranges this node writes. Historical rows are diagnostic only.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -17,6 +17,7 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey,
     ManagedCopyRecord, VersionKey,
 };
+use aruna_core::structs::storage::distribution::{DistributionBinding, RouteError};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -24,6 +25,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::distribution::guard::{GuardError, authority_read, authority_rows, write_authority};
 
 /// Upper bound on one page, so a scan can never walk a whole bucket at once.
 pub const COVERAGE_PAGE_LIMIT: usize = 256;
@@ -77,6 +79,8 @@ pub enum CoverageLimit {
     HistoricalExcluded,
     /// A write committed after a head was observed is not reflected.
     ConcurrentWrites,
+    /// A distributed bucket: only the ranges this node writes, the other coordinators report theirs.
+    CoordinatedRanges,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +108,8 @@ pub struct CoverageReport {
     /// True only when the bounded local iterator was exhausted in this pass.
     pub complete: bool,
     pub limits: Vec<CoverageLimit>,
+    /// Entries of ranges another node writes; that node reports them.
+    pub elsewhere: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +131,8 @@ pub enum CoverageError {
     NoSuchBucket,
     #[error("caller may not administer the realm configuration")]
     Unauthorized,
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
     #[error("unexpected event during the coverage scan")]
     InvalidEvent,
 }
@@ -135,6 +143,8 @@ enum ScanState {
     Authorize,
     StartTransaction,
     ReadBucket,
+    /// Reads the set record and this node's fence, so only the keys it writes are counted.
+    ReadRecord,
     ScanPage,
     ReadVersions,
     ReadHeads,
@@ -165,6 +175,10 @@ pub struct PolicyCoverageOperation {
     gaps: Vec<CoverageGap>,
     copies: CopyCounts,
     cursor: Option<Key>,
+    /// The bucket's membership in a distributed set, and the set record and fence rows.
+    binding: Option<DistributionBinding>,
+    authority: (Option<Value>, Option<Value>),
+    elsewhere: usize,
     output: Option<Result<CoverageReport, CoverageError>>,
 }
 
@@ -182,7 +196,27 @@ impl PolicyCoverageOperation {
             gaps: Vec::new(),
             copies: CopyCounts::default(),
             cursor: None,
+            binding: None,
+            authority: (None, None),
+            elsewhere: 0,
             output: None,
+        }
+    }
+
+    /// Whether this report counts `key`: in a distributed bucket only while this node writes its
+    /// range, or holds it fenced until the next coordinator takes over, so each key counts once.
+    fn counts(&mut self, key: &str) -> Result<bool, CoverageError> {
+        let Some(binding) = self.binding.as_ref() else {
+            return Ok(true);
+        };
+        let (record, fence) = (self.authority.0.as_deref(), self.authority.1.as_deref());
+        match write_authority(binding, key, record, fence) {
+            Ok(_) | Err(GuardError::Route(RouteError::Moving(_))) => Ok(true),
+            Err(GuardError::NotCoordinator { .. }) => {
+                self.elsewhere += 1;
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -247,6 +281,11 @@ impl PolicyCoverageOperation {
                 Ok(head) => head,
                 Err(error) => return self.fail(error.into()),
             };
+            match self.counts(&head.key) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => return self.fail(error),
+            }
             let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
                 Ok(pointer) => pointer,
                 Err(error) => return self.fail(error.into()),
@@ -263,6 +302,9 @@ impl PolicyCoverageOperation {
                 version: None,
             });
         }
+        if reads.is_empty() {
+            return self.commit();
+        }
         self.state = ScanState::ReadVersions;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
@@ -278,6 +320,11 @@ impl PolicyCoverageOperation {
                 Ok(version_key) => version_key,
                 Err(error) => return self.fail(error.into()),
             };
+            match self.counts(&version_key.key) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => return self.fail(error),
+            }
             let version = match BlobVersion::from_bytes(value.as_ref()) {
                 Ok(version) => version,
                 Err(error) => return self.fail(error.into()),
@@ -292,6 +339,9 @@ impl PolicyCoverageOperation {
                 version_id: version_key.version_id,
                 version: Some(version),
             });
+        }
+        if reads.is_empty() {
+            return self.commit();
         }
         self.state = ScanState::ReadHeads;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -481,6 +531,9 @@ impl PolicyCoverageOperation {
         if self.input.scope == CoverageScope::CurrentHeads {
             limits.push(CoverageLimit::HistoricalExcluded);
         }
+        if self.binding.is_some() {
+            limits.push(CoverageLimit::CoordinatedRanges);
+        }
         limits
     }
 
@@ -497,6 +550,7 @@ impl PolicyCoverageOperation {
             cursor: self.cursor.clone(),
             complete: self.cursor.is_none(),
             limits: self.limits(),
+            elsewhere: self.elsewhere,
         }));
         match self.txn_id {
             Some(txn_id) => {
@@ -580,8 +634,23 @@ impl Operation for PolicyCoverageOperation {
                 };
                 self.generation = bucket.placement_policy_generation;
                 self.target_refs = bucket.placement_policies;
-                self.scan_page()
+                self.binding = bucket.distribution;
+                match self.binding.as_ref() {
+                    // Read in the same transaction as the heads, so both describe one moment.
+                    Some(binding) => {
+                        self.state = ScanState::ReadRecord;
+                        smallvec![authority_read(binding.set_id, self.txn_id)]
+                    }
+                    None => self.scan_page(),
+                }
             }
+            ScanState::ReadRecord => match authority_rows(event) {
+                Ok(rows) => {
+                    self.authority = rows;
+                    self.scan_page()
+                }
+                Err(error) => self.fail(error.into()),
+            },
             ScanState::ScanPage => self.handle_page(event),
             ScanState::ReadVersions => self.handle_versions(event),
             ScanState::ReadHeads => self.handle_heads(event),
@@ -633,6 +702,7 @@ mod pure_tests {
         CoverageScope, PolicyCoverageOperation,
     };
     use aruna_core::UserId;
+    use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
@@ -800,6 +870,86 @@ mod pure_tests {
             txn_id: Ulid::from_bytes([4u8; 16]),
         }));
         operation.finalize().expect("report returned")
+    }
+
+    /// A head scan of a bucket bound to member 1 of the two-shard test set, which writes the keys
+    /// below "m"; `fence` is this node's fence row.
+    fn scan_distributed(
+        entries: Vec<(&str, Ulid)>,
+        fence: Option<Vec<u8>>,
+        owned: usize,
+    ) -> CoverageReport {
+        use crate::distribution::test_record::{authority_rows, binding, record};
+        let (snapshot, bytes) = record(true);
+        let mut bound = bucket(vec![policy_ref(1)]);
+        bound.distribution = Some(binding(&snapshot, 1, 5));
+        let mut operation = operation(CoverageScope::CurrentHeads);
+        operation.start();
+        operation.step(authorized(true));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([4u8; 16]),
+        }));
+        let effects = operation.step(read(Some(bound.to_bytes().expect("bucket"))));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead {
+                txn_id: Some(_),
+                ..
+            })]
+        ));
+        operation.step(authority_rows(Some(bytes), fence));
+        let effects = operation.step(page(entries));
+        if owned > 0 {
+            let version = version(vec![policy_ref(1)]).to_bytes().expect("version");
+            operation.step(batch(vec![Some(version); owned]));
+            operation.step(batch(vec![None; owned]));
+        } else {
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+            ));
+        }
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: Ulid::from_bytes([4u8; 16]),
+        }));
+        operation.finalize().expect("report returned")
+    }
+
+    #[test]
+    fn counts_coordinated_ranges() {
+        // Member 1 writes "a" but not "x": the coordinator of "x" reports it, so it counts once.
+        let report = scan_distributed(
+            vec![
+                ("a", Ulid::from_bytes([8; 16])),
+                ("x", Ulid::from_bytes([9; 16])),
+            ],
+            None,
+            1,
+        );
+        assert_eq!((report.observed, report.elsewhere), (1, 1));
+        assert!(report.limits.contains(&CoverageLimit::CoordinatedRanges));
+
+        let other = scan_distributed(vec![("x", Ulid::from_bytes([9; 16]))], None, 0);
+        assert_eq!((other.observed, other.elsewhere), (0, 1));
+        assert!(other.complete);
+    }
+
+    #[test]
+    fn counts_fenced_range() {
+        // A range fenced for a transfer stays this node's to report until the next one takes over.
+        use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
+        let (snapshot, _) = crate::distribution::test_record::record(true);
+        let mut fence = LocalFence::default();
+        fence.fence_range(RangeFence {
+            range_id: snapshot.config.ranges[0].range_id,
+            transfer_id: Ulid::from_bytes([3; 16]),
+            epoch: 1,
+            since_ms: 0,
+            uploads_open: false,
+        });
+        let fence = fence.to_bytes().expect("fence encodes");
+        let report = scan_distributed(vec![("a", Ulid::from_bytes([8; 16]))], Some(fence), 1);
+        assert_eq!((report.observed, report.elsewhere), (1, 0));
     }
 
     #[test]

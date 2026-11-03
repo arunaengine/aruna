@@ -34,6 +34,7 @@ use super::refill::{RefillConfig, RefillOperation};
 use super::sign_statement;
 use super::split::{SplitConfig, SplitError, SplitOperation};
 use crate::driver::{DriverContext, drive};
+use crate::node::usage_stats::mark_dirty;
 
 /// How long a pass that found nothing to do waits before it looks again.
 pub const MAINTAIN_AFTER: Duration = Duration::from_secs(60);
@@ -160,6 +161,7 @@ pub async fn begin_range_rebuilds(context: &DriverContext) -> Result<usize, Stri
                 page_rows: WALK_ROWS,
                 page_bytes: WALK_BYTES,
                 max_pages: 0,
+                group_id: None,
             };
             match drive(RebuildOperation::new(config), context).await {
                 Ok(_) => begun += 1,
@@ -264,7 +266,10 @@ impl Tending<'_> {
     /// Splits this node's accounting the way the record split the range.
     async fn split_accounting(&self, context: &Arc<DriverContext>, config: SplitConfig) -> Tended {
         match drive(SplitOperation::new(config), context.as_ref()).await {
-            Ok(()) => Tended::Busy,
+            Ok(()) => {
+                self.republish(context).await;
+                Tended::Busy
+            }
             // Concurrent writers left more sample entries than one split reads.
             Err(SplitError::Refused(_, "the key sample needs a refill")) => {
                 self.refill(context).await
@@ -276,6 +281,14 @@ impl Tending<'_> {
         }
     }
 
+    /// A finished accounting transition moves the charged rows a replica share reads.
+    async fn republish(&self, context: &DriverContext) {
+        let group = self.snapshot.config.owner_group;
+        if let Err(error) = mark_dirty(context, [group]).await {
+            warn!(set_id = %self.set_id(), %error, "The replica share was not marked for a publish");
+        }
+    }
+
     async fn rebuild(&self, context: &Arc<DriverContext>) -> Tended {
         let config = RebuildConfig {
             set_id: self.set_id(),
@@ -283,10 +296,15 @@ impl Tending<'_> {
             page_rows: WALK_ROWS,
             page_bytes: WALK_BYTES,
             max_pages: WALK_PAGES,
+            group_id: Some(self.snapshot.config.owner_group),
         };
         match drive(RebuildOperation::new(config), context.as_ref()).await {
             Ok(RebuildOutcome::Paused) => Tended::Busy,
-            Ok(RebuildOutcome::Done | RebuildOutcome::Waiting) => Tended::Idle,
+            Ok(RebuildOutcome::Done) => {
+                self.republish(context).await;
+                Tended::Idle
+            }
+            Ok(RebuildOutcome::Waiting) => Tended::Idle,
             Err(error) => {
                 warn!(set_id = %self.set_id(), range_id = %self.range_id, %error, "A range rebuild failed");
                 Tended::Idle
@@ -500,6 +518,7 @@ mod tests {
             page_rows: 8,
             page_bytes: 1 << 20,
             max_pages: 100,
+            group_id: None,
         };
         let outcome = drive(RebuildOperation::new(config), &context).await;
         assert_eq!(outcome.unwrap(), RebuildOutcome::Done);
@@ -509,6 +528,53 @@ mod tests {
         };
         let row = counters(&handle, generation_key(set, range_id, generation)).await;
         assert_eq!(row, exact(1, 5));
+    }
+
+    #[tokio::test]
+    async fn split_marks_group() {
+        // A split of this node's accounting moves the charged rows, so the group's replica
+        // share is published again.
+        use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
+        use aruna_core::structs::storage::usage::dirty_group_key;
+        let (_dir, handle) = open();
+        let (snapshot, _) = crate::distribution::test_record::record(true);
+        let set = snapshot.set_id();
+        let range_id = Ulid::from_bytes([1; 16]);
+        install(
+            &handle,
+            set,
+            &[super::super::test_store::range(1, "", None)],
+        )
+        .await;
+        for (key, seed) in [("a", 1), ("x", 2)] {
+            assert!(apply(&handle, write(set, key, seed, 5)).await.unwrap());
+        }
+        let context = std::sync::Arc::new(context(&handle));
+        let account = account(&handle, set, range_id).await.unwrap();
+        let tending = super::Tending {
+            realm_id: crate::distribution::test_record::realm(),
+            local: crate::distribution::test_record::secret(1).public(),
+            snapshot: &snapshot,
+            range_id,
+            account: &account,
+        };
+        let config = super::SplitConfig {
+            set_id: set,
+            range_id,
+            split_key: "m".to_string(),
+            left: Ulid::from_bytes([2; 16]),
+            right: Ulid::from_bytes([3; 16]),
+        };
+        assert_eq!(
+            tending.split_accounting(&context, config).await,
+            super::Tended::Busy
+        );
+        let marker = super::super::test_store::get(
+            &handle,
+            NODE_STATS_KEYSPACE,
+            dirty_group_key(snapshot.config.owner_group),
+        );
+        assert!(marker.await.is_some());
     }
 
     #[test]

@@ -278,17 +278,19 @@ impl ArunaS3Service {
             .and_then(|info| info.distribution.clone())
             .zip(extensions.get::<UserAccess>());
         // A distributed bucket's folder spans its key ranges, as its S3 listing does.
-        let page = match distributed {
+        let (page, stale) = match distributed {
             Some((binding, user)) => {
                 let user = forward::reads::anonymous_window(user);
                 let shape = (None, false, None);
-                self.merged_objects(&user, &binding, input, shape, (None, true))
-                    .await?
-                    .0
+                let (page, _, stale) =
+                    (self.merged_objects(&user, &binding, input, shape, (None, true))).await?;
+                (page, stale)
             }
             None => {
-                self.run_object_listing(input, None, false, None, None)
-                    .await?
+                let page = self
+                    .run_object_listing(input, None, false, None, None)
+                    .await?;
+                (page, Vec::new())
             }
         };
         let truncated = page.continuation_token.is_some();
@@ -337,6 +339,7 @@ impl ArunaS3Service {
             ..Default::default()
         };
         let mut response = S3Response::new(output);
+        forward::reads::mark_stale(&mut response.headers, &stale);
         response
             .headers
             .insert(http::header::VARY, http::HeaderValue::from_static("Accept"));
@@ -730,7 +733,7 @@ impl S3 for ArunaS3Service {
             delimiter: delimiter.clone(),
             start_after: start_after.clone(),
         };
-        let (page, next_from) = match &merged {
+        let (page, next_from, stale) = match &merged {
             Some(binding) => {
                 let shape = (owner, url_encoded, scope.as_ref());
                 self.merged_objects(&user_access, binding, input, shape, (from, true))
@@ -740,7 +743,7 @@ impl S3 for ArunaS3Service {
                 let page = self
                     .run_object_listing(input, owner, url_encoded, scope.as_ref(), bounds)
                     .await?;
-                (page, None)
+                (page, None, Vec::new())
             }
         };
 
@@ -760,7 +763,7 @@ impl S3 for ArunaS3Service {
         };
         let is_truncated = next_continuation_token.is_some();
 
-        Ok(S3Response::new(ListObjectsV2Output {
+        let mut response = S3Response::new(ListObjectsV2Output {
             name: Some(bucket),
             prefix: prefix.map(&encode_field),
             max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
@@ -774,7 +777,9 @@ impl S3 for ArunaS3Service {
             encoding_type: req.input.encoding_type,
             start_after: start_after.map(&encode_field),
             ..Default::default()
-        }))
+        });
+        forward::reads::mark_stale(&mut response.headers, &stale);
+        Ok(response)
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -863,17 +868,20 @@ impl S3 for ArunaS3Service {
             delimiter: delimiter.clone(),
             start_after,
         };
-        let page = match &merged {
+        let (page, stale) = match &merged {
             // A marker cannot name a range start, so a legacy listing visits every range.
             Some(binding) => {
                 let shape = (owner, url_encoded, scope.as_ref());
-                self.merged_objects(&user_access, binding, input, shape, (None, false))
-                    .await?
-                    .0
+                let (page, _, stale) =
+                    (self.merged_objects(&user_access, binding, input, shape, (None, false)))
+                        .await?;
+                (page, stale)
             }
             None => {
-                self.run_object_listing(input, owner, url_encoded, scope.as_ref(), None)
-                    .await?
+                let page = self
+                    .run_object_listing(input, owner, url_encoded, scope.as_ref(), None)
+                    .await?;
+                (page, Vec::new())
             }
         };
 
@@ -890,7 +898,7 @@ impl S3 for ArunaS3Service {
         )
         .map(&encode_field);
 
-        Ok(S3Response::new(ListObjectsOutput {
+        let mut response = S3Response::new(ListObjectsOutput {
             name: Some(bucket),
             prefix: prefix.map(&encode_field),
             marker: marker.map(&encode_field),
@@ -902,7 +910,9 @@ impl S3 for ArunaS3Service {
             delimiter: delimiter.map(&encode_field),
             encoding_type: req.input.encoding_type,
             ..Default::default()
-        }))
+        });
+        forward::reads::mark_stale(&mut response.headers, &stale);
+        Ok(response)
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1163,7 +1173,11 @@ impl S3 for ArunaS3Service {
             .await?
         {
             return match self
-                .copy_path(&source_bucket_info, &source_key, &forward)
+                .copy_path(
+                    &source_bucket_info,
+                    (&source_key, source_version_id.is_some()),
+                    &forward,
+                )
                 .await?
             {
                 CopyPath::Stream => {
@@ -1226,7 +1240,11 @@ impl S3 for ArunaS3Service {
                 }
             };
         }
-        self.ensure_source(&source_bucket_info, &source_key).await?;
+        self.ensure_source(
+            &source_bucket_info,
+            (&source_key, source_version_id.is_some()),
+        )
+        .await?;
         let dest_group_id = dest_bucket_info
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
@@ -1597,7 +1615,11 @@ impl S3 for ArunaS3Service {
                 url::form_urlencoded::byte_serialize(req.input.upload_id.as_bytes()).collect();
             let query = format!("partNumber={}&uploadId={upload}", req.input.part_number);
             return match self
-                .copy_path(&source_bucket_info, &source_key, &forward)
+                .copy_path(
+                    &source_bucket_info,
+                    (&source_key, source_version_id.is_some()),
+                    &forward,
+                )
                 .await?
             {
                 CopyPath::Stream => {
@@ -1640,7 +1662,11 @@ impl S3 for ArunaS3Service {
                 }
             };
         }
-        self.ensure_source(&source_bucket_info, &source_key).await?;
+        self.ensure_source(
+            &source_bucket_info,
+            (&source_key, source_version_id.is_some()),
+        )
+        .await?;
         let upload_id = self
             .upload_id(dest_info.as_ref(), &req.input.key, &req.input.upload_id)
             .await?;
@@ -1930,23 +1956,34 @@ impl S3 for ArunaS3Service {
         let key = req.input.key;
         let response_bucket = bucket.clone();
         let response_key = key.clone();
-        if let Some(holder) = self
-            .read_holder(&req.extensions, bucket_info.as_ref(), &key)
-            .await?
-        {
-            let request = || {
-                forward::reads::read_request(
-                    http::Method::GET,
-                    "GetObject",
-                    &bucket,
-                    &key,
-                    req.uri.query(),
-                    &req.headers,
-                )
-            };
-            let response = self.read_object(&user_access, &holder, request).await?;
-            return Ok(forward::reads::forwarded_get(response));
-        }
+        let request = || {
+            forward::reads::read_request(
+                http::Method::GET,
+                "GetObject",
+                &bucket,
+                &key,
+                req.uri.query(),
+                &req.headers,
+            )
+        };
+        let pinned = version_id.is_some();
+        let answer = self
+            .answer_read(
+                &req.extensions,
+                &user_access,
+                bucket_info.as_ref(),
+                (&key, pinned),
+                request,
+            )
+            .await?;
+        let stale = match answer {
+            forward::reads::ReadAnswer::Forwarded(response, stale) => {
+                let mut response = forward::reads::forwarded_get(response);
+                forward::reads::mark_stale(&mut response.headers, stale.as_slice());
+                return Ok(response);
+            }
+            forward::reads::ReadAnswer::Local(stale) => stale,
+        };
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
 
         let range_request = requested_range.map(object_range_request);
@@ -1976,8 +2013,41 @@ impl S3 for ArunaS3Service {
             }
             _ => get_object_token(&self.state, input, restrictions, token).await,
         }
-        .map_err(IntoS3Error::into_s3_error)
-        .map_err(|error| forward::catch_up_miss(error, catching_up, bucket_info.as_ref()))?;
+        .map_err(IntoS3Error::into_s3_error);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(range_id) = stale {
+                    return Err(forward::reads::stale_error(error, range_id));
+                }
+                let miss = self
+                    .copy_miss(&req.extensions, bucket_info.as_ref(), &response_key, &error)
+                    .await?;
+                let Some(coordinator) = miss else {
+                    return Err(forward::catch_up_miss(
+                        error,
+                        catching_up,
+                        bucket_info.as_ref(),
+                    ));
+                };
+                let request = forward::reads::read_request(
+                    http::Method::GET,
+                    "GetObject",
+                    &response_bucket,
+                    &response_key,
+                    req.uri.query(),
+                    &req.headers,
+                );
+                // While the coordinator cannot answer, this copy's miss stands, marked.
+                let response = match self.forward_read(&user_access, &coordinator, request).await {
+                    Err(failed) if forward::list::unreachable(&failed) => {
+                        return Err(forward::reads::stale_error(error, coordinator.range_id));
+                    }
+                    answer => answer?,
+                };
+                return Ok(forward::reads::forwarded_get(response));
+            }
+        };
         self.record_touch(
             &user_access.access_key,
             &response_bucket,
@@ -2044,6 +2114,7 @@ impl S3 for ArunaS3Service {
         if let Some(value) = forward::copy_policies(&req.extensions, &result.source_policies) {
             (response.headers).insert(COPY_CONTEXT_HEADER, value);
         }
+        forward::reads::mark_stale(&mut response.headers, stale.as_slice());
         Ok(response)
     }
 
@@ -2181,23 +2252,34 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(|info| info.group_id)
             .unwrap_or(user_access.group_id);
-        if let Some(holder) = self
-            .read_holder(&req.extensions, bucket_info.as_ref(), &key)
-            .await?
-        {
-            let request = || {
-                forward::reads::read_request(
-                    http::Method::HEAD,
-                    "HeadObject",
-                    &bucket,
-                    &key,
-                    req.uri.query(),
-                    &req.headers,
-                )
-            };
-            let response = self.read_object(&user_access, &holder, request).await?;
-            return Ok(forward::reads::forwarded_head(&response));
-        }
+        let request = || {
+            forward::reads::read_request(
+                http::Method::HEAD,
+                "HeadObject",
+                &bucket,
+                &key,
+                req.uri.query(),
+                &req.headers,
+            )
+        };
+        let pinned = version_id.is_some();
+        let answer = self
+            .answer_read(
+                &req.extensions,
+                &user_access,
+                bucket_info.as_ref(),
+                (&key, pinned),
+                request,
+            )
+            .await?;
+        let stale = match answer {
+            forward::reads::ReadAnswer::Forwarded(response, stale) => {
+                let mut response = forward::reads::forwarded_head(&response);
+                forward::reads::mark_stale(&mut response.headers, stale.as_slice());
+                return Ok(response);
+            }
+            forward::reads::ReadAnswer::Local(stale) => stale,
+        };
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
         let operation = HeadObjectOperation::new(HOI {
             bucket: bucket.clone(),
@@ -2205,10 +2287,41 @@ impl S3 for ArunaS3Service {
             version_id,
         });
 
-        let result = drive(operation, &self.state)
-            .await
-            .map_err(IntoS3Error::into_s3_error)
-            .map_err(|error| forward::catch_up_miss(error, catching_up, bucket_info.as_ref()))?;
+        let result = match drive(operation, &self.state).await {
+            Ok(result) => result,
+            Err(error) => {
+                let error = error.into_s3_error();
+                if let Some(range_id) = stale {
+                    return Err(forward::reads::stale_error(error, range_id));
+                }
+                let miss = self
+                    .copy_miss(&req.extensions, bucket_info.as_ref(), &key, &error)
+                    .await?;
+                let Some(coordinator) = miss else {
+                    return Err(forward::catch_up_miss(
+                        error,
+                        catching_up,
+                        bucket_info.as_ref(),
+                    ));
+                };
+                let request = forward::reads::read_request(
+                    http::Method::HEAD,
+                    "HeadObject",
+                    &bucket,
+                    &key,
+                    req.uri.query(),
+                    &req.headers,
+                );
+                // While the coordinator cannot answer, this copy's miss stands, marked.
+                let response = match self.forward_read(&user_access, &coordinator, request).await {
+                    Err(failed) if forward::list::unreachable(&failed) => {
+                        return Err(forward::reads::stale_error(error, coordinator.range_id));
+                    }
+                    answer => answer?,
+                };
+                return Ok(forward::reads::forwarded_head(&response));
+            }
+        };
 
         // A reference answers from its source observation without opening a source read.
         let remote_info = if result.location.is_none() && result.source_metadata.is_none() {
@@ -2277,7 +2390,9 @@ impl S3 for ArunaS3Service {
             ));
         }
 
-        Ok(S3Response::new(output))
+        let mut response = S3Response::new(output);
+        forward::reads::mark_stale(&mut response.headers, stale.as_slice());
+        Ok(response)
     }
 
     #[tracing::instrument(err, skip(self, req))]

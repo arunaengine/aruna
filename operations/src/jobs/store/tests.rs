@@ -349,6 +349,63 @@ async fn claim_moves_index() {
     assert_eq!(parsed, job_id);
 }
 
+// A job its node gave up on is cancelled for good, after which it can be deleted.
+#[tokio::test]
+async fn exhausted_job_cancels() {
+    let (_dir, storage) = temp_storage();
+    let mut record = queued_record(JobId::from_bytes([0x44; 16]));
+    record.state = JobState::Indeterminate;
+    record.locally_exhausted = true;
+    insert_job(&storage, &record).await.unwrap();
+
+    let outcome = set_cancel_requested(&storage, record.job_id, 9_000)
+        .await
+        .unwrap();
+
+    let CancelRequestOutcome::Cancelled(cancelled) = outcome else {
+        panic!("an exhausted job must settle as cancelled");
+    };
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert!(!cancelled.locally_exhausted && cancelled.cancel_requested);
+    let deleted = delete_finished_run(&storage, record.created_by, record.job_id).await;
+    assert_eq!(deleted.unwrap(), RunDelete::Deleted);
+}
+
+fn claim_rows(old: &JobRecord, new: &JobRecord) -> (usize, usize) {
+    let (writes, deletes) = index_deltas(old, new).unwrap();
+    let written = writes
+        .iter()
+        .filter(|(space, ..)| space == JOB_CLAIM_KEYSPACE);
+    let deleted = deletes
+        .iter()
+        .filter(|(space, _)| space == JOB_CLAIM_KEYSPACE);
+    (written.count(), deleted.count())
+}
+
+// Lease renewals and progress flushes leave the claim row alone; a new claim or settling moves it.
+#[test]
+fn claim_row_moves() {
+    let mut claimed = queued_record(JobId::from_bytes([3u8; 16]));
+    claimed.state = JobState::Running;
+    claimed.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: Ulid::from_bytes([4u8; 16]),
+        lease_expires_ms: 5_000,
+    });
+    let mut renewed = claimed.clone();
+    renewed.progress.current = 7;
+    renewed.claim.as_mut().unwrap().lease_expires_ms = 9_000;
+    let mut taken = renewed.clone();
+    taken.claim.as_mut().unwrap().claim_token = Ulid::from_bytes([5u8; 16]);
+    let mut settled = renewed.clone();
+    settled.state = JobState::Succeeded;
+
+    assert_eq!(claim_rows(&queued_record(claimed.job_id), &claimed), (1, 0));
+    assert_eq!(claim_rows(&claimed, &renewed), (0, 0));
+    assert_eq!(claim_rows(&renewed, &taken), (1, 0));
+    assert_eq!(claim_rows(&renewed, &settled), (0, 1));
+}
+
 // Perf budget: a claim is start + read + batch-write + batch-delete + commit.
 #[tokio::test]
 async fn claim_transition_bounded() {
@@ -600,6 +657,48 @@ async fn deferral_keeps_attempt() {
             .map(|error| error.message.as_str()),
         Some("metadata projection pending")
     );
+}
+
+// A run deferred by a storage conflict spends no attempt, and the success after it clears the
+// conflict from the job's error.
+#[tokio::test]
+async fn success_clears_error() {
+    let (_dir, storage) = temp_storage();
+    let job_id = JobId::from_bytes([0x45u8; 16]);
+    insert_job(&storage, &queued_record(job_id)).await.unwrap();
+    let claim = |now| claim_job(&storage, job_id, node_id(3), now);
+    let ClaimOutcome::Claimed(record) = claim(5_000).await.unwrap() else {
+        panic!("job must be claimed")
+    };
+    let token = record.claim.unwrap().claim_token;
+    let conflict = JobError::retryable("Transaction conflict");
+    defer_job(&storage, job_id, token, 6_000, 1_000, conflict)
+        .await
+        .unwrap();
+    let ClaimOutcome::Claimed(record) = claim(7_000).await.unwrap() else {
+        panic!("job must be claimed again")
+    };
+    assert_eq!(record.attempts, 0);
+    let token = record.claim.unwrap().claim_token;
+
+    let progress = JobProgress {
+        current: 1,
+        total: Some(1),
+        unit: "items".to_string(),
+    };
+    let payload = JobResultPayload::Staging {
+        completed_items: 1,
+        failed_items: 0,
+    };
+    transition_to_running(&storage, job_id, token, 7_500)
+        .await
+        .unwrap();
+    let done = complete_job(&storage, job_id, token, payload, progress, 8_000)
+        .await
+        .unwrap();
+
+    assert_eq!(done.state, JobState::Succeeded);
+    assert!(done.last_error.is_none());
 }
 
 // Retried payload work starts over, so persisted progress must start over too.
@@ -1401,7 +1500,12 @@ async fn run_delete_rules() {
     );
     assert_eq!(
         delete(owner, running.job_id).await.unwrap(),
-        RunDelete::Unfinished
+        RunDelete::Unfinished(JobState::Running)
+    );
+    // Another kind of job leaves the list at once and is pruned later.
+    assert_eq!(
+        delete(owner, probe.job_id).await.unwrap(),
+        RunDelete::Deleted
     );
     assert_eq!(
         delete(owner, probe.job_id).await.unwrap(),
@@ -1427,7 +1531,12 @@ async fn run_delete_rules() {
         .unwrap();
     let ids: Vec<JobId> = listed.iter().map(|record| record.job_id).collect();
     assert!(!ids.contains(&finished.job_id));
+    assert!(!ids.contains(&probe.job_id));
     assert!(ids.contains(&running.job_id));
+    let hidden = read_job_record(&storage, probe.job_id, None).await.unwrap();
+    let keys = schedule_keys(&storage).await;
+    let due = job_prune_key(hidden.unwrap().finished_at_ms.unwrap(), probe.job_id);
+    assert!(keys.contains(&due), "the deleted job is due for pruning");
     let (entries, _) = iter_prefix_page(
         &storage,
         JOB_ENTRY_KEYSPACE,

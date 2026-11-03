@@ -224,6 +224,9 @@ pub enum GroupWriteError {
     Conversion(#[from] ConversionError),
     #[error("unexpected group write event")]
     Unexpected,
+    /// A row the write must create already exists.
+    #[error("the record already exists")]
+    Taken,
 }
 
 pub fn check_group_write(value: Option<&[u8]>) -> Result<(), GroupWriteError> {

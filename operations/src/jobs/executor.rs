@@ -2,15 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
     JobError, JobId, JobPayload, JobProgress, JobResultPayload,
 };
+use tokio::sync::OwnedMutexGuard;
 use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
@@ -24,6 +27,10 @@ struct ProgressInner {
     current: AtomicU64,
     total: Mutex<Option<u64>>,
     unit: String,
+    /// Set once this execution committed a resumable checkpoint.
+    checkpointed: AtomicBool,
+    /// Wakes the heartbeat to persist a committed checkpoint's progress at once.
+    flush: tokio::sync::Notify,
 }
 
 impl ProgressReporter {
@@ -33,6 +40,8 @@ impl ProgressReporter {
                 current: AtomicU64::new(progress.current),
                 total: Mutex::new(progress.total),
                 unit: progress.unit.clone(),
+                checkpointed: AtomicBool::new(false),
+                flush: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -47,6 +56,21 @@ impl ProgressReporter {
 
     pub fn advance(&self, delta: u64) {
         self.inner.current.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    /// Records that a durable checkpoint advanced, so a later transient failure costs no attempt.
+    pub fn checkpoint(&self) {
+        self.inner.checkpointed.store(true, Ordering::Relaxed);
+        self.inner.flush.notify_one();
+    }
+
+    /// Completes once a checkpoint asked for its progress to be persisted.
+    pub async fn flush_requested(&self) {
+        self.inner.flush.notified().await
+    }
+
+    pub fn checkpointed(&self) -> bool {
+        self.inner.checkpointed.load(Ordering::Relaxed)
     }
 
     pub fn snapshot(&self) -> JobProgress {
@@ -69,6 +93,34 @@ pub struct JobContext {
     /// Node shutdown: stop where you are, the lease is handed back and the job re-runs.
     pub shutdown: CancellationToken,
     pub progress: ProgressReporter,
+    pub range_turns: RangeTurns,
+}
+
+/// One turn per distribution range, shared by every job on this node: page imports into one
+/// range commit one at a time instead of conflicting on the range's key sample.
+#[derive(Clone, Debug, Default)]
+pub struct RangeTurns(Arc<Mutex<HashMap<(Ulid, Ulid), Turn>>>);
+
+type Turn = Arc<tokio::sync::Mutex<()>>;
+
+impl RangeTurns {
+    /// Waits for the turns of `ranges`, keyed by set and range, in key order; they end when
+    /// the guards drop.
+    pub async fn take(&self, ranges: &BTreeSet<(Ulid, Ulid)>) -> Vec<OwnedMutexGuard<()>> {
+        let turns: Vec<_> = {
+            let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            // A turn nobody holds or waits for is dropped.
+            map.retain(|_, turn| Arc::strong_count(turn) > 1);
+            (ranges.iter())
+                .map(|range| map.entry(*range).or_default().clone())
+                .collect()
+        };
+        let mut guards = Vec::with_capacity(turns.len());
+        for turn in turns {
+            guards.push(turn.lock_owned().await);
+        }
+        guards
+    }
 }
 
 pub enum JobRunOutcome {

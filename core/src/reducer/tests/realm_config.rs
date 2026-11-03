@@ -730,3 +730,46 @@ fn federation_settings_materialize() {
         .unwrap();
     assert_eq!(state.materialized_realm_federation(), Some(settings));
 }
+
+#[test]
+fn quota_event_replays() {
+    // A quota event signed before the replica setting keeps its bytes, so a fresh node replays
+    // the realm's quota history; the setting travels as its own operation.
+    const SIGNED: &str =
+        "1401e8076e55011a303130343047323038313034304732303831303430473230383101f40300010300000000";
+    let quota = QuotaConfig {
+        default_quota_bytes: Some(1_000),
+        group_overrides: vec![GroupQuotaOverride {
+            group_id: Ulid::from_bytes([1; 16]),
+            quota_bytes: Some(500),
+            grace_factor_percent: None,
+        }],
+        ..QuotaConfig::default()
+    };
+    let op = AdminDocumentOperation::ConfigQuotaSet {
+        quota: quota.clone(),
+    };
+    assert_eq!(hex::encode(postcard::to_allocvec(&op).unwrap()), SIGNED);
+    let signed = postcard::from_bytes(&hex::decode(SIGNED).unwrap()).unwrap();
+    let event = realm_config_event(1, node(1), 1, AdminDocumentClock::default(), signed);
+    let mut fresh = realm_config_state();
+    fresh.apply(&event).unwrap();
+    assert_eq!(fresh.materialized_realm_quota(), Some(quota));
+
+    let replicas = crate::structs::identity::realm::ReplicaQuota {
+        count: true,
+        groups: [(Ulid::from_bytes([1; 16]), false)].into(),
+    };
+    let set = AdminDocumentOperation::ConfigReplicasSet {
+        replicas: replicas.clone(),
+    };
+    let observed = fresh.clock.clone();
+    fresh
+        .apply(&realm_config_event(2, node(1), 2, observed, set))
+        .unwrap();
+    assert_eq!(fresh.materialized_realm_replicas(), Some(replicas));
+    assert!(
+        fresh.materialized_realm_quota().is_some(),
+        "the quota stays"
+    );
+}

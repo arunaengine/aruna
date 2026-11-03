@@ -10,6 +10,7 @@ use fjall::OptimisticTxDatabase;
 use crate::compaction::Compactor;
 use crate::errors::StorageLibError;
 
+use super::preimage::flush_empty;
 use super::rebuild::running_rebuild;
 use super::{
     BULK_POOL_THREADS, EFFECT_QUEUE_CAPACITY, FjallPersistPolicy, FjallStorage, QUEUE_CAPACITY,
@@ -17,7 +18,7 @@ use super::{
 };
 
 /// Block cache of the node database; Fjall's 32 MiB default rereads blocks on large scans.
-const CACHE_BYTES: u64 = 256 << 20;
+pub const CACHE_BYTES: u64 = 256 << 20;
 
 impl FjallStorage {
     #[tracing::instrument(name = "storage.open", level = "debug", fields(path = %path))]
@@ -27,7 +28,7 @@ impl FjallStorage {
 
     #[doc(hidden)]
     pub fn open_test(path: &str) -> Result<StorageHandle, StorageLibError> {
-        Self::open_pools(path, FjallPersistPolicy::default(), 1, 1)
+        Self::open_pools(path, FjallPersistPolicy::default(), CACHE_BYTES, (1, 1))
     }
 
     #[tracing::instrument(
@@ -39,18 +40,32 @@ impl FjallStorage {
         path: &str,
         policy: FjallPersistPolicy,
     ) -> Result<StorageHandle, StorageLibError> {
-        Self::open_pools(path, policy, READ_POOL_THREADS, BULK_POOL_THREADS)
+        Self::open_with_cache(path, policy, CACHE_BYTES)
+    }
+
+    /// Opens the database with a block cache of `cache_bytes`.
+    pub fn open_with_cache(
+        path: &str,
+        policy: FjallPersistPolicy,
+        cache_bytes: u64,
+    ) -> Result<StorageHandle, StorageLibError> {
+        Self::open_pools(
+            path,
+            policy,
+            cache_bytes,
+            (READ_POOL_THREADS, BULK_POOL_THREADS),
+        )
     }
 
     fn open_pools(
         path: &str,
         policy: FjallPersistPolicy,
-        read_threads: usize,
-        bulk_threads: usize,
+        cache_bytes: u64,
+        (read_threads, bulk_threads): (usize, usize),
     ) -> Result<StorageHandle, StorageLibError> {
         let db = OptimisticTxDatabase::builder(path)
             .manual_journal_persist(true)
-            .cache_size(CACHE_BYTES)
+            .cache_size(cache_bytes)
             .open()?;
 
         let (sender, receivers) = StorageHandle::new();
@@ -71,11 +86,17 @@ impl FjallStorage {
         Ok(sender)
     }
 
-    fn close(mut self) {
-        self.compactor.shutdown();
-        self.read_pool.clear();
-        self.bulk_read_pool.clear();
-        for reader in std::mem::take(&mut self.pool_threads) {
+    fn close(self) {
+        let Self {
+            mut compactor,
+            read_pool,
+            bulk_read_pool,
+            pool_threads,
+            ..
+        } = self;
+        compactor.shutdown();
+        drop((read_pool, bulk_read_pool));
+        for reader in pool_threads {
             let _ = reader.join();
         }
     }
@@ -93,6 +114,7 @@ impl FjallStorage {
             spawn_read_pool(store.clone(), bulk_threads, EFFECT_QUEUE_CAPACITY);
         pool_threads.extend(bulk_threads);
         let usage_shadow = running_rebuild(&store);
+        flush_empty(&store);
         Self {
             store,
             persist_policy: policy,
@@ -100,12 +122,11 @@ impl FjallStorage {
             transaction_cleanup: handle.transaction_cleanup.clone(),
             metrics: handle.metrics.clone(),
             read_pool,
-            next_reader: 0,
             bulk_read_pool,
-            next_bulk_reader: 0,
             pool_threads,
             compactor: Compactor::spawn(),
             deletes: HashMap::new(),
+            swept: 0,
             txn_deletes: HashMap::new(),
             txn_usage: HashMap::new(),
             config_txns: HashSet::new(),

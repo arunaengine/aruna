@@ -114,7 +114,7 @@ async fn reference_records_root() {
         probe_config: BTreeMap::new(),
     };
     let mut update = put("a", 1, 1, 10);
-    update.change.root = Some(entry.clone());
+    update.change_mut().root = Some(entry.clone());
     assert!(apply(&handle, update).await.unwrap());
     let key = root_key(set(), &entry.root.digest().unwrap());
     let stored = get(&handle, SOURCE_ROOT_KEYSPACE, key).await.unwrap();
@@ -153,8 +153,8 @@ async fn update_keeps_content() {
     single_range(&handle).await;
     assert!(apply(&handle, put("a", 1, 1, 10)).await.unwrap());
     let mut update = put("a", 1, 1, 10);
-    update.change.added[0].entry.referenced = true;
-    update.change.head = HeadChange::Keep;
+    update.change_mut().added[0].entry.referenced = true;
+    update.change_mut().head = HeadChange::Keep;
     assert!(apply(&handle, update).await.unwrap());
     let content = content_key(set(), &stored(10).identity.unwrap(), id(1));
     let kept = get(&handle, CONTENT_INDEX_KEYSPACE, content).await;
@@ -169,7 +169,7 @@ async fn replay_changes_nothing() {
     let before = counters(&handle, active(1)).await;
     assert!(apply(&handle, put("a", 1, 1, 10)).await.unwrap());
     let mut late = put("a", 1, 7, 10);
-    late.change.head = HeadChange::Keep;
+    late.change_mut().head = HeadChange::Keep;
     assert!(
         apply(&handle, late).await.unwrap(),
         "another generation is still a replay"
@@ -196,10 +196,10 @@ async fn refuses_other_content() {
     let result = apply(&handle, put("a", 1, 1, 11)).await;
     assert_eq!(result, Err(InventoryError::Collision(id(1))));
     let mut pending = put("a", 2, 2, 0);
-    if let HeadChange::Set(head) = &mut pending.change.head {
+    if let HeadChange::Set(head) = &mut pending.change_mut().head {
         (head.version.identity, head.version.pending) = (None, true);
     }
-    let entry = &mut pending.change.added[0].entry;
+    let entry = &mut pending.change_mut().added[0].entry;
     (entry.identity, entry.pending) = (None, true);
     assert!(apply(&handle, pending.clone()).await.unwrap());
     assert!(
@@ -218,16 +218,16 @@ async fn refuses_other_content() {
 
     // A marker and a version never share an id, and stored content never loses its identity.
     let mut marker = put("a", 2, 2, 0);
-    let entry = &mut marker.change.added[0].entry;
+    let entry = &mut marker.change_mut().added[0].entry;
     (entry.marker, entry.identity) = (true, None);
-    marker.change.head = HeadChange::Keep;
+    marker.change_mut().head = HeadChange::Keep;
     assert_eq!(
         apply(&handle, marker).await,
         Err(InventoryError::Collision(id(2)))
     );
     let mut unknown = put("a", 2, 2, 0);
-    unknown.change.added[0].entry.identity = None;
-    unknown.change.head = HeadChange::Keep;
+    unknown.change_mut().added[0].entry.identity = None;
+    unknown.change_mut().head = HeadChange::Keep;
     assert_eq!(
         apply(&handle, unknown).await,
         Err(InventoryError::Collision(id(2)))
@@ -319,7 +319,7 @@ async fn seeks_range_bounds() {
 
     let other = Ulid::from_bytes([10; 16]);
     let mut stray = put("a", 3, 1, 1);
-    stray.change.set_id = other;
+    stray.change_mut().set_id = other;
     let missing = apply(&handle, stray).await;
     assert!(matches!(missing, Err(InventoryError::RangeMissing { .. })));
 }

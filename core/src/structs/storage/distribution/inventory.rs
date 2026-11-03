@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::OriginalEpoch;
+use super::source_root::RootEntry;
 use crate::errors::ConversionError;
 use crate::structs::storage::blob::{BlobVersion, BlobVersionState};
 
@@ -217,7 +218,7 @@ pub fn logical_identity(version: &BlobVersion) -> Option<[u8; 32]> {
     version.identity.or_else(|| content_identity(version))
 }
 
-const IDENTITY_DOMAIN: &[u8] = b"aruna-reference-identity-v2";
+const IDENTITY_DOMAIN: &[u8] = b"aruna-reference-identity-v3";
 
 /// What one version holds, independent of where its bytes are: the BLAKE3 of stored bytes,
 /// or a digest of the observed source object of a reference. Markers and archives whose
@@ -230,11 +231,18 @@ pub fn content_identity(version: &BlobVersion) -> Option<[u8; 32]> {
             cached_metadata,
             ..
         } => {
-            // The source address with its configuration sorted, then the recorded validators.
+            // The source address with its configuration sorted, then the recorded validators; a
+            // root a node keeps once stands for its settings, so both stored forms agree.
+            let source = RootEntry::normalized(source);
             let descriptor = &source.descriptor;
             let config: BTreeMap<_, _> = descriptor.public_config.iter().collect();
             let observed = (
-                (&descriptor.kind, config, &descriptor.namespace),
+                (
+                    &descriptor.kind,
+                    config,
+                    &descriptor.namespace,
+                    &descriptor.root,
+                ),
                 &descriptor.source_path,
                 &descriptor.version_selector,
                 &cached_metadata.etag,
@@ -366,6 +374,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: namespace.map(str::to_string),
+                root: None,
             };
             let source = VersionSourceBinding {
                 strategy: StagingStrategy::Reference,

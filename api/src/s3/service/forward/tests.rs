@@ -174,6 +174,7 @@ fn copy_context_bound() {
         issuer: forward().node_id,
         nonce: [6; 16],
         payload: Payload::Framed { checksum: None },
+        copy_read: false,
     });
     assert_eq!(
         copy_context(&extensions, &copied).unwrap(),

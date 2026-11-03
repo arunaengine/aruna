@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
@@ -21,7 +21,7 @@ use ulid::Ulid;
 use super::effects::{record_error, record_query_counts};
 use super::{
     METADATA_CHUNK_SIZE, METADATA_ENVELOPE_BYTES, METADATA_IO_TIMEOUT, MetadataHandle,
-    MetadataInner, MetadataRequestError, SYNC_MIRROR_TIMEOUT,
+    MetadataInner, MetadataRequestError, PAGE_ANSWER_TIMEOUT, SYNC_MIRROR_TIMEOUT,
 };
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::protocol::{
@@ -56,6 +56,11 @@ pub(super) async fn send_request(
     let span = Span::current();
     let total_started = Instant::now();
     let max_response_size = response_cap(&message);
+    // A member answers a reference page only after its one commit, which takes longer.
+    let answer_timeout = match &message {
+        MetadataTransportMessage::ReferencePage { .. } => PAGE_ANSWER_TIMEOUT,
+        _ => METADATA_IO_TIMEOUT,
+    };
 
     let bytes = encode_message(&message)
         .map_err(MetadataError::Backend)
@@ -88,7 +93,7 @@ pub(super) async fn send_request(
     record_elapsed_ms(&span, "finish_ms", finish_started);
 
     let read_started = Instant::now();
-    let response = read_transport_cap(&mut stream, max_response_size)
+    let response = read_transport_cap(&mut stream, max_response_size, answer_timeout)
         .await
         .map_err(|error| with_close(&stream, error))
         .map_err(MetadataRequestError::possibly_sent)?;
@@ -236,13 +241,10 @@ where
 async fn read_transport_cap(
     stream: &mut BiStream,
     max_size: usize,
+    wait: Duration,
 ) -> Result<MetadataTransportMessage, MetadataError> {
     let result: Result<Result<MetadataTransportMessage, String>, tokio::time::error::Elapsed> =
-        timeout(
-            METADATA_IO_TIMEOUT,
-            read_message_cap(&mut stream.1, max_size),
-        )
-        .await;
+        timeout(wait, read_message_cap(&mut stream.1, max_size)).await;
     result
         .map_err(|_| MetadataError::Backend("timed out waiting for metadata message".to_string()))?
         .map_err(MetadataError::Backend)
@@ -517,6 +519,12 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::SetPreviewResults { .. } => "set_preview_results",
         MetadataTransportMessage::StagingSpec { .. } => "staging_spec",
         MetadataTransportMessage::StagingSpecResult { .. } => "staging_spec_result",
+        MetadataTransportMessage::ReferencePage { .. } => "reference_page",
+        MetadataTransportMessage::ReferencePageAnswer { .. } => "reference_page_answer",
+        MetadataTransportMessage::HandRealmKey { .. } => "hand_realm_key",
+        MetadataTransportMessage::RealmKeyStored { .. } => "realm_key_stored",
+        MetadataTransportMessage::PromotionCheck => "promotion_check",
+        MetadataTransportMessage::PromotionReady { .. } => "promotion_ready",
     }
 }
 
@@ -699,6 +707,25 @@ impl MetadataHandle {
         {
             MetadataTransportMessage::StagingSpecResult { result } => result.map(|spec| *spec),
             _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// Sends a reference page to a member; an error leaves its outcome unknown.
+    pub async fn request_reference_page(
+        &self,
+        node_id: NodeId,
+        page: crate::replication::page::ReferencePage,
+    ) -> Result<crate::replication::page::PageAnswer, String> {
+        let request = MetadataTransportMessage::ReferencePage {
+            page: Box::new(page),
+        };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
+            Ok(MetadataTransportMessage::ReferencePageAnswer { answer }) => Ok(answer),
+            Ok(other) => Err(format!(
+                "the member answered {}",
+                transport_message_kind(&other)
+            )),
+            Err(error) => Err(error.to_string()),
         }
     }
 

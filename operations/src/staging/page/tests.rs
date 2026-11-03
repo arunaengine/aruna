@@ -134,10 +134,12 @@ fn input(entries: Vec<PageEntry>) -> PageImportInput {
         secret_fingerprint: None,
         entries,
         checkpoint: checkpoint(),
+        checkpoint_key: ByteView::from(JobId::from_bytes([5; 16]).to_bytes().to_vec()),
         writes: Vec::new(),
         deletes: Vec::new(),
         now: SystemTime::UNIX_EPOCH + Duration::from_secs(2_000),
         database: None,
+        ranges: None,
     }
 }
 
@@ -165,12 +167,17 @@ fn record(claim_token: Ulid) -> JobRecord {
     record
 }
 
+fn claim(record: &JobRecord) -> Option<Value> {
+    let guard = crate::jobs::store::ClaimGuard::of(record)?;
+    value(guard.to_bytes().unwrap())
+}
+
 fn value(bytes: Vec<u8>) -> Option<Value> {
     Some(ByteView::from(bytes))
 }
 
-fn guards(fence: Option<Value>, record: &JobRecord, heads: Vec<Option<Value>>) -> Event {
-    let mut values = vec![
+fn guards(fence: Option<Value>, record: &JobRecord) -> Event {
+    let values = vec![
         (Key::from(b"fence".to_vec()), fence),
         (
             Key::from(b"bucket".to_vec()),
@@ -180,17 +187,35 @@ fn guards(fence: Option<Value>, record: &JobRecord, heads: Vec<Option<Value>>) -
             Key::from(b"connector".to_vec()),
             value(connector().to_bytes().unwrap()),
         ),
-        (
-            Key::from(b"job".to_vec()),
-            value(record.to_bytes().unwrap()),
-        ),
+        (Key::from(b"job".to_vec()), claim(record)),
     ];
-    values.extend(
-        heads
-            .into_iter()
-            .map(|head| (Key::from(b"head".to_vec()), head)),
-    );
     Event::Storage(StorageEvent::BatchReadResult { values })
+}
+
+/// Answers the head interval read as holding too many other keys, then the head reads with
+/// `heads` in entry order.
+fn answer_heads(operation: &mut PageImportOperation, heads: Vec<Option<Value>>) -> Effects {
+    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: Some(Key::from(b"other".to_vec())),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == heads.len()
+    ));
+    let values = (heads.into_iter())
+        .map(|head| (Key::from(b"head".to_vec()), head))
+        .collect();
+    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+}
+
+/// The answer to the relationship read: `count` relationships replicate the bucket.
+fn relationships(count: usize) -> Event {
+    let row = || (Key::from(b"rel".to_vec()), ByteView::from(Vec::new()));
+    Event::Storage(StorageEvent::IterResult {
+        values: (0..count).map(|_| row()).collect(),
+        next_start_after: None,
+    })
 }
 
 fn no_secret() -> Event {
@@ -250,12 +275,13 @@ fn run_to_writes(
     let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
         txn_id: txn(),
     }));
-    let reads = heads.len() + GUARD_READS;
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { reads: batch, .. })] if batch.len() == reads
+        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == GUARD_READS
     ));
-    operation.step(guards(None, &record(token()), heads));
+    operation.step(guards(None, &record(token())));
+    answer_heads(operation, heads);
+    operation.step(relationships(1));
     let mut effects = operation.step(no_secret());
     if let Some(versions) = versions {
         let values = versions
@@ -289,13 +315,26 @@ fn page_registers_atomically() {
     assert_eq!(rows_in(&writes, STAGING_STATE_KEYSPACE), 1);
     assert_eq!(rows_in(&writes, REPLICATION_OBLIGATION_KEYSPACE), 2);
     let effects = operation.step(written());
-    let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
+    let [
+        Effect::Storage(StorageEffect::AddUsage {
+            deltas, buckets, ..
+        }),
+    ] = effects.as_slice()
+    else {
         panic!("expected one usage update, got {effects:?}");
     };
     assert!(
         deltas
             .iter()
             .all(|(_, delta)| delta.objects == 2 && delta.referenced_bytes == 6)
+    );
+    // The bucket row counts the page like the group does, with one version row per entry.
+    let [(_, bucket)] = buckets.as_slice() else {
+        panic!("expected the bucket row, got {buckets:?}");
+    };
+    assert_eq!(
+        (bucket.objects, bucket.versions, bucket.referenced_bytes),
+        (2, 2, 6)
     );
     operation.step(written());
     assert!(matches!(
@@ -451,15 +490,11 @@ fn guards_abort_page() {
     };
     let cases = [
         (
-            guards(
-                value(fence.to_bytes().unwrap()),
-                &record(token()),
-                vec![None],
-            ),
+            guards(value(fence.to_bytes().unwrap()), &record(token())),
             PageImportError::Purge(PurgeFenceError::Suspended),
         ),
         (
-            guards(None, &record(Ulid::from_bytes([1; 16])), vec![None]),
+            guards(None, &record(Ulid::from_bytes([1; 16]))),
             PageImportError::ClaimLost,
         ),
     ];
@@ -492,7 +527,9 @@ fn changed_secret_aborts() {
     operation.step(Event::Storage(StorageEvent::TransactionStarted {
         txn_id: txn(),
     }));
-    operation.step(guards(None, &record(token()), vec![None]));
+    operation.step(guards(None, &record(token())));
+    answer_heads(&mut operation, vec![None]);
+    operation.step(relationships(1));
 
     assert!(matches!(
         operation.step(no_secret()).as_slice(),
@@ -502,6 +539,69 @@ fn changed_secret_aborts() {
         txn_id: txn(),
     }));
     assert_eq!(operation.finalize(), Err(PageImportError::ConnectorChanged));
+}
+
+// The heads of a page are read as one interval of its keys; an empty interval proves every
+// key new without a read per key.
+#[test]
+fn interval_proves_absence() {
+    use aruna_core::effects::{IterEnd, IterStart};
+    use aruna_core::structs::storage::blob::BlobHeadKey;
+    let mut operation = PageImportOperation::new(input(vec![entry("b"), entry("a")]));
+    operation.start();
+    operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: txn(),
+    }));
+
+    let effects = operation.step(guards(None, &record(token())));
+
+    let key = |name| Key::from(BlobHeadKey::new("imports", name).to_bytes().unwrap());
+    let [Effect::Storage(StorageEffect::IterRange { start, end, .. })] = effects.as_slice() else {
+        panic!("expected one head interval read, got {effects:?}");
+    };
+    assert_eq!(
+        (start, end),
+        (&IterStart::At(key("a")), &IterEnd::Through(key("b")))
+    );
+    operation.step(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    }));
+    operation.step(relationships(1));
+    let effects = operation.step(no_secret());
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the page rows, got {effects:?}");
+    };
+    assert_eq!(rows_in(writes, BLOB_VERSIONS_KEYSPACE), 2);
+}
+
+// A bucket nothing replicates gets no replication obligation per imported file.
+#[test]
+fn obligations_need_downstream() {
+    let mut operation = PageImportOperation::new(input(vec![entry("a"), entry("b")]));
+    operation.start();
+    operation.step(Event::Storage(StorageEvent::TransactionStarted {
+        txn_id: txn(),
+    }));
+    operation.step(guards(None, &record(token())));
+    let effects = answer_heads(&mut operation, vec![None, None]);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter {
+            limit: 1,
+            txn_id: Some(_),
+            ..
+        })]
+    ));
+    operation.step(relationships(0));
+
+    let effects = operation.step(no_secret());
+
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the page rows, got {effects:?}");
+    };
+    assert_eq!(rows_in(writes, BLOB_VERSIONS_KEYSPACE), 2);
+    assert_eq!(rows_in(writes, REPLICATION_OBLIGATION_KEYSPACE), 0);
 }
 
 #[test]
@@ -538,6 +638,57 @@ fn page_bounds_entries() {
         operation.finalize(),
         Err(PageImportError::TooManyEntries(MAX_PAGE_ENTRIES + 1))
     );
+}
+
+// A progress flush and a lease renewal that commit while the page is open must not conflict.
+#[tokio::test]
+async fn flush_keeps_page() {
+    use crate::jobs::store::{flush_progress, renew_lease};
+    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let storage = &context.storage_handle;
+    let group_id = bucket().group_id;
+    let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
+    let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
+    let job = record(token());
+    crate::jobs::store::insert_job(storage, &job).await.unwrap();
+    let mut operation = PageImportOperation::new(PageImportInput {
+        connector,
+        expected_bucket,
+        ..input(vec![entry("a")])
+    });
+
+    let mut pending = std::collections::VecDeque::from(operation.start().into_vec());
+    while let Some(effect) = pending.pop_front() {
+        let Effect::Storage(effect) = effect else {
+            break;
+        };
+        let commit = matches!(effect, StorageEffect::CommitTransaction { .. });
+        if commit {
+            let progress = job.progress.clone();
+            flush_progress(storage, job.job_id, token(), progress, 2)
+                .await
+                .unwrap();
+            renew_lease(storage, job.job_id, token(), 3, None)
+                .await
+                .unwrap();
+        }
+        let event = storage.send_storage_effect(effect).await;
+        if commit {
+            assert!(
+                matches!(
+                    event,
+                    Event::Storage(StorageEvent::TransactionCommitted { .. })
+                ),
+                "the page must commit, got {event:?}"
+            );
+            return;
+        }
+        pending.extend(operation.step(event));
+    }
+    panic!("the page never reached its commit");
 }
 
 // Runs the page twice against real storage: the commit is atomic and the replay finds the
@@ -631,11 +782,7 @@ fn guards_carry_hint() {
             Key::from(b"connector".to_vec()),
             value(connector().to_bytes().unwrap()),
         ),
-        (
-            Key::from(b"job".to_vec()),
-            value(record(token()).to_bytes().unwrap()),
-        ),
-        (Key::from(b"head".to_vec()), None),
+        (Key::from(b"job".to_vec()), claim(&record(token()))),
     ];
     let input = input(vec![entry("a")]);
     let guards = crate::staging::page::rows::check_guards(&input, values).unwrap();
@@ -707,6 +854,13 @@ async fn page_maintains_inventory() {
     );
     assert!(has_row(handle, head_position(set_id, "a")).await);
     assert!(has_row(handle, head_position(set_id, "b")).await);
+    // The set keeps no search index, so the page feeds none.
+    let feed = crate::distribution::test_store::get(
+        handle,
+        aruna_core::keyspaces::SEARCH_FEED_KEYSPACE,
+        head_position(set_id, "a"),
+    );
+    assert!(feed.await.is_none());
 }
 
 // A page whose keys reach a range another member coordinates writes nothing.
@@ -759,4 +913,249 @@ async fn page_needs_coordinator() {
         ))
     ));
     assert!(!has_row(handle, head_position(set_id, "a")).await);
+}
+
+/// Bytes of keys and values per keyspace in `handle`.
+async fn keyspace_bytes(handle: &aruna_storage::StorageHandle) -> HashMap<&'static str, usize> {
+    let mut sizes = HashMap::new();
+    for key_space in aruna_core::keyspaces::KEYSPACE_CATALOG {
+        let iter = StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: None,
+            start: None,
+            limit: 1_000_000,
+            txn_id: None,
+        };
+        if let Event::Storage(StorageEvent::IterResult { values, .. }) =
+            handle.send_storage_effect(iter).await
+        {
+            let bytes = values.iter().map(|(key, value)| key.len() + value.len());
+            sizes.insert(*key_space, bytes.sum());
+        }
+    }
+    sizes
+}
+
+/// A public bakrep-like S3 connector stored for the test group.
+async fn bakrep_connector(context: &crate::driver::DriverContext) -> SourceConnector {
+    use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
+    let input = SourceConnectorInput {
+        group_id: bucket().group_id,
+        created_by: UserId::default(),
+        name: "bakrep".to_string(),
+        kind: SourceConnectorKind::S3,
+        public_config: HashMap::from([
+            ("bucket".to_string(), "bakrep-v2-data-000".to_string()),
+            (
+                "endpoint".to_string(),
+                "https://s3.bwsfs.uni-freiburg.de".to_string(),
+            ),
+            ("region".to_string(), "us-east-1".to_string()),
+            ("skip_signature".to_string(), "true".to_string()),
+        ]),
+        secret_config: HashMap::new(),
+    };
+    let operation = SourceConnectorOperation::new(input);
+    crate::driver::drive(operation, context)
+        .await
+        .unwrap()
+        .connector
+}
+
+fn bakrep_entry(index: usize) -> PageEntry {
+    let sample = format!("SAMD{:08}", 344 + index);
+    let source_path = format!("{sample}/{sample}.bakta.gff3.gz");
+    PageEntry {
+        target_key: format!("bakrep-v2-data-000/{source_path}"),
+        source_path,
+        observation: SourceMetadata {
+            content_length: 1_234_567,
+            content_type: None,
+            etag: Some("\"9b2cf535f27731c974343645a3985328\"".to_string()),
+            last_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            source_version: None,
+            digests: Default::default(),
+        },
+    }
+}
+
+/// Prints the bytes each row kind gained per entry between `before` and `after`.
+fn print_sizes(
+    label: &str,
+    before: &HashMap<&'static str, usize>,
+    after: &HashMap<&'static str, usize>,
+    entries: usize,
+) {
+    let mut rows: Vec<_> = (after.iter())
+        .map(|(space, bytes)| (*space, bytes - before.get(space).copied().unwrap_or(0)))
+        .filter(|(_, bytes)| *bytes > 0)
+        .collect();
+    rows.sort();
+    let total: usize = rows.iter().map(|(_, bytes)| bytes / entries).sum();
+    for (space, bytes) in rows {
+        println!("{label} {space}: {} bytes per entry", bytes / entries);
+    }
+    println!("{label} total: {total} bytes per entry");
+}
+
+// The same measurement for a distributed bucket, inventory rows included.
+#[tokio::test]
+async fn distributed_sizes_measured() {
+    use crate::distribution::test_store::{install, range};
+    use crate::driver::drive;
+    use crate::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+
+    const ENTRIES: usize = 100;
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let connector = bakrep_connector(context).await;
+    let group_id = bucket().group_id;
+    let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
+    let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
+    let set_id = snapshot.set_id();
+    crate::distribution::test_record::store_record(handle, set_id, record_bytes).await;
+    bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
+    let write = StorageEffect::Write {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: b"shared".to_vec().into(),
+        value: bound.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    handle.send_storage_effect(write).await;
+    install(handle, set_id, &[range(1, "", None)]).await;
+    crate::jobs::store::insert_job(handle, &record(token()))
+        .await
+        .unwrap();
+    let before = keyspace_bytes(handle).await;
+    let page = PageImportInput {
+        connector,
+        bucket: "shared".to_string(),
+        expected_bucket: bound,
+        ..input((0..ENTRIES).map(bakrep_entry).collect())
+    };
+    drive(PageImportOperation::new(page), context)
+        .await
+        .unwrap();
+
+    let after = keyspace_bytes(handle).await;
+    print_sizes("distributed", &before, &after, ENTRIES);
+}
+
+// Prints the stored bytes per entry and row kind of a realistic bakrep page; a measurement
+// for the entry size work, not a size contract. Run with `--nocapture` to read it.
+#[tokio::test]
+async fn entry_sizes_measured() {
+    use crate::driver::drive;
+    use crate::tests::staging::{create_test_bucket, setup_driver_context};
+
+    const ENTRIES: usize = 100;
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let connector = bakrep_connector(context).await;
+    let group_id = bucket().group_id;
+    let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
+    crate::jobs::store::insert_job(handle, &record(token()))
+        .await
+        .unwrap();
+    let before = keyspace_bytes(handle).await;
+    let page = PageImportInput {
+        connector,
+        expected_bucket,
+        ..input((0..ENTRIES).map(bakrep_entry).collect())
+    };
+    drive(PageImportOperation::new(page), context)
+        .await
+        .unwrap();
+
+    let after = keyspace_bytes(handle).await;
+    print_sizes("plain", &before, &after, ENTRIES);
+}
+
+/// Drives `operation` against `handle` and counts its storage request/response exchanges.
+async fn count_exchanges(
+    mut operation: PageImportOperation,
+    handle: &aruna_storage::StorageHandle,
+) -> (usize, Result<PageImportResult, PageImportError>) {
+    let mut exchanges = 0;
+    let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
+    while let Some(effect) = effects.pop_front() {
+        let event = match effect {
+            Effect::Storage(effect) => {
+                exchanges += 1;
+                handle.send_storage_effect(effect).await
+            }
+            Effect::Task(
+                TaskEffect::ShortenTimer { key, after } | TaskEffect::ResetTimer { key, after },
+            ) => Event::Task(TaskEvent::TimerScheduled { key, after }),
+            other => panic!("unexpected effect: {other:?}"),
+        };
+        effects.extend(operation.step(event));
+    }
+    (exchanges, operation.finalize())
+}
+
+// Prints the storage exchanges of four 500-key pages into one distributed range, the last ones
+// with a full key sample, then of two gathered 5,000-key pages; a measurement, not a contract.
+// Run with `--nocapture` to read it.
+#[tokio::test]
+async fn page_exchanges_measured() {
+    use crate::distribution::test_store::{install, range};
+    use crate::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+
+    const ENTRIES: usize = 500;
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let connector = bakrep_connector(context).await;
+    let group_id = bucket().group_id;
+    let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
+    let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
+    let set_id = snapshot.set_id();
+    crate::distribution::test_record::store_record(handle, set_id, record_bytes).await;
+    bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
+    let write = StorageEffect::Write {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: b"shared".to_vec().into(),
+        value: bound.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    handle.send_storage_effect(write).await;
+    install(handle, set_id, &[range(1, "", None)]).await;
+    crate::jobs::store::insert_job(handle, &record(token()))
+        .await
+        .unwrap();
+    for page in 0..4 {
+        let entries = (page * ENTRIES..(page + 1) * ENTRIES).map(bakrep_entry);
+        let input = PageImportInput {
+            connector: connector.clone(),
+            bucket: "shared".to_string(),
+            expected_bucket: bound.clone(),
+            ..input(entries.collect())
+        };
+        let (exchanges, result) = count_exchanges(PageImportOperation::new(input), handle).await;
+        assert_eq!(result.unwrap().registered, ENTRIES as u64);
+        println!("distributed page {page}: {exchanges} storage exchanges for {ENTRIES} keys");
+    }
+    const GATHERED: usize = 5_000;
+    for page in 0..2 {
+        let first = 4 * ENTRIES + page * GATHERED;
+        let entries = (first..first + GATHERED).map(bakrep_entry);
+        let input = PageImportInput {
+            connector: connector.clone(),
+            bucket: "shared".to_string(),
+            expected_bucket: bound.clone(),
+            ..input(entries.collect())
+        };
+        let started = std::time::Instant::now();
+        let (exchanges, result) = count_exchanges(PageImportOperation::new(input), handle).await;
+        assert_eq!(result.unwrap().registered, GATHERED as u64);
+        let elapsed = started.elapsed().as_millis();
+        println!(
+            "gathered page {page}: {exchanges} storage exchanges, {elapsed} ms for {GATHERED} keys"
+        );
+    }
 }

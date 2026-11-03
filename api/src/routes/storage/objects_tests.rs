@@ -8,6 +8,7 @@ use crate::mcp::data::{WriteObjectInput, store_text};
 use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
+    replicate,
 };
 use axum::http::StatusCode;
 
@@ -202,6 +203,108 @@ async fn merges_peer_range() {
     )
     .await;
     assert_eq!(keys(&rest.unwrap()), vec!["x.md"]);
+}
+
+// A copy may lag behind, so the coordinator lists the range even where a copy is kept.
+#[tokio::test]
+async fn copy_defers_listing() {
+    let node = node_state().await;
+    store(&node, &["a.md"]).await;
+    replicate(&node.state, node.group_id, BUCKET).await;
+    let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
+        "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
+        "prefixes":[],"next_cursor":null}"#;
+    let peer = mock_peer(StatusCode::OK, answer).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let page = list(&node, &node.owner, HeaderMap::new(), query(None, None, 10))
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["x.md"]);
+    assert_eq!(peer.paths.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn start_after_resumes() {
+    let node = node_state().await;
+    store(&node, &["a.md", "b.md", "c.md"]).await;
+    let mut after = query(None, None, 10);
+    after.start_after = Some("a.md".to_string());
+    let page = list(&node, &node.owner, HeaderMap::new(), after.clone())
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["b.md", "c.md"]);
+    distribute(&node.state, node.group_id, BUCKET).await;
+    let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
+        "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
+        "prefixes":[],"next_cursor":null}"#;
+    let peer = mock_peer(StatusCode::OK, answer).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let page = list(&node, &node.owner, HeaderMap::new(), after)
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["b.md", "c.md", "x.md"]);
+}
+
+// A start key on or inside a common prefix skips the whole prefix, here and in later ranges.
+#[tokio::test]
+async fn start_after_groups() {
+    let node = node_state().await;
+    store(&node, &["a/a/x", "a/b/x"]).await;
+    for start in ["a/a/", "a/a/x"] {
+        let mut after = query(Some("a/"), None, 10);
+        after.start_after = Some(start.to_string());
+        let page = list(&node, &node.owner, HeaderMap::new(), after)
+            .await
+            .unwrap();
+        assert_eq!(page.prefixes, vec!["a/b/".to_string()], "{start}");
+    }
+    distribute(&node.state, node.group_id, BUCKET).await;
+    let answer = r#"{"bucket":"routed","objects":[],"prefixes":["y/","z/"],"next_cursor":null}"#;
+    let peer = mock_peer(StatusCode::OK, answer).await;
+    publish_api(&node.state, node_id(PEER), &peer.url).await;
+    let mut after = query(None, None, 10);
+    after.start_after = Some("a/a/x".to_string());
+    let page = list(&node, &node.owner, HeaderMap::new(), after.clone())
+        .await
+        .unwrap();
+    assert_eq!(page.prefixes, vec!["y/".to_string(), "z/".into()]);
+    // In the peer's range the prefix it names is not listed again.
+    after.start_after = Some("y/q".to_string());
+    let page = list(&node, &node.owner, HeaderMap::new(), after)
+        .await
+        .unwrap();
+    assert_eq!(page.prefixes, vec!["z/".to_string()]);
+    assert!(peer.paths.lock().unwrap()[1].contains("cursor="));
+}
+
+// While the coordinator cannot answer, this node's copy lists the range, marked stale, and a
+// relayed listing asks a copy only with `copy`.
+#[tokio::test]
+async fn down_coordinator_copy() {
+    let node = node_state().await;
+    store(&node, &["a.md"]).await;
+    let snapshot = replicate(&node.state, node.group_id, BUCKET).await;
+    publish_api(&node.state, node_id(PEER), CLOSED_API).await;
+    let page = list(&node, &node.owner, HeaderMap::new(), query(None, None, 10))
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["a.md"]);
+    let range_id = snapshot.config.ranges[0].range_id.to_string();
+    assert_eq!(page.stale_ranges, [range_id]);
+
+    let mut bounded = query(None, None, 10);
+    bounded.lower = Some(String::new());
+    let relayed_set = relayed(snapshot.set_id());
+    let refused = list(&node, &node.owner, relayed_set.clone(), bounded.clone()).await;
+    assert!(matches!(
+        refused,
+        Err(ServerError::ServiceUnavailableReason(_))
+    ));
+    bounded.copy = Some(true);
+    let page = list(&node, &node.owner, relayed_set, bounded)
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), vec!["a.md"]);
 }
 
 #[tokio::test]

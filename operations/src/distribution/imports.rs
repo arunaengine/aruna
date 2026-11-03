@@ -12,6 +12,7 @@ use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, JOB_KEYSPACE, NODE_STATE_KEYS
 use aruna_core::structs::execution::job::{
     JobId, JobPayload, RECORD_KEY_PREFIX, StagingJobCheckpoint, StagingJobSpec,
 };
+use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::distribution::source_root::SourceRoot;
@@ -21,6 +22,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::purge::clear_prefix;
+use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
 use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
 use crate::connectors::list_connectors::{ListSourceInput, ListSourceOperation};
 use crate::driver::{DriverContext, drive};
@@ -44,6 +46,9 @@ pub struct HandedImport {
     pub spec: StagingJobSpec,
     pub root: SourceRoot,
     pub resume: Option<StagingJobCheckpoint>,
+    /// The connector's record when it holds no credentials, so the new coordinator can register
+    /// it under the same id, as the import's fan-out does.
+    pub shared: Option<SourceConnector>,
 }
 
 /// A fenced job as its former coordinator keeps it until the transfer is no longer open: its
@@ -194,17 +199,23 @@ pub(crate) async fn staging_spec(
         group_id: spec.group_id,
         connector_id: spec.connector_id,
     };
-    let connector = drive(GetSourceOperation::new(input), context)
+    let source = drive(GetSourceOperation::new(input), context)
         .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        .connector;
+        .map_err(|_| MetadataReadError::Unavailable)?;
+    let connector = source.connector;
+    let shared = (!source.has_secret_config).then(|| connector.clone());
     let root = SourceRoot {
         kind: connector.kind,
         public_config: connector.public_config.into_iter().collect(),
         namespace: connector.namespace,
     };
     let resume = at.map(|at| handed_checkpoint(&spec, &at));
-    Ok(HandedImport { spec, root, resume })
+    Ok(HandedImport {
+        spec,
+        root,
+        resume,
+        shared,
+    })
 }
 
 fn handover_key(set_id: Ulid, range_id: Ulid) -> Vec<u8> {
@@ -243,8 +254,12 @@ pub(crate) async fn fetch_imports(
         {
             Ok(handed) => {
                 let group_id = handed.spec.group_id;
-                let Some(connector_id) = local_connector(context, group_id, &handed.root).await?
-                else {
+                let found = local_connector(context, group_id, &handed.root).await?;
+                let found = match (found, handed.shared.as_ref()) {
+                    (None, Some(shared)) => share_connector(context, group_id, shared).await,
+                    (found, _) => found,
+                };
+                let Some(connector_id) = found else {
                     warn!(%set_id, %job_id, kind = ?handed.root.kind, "No connector here reads a handed-over import's source; the transfer waits");
                     break;
                 };
@@ -266,6 +281,35 @@ pub(crate) async fn fetch_imports(
     }
     write_kept(context, key, &kept).await?;
     Ok(kept.pending.is_empty())
+}
+
+/// Registers a connector without credentials of the former coordinator under its id here;
+/// `None` when this node cannot, so the transfer waits.
+async fn share_connector(
+    context: &DriverContext,
+    group_id: GroupId,
+    shared: &SourceConnector,
+) -> Option<Ulid> {
+    if shared.group_id != group_id {
+        return None;
+    }
+    let input = SourceConnectorInput {
+        group_id,
+        created_by: shared.created_by,
+        name: shared.name.clone(),
+        kind: shared.kind,
+        public_config: shared.public_config.clone(),
+        secret_config: Default::default(),
+    };
+    let operation = SourceConnectorOperation::with_id(input, shared.connector_id);
+    match drive(operation, context).await {
+        Ok(created) => Some(created.connector.connector_id),
+        Err(error) => {
+            let connector_id = shared.connector_id;
+            warn!(%connector_id, %error, "A handed-over import's connector cannot be registered here");
+            None
+        }
+    }
 }
 
 /// This node's connector of `group_id` with the same source root: kind, public settings and
@@ -582,6 +626,18 @@ mod tests {
             local_connector(context, spec.group_id, &other).await,
             Ok(None)
         );
+        // A connector without credentials travels along, and a node without it registers it
+        // under the same id, as the fan-out does.
+        assert_eq!(handed.shared.as_ref(), Some(&connector));
+        let receiver = setup_driver_context().await;
+        let receiver = &receiver.driver_context;
+        let shared = handed.shared.as_ref().unwrap();
+        let registered = share_connector(receiver, spec.group_id, shared).await;
+        assert_eq!(registered, Some(connector.connector_id));
+        let found = local_connector(receiver, spec.group_id, &handed.root).await;
+        assert_eq!(found, Ok(Some(connector.connector_id)));
+        let elsewhere = share_connector(receiver, Ulid::from_bytes([9; 16]), shared).await;
+        assert_eq!(elsewhere, None);
         let stranger = secret(7).public();
         assert_eq!(
             staging_spec(context, stranger, (transfer_id, job_id)).await,

@@ -854,6 +854,7 @@ fn job_context(driver: Arc<DriverContext>, owner_node_id: NodeId) -> JobContext 
                 unit: "entries".to_string(),
             },
         ),
+        range_turns: Default::default(),
     }
 }
 

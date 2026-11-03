@@ -150,17 +150,66 @@ fn target_for(
     completion: bool,
 ) -> Result<WriteRoute, GuardError> {
     let view = bound_record(binding, record)?;
+    let fence = LocalFence::decode(fence)?;
+    route_in(binding, (&view, &fence), key, completion)
+}
+
+fn route_in(
+    binding: &DistributionBinding,
+    (view, fence): (&DistributionView, &LocalFence),
+    key: &str,
+    completion: bool,
+) -> Result<WriteRoute, GuardError> {
     let snapshot = view.snapshot();
     let route = snapshot.write_route(binding.member_id, key)?;
     if let WriteRoute::Local { epoch, .. } = &route {
         let range = (snapshot.range_for(key)).ok_or(RouteError::NoRange(binding.set_id))?;
-        let fence = LocalFence::decode(fence)?;
         match completion {
             true => fence.check_completion(snapshot, range, epoch.0)?,
             false => fence.check_write(snapshot, range, epoch.0)?,
         }
     }
     Ok(route)
+}
+
+/// [`write_target`] of each of `keys`, decoding the record and the fence once.
+pub fn write_targets<'a>(
+    binding: &DistributionBinding,
+    keys: impl IntoIterator<Item = &'a str>,
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
+) -> Result<Vec<Result<WriteRoute, GuardError>>, GuardError> {
+    let view = bound_record(binding, record)?;
+    let fence = LocalFence::decode(fence)?;
+    let routes = keys.into_iter();
+    Ok((routes.map(|key| route_in(binding, (&view, &fence), key, false))).collect())
+}
+
+/// The range and [`write_epoch`] of each of `keys`, decoding the record and the fence once, and
+/// whether the set keeps a search index.
+pub fn write_epochs<'a>(
+    binding: &DistributionBinding,
+    keys: impl IntoIterator<Item = &'a str>,
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
+) -> Result<(Vec<(Ulid, OriginalEpoch)>, bool), GuardError> {
+    let view = bound_record(binding, record)?;
+    let fence = LocalFence::decode(fence)?;
+    let epochs =
+        keys.into_iter().map(
+            |key| match route_in(binding, (&view, &fence), key, false)? {
+                WriteRoute::Local { range_id, epoch } => Ok((range_id, epoch)),
+                WriteRoute::Forward {
+                    range_id, node_id, ..
+                } => Err(GuardError::NotCoordinator {
+                    set_id: binding.set_id,
+                    range_id,
+                    node_id,
+                }),
+            },
+        );
+    let search = view.snapshot().config.settings.search_index;
+    Ok((epochs.collect::<Result<_, _>>()?, search))
 }
 
 /// The authority a write to `key` takes here, or why it may not write here.
@@ -354,6 +403,48 @@ pub async fn bound_view(
     Ok(view)
 }
 
+/// This node's fence row of the set.
+pub async fn local_fence(context: &DriverContext, set_id: Ulid) -> Result<LocalFence, GuardError> {
+    let read = StorageEffect::Read {
+        key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+        key: LocalFence::key(set_id).into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(LocalFence::decode(value.as_deref())?)
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(GuardError::Unreadable(error.to_string()))
+        }
+        other => Err(GuardError::Unreadable(format!(
+            "unexpected answer {other:?}"
+        ))),
+    }
+}
+
+/// The range id and node of the coordinator of `key`'s range, or `None` when this member
+/// coordinates it and has not fenced it for a transfer.
+pub async fn read_coordinator(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+) -> Result<Option<(Ulid, NodeId)>, GuardError> {
+    let view = bound_view(context, binding).await?;
+    let snapshot = view.snapshot();
+    let set_id = binding.set_id;
+    let range = snapshot.range_for(key).ok_or(RouteError::NoRange(set_id))?;
+    if range.coordinator == binding.member_id {
+        let fence = local_fence(context, set_id).await?;
+        fence.check_read(snapshot, range)?;
+        return Ok(None);
+    }
+    let coordinator = snapshot
+        .member(range.coordinator)
+        .ok_or(RouteError::NoRange(set_id))?;
+    Ok(Some((range.range_id, coordinator.node_id)))
+}
+
 /// Names a new upload of `key` by the range and epoch this member coordinates it under.
 pub async fn upload_tag(
     context: &DriverContext,
@@ -468,9 +559,45 @@ pub async fn lists_interval(
     upper: Option<&str>,
 ) -> Result<bool, GuardError> {
     let view = bound_view(context, binding).await?;
+    let fence = local_fence(context, binding.set_id).await?;
     Ok(view
         .snapshot()
-        .lists_interval(binding.member_id, lower, upper))
+        .lists_interval(binding.member_id, (lower, upper), &fence))
+}
+
+/// Whether this member, as a ready copy, may answer listings of every key in `[lower, upper)`
+/// while their coordinators cannot.
+pub async fn copies_interval(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    lower: &str,
+    upper: Option<&str>,
+) -> Result<bool, GuardError> {
+    let view = bound_view(context, binding).await?;
+    Ok(view
+        .snapshot()
+        .copies_interval(binding.member_id, (lower, upper)))
+}
+
+/// Who answers a read of `key` while its range's coordinator cannot: the range, whether this
+/// member keeps the range's records, and the other nodes with a ready copy.
+pub async fn copy_readers(
+    context: &DriverContext,
+    binding: &DistributionBinding,
+    key: &str,
+) -> Result<(Ulid, bool, Vec<NodeId>), GuardError> {
+    let view = bound_view(context, binding).await?;
+    let snapshot = view.snapshot();
+    let range = snapshot
+        .range_for(key)
+        .ok_or(RouteError::NoRange(binding.set_id))?;
+    let here =
+        (snapshot.record_holders(range).iter()).any(|member| member.member_id == binding.member_id);
+    let copies = (snapshot.copy_holders(range).into_iter())
+        .filter(|member| member.member_id != binding.member_id)
+        .map(|member| member.node_id)
+        .collect();
+    Ok((range.range_id, here, copies))
 }
 
 /// The nodes that answer reads of `key`'s range from their own records, coordinator last.

@@ -8,19 +8,21 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::keyspaces::{
+    NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BucketInfo};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::usage::{
     BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY,
     SUMMARY_GROUP_PREFIX, USAGE_COMPLETE_KEY, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX,
     USAGE_GROUP_PREFIX, USAGE_REBUILD_KEY, UsageCounterError, UsageCounters, UsageDelta,
-    dirty_group_id, dirty_group_key, global_group_key, global_shard_key, global_shard_keys,
-    shard_for_archive, shard_for_hash, usage_backend_key, usage_bucket_key, usage_global_key,
-    usage_group_id, usage_group_key, usage_group_prefix, usage_node_id, usage_snapshot_key,
-    usage_summary_key,
+    dirty_group_id, dirty_group_key, dirty_share_id, dirty_share_key, global_group_key,
+    global_shard_key, global_shard_keys, shard_for_archive, shard_for_hash, usage_backend_key,
+    usage_bucket_key, usage_global_key, usage_group_id, usage_group_key, usage_group_prefix,
+    usage_node_id, usage_snapshot_key, usage_summary_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -28,12 +30,13 @@ use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
 
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
+use crate::distribution::usage::replica_shares;
 use crate::driver::{DriverContext, drive};
 use crate::storage_read::scan_all;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
@@ -68,10 +71,8 @@ pub struct UsageCounterUpdate {
     /// The row of the bucket the change concerns, if it concerns one.
     bucket: Option<(Vec<u8>, BucketDelta)>,
     dirty_group: Option<GroupId>,
-    /// The distributed bucket rows of each changed key, maintained in the same transaction.
-    inventory: VecDeque<InventoryUpdate>,
-    /// Sample entries the finished inventory updates added, per range, for the next ones.
-    sampled: BTreeMap<ulid::Ulid, i128>,
+    /// The distributed bucket rows of the changed keys, maintained in the same transaction.
+    inventory: Option<InventoryUpdate>,
     phase: UsageUpdatePhase,
 }
 
@@ -224,8 +225,7 @@ impl UsageCounterUpdate {
             ],
             bucket: None,
             dirty_group: Some(group_id),
-            inventory: VecDeque::new(),
-            sampled: BTreeMap::new(),
+            inventory: None,
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -245,8 +245,7 @@ impl UsageCounterUpdate {
             entries,
             bucket: None,
             dirty_group: Some(group_id),
-            inventory: VecDeque::new(),
-            sampled: BTreeMap::new(),
+            inventory: None,
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -265,15 +264,27 @@ impl UsageCounterUpdate {
         self
     }
 
+    /// Also books `versions` added version rows on the bucket row set by [`Self::in_bucket`].
+    pub fn with_versions(mut self, versions: u64) -> Self {
+        if let Some((_, delta)) = self.bucket.as_mut() {
+            delta.versions = delta.versions.saturating_add(i128::from(versions));
+        }
+        self
+    }
+
     /// Also maintains the inventory of a distributed bucket's key; `None` for ordinary buckets.
     pub fn with_inventory(self, change: Option<InventoryChange>) -> Self {
         self.with_inventories(change)
     }
 
-    /// Maintains the inventory of several keys of a distributed bucket, one after another.
+    /// Maintains the inventory of several keys of a distributed bucket, batched in rounds.
     pub fn with_inventories(mut self, changes: impl IntoIterator<Item = InventoryChange>) -> Self {
-        self.inventory
-            .extend(changes.into_iter().map(InventoryUpdate::new));
+        for change in changes {
+            match self.inventory.as_mut() {
+                Some(inventory) => inventory.push(change),
+                None => self.inventory = Some(InventoryUpdate::new(change)),
+            }
+        }
         self
     }
 
@@ -283,8 +294,7 @@ impl UsageCounterUpdate {
             entries: stored.entries(),
             bucket: None,
             dirty_group: None,
-            inventory: VecDeque::new(),
-            sampled: BTreeMap::new(),
+            inventory: None,
             phase: UsageUpdatePhase::Pending,
         }
     }
@@ -303,17 +313,34 @@ impl UsageCounterUpdate {
             writes.push((
                 NODE_STATS_KEYSPACE.to_string(),
                 ByteView::from(dirty_group_key(group_id)),
-                generation,
+                generation.clone(),
             ));
+            // Only a removal can shrink this node's replica share; additions leave it deductible.
+            if self.shrinks(group_id) {
+                let key = ByteView::from(dirty_share_key(group_id));
+                writes.push((NODE_STATS_KEYSPACE.to_string(), key, generation));
+            }
         }
         writes
+    }
+
+    /// Whether the update lowers the group's logical bytes or removes a distributed version.
+    fn shrinks(&self, group_id: GroupId) -> bool {
+        let group = usage_group_key(group_id);
+        let lowers =
+            (self.entries.iter()).any(|(key, delta)| *key == group && delta.logical_bytes < 0);
+        lowers
+            || self
+                .inventory
+                .as_ref()
+                .is_some_and(InventoryUpdate::removes)
     }
 
     pub fn is_noop(&self) -> bool {
         let bucket = self.bucket.as_ref().map(|(_, delta)| *delta);
         self.entries.iter().all(|(_, delta)| delta.is_zero())
             && bucket.is_none_or(|delta| delta == BucketDelta::default())
-            && self.inventory.is_empty()
+            && self.inventory.is_none()
     }
 
     pub fn start(&mut self, txn_id: TxnId) -> Effects {
@@ -354,19 +381,14 @@ impl UsageCounterUpdate {
                 Ok(self.next_inventory(txn_id))
             }
             (UsageUpdatePhase::Inventory, event) => {
-                let Some(inventory) = self.inventory.front_mut() else {
+                let Some(inventory) = self.inventory.as_mut() else {
                     return Err(UsageUpdateError::UnexpectedEvent(event));
                 };
                 match inventory.step(event, txn_id)? {
                     Some(effects) => Ok(Some(effects)),
                     None => {
-                        let finished = self.inventory.pop_front();
-                        if let Some((range_id, entries)) =
-                            finished.and_then(|update| update.sample_change())
-                        {
-                            *self.sampled.entry(range_id).or_default() += entries;
-                        }
-                        Ok(self.next_inventory(txn_id))
+                        self.phase = UsageUpdatePhase::Done;
+                        Ok(None)
                     }
                 }
             }
@@ -378,13 +400,10 @@ impl UsageCounterUpdate {
         self.phase == UsageUpdatePhase::Done
     }
 
-    /// Starts the next key's inventory update, or ends the update when none is left.
+    /// Starts the inventory update, or ends the update without one.
     fn next_inventory(&mut self, txn_id: TxnId) -> Option<Effects> {
-        match self.inventory.front_mut() {
-            Some(inventory) => {
-                inventory.set_sampled(self.sampled.clone());
-                Some(inventory.start(txn_id))
-            }
+        match self.inventory.as_mut() {
+            Some(inventory) => Some(inventory.start(txn_id)),
             None => {
                 self.phase = UsageUpdatePhase::Done;
                 None
@@ -402,6 +421,8 @@ enum QuotaGatePhase {
     ReadRealmConfig,
     ReadLocal,
     ScanRemote,
+    /// Whether this node's own share may have shrunk since its last publish.
+    ReadDirty,
     Done,
 }
 
@@ -413,19 +434,29 @@ pub enum QuotaGateError {
     UnexpectedEvent(Event),
 }
 
-/// Embeddable read side of the per-group quota gate: sums the realm-wide `logical_bytes` in the
-/// caller's write transaction, so same-group writes conflict; `ceiling` folds in grace. A rebuild
-/// without complete counters from an earlier one refuses every write.
+/// Read side of the per-group quota gate: sums realm-wide `logical_bytes` in the caller's write
+/// transaction, so same-group writes conflict; `ceiling` folds in grace. Replicas count only when
+/// group quota settings say so. A rebuild without complete earlier counters refuses every write.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaGate {
     ceiling: u64,
     delta_logical_bytes: u64,
+    group_id: GroupId,
     group_key: Vec<u8>,
     remote_prefix: Vec<u8>,
     local_node_id: NodeId,
     realm_id: Option<RealmId>,
     active_node_ids: Option<HashSet<NodeId>>,
     usage: u64,
+    /// The deducted replicas' logical bytes in `usage`, from the other nodes' last snapshots.
+    replica_bytes: u64,
+    /// This node's own published share, deducted only while nothing shrank it since.
+    own_replicas: u64,
+    /// The record numbers this node's own share was computed under, by set.
+    own_revisions: BTreeMap<ulid::Ulid, u64>,
+    /// The other nodes' shares and the record numbers each was computed under, by set.
+    remote_shares: Vec<(u64, BTreeMap<ulid::Ulid, u64>)>,
+    count_replicas: bool,
     rebuilding: bool,
     phase: QuotaGatePhase,
 }
@@ -442,12 +473,18 @@ impl QuotaGate {
         Self {
             ceiling,
             delta_logical_bytes,
+            group_id,
             group_key: usage_group_key(group_id),
             remote_prefix: usage_group_prefix(group_id),
             local_node_id,
             realm_id: None,
             active_node_ids: None,
             usage: 0,
+            replica_bytes: 0,
+            own_replicas: 0,
+            own_revisions: BTreeMap::new(),
+            remote_shares: Vec::new(),
+            count_replicas: false,
             rebuilding: false,
             phase: QuotaGatePhase::Pending,
         }
@@ -542,6 +579,7 @@ impl QuotaGate {
                     let document = RealmConfigDocument::from_bytes(bytes.as_ref())?;
                     self.active_node_ids =
                         Some(document.sync_eligible_nodes()?.into_iter().collect());
+                    self.count_replicas = document.replica_quota.counts(&self.group_id);
                 }
                 Ok(Some(self.read_local_effect(txn_id)))
             }
@@ -561,39 +599,86 @@ impl QuotaGate {
                 }),
             ) => {
                 for (key, value) in values {
-                    // Live counters already include our snapshot. Remote snapshots must also
-                    // bind their embedded node id to the storage key.
+                    // Live counters already include our snapshot's counters, not its replica
+                    // share. Snapshots must also bind their embedded node id to the storage key.
                     let key_node_id = usage_node_id(key.as_ref());
-                    if key_node_id == Some(self.local_node_id) {
-                        continue;
-                    }
-                    if let (Some(active_node_ids), Some(node_id)) =
-                        (&self.active_node_ids, key_node_id)
-                        && !active_node_ids.contains(&node_id)
-                    {
+                    let local = key_node_id == Some(self.local_node_id);
+                    if !local && !counted(self.active_node_ids.as_ref(), key_node_id) {
                         continue;
                     }
                     let snapshot = NodeUsageSnapshot::from_bytes(value.as_ref())?;
                     if key_node_id != Some(snapshot.node_id) {
                         continue;
                     }
+                    let replicas = snapshot.replicas.logical_bytes;
+                    if local {
+                        self.own_replicas = replicas;
+                        self.own_revisions = snapshot.revisions;
+                        continue;
+                    }
                     self.usage = self.usage.saturating_add(snapshot.counters.logical_bytes);
+                    self.remote_shares.push((replicas, snapshot.revisions));
+                }
+                if next_start_after.is_none() {
+                    self.settle_shares();
                 }
                 match next_start_after {
                     Some(start) => Ok(Some(self.scan_effect(Some(start), txn_id))),
+                    // The own share may exceed the live copies once a removal shrank it.
+                    None if !self.count_replicas && self.own_replicas > 0 => {
+                        self.phase = QuotaGatePhase::ReadDirty;
+                        Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
+                            key_space: NODE_STATS_KEYSPACE.to_string(),
+                            key: Key::from(dirty_share_key(self.group_id)),
+                            txn_id: Some(txn_id),
+                        })]))
+                    }
                     None => {
                         self.phase = QuotaGatePhase::Done;
                         Ok(None)
                     }
                 }
             }
+            (QuotaGatePhase::ReadDirty, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                if value.is_some() {
+                    self.own_replicas = 0;
+                }
+                self.phase = QuotaGatePhase::Done;
+                Ok(None)
+            }
             (_, received) => Err(QuotaGateError::UnexpectedEvent(received)),
         }
     }
 
+    /// Deducts only shares, this node's own included, computed under the newest record known for
+    /// every set they cover: a node that has not published under it may still count copies of
+    /// ranges another node now counts, so its share stays charged until it publishes again.
+    fn settle_shares(&mut self) {
+        let mut newest = self.own_revisions.clone();
+        for (set_id, number) in self.remote_shares.iter().flat_map(|(_, numbers)| numbers) {
+            let known = newest.entry(*set_id).or_default();
+            *known = (*known).max(*number);
+        }
+        let current = |numbers: &BTreeMap<ulid::Ulid, u64>| {
+            let newer = |(set_id, number)| newest.get(set_id).is_some_and(|known| known > number);
+            !numbers.iter().any(newer)
+        };
+        if !current(&self.own_revisions) {
+            self.own_replicas = 0;
+        }
+        self.replica_bytes = (self.remote_shares.iter())
+            .filter(|(_, numbers)| current(numbers))
+            .fold(0, |sum, (bytes, _)| sum.saturating_add(*bytes));
+    }
+
     /// Projected group-wide `logical_bytes` if the pending write commits.
     pub fn projected_usage(&self) -> u64 {
-        self.usage.saturating_add(self.delta_logical_bytes)
+        let replicas = self.replica_bytes.saturating_add(self.own_replicas);
+        let usage = match self.count_replicas {
+            true => self.usage,
+            false => self.usage.saturating_sub(replicas),
+        };
+        usage.saturating_add(self.delta_logical_bytes)
     }
 
     /// True when committing the pending write would push the group's realm-wide
@@ -842,16 +927,16 @@ pub enum RealmUsageScope {
     Group(GroupId),
 }
 
-pub(crate) async fn read_local_global(storage: &StorageHandle) -> Result<UsageCounters, String> {
+pub(crate) async fn read_local_global(
+    storage: &StorageHandle,
+    txn_id: Option<TxnId>,
+) -> Result<UsageCounters, String> {
     let reads = global_shard_keys()
         .into_iter()
         .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
         .collect();
     match storage
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })
+        .send_storage_effect(StorageEffect::BatchRead { reads, txn_id })
         .await
     {
         Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -873,12 +958,13 @@ pub(crate) async fn read_local_global(storage: &StorageHandle) -> Result<UsageCo
 async fn read_local_group(
     storage: &StorageHandle,
     group_id: GroupId,
+    txn_id: Option<TxnId>,
 ) -> Result<UsageCounters, String> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: USAGE_STATS_KEYSPACE.to_string(),
             key: Key::from(usage_group_key(group_id)),
-            txn_id: None,
+            txn_id,
         })
         .await
     {
@@ -893,24 +979,29 @@ async fn read_local_group(
     }
 }
 
-/// Sums remote nodes' snapshots under `prefix`, skipping the local node's own
-/// snapshot so it is never double-counted against the live local counters.
-async fn sum_remote_snapshots(
+/// Whether a snapshot of `node_id` counts: with a realm config, only its sync-eligible nodes do.
+fn counted(active_node_ids: Option<&HashSet<NodeId>>, node_id: Option<NodeId>) -> bool {
+    match (active_node_ids, node_id) {
+        (Some(active_node_ids), Some(node_id)) => active_node_ids.contains(&node_id),
+        _ => true,
+    }
+}
+
+/// Sums remote nodes' snapshots under `prefix`, and every node's replica share, the local one
+/// included. The local counters are skipped so they are never double-counted against the live
+/// local counters.
+async fn sum_snapshots(
     storage: &StorageHandle,
     prefix: Vec<u8>,
     local_node_id: NodeId,
     active_node_ids: Option<&HashSet<NodeId>>,
-) -> Result<UsageCounters, String> {
+) -> Result<(UsageCounters, UsageCounters), String> {
     let entries = scan_all(storage, NODE_STATS_KEYSPACE, Some(Key::from(prefix))).await?;
-    let mut total = UsageCounters::default();
+    let (mut total, mut replicas) = (UsageCounters::default(), UsageCounters::default());
     for (key, value) in entries {
         let key_node_id = usage_node_id(key.as_ref());
-        if key_node_id == Some(local_node_id) {
-            continue;
-        }
-        if let (Some(active_node_ids), Some(node_id)) = (active_node_ids, key_node_id)
-            && !active_node_ids.contains(&node_id)
-        {
+        let local = key_node_id == Some(local_node_id);
+        if !local && !counted(active_node_ids, key_node_id) {
             continue;
         }
         let snapshot = NodeUsageSnapshot::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
@@ -918,9 +1009,14 @@ async fn sum_remote_snapshots(
         if key_node_id != Some(snapshot.node_id) {
             continue;
         }
-        total.add(&snapshot.counters).map_err(|e| e.to_string())?;
+        replicas
+            .add(&snapshot.replicas)
+            .map_err(|e| e.to_string())?;
+        if !local {
+            total.add(&snapshot.counters).map_err(|e| e.to_string())?;
+        }
     }
-    Ok(total)
+    Ok((total, replicas))
 }
 
 /// Rebuilds this node's snapshot documents from live counters and distributes them
@@ -960,6 +1056,9 @@ async fn publish_retaining_markers(
             global = true;
         } else if let Some(group_id) = dirty_group_id(key.as_ref()) {
             groups.insert(group_id);
+        } else if let Some(group_id) = dirty_share_id(key.as_ref()) {
+            // A share marker the scan saw without its group's marker still needs a publish.
+            groups.insert(group_id);
         }
     }
 
@@ -998,20 +1097,62 @@ async fn publish_retaining_markers(
         return Ok((PublishedUsage::default(), Vec::new()));
     }
 
-    let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(groups.len() + 1);
+    // Counters and replica shares come from one snapshot, as a purge debits both together.
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: true })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(format!("unexpected transaction answer {other:?}")),
+    };
+    let group_list: Vec<GroupId> = groups.into_iter().collect();
+    let read = async {
+        let shares = replica_shares(ctx, txn_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let counters = if global {
+            read_local_global(storage, Some(txn_id)).await?
+        } else {
+            UsageCounters::default()
+        };
+        let mut group_counters = Vec::with_capacity(group_list.len());
+        for group_id in &group_list {
+            group_counters.push(read_local_group(storage, *group_id, Some(txn_id)).await?);
+        }
+        Ok::<_, String>((shares, counters, group_counters))
+    }
+    .await;
+    storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
+    let (shares, counters, group_counters) = read?;
+    let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(group_list.len() + 1);
     if global {
-        let counters = read_local_global(storage).await?;
-        let snapshot = NodeUsageSnapshot { node_id, counters };
+        let (mut replicas, mut revisions) = (UsageCounters::default(), BTreeMap::new());
+        for share in shares.values() {
+            replicas.add(&share.replicas).map_err(|e| e.to_string())?;
+            revisions.extend(&share.revisions);
+        }
+        let snapshot = NodeUsageSnapshot {
+            node_id,
+            counters,
+            replicas,
+            revisions,
+        };
         writes.push((
             NODE_STATS_KEYSPACE.to_string(),
             Key::from(usage_global_key(node_id)),
             Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
-    let group_list: Vec<GroupId> = groups.into_iter().collect();
-    for group_id in &group_list {
-        let counters = read_local_group(storage, *group_id).await?;
-        let snapshot = NodeUsageSnapshot { node_id, counters };
+    for (group_id, counters) in group_list.iter().zip(group_counters) {
+        let share = shares.get(group_id).cloned().unwrap_or_default();
+        let snapshot = NodeUsageSnapshot {
+            node_id,
+            counters,
+            replicas: share.replicas,
+            revisions: share.revisions,
+        };
         writes.push((
             NODE_STATS_KEYSPACE.to_string(),
             Key::from(usage_snapshot_key(*group_id, node_id)),
@@ -1336,7 +1477,7 @@ pub async fn recompute_usage_summary(
         writes.push((
             NODE_STATS_KEYSPACE.to_string(),
             Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
-            Value::from(total.to_bytes().map_err(|e| e.to_string())?),
+            Value::from(total.counters.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
     for group_id in groups {
@@ -1345,7 +1486,7 @@ pub async fn recompute_usage_summary(
         writes.push((
             NODE_STATS_KEYSPACE.to_string(),
             Key::from(usage_summary_key(group_id)),
-            Value::from(total.to_bytes().map_err(|e| e.to_string())?),
+            Value::from(total.counters.to_bytes().map_err(|e| e.to_string())?),
         ));
     }
 
@@ -1393,6 +1534,10 @@ pub async fn refresh_usage_targets(
     if realm_config_changed && let Err(error) = clear_usage_cache(ctx).await {
         warn!(error = %error, "Failed to clear realm usage summary after realm config change");
     }
+    // Distribution records arrive as realm config targets; a new coordinator moves replica shares.
+    if realm_config_changed && let Err(error) = dirty_bound_groups(ctx).await {
+        warn!(error = %error, "Failed to mark distributed bucket groups for a usage publish");
+    }
     if !include_global && groups.is_empty() {
         return;
     }
@@ -1408,21 +1553,98 @@ pub async fn refresh_usage_targets(
     }
 }
 
+/// A realm-wide usage total.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RealmUsage {
+    /// Objects and data counted once, a distributed range at its coordinator; `stored_*` and
+    /// `buckets` over every node.
+    pub counters: UsageCounters,
+    /// The copies of distributed ranges left out of `counters`.
+    pub replicas: UsageCounters,
+}
+
+impl RealmUsage {
+    fn of(
+        local: UsageCounters,
+        (remote, replicas): (UsageCounters, UsageCounters),
+    ) -> Result<Self, String> {
+        let mut total = local;
+        total.add(&remote).map_err(|e| e.to_string())?;
+        Ok(Self {
+            counters: total.without_replicas(&replicas),
+            replicas,
+        })
+    }
+}
+
+/// Marks the groups of local distributed buckets and the global for the next publish, which
+/// recomputes their replica shares, and schedules it.
+async fn dirty_bound_groups(ctx: &DriverContext) -> Result<(), String> {
+    let mut groups = BTreeSet::new();
+    for (_, value) in scan_all(&ctx.storage_handle, S3_BUCKET_KEYSPACE, None).await? {
+        let info = BucketInfo::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
+        if info.distribution.is_some() {
+            groups.insert(info.group_id);
+        }
+    }
+    if groups.is_empty() {
+        return Ok(());
+    }
+    mark_dirty(ctx, groups).await
+}
+
+/// Rows marking `groups` and the global for the next publish, for a caller's transaction.
+pub(crate) fn dirty_rows(groups: impl IntoIterator<Item = GroupId>) -> Vec<(String, Key, Value)> {
+    let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
+    let marker = |key: Vec<u8>| {
+        (
+            NODE_STATS_KEYSPACE.to_string(),
+            Key::from(key),
+            generation.clone(),
+        )
+    };
+    let mut rows = vec![marker(DIRTY_GLOBAL_KEY.to_vec())];
+    for group in groups {
+        rows.push(marker(dirty_group_key(group)));
+        rows.push(marker(dirty_share_key(group)));
+    }
+    rows
+}
+
+/// Schedules the publish that consumes committed dirty markers.
+pub(crate) async fn wake_publish(ctx: &DriverContext) {
+    if let Some(task_handle) = ctx.task_handle.as_ref() {
+        task_handle.send_effect(schedule_snapshot_publish()).await;
+    }
+}
+
+/// Marks `groups` and the global for the next publish and schedules it.
+pub(crate) async fn mark_dirty(
+    ctx: &DriverContext,
+    groups: impl IntoIterator<Item = GroupId>,
+) -> Result<(), String> {
+    let write = StorageEffect::BatchWrite {
+        writes: dirty_rows(groups),
+        txn_id: None,
+    };
+    match ctx.storage_handle.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+        other => return Err(format!("dirty marker write failed: {other:?}")),
+    }
+    wake_publish(ctx).await;
+    Ok(())
+}
+
 async fn realm_global_usage(
     storage: &StorageHandle,
     local_node_id: NodeId,
     active_node_ids: Option<&HashSet<NodeId>>,
-) -> Result<UsageCounters, String> {
-    let mut total = read_local_global(storage).await?;
-    let remote = sum_remote_snapshots(
-        storage,
-        USAGE_GLOBAL_PREFIX.to_vec(),
-        local_node_id,
-        active_node_ids,
-    )
-    .await?;
-    total.add(&remote).map_err(|e| e.to_string())?;
-    Ok(total)
+) -> Result<RealmUsage, String> {
+    let local = read_local_global(storage, None).await?;
+    let prefix = USAGE_GLOBAL_PREFIX.to_vec();
+    let remote = sum_snapshots(storage, prefix, local_node_id, active_node_ids).await?;
+    RealmUsage::of(local, remote)
 }
 
 async fn realm_group_usage(
@@ -1430,17 +1652,11 @@ async fn realm_group_usage(
     local_node_id: NodeId,
     group_id: GroupId,
     active_node_ids: Option<&HashSet<NodeId>>,
-) -> Result<UsageCounters, String> {
-    let mut total = read_local_group(storage, group_id).await?;
-    let remote = sum_remote_snapshots(
-        storage,
-        usage_group_prefix(group_id),
-        local_node_id,
-        active_node_ids,
-    )
-    .await?;
-    total.add(&remote).map_err(|e| e.to_string())?;
-    Ok(total)
+) -> Result<RealmUsage, String> {
+    let local = read_local_group(storage, group_id, None).await?;
+    let prefix = usage_group_prefix(group_id);
+    let remote = sum_snapshots(storage, prefix, local_node_id, active_node_ids).await?;
+    RealmUsage::of(local, remote)
 }
 
 /// Sums the realm-wide total from the live local counters and the remote snapshots, the
@@ -1449,7 +1665,7 @@ pub async fn load_realm_usage(
     ctx: &DriverContext,
     local_node_id: NodeId,
     scope: RealmUsageScope,
-) -> Result<UsageCounters, String> {
+) -> Result<RealmUsage, String> {
     let storage = &ctx.storage_handle;
     let active_node_ids = active_usage_nodes(ctx).await?;
     match scope {
@@ -2152,6 +2368,7 @@ mod tests {
                         capabilities: Vec::new(),
                         origin_node_id: None,
                         namespace: None,
+                        root: None,
                     },
                     connector_id: Some(Ulid::generate()),
                 },
@@ -2328,10 +2545,14 @@ mod tests {
     }
 
     async fn write_node_stat(ctx: &DriverContext, key: Vec<u8>, value: Vec<u8>) {
+        write_stat(ctx, NODE_STATS_KEYSPACE, key, value).await;
+    }
+
+    async fn write_stat(ctx: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
         match ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: NODE_STATS_KEYSPACE.to_string(),
+                key_space: key_space.to_string(),
                 key: key.into(),
                 value: value.into(),
                 txn_id: None,
@@ -2341,6 +2562,343 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    fn logical(logical_bytes: u64) -> UsageCounters {
+        UsageCounters {
+            logical_bytes,
+            ..Default::default()
+        }
+    }
+
+    /// Drives a gate of a two-node realm: `live` local logical bytes, then each node's snapshot
+    /// as (counters, replicas), the local one first, and whether a removal shrank the share.
+    fn run_gate(
+        count_replicas: bool,
+        limits: (u64, u64),
+        live: u64,
+        shares: [(u64, u64); 2],
+        dirty: bool,
+    ) -> QuotaGate {
+        run_gate_at(count_replicas, limits, live, shares, dirty, [1, 1])
+    }
+
+    /// [`run_gate`] with the number of the one set's record each node's share was computed under.
+    fn run_gate_at(
+        count_replicas: bool,
+        (ceiling, delta): (u64, u64),
+        live: u64,
+        shares: [(u64, u64); 2],
+        dirty: bool,
+        numbers: [u64; 2],
+    ) -> QuotaGate {
+        use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
+        let nodes = [node(1), node(2)];
+        let group_id = Ulid::from_bytes([2; 16]);
+        let realm_id = RealmId([4; 32]);
+        let txn_id = Ulid::from_bytes([1; 16]);
+        let read = |value: Option<Vec<u8>>| {
+            Event::Storage(StorageEvent::ReadResult {
+                key: Key::from(b"row".to_vec()),
+                value: value.map(Into::into),
+            })
+        };
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.nodes = nodes
+            .map(|node_id| RealmNode {
+                node_id: node_id.to_string(),
+                kind: RealmNodeKind::Management,
+            })
+            .to_vec();
+        config.replica_quota.count = count_replicas;
+        let mut gate = QuotaGate::new_for_realm(ceiling, delta, group_id, nodes[0], realm_id);
+        gate.start(txn_id);
+        gate.step(read(None), txn_id).unwrap();
+        gate.step(read(Some(postcard::to_allocvec(&config).unwrap())), txn_id)
+            .unwrap();
+        gate.step(read(Some(logical(live).to_bytes().unwrap())), txn_id)
+            .unwrap();
+        let set_id = Ulid::from_bytes([3; 16]);
+        let values = (nodes.into_iter().zip(shares).zip(numbers))
+            .map(|((node_id, (counters, replicas)), number)| {
+                let snapshot = NodeUsageSnapshot {
+                    node_id,
+                    counters: logical(counters),
+                    replicas: logical(replicas),
+                    revisions: BTreeMap::from([(set_id, number)]),
+                };
+                let key = Key::from(usage_snapshot_key(group_id, node_id));
+                (key, Value::from(snapshot.to_bytes().unwrap()))
+            })
+            .collect();
+        let scanned = Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        });
+        if let Some(effects) = gate.step(scanned, txn_id).unwrap() {
+            let [Effect::Storage(StorageEffect::Read { key, .. })] = effects.as_slice() else {
+                panic!("the gate reads one marker: {effects:?}");
+            };
+            assert_eq!(
+                key.as_ref(),
+                dirty_share_key(group_id),
+                "the share marker, not the group's"
+            );
+            let marker = dirty.then(|| vec![1]);
+            assert_eq!(gate.step(read(marker), txn_id).unwrap(), None);
+        }
+        gate
+    }
+
+    // Replicas count toward a quota only by the group's setting; the own snapshot adds its
+    // replica share, never its counters a second time, and no share once a removal shrank it.
+    #[test]
+    fn gate_counts_replicas() {
+        let cases = [(false, false, 61), (false, true, 101), (true, false, 151)];
+        for (count_replicas, dirty, projected) in cases {
+            let gate = run_gate(
+                count_replicas,
+                (1_000, 1),
+                100,
+                [(100, 40), (50, 50)],
+                dirty,
+            );
+            assert_eq!(gate.projected_usage(), projected);
+        }
+    }
+
+    // Another node owns 100 B and this node just purged its 100 B copy: until the next publish
+    // its stale share must not hide the owner's bytes from a 100 B ceiling.
+    #[test]
+    fn stale_share_refused() {
+        let gate = run_gate(false, (100, 100), 0, [(100, 100), (100, 0)], true);
+        assert!(gate.is_exceeded());
+        let published = run_gate(false, (100, 100), 0, [(0, 0), (100, 0)], false);
+        assert!(
+            published.is_exceeded(),
+            "after the publish the owner's bytes still count"
+        );
+    }
+
+    // After a promotion the former coordinator publishes its 100 B as replicas; the record marked
+    // this node's share in its install, so the stale 100 B share is not deducted as well.
+    #[test]
+    fn promotion_counts_once() {
+        let gate = run_gate(false, (1_000, 1), 120, [(120, 100), (100, 100)], true);
+        assert_eq!(gate.projected_usage(), 121);
+    }
+
+    // The former coordinator's snapshot under the promoting record can arrive before that record:
+    // a share computed under an older record of the set is then not deducted, 1 B counts as 121 B.
+    #[test]
+    fn newer_record_counts() {
+        let shares = [(120, 100), (100, 100)];
+        let early = run_gate_at(false, (1_000, 1), 120, shares, false, [1, 2]);
+        assert_eq!(early.projected_usage(), 121);
+        let applied = run_gate_at(false, (1_000, 1), 120, shares, false, [2, 2]);
+        assert_eq!(
+            applied.projected_usage(),
+            21,
+            "both shares under one record are exact"
+        );
+    }
+
+    // The reverse on the former coordinator A: it writes under record 2 while the promoted node's
+    // snapshot is still from record 1, so that stale share stays charged too: 1 B counts as 121 B.
+    #[test]
+    fn older_record_charged() {
+        let shares = [(100, 100), (120, 100)];
+        let stale = run_gate_at(false, (1_000, 1), 100, shares, false, [2, 1]);
+        assert_eq!(stale.projected_usage(), 121);
+        let published = run_gate_at(
+            false,
+            (1_000, 1),
+            100,
+            [(100, 100), (120, 0)],
+            false,
+            [2, 2],
+        );
+        assert_eq!(
+            published.projected_usage(),
+            121,
+            "the republished share counts the same"
+        );
+    }
+
+    // Steady additions keep a group dirty but never mark its share, so the gate keeps deducting
+    // it: with 100 B owned elsewhere and a 100 B local copy, a 150 B quota admits 1 B more.
+    #[test]
+    fn additions_keep_share() {
+        let group_id = Ulid::from_bytes([2; 16]);
+        let txn_id = Ulid::from_bytes([1; 16]);
+        let markers = |logical_bytes| {
+            let delta = UsageDelta {
+                logical_bytes,
+                ..Default::default()
+            };
+            let mut update = UsageCounterUpdate::for_group(group_id, delta);
+            update.start(txn_id);
+            let added = Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            });
+            let effects = update.step(added, txn_id).unwrap().unwrap();
+            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
+            else {
+                panic!("the update writes its markers: {effects:?}");
+            };
+            writes
+                .iter()
+                .map(|(_, key, _)| key.to_vec())
+                .collect::<Vec<_>>()
+        };
+        let share = dirty_share_key(group_id);
+        assert!(markers(100).contains(&dirty_group_key(group_id)));
+        assert!(
+            !markers(100).contains(&share),
+            "an addition leaves the share deductible"
+        );
+        assert!(markers(-100).contains(&share), "a removal may shrink it");
+
+        let gate = run_gate(false, (150, 1), 100, [(100, 100), (100, 0)], false);
+        assert_eq!(gate.projected_usage(), 101);
+        assert!(!gate.is_exceeded());
+    }
+
+    // Realm totals leave out the copies of distributed ranges, the own node's included, while
+    // physical stored bytes add up over every node.
+    #[tokio::test]
+    async fn totals_count_once() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let (local, remote) = (node(1), node(2));
+        let group_id = Ulid::from_bytes([5; 16]);
+        let counters = |objects, logical_bytes, referenced_bytes, stored_bytes| UsageCounters {
+            objects,
+            logical_bytes,
+            referenced_bytes,
+            stored_bytes,
+            ..Default::default()
+        };
+        write_counters(&ctx, global_shard_key(0), counters(3, 30, 9, 50)).await;
+        write_counters(&ctx, usage_group_key(group_id), counters(3, 30, 9, 0)).await;
+        let snapshot = |node_id, counters, replicas| {
+            NodeUsageSnapshot {
+                node_id,
+                counters,
+                replicas,
+                revisions: Default::default(),
+            }
+            .to_bytes()
+            .unwrap()
+        };
+        for (global, key) in [
+            (true, usage_global_key(local)),
+            (false, usage_snapshot_key(group_id, local)),
+        ] {
+            let own = counters(3, 30, 9, if global { 50 } else { 0 });
+            let value = snapshot(local, own, counters(1, 10, 4, 0));
+            write_node_stat(&ctx, key, value).await;
+        }
+        for (global, key) in [
+            (true, usage_global_key(remote)),
+            (false, usage_snapshot_key(group_id, remote)),
+        ] {
+            // The remote node holds copies only.
+            let held = counters(2, 20, 6, if global { 25 } else { 0 });
+            let value = snapshot(remote, held, counters(2, 20, 6, 0));
+            write_node_stat(&ctx, key, value).await;
+        }
+
+        let global = load_realm_usage(&ctx, local, RealmUsageScope::Global)
+            .await
+            .unwrap();
+        assert_eq!(global.counters, counters(2, 20, 5, 75));
+        assert_eq!(global.replicas, counters(3, 30, 10, 0));
+        let group = load_realm_usage(&ctx, local, RealmUsageScope::Group(group_id))
+            .await
+            .unwrap();
+        assert_eq!(group.counters, counters(2, 20, 5, 0));
+    }
+
+    fn binding(seed: u8) -> aruna_core::structs::storage::distribution::DistributionBinding {
+        aruna_core::structs::storage::distribution::DistributionBinding {
+            set_id: Ulid::from_bytes([seed; 16]),
+            member_id: Ulid::from_bytes([9; 16]),
+            incarnation: 1,
+            revision: Default::default(),
+        }
+    }
+
+    async fn write_bucket(
+        ctx: &DriverContext,
+        bucket: &str,
+        group_id: GroupId,
+        distribution: Option<aruna_core::structs::storage::distribution::DistributionBinding>,
+    ) {
+        let info = BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution,
+        };
+        let write = StorageEffect::Write {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: bucket.as_bytes().to_vec().into(),
+            value: info.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        ctx.storage_handle.send_storage_effect(write).await;
+    }
+
+    // Distribution records arrive as realm config targets; the groups of local distributed
+    // buckets are marked so their replica shares are published again.
+    #[tokio::test]
+    async fn record_marks_groups() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let (bound, plain) = (Ulid::from_bytes([6; 16]), Ulid::from_bytes([7; 16]));
+        write_bucket(&ctx, "spire", bound, Some(binding(8))).await;
+        write_bucket(&ctx, "plain", plain, None).await;
+
+        let target = DocumentTarget::RealmConfig {
+            realm_id: RealmId([4; 32]),
+        };
+        refresh_usage_targets(&ctx, node(1), &[target]).await;
+
+        assert!(read_node_stat(&ctx, dirty_group_key(bound)).await.is_some());
+        assert!(read_node_stat(&ctx, dirty_group_key(plain)).await.is_none());
+        assert!(
+            read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
+                .await
+                .is_some()
+        );
+    }
+
+    // A replica share that cannot be read fails the publish, so its markers stay for the retry.
+    #[tokio::test]
+    async fn share_failure_keeps() {
+        use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let group_id = Ulid::from_bytes([6; 16]);
+        write_bucket(&ctx, "spire", group_id, Some(binding(8))).await;
+        let record = Ulid::from_bytes([8; 16]).to_bytes().to_vec();
+        write_stat(&ctx, DISTRIBUTION_KEYSPACE, record, vec![0xff; 3]).await;
+        write_node_stat(&ctx, dirty_group_key(group_id), vec![1]).await;
+
+        let published = publish_usage_snapshots(&ctx, node(1), RealmId([4; 32]), false).await;
+
+        assert!(published.is_err(), "an unreadable record is no zero share");
+        assert!(
+            read_node_stat(&ctx, dirty_group_key(group_id))
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2378,6 +2936,31 @@ mod tests {
             read_node_stat(&ctx, dirty_group_key(group_id))
                 .await
                 .is_some()
+        );
+    }
+
+    // A paged marker scan can pass a group's marker before it is written and then see the
+    // group's share marker: the group is published in that run, so clearing the marker is safe.
+    #[tokio::test]
+    async fn share_marker_publishes() {
+        let temp = tempdir().unwrap();
+        let ctx = test_ctx(temp.path().to_str().unwrap());
+        let group_id = Ulid::from_bytes([5; 16]);
+        write_counters(&ctx, usage_group_key(group_id), logical(7)).await;
+        write_node_stat(&ctx, dirty_share_key(group_id), vec![1]).await;
+
+        let published = publish_usage_snapshots(&ctx, node(1), RealmId([4; 32]), false)
+            .await
+            .unwrap();
+
+        assert_eq!(published.groups, vec![group_id]);
+        let snapshot = read_node_stat(&ctx, usage_snapshot_key(group_id, node(1))).await;
+        let snapshot = NodeUsageSnapshot::from_bytes(&snapshot.unwrap()).unwrap();
+        assert_eq!(snapshot.counters.logical_bytes, 7);
+        assert!(
+            read_node_stat(&ctx, dirty_share_key(group_id))
+                .await
+                .is_none()
         );
     }
 
@@ -2454,6 +3037,8 @@ mod tests {
         let remote_snapshot = |counters| NodeUsageSnapshot {
             node_id: remote,
             counters,
+            replicas: Default::default(),
+            revisions: Default::default(),
         };
         let remote_counters = UsageCounters {
             logical_bytes: 5,
@@ -2482,6 +3067,8 @@ mod tests {
                     logical_bytes: 999,
                     ..Default::default()
                 },
+                replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -2494,12 +3081,14 @@ mod tests {
 
         let global = load_realm_usage(&ctx, local, RealmUsageScope::Global)
             .await
-            .unwrap();
+            .unwrap()
+            .counters;
         assert_eq!(global.logical_bytes, 15);
         assert_eq!(global.objects, 2);
         let group = load_realm_usage(&ctx, local, RealmUsageScope::Group(group_id))
             .await
-            .unwrap();
+            .unwrap()
+            .counters;
         assert_eq!(group.logical_bytes, 15);
         assert_eq!(group.objects, 2);
     }
@@ -2529,6 +3118,8 @@ mod tests {
                     logical_bytes: 4,
                     ..Default::default()
                 },
+                replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -2538,7 +3129,8 @@ mod tests {
         // No summary/global cache entry exists, so the read recomputes on the fly.
         let global = load_realm_usage(&ctx, local, RealmUsageScope::Global)
             .await
-            .unwrap();
+            .unwrap()
+            .counters;
         assert_eq!(global.logical_bytes, 7);
     }
 
@@ -2554,6 +3146,8 @@ mod tests {
                 logical_bytes: 42,
                 ..Default::default()
             },
+            replicas: Default::default(),
+            revisions: Default::default(),
         };
         write_node_stat(&ctx, snapshot_key.clone(), snapshot.to_bytes().unwrap()).await;
         write_node_stat(&ctx, SUMMARY_GLOBAL_KEY.to_vec(), Vec::new()).await;
@@ -2865,6 +3459,8 @@ mod tests {
                     logical_bytes: 500,
                     ..Default::default()
                 },
+                replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -2921,6 +3517,8 @@ mod tests {
             NodeUsageSnapshot {
                 node_id: remote,
                 counters: remote_counters,
+                replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap(),
@@ -2932,6 +3530,8 @@ mod tests {
             NodeUsageSnapshot {
                 node_id: remote,
                 counters: remote_counters,
+                replicas: Default::default(),
+                revisions: Default::default(),
             }
             .to_bytes()
             .unwrap(),

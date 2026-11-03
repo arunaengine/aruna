@@ -19,6 +19,7 @@ mod network_recovery;
 mod observability;
 mod oidc_registration;
 mod onboarding;
+mod promotion;
 mod public_access;
 mod replication;
 mod s3_attributes;

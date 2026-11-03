@@ -231,3 +231,76 @@ async fn replicas_take_reads() {
         Err(GuardError::Route(RouteError::StaleRange(lower)))
     );
 }
+
+// A coordinator that fenced its range for a transfer neither lists it nor reads it as final.
+#[tokio::test]
+async fn fenced_coordinator_refuses() {
+    use crate::distribution::test_record::store_record;
+    use crate::distribution::test_store::{context, open, send};
+    use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
+    let (_dir, handle) = open();
+    let context = context(&handle);
+    let (snapshot, bytes) = record(true);
+    store_record(&handle, snapshot.set_id(), bytes).await;
+    let own = binding(&snapshot, 1, 5);
+    assert_eq!(read_coordinator(&context, &own, "a").await, Ok(None));
+    assert_eq!(
+        lists_interval(&context, &own, "", Some("m")).await,
+        Ok(true)
+    );
+    let range_id = snapshot.config.ranges[0].range_id;
+    let mut fence = LocalFence::default();
+    fence.fence_range(RangeFence {
+        range_id,
+        transfer_id: Ulid::from_bytes([3; 16]),
+        epoch: 1,
+        since_ms: 0,
+        uploads_open: false,
+    });
+    let write = StorageEffect::Write {
+        key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+        key: LocalFence::key(snapshot.set_id()).into(),
+        value: fence.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    send(&handle, Effect::Storage(write)).await;
+    assert_eq!(
+        read_coordinator(&context, &own, "a").await,
+        Err(GuardError::Route(RouteError::Moving(range_id)))
+    );
+    assert_eq!(
+        lists_interval(&context, &own, "", Some("m")).await,
+        Ok(false)
+    );
+    let upper = Some((snapshot.config.ranges[1].range_id, secret(2).public()));
+    assert_eq!(read_coordinator(&context, &own, "x").await, Ok(upper));
+}
+
+// A replica answers reads and listings of a range its coordinator cannot serve.
+#[tokio::test]
+async fn copies_answer_reads() {
+    use crate::distribution::test_record::{replicated, store_record};
+    use crate::distribution::test_store::{context, open};
+    let (_dir, handle) = open();
+    let context = context(&handle);
+    let (snapshot, bytes) = replicated(true, 1);
+    store_record(&handle, snapshot.set_id(), bytes).await;
+    let (coordinator, copy) = (binding(&snapshot, 1, 5), binding(&snapshot, 2, 5));
+    let lower = snapshot.config.ranges[0].range_id;
+    assert_eq!(
+        copy_readers(&context, &copy, "a").await,
+        Ok((lower, true, Vec::new()))
+    );
+    assert_eq!(
+        copy_readers(&context, &coordinator, "a").await,
+        Ok((lower, true, vec![secret(2).public()]))
+    );
+    assert_eq!(
+        copies_interval(&context, &copy, "", Some("m")).await,
+        Ok(true)
+    );
+    assert_eq!(
+        copies_interval(&context, &coordinator, "", Some("m")).await,
+        Ok(false)
+    );
+}

@@ -3,11 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
 use std::path::{Component, Path};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::effects::StorageEffect;
-use aruna_core::errors::StagingSourceError;
+use aruna_core::errors::{StagingSourceError, StorageError};
 use aruna_core::keyspaces::{STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::execution::job::{
@@ -21,19 +22,27 @@ use aruna_core::structs::execution::source_access::{
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::storage::distribution::{DistributionView, WriteRoute};
+use aruna_core::structs::storage::distribution::{
+    DistributionBinding, DistributionView, WriteRoute,
+};
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
+use tokio::sync::Mutex;
 use tracing::warn;
+use ulid::Ulid;
 
 use super::manifest::{
     ManifestDigest, lasting_head, lasting_resolution, lasting_source, manifest_digests,
 };
 use super::{
-    ItemFailure, moved_away, persist_rows, pinned_bucket, queue_key, stage_item, sync_progress,
+    ItemFailure, checkpoint_key, moved_away, persist_slot, pinned_bucket, queue_key, stage_item,
+    sync_progress,
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::distribution::guard::{GuardError, authority_reads, authority_rows, write_target};
+use crate::auth::permission_rules::{PermissionRules, permission_rules};
+use crate::distribution::guard::{
+    GuardError, authority_reads, authority_rows, write_target, write_targets,
+};
 use crate::driver::drive;
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::store::{batch_delete, iter_prefix_page, read_state};
@@ -43,17 +52,25 @@ use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
 };
 use crate::staging::page::import::{
-    PageEntry, PageImportError, PageImportInput, PageImportOperation,
+    PageEntry, PageImportError, PageImportInput, PageImportOperation, PageImportResult,
 };
 use crate::staging::page::rows::MAX_ERROR_SAMPLE;
 
-/// Entries one reference page lists and registers in one transaction.
-const STAGING_PAGE_SIZE: usize = 500;
+/// Entries one listing request reads.
+const STAGING_PAGE_SIZE: usize = 1000;
+/// Entries a flat reference walk gathers from several listings into one page transaction.
+const COMMIT_ENTRIES: usize = 5000;
+/// Bytes of listed source paths one gathered page holds at most.
+const COMMIT_PATH_BYTES: usize = 4 << 20;
 /// Snapshot pages copy every file before their checkpoint, so they stay smaller.
 const SNAPSHOT_PAGE_SIZE: usize = 100;
 
 /// Queue rows one cleanup pass deletes.
 const QUEUE_CLEANUP_PAGE: usize = 256;
+/// Page transactions one listed page runs at most while their commits conflict.
+const PAGE_ATTEMPTS: u32 = 8;
+/// Pause before the next page transaction, times the attempts so far.
+const CONFLICT_PAUSE: Duration = Duration::from_millis(20);
 
 /// Starts the next listing: the next queued directory, else the next spec prefix.
 /// `Ok(false)` once nothing is left to list.
@@ -180,6 +197,8 @@ pub(super) fn record_failure(
 pub(super) enum PageFailure {
     Retry(String),
     Permanent(String),
+    /// Page transactions kept conflicting with other writers; the job is deferred.
+    Conflict(String),
 }
 
 /// A file a listing page found, mapped to its destination key.
@@ -192,11 +211,13 @@ struct StagedFile {
 }
 
 /// Lists one page of the current walk and records it, with the walk's next position and the
-/// queue changes, in one write.
+/// queue changes, in one write. Lanes share `turn`, so their page transactions run one at a time.
 pub(super) async fn walk_page(
     ctx: &JobContext,
     spec: &StagingJobSpec,
+    (slot, upper): (Option<u64>, Option<&str>),
     checkpoint: &mut StagingJobCheckpoint,
+    (ahead, turn): (&mut Option<Ahead>, Option<&Mutex<()>>),
 ) -> Result<(), PageFailure> {
     let Some(walk) = checkpoint.walk.clone() else {
         return Ok(());
@@ -207,19 +228,18 @@ pub(super) async fn walk_page(
     let mut next = checkpoint.clone();
     let mut writes = Vec::new();
     let mut deletes = Vec::new();
-    // A flat walk into a distributed bucket lists only the key ranges this node coordinates.
-    let segment = match (flat, walk.queue_row) {
-        (true, None) => match segment_of(ctx, spec, &walk).await? {
-            Bounds::Whole => None,
-            Bounds::Segment(segment) => Some(segment),
-            Bounds::Done => {
-                next.walk = None;
-                return commit_rows(ctx, checkpoint, next, writes, deletes).await;
-            }
-        },
-        _ => None,
+    let listed = match ahead.take().filter(|ahead| ahead.walk == walk) {
+        Some(ahead) => ahead.listing,
+        None => listing(ctx, spec, &walk, (flat, upper)).await?,
     };
-    let mut page = match list_page(ctx, spec, &walk, (flat, segment.as_ref())).await {
+    let (segment, listed) = match listed {
+        Listing::Done => {
+            next.walk = None;
+            return commit_slot(ctx, slot, checkpoint, next, writes, deletes).await;
+        }
+        Listing::Page(segment, listed) => (segment, listed),
+    };
+    let mut page = match listed {
         Ok(page) => Some(page),
         Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
             record_failure(&mut next, &walk.source_path, &walk.target_prefix, message);
@@ -299,7 +319,7 @@ pub(super) async fn walk_page(
     next.phase = item_phase(spec);
     let Some(page) = page else {
         // The listing failed for good: record that and move on.
-        return commit_rows(ctx, checkpoint, next, writes, deletes).await;
+        return commit_slot(ctx, slot, checkpoint, next, writes, deletes).await;
     };
     let rows = PageRows {
         files,
@@ -307,11 +327,86 @@ pub(super) async fn walk_page(
         deletes,
     };
     match spec.strategy {
-        StagingStrategy::Reference => import_page(ctx, spec, checkpoint, next, rows, page).await,
+        StagingStrategy::Reference => {
+            // The next page of a flat walk is listed while this one commits; one page at most.
+            let following = (next.walk.clone()).filter(|walk| flat && walk.queue_row.is_none());
+            let prefetch = async {
+                let walk = following?;
+                let listing = listing(ctx, spec, &walk, (flat, upper)).await.ok()?;
+                Some(Ahead { walk, listing })
+            };
+            let import = import_page(ctx, spec, (slot, turn), checkpoint, next, rows, page);
+            let (imported, fetched) = tokio::join!(import, prefetch);
+            if imported.is_ok() {
+                *ahead = fetched;
+            }
+            imported
+        }
         StagingStrategy::Snapshot | StagingStrategy::Sync => {
             snapshot_page(ctx, spec, checkpoint, next, rows).await
         }
     }
+}
+
+/// A listing made ahead for the walk position it was made for.
+pub(super) struct Ahead {
+    walk: StagingWalk,
+    listing: Listing,
+}
+
+/// What one listing of a walk position found.
+enum Listing {
+    /// No coordinated range of the walk is left.
+    Done,
+    Page(Option<Segment>, Result<ListStagingResult, ItemFailure>),
+}
+
+/// Lists the page at `walk`; a flat walk into a distributed bucket lists only the key ranges
+/// this node coordinates.
+async fn listing(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    walk: &StagingWalk,
+    (flat, upper): (bool, Option<&str>),
+) -> Result<Listing, PageFailure> {
+    let segment = match (flat, walk.queue_row) {
+        (true, None) => match segment_of(ctx, spec, walk, upper).await? {
+            Bounds::Whole => None,
+            Bounds::Segment(segment) => Some(segment),
+            Bounds::Done => return Ok(Listing::Done),
+        },
+        _ => None,
+    };
+    let mut page = list_page(ctx, spec, walk, (flat, segment.as_ref())).await;
+    // A flat reference walk is an ordered stream, so its next pages join the same transaction.
+    let gathers = flat && walk.queue_row.is_none() && spec.checksum_manifest.is_none();
+    let gathers = gathers && spec.strategy == StagingStrategy::Reference;
+    while gathers && let Ok(listed) = &mut page {
+        let bytes: usize = (listed.entries.iter()).map(|entry| entry.path.len()).sum();
+        let full = listed.entries.len() + STAGING_PAGE_SIZE > COMMIT_ENTRIES;
+        let Some(cursor) = listed.next_cursor.clone().filter(|_| !full) else {
+            break;
+        };
+        if bytes > COMMIT_PATH_BYTES {
+            break;
+        }
+        let next = StagingWalk {
+            cursor: Some(cursor),
+            ..walk.clone()
+        };
+        // A failed listing ends the gathered page; the walk lists it again from its cursor.
+        let Ok(more) = list_page(ctx, spec, &next, (flat, segment.as_ref())).await else {
+            break;
+        };
+        if (more.connector != listed.connector)
+            || more.secret_fingerprint != listed.secret_fingerprint
+        {
+            break;
+        }
+        listed.entries.extend(more.entries);
+        listed.next_cursor = more.next_cursor;
+    }
+    Ok(Listing::Page(segment, page))
 }
 
 /// What one listing page adds: files to stage and the job's queue changes.
@@ -328,12 +423,38 @@ pub(super) async fn commit_rows(
     writes: Vec<(KeySpace, Key, Value)>,
     deletes: Vec<(KeySpace, Key)>,
 ) -> Result<(), PageFailure> {
-    persist_rows(ctx, &next, writes, deletes)
+    commit_slot(ctx, None, checkpoint, next, writes, deletes).await
+}
+
+async fn commit_slot(
+    ctx: &JobContext,
+    slot: Option<u64>,
+    checkpoint: &mut StagingJobCheckpoint,
+    next: StagingJobCheckpoint,
+    writes: Vec<(KeySpace, Key, Value)>,
+    deletes: Vec<(KeySpace, Key)>,
+) -> Result<(), PageFailure> {
+    persist_slot(ctx, slot, &next, writes, deletes)
         .await
         .map_err(PageFailure::Retry)?;
-    *checkpoint = next;
-    sync_progress(ctx, checkpoint);
+    committed(ctx, slot, checkpoint, next);
     Ok(())
+}
+
+/// Takes a committed checkpoint over; a lane adds its own progress to the job's.
+fn committed(
+    ctx: &JobContext,
+    slot: Option<u64>,
+    checkpoint: &mut StagingJobCheckpoint,
+    next: StagingJobCheckpoint,
+) {
+    let before = checkpoint.items_current;
+    *checkpoint = next;
+    match slot {
+        None => sync_progress(ctx, checkpoint),
+        Some(_) => (ctx.progress).advance(checkpoint.items_current.saturating_sub(before)),
+    }
+    ctx.progress.checkpoint();
 }
 
 async fn list_page(
@@ -405,6 +526,16 @@ pub(super) async fn coordinated(
     let Some(binding) = bucket.distribution.as_ref() else {
         return Ok(vec![true; keys.len()]);
     };
+    let ranges = local_ranges(ctx, binding, keys).await?;
+    Ok(ranges.iter().map(Option::is_some).collect())
+}
+
+/// The range of each of `keys` if this node coordinates it, else `None`.
+async fn local_ranges(
+    ctx: &JobContext,
+    binding: &DistributionBinding,
+    keys: &[&str],
+) -> Result<Vec<Option<Ulid>>, String> {
     let read = StorageEffect::BatchRead {
         reads: authority_reads(binding.set_id),
         txn_id: None,
@@ -412,11 +543,16 @@ pub(super) async fn coordinated(
     let event = ctx.driver.storage_handle.send_storage_effect(read).await;
     let (record, fence) = authority_rows(event).map_err(|error| error.to_string())?;
     let (record, fence) = (record.as_deref(), fence.as_deref());
-    (keys.iter())
-        .map(|key| match write_target(binding, key, record, fence) {
-            Ok(WriteRoute::Local { .. }) => Ok(true),
-            Ok(WriteRoute::Forward { .. }) => Ok(false),
-            Err(error) if error.moved_away() => Ok(false),
+    let routes = match write_targets(binding, keys.iter().copied(), record, fence) {
+        Ok(routes) => routes,
+        Err(error) if error.moved_away() => return Ok(vec![None; keys.len()]),
+        Err(error) => return Err(error.to_string()),
+    };
+    (routes.into_iter())
+        .map(|route| match route {
+            Ok(WriteRoute::Local { range_id, .. }) => Ok(Some(range_id)),
+            Ok(WriteRoute::Forward { .. }) => Ok(None),
+            Err(error) if error.moved_away() => Ok(None),
             Err(error) => Err(error.to_string()),
         })
         .collect()
@@ -498,11 +634,13 @@ fn next_segment(
     Bounds::Done
 }
 
-/// The bounds of the walk's next listing in a distributed destination.
+/// The bounds of the walk's next listing: the key ranges a distributed destination has this node
+/// coordinate, or the whole bucket, cut at a lane's exclusive `upper` target key.
 async fn segment_of(
     ctx: &JobContext,
     spec: &StagingJobSpec,
     walk: &StagingWalk,
+    upper: Option<&str>,
 ) -> Result<Bounds, PageFailure> {
     let bucket = match pinned_bucket(ctx, spec).await {
         Ok(bucket) => bucket,
@@ -514,7 +652,13 @@ async fn segment_of(
         ) => return Err(PageFailure::Permanent(message)),
     };
     let Some(binding) = bucket.distribution.as_ref() else {
-        return Ok(Bounds::Whole);
+        if upper.is_none() && walk.from.is_none() {
+            return Ok(Bounds::Whole);
+        }
+        return Ok(next_segment(
+            walk,
+            clamped(vec![(String::new(), None)], upper),
+        ));
     };
     let read = StorageEffect::BatchRead {
         reads: authority_reads(binding.set_id),
@@ -539,22 +683,84 @@ async fn segment_of(
             Err(error) => return Err(retry(error)),
         }
     }
-    Ok(next_segment(walk, coordinated))
+    Ok(next_segment(walk, clamped(coordinated, upper)))
 }
 
-/// The files of a page this node imports.
+/// Key ranges cut at a lane's exclusive upper target key; ranges left empty are dropped.
+fn clamped(
+    ranges: Vec<(String, Option<String>)>,
+    upper: Option<&str>,
+) -> Vec<(String, Option<String>)> {
+    let Some(upper) = upper else {
+        return ranges;
+    };
+    (ranges.into_iter())
+        .filter(|(lower, _)| lower.as_str() < upper)
+        .map(|(lower, end)| {
+            let end = match end {
+                Some(end) if end.as_str() < upper => end,
+                _ => upper.to_string(),
+            };
+            (lower, Some(end))
+        })
+        .collect()
+}
+
+/// The first source file at or after `lower` below the walk's path, listed alone.
+pub(super) async fn first_key(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    walk: &StagingWalk,
+    lower: &str,
+) -> Result<Option<String>, PageFailure> {
+    let listed = drive(
+        ListStagingOperation::new(ListStagingInput {
+            group_id: spec.group_id,
+            connector_id: spec.connector_id,
+            source_path: walk.source_path.clone(),
+            request: ListRequest {
+                cursor: None,
+                lower: Some(lower.to_string()),
+                stop: None,
+                limit: 1,
+                recursive: true,
+                files_only: true,
+            },
+        }),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| PageFailure::Retry(error.to_string()))?;
+    Ok(listed.entries.into_iter().next().map(|entry| entry.path))
+}
+
+/// The target key a source key below the walk's path maps to.
+pub(super) fn target_of(walk: &StagingWalk, source_key: &str) -> Option<String> {
+    let relative = relative_entry_path(&walk.source_path, source_key, true).ok()?;
+    Some(join_target_prefix(&walk.target_prefix, &relative))
+}
+
+/// The files of a page this node imports, and the set and range of each distributed one.
 async fn own_files(
     ctx: &JobContext,
     bucket: &BucketInfo,
     files: Vec<StagedFile>,
-) -> Result<Vec<StagedFile>, PageFailure> {
+) -> Result<(Vec<StagedFile>, BTreeSet<(Ulid, Ulid)>), PageFailure> {
+    let Some(binding) = bucket.distribution.as_ref() else {
+        return Ok((files, BTreeSet::new()));
+    };
     let keys: Vec<&str> = files.iter().map(|file| file.target_key.as_str()).collect();
-    let own = coordinated(ctx, bucket, &keys)
+    let ranges = local_ranges(ctx, binding, &keys)
         .await
         .map_err(PageFailure::Retry)?;
-    Ok((files.into_iter().zip(own))
-        .filter_map(|(file, own)| own.then_some(file))
-        .collect())
+    let mut turns = BTreeSet::new();
+    let files = (files.into_iter().zip(ranges))
+        .filter_map(|(file, range)| {
+            turns.insert((binding.set_id, range?));
+            Some(file)
+        })
+        .collect();
+    Ok((files, turns))
 }
 
 /// Registers a page's files as references with listing metadata, in one transaction with the
@@ -562,6 +768,7 @@ async fn own_files(
 async fn import_page(
     ctx: &JobContext,
     spec: &StagingJobSpec,
+    (slot, turn): (Option<u64>, Option<&Mutex<()>>),
     checkpoint: &mut StagingJobCheckpoint,
     mut next: StagingJobCheckpoint,
     rows: PageRows,
@@ -578,10 +785,13 @@ async fn import_page(
             return Err(PageFailure::Permanent(message));
         }
     };
-    let files = own_files(ctx, &bucket, rows.files).await?;
+    let (files, ranges) = own_files(ctx, &bucket, rows.files).await?;
     let mut entries = Vec::with_capacity(files.len());
+    // The submitter's rules are collected once per page and decide every file in memory.
+    let rules = access_rules(ctx, spec).await.map_err(PageFailure::Retry)?;
     for file in files {
-        let observation = match check_access(ctx, spec, &file.source_path, &file.target_key).await {
+        let access = file_access(&rules, spec, &file.source_path, &file.target_key);
+        let observation = match access {
             Ok(()) => match file.observation {
                 Some(observation) => Ok(observation),
                 None => head_observation(ctx, spec, &file.source_path).await,
@@ -609,40 +819,92 @@ async fn import_page(
         (bucket.distribution.as_ref()).map(|binding| binding.set_id),
     )
     .await;
-    let result = drive(
-        PageImportOperation::new(PageImportInput {
-            job_id: ctx.job_id,
-            claim_token: ctx.claim_token,
-            realm_id: spec.auth_context.realm_id,
-            group_id: spec.group_id,
-            user_id: spec.auth_context.user_id,
-            auth_context: spec.auth_context.clone(),
-            node_id: spec.node_id,
-            bucket: spec.bucket.clone(),
-            expected_bucket: bucket,
-            connector: page.connector,
-            secret_fingerprint: page.secret_fingerprint,
-            entries,
-            checkpoint: next,
-            writes: rows.writes,
-            deletes: rows.deletes,
-            now: SystemTime::now(),
-            database,
-        }),
-        &ctx.driver,
-    )
-    .await;
+    let input = PageImportInput {
+        job_id: ctx.job_id,
+        claim_token: ctx.claim_token,
+        realm_id: spec.auth_context.realm_id,
+        group_id: spec.group_id,
+        user_id: spec.auth_context.user_id,
+        auth_context: spec.auth_context.clone(),
+        node_id: spec.node_id,
+        bucket: spec.bucket.clone(),
+        expected_bucket: bucket,
+        connector: page.connector,
+        secret_fingerprint: page.secret_fingerprint,
+        entries,
+        checkpoint: next,
+        checkpoint_key: checkpoint_key(ctx.job_id, slot),
+        writes: rows.writes,
+        deletes: rows.deletes,
+        now: SystemTime::now(),
+        database,
+        ranges: None,
+    };
+    let result = {
+        // Listing and the reads above run in parallel; the page transactions take turns.
+        let _turn = match turn {
+            Some(turn) => Some(turn.lock().await),
+            None => None,
+        };
+        let run = |input| drive(PageImportOperation::new(input), &ctx.driver);
+        retry_page(ctx, (input, &ranges), run).await
+    };
     match result {
         Ok(result) => {
-            *checkpoint = result.checkpoint;
-            sync_progress(ctx, checkpoint);
+            committed(ctx, slot, checkpoint, result.checkpoint);
             Ok(())
         }
         Err(error @ (PageImportError::BucketChanged | PageImportError::TooManyBytes(_))) => {
             Err(PageFailure::Permanent(error.to_string()))
         }
-        // A changed connector, a lost claim or a conflict replays the page from its cursor.
+        Err(error @ PageImportError::Storage(StorageError::TransactionConflict)) => {
+            Err(PageFailure::Conflict(error.to_string()))
+        }
+        // A changed connector or a lost claim replays the page from its cursor.
         Err(error) => Err(PageFailure::Retry(error.to_string())),
+    }
+}
+
+/// Runs the page transaction of `input` in the turns of `ranges`, again while its commit
+/// conflicts or its ranges moved, at most [`PAGE_ATTEMPTS`] times. Each run is a new
+/// transaction that checks every guard again.
+pub(super) async fn retry_page<R, F>(
+    ctx: &JobContext,
+    (mut input, ranges): (PageImportInput, &BTreeSet<(Ulid, Ulid)>),
+    mut run: R,
+) -> Result<PageImportResult, PageImportError>
+where
+    R: FnMut(PageImportInput) -> F,
+    F: Future<Output = Result<PageImportResult, PageImportError>>,
+{
+    // Pages of other jobs into these ranges wait here instead of conflicting on their rows.
+    let mut turns = ctx.range_turns.take(ranges).await;
+    let set_id = ranges.first().map(|(set_id, _)| *set_id);
+    input.ranges = set_id.map(|_| ranges.iter().map(|(_, range)| *range).collect());
+    let mut attempts = 1;
+    loop {
+        let result = run(input.clone()).await;
+        if let (Err(PageImportError::RangesMoved(moved)), Some(set_id)) = (&result, set_id)
+            && attempts < PAGE_ATTEMPTS
+        {
+            // A range split or merged meanwhile: the page runs again in the turns of the new ones.
+            drop(turns);
+            let moved_turns = moved.iter().map(|range| (set_id, *range)).collect();
+            turns = ctx.range_turns.take(&moved_turns).await;
+            input.ranges = Some(moved.clone());
+            attempts += 1;
+            continue;
+        }
+        let conflict = PageImportError::Storage(StorageError::TransactionConflict);
+        if result.as_ref().err() != Some(&conflict) || attempts >= PAGE_ATTEMPTS {
+            return result;
+        }
+        tokio::select! {
+            _ = ctx.cancel.cancelled() => return result,
+            _ = ctx.shutdown.cancelled() => return result,
+            _ = tokio::time::sleep(CONFLICT_PAUSE * attempts) => {}
+        }
+        attempts += 1;
     }
 }
 
@@ -664,7 +926,7 @@ async fn snapshot_page(
             | ItemFailure::Lasting(message),
         ) => return Err(PageFailure::Permanent(message)),
     };
-    for file in own_files(ctx, &bucket, rows.files).await? {
+    for file in own_files(ctx, &bucket, rows.files).await?.0 {
         if ctx.cancel.is_cancelled() || ctx.shutdown.is_cancelled() {
             return Ok(());
         }
@@ -740,6 +1002,25 @@ pub(super) async fn check_access(
     source_path: &str,
     target_key: &str,
 ) -> Result<(), ItemFailure> {
+    let rules = access_rules(ctx, spec).await.map_err(ItemFailure::System)?;
+    file_access(&rules, spec, source_path, target_key)
+}
+
+/// The submitter's permission rules in the job's group, which holds the source and target paths.
+async fn access_rules(ctx: &JobContext, spec: &StagingJobSpec) -> Result<PermissionRules, String> {
+    let root = source_permission_path(spec, "");
+    permission_rules(&ctx.driver, &spec.auth_context, &root)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// READ on the source file and WRITE on the destination key, decided as a single check would.
+fn file_access(
+    rules: &PermissionRules,
+    spec: &StagingJobSpec,
+    source_path: &str,
+    target_key: &str,
+) -> Result<(), ItemFailure> {
     let source_path = source_permission_path(spec, source_path);
     let target_path = object_permission_path(
         spec.auth_context.realm_id,
@@ -748,25 +1029,12 @@ pub(super) async fn check_access(
         &spec.bucket,
         target_key,
     );
-    for (path, required_permission) in [
-        (source_path, Permission::READ),
-        (target_path, Permission::WRITE),
-    ] {
-        let allowed = drive(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: spec.auth_context.clone(),
-                path,
-                required_permission,
-            }),
-            &ctx.driver,
-        )
-        .await
-        .map_err(|error| ItemFailure::System(error.to_string()))?;
-        if !allowed {
-            return Err(ItemFailure::Denied("permission denied".to_string()));
-        }
+    let allowed = rules.allows(&source_path, &Permission::READ)
+        && rules.allows(&target_path, &Permission::WRITE);
+    match allowed {
+        true => Ok(()),
+        false => Err(ItemFailure::Denied("permission denied".to_string())),
     }
-    Ok(())
 }
 
 enum MappedEntry {

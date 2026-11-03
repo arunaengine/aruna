@@ -21,7 +21,7 @@ use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained, v
 use crate::structs::identity::auth::Actor;
 use crate::structs::identity::realm::{
     MetadataReplicationConfig, OidcProviderConfig, QuotaConfig, RealmConfigDocument,
-    RealmDiscoveryConfig, RealmId, RealmNodeKind,
+    RealmDiscoveryConfig, RealmId, RealmNodeKind, ReplicaQuota,
 };
 use crate::structs::placement::compute_config::RealmComputeConfig;
 use crate::structs::placement::record::{

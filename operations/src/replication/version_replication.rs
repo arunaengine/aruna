@@ -23,6 +23,8 @@ use crate::replication::protocol::{
     MaterializedBlobInfo, MultipartObjectMetadata, ReferenceAdvance, ReplicationMode, SyncOrigin,
     VersionReplicationManifest, VersionReplicationMessage, VersionReplicationRequest,
 };
+use crate::staging::root_record::{hydrated, named_root, parse_root, read_root};
+use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
@@ -1130,6 +1132,9 @@ impl ReplicateObjectError {
 enum ReplicateObjectState {
     Init,
     ReadVersion,
+    /// Reads the root record a stored compact binding names: a version leaves with its root's
+    /// settings, since another node reads the source through its own connector of the root.
+    ReadSourceRoot,
     ReadBlobLocation,
     CheckManagedCopy,
     ResolveReferenceAccess,
@@ -1172,6 +1177,8 @@ pub struct ReplicateObjectOperation {
     request: VersionReplicationRequest,
     state: ReplicateObjectState,
     pending_materialized_version: Option<PendingMaterializedVersion>,
+    /// A version read with a compact binding, while its root record is read.
+    compact_version: Option<BlobVersion>,
     replication_version: Option<ReplicationVersion>,
     multipart_summary: Option<MultipartObjectSummary>,
     multipart_parts: Vec<MultipartObjectPart>,
@@ -1233,6 +1240,7 @@ impl ReplicateObjectOperation {
             request,
             state: ReplicateObjectState::Init,
             pending_materialized_version: None,
+            compact_version: None,
             replication_version: None,
             multipart_summary: None,
             multipart_parts: Vec::new(),
@@ -1304,6 +1312,7 @@ impl ReplicateObjectOperation {
         match self.state {
             ReplicateObjectState::Init => "Init",
             ReplicateObjectState::ReadVersion => "ReadVersion",
+            ReplicateObjectState::ReadSourceRoot => "ReadSourceRoot",
             ReplicateObjectState::ReadBlobLocation => "ReadBlobLocation",
             ReplicateObjectState::CheckManagedCopy => "CheckManagedCopy",
             ReplicateObjectState::ResolveReferenceAccess => "ResolveReferenceAccess",
@@ -2191,6 +2200,7 @@ impl ReplicateObjectOperation {
                 capabilities: Vec::new(),
                 origin_node_id: Some(sync.source_node_id),
                 namespace: None,
+                root: None,
             },
             connector_id: None,
         }
@@ -2307,6 +2317,7 @@ impl Operation for ReplicateObjectOperation {
             // Manifest preparation: read the version and materialize references.
             ReplicateObjectState::Init => self.read_version(),
             ReplicateObjectState::ReadVersion => self.accept_version_read(event),
+            ReplicateObjectState::ReadSourceRoot => self.accept_root_read(event),
             ReplicateObjectState::ReadBlobLocation => self.accept_blob_location(event),
             ReplicateObjectState::CheckManagedCopy => self.accept_managed_copy(event),
             ReplicateObjectState::ResolveReferenceAccess => self.accept_reference_access(event),
@@ -2397,6 +2408,31 @@ impl ReplicateObjectOperation {
             Ok(version) => version,
             Err(err) => return self.fail(err.into()),
         };
+        if let Some(digest) = named_root(&version) {
+            self.compact_version = Some(version);
+            self.state = ReplicateObjectState::ReadSourceRoot;
+            return smallvec![Effect::Storage(read_root(digest, None))];
+        }
+        self.take_version(version)
+    }
+
+    fn accept_root_read(&mut self, event: Event) -> Effects {
+        let Some(version) = self.compact_version.take() else {
+            return self.fail(ReplicateObjectError::VersionNotFound);
+        };
+        let root = match parse_root(event) {
+            Ok(Some(root)) => root,
+            Ok(None) => return self.fail(ReplicateObjectError::UnresolvedReferenceVersion),
+            Err(StorageReadError::Storage(error)) => return self.fail(error.into()),
+            Err(StorageReadError::Conversion(error)) => return self.fail(error.into()),
+        };
+        match hydrated(version, &root) {
+            Ok(version) => self.take_version(version),
+            Err(_) => self.fail(ReplicateObjectError::UnresolvedReferenceVersion),
+        }
+    }
+
+    fn take_version(&mut self, version: BlobVersion) -> Effects {
         let is_materialized = version.is_materialized();
         let is_deleted = version.is_deleted();
         let has_source_binding = version.source_binding().is_some();
@@ -3402,6 +3438,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
                 namespace: None,
+                root: None,
             },
             connector_id: Some(Ulid::from_bytes([9u8; 16])),
         }
@@ -4132,6 +4169,39 @@ mod tests {
         assert_eq!(manifest.reference_advance, Some(advance));
     }
 
+    // A version stored compact leaves with its root's settings: its root record is read first.
+    #[test]
+    fn compact_version_hydrated() {
+        use aruna_core::keyspaces::ROOT_RECORD_KEYSPACE;
+        use aruna_core::structs::storage::distribution::source_root::RootEntry;
+        let full = reference_source_binding();
+        let (compact, root) = RootEntry::compact(&full).unwrap().unwrap();
+        let (now, user) = (SystemTime::now(), test_user_id());
+        let stored = BlobVersion::reference(compact, reference_cached_metadata(), now, user, now);
+        let mut op = ReplicateObjectOperation::new(version_request(Ulid::generate()))
+            .with_sync(reference_sync());
+        op.start();
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(stored.to_bytes().unwrap().into()),
+        }));
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected the root read, got {effects:?}");
+        };
+        assert_eq!(key_space, ROOT_RECORD_KEYSPACE);
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![2u8].into(),
+            value: Some(root.to_bytes().unwrap().into()),
+        }));
+
+        let Some(ReplicationVersion::Reference { source, .. }) = op.replication_version.as_ref()
+        else {
+            panic!("the reference must be kept for its manifest");
+        };
+        assert_eq!(source, &full);
+    }
+
     // Normal reference replication carries the stored cap, so repair and snapshot
     // transfers cannot hand the target a fresh advance budget.
     #[test]
@@ -4475,6 +4545,61 @@ mod tests {
         let mut expected = reference_source_binding();
         expected.connector_id = None;
         assert_eq!(source, expected);
+    }
+
+    #[test]
+    fn page_matches_single() {
+        // A reference page carries exactly the manifest a single delivery of the job sends.
+        use crate::replication::page::build::reference_manifest;
+        use crate::replication::queue::BlobJobRecord;
+        use aruna_core::structs::storage::distribution::OriginalEpoch;
+        let version_id = Ulid::generate();
+        let publication = Publication {
+            set_id: Ulid::from_bytes([4; 16]),
+            range_id: Ulid::from_bytes([5; 16]),
+            revision: 3,
+            epoch: aruna_core::structs::storage::distribution::PublicationEpoch(2),
+            member_id: Ulid::from_bytes([6; 16]),
+            incarnation: 7,
+            bytes: true,
+        };
+        let request = request_with_mode(version_id, ReplicationMode::Live);
+        let input = ReplicateScopeInput {
+            bucket: request.bucket.clone(),
+            target: ReplicateScopeTarget::Version {
+                key: request.key.clone(),
+                version_id,
+            },
+            target_node_id: request.target_node_id,
+            auth_context: request.auth_context.clone(),
+            replicate_delete_markers: true,
+            mode: ReplicationMode::Live,
+        };
+        let local = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let scope = ReplicateScopeOperation::new(input.clone())
+            .with_distribution(publication.clone(), local);
+        let mut sync = scope.sync.clone().expect("a publication");
+        sync.target_prefix = Some(request.key.clone());
+        let version = reference_blob_version()
+            .with_epoch(OriginalEpoch(2))
+            .with_generation(4);
+        let head =
+            CurrentVersionPointer::new_with_generation(version_id, 4).with_epoch(OriginalEpoch(2));
+        let group_id = request.source_group_id;
+        let mut op = ReplicateObjectOperation::new(request).with_sync(sync);
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(version.to_bytes().unwrap().into()),
+        }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![2u8].into(),
+            value: Some(head.to_bytes().unwrap().into()),
+        }));
+        let single = op.manifest.expect("manifest built");
+        let job = BlobJobRecord::new(input, Some(false), 0);
+        let paged = reference_manifest(&job, version, Some(&head), group_id, &publication);
+        assert_eq!(paged, Some(single));
     }
 
     #[test]

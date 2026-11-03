@@ -790,3 +790,54 @@ async fn database_owner_checked() {
         "{outcome:?}"
     );
 }
+
+#[tokio::test]
+async fn record_marks_share() {
+    // A record installs with its bound member's share marker, so that node's quota gate stops
+    // deducting a replica share the new coordination may have shrunk before the next publish.
+    use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::storage::usage::dirty_share_key;
+    let (_dir, storage) = test_storage();
+    realm_nodes(&storage).await;
+    let group = Ulid::from_parts(845, 1);
+    let marker = || {
+        let key = dirty_share_key(group).into();
+        storage_read_from(&storage, NODE_STATS_KEYSPACE.to_string(), key)
+    };
+    let first = created();
+    let accepted = receive(&storage, published(PUBLISHER, first.clone(), PUBLISHER)).await;
+    assert_eq!(accepted, AdminEventValidation::Accepted);
+    assert!(
+        marker().await.unwrap().is_none(),
+        "no bound bucket, no marker"
+    );
+
+    let info = BucketInfo {
+        group_id: group,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Default::default(),
+        distribution: Some(DistributionBinding {
+            set_id: root().set_id(),
+            member_id: Ulid::from_parts(843, 2),
+            incarnation: 6,
+            revision: Default::default(),
+        }),
+    };
+    let row = (
+        S3_BUCKET_KEYSPACE.to_string(),
+        b"spire".to_vec().into(),
+        info.to_bytes().unwrap().into(),
+    );
+    batch_write_to(&storage, vec![row]).await.unwrap();
+    let second = admitted(&first, MEMBER);
+    let accepted = receive(&storage, published(PUBLISHER, second, PUBLISHER)).await;
+    assert_eq!(accepted, AdminEventValidation::Accepted);
+    assert!(marker().await.unwrap().is_some());
+}

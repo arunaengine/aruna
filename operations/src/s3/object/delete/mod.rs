@@ -10,7 +10,7 @@ use crate::blob::records::{
 };
 use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
-    AddedVersion, InventoryChange, stamp_head, stamp_version, version_written,
+    AddedVersion, HeadChange, InventoryChange, stamp_head, stamp_version, version_written,
 };
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
@@ -238,6 +238,8 @@ pub struct DeleteObjectOperation {
     /// The member binding a set deletion or range reclaim purges under; only then may a
     /// version of a distributed bucket be deleted.
     purge: Option<DistributionBinding>,
+    /// A range purge also takes the version out of the set's inventory and range counters.
+    inventory: bool,
 }
 
 impl DeleteObjectOperation {
@@ -278,6 +280,7 @@ impl DeleteObjectOperation {
             marker_head: None,
             marker_epoch: OriginalEpoch::default(),
             purge: None,
+            inventory: false,
         }
     }
 
@@ -285,6 +288,13 @@ impl DeleteObjectOperation {
     /// read in the delete transaction and must still carry that set, member and incarnation.
     pub fn purging(mut self, binding: DistributionBinding) -> Self {
         self.purge = Some(binding);
+        self
+    }
+
+    /// Also takes the purged version, and the key's head with it, out of the set's inventory and
+    /// range counters in the delete's transaction, so both counters move together.
+    pub fn in_inventory(mut self) -> Self {
+        self.inventory = true;
         self
     }
 
@@ -1018,9 +1028,10 @@ impl DeleteObjectOperation {
             (Some(_), Some(_)) => RowChange::RemovedVersion,
             (Some(_), None) => RowChange::Kept,
         };
+        let inventory = self.marker_inventory().or_else(|| self.purged_inventory());
         let mut update = UsageCounterUpdate::for_group(self.input.group_id, delta)
             .in_bucket(&self.input.bucket, row)
-            .with_inventory(self.marker_inventory());
+            .with_inventory(inventory);
         if update.is_noop() {
             return self.write_delete_audit();
         }
@@ -1052,6 +1063,21 @@ impl DeleteObjectOperation {
             },
         };
         version_written(self.binding.as_ref(), &self.input.key, added, true)
+    }
+
+    /// A purged version leaves the inventory; the key's head goes with the version it names.
+    fn purged_inventory(&self) -> Option<InventoryChange> {
+        let binding = self.purge.as_ref().filter(|_| self.inventory)?;
+        let target = self.target_version.as_ref()?;
+        let mut change = InventoryChange::new(binding.set_id, self.input.key.clone());
+        change.removed.push(target.version_id);
+        let pointer = self.existing_pointer.as_ref();
+        if pointer.is_some_and(|pointer| pointer.version_id == target.version_id) {
+            change.head = HeadChange::Remove;
+        }
+        // The purged range's search index is dropped with it.
+        change.feed = false;
+        Some(change)
     }
 
     fn handle_usage_update(&mut self, event: Event) -> Effects {

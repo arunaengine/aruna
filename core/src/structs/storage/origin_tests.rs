@@ -124,6 +124,7 @@ fn source_url_joins() {
         namespace: None,
         capabilities: Vec::new(),
         origin_node_id: None,
+        root: None,
     };
     assert_eq!(
         public_source_url(&descriptor).as_deref(),
@@ -152,6 +153,7 @@ fn signed_source_unpublished() {
         namespace: None,
         capabilities: Vec::new(),
         origin_node_id: None,
+        root: None,
     };
     assert!(!publishable(&descriptor));
     (descriptor.public_config).insert("skip_signature".to_string(), "true".to_string());
