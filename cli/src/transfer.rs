@@ -30,6 +30,9 @@ pub struct S3Session {
     pub session_token: String,
     pub expires_at: String,
     pub issuer_node: Issuer,
+    /// Set only for a path-restricted token, which can neither refresh nor revoke the session.
+    #[serde(default)]
+    pub restrictions: Vec<serde_json::Value>,
     #[serde(default)]
     pub endpoint: String,
 }
@@ -120,7 +123,11 @@ async fn node_endpoint(
 }
 
 /// Revokes a session; a failure only warns, as the session ends at its expiry anyway.
+/// A path-restricted token may not revoke, so its session is left to expire.
 pub async fn revoke_session(api: &Api, session: &S3Session) {
+    if !session.restrictions.is_empty() {
+        return;
+    }
     let path = format!("access/s3/sessions/{}", session.access_key_id);
     if let Err(error) = api.delete(&path).await {
         eprintln!(
@@ -197,6 +204,9 @@ impl S3Access {
         if !expires_within(&session.expires_at, now, REFRESH_BEFORE) {
             return Ok(self.client.clone());
         }
+        if !session.restrictions.is_empty() {
+            return Err(cannot_refresh(&session.expires_at));
+        }
         let path = format!("access/s3/sessions/{}/refresh", session.access_key_id);
         match self
             .api
@@ -221,6 +231,13 @@ impl S3Access {
             revoke_session(&self.api, session).await;
         }
     }
+}
+
+fn cannot_refresh(expires_at: &str) -> CliError {
+    CliError::usage(format!(
+        "the S3 session expires at {expires_at} and a path-restricted token cannot refresh it; \
+         rerun to continue, or sign in with an unrestricted token for longer transfers"
+    ))
 }
 
 /// Whether an RFC 3339 expiry is less than `margin` away; an unreadable one never expires.
@@ -682,6 +699,31 @@ mod tests {
         assert!(expires_within("2026-11-03T11:59:00Z", now, REFRESH_BEFORE));
         assert!(!expires_within("2026-11-03T12:30:00Z", now, REFRESH_BEFORE));
         assert!(!expires_within("not a time", now, REFRESH_BEFORE));
+    }
+
+    #[tokio::test]
+    async fn refuses_restricted_refresh() {
+        let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
+        let session = S3Session {
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+            session_token: "token".into(),
+            expires_at: soon.to_rfc3339(),
+            issuer_node: Issuer {
+                node_id: "node".into(),
+                s3_endpoint: None,
+            },
+            restrictions: vec![serde_json::json!({ "pattern": "/r/g/*", "permission": "READ" })],
+            endpoint: "http://127.0.0.1:1".into(),
+        };
+        // The refusal comes before any request, so the unreachable API is never called.
+        let mut access = S3Access {
+            api: Api::new("http://127.0.0.1:1", None).unwrap(),
+            client: s3_client(&session),
+            session: Some(session),
+        };
+        let error = access.client().await.unwrap_err();
+        assert!(error.to_string().contains("cannot refresh"), "{error}");
     }
 
     #[test]
