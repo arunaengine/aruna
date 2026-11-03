@@ -1,5 +1,5 @@
-//! A read-only OpenDAL service for a local folder that never follows a symlink below its root.
-//! Listings come sorted by key, so a recursive listing can resume with `start_after`.
+//! An OpenDAL service for a local folder that never follows a symlink below its root. Writes
+//! are refused unless enabled. Listings come sorted by key, so they can resume with `start_after`.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,8 +8,8 @@ use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use opendal::raw::{
-    OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite, RpCreateDir,
-    RpPresign, RpRename, RpStat, Service, ServiceInfo, Timestamp, new_std_io_error,
+    OpCopy, OpCreateDir, OpDelete, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite,
+    RpCreateDir, RpPresign, RpRename, RpStat, Service, ServiceInfo, Timestamp, new_std_io_error,
     new_task_join_error, oio,
 };
 use opendal::{
@@ -19,8 +19,10 @@ use opendal::{
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::File;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use ulid::Ulid;
 
 /// Decides whether a path below the root may be listed, stated or read. Folder paths end with
 /// `/`. Every folder on the way to an entry is asked too, so a refused folder hides its content.
@@ -28,11 +30,18 @@ pub type PathFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 const SCHEME: &str = "local-fs";
 
+/// Names of files a write fills before it renames them into place. Listings leave them out.
+const TEMP_PREFIX: &str = ".aruna-write-";
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct LocalFsConfig {
     /// Folder the service serves. It may itself be a symlink; nothing below it is followed.
     pub root: Option<String>,
+    /// Folder below `root` that is served instead, as names each ended by `/`.
+    pub folder: Option<String>,
+    /// Allows writes, folder creation and deletes.
+    pub writable: bool,
 }
 
 impl Configurator for LocalFsConfig {
@@ -71,6 +80,16 @@ impl LocalFsBuilder {
         self.filter = Some(filter);
         self
     }
+
+    pub fn folder(mut self, folder: &str) -> Self {
+        self.config.folder = Some(folder.to_string());
+        self
+    }
+
+    pub fn writable(mut self, writable: bool) -> Self {
+        self.config.writable = writable;
+        self
+    }
 }
 
 impl Builder for LocalFsBuilder {
@@ -83,9 +102,14 @@ impl Builder for LocalFsBuilder {
             .root
             .filter(|root| !root.is_empty())
             .ok_or_else(|| Error::new(ErrorKind::ConfigInvalid, "root is not specified"))?;
+        let folder = self.config.folder.unwrap_or_default();
+        let base = path_parts(&folder)
+            .map_err(|_| Error::new(ErrorKind::ConfigInvalid, "folder is not a plain path"))?;
         Ok(LocalFs {
             core: Arc::new(Core {
                 root: PathBuf::from(root),
+                base: base.into_iter().map(str::to_string).collect(),
+                writable: self.config.writable,
                 filter: self.filter,
             }),
         })
@@ -94,6 +118,9 @@ impl Builder for LocalFsBuilder {
 
 struct Core {
     root: PathBuf,
+    /// The names of the served folder below `root`.
+    base: Vec<String>,
+    writable: bool,
     filter: Option<PathFilter>,
 }
 
@@ -102,11 +129,22 @@ impl Core {
         self.filter.as_ref().is_none_or(|filter| filter(key))
     }
 
-    /// Opens the folder `parts` names, one level at a time relative to the level above, so
-    /// no symlink is followed even if a folder is swapped while it is walked.
     fn open_folder(&self, parts: &[&str]) -> Result<Dir> {
-        let mut folder =
-            Dir::open_ambient_dir(&self.root, ambient_authority()).map_err(io_error)?;
+        self.walk(parts, false)
+    }
+
+    /// Opens the folder `parts` names, one level at a time relative to the level above, so
+    /// no symlink is followed even if a folder is swapped while it is walked. `create` makes
+    /// missing folders below the served one.
+    fn walk(&self, parts: &[&str], create: bool) -> Result<Dir> {
+        let opened = Dir::open_ambient_dir(&self.root, ambient_authority());
+        let mut folder = opened.map_err(|error| match absent(&error) {
+            true => gone(),
+            false => io_error(error),
+        })?;
+        for part in &self.base {
+            folder = open_child(&folder, part)?.ok_or_else(gone)?;
+        }
         let mut key = String::new();
         for part in parts {
             key.push_str(part);
@@ -114,9 +152,49 @@ impl Core {
             if !self.allowed(&key) {
                 return Err(refused(&key));
             }
+            if create {
+                match folder.create_dir(part) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(io_error(error)),
+                }
+            }
             folder = open_child(&folder, part)?.ok_or_else(|| missing(&key))?;
         }
         Ok(folder)
+    }
+
+    /// The folder that holds the file `path` names, and the file's name.
+    fn parent_of<'a>(&self, path: &'a str, create: bool) -> Result<(Dir, &'a str)> {
+        let parts = path_parts(path)?;
+        let Some((name, folders)) = parts.split_last().filter(|_| !path.ends_with('/')) else {
+            return Err(missing(path));
+        };
+        let key = parts.join("/");
+        if !self.allowed(&key) {
+            return Err(refused(&key));
+        }
+        Ok((self.walk(folders, create)?, name))
+    }
+
+    /// Removes the file `path` names, or the empty folder when it ends with `/`. Anything
+    /// else at the path, such as a symlink, counts as absent.
+    fn remove(&self, path: &str) -> Result<()> {
+        let (folder, name) = match self.parent_of(path.trim_end_matches('/'), false) {
+            Ok(found) => found,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let removed = match folder.symlink_metadata(name) {
+            Ok(entry) if entry.is_dir() && path.ends_with('/') => folder.remove_dir(name),
+            Ok(entry) if entry.is_file() && !path.ends_with('/') => folder.remove_file(name),
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        };
+        match removed {
+            Err(error) if !absent(&error) => Err(io_error(error)),
+            _ => Ok(()),
+        }
     }
 
     fn stat_path(&self, path: &str) -> Result<Metadata> {
@@ -174,7 +252,7 @@ impl Core {
     }
 }
 
-/// Serves a local folder read-only. See [`LocalFsBuilder`].
+/// Serves a local folder. See [`LocalFsBuilder`].
 #[derive(Clone)]
 pub struct LocalFs {
     core: Arc<Core>,
@@ -190,9 +268,9 @@ impl fmt::Debug for LocalFs {
 
 impl Service for LocalFs {
     type Reader = oio::PositionReader<FileReader>;
-    type Writer = ();
+    type Writer = FileWriter;
     type Lister = FolderLister;
-    type Deleter = ();
+    type Deleter = FileDeleter;
     type Copier = ();
     type Composer = ();
 
@@ -201,12 +279,19 @@ impl Service for LocalFs {
     }
 
     fn capability(&self) -> Capability {
+        let writable = self.core.writable;
         Capability {
             stat: true,
             read: true,
             list: true,
             list_with_recursive: true,
             list_with_start_after: true,
+            write: writable,
+            write_can_empty: writable,
+            write_can_multi: writable,
+            write_with_if_not_exists: writable,
+            create_dir: writable,
+            delete: writable,
             shared: true,
             ..Default::default()
         }
@@ -215,10 +300,15 @@ impl Service for LocalFs {
     async fn create_dir(
         &self,
         _: &OperationContext,
-        _: &str,
+        path: &str,
         _: OpCreateDir,
     ) -> Result<RpCreateDir> {
-        Err(read_only())
+        if !self.core.writable {
+            return Err(read_only());
+        }
+        let (core, path) = (self.core.clone(), path.to_string());
+        blocking(move || core.walk(&path_parts(&path)?, true).map(|_| ())).await?;
+        Ok(RpCreateDir::default())
     }
 
     async fn stat(&self, _: &OperationContext, path: &str, _: OpStat) -> Result<RpStat> {
@@ -235,12 +325,25 @@ impl Service for LocalFs {
         }))
     }
 
-    fn write(&self, _: &OperationContext, _: &str, _: OpWrite) -> Result<Self::Writer> {
-        Err(read_only())
+    fn write(&self, _: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
+        if !self.core.writable {
+            return Err(read_only());
+        }
+        Ok(FileWriter {
+            core: self.core.clone(),
+            path: path.to_string(),
+            if_not_exists: args.if_not_exists(),
+            spool: None,
+        })
     }
 
     fn delete(&self, _: &OperationContext) -> Result<Self::Deleter> {
-        Err(read_only())
+        if !self.core.writable {
+            return Err(read_only());
+        }
+        Ok(FileDeleter {
+            core: self.core.clone(),
+        })
     }
 
     fn list(&self, _: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
@@ -298,6 +401,141 @@ impl oio::PositionRead for FileReader {
         })
         .await?;
         Ok(Buffer::from(Bytes::from(bytes)))
+    }
+}
+
+/// A file a write fills next to its target, in the target's folder.
+struct Spool {
+    folder: Dir,
+    name: String,
+    temp: String,
+    file: File,
+    size: u64,
+}
+
+impl Spool {
+    fn open(core: &Core, path: &str) -> Result<Self> {
+        let (folder, name) = core.parent_of(path, true)?;
+        let temp = format!("{TEMP_PREFIX}{}", Ulid::generate());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).follow(FollowSymlinks::No);
+        let file = folder.open_with(&temp, &options).map_err(io_error)?;
+        Ok(Self {
+            name: name.to_string(),
+            folder,
+            temp,
+            file: file.into_std(),
+            size: 0,
+        })
+    }
+
+    /// Removes the temporary file and answers `error`.
+    fn discard(self, error: Error) -> Error {
+        drop(self.file);
+        remove_temp(&self.folder, &self.temp);
+        error
+    }
+
+    /// Moves the written file into place. A create-only write links it, which fails when the
+    /// target exists, also on NFS; any other renames it over the target.
+    fn publish(self, if_not_exists: bool) -> Result<u64> {
+        if let Err(error) = self.file.sync_all() {
+            return Err(self.discard(new_std_io_error(error)));
+        }
+        drop(self.file);
+        let (folder, temp, name) = (&self.folder, self.temp.as_str(), self.name.as_str());
+        let placed = match if_not_exists {
+            true => folder.hard_link(temp, folder, name),
+            false => folder.rename(temp, folder, name),
+        };
+        // After a rename nothing is left at the temporary name; after a link it must go.
+        if if_not_exists || placed.is_err() {
+            remove_temp(folder, temp);
+        }
+        match placed {
+            Ok(()) => Ok(self.size),
+            Err(error) if if_not_exists && error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(Error::new(ErrorKind::ConditionNotMatch, "the path is taken"))
+            }
+            Err(error) => Err(io_error(error)),
+        }
+    }
+}
+
+fn remove_temp(folder: &Dir, temp: &str) {
+    if let Err(error) = folder.remove_file(temp) {
+        tracing::warn!(%error, "a temporary file of a write stays");
+    }
+}
+
+/// Fills a temporary file and moves it into place on close, so a reader never sees a part.
+pub struct FileWriter {
+    core: Arc<Core>,
+    path: String,
+    if_not_exists: bool,
+    spool: Option<Spool>,
+}
+
+impl FileWriter {
+    async fn take_spool(&mut self) -> Result<Spool> {
+        if let Some(spool) = self.spool.take() {
+            return Ok(spool);
+        }
+        let (core, path) = (self.core.clone(), self.path.clone());
+        blocking(move || Spool::open(&core, &path)).await
+    }
+}
+
+impl oio::Write for FileWriter {
+    async fn write(&mut self, bs: Buffer) -> Result<()> {
+        let mut spool = self.take_spool().await?;
+        let spool = blocking(move || {
+            for chunk in bs {
+                if let Err(error) = spool.file.write_all(&chunk) {
+                    return Err(spool.discard(new_std_io_error(error)));
+                }
+                spool.size += chunk.len() as u64;
+            }
+            Ok(spool)
+        })
+        .await?;
+        self.spool = Some(spool);
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<Metadata> {
+        let spool = self.take_spool().await?;
+        let if_not_exists = self.if_not_exists;
+        let size = blocking(move || spool.publish(if_not_exists)).await?;
+        Ok(MetadataBuilder::file(size).build())
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        let Some(spool) = self.spool.take() else {
+            return Ok(());
+        };
+        blocking(move || {
+            drop(spool.file);
+            remove_temp(&spool.folder, &spool.temp);
+            Ok(())
+        })
+        .await
+    }
+}
+
+/// Deletes files and empty folders one by one.
+pub struct FileDeleter {
+    core: Arc<Core>,
+}
+
+impl oio::Delete for FileDeleter {
+    async fn delete(&mut self, path: &str, _: OpDelete) -> Result<()> {
+        let (core, path) = (self.core.clone(), path.to_string());
+        blocking(move || core.remove(&path)).await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -446,14 +684,17 @@ fn open_frame(parent: &Dir, name: &str, key: &str) -> Result<Option<Frame>> {
     }))
 }
 
-/// Regular files and folders of one folder, sorted by key. Symlinks, special files and names
-/// that are not UTF-8 are left out.
+/// Regular files and folders of one folder, sorted by key. Symlinks, special files, names
+/// that are not UTF-8 and the temporary files of writes are left out.
 fn read_folder(folder: &Dir, prefix: &str) -> Result<Vec<Child>> {
     let mut children = Vec::new();
     for entry in folder.entries().map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name();
-        let Some(name) = name.to_str().filter(|name| plain_name(name)) else {
+        let Some(name) = name
+            .to_str()
+            .filter(|name| plain_name(name) && !name.starts_with(TEMP_PREFIX))
+        else {
             continue;
         };
         let kind = match entry.file_type() {
@@ -555,6 +796,11 @@ fn refused(key: &str) -> Error {
         "the path filter refuses this path",
     )
     .with_context("path", key)
+}
+
+/// The served folder is missing, so nothing below it can be told apart from absent.
+fn gone() -> Error {
+    Error::new(ErrorKind::ConfigInvalid, "the served folder does not exist")
 }
 
 fn read_only() -> Error {
