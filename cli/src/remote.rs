@@ -145,15 +145,32 @@ pub async fn locate(
     bucket: &str,
     wanted: Option<&str>,
 ) -> Result<(Placement, Api), CliError> {
-    let page: BucketPage = api
-        .get(
-            "search/buckets",
-            &[("q", bucket.to_string()), ("limit", "50".to_string())],
-        )
-        .await?;
-    let placement = choose_node(bucket, &page, api.node_id.as_deref(), wanted)?;
+    let mut found = BucketPage::default();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut query = vec![("q", bucket.to_string()), ("limit", "50".to_string())];
+        query.extend(cursor.clone().map(|cursor| ("cursor", cursor)));
+        let page: BucketPage = api.get("search/buckets", &query).await?;
+        merge_page(&mut found, page, bucket);
+        // A node that keeps failing holds the cursor in place, which ends the search here.
+        match found.next_cursor.take() {
+            Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+            _ => break,
+        }
+    }
+    let placement = choose_node(bucket, &found, api.node_id.as_deref(), wanted)?;
     let node_api = api.for_node(&placement.node_id).await?;
     Ok((placement, node_api))
+}
+
+/// Adds a page's exact-name hits to `found` and keeps its cursor and worst failure count.
+fn merge_page(found: &mut BucketPage, page: BucketPage, bucket: &str) {
+    found
+        .hits
+        .extend(page.hits.into_iter().filter(|hit| hit.bucket == bucket));
+    found.nodes_queried = found.nodes_queried.max(page.nodes_queried);
+    found.nodes_failed = found.nodes_failed.max(page.nodes_failed);
+    found.next_cursor = page.next_cursor;
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -304,6 +321,25 @@ mod tests {
         page.nodes_failed = 1;
         let error = choose_node("data", &page, None, None).unwrap_err();
         assert!(error.to_string().contains("1 of 3 nodes"), "{error}");
+    }
+
+    #[test]
+    fn merges_later_pages() {
+        let mut found = BucketPage::default();
+        let mut first = page(vec![hit("a", None)]);
+        first.hits[0].bucket = "data-old".into();
+        first.next_cursor = Some("c1".into());
+        merge_page(&mut found, first, "data");
+        assert!(found.hits.is_empty());
+        assert_eq!(found.next_cursor.as_deref(), Some("c1"));
+        let mut second = page(vec![hit("b", None)]);
+        second.nodes_failed = 1;
+        merge_page(&mut found, second, "data");
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(found.nodes_failed, 1);
+        assert!(found.next_cursor.is_none());
+        let placement = choose_node("data", &found, None, None).unwrap();
+        assert_eq!(placement.node_id, "b");
     }
 
     #[test]
