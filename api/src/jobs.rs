@@ -95,7 +95,7 @@ impl JobRequestError {
             SubmitJobError::ActiveJobLimit { limit } => {
                 Self::Conflict(format!("active job limit of {limit} reached"))
             }
-            SubmitJobError::InvalidWorkspace(_) => Self::BadRequest,
+            SubmitJobError::InvalidWorkspace(reason) => Self::BadRequestMessage(reason),
             SubmitJobError::TooManyOutputs { limit } => {
                 Self::BadRequestMessage(format!("a job may declare at most {limit} outputs"))
             }

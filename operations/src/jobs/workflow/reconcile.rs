@@ -239,11 +239,12 @@ impl ExternalReconciler for ComputeReconciler {
                         reason: "walltime limit exceeded while unobserved".to_string(),
                     };
                 }
+                let cancel = CancellationToken::new();
                 let finalized = with_execution_heartbeat(
                     storage.clone(),
                     job_id,
                     token,
-                    CancellationToken::new(),
+                    cancel.clone(),
                     Box::pin(finalize_attempt(
                         &self.context,
                         job_id,
@@ -253,6 +254,7 @@ impl ExternalReconciler for ComputeReconciler {
                         &spec,
                         &bucket,
                         Ok(status),
+                        &cancel,
                     )),
                 )
                 .await;

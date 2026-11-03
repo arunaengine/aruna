@@ -19,7 +19,8 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, group_permission_path,
 };
-use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, ReleaseRef};
+use aruna_core::structs::storage::bucket_metadata::{CapturedDatabase, ReleaseRef};
+use aruna_core::structs::storage::dataset_description::DatasetDescription;
 use aruna_core::structs::storage::origin::{SourcePin, public_source_url, publishable};
 use aruna_core::structs::storage::read_grant::{GrantScope, ReadGrant};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -55,7 +56,7 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{AuthToken, WritePeerError};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::metadata::bucket_metadata;
+use crate::s3::bucket::metadata::{DescriptionError, bucket_metadata, dataset_description};
 use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
@@ -206,6 +207,10 @@ pub async fn serve_input_resolve(
             return Err(SubmissionRefusal::Unavailable);
         };
         captured.link = link;
+        // An input asked without a version is pinned to the one captured here.
+        let aruna_core::structs::execution::job::InputSource::S3 { version_id, .. } =
+            &mut input.source;
+        version_id.get_or_insert_with(|| captured.version_id.to_string());
         let answer = (input, captured);
         if !fits(&mut size, &answer) {
             if answers.is_empty() {
@@ -235,13 +240,24 @@ fn answers_input(
             .and_then(|v| Ulid::from_string(v).ok())
     };
     let InputSource::S3 { bucket, key, .. } = &asked.source;
+    // A source asked without a version is answered at the version captured there.
+    let same_source = |selection: &InputSelection| {
+        let InputSource::S3 {
+            bucket: answered,
+            key: answered_key,
+            ..
+        } = &selection.source;
+        answered == bucket
+            && answered_key == key
+            && pin(asked).is_none_or(|v| pin(selection) == Some(v))
+    };
     let source_kept = match &captured.link {
-        None => selection.source == asked.source,
+        None => same_source(selection),
         Some(link) => {
             link.node_id == node
                 && link.bucket == *bucket
                 && link.key == *key
-                && Some(link.version) == pin(asked)
+                && pin(asked).is_none_or(|version| link.version == version)
         }
     };
     source_kept
@@ -288,7 +304,7 @@ pub async fn submit_external_job(
     validate_execution(&mut spec, workspace_mode, workspace_bucket.as_deref())?;
     store_workspace(&mut spec, workspace_mode, workspace_bucket.clone())
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
-    ids::required_labels(&spec)
+    let labels = ids::required_labels(&spec)
         .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
     let (config, local) = local_view(context).await?;
     let scope = match idempotency_key {
@@ -307,6 +323,16 @@ pub async fn submit_external_job(
             input_pages: None,
         };
         return forward_device(context, request, &config, local, auth_token).await;
+    }
+    if !labels.is_empty() {
+        // Only a complete read of the advertisements proves that no executor carries a label.
+        let (documents, unread) = super::plan::advertisements(context, &config).await;
+        if let Some(label) = super::plan::missing_label(&documents, &labels).filter(|_| !unread) {
+            return Err(SubmitJobError::InvalidWorkspace(format!(
+                "no executor in the realm carries the label `{}={}`",
+                label.key, label.value
+            )));
+        }
     }
     pin_outputs(&mut spec, local);
     let (inputs, captured_inputs, output_policies) = resolve_inputs(
@@ -411,9 +437,9 @@ fn input_reference(bucket: &str, key: &str, version_id: Option<&str>) -> String 
     }
 }
 
-/// A reference version without a content hash, accepted only when GetObject can serve it at
-/// that exact version: a strong ETag on a source that enforces `If-Match` binds every range,
-/// recorded digests bind a whole read. Anything else is not materialized.
+/// A reference version without a content hash, served by GetObject while its source still
+/// matches the recorded observation: a strong ETag on a source that enforces `If-Match` binds
+/// every range, so only that input may be mounted. Anything else is not materialized.
 fn reference_content(
     reference: &str,
     head: &crate::s3::object::head::HeadObjectResult,
@@ -426,11 +452,6 @@ fn reference_content(
     };
     let range_bound = binding.descriptor.kind.enforces_if_match()
         && crate::s3::object::get::strong_validator(metadata.etag.as_deref());
-    if !range_bound && metadata.enforced_checksums().is_empty() {
-        return Err(refused(
-            "input reference cannot be read at its exact version",
-        ));
-    }
     let descriptor = &binding.descriptor;
     let pin = SourcePin {
         url: publishable(descriptor)
@@ -473,6 +494,55 @@ fn source_error(reference: &str, error: SourceReadError) -> SubmitJobError {
     }
 }
 
+/// An input the caller names on another node must name its exact version there too.
+fn exact_version(input: &InputSelection) -> Result<(), SubmitJobError> {
+    let aruna_core::structs::execution::job::InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &input.source;
+    match version_id.as_deref().map(Ulid::from_string) {
+        Some(Ok(_)) => Ok(()),
+        _ => Err(SubmitJobError::InvalidWorkspace(format!(
+            "s3://{bucket}/{key}: an input on another node must name its exact version"
+        ))),
+    }
+}
+
+/// Points a local input of a distributed bucket at the member that coordinates its key, so it
+/// is captured and pinned there, as an S3 read of the key is served there.
+async fn range_holder(
+    context: &DriverContext,
+    mut input: InputSelection,
+    local: NodeId,
+) -> Result<InputSelection, SubmitJobError> {
+    if input.source_node_id.is_some_and(|node| node != local) {
+        return Ok(input);
+    }
+    let aruna_core::structs::execution::job::InputSource::S3 {
+        bucket,
+        key,
+        version_id,
+    } = &input.source;
+    // A missing or unreadable bucket is refused by the capture with its own message.
+    let Ok(info) = drive(GetBucketOperation::new(bucket.clone()), context).await else {
+        return Ok(input);
+    };
+    let Some(binding) = info.distribution else {
+        return Ok(input);
+    };
+    let coordinator = crate::distribution::guard::read_coordinator(context, &binding, key)
+        .await
+        .map_err(|error| {
+            let reference = input_reference(bucket, key, version_id.as_deref());
+            SubmitJobError::PlacementUnavailable(format!("{reference}: {error}"))
+        })?;
+    if let Some((_, node)) = coordinator {
+        input.source_node_id = Some(node);
+    }
+    Ok(input)
+}
+
 /// Resolve every input at the node that holds it, once, at ingress. The values are stored in
 /// the family spec and remain valid when admission or planning is forwarded.
 async fn resolve_inputs(
@@ -492,7 +562,10 @@ async fn resolve_inputs(
     let mut here = Vec::new();
     for input in &spec.inputs {
         match input.source_node_id.filter(|node| *node != local) {
-            Some(node) => remote.entry(node).or_default().push(input.clone()),
+            Some(node) => {
+                exact_version(input)?;
+                remote.entry(node).or_default().push(input.clone());
+            }
             None => here.push(input.clone()),
         }
     }
@@ -511,6 +584,7 @@ async fn resolve_inputs(
         if let Some(link) = link {
             links.insert(input.dest_key.clone(), link);
         }
+        let input = range_holder(context, input, local).await?;
         match input.source_node_id.filter(|node| *node != local) {
             Some(node) => remote.entry(node).or_default().push(input),
             None => here.push(input),
@@ -734,21 +808,6 @@ async fn remote_captures(
     (created_by, submission_id, expires_at): (UserId, SubmissionId, u64),
     auth_token: Option<&AuthToken>,
 ) -> Result<Vec<(InputSelection, CapturedInput)>, SubmitJobError> {
-    for input in inputs {
-        let aruna_core::structs::execution::job::InputSource::S3 {
-            bucket,
-            key,
-            version_id,
-        } = &input.source;
-        version_id
-            .as_deref()
-            .and_then(|version| Ulid::from_string(version).ok())
-            .ok_or_else(|| {
-                SubmitJobError::InvalidWorkspace(format!(
-                    "s3://{bucket}/{key}: an input on another node must name its exact version"
-                ))
-            })?;
-    }
     let (Some(metadata), Some(AuthToken::Bearer(token))) =
         (context.metadata_handle.as_ref(), auth_token)
     else {
@@ -828,6 +887,8 @@ async fn capture_inputs(
     (local, bearer): (NodeId, Option<&str>),
 ) -> Result<Vec<CapturedInput>, SubmitJobError> {
     let mut captured_inputs = Vec::with_capacity(inputs.len());
+    // Inputs of one bucket share its metadata and its dataset's description, read once.
+    let mut databases = std::collections::HashMap::new();
     for input in inputs {
         let aruna_core::structs::execution::job::InputSource::S3 {
             bucket,
@@ -913,9 +974,16 @@ async fn capture_inputs(
         let info = drive(GetBucketOperation::new(bucket.clone()), context)
             .await
             .map_err(|error| unavailable(error.to_string()))?;
-        let database = readable_metadata(context, (&auth, local), bucket, &info)
-            .await
-            .map_err(unavailable)?;
+        let database = match databases.get(bucket.as_str()) {
+            Some(database) => Option::clone(database),
+            None => {
+                let database = readable_metadata(context, (&auth, local, bearer), bucket, &info)
+                    .await
+                    .map_err(unavailable)?;
+                databases.insert(bucket.clone(), database.clone());
+                database
+            }
+        };
         let scope = BucketScope {
             realm_id,
             node_id: local,
@@ -964,17 +1032,19 @@ async fn capture_inputs(
     Ok(captured_inputs)
 }
 
-/// The bucket's metadata when the caller may read the bucket itself, checked like the metadata
-/// route; READ on one key alone shows none of it, and the run still starts.
+/// The bucket's metadata and its dataset's description when the caller may read the bucket
+/// itself, checked like the metadata route; READ on one key alone shows none of it, and the run
+/// still starts. A dataset the caller may not read leaves the description empty; one that is
+/// unavailable now fails the admission, which may be retried.
 async fn readable_metadata(
     context: &DriverContext,
-    (auth, local): (&AuthContext, NodeId),
+    (auth, local, bearer): (&AuthContext, NodeId, Option<&str>),
     bucket: &str,
     info: &BucketInfo,
-) -> Result<Option<BucketMetadata>, String> {
+) -> Result<Option<CapturedDatabase>, String> {
     let path = bucket_permission_path(auth.realm_id, info.group_id, local, bucket);
     let extras = PolicyRequestExtras::rest();
-    match authorize(
+    let metadata = match authorize(
         context,
         auth.realm_id,
         auth,
@@ -984,13 +1054,36 @@ async fn readable_metadata(
     )
     .await
     {
-        Ok(()) => bucket_metadata(context, bucket, info).await,
+        Ok(()) => bucket_metadata(context, bucket, info).await?,
         // Only a refusal omits the metadata; unreadable policy state stays a retryable failure.
         Err(
             AuthorizeError::PermissionDenied
             | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
-        ) => Ok(None),
-        Err(error) => Err(error.to_string()),
+        ) => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    let described = match metadata.dataset {
+        Some(dataset) => {
+            let token = bearer.and_then(|token| crate::metadata::AuthToken::bearer(token).ok());
+            let read = dataset_description(context, auth.realm_id, dataset, (Some(auth), token));
+            admitted_description(read.await)?
+        }
+        None => Default::default(),
+    };
+    Ok(Some(CapturedDatabase::new(metadata, described)))
+}
+
+/// The description a run captures: empty only when the dataset definitely gives none.
+fn admitted_description(
+    read: Result<DatasetDescription, DescriptionError>,
+) -> Result<DatasetDescription, String> {
+    match read {
+        Ok(described) => Ok(described),
+        Err(DescriptionError::Unreadable | DescriptionError::Invalid(_)) => Ok(Default::default()),
+        Err(error @ DescriptionError::Unavailable) => Err(error.to_string()),
     }
 }
 
@@ -1645,6 +1738,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unavailable_dataset_retries() {
+        // Only a dataset that gives no description for good leaves the capture empty.
+        let described = DatasetDescription {
+            title: Some("Bakta".to_string()),
+            ..DatasetDescription::default()
+        };
+        assert_eq!(admitted_description(Ok(described.clone())), Ok(described));
+        for definite in [
+            DescriptionError::Unreadable,
+            DescriptionError::Invalid("not a Dataset".to_string()),
+        ] {
+            assert_eq!(admitted_description(Err(definite)), Ok(Default::default()));
+        }
+        assert!(admitted_description(Err(DescriptionError::Unavailable)).is_err());
+    }
+
+    // A plain s3:// input of a distributed bucket is captured at the member that coordinates
+    // its key, not refused because this member holds no copy.
+    #[tokio::test]
+    async fn routes_range_holder() {
+        use crate::distribution::test_record::{binding, record, secret, store_record};
+        use crate::distribution::test_store::{context, open};
+        let (_dir, handle) = open();
+        let (snapshot, bytes) = record(true);
+        store_record(&handle, snapshot.set_id(), bytes).await;
+        let bucket = aruna_core::structs::storage::blob::BucketInfo {
+            group_id: Ulid::from_bytes([90; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: UserId::nil(RealmId::from_bytes([9; 32])),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: Some(binding(&snapshot, 1, 5)),
+        };
+        let write = StorageEffect::Write {
+            key_space: aruna_core::keyspaces::S3_BUCKET_KEYSPACE.to_string(),
+            key: b"refseq".to_vec().into(),
+            value: bucket.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        handle.send_storage_effect(write).await;
+        let context = context(&handle);
+        let input = |key: &str| InputSelection {
+            source: InputSource::S3 {
+                bucket: "refseq".to_string(),
+                key: key.to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: key.to_string(),
+            mode: InputMode::Snapshot,
+            container_path: Some(format!("/in/{key}")),
+            name: None,
+            description: None,
+        };
+        let local = secret(1).public();
+
+        let lower = range_holder(&context, input("a"), local).await.unwrap();
+        let upper = range_holder(&context, input("x"), local).await.unwrap();
+
+        assert_eq!(lower.source_node_id, None);
+        assert_eq!(upper.source_node_id, Some(secret(2).public()));
+    }
+
     fn test_ctx(root: &str) -> DriverContext {
         DriverContext {
             storage_handle: FjallStorage::open(root).unwrap(),
@@ -1921,8 +2081,8 @@ mod tests {
 
     #[test]
     fn binds_reference_reads() {
-        // A strong ETag on an S3 source binds every range; recorded digests bind a whole read;
-        // a source with neither cannot be read at its exact version.
+        // A strong ETag on an S3 source binds every range; any other reference is staged whole,
+        // bound to its recorded observation.
         use aruna_core::structs::execution::source_connector::SourceConnectorKind;
         let bound = reference_content(
             "s3://db/a",
@@ -1947,9 +2107,13 @@ mod tests {
             }
         ));
         let http = reference_head(SourceConnectorKind::Http, Some("\"e1\""), false);
+        let (content, _) = reference_content("s3://db/a", &http).expect("observation bound");
         assert!(matches!(
-            reference_content("s3://db/a", &http),
-            Err(SubmitJobError::InvalidWorkspace(_))
+            content,
+            InputContent::Reference {
+                range_bound: false,
+                ..
+            }
         ));
         let mut stored = reference_head(SourceConnectorKind::S3, Some("\"e1\""), false);
         stored.source_binding = None;
@@ -2056,6 +2220,26 @@ mod tests {
         let mut stale = linked;
         stale.link.as_mut().expect("link").version = Ulid::from_parts(9, 9);
         assert!(!answers_input(&asked, &(target, stale), node_id));
+
+        // An input routed to its range coordinator without a version is answered pinned there,
+        // never unpinned and never as another key.
+        let mut unpinned = s3_input("db", "bakta.db", None);
+        unpinned.source_node_id = Some(node_id);
+        assert!(answers_input(&unpinned, &plain, node_id));
+        let bare = (unpinned.clone(), captured_from(&asked, node_id));
+        assert!(!answers_input(&unpinned, &bare, node_id));
+        let mut other = asked.clone();
+        other.source = s3_input("db", "other.db", Some(&version.to_string())).source;
+        let moved = (other.clone(), captured_from(&other, node_id));
+        assert!(!answers_input(&unpinned, &moved, node_id));
+    }
+
+    // A node named by the caller still needs an exact version; a range coordinator does not.
+    #[test]
+    fn named_node_needs_version() {
+        assert!(exact_version(&s3_input("db", "a", None)).is_err());
+        let version = Ulid::from_parts(1, 1).to_string();
+        assert!(exact_version(&s3_input("db", "a", Some(&version))).is_ok());
     }
 
     #[test]
@@ -2118,8 +2302,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_needs_pin_and_bearer() {
-        // An input on another node needs an exact version and the caller's own bearer.
+    async fn remote_needs_bearer() {
+        // An input on another node needs the caller's own bearer; its version rule is checked
+        // where the caller names the node (`named_node_needs_version`).
         let dir = tempdir().unwrap();
         let context = test_ctx(dir.path().to_str().unwrap());
         let caller = (
@@ -2127,9 +2312,6 @@ mod tests {
             SubmissionId([4; 32]),
             10,
         );
-        let unpinned = vec![s3_input("a", "x", None)];
-        let refused = remote_captures(&context, node(2), &unpinned, caller, None).await;
-        assert!(matches!(refused, Err(SubmitJobError::InvalidWorkspace(_))));
         let pinned = vec![s3_input(
             "a",
             "x",

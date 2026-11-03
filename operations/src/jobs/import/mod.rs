@@ -2034,6 +2034,7 @@ fn classify_get(error: GetObjectError) -> ImportFailure {
         // Retrying cannot recover an observation the source no longer serves,
         // and only an explicit rebind clears an exhausted binding.
         | GetObjectError::HistoricalReferenceUnavailable
+        | GetObjectError::ReferenceChecksumMismatch
         | GetObjectError::ReferenceAdvanceExhausted => true,
         // A drifting source can stabilize; the job attempt cap bounds the retries.
         GetObjectError::ReferenceSourceChanged => false,

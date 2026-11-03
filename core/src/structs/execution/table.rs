@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{BufRead, Read};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,12 @@ pub const MAX_METADATA_ENTRIES: usize = 128;
 pub const MAX_METADATA_KEY: usize = 128;
 /// Bytes of one metadata value at most.
 pub const MAX_METADATA_VALUE: usize = 4 * 1024;
+/// Column of a record row's source ETag.
+pub const RECORD_ETAG: &str = "etag";
+/// Column of a record row's content type.
+pub const RECORD_CONTENT_TYPE: &str = "content_type";
+/// Column of a record row's metadata as a JSON object of strings.
+pub const RECORD_METADATA: &str = "metadata";
 /// Whether version metadata names columns that metadata search matches.
 pub fn searchable(metadata: &std::collections::HashMap<String, String>) -> bool {
     metadata.contains_key(SEARCH_TEXT_KEY) || metadata.contains_key(SEARCH_EXACT_KEY)
@@ -205,6 +211,10 @@ pub enum RowKind {
     File,
     /// A row names a directory whose files are listed.
     Folder,
+    /// A row is a complete object record whose values are trusted, so the source is never
+    /// asked: size, time and checksums as for files, plus the `etag`, `content_type` and
+    /// `metadata` columns when present. A row without a source writes an empty object.
+    Record,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +373,10 @@ impl TableImport {
         let described = rows.size.is_some() || rows.modified.is_some();
         if rows.kind == RowKind::Folder && (described || !rows.checksums.is_empty()) {
             let reason = "size, checksums and modified describe file rows only";
+            return Err(TableError::Mapping(reason.to_string()));
+        }
+        if rows.kind == RowKind::Record && rows.size.is_none() {
+            let reason = "record rows need a size column";
             return Err(TableError::Mapping(reason.to_string()));
         }
         let mut algorithms = BTreeSet::new();
@@ -588,6 +602,8 @@ pub struct TableEntry {
     pub digests: Vec<(ChecksumAlgorithm, Vec<u8>)>,
     /// The file's modification time from the row, when it names one to the second.
     pub modified: Option<SystemTime>,
+    pub etag: Option<String>,
+    pub content_type: Option<String>,
 }
 
 /// The row mapping resolved against one table's columns.
@@ -603,6 +619,8 @@ pub struct RowMapper {
     size: Option<usize>,
     checksums: Vec<(ChecksumAlgorithm, usize)>,
     modified: Option<usize>,
+    /// Columns of a record row's ETag, content type and metadata object.
+    record: [Option<usize>; 3],
 }
 
 impl RowMapper {
@@ -675,6 +693,10 @@ impl RowMapper {
             size: rows.size.as_deref().map(index).transpose()?,
             checksums,
             modified: rows.modified.as_deref().map(index).transpose()?,
+            record: [RECORD_ETAG, RECORD_CONTENT_TYPE, RECORD_METADATA].map(|name| {
+                let found = columns.iter().position(|column| column == name);
+                found.filter(|_| rows.kind == RowKind::Record)
+            }),
         })
     }
 
@@ -692,21 +714,30 @@ impl RowMapper {
         if !included {
             return RowOutcome::Filtered;
         }
-        let (Some(source), Some(target)) =
-            (render(&self.source, &value), render(&self.target, &value))
-        else {
+        let source = render(&self.source, &value);
+        let (Some(rendered), true) = (
+            render(&self.target, &value),
+            source.is_some() || self.kind == RowKind::Record,
+        ) else {
             return RowOutcome::Skipped;
         };
-        let source = match source_path(&source, base) {
-            Ok(path) => path,
+        let source = match source.map(|source| source_path(&source, base)).transpose() {
+            Ok(source) => source,
             Err(reason) => return RowOutcome::Failed(reason),
         };
-        let Some(target) = canonical_path(&target) else {
-            return RowOutcome::Failed(format!("the target `{target}` is not a canonical key"));
+        let Some(mut target) = canonical_path(&rendered) else {
+            return RowOutcome::Failed(format!("the target `{rendered}` is not a canonical key"));
         };
-        let source_path = match self.kind {
-            RowKind::File => source,
-            RowKind::Folder => format!("{source}/"),
+        let source_path = match (self.kind, source) {
+            (RowKind::Folder, Some(source)) => format!("{source}/"),
+            (_, Some(source)) => source,
+            // A record without a source is an empty object; a folder marker keeps its `/`.
+            (_, None) => {
+                if rendered.ends_with('/') {
+                    target.push('/');
+                }
+                String::new()
+            }
         };
         let mut metadata = BTreeMap::new();
         for (index, key) in &self.kept {
@@ -723,6 +754,15 @@ impl RowMapper {
             Ok(described) => described,
             Err(reason) => return RowOutcome::Failed(reason),
         };
+        let [etag, content_type, object] = self.record.map(|index| index.and_then(value));
+        if let Some(object) = object
+            && let Err(reason) = record_metadata(object, &mut metadata)
+        {
+            return RowOutcome::Failed(reason);
+        }
+        if source_path.is_empty() && size != Some(0) {
+            return RowOutcome::Failed("a record without a source must be empty".to_string());
+        }
         RowOutcome::Import(TableEntry {
             source_path,
             target,
@@ -730,7 +770,15 @@ impl RowMapper {
             size,
             digests,
             modified,
+            etag: etag.map(str::to_string),
+            content_type: content_type.map(str::to_string),
         })
+    }
+
+    /// The key a row maps to, if its target renders as a canonical key; names a failed row.
+    pub fn target_key(&self, fields: &[Option<String>]) -> Option<String> {
+        let value = |index: usize| fields.get(index).and_then(Option::as_deref);
+        render(&self.target, &value).and_then(|target| canonical_path(&target))
     }
 
     /// The size, checksums and modification time a row gives; a null value gives none.
@@ -766,6 +814,29 @@ impl RowMapper {
             },
         };
         Ok((size, digests, modified))
+    }
+}
+
+/// Adds a record row's metadata object; the search selection entries are the only `aruna-`
+/// keys it may carry, as the import itself writes them.
+fn record_metadata(object: &str, metadata: &mut BTreeMap<String, String>) -> Result<(), String> {
+    let entries: BTreeMap<String, String> = serde_json::from_str(object)
+        .map_err(|error| format!("the metadata is no JSON object of strings: {error}"))?;
+    for (key, value) in entries {
+        let selection = key == SEARCH_TEXT_KEY || key == SEARCH_EXACT_KEY;
+        if !header_safe(&key) || (key.starts_with("aruna-") && !selection) {
+            return Err(format!("`{key}` cannot be a metadata key"));
+        }
+        if value.len() > MAX_METADATA_VALUE {
+            return Err(format!("the value of `{key}` is too long"));
+        }
+        metadata.entry(key).or_insert(value);
+    }
+    match metadata.len() <= MAX_METADATA_ENTRIES {
+        true => Ok(()),
+        false => Err(format!(
+            "at most {MAX_METADATA_ENTRIES} metadata entries fit an object"
+        )),
     }
 }
 
@@ -830,72 +901,129 @@ fn canonical_path(path: &str) -> Option<String> {
     (!invalid).then(|| path.to_string())
 }
 
-/// Decompresses a gzip table from its start and keeps the bytes after `skip`, at most `limit`.
-pub struct GzipWindow {
-    decoder: flate2::write::MultiGzDecoder<Window>,
+/// Compressed bytes a cursor received and has not decoded yet. While the transport has not
+/// ended, empty input answers `WouldBlock`, so the decoder keeps its state for the next push.
+struct Pending {
+    bytes: Vec<u8>,
+    read: usize,
+    ended: bool,
 }
 
-struct Window {
-    skip: u64,
-    limit: usize,
-    kept: Vec<u8>,
-    full: bool,
+impl Read for Pending {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let available = self.fill_buf()?;
+        let count = available.len().min(out.len());
+        out[..count].copy_from_slice(&available[..count]);
+        self.consume(count);
+        Ok(count)
+    }
 }
 
-impl Write for Window {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let skipped = (self.skip.min(bytes.len() as u64)) as usize;
-        self.skip -= skipped as u64;
-        let rest = &bytes[skipped..];
-        let room = self.limit - self.kept.len();
-        if rest.len() > room {
-            self.kept.extend_from_slice(&rest[..room]);
-            self.full = true;
-            return Err(std::io::Error::other("window full"));
+impl BufRead for Pending {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        match (self.read < self.bytes.len(), self.ended) {
+            (true, _) => Ok(&self.bytes[self.read..]),
+            (false, true) => Ok(&[]),
+            (false, false) => Err(std::io::ErrorKind::WouldBlock.into()),
         }
-        self.kept.extend_from_slice(rest);
-        Ok(bytes.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    fn consume(&mut self, amount: usize) {
+        self.read += amount;
     }
 }
 
-impl GzipWindow {
-    pub fn new(skip: u64, limit: usize) -> Self {
-        let window = Window {
-            skip,
-            limit,
-            kept: Vec::new(),
-            full: false,
+/// Decompresses a gzip table in order and keeps its decoder between the chunks one read takes,
+/// so every compressed byte is decoded once. It decodes only as far as the next chunk needs and
+/// discards bytes before the read position as they are produced, so memory stays bounded.
+pub struct GzipCursor {
+    decoder: flate2::bufread::MultiGzDecoder<Pending>,
+    /// Decoded bytes from the read position on: the chunk and one byte that shows more follows.
+    kept: Vec<u8>,
+    limit: usize,
+    /// Decoded bytes so far, kept or discarded.
+    decoded: u64,
+    /// The decompressed position the next chunk starts at.
+    at: u64,
+    ended: bool,
+}
+
+impl GzipCursor {
+    /// A cursor that decodes from the table's start and keeps chunks of `limit` bytes from `at`.
+    pub fn new(at: u64, limit: usize) -> Self {
+        let pending = Pending {
+            bytes: Vec::new(),
+            read: 0,
+            ended: false,
         };
         Self {
-            decoder: flate2::write::MultiGzDecoder::new(window),
+            decoder: flate2::bufread::MultiGzDecoder::new(pending),
+            kept: Vec::new(),
+            limit,
+            decoded: 0,
+            at,
+            ended: false,
         }
     }
 
-    /// Feeds compressed bytes; `true` once the window is full and reading may stop.
-    pub fn push(&mut self, bytes: &[u8]) -> Result<bool, TableError> {
-        match self.decoder.write_all(bytes) {
-            Ok(()) => Ok(false),
-            Err(_) if self.decoder.get_ref().full => Ok(true),
-            Err(error) => Err(TableError::Gzip(error.to_string())),
+    /// Moves the read position forward to `at`; `false` for a position before the current one.
+    pub fn advance(&mut self, at: u64) -> bool {
+        if at < self.at {
+            return false;
         }
+        let start = self.decoded - self.kept.len() as u64;
+        let dropped = (at.saturating_sub(start)).min(self.kept.len() as u64);
+        self.kept.drain(..dropped as usize);
+        self.at = at;
+        true
     }
 
-    /// The kept bytes and whether they reach the end of the table.
-    pub fn finish(mut self) -> Result<(Vec<u8>, bool), TableError> {
-        if !self.decoder.get_ref().full {
-            match self.decoder.try_finish() {
-                Ok(()) => {}
-                Err(_) if self.decoder.get_ref().full => {}
+    /// Adds compressed bytes; [`Self::fill`] decodes them.
+    pub fn push(&mut self, bytes: &[u8]) {
+        let pending = self.decoder.get_mut();
+        pending.bytes.drain(..pending.read);
+        pending.read = 0;
+        pending.bytes.extend_from_slice(bytes);
+    }
+
+    /// Marks the compressed input as complete.
+    pub fn finish(&mut self) {
+        self.decoder.get_mut().ended = true;
+    }
+
+    /// Decodes until a chunk and one byte beyond it are kept, the table ends, or the input
+    /// runs out; `true` once the next chunk can be taken. A cut or corrupt stream is an error.
+    pub fn fill(&mut self) -> Result<bool, TableError> {
+        let mut scratch = [0u8; 16 * 1024];
+        while !self.ended && self.kept.len() <= self.limit {
+            let skipped = self.at.saturating_sub(self.decoded);
+            let wanted = match skipped {
+                0 => self.limit + 1 - self.kept.len(),
+                skipped => usize::try_from(skipped).unwrap_or(usize::MAX),
+            };
+            let wanted = wanted.min(scratch.len());
+            match self.decoder.read(&mut scratch[..wanted]) {
+                Ok(0) => self.ended = true,
+                Ok(count) => {
+                    self.decoded += count as u64;
+                    if skipped == 0 {
+                        self.kept.extend_from_slice(&scratch[..count]);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
                 Err(error) => return Err(TableError::Gzip(error.to_string())),
             }
         }
-        let window = self.decoder.get_ref();
-        let complete = !window.full;
-        Ok((window.kept.clone(), complete))
+        Ok(true)
+    }
+
+    /// Up to `limit` bytes from the read position and whether they reach the table's end.
+    pub fn chunk(&self) -> (Vec<u8>, bool) {
+        let taken = self.kept.len().min(self.limit);
+        (
+            self.kept[..taken].to_vec(),
+            self.ended && taken == self.kept.len(),
+        )
     }
 }
 

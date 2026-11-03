@@ -1089,8 +1089,10 @@ pub(super) async fn write_archive_checked(
 }
 
 pub(super) fn zip_entry(path: &str, modified_ms: u64) -> ZipEntryBuilder {
+    // A regular file readable by everyone, so an unpacked archive opens without a chmod.
     ZipEntryBuilder::new(path.to_string().into(), Compression::Stored)
         .last_modification_date(zip_date(modified_ms))
+        .unix_permissions(0o100_644)
 }
 
 /// MS-DOS ZIP timestamps only cover 1980 through 2107, so a moment outside

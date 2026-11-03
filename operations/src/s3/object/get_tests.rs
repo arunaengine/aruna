@@ -1881,6 +1881,44 @@ fn unknown_keeps_digests() {
     assert_eq!(result.last_refresh, None);
 }
 
+// A changed time or ETag of the same length is decided by the recorded digests: matching bytes
+// are served, without recording a successor.
+#[test]
+fn drift_digest_decides() {
+    let mut operation = drifted_operation();
+    let stored = digested(9, 7);
+    let mut fresh = observation(9);
+    fresh.etag = Some("etag-new".to_string());
+    operation.reference_cached = Some(stored.clone());
+    operation.state = GetObjectState::HeadReferenceSource;
+
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: fresh.clone(),
+    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+    ));
+    operation.step(source_read(fresh));
+    assert!(operation.step(spooled(7)).is_empty());
+
+    let result = operation.finalize().unwrap();
+    assert_eq!(result.source_metadata.unwrap().digests, stored.digests);
+
+    // A different length can never match the digests, so it fails without a read.
+    let mut operation = drifted_operation();
+    operation.reference_cached = Some(digested(9, 7));
+    operation.state = GetObjectState::HeadReferenceSource;
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+        metadata: observation(10),
+    }));
+    assert!(effects.is_empty());
+    assert_eq!(
+        operation.finalize(),
+        Err(GetObjectError::ReferenceChecksumMismatch)
+    );
+}
+
 // Bytes that miss the recorded digests are never served: the spool stream is dropped, the read
 // fails.
 #[test]
@@ -1900,7 +1938,7 @@ fn pinned_unknown_verified() {
 
     assert_eq!(
         operation.finalize(),
-        Err(GetObjectError::ReferenceSourceChanged)
+        Err(GetObjectError::ReferenceChecksumMismatch)
     );
 }
 
@@ -1980,24 +2018,59 @@ fn oversized_spool_refused() {
     );
 }
 
-// An HTTP server may ignore `If-Match`, so a pinned version it serves needs recorded digests:
-// without them it is refused even when the observation compares as the same.
+// A pinned version without digests is still served while its source matches the observation:
+// the read response is compared again, so a change in between never serves other bytes.
 #[test]
-fn unbound_pin_refused() {
+fn unbound_pin_served() {
     let mut operation = drifted_operation();
     let stored = observation(9);
     operation.reference_cached = Some(stored.clone());
     operation.reference_explicit = true;
     operation.state = GetObjectState::HeadReferenceSource;
 
-    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
         metadata: stored,
     }));
 
-    assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::HistoricalReferenceUnavailable)
-    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+    ));
+    assert_eq!(operation.state, GetObjectState::ReadReferenceSource);
+}
+
+// A pinned version without digests is refused when the read itself does not prove it: other
+// bytes than the HEAD's, or no validator in the GET's answer.
+#[test]
+fn unproven_pin_refused() {
+    for read in [
+        observation(10),
+        SourceMetadata {
+            etag: None,
+            ..observation(9)
+        },
+    ] {
+        let mut operation = drifted_operation();
+        operation.reference_explicit = true;
+        operation.source_metadata = Some(observation(9));
+        operation.state = GetObjectState::ReadReferenceSource;
+
+        operation.step(source_read(read));
+
+        assert_eq!(
+            operation.finalize(),
+            Err(GetObjectError::HistoricalReferenceUnavailable)
+        );
+    }
+
+    // The same validators in the GET serve the pin.
+    let mut operation = drifted_operation();
+    operation.reference_explicit = true;
+    operation.source_metadata = Some(observation(9));
+    operation.state = GetObjectState::ReadReferenceSource;
+    let effects = operation.step(source_read(observation(9)));
+    assert!(effects.is_empty());
+    assert_eq!(operation.state, GetObjectState::Finish);
 }
 
 // A bound read whose condition fails queues a request to observe the source, which the refresh

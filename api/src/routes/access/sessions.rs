@@ -16,8 +16,8 @@ use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::create_token::CreateTokenError;
 use aruna_operations::driver::drive;
 use aruna_operations::session::{
-    CreateSessionConfig, CreateSessionError, CreateSessionOperation, ListSessionOperation,
-    RevokeSessionError, RevokeSessionOperation, bound_session_expiry,
+    CreateSessionConfig, CreateSessionError, ListSessionOperation, RevokeSessionError,
+    RevokeSessionOperation, bound_session_expiry, create_making_room,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -98,7 +98,7 @@ pub(crate) fn map_create_error(error: CreateSessionError) -> ServerError {
         CreateSessionError::InvalidExpiry => {
             ServerError::BadRequestReason("session expiry is invalid".to_string())
         }
-        CreateSessionError::LimitReached => {
+        CreateSessionError::LimitReached { .. } => {
             ServerError::Conflict("active session limit reached".to_string())
         }
         CreateSessionError::Token(CreateTokenError::RestrictionsTooLarge) => {
@@ -225,24 +225,23 @@ pub async fn create_session(
         .map_err(map_create_error)?;
     crate::routes::access::users::ensure_active(&state, auth.user_id).await?;
     let restrictions = session_restrictions(&state, &auth, request.path_restrictions).await?;
-    let created = drive(
-        CreateSessionOperation::new(CreateSessionConfig {
-            time: now,
-            expiry,
-            user_id: auth.user_id,
-            realm_id: auth.realm_id,
-            node_capabilities: state.node_capabilities().clone(),
-            kind,
-            label: request.label,
-            name: None,
-            restrictions,
-            via: None,
-            auth_time: None,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_create_error)?;
+    let config = CreateSessionConfig {
+        time: now,
+        expiry,
+        user_id: auth.user_id,
+        realm_id: auth.realm_id,
+        node_capabilities: state.node_capabilities().clone(),
+        kind,
+        label: request.label,
+        name: None,
+        restrictions,
+        via: None,
+        auth_time: None,
+        cutoff: None,
+    };
+    let created = create_making_room(&state.get_ctx(), state.get_node_id(), config)
+        .await
+        .map_err(map_create_error)?;
     Ok((
         StatusCode::CREATED,
         Json(CreateSessionResponse {

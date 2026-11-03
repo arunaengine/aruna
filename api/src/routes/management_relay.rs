@@ -46,6 +46,8 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/access/onboarding/secrets/{id}/status"),
     ("GET", "/access/token"),
     ("GET", "/system/realm/placement"),
+    ("PATCH", "/access/users/me/devices/{id}"),
+    ("PATCH", "/system/realm/nodes/{node_id}"),
     ("PATCH", "/system/realm/placement"),
     ("POST", "/access/groups/{id}/service-accounts"),
     (

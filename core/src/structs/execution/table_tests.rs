@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use std::io::Write;
 
 const SUMMARY: &str = include_str!("../../../tests/fixtures/assembly_summary.tsv");
 const BASE: &str = "https://ftp.ncbi.nlm.nih.gov/genomes/";
@@ -86,6 +87,34 @@ fn summary_maps_folders() {
     assert_eq!(mapper.map(&last, Some(BASE)), RowOutcome::Skipped);
 }
 
+// One file per assembly comes straight from the summary: a suffix after the folder's basename.
+#[test]
+fn summary_maps_genomes() {
+    let mut import = ncbi();
+    import.rows.kind = RowKind::File;
+    import.rows.source = "{ftp_path}/{ftp_path|basename}_genomic.fna.gz".to_string();
+    import.rows.target = "{ftp_path|basename}/{ftp_path|basename}_genomic.fna.gz".to_string();
+    import.rows.filter.clear();
+    import.validate().unwrap();
+    let bytes = SUMMARY.as_bytes();
+    let (columns, used) = read_header(&import.format, bytes, true).unwrap();
+    let mapper = RowMapper::new(&import.rows, &columns).unwrap();
+    let (rows, _) = parse_rows(&import.format, Some(38), &bytes[used..], true).unwrap();
+    let outcomes: Vec<RowOutcome> = (rows.into_iter())
+        .map(|(row, _)| mapper.map(&row.unwrap(), Some(BASE)))
+        .collect();
+    let human = imported(outcomes[0].clone());
+    let folder = "GCF_000001405.40_GRCh38.p14";
+    assert_eq!(
+        human.source_path,
+        format!("all/GCF/000/001/405/{folder}/{folder}_genomic.fna.gz")
+    );
+    assert_eq!(human.target, format!("{folder}/{folder}_genomic.fna.gz"));
+    // A row without a size column is headed once at import; an `na` folder is skipped.
+    assert_eq!(human.size, None);
+    assert_eq!(outcomes.last(), Some(&RowOutcome::Skipped));
+}
+
 // URLs outside the connector base and non-canonical paths fail their row only.
 #[test]
 fn foreign_paths_fail() {
@@ -126,6 +155,9 @@ fn foreign_paths_fail() {
         mapper.map(&row("https://data.example.org/files/a.fq"), None),
         RowOutcome::Failed(_)
     ));
+    // A failed row is still named by the key it would map to.
+    let failed = row("https://other.example.org/files/a.fq");
+    assert_eq!(mapper.target_key(&failed).as_deref(), Some("samples/a.fq"));
 }
 
 // Quoted fields may hold delimiters and newlines; a row cut by the chunk end waits.
@@ -272,24 +304,83 @@ fn gzip_windows_resume() {
         "summary.txt",
         SUMMARY.as_bytes()
     ));
+    // Each step continues the decoder of the step before, after the bytes that step used.
+    let mut cursor = GzipCursor::new(0, 1000);
+    let mut pieces = compressed.chunks(97);
     let mut read = Vec::new();
     loop {
-        let mut window = GzipWindow::new(read.len() as u64, 1000);
-        for chunk in compressed.chunks(97) {
-            if window.push(chunk).unwrap() {
-                break;
+        while !cursor.fill().unwrap() {
+            match pieces.next() {
+                Some(piece) => cursor.push(piece),
+                None => cursor.finish(),
             }
         }
-        let (bytes, complete) = window.finish().unwrap();
-        read.extend_from_slice(&bytes);
-        if complete {
+        let (bytes, complete) = cursor.chunk();
+        let used = bytes.len().min(700);
+        read.extend_from_slice(&bytes[..used]);
+        assert!(cursor.advance(read.len() as u64));
+        if complete && used == bytes.len() {
             break;
         }
     }
     assert_eq!(read, SUMMARY.as_bytes());
-    let mut truncated = GzipWindow::new(0, TABLE_CHUNK);
-    truncated.push(&compressed[..compressed.len() / 2]).unwrap();
-    assert!(truncated.finish().is_err());
+    assert!(!cursor.advance(0), "a cursor never goes back");
+    // A cursor opened at a later position skips to it.
+    let mut later = GzipCursor::new(5, 4);
+    later.push(&compressed);
+    later.finish();
+    assert!(later.fill().unwrap());
+    assert_eq!(later.chunk().0, &SUMMARY.as_bytes()[5..9]);
+    let mut truncated = GzipCursor::new(0, TABLE_CHUNK);
+    truncated.push(&compressed[..compressed.len() / 2]);
+    truncated.finish();
+    assert!(truncated.fill().is_err());
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+// A small compressed input that expands enormously is decoded only as far as a chunk needs,
+// also while skipping to a late position.
+#[test]
+fn gzip_memory_bounded() {
+    let zeros = gzip(&vec![0u8; 16 << 20]);
+    assert!(zeros.len() < 64 * 1024);
+    let mut cursor = GzipCursor::new(0, 1000);
+    cursor.push(&zeros);
+    assert!(cursor.fill().unwrap());
+    assert!(cursor.kept.len() <= 1001 && cursor.kept.capacity() <= 4 * 1024);
+    assert!(
+        cursor.decoded <= 1001,
+        "decoding stops after the chunk and one byte"
+    );
+    let (bytes, complete) = cursor.chunk();
+    assert_eq!((bytes.len(), complete), (1000, false));
+
+    let mut late = GzipCursor::new(15 << 20, 1000);
+    late.push(&zeros);
+    assert!(late.fill().unwrap());
+    assert!(late.kept.len() <= 1001 && late.kept.capacity() <= 4 * 1024);
+    assert!(late.decoded <= (15 << 20) + 1001);
+}
+
+// A table whose last chunk is exactly the chunk size is complete only once its end is known;
+// until then the cursor waits instead of offering a chunk that cuts the last row off.
+#[test]
+fn gzip_exact_chunk() {
+    let table = b"a\tb\n1\t2\n";
+    let mut cursor = GzipCursor::new(0, table.len());
+    cursor.push(&gzip(table));
+    assert!(
+        !cursor.fill().unwrap(),
+        "the end of the input is not known yet"
+    );
+    cursor.finish();
+    assert!(cursor.fill().unwrap());
+    assert_eq!(cursor.chunk(), (table.to_vec(), true));
 }
 
 // Search reads the version's own selections: only selected columns match, tax ids exactly.
@@ -393,4 +484,105 @@ fn file_columns_checked() {
     let mut unknown = rows;
     unknown.checksums[0].algorithm = "crc32".to_string();
     assert!(import(unknown).validate().is_err());
+}
+
+#[test]
+fn record_rows_trusted() {
+    let rows: TableRows = serde_json::from_value(serde_json::json!({
+        "kind": "record", "source": "{source}", "target": "{key}", "keep": [],
+        "size": "size", "modified": "modified",
+        "checksums": [{ "algorithm": "md5", "column": "md5" }]
+    }))
+    .unwrap();
+    let columns: Vec<String> = [
+        "key",
+        "source",
+        "size",
+        "modified",
+        "etag",
+        "content_type",
+        "md5",
+        "metadata",
+    ]
+    .map(String::from)
+    .into();
+    let mapper = RowMapper::new(&rows, &columns).unwrap();
+    let md5 = "9e107d9d372bb6826bd81d3542a419d6";
+    let row = |key: &str, source: &str, size: &str, metadata: &str| {
+        let value = |text: &str| (!text.is_empty()).then(|| text.to_string());
+        vec![
+            value(key),
+            value(source),
+            value(size),
+            Some("2025-11-17T17:38:21Z".to_string()),
+            Some(format!("\"{md5}\"")),
+            Some("text/plain".to_string()),
+            Some(md5.to_string()),
+            value(metadata),
+        ]
+    };
+    let meta = r#"{"taxid": "562", "aruna-search-exact": "taxid"}"#;
+    let entry = imported(mapper.map(&row("g/a.txt", "all/g/a.txt", "42", meta), None));
+    assert_eq!(
+        (entry.source_path.as_str(), entry.target.as_str()),
+        ("all/g/a.txt", "g/a.txt")
+    );
+    assert_eq!(entry.size, Some(42));
+    assert_eq!(
+        entry.etag.as_deref(),
+        Some("\"9e107d9d372bb6826bd81d3542a419d6\"")
+    );
+    assert_eq!(entry.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(entry.digests.len(), 1);
+    assert_eq!(entry.metadata.get("taxid").map(String::as_str), Some("562"));
+    assert_eq!(
+        entry.metadata.get(SEARCH_EXACT_KEY).map(String::as_str),
+        Some("taxid")
+    );
+    // A row without a source is an empty object; a folder marker keeps its slash.
+    let folder = imported(mapper.map(&row("g/", "", "0", meta), None));
+    assert_eq!(
+        (folder.source_path.as_str(), folder.target.as_str()),
+        ("", "g/")
+    );
+    for bad in [
+        row("g/b", "", "3", ""),
+        row("g/b", "all/g/b", "3", "[1]"),
+        row("g/b", "all/g/b", "3", r#"{"aruna-owner": "x"}"#),
+        row("g/b", "all/g/b", "3", r#"{"bad key": "x"}"#),
+    ] {
+        assert!(
+            matches!(mapper.map(&bad, None), RowOutcome::Failed(_)),
+            "{bad:?}"
+        );
+    }
+    // File rows ignore the record columns.
+    let mut file = rows.clone();
+    file.kind = RowKind::File;
+    let plain = imported(
+        RowMapper::new(&file, &columns)
+            .unwrap()
+            .map(&row("g/a", "all/g/a", "1", meta), None),
+    );
+    assert_eq!(
+        (plain.etag, plain.content_type, plain.metadata.len()),
+        (None, None, 0)
+    );
+    let import = |rows: TableRows| TableImport {
+        source: TableSource::Connector("records.tsv".to_string()),
+        format: TableFormat::default(),
+        rows,
+        rate: None,
+    };
+    let mut sizeless = rows;
+    sizeless.size = None;
+    assert!(import(sizeless).validate().is_err());
+}
+
+// The record kind is a new last variant, so stored descriptors of the other kinds still decode.
+#[test]
+fn record_kind_appended() {
+    assert_eq!(postcard::to_allocvec(&RowKind::File).unwrap(), [0]);
+    assert_eq!(postcard::to_allocvec(&RowKind::Folder).unwrap(), [1]);
+    assert_eq!(postcard::to_allocvec(&RowKind::Record).unwrap(), [2]);
 }

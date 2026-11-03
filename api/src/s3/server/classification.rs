@@ -114,7 +114,7 @@ fn request_path(host: Option<&str>, path: &str, domain: &str) -> Option<s3s::pat
         && host.parse::<SocketAddr>().is_err()
         && host.parse::<IpAddr>().is_err()
     {
-        let s3_host = s3s::host::SingleDomain::new(domain).ok()?;
+        let s3_host = super::s3_host(domain).ok()?;
         let virtual_host = s3_host.parse_host_header(host).ok()?;
         return s3s::path::parse_virtual_hosted_style(virtual_host.bucket(), path.as_ref()).ok();
     }
@@ -238,6 +238,15 @@ fn virtual_hosted_bucket(host: &str, domain: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An in-cluster service host is path-style here too, so transfers keep the bulk lane.
+    #[test]
+    fn service_host_path_style() {
+        let path = request_path(Some("node-2.aruna.svc:1337"), "/data/key", "s3.example");
+        assert!(
+            matches!(path, Some(s3s::path::S3Path::Object { bucket, .. }) if &*bucket == "data")
+        );
+    }
 
     fn parts(method: Method, uri: &str, headers: HeaderMap) -> http::request::Parts {
         let mut request = http::Request::builder()

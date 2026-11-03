@@ -323,6 +323,8 @@ pub async fn transfer_distributed(
 
 **Behavior**
 - Omitted fields take their defaults; the whole settings object is replaced.
+- The status routes return the current values in `settings`; edit and send those back to
+  keep the other settings.
 - Refused while the set is being deleted."#,
     params(
         ("group_id" = String, Path, description = "Owner group id"),

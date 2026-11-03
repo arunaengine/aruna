@@ -100,6 +100,8 @@ pub enum DistributionError {
     NoDeletion,
     #[error("invalid bucket metadata: {0}")]
     InvalidMetadata(String),
+    #[error("the bucket metadata changed meanwhile")]
+    MetadataChanged,
     #[error("coordinator {0} has not fenced its ranges for the deletion yet")]
     NotFenced(Ulid),
 }

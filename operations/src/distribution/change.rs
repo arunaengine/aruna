@@ -211,16 +211,18 @@ pub async fn change_settings(
     send(context, (local, &snapshot), caller, request).await
 }
 
-/// Replaces the set's bucket metadata; the publisher checks group admin of the set's owner.
+/// Replaces the set's bucket metadata, if `expected` is set only while it is still that; the
+/// publisher checks group admin of the set's owner.
 pub async fn change_metadata(
     context: &Arc<DriverContext>,
     caller: Caller<'_>,
     set_id: Ulid,
-    metadata: Option<BucketMetadata>,
+    (metadata, expected): (Option<BucketMetadata>, Option<BucketMetadata>),
 ) -> Result<DistributionRevision, CreateError> {
     let (local, snapshot) = head(context, set_id).await?;
     let request = DistributionRequest::ChangeMetadata {
         metadata: metadata.map(Box::new),
+        expected: expected.map(Box::new),
     };
     send(context, (local, &snapshot), caller, request).await
 }

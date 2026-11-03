@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -47,7 +47,9 @@ fn stage_command(arguments: &[std::ffi::OsString]) -> Result<(), String> {
 fn fetch_command(arguments: &[std::ffi::OsString]) -> Result<(), String> {
     let workspace = required_path(arguments, "--workspace")?;
     let path = required_value(arguments, "--path")?;
-    fetch_archive(&workspace, &path, io::stdout().lock())
+    let offset = required_number(arguments, "--offset")?;
+    let length = required_number(arguments, "--length")?;
+    fetch_range(&workspace, &path, offset, length, io::stdout().lock())
         .map_err(|error| format!("fetch failed: {error}"))
 }
 
@@ -128,22 +130,26 @@ fn stage_archive(
     Ok(())
 }
 
-fn fetch_archive(workspace: &Path, path: &str, writer: impl Write) -> io::Result<()> {
+/// Write the file size as eight big-endian bytes, then at most `length` bytes
+/// from `offset`, so the caller can read a large file in short execs.
+fn fetch_range(
+    workspace: &Path,
+    path: &str,
+    offset: u64,
+    length: u64,
+    mut writer: impl Write,
+) -> io::Result<()> {
     let relative = safe_absolute(path)?;
     let root = workspace.canonicalize()?;
     let source = root.join(&relative).canonicalize()?;
     if !source.starts_with(&root) || !source.symlink_metadata()?.file_type().is_file() {
         return Err(io::Error::other("output is not a regular workspace file"));
     }
-    let size = source.metadata()?.len();
-    let mut header = tar::Header::new_gnu();
-    header.set_entry_type(tar::EntryType::Regular);
-    header.set_mode(0o440);
-    header.set_size(size);
-    header.set_cksum();
-    let mut archive = tar::Builder::new(writer);
-    archive.append_data(&mut header, relative, File::open(source)?)?;
-    archive.finish()
+    let mut file = File::open(source)?;
+    writer.write_all(&file.metadata()?.len().to_be_bytes())?;
+    file.seek(SeekFrom::Start(offset))?;
+    io::copy(&mut file.take(length), &mut writer)?;
+    writer.flush()
 }
 
 /// Emit every regular file below `prefix` as NUL-terminated absolute container
@@ -311,6 +317,12 @@ fn required_value(arguments: &[std::ffi::OsString], name: &str) -> Result<String
         .ok_or_else(|| format!("{name} is required and must be UTF-8"))
 }
 
+fn required_number(arguments: &[std::ffi::OsString], name: &str) -> Result<u64, String> {
+    required_value(arguments, name)?
+        .parse()
+        .map_err(|error| format!("{name} is not a byte count: {error}"))
+}
+
 fn required_path(arguments: &[std::ffi::OsString], name: &str) -> Result<PathBuf, String> {
     optional_path(arguments, name)?.ok_or_else(|| format!("{name} is required"))
 }
@@ -361,6 +373,27 @@ mod tests {
     fn rejects_unsafe_path() {
         assert!(safe_relative(Path::new("../escape")).is_err());
         assert!(safe_absolute("/safe/path").is_ok());
+    }
+
+    #[test]
+    fn fetches_byte_range() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("out")).unwrap();
+        std::fs::write(directory.path().join("out/data"), b"0123456789").unwrap();
+
+        let mut middle = Vec::new();
+        fetch_range(directory.path(), "/out/data", 3, 4, &mut middle).unwrap();
+        assert_eq!(middle, [&10u64.to_be_bytes()[..], b"3456"].concat());
+
+        // A range past the end still reports the size, so the caller can stop.
+        let mut tail = Vec::new();
+        fetch_range(directory.path(), "/out/data", 8, 4, &mut tail).unwrap();
+        assert_eq!(tail, [&10u64.to_be_bytes()[..], b"89"].concat());
+        let mut past = Vec::new();
+        fetch_range(directory.path(), "/out/data", 12, 4, &mut past).unwrap();
+        assert_eq!(past, 10u64.to_be_bytes());
+
+        assert!(fetch_range(directory.path(), "/out", 0, 4, &mut Vec::new()).is_err());
     }
 
     #[test]

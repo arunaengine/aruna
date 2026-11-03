@@ -15,9 +15,10 @@ use aruna_operations::driver::drive;
 use aruna_operations::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
 use aruna_operations::metadata::api::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
-    ObjectExecution, ObjectQueryMode, SearchQueryRequest, search_buckets_distributed,
-    search_metadata as run_search_metadata, search_objects,
+    ObjectExecution, ObjectQueryMode, SearchQueryRequest, forwarded_bearer,
+    search_buckets_distributed, search_metadata as run_search_metadata, search_objects,
 };
+use aruna_operations::s3::bucket::metadata::dataset_description;
 use aruna_operations::s3::object::search::ObjectKeyMatch;
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{Query, State};
@@ -275,13 +276,16 @@ pub struct BucketHit {
     pub group_id: String,
     pub group_name: Option<String>,
     pub created_at: String,
-    /// The distributed bucket this hit is a member of; absent for an ordinary bucket. Hits of one
-    /// set on several nodes are one bucket.
+    /// The distributed bucket this hit is a member of; absent for an ordinary bucket. A page shows
+    /// one member of a set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set_id: Option<String>,
-    /// The bucket's metadata, in a `database=true` search only.
+    /// The bucket's current metadata, if it has any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<crate::routes::storage::bucket_metadata::BucketMetadataBody>,
+    /// What a database's linked dataset says now, read with the caller's access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<crate::routes::storage::bucket_metadata::DatasetDescriptionBody>,
     /// Anyone, also without a login, may read the bucket; in a `database=true` search only.
     #[serde(default)]
     pub public: bool,
@@ -396,11 +400,14 @@ to its own buckets, so a bucket the caller may not read never appears.
 - The search fans out over the realm's serving nodes under one shared deadline of about 12 seconds.
 - An empty or missing `q` lists every bucket the caller may read; `group_id` keeps only the
   buckets of that group.
+- Every hit carries the bucket's current `metadata`, if it has any. A database hit also
+  carries `description`, read now from its linked dataset with the caller's access; it is
+  absent while that dataset cannot be read. Queries match bucket names only.
 - `database=true` keeps only buckets whose current metadata marks them as a database, across
-  groups, and adds that `metadata` and `public` (readable without a login) to each hit. This is
-  how clients find databases; there is no separate database list.
-- A member of a distributed bucket carries its `set_id`; every member node answers its own hit,
-  so hits with one `set_id` are one bucket.
+  groups, and adds `public` (readable without a login) to each hit. This is how clients find
+  databases; there is no separate database list.
+- A distributed bucket carries its `set_id` and shows once per page, as the member node that
+  sorts first; a page boundary between two members may show it again on the next page.
 - Hits are ordered by bucket name, then node id. `next_cursor` continues the listing and is absent
   on the last page. It is opaque, holds a scan position per node and is only valid with the same
   `q` and `group_id`; every page checks authorization again.
@@ -425,7 +432,7 @@ to its own buckets, so a bucket the caller may not read never appears.
         ("group_id" = Option<String>, Query, description = "Only buckets of this group, as a 26-character ULID"),
         ("limit" = Option<usize>, Query, description = "Maximum number of merged hits (default 10, clamped to 1..=50)"),
         ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` of the previous page, with the same `q`, `group_id` and `database`"),
-        ("database" = Option<bool>, Query, description = "Only buckets whose metadata marks them as a database; hits then carry `metadata` and `public`")
+        ("database" = Option<bool>, Query, description = "Only buckets whose metadata marks them as a database; hits then carry `public`")
     ),
     responses(
         (
@@ -469,13 +476,14 @@ pub async fn bucket_search(
         return Err(ServerError::BadRequest);
     }
     let group_id = params.group_id.as_deref().map(parse_group_id).transpose()?;
+    let bearer = bearer_token.map(|carrier| carrier.as_str().to_string());
     let result = search_buckets_distributed(
         state.get_ctx().as_ref(),
         state.get_realm_id(),
         state.get_node_id(),
         BucketSearchRequest {
-            auth,
-            bearer_token: bearer_token.map(|carrier| carrier.as_str().to_string()),
+            auth: auth.clone(),
+            bearer_token: bearer.clone(),
             query: query.to_string(),
             limit: params
                 .limit
@@ -489,7 +497,9 @@ pub async fn bucket_search(
     )
     .await
     .map_err(map_api_error)?;
-    Ok((StatusCode::OK, Json(map_bucket_section(result))))
+    let mut section = map_bucket_section(result);
+    describe_hits(&state, &auth, bearer.as_deref(), &mut section).await;
+    Ok((StatusCode::OK, Json(section)))
 }
 
 #[utoipa::path(
@@ -511,8 +521,11 @@ restrictions and request policies before it can be returned.
 - `coverage` names the live-head source, observation times, failed partitions, completeness and
   truncation.
 - A bucket-scoped search of a distributed bucket reads only the key indexes of the ranges each
-  member coordinates and examines a bounded number of candidates per page; a page that reaches
-  that bound returns a cursor even without hits. Substring queries match whole name parts of
+  member coordinates. Substring and metadata queries look their terms up in the index, so a page
+  holds the next matches in key order and an index answers no more hits once a page comes back
+  without a cursor. A page can still return a cursor with few or no hits when the caller may not
+  read the matches, or when a range is only partly indexed. A prefix query without terms
+  examines a bounded number of keys per page. Substring queries match whole name parts of
   the key, split at `/`, `.`, `-`, `_` and other separators. `coverage.incomplete_ranges` counts
   ranges whose index is missing or still being built (and, in `local` mode, ranges another
   member coordinates); they are never scanned, and `complete` is false while any remain.
@@ -527,10 +540,12 @@ restrictions and request policies before it can be returned.
   Words of `q` must all appear in the text columns (case-insensitive, whole words); terms
   `column=value` must equal an exact column, with quotes around values with spaces, as in
   `coli taxid=562 assembly_level="Complete Genome"`. Each hit carries the object's kept metadata
-  columns in `metadata`, after the same authorization as every hit. A distributed bucket walks only its
-  searchable keys, a bounded number per page, so a rare match may take many pages.
-- A search without `bucket` skips distributed buckets, which only their key indexes cover;
-  each skipped bucket counts in `coverage.incomplete_ranges`.
+  columns in `metadata`, after the same authorization as every hit. A distributed bucket finds the
+  matches in its key indexes, so a rare match is on the first page.
+- A search without `bucket` reaches a distributed bucket through its key indexes: the page whose
+  scan reaches it adds one bucket-scoped page of its hits, so that page may hold more than `limit`
+  hits. More hits of it than one page, a failed search of it, or more than 8 such buckets on one
+  page count in `coverage.incomplete_ranges`; search the bucket by name for all its hits.
 - A cursor that continues after keys the caller may not see carries them sealed; a restart of
   the node that sealed it makes such a cursor invalid."#,
     params(
@@ -928,7 +943,7 @@ async fn run_buckets(
         state.get_node_id(),
         BucketSearchRequest {
             auth: auth.clone(),
-            bearer_token,
+            bearer_token: bearer_token.clone(),
             query: query.to_string(),
             limit: limit.min(MAX_BUCKET_LIMIT),
             group_id: None,
@@ -939,7 +954,43 @@ async fn run_buckets(
     )
     .await
     .map_err(map_api_error)?;
-    Ok(Some(map_bucket_section(result)))
+    let mut section = map_bucket_section(result);
+    describe_hits(state, auth, bearer_token.as_deref(), &mut section).await;
+    Ok(Some(section))
+}
+
+/// Datasets one search reads at the same time.
+const DESCRIBE_READS: usize = 8;
+
+/// Adds the linked dataset's description to every database hit, reading each dataset once with
+/// the caller's access; a dataset that cannot be read now leaves its hits without one.
+async fn describe_hits(
+    state: &ServerState,
+    auth: &AuthContext,
+    bearer: Option<&str>,
+    section: &mut BucketsSection,
+) {
+    use futures_util::StreamExt;
+    let dataset_of = |hit: &BucketHit| {
+        let metadata = hit.metadata.as_ref().filter(|metadata| metadata.database)?;
+        Ulid::from_string(metadata.dataset.as_deref()?).ok()
+    };
+    let datasets: std::collections::BTreeSet<Ulid> =
+        section.hits.iter().filter_map(dataset_of).collect();
+    let ctx = state.get_ctx();
+    let reads = datasets.into_iter().map(|dataset| {
+        let token = forwarded_bearer(bearer).ok().flatten();
+        let read = dataset_description(&ctx, state.get_realm_id(), dataset, (Some(auth), token));
+        async move { (dataset, read.await.ok()) }
+    });
+    let found: std::collections::BTreeMap<_, _> = futures_util::stream::iter(reads)
+        .buffer_unordered(DESCRIBE_READS)
+        .collect()
+        .await;
+    for hit in &mut section.hits {
+        let described = dataset_of(hit).and_then(|dataset| found.get(&dataset).cloned());
+        hit.description = described.flatten().map(Into::into);
+    }
 }
 
 fn map_bucket_section(result: BucketSearchExecution) -> BucketsSection {
@@ -965,6 +1016,7 @@ fn map_bucket_section(result: BucketSearchExecution) -> BucketsSection {
                 created_at: chrono::DateTime::<chrono::Utc>::from(hit.created_at).to_rfc3339(),
                 set_id: hit.set_id.map(|set_id| set_id.to_string()),
                 metadata: hit.metadata.map(Into::into),
+                description: None,
                 public: hit.public,
             })
             .collect(),

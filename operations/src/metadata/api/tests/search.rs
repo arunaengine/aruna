@@ -451,6 +451,7 @@ fn search_assembly_order() {
         failed_partitions: Vec::new(),
         discovery_failed: false,
         omitted_partitions: 0,
+        pending: Vec::new(),
     };
     let page = |node_id, key: Option<&str>| SearchNodePage {
         hits: key
@@ -477,6 +478,7 @@ fn search_assembly_order() {
         remote_ranges: 0,
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
+        skipped_buckets: Vec::new(),
     };
     let stats = || MetadataFanoutStats {
         nodes_queried: 2,

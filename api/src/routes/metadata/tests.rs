@@ -52,7 +52,8 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::record::METADATA_HANDLE;
 use aruna_core::structs::storage::blob::{
-    BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, HashIndex, VersionKey,
+    ArchiveKey, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, HashIndex,
+    VersionKey,
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{PersistedTaskTimer, TaskKey};
@@ -3889,11 +3890,108 @@ async fn preflight_finds_ids() {
     .unwrap();
     assert_eq!(response.targets.len(), 1);
     let target = &response.targets[0];
-    assert_eq!(target.content_w3id, preflight_w3id(hash));
+    assert_eq!(target.content_w3id, Some(preflight_w3id(hash)));
+    assert_eq!(target.location_iri, None);
     assert_eq!(target.targeted_versions.len(), 1);
     assert_eq!(target.visible_references[0].document_id, document_id);
     assert!(target.would_remove_location);
     assert!(response.coverage.path_style_complete);
+}
+
+// A key whose bytes were never read is a target by its location, so its s3 backlinks are found
+// and resolution is complete; coverage names the content w3ids that cannot be searched.
+#[tokio::test]
+async fn preflight_locates_unread() {
+    let test = setup_state().await;
+    let (bucket, key) = ("unread-bucket", "genomes/b.fna");
+    let version_id = Ulid::generate();
+    let ctx = test.state.get_ctx();
+    let bucket_info = BucketInfo {
+        group_id: test.group_id,
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: test.auth.user_id,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: None,
+    };
+    let pending = BlobVersion::pending(
+        ArchiveKey::new(Ulid::generate(), BackendRef::node_default()),
+        SystemTime::UNIX_EPOCH,
+        test.auth.user_id,
+        None,
+    );
+    let rows = [
+        (
+            S3_BUCKET_KEYSPACE,
+            bucket.as_bytes().to_vec(),
+            bucket_info.to_bytes().unwrap(),
+        ),
+        (
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new(bucket, key).to_bytes().unwrap(),
+            CurrentVersionPointer::new(version_id).to_bytes().unwrap(),
+        ),
+        (
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(bucket, key, version_id).to_bytes().unwrap(),
+            pending.to_bytes().unwrap(),
+        ),
+    ];
+    for (key_space, row, value) in rows {
+        write_doc(&ctx, key_space, row.into(), value.into()).await;
+    }
+    let document_id = create_linking_doc(
+        &test,
+        test.auth.clone(),
+        test.group_id,
+        "datasets/unread-reference",
+        "Unread reference",
+        true,
+        &[("license", &format!("s3://{bucket}/{key}"))],
+    )
+    .await;
+    drain_metadata_background(test.state.as_ref()).await;
+    let purge = || PreflightTargetBody::BucketPrefix {
+        bucket: bucket.to_string(),
+        prefix: Some(key.to_string()),
+        operation: PreflightStorageBody::AllVersionsPurge,
+    };
+
+    // Without an S3 endpoint no path-style IRI of the key is queried, so coverage says so.
+    let mode = || MetadataQueryMode::Local;
+    let auth = Some(test.auth.clone());
+    let response = preflight_route(&test, auth.clone(), purge(), mode(), true, None, None)
+        .await
+        .unwrap();
+    assert!(!response.coverage.path_style_complete);
+    assert!(!response.targets[0].would_remove_location);
+
+    test.state
+        .register_s3_interface("127.0.0.1:9000".parse().unwrap(), "https://s3.example.test")
+        .await;
+    let response = preflight_route(&test, auth, purge(), mode(), true, None, None)
+        .await
+        .unwrap();
+    assert!(response.coverage.path_style_complete);
+    assert_eq!(response.targets.len(), 1);
+    let target = &response.targets[0];
+    assert_eq!(target.content_w3id, None);
+    assert_eq!(
+        target.location_iri.as_deref(),
+        Some("s3://unread-bucket/genomes/b.fna")
+    );
+    assert_eq!(target.visible_references[0].document_id, document_id);
+    assert!(target.would_remove_location);
+    assert!(response.coverage.target_resolution_complete);
+    let excluded = response.coverage.excluded_forms.iter();
+    assert!(
+        excluded
+            .map(|form| form.form.as_str())
+            .any(|form| form == "unread_content_w3id")
+    );
 }
 
 async fn create_test_document(

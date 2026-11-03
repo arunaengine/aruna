@@ -105,7 +105,7 @@ pub(super) async fn resolve_preflight_targets(
             )
             .await?;
 
-            let (versions, mut complete) = match operation {
+            let (versions, complete) = match operation {
                 MetadataStorageOperation::LatestVersionTombstone => {
                     resolve_preflight_versions(context, &bucket, prefix.as_deref()).await?
                 }
@@ -134,69 +134,79 @@ pub(super) async fn resolve_preflight_targets(
                     .await?;
                 }
             }
-            let mut targets = BTreeMap::<[u8; 32], MetadataResolvedTarget>::new();
-            for (version_key, version) in versions {
-                let content_hash = match version.state {
-                    BlobVersionState::Materialized { blob_hash, .. } => blob_hash,
-                    BlobVersionState::Reference { .. }
-                    | BlobVersionState::PendingContent { .. } => {
-                        complete = false;
-                        continue;
-                    }
-                    BlobVersionState::Deleted => continue,
-                };
-                let location = MetadataPreflightLocation {
-                    node_id: local_node_id,
-                    bucket: version_key.bucket.clone(),
-                    key: version_key.key.clone(),
-                    version_id: version_key.version_id,
-                };
-                let target = targets.entry(content_hash).or_insert_with(|| {
-                    let content_w3id = format!("{ARUNA_DATA_PREFIX}{}", hex::encode(content_hash));
-                    MetadataResolvedTarget {
-                        queried_iris: vec![content_w3id.clone()],
-                        content_w3id,
-                        content_hash,
-                        targeted_versions: Vec::new(),
-                        removed_locations: Vec::new(),
-                        remove_resolvable_locations: false,
-                    }
-                });
-                add_location_iris(
-                    &mut target.queried_iris,
-                    s3_endpoint,
-                    &location.bucket,
-                    &location.key,
-                );
-                target.targeted_versions.push(location.clone());
-                if operation == MetadataStorageOperation::AllVersionsPurge {
-                    target.removed_locations.push(location);
-                }
-            }
-            for target in targets.values_mut() {
-                target.queried_iris.sort();
-                target.queried_iris.dedup();
-                target.targeted_versions.sort_by_key(|location| {
-                    (
-                        location.bucket.clone(),
-                        location.key.clone(),
-                        location.version_id,
-                    )
-                });
-                target.removed_locations.sort_by_key(|location| {
-                    (
-                        location.bucket.clone(),
-                        location.key.clone(),
-                        location.version_id,
-                    )
-                });
-            }
             Ok(ResolvedPreflightTargets {
-                targets: targets.into_values().collect(),
+                targets: version_targets(versions, operation, local_node_id, s3_endpoint),
                 complete,
             })
         }
     }
+}
+
+/// The content hash of a location target, which has none: its bytes were never read.
+const LOCATION_HASH: [u8; 32] = [0; 32];
+
+/// Groups versions into targets: stored bytes by their content identity, reference and pending
+/// versions, whose bytes were never read, by the `s3://` location of their key.
+pub(super) fn version_targets(
+    versions: Vec<(VersionKey, BlobVersion)>,
+    operation: MetadataStorageOperation,
+    local_node_id: NodeId,
+    s3_endpoint: Option<&str>,
+) -> Vec<MetadataResolvedTarget> {
+    let mut targets = BTreeMap::<String, MetadataResolvedTarget>::new();
+    for (version_key, version) in versions {
+        let (id, content_hash) = match version.state {
+            BlobVersionState::Materialized { blob_hash, .. } => (
+                format!("{ARUNA_DATA_PREFIX}{}", hex::encode(blob_hash)),
+                blob_hash,
+            ),
+            BlobVersionState::Reference { .. } | BlobVersionState::PendingContent { .. } => (
+                format!("s3://{}/{}", version_key.bucket, version_key.key),
+                LOCATION_HASH,
+            ),
+            BlobVersionState::Deleted => continue,
+        };
+        let location = MetadataPreflightLocation {
+            node_id: local_node_id,
+            bucket: version_key.bucket.clone(),
+            key: version_key.key.clone(),
+            version_id: version_key.version_id,
+        };
+        let target = targets
+            .entry(id.clone())
+            .or_insert_with(|| MetadataResolvedTarget {
+                queried_iris: vec![id.clone()],
+                content_w3id: id,
+                content_hash,
+                targeted_versions: Vec::new(),
+                removed_locations: Vec::new(),
+                remove_resolvable_locations: false,
+            });
+        add_location_iris(
+            &mut target.queried_iris,
+            s3_endpoint,
+            &location.bucket,
+            &location.key,
+        );
+        target.targeted_versions.push(location.clone());
+        if operation == MetadataStorageOperation::AllVersionsPurge {
+            target.removed_locations.push(location);
+        }
+    }
+    let order = |location: &MetadataPreflightLocation| {
+        (
+            location.bucket.clone(),
+            location.key.clone(),
+            location.version_id,
+        )
+    };
+    for target in targets.values_mut() {
+        target.queried_iris.sort();
+        target.queried_iris.dedup();
+        target.targeted_versions.sort_by_key(order);
+        target.removed_locations.sort_by_key(order);
+    }
+    targets.into_values().collect()
 }
 
 /// Resolves the current versions of at most `MAX_TARGET_VERSIONS` keys; false marks a cut scope.
@@ -414,9 +424,13 @@ pub(crate) async fn references_preflight_local(
     let mut target_locations = BTreeMap::<String, (bool, bool)>::new();
     let mut aliases_seen = false;
     for target in request.targets.iter_mut() {
-        let mut local_aliases = drive(ResolvePathsOperation::new(target.content_hash), context)
-            .await
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+        // A location target has no content identity to find other copies by.
+        let mut local_aliases = match target.location() {
+            Some(_) => Vec::new(),
+            None => drive(ResolvePathsOperation::new(target.content_hash), context)
+                .await
+                .map_err(|_| MetadataApiError::ServiceUnavailable)?,
+        };
         local_aliases.retain(|alias| alias.realm_id == realm_id && alias.node_id == local_node_id);
         aliases_seen |= !local_aliases.is_empty();
         let mut found = false;
@@ -809,13 +823,23 @@ pub struct MetadataPreflightLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataResolvedTarget {
+    /// The content w3id, or the `s3://` location IRI of a location target; it keys the target.
     pub content_w3id: String,
+    /// All zeros for a location target; a node of an earlier build then finds no copy by it and
+    /// still looks up the target's IRIs.
     pub content_hash: [u8; 32],
     pub queried_iris: Vec<String>,
     pub targeted_versions: Vec<MetadataPreflightLocation>,
     pub removed_locations: Vec<MetadataPreflightLocation>,
     #[serde(rename = "remove_all_resolvable_locations")]
     pub remove_resolvable_locations: bool,
+}
+
+impl MetadataResolvedTarget {
+    /// The location IRI of a target named by its location, as its bytes were never read.
+    pub fn location(&self) -> Option<&str> {
+        (!self.content_w3id.starts_with(ARUNA_DATA_PREFIX)).then_some(self.content_w3id.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -868,7 +892,10 @@ pub struct ReferenceNodeExecution {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceTargetExecution {
-    pub content_w3id: String,
+    /// The content identity of stored bytes; `None` for a location target.
+    pub content_w3id: Option<String>,
+    /// The `s3://` location of reference or pending versions, whose bytes were never read.
+    pub location_iri: Option<String>,
     pub targeted_versions: Vec<MetadataPreflightLocation>,
     pub visible_references: Vec<MetadataVisibleReference>,
     pub hidden_references_exist: bool,
@@ -1226,6 +1253,9 @@ pub(super) fn assemble_preflight_execution(
                 title: hit.title,
             });
     }
+    // A location target has a path-style IRI only when the node it was resolved on serves S3.
+    let unread = (resolved.targets.iter()).any(|target| target.location().is_some());
+    path_style_complete &= plan.s3_endpoint.is_some() || !unread;
     let index_current = node_freshness
         .iter()
         .all(|freshness| freshness.index_state == MetadataIndexState::Current);
@@ -1246,14 +1276,18 @@ pub(super) fn assemble_preflight_execution(
                 .unwrap_or((false, false));
             let removes_location =
                 target.remove_resolvable_locations || !target.removed_locations.is_empty();
+            // Purging a location target's versions ends its only known location.
+            let location = target.location().is_some();
+            let last = location || (found && !remaining);
             ReferenceTargetExecution {
                 visible_references: visible_by_target
                     .remove(&target.content_w3id)
                     .unwrap_or_default(),
                 hidden_references_exist: hidden.contains(&target.content_w3id),
-                would_remove_location: complete && removes_location && found && !remaining,
+                would_remove_location: complete && removes_location && last,
                 location_impact_complete: complete,
-                content_w3id: target.content_w3id,
+                content_w3id: (!location).then(|| target.content_w3id.clone()),
+                location_iri: location.then_some(target.content_w3id),
                 targeted_versions: target.targeted_versions,
             }
         })
@@ -1309,7 +1343,14 @@ pub(super) fn assemble_preflight_execution(
                     form: "imported_external_identity",
                     reason: "external identities without an Aruna content mapping are outside coverage",
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(unread.then_some(MetadataExcludedForm {
+                form: "unread_content_w3id",
+                reason: "reference and pending versions have no content identity until their bytes \
+                         are read, so documents citing those bytes by content w3id are not found",
+            }))
+            .collect(),
             node_freshness,
             target_resolution_complete: resolved.complete,
             path_style_complete,

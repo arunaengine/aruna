@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use aruna_compute::executor::BackendCaps;
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
     AttemptRef, ExecutorKind, NetworkAccess, ResourceRequest, S3Mount, Secret, SecurityContext,
@@ -16,7 +17,7 @@ use aruna_core::structs::execution::job::{ExecutionSpec, JobError, JobRecord, Wo
 use super::DEFAULT_WALLTIME;
 use crate::driver::DriverContext;
 use crate::jobs::lifecycle::ids::session_of;
-use crate::jobs::workflow::input_view::{view_bucket, view_entries};
+use crate::jobs::workflow::input_view::{cached_keys, view_bucket, view_entries};
 use crate::jobs::workflow::workspace::{
     check_workspace_bucket, ensure_group_write, load_direct_inputs, mint_input_credential,
     mint_workspace_credential,
@@ -48,7 +49,8 @@ pub(super) struct PreparedTask {
     pub(super) mounts: Vec<S3Mount>,
     pub(super) secrets: BTreeMap<String, Secret>,
     pub(super) staging: StagingMode,
-    /// Set for a session only: the bucket and endpoint its credential reaches.
+    /// Set for a session or a batch run inside its bucket: the bucket and endpoint its
+    /// credential reaches.
     pub(super) workspace: Option<WorkspaceBinding>,
 }
 
@@ -57,8 +59,8 @@ pub(super) fn job_bucket(record: &JobRecord) -> String {
     record.workspace_bucket.clone().unwrap_or_default()
 }
 
-/// Whether the backend this run is placed on can mount inputs.
-fn backend_mounts(context: &DriverContext, spec: &ExecutionSpec) -> bool {
+/// The capabilities of the backend this run is placed on.
+fn backend_caps(context: &DriverContext, spec: &ExecutionSpec) -> Option<BackendCaps> {
     let kind = spec
         .executor_constraint
         .as_deref()
@@ -68,7 +70,23 @@ fn backend_mounts(context: &DriverContext, spec: &ExecutionSpec) -> bool {
         .as_ref()
         .zip(kind)
         .and_then(|(registry, kind)| registry.get(&kind).map(|backend| backend.capabilities()))
-        .is_some_and(|caps| caps.s3_mount)
+}
+
+/// Whether the backend this run is placed on can mount inputs.
+fn backend_mounts(context: &DriverContext, spec: &ExecutionSpec) -> bool {
+    backend_caps(context, spec).is_some_and(|caps| caps.s3_mount)
+}
+
+/// Whether a batch run inside its bucket gets a session's S3 access: its backend gives
+/// sessions S3 and this node names an endpoint for it.
+fn workspace_access(context: &DriverContext, spec: &ExecutionSpec, record: &JobRecord) -> bool {
+    let endpoint = context.compute_handle.as_ref().is_some_and(|registry| {
+        let workspace = registry.workspace_endpoint();
+        workspace.session_endpoint.is_some() || workspace.endpoint.is_some()
+    });
+    record.workspace_mode == WorkspaceMode::Existing
+        && endpoint
+        && backend_caps(context, spec).is_some_and(|caps| caps.session)
 }
 
 /// The input view a run mounts, when its backend mounts and any input is mounted.
@@ -111,12 +129,16 @@ async fn prepare_inputs(
         });
     }
     let view = view_bucket(record.job_id);
+    let cached = Box::pin(cached_keys(context, &entries, node_id))
+        .await
+        .map_err(|error| JobError::retryable(error.to_string()))?;
     let mounts = entries
         .iter()
         .map(|entry| S3Mount {
             bucket: view.clone(),
             key: entry.key.clone(),
             path: entry.input.container_path.clone().unwrap_or_default(),
+            cached: cached.contains(&entry.key),
         })
         .collect();
     let mut secrets = BTreeMap::new();
@@ -168,7 +190,7 @@ pub(super) async fn prepare_attempt(
     node_id: NodeId,
     bucket: &str,
 ) -> Result<PreparedTask, JobError> {
-    let session = session_of(spec).is_some();
+    let session = session_of(spec).is_some() || workspace_access(context, spec, record);
     let mut prepared = Box::pin(prepare_inputs(context, spec, record, node_id, !session)).await?;
     if session {
         Box::pin(add_session_credential(
@@ -184,8 +206,8 @@ pub(super) async fn prepare_attempt(
     Ok(prepared)
 }
 
-/// A session reads and writes its workspace bucket over S3 and nothing else.
-/// The credential is revoked with the job's terminal cleanup.
+/// A session, or a batch run inside its bucket, reads and writes that bucket over S3 and
+/// nothing else. The credential is revoked with the job's terminal cleanup.
 async fn add_session_credential(
     context: &DriverContext,
     spec: &ExecutionSpec,

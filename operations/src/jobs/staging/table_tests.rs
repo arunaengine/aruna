@@ -438,6 +438,101 @@ async fn summary_imports_folders() {
     server.abort();
 }
 
+// A gzip table spanning many chunks is fetched once per run: each chunk continues the decoder
+// of the one before instead of decompressing the table from its start again.
+#[tokio::test]
+async fn gzip_table_streams() {
+    use std::io::Write;
+    const GZIP: &str = "ASSEMBLY_REPORTS/assembly_summary_refseq.txt.gz";
+    let (endpoint, site, server) = serve(|endpoint| {
+        let mut site = Site::ncbi(endpoint);
+        let summary = String::from_utf8(site.files[GZIP.trim_end_matches(".gz")].clone()).unwrap();
+        let (header, rows) = summary.split_at(summary.find("\nGCF_").unwrap() + 1);
+        // A filtered row repeated until the real rows lie several chunks into the table.
+        let filler = rows.lines().nth(2).unwrap();
+        let mut table = header.to_string();
+        while table.len() < 4 * aruna_core::structs::execution::table::TABLE_CHUNK {
+            table.push_str(filler);
+            table.push('\n');
+        }
+        table.push_str(rows);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Default::default());
+        encoder.write_all(table.as_bytes()).unwrap();
+        site.files
+            .insert(GZIP.to_string(), encoder.finish().unwrap());
+        site
+    })
+    .await;
+    let mut table = summary_table();
+    table["source"]["connector"] = GZIP.into();
+    let fixture = Fixture::new(&endpoint, table).await;
+
+    assert_eq!(fixture.run(9).await, (4, 0));
+    assert_eq!(
+        site.count(&Method::GET, GZIP),
+        1,
+        "one stream for the whole table"
+    );
+    server.abort();
+}
+
+/// A stream of `bytes` in pieces, the way a transport delivers them.
+fn pieces(bytes: Vec<u8>) -> BackendStream<Result<Bytes, StreamError>> {
+    let pieces: Vec<Result<Bytes, StreamError>> = (bytes.chunks(16 * 1024))
+        .map(|piece| Ok(Bytes::copy_from_slice(piece)))
+        .collect();
+    BackendStream(Box::pin(futures_util::stream::iter(pieces)))
+}
+
+// A source rewritten in place while a step kept its stream makes the kept decoder fail; the
+// stream is opened again once, and that open reports the change, never a broken table.
+#[tokio::test]
+async fn rewritten_gzip_reopens() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut seed = 7u64;
+    let mut text = Vec::new();
+    while text.len() < 1 << 20 {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        text.extend_from_slice(format!("{:016x}\n", seed).as_bytes());
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Default::default());
+    encoder.write_all(&text).unwrap();
+    let compressed = encoder.finish().unwrap();
+    // The first part of the table, then bytes another writer left behind.
+    let mut rewritten = compressed[..compressed.len() / 2].to_vec();
+    rewritten.extend(std::iter::repeat_n(0xFF, compressed.len() / 2));
+    let opens = AtomicUsize::new(0);
+    let open = || {
+        let first = opens.fetch_add(1, Ordering::SeqCst) == 0;
+        let rewritten = rewritten.clone();
+        async move {
+            match first {
+                true => Ok((pieces(rewritten), None)),
+                false => Err(ChunkFailure::Changed),
+            }
+        }
+    };
+    let mut kept = None;
+    let mut offset = 0;
+    let failure = loop {
+        match gzip_chunk(&mut kept, (None, None, offset), open).await {
+            Ok((bytes, _, _)) => offset += bytes.len() as u64,
+            Err(failure) => break failure,
+        }
+    };
+    assert!(offset > 0, "the first steps read the table");
+    assert!(matches!(failure, ChunkFailure::Changed));
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+
+    // A freshly opened stream that is no valid gzip stays a lasting failure.
+    let broken = || async { Ok((pieces(vec![0xFF; 1024]), None)) };
+    let failure = gzip_chunk(&mut None, (None, None, 0), broken).await;
+    assert!(matches!(failure, Err(ChunkFailure::Lasting(_))));
+}
+
 // An uploaded CSV of file URLs imports one reference per row with its kept columns, read as
 // the submitter.
 #[tokio::test]
@@ -598,5 +693,55 @@ async fn list_columns_recorded() {
     let kept = &hits[0].metadata;
     assert_eq!(kept.get("note").map(String::as_str), Some("coli sums"));
     assert!(kept.keys().all(|key| !key.starts_with("aruna-")));
+    server.abort();
+}
+
+// Record rows are trusted as they are: the source sees no request, the references keep the
+// row's ETag, type, time and metadata, and a row without a source writes an empty object.
+#[tokio::test]
+async fn record_rows_trusted() {
+    let (endpoint, site, server) = serve(Site::ncbi).await;
+    let table = serde_json::json!({
+        "source": { "object": { "bucket": "lists", "key": "records.tsv" } },
+        "format": { "delimiter": "\t", "quote": null },
+        "rows": { "kind": "record", "source": "{source}", "target": "{key}", "keep": [],
+                  "size": "size", "modified": "modified",
+                  "checksums": [{ "algorithm": "md5", "column": "md5" }] }
+    });
+    let fixture = Fixture::new(&endpoint, table).await;
+    let md5 = format!("{:x}", md5::compute(b"sums"));
+    let meta = r#"{"note":"coli sums","aruna-search-text":"note"}"#;
+    let tsv = format!(
+        "key\tsource\tsize\tmodified\tetag\tcontent_type\tmd5\tmetadata\n\
+         coli/sums.txt\t{COLI}md5checksums.txt\t4\t2025-11-17T17:38:21Z\t\"e1\"\ttext/plain\t{md5}\t{meta}\n\
+         coli/\t\t0\t\t\t\t\t{meta}\n"
+    );
+    let ctx = fixture.context(40).await;
+    let lists = drive(
+        GetBucketOperation::new("lists".to_string()),
+        &fixture.driver,
+    )
+    .await;
+    let body = (Bytes::from(tsv), &BTreeMap::new());
+    let lists = ("lists", &lists.unwrap());
+    write_object(&ctx, &fixture.spec, lists, "records.tsv", body)
+        .await
+        .ok()
+        .unwrap();
+
+    fixture.run(41).await;
+    assert!(site.requests.lock().unwrap().is_empty());
+    let observation = fixture.observation("coli/sums.txt").await;
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_763_401_101);
+    assert_eq!(observation.content_length, 4);
+    assert_eq!(observation.etag.as_deref(), Some("\"e1\""));
+    assert_eq!(observation.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(observation.last_modified, Some(at));
+    let bucket = fixture.spec.bucket.clone();
+    let (_, folder) = fixture.head(&bucket, "coli/").await.unwrap();
+    assert_eq!(folder["note"], "coli sums");
+    let mut found = fixture.search("sums").await;
+    found.sort();
+    assert_eq!(found, ["coli/", "coli/sums.txt"]);
     server.abort();
 }

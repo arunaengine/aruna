@@ -17,7 +17,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
+use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat, RunningJobs};
 use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
@@ -444,6 +444,7 @@ pub async fn refresh_info_heartbeat(
     node_id: NodeId,
     realm_id: RealmId,
     sequence: u64,
+    jobs: Option<RunningJobs>,
 ) -> Result<(), String> {
     let Some(document) = read_info_document(&ctx.storage_handle, node_id).await? else {
         return Ok(());
@@ -508,6 +509,7 @@ pub async fn refresh_info_heartbeat(
             ..reservation
         },
         demand: ComputeDemandSnapshot { epoch, ..demand },
+        jobs,
     };
     crate::node::heartbeat::send_heartbeat(net_handle, heartbeat).await;
     Ok(())
@@ -1417,7 +1419,7 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
 
@@ -1574,7 +1576,7 @@ mod tests {
         let expected_labels = build_view(&config).nodes[0].labels.clone();
         write_realm_config(&ctx, &config).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
         let second = read_info_document(&ctx.storage_handle, local)
@@ -1616,7 +1618,7 @@ mod tests {
         let local = node(1);
         write_realm_config(&ctx, &realm_config(realm_id, &[local])).await;
 
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
         assert!(
@@ -1974,6 +1976,7 @@ mod tests {
                     }],
                     truncated: false,
                 },
+                jobs: None,
             },
             age_ms: 0,
             received_at_ms: 1,
@@ -2343,7 +2346,7 @@ mod tests {
         .unwrap();
 
         write_operator_drain(&ctx, true).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
         let drained = read_info_document(&ctx.storage_handle, local)
@@ -2353,7 +2356,7 @@ mod tests {
         assert!(drained.compute_draining && !drained.leaving);
 
         write_operator_drain(&ctx, false).await.unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
         let released = read_info_document(&ctx.storage_handle, local)
@@ -2386,7 +2389,7 @@ mod tests {
             .await
             .unwrap();
 
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
 
@@ -2417,7 +2420,7 @@ mod tests {
         )
         .await
         .unwrap();
-        refresh_info_heartbeat(&ctx, local, realm_id, 1)
+        refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
 
@@ -2457,7 +2460,7 @@ mod tests {
 
         assert_eq!(read_owed(&ctx, None).await.unwrap(), None);
         for sequence in 1..=3 {
-            refresh_info_heartbeat(&ctx, local, realm_id, sequence)
+            refresh_info_heartbeat(&ctx, local, realm_id, sequence, None)
                 .await
                 .unwrap();
         }
@@ -2474,7 +2477,7 @@ mod tests {
             .await
             .unwrap();
         assert!(commit_txn(&ctx.storage_handle, txn_id).await.unwrap());
-        refresh_info_heartbeat(&ctx, local, realm_id, 4)
+        refresh_info_heartbeat(&ctx, local, realm_id, 4, None)
             .await
             .unwrap();
         let stored = read_info_document(&ctx.storage_handle, local)

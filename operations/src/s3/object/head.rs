@@ -633,6 +633,16 @@ impl Operation for HeadObjectOperation {
         }
     }
 
+    // A missing key or version is a normal answer, for example when an import checks a key first.
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            HeadObjectError::NoSuchKey
+                | HeadObjectError::NoSuchVersion
+                | HeadObjectError::DeleteMarker
+        )
+    }
+
     fn abort(&mut self) -> Effects {
         match self.txn_id {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],

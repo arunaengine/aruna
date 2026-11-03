@@ -606,7 +606,8 @@ pub async fn search_buckets_distributed(
         .clone()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     let remote_auth_token = fanout_bearer(request.bearer_token.as_deref());
-    let positions = decode_cursor(request.cursor.as_deref())?;
+    let cursor = decode_cursor(request.cursor.as_deref())?;
+    let positions = cursor.positions.clone();
     let group_id = request.group_id;
     let database = request.database;
     let done = (positions.iter())
@@ -686,13 +687,13 @@ pub async fn search_buckets_distributed(
         &fanout_stats.omitted[..],
     );
     let retired = retired_nodes(&parts);
-    let (hits, positions) = merge_pages(parts, asked, positions, limit);
+    let (hits, cursor) = merge_pages(parts, asked, cursor, limit);
     // A retired node's part ended early, so the page is partial though its scan is done.
     fanout_stats.nodes_failed += retired.len();
     fanout_stats.failed_partitions.extend(retired);
     Ok(BucketSearchExecution {
         hits,
-        next_cursor: encode_cursor(&positions),
+        next_cursor: encode_cursor(&cursor),
         fanout_stats,
     })
 }

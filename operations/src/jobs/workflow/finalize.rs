@@ -18,6 +18,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::super::output_record::store_outputs;
@@ -164,6 +165,7 @@ pub(crate) async fn finalize_attempt(
     spec: &ExecutionSpec,
     bucket: &str,
     result: Result<AttemptStatus, BackendError>,
+    cancel: &CancellationToken,
 ) {
     let storage = &context.storage_handle;
     let cancel_requested = read_job_record(storage, job_id, None)
@@ -209,7 +211,14 @@ pub(crate) async fn finalize_attempt(
             // Export first: inventory attributes only versions this execution
             // already reserved, so the reservations must be durable before it.
             let Some(captured) = Box::pin(export_or_park(
-                context, job_id, token, backend, fence, spec, bucket,
+                context,
+                job_id,
+                token,
+                backend,
+                fence,
+                spec,
+                bucket,
+                Some(cancel),
             ))
             .await
             else {
@@ -382,7 +391,7 @@ pub(super) async fn finalize_cancel(
             match status.phase {
                 AttemptPhase::Exited { code: 0 } => {
                     let Some(captured) = Box::pin(export_or_park(
-                        context, job_id, token, backend, fence, spec, bucket,
+                        context, job_id, token, backend, fence, spec, bucket, None,
                     ))
                     .await
                     else {
@@ -642,6 +651,23 @@ async fn terminal_fail(
     }
 }
 
+async fn cancel_requested(context: &DriverContext, job_id: JobId) -> bool {
+    read_job_record(&context.storage_handle, job_id, None)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|record| record.cancel_requested)
+}
+
+/// Settles a cancelled run without its outputs; cleanup removes its capture helpers.
+async fn cancel_capture(context: &DriverContext, job_id: JobId, token: ulid::Ulid, bucket: &str) {
+    let storage = &context.storage_handle;
+    let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
+    let result = execution_result_for(bucket, Some(0), Vec::new(), LogTails::default());
+    let record = Box::pin(terminal_cancel(storage, job_id, token, result)).await;
+    Box::pin(cleanup_and_crate(context, job_id, record)).await;
+}
+
 async fn terminal_cancel(
     storage: &aruna_storage::StorageHandle,
     job_id: JobId,
@@ -848,6 +874,9 @@ async fn merge_or_park(
     }
 }
 
+/// A cancel wins over capture: `cancel` stops a running capture, and a failed capture of a
+/// cancelled run settles it as cancelled instead of retrying it.
+#[allow(clippy::too_many_arguments)]
 async fn export_or_park(
     context: &DriverContext,
     job_id: JobId,
@@ -856,6 +885,7 @@ async fn export_or_park(
     fence: &FenceContext,
     spec: &ExecutionSpec,
     bucket: &str,
+    cancel: Option<&CancellationToken>,
 ) -> Option<Vec<OutputObject>> {
     if spec.file_outputs.is_empty() {
         return Some(Vec::new());
@@ -888,12 +918,30 @@ async fn export_or_park(
         Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
         return None;
     };
-    match Box::pin(capture_outputs(
-        context, backend, fence, spec, &record, node_id,
+    // The cancel path itself captures what finished before the cancel, so it is never stopped.
+    let never = CancellationToken::new();
+    let stop = cancel.unwrap_or(&never);
+    let captured = Box::pin(capture_outputs(
+        context,
+        backend,
+        fence,
+        spec,
+        &record,
+        (node_id, stop),
     ))
-    .await
-    {
+    .await;
+    // A cancelled run settles once its capture has returned, after any put cleaned up.
+    let cancelled = || async {
+        cancel.is_none_or(CancellationToken::is_cancelled)
+            || cancel_requested(context, job_id).await
+    };
+    match captured {
         Ok(outputs) => Some(outputs),
+        Err(error) if cancelled().await => {
+            info!(job_id = %job_id, error = ?error, "Output capture of a cancelled run stopped");
+            Box::pin(cancel_capture(context, job_id, token, bucket)).await;
+            None
+        }
         Err(error)
             if error.kind == aruna_core::structs::execution::job::JobErrorKind::Retryable =>
         {

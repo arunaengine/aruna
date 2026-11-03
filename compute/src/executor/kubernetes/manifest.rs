@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use aruna_core::compute::{
-    BackendError, FenceContext, GrantedResources, NetworkAccess, SessionMount, StagingMode,
-    TaskSpec, normalize_container_path,
+    BackendError, CACHE_MANIFEST_KEY, FenceContext, GrantedResources, NetworkAccess, SessionMount,
+    StagingMode, TaskSpec, normalize_container_path,
 };
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolume, PersistentVolumeClaim, Pod, Secret};
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{EPOCH_ANNOTATION, GENERATION_ANNOTATION, ROLE_LABEL, STATE_ANNOTATION};
-use crate::executor::config::KubernetesConfig;
+use crate::executor::config::{KubedalCache, KubernetesConfig};
 use crate::executor::staging::StageLayout;
 use crate::executor::{digest_pinned, enforced_limit};
 
@@ -46,7 +46,7 @@ pub fn job_manifest(
     labels.insert(
         "aruna-engine.org/network".to_string(),
         match spec.security.network {
-            NetworkAccess::Isolated if spec.session => "s3",
+            NetworkAccess::Isolated if spec.reaches_s3() => "s3",
             NetworkAccess::Isolated => "none",
             NetworkAccess::S3Only => "s3",
             NetworkAccess::Open => "task",
@@ -103,6 +103,29 @@ pub fn job_manifest(
     if spec.staging_mode == StagingMode::S3Mount {
         let buckets = mount_buckets(layout);
         for (index, bucket) in buckets.iter().enumerate() {
+            let inputs = layout.mounts.iter().filter(|input| &input.bucket == bucket);
+            let (cached, streamed): (Vec<_>, Vec<_>) =
+                inputs.partition(|input| input.cached && cache_of(config).is_some());
+            // Cached inputs come from a KubeDAL file list that the worker keeps between runs.
+            if let (Some(kubedal), false) = (&config.kubedal, cached.is_empty()) {
+                let volume = cache_name(&name, index);
+                volumes.push(json!({"name":volume,"csi":{
+                    "driver":kubedal.driver,
+                    "readOnly":true,
+                    "volumeAttributes":{"dataNode":mount_name(&name,index),"manifest":CACHE_MANIFEST_KEY}
+                }}));
+                for input in &cached {
+                    mounts.push(json!({
+                        "name":volume,
+                        "mountPath":input.path,
+                        "subPath":input.key,
+                        "readOnly":true
+                    }));
+                }
+            }
+            if streamed.is_empty() {
+                continue;
+            }
             // KubeDAL reads its endpoint and credential from the run's own DataNode.
             let source = match &config.kubedal {
                 Some(kubedal) => json!({"csi":{
@@ -117,7 +140,7 @@ pub fn job_manifest(
                 volume.extend(source.clone());
             }
             volumes.push(volume);
-            for input in layout.mounts.iter().filter(|input| &input.bucket == bucket) {
+            for input in streamed {
                 mounts.push(json!({
                     "name":mount_name(&name,index),
                     "mountPath":input.path,
@@ -127,7 +150,7 @@ pub fn job_manifest(
             }
         }
     }
-    if spec.staging_mode == StagingMode::DirectS3 || spec.session {
+    if spec.staging_mode == StagingMode::DirectS3 || spec.reaches_s3() {
         env_from.push(json!({"secretRef":{"name":secret_name(&name)}}));
     }
     // Tools write caches relative to the working directory, so the non-root
@@ -149,10 +172,21 @@ pub fn job_manifest(
     if let Some(mount) = session_mount(spec, config) {
         let path = normalize_container_path(&mount.path).map_err(BackendError::InvalidSpec)?;
         let volume = data_name(&name);
-        volumes.push(json!({
-            "name":volume,
-            "persistentVolumeClaim":{"claimName":volume}
-        }));
+        // KubeDAL writes through the session's own DataNode, so the credential stays on this realm.
+        volumes.push(match &config.kubedal {
+            Some(kubedal) => {
+                let mut attributes = json!({"dataNode":volume,"mount":"fuse-read-write"});
+                if !mount.prefix.is_empty() {
+                    attributes["path"] = json!(mount.prefix);
+                }
+                json!({"name":volume,"csi":{
+                    "driver":kubedal.driver,
+                    "readOnly":false,
+                    "volumeAttributes":attributes
+                }})
+            }
+            None => json!({"name":volume,"persistentVolumeClaim":{"claimName":volume}}),
+        });
         mounts.push(json!({
             "name":volume,
             "mountPath":path,
@@ -230,6 +264,7 @@ pub fn job_manifest(
                     "serviceAccountName":config.service_account,
                     "automountServiceAccountToken":false,
                     "nodeSelector":node_selector(config),
+                    "affinity":cache_affinity(config, layout),
                     "securityContext":pod_security(),
                     "initContainers":init,
                     "containers":[container],
@@ -283,29 +318,55 @@ pub fn data_node_manifest(
     index: usize,
     bucket: &str,
 ) -> Result<serde_json::Value, BackendError> {
+    let name = mount_name(&context.attempt.external_name(), index);
+    kubedal_node(context, config, &name, bucket, true)
+}
+
+/// The session's writable DataNode for its workspace bucket, named like its data volume.
+pub fn session_node_manifest(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    bucket: &str,
+) -> Result<serde_json::Value, BackendError> {
+    let name = data_name(&context.attempt.external_name());
+    kubedal_node(context, config, &name, bucket, false)
+}
+
+fn kubedal_node(
+    context: &FenceContext,
+    config: &KubernetesConfig,
+    node: &str,
+    bucket: &str,
+    read_only: bool,
+) -> Result<serde_json::Value, BackendError> {
     let kubedal = config.kubedal.as_ref().ok_or_else(|| {
         BackendError::InvalidSpec("KubeDAL mounts are disabled on this backend".to_string())
     })?;
     let name = context.attempt.external_name();
+    let mut spec = json!({
+        "backend":"S3",
+        "read_only":read_only,
+        "secretRef":{"name":secret_name(&name)},
+        "config":{
+            "bucket":bucket,
+            "endpoint":kubedal.endpoint,
+            "region":kubedal.region
+        }
+    });
+    // Runs share cached content by its digest; a session's writable node never caches.
+    if let Some(cache) = kubedal.cache.as_ref().filter(|_| read_only) {
+        spec["cacheScope"] = json!(cache.scope);
+    }
     Ok(json!({
         "apiVersion":"kubedal.arunaengine.org/v1alpha1",
         "kind":"DataNode",
         "metadata":{
-            "name":mount_name(&name,index),
+            "name":node,
             "namespace":config.namespace,
             "labels":labels(context,"s3-mount"),
             "annotations":annotations_base(context,"active")
         },
-        "spec":{
-            "backend":"S3",
-            "read_only":true,
-            "secretRef":{"name":secret_name(&name)},
-            "config":{
-                "bucket":bucket,
-                "endpoint":kubedal.endpoint,
-                "region":kubedal.region
-            }
-        }
+        "spec":spec
     }))
 }
 
@@ -650,6 +711,10 @@ pub fn mount_name(name: &str, index: usize) -> String {
     format!("{name}-s3-{index}")
 }
 
+pub fn cache_name(name: &str, index: usize) -> String {
+    format!("{name}-cache-{index}")
+}
+
 pub fn data_name(name: &str) -> String {
     format!("{name}-data")
 }
@@ -659,7 +724,7 @@ pub fn session_mount<'a>(
     spec: &'a TaskSpec,
     config: &KubernetesConfig,
 ) -> Option<&'a SessionMount> {
-    if !spec.session || spec.workspace.is_none() || config.s3_mount_driver.is_none() {
+    if !spec.session || spec.workspace.is_none() || !config.mounts_inputs() {
         return None;
     }
     spec.session_mount.as_ref()
@@ -858,6 +923,28 @@ fn node_selector(config: &KubernetesConfig) -> Option<serde_json::Value> {
         true => None,
         false => Some(json!(config.node_selector)),
     }
+}
+
+/// Runs with cached inputs prefer workers with a cache volume, but may run elsewhere.
+fn cache_affinity(config: &KubernetesConfig, layout: &StageLayout) -> Option<serde_json::Value> {
+    let cache = cache_of(config).filter(|cache| !cache.worker_labels.is_empty())?;
+    if !layout.mounts.iter().any(|input| input.cached) {
+        return None;
+    }
+    let expressions = cache
+        .worker_labels
+        .iter()
+        .map(|(key, value)| json!({"key":key,"operator":"In","values":[value]}))
+        .collect::<Vec<_>>();
+    Some(
+        json!({"nodeAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[
+            {"weight":100,"preference":{"matchExpressions":expressions}}
+        ]}}),
+    )
+}
+
+fn cache_of(config: &KubernetesConfig) -> Option<&KubedalCache> {
+    config.kubedal.as_ref()?.cache.as_ref()
 }
 
 fn manifest_error(error: serde_json::Error) -> BackendError {
@@ -1095,6 +1182,7 @@ mod tests {
             driver: "kubedal.arunaengine.org".to_string(),
             endpoint: "https://s3.node-2.example".to_string(),
             region: "us-east-1".to_string(),
+            cache: None,
         }));
         let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
         spec.staging_mode = StagingMode::S3Mount;
@@ -1102,6 +1190,7 @@ mod tests {
             bucket: "in-run".to_string(),
             key: "db/bakta.db".to_string(),
             path: "/db/bakta.db".to_string(),
+            cached: false,
         });
         spec.secret_env
             .insert("access_key_id".to_string(), Secret::new("temporary-access"));
@@ -1146,6 +1235,90 @@ mod tests {
     }
 
     #[test]
+    fn caches_inputs_through_kubedal() {
+        // Cached inputs come from a KubeDAL file list with the shared scope; others stay FUSE.
+        let mut cached = config();
+        cached.kubedal = Some(Box::new(crate::executor::config::KubedalMount {
+            driver: "kubedal.arunaengine.org".to_string(),
+            endpoint: "https://s3.node-2.example".to_string(),
+            region: "us-east-1".to_string(),
+            cache: Some(KubedalCache {
+                scope: "node-2".to_string(),
+                worker_labels: BTreeMap::from([("cache".to_string(), "large".to_string())]),
+            }),
+        }));
+        let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
+        spec.staging_mode = StagingMode::S3Mount;
+        for (key, cached) in [("db/bakta.db", true), ("reads.fq", false)] {
+            spec.s3_mounts.push(S3Mount {
+                bucket: "in-run".to_string(),
+                key: key.to_string(),
+                path: format!("/{key}"),
+                cached,
+            });
+        }
+        spec.secret_env
+            .insert("access_key_id".to_string(), Secret::new("temporary-access"));
+        spec.secret_env.insert(
+            "secret_access_key".to_string(),
+            Secret::new("temporary-secret"),
+        );
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = serde_json::to_value(job_manifest(&context(), &spec, &cached, &layout).unwrap())
+            .unwrap();
+        let pod = &job["spec"]["template"]["spec"];
+        let name = context().attempt.external_name();
+        let volumes = pod["volumes"].as_array().unwrap();
+        let volume = |volume: &str| {
+            volumes
+                .iter()
+                .find(|entry| entry["name"] == volume)
+                .unwrap_or_else(|| panic!("volume {volume}"))
+        };
+        let list = volume(&cache_name(&name, 0));
+        assert_eq!(list["csi"]["readOnly"], true);
+        assert_eq!(
+            list["csi"]["volumeAttributes"]["manifest"],
+            CACHE_MANIFEST_KEY
+        );
+        assert_eq!(
+            list["csi"]["volumeAttributes"]["dataNode"],
+            mount_name(&name, 0).as_str()
+        );
+        let fuse = volume(&mount_name(&name, 0));
+        assert_eq!(fuse["csi"]["volumeAttributes"]["mount"], "fuse-read-only");
+        let mounts = pod["containers"][0]["volumeMounts"].as_array().unwrap();
+        let source = |path: &str| {
+            mounts
+                .iter()
+                .find(|mount| mount["mountPath"] == path)
+                .map(|mount| mount["name"].clone())
+        };
+        assert_eq!(source("/db/bakta.db"), Some(json!(cache_name(&name, 0))));
+        assert_eq!(source("/reads.fq"), Some(json!(mount_name(&name, 0))));
+        let preferred =
+            &pod["affinity"]["nodeAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"][0];
+        assert_eq!(
+            preferred["preference"]["matchExpressions"][0],
+            json!({"key":"cache","operator":"In","values":["large"]})
+        );
+        let node = data_node_manifest(&context(), &cached, 0, "in-run").unwrap();
+        assert_eq!(node["spec"]["cacheScope"], "node-2");
+        let session = session_node_manifest(&context(), &cached, "work").unwrap();
+        assert!(session["spec"].get("cacheScope").is_none());
+
+        // Without a configured cache, the same spec mounts everything through FUSE.
+        cached.kubedal.as_mut().unwrap().cache = None;
+        let job = serde_json::to_value(job_manifest(&context(), &spec, &cached, &layout).unwrap())
+            .unwrap();
+        let pod = &job["spec"]["template"]["spec"];
+        assert_eq!(pod["volumes"].as_array().unwrap().len(), 1);
+        assert!(pod["affinity"].is_null());
+        let node = data_node_manifest(&context(), &cached, 0, "in-run").unwrap();
+        assert!(node["spec"].get("cacheScope").is_none());
+    }
+
+    #[test]
     fn mounts_s3_inputs() {
         let mut spec = TaskSpec::new(context().attempt, "registry.example/task:latest");
         spec.staging_mode = StagingMode::S3Mount;
@@ -1153,6 +1326,7 @@ mod tests {
             bucket: "input-bucket".to_string(),
             key: "data/input.txt".to_string(),
             path: "/input.txt".to_string(),
+            cached: false,
         });
         spec.secret_env
             .insert("access_key_id".to_string(), Secret::new("temporary-access"));
@@ -1323,6 +1497,127 @@ mod tests {
         assert_eq!(data["access_key_id"], "session-access");
         assert_eq!(data["secret_access_key"], "session-secret");
         assert_eq!(data["AWS_ACCESS_KEY_ID"], "session-access");
+    }
+
+    #[test]
+    fn workspace_run_reaches() {
+        // A batch run bound to its bucket gets the credential, endpoint and S3-only egress.
+        let mut spec = session_spec();
+        spec.session = false;
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job =
+            serde_json::to_value(job_manifest(&context(), &spec, &config(), &layout).unwrap())
+                .unwrap();
+        let template = &job["spec"]["template"];
+        assert_eq!(
+            template["metadata"]["labels"]["aruna-engine.org/network"],
+            "s3"
+        );
+        let container = &template["spec"]["containers"][0];
+        assert_eq!(
+            container["envFrom"][0]["secretRef"]["name"],
+            "aruna-job-a1-env"
+        );
+        let env = container["env"].as_array().unwrap();
+        assert!(
+            env.iter().any(|entry| entry["name"] == "AWS_ENDPOINT_URL"
+                && entry["value"] == "https://s3.example")
+        );
+        assert!(
+            env.iter()
+                .any(|entry| entry["name"] == "ARUNA_WORKSPACE_BUCKET"
+                    && entry["value"] == "workspace-bucket")
+        );
+        let volumes = template["spec"]["volumes"].as_array().unwrap();
+        assert!(
+            volumes
+                .iter()
+                .all(|volume| volume["name"] != "aruna-job-a1-data")
+        );
+
+        // An unbound batch run stays without any network.
+        spec.workspace = None;
+        spec.secret_env.clear();
+        let job =
+            serde_json::to_value(job_manifest(&context(), &spec, &config(), &layout).unwrap())
+                .unwrap();
+        let template = &job["spec"]["template"];
+        assert_eq!(
+            template["metadata"]["labels"]["aruna-engine.org/network"],
+            "none"
+        );
+        assert!(
+            template["spec"]["containers"][0]["envFrom"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mounts_session_kubedal() {
+        // With KubeDAL the data volume never uses the driver wide Mountpoint endpoint.
+        let spec = session_spec();
+        let mut config = config();
+        config.kubedal = Some(Box::new(crate::executor::config::KubedalMount {
+            driver: "kubedal.arunaengine.org".to_string(),
+            endpoint: "https://s3.node-2.example".to_string(),
+            region: "us-east-1".to_string(),
+            cache: None,
+        }));
+        let layout = StageLayout::from_spec(&spec).unwrap();
+        let job = serde_json::to_value(job_manifest(&context(), &spec, &config, &layout).unwrap())
+            .unwrap();
+        let pod = &job["spec"]["template"]["spec"];
+        let volume = pod["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == "aruna-job-a1-data")
+            .unwrap();
+        assert!(volume.get("persistentVolumeClaim").is_none());
+        assert_eq!(volume["csi"]["driver"], "kubedal.arunaengine.org");
+        assert_eq!(volume["csi"]["readOnly"], false);
+        let attributes = &volume["csi"]["volumeAttributes"];
+        assert_eq!(attributes["dataNode"], "aruna-job-a1-data");
+        assert_eq!(attributes["mount"], "fuse-read-write");
+        assert_eq!(attributes["path"], "data/");
+        let mounts = pod["containers"][0]["volumeMounts"].as_array().unwrap();
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount["mountPath"] == "/work/data" && mount["readOnly"] == false)
+        );
+        let node = session_node_manifest(&context(), &config, "workspace-bucket").unwrap();
+        assert_eq!(node["metadata"]["name"], "aruna-job-a1-data");
+        assert_eq!(node["metadata"]["labels"][ROLE_LABEL], "s3-mount");
+        assert_eq!(node["spec"]["read_only"], false);
+        assert_eq!(node["spec"]["config"]["bucket"], "workspace-bucket");
+        assert_eq!(
+            node["spec"]["config"]["endpoint"],
+            "https://s3.node-2.example"
+        );
+        assert_eq!(node["spec"]["secretRef"]["name"], "aruna-job-a1-env");
+        let secret = secret_manifest(&context(), &config, &spec).unwrap();
+        assert_eq!(
+            secret.string_data.unwrap()["access_key_id"],
+            "session-access"
+        );
+
+        // The whole bucket needs no path; KubeDAL alone also enables the mount.
+        let mut spec = spec;
+        spec.session_mount.as_mut().unwrap().prefix = String::new();
+        config.s3_mount_driver = None;
+        let job = serde_json::to_value(job_manifest(&context(), &spec, &config, &layout).unwrap())
+            .unwrap();
+        let volume = job["spec"]["template"]["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == "aruna-job-a1-data")
+            .cloned()
+            .unwrap();
+        assert!(volume["csi"]["volumeAttributes"].get("path").is_none());
     }
 
     #[test]

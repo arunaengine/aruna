@@ -26,6 +26,9 @@ const CURSOR_MAX_BYTES: usize = 64 * 1024;
 
 const SEARCH_MAX_BYTES: usize = 2 * 1024;
 
+/// Skipped distributed buckets one realm-wide page searches by name; the rest wait in its cursor.
+const MAX_SKIPPED_SEARCHES: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct MetadataSearchRequest {
     pub auth: Option<AuthContext>,
@@ -153,6 +156,15 @@ pub(super) struct ObjectCursorPayload {
     pub(super) failed_partitions: Vec<[u8; 32]>,
     pub(super) discovery_failed: bool,
     pub(super) omitted_partitions: usize,
+    pub(super) pending: Vec<PendingBucket>,
+}
+
+/// A distributed bucket a realm-wide search still owes: its name and the cursor of its own
+/// bucket search, `None` before its first page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PendingBucket {
+    pub(super) bucket: String,
+    pub(super) cursor: Option<String>,
 }
 
 pub(super) type ObjectCursor = SignedCursor<ObjectCursorPayload>;
@@ -222,11 +234,12 @@ impl SignedCursor<ObjectCursorPayload> {
                 ));
             }
         }
-        if !cursor
-            .payload
-            .partitions
-            .iter()
-            .any(|partition| !partition.exhausted)
+        if cursor.payload.pending.is_empty()
+            && !cursor
+                .payload
+                .partitions
+                .iter()
+                .any(|partition| !partition.exhausted)
         {
             return Err(MetadataApiError::InvalidCursor(
                 "exhausted object search cursor".to_string(),
@@ -272,6 +285,7 @@ impl SignedCursor<ObjectCursorPayload> {
         failed_partitions: &[NodeId],
         discovery_failed: bool,
         omitted_partitions: usize,
+        pending: &[PendingBucket],
         signer: NodeId,
         sign: impl FnOnce(&[u8]) -> iroh::Signature,
     ) -> Result<Self, postcard::Error> {
@@ -298,6 +312,7 @@ impl SignedCursor<ObjectCursorPayload> {
                 failed_partitions,
                 discovery_failed,
                 omitted_partitions,
+                pending: pending.to_vec(),
             },
             signer,
             sign,
@@ -324,6 +339,7 @@ pub(super) struct ObjectSearchPartitions {
     pub(super) failed_partitions: Vec<NodeId>,
     pub(super) discovery_failed: bool,
     pub(super) omitted_partitions: usize,
+    pub(super) pending: Vec<PendingBucket>,
 }
 
 pub async fn search_objects(
@@ -333,10 +349,20 @@ pub async fn search_objects(
     request: SearchQueryRequest,
 ) -> Result<ObjectExecution, MetadataApiError> {
     let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
+    search_until(context, (realm_id, local_node_id), request, deadline).await
+}
+
+/// One search page that ends by `deadline`, which its distributed bucket searches share.
+async fn search_until(
+    context: &DriverContext,
+    (realm_id, local_node_id): (RealmId, NodeId),
+    request: SearchQueryRequest,
+    deadline: tokio::time::Instant,
+) -> Result<ObjectExecution, MetadataApiError> {
     let plan = plan_object_search(realm_id, request)?;
     let partitions =
         resolve_object_partitions(context, realm_id, local_node_id, &plan, deadline).await?;
-    let (parts, fanout_stats) = run_object_fanout(
+    let (mut parts, fanout_stats) = run_object_fanout(
         context,
         realm_id,
         local_node_id,
@@ -345,7 +371,104 @@ pub async fn search_objects(
         deadline,
     )
     .await?;
-    assemble_object_execution(context, &plan, partitions, parts, fanout_stats)
+    let mut partitions = partitions;
+    let mut queue = std::mem::take(&mut partitions.pending);
+    for bucket in take_skipped(&mut parts) {
+        if !queue.iter().any(|pending| pending.bucket == bucket) {
+            queue.push(PendingBucket {
+                bucket,
+                cursor: None,
+            });
+        }
+    }
+    let mut found = Vec::new();
+    let mut failed = 0;
+    for (index, pending) in queue.into_iter().enumerate() {
+        if index >= MAX_SKIPPED_SEARCHES {
+            partitions.pending.push(pending);
+            continue;
+        }
+        let ids = (realm_id, local_node_id);
+        match Box::pin(search_skipped(context, ids, &plan, &pending, deadline)).await {
+            Ok(page) => {
+                if let Some(cursor) = page.next_cursor.clone() {
+                    partitions.pending.push(PendingBucket {
+                        bucket: pending.bucket,
+                        cursor: Some(cursor),
+                    });
+                }
+                found.push(page);
+            }
+            Err(error) if plan.mode == ObjectQueryMode::DistributedStrict => return Err(error),
+            Err(_) => failed += 1,
+        }
+    }
+    // The cursor carries the rest; what would not fit in it stays unsearched.
+    let size = |pending: &[PendingBucket]| {
+        (pending.iter())
+            .map(|entry| entry.bucket.len() + entry.cursor.as_ref().map_or(0, String::len))
+            .sum::<usize>()
+    };
+    while size(&partitions.pending) > CURSOR_MAX_BYTES / 2 {
+        partitions.pending.pop();
+        failed += 1;
+    }
+    let mut execution = assemble_object_execution(context, &plan, partitions, parts, fanout_stats)?;
+    for page in found {
+        execution.hits.extend(page.hits);
+        execution.incomplete_ranges += page.incomplete_ranges;
+        execution.index_progress.extend(page.index_progress);
+        execution.partial_ranges.extend(page.partial_ranges);
+        execution.complete &= page.complete;
+    }
+    execution.incomplete_ranges += failed;
+    execution.complete &= failed == 0;
+    // Strict mode answers complete pages only; work left in the cursor is not missing.
+    if plan.mode == ObjectQueryMode::DistributedStrict && execution.incomplete_ranges > 0 {
+        return Err(MetadataApiError::SearchIncomplete(incomplete_reason(
+            execution.incomplete_ranges,
+            execution.partial_ranges.len(),
+            &execution.index_progress,
+        )));
+    }
+    Ok(execution)
+}
+
+/// The distributed buckets a realm-wide page skipped, once each. They no longer count as
+/// unsearched: [`search_skipped`] searches them through their range indexes.
+fn take_skipped(parts: &mut [(NodeId, SearchNodePage)]) -> Vec<String> {
+    let mut skipped = Vec::new();
+    for (_, page) in parts.iter_mut() {
+        page.incomplete_ranges =
+            (page.incomplete_ranges).saturating_sub(page.skipped_buckets.len());
+        skipped.append(&mut page.skipped_buckets);
+    }
+    skipped.sort_unstable();
+    skipped.dedup();
+    skipped
+}
+
+/// One page of a skipped distributed bucket, searched through its range indexes from where
+/// the realm-wide cursor left it.
+async fn search_skipped(
+    context: &DriverContext,
+    (realm_id, local_node_id): (RealmId, NodeId),
+    plan: &ObjectSearchPlan,
+    pending: &PendingBucket,
+    deadline: tokio::time::Instant,
+) -> Result<ObjectExecution, MetadataApiError> {
+    let request = SearchQueryRequest {
+        auth: plan.auth.clone(),
+        bearer_token: plan.bearer_token.clone(),
+        query: plan.query.clone(),
+        key_match: plan.key_match,
+        bucket: Some(pending.bucket.clone()),
+        limit: plan.limit,
+        cursor: pending.cursor.clone(),
+        mode: plan.mode,
+        target_nodes: plan.target_nodes.clone(),
+    };
+    search_until(context, (realm_id, local_node_id), request, deadline).await
 }
 
 pub(super) fn plan_object_search(
@@ -390,7 +513,7 @@ pub(super) async fn resolve_object_partitions(
     plan: &ObjectSearchPlan,
     deadline: tokio::time::Instant,
 ) -> Result<ObjectSearchPartitions, MetadataApiError> {
-    let (as_of, partitions, failed_partitions, discovery_failed, omitted_partitions) =
+    let (as_of, partitions, failed_partitions, discovery_failed, omitted_partitions, pending) =
         match plan.cursor.as_deref() {
             Some(raw) => {
                 let authorized_signers = match plan.mode {
@@ -418,6 +541,7 @@ pub(super) async fn resolve_object_partitions(
                     cursor.failed_nodes()?,
                     cursor.payload.discovery_failed,
                     cursor.payload.omitted_partitions,
+                    cursor.payload.pending.clone(),
                 )
             }
             None => {
@@ -473,6 +597,7 @@ pub(super) async fn resolve_object_partitions(
                     Vec::new(),
                     discovery_failed,
                     omitted_partitions,
+                    Vec::new(),
                 )
             }
         };
@@ -482,7 +607,7 @@ pub(super) async fn resolve_object_partitions(
     {
         return Err(MetadataApiError::ServiceUnavailable);
     }
-    if !partitions.iter().any(|partition| !partition.exhausted) {
+    if pending.is_empty() && !partitions.iter().any(|partition| !partition.exhausted) {
         return Err(MetadataApiError::InvalidCursor(
             "exhausted object search cursor".to_string(),
         ));
@@ -493,6 +618,7 @@ pub(super) async fn resolve_object_partitions(
         failed_partitions,
         discovery_failed,
         omitted_partitions,
+        pending,
     })
 }
 
@@ -612,6 +738,7 @@ pub(super) fn assemble_object_execution(
         mut failed_partitions,
         discovery_failed,
         omitted_partitions,
+        pending,
     } = partitions;
     let newly_failed = fanout_stats.failed_partitions.clone();
     failed_partitions.extend(newly_failed.iter().copied());
@@ -683,7 +810,8 @@ pub(super) fn assemble_object_execution(
         }
     }
 
-    let next_cursor = if partitions.iter().any(|partition| !partition.exhausted) {
+    let unfinished = partitions.iter().any(|partition| !partition.exhausted);
+    let next_cursor = if unfinished || !pending.is_empty() {
         let net = context.net_handle.as_ref().ok_or_else(|| {
             MetadataApiError::Internal(
                 "net handle unavailable for object search cursor signing".to_string(),
@@ -697,6 +825,7 @@ pub(super) fn assemble_object_execution(
                 &failed_partitions,
                 discovery_failed,
                 omitted_partitions,
+                &pending,
                 net.node_id(),
                 |bytes| net.sign(bytes),
             )

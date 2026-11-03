@@ -660,6 +660,7 @@ dependencies = [
  "croner",
  "ed25519-dalek 3.0.0",
  "fjall",
+ "flate2",
  "futures-util",
  "globset",
  "hex",

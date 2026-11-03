@@ -32,6 +32,7 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::replication::{ReplicationFailure, VersionedObjectArn};
 use futures_util::StreamExt;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use super::DEFAULT_WALLTIME;
@@ -637,17 +638,20 @@ async fn local_hints(
 
 /// Export every declared file output under one write-ahead commit reservation, so
 /// an interrupted capture replays into the same versions instead of new ones.
+/// `cancel` ends the capture cooperatively: a put in flight fails through its own stream and
+/// cleans up after itself, so no write is dropped halfway.
 pub async fn capture_outputs(
     context: &DriverContext,
     backend: &Arc<dyn ExecutorBackend>,
     fence: &FenceContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
-    node_id: NodeId,
+    (node_id, cancel): (NodeId, &CancellationToken),
 ) -> Result<Vec<OutputObject>, JobError> {
     let mut selections = Vec::with_capacity(spec.file_outputs.len());
     for declared in &spec.file_outputs {
-        selections.extend(resolve_output(backend, fence, declared, &spec.inputs).await?);
+        let resolved = resolve_output(backend, fence, declared, &spec.inputs);
+        selections.extend(until_cancel(cancel, resolved).await??);
     }
     let selections = distinct_selections(selections)?;
     if selections.len() > MAX_EXECUTION_OUTPUTS {
@@ -686,6 +690,9 @@ pub async fn capture_outputs(
     let inherited = Box::pin(input_policies(context, spec, record)).await?;
     let mut outputs = Vec::with_capacity(selections.len());
     for (selection, (destination_node_id, bucket, key)) in selections.iter().zip(&destinations) {
+        if cancel.is_cancelled() {
+            return Err(capture_cancelled());
+        }
         let Some(version_id) = reserved
             .get(&(*destination_node_id, bucket.as_str(), key.as_str()))
             .copied()
@@ -695,7 +702,7 @@ pub async fn capture_outputs(
         outputs.push(
             Box::pin(put_file_output(
                 context,
-                backend,
+                (backend, cancel),
                 fence,
                 spec,
                 record,
@@ -709,6 +716,39 @@ pub async fn capture_outputs(
         );
     }
     Ok(outputs)
+}
+
+fn capture_cancelled() -> JobError {
+    JobError::retryable("output capture cancelled")
+}
+
+/// Runs a step that writes nothing yet, ending it early on a cancel.
+async fn until_cancel<T>(
+    cancel: &CancellationToken,
+    step: impl std::future::Future<Output = T>,
+) -> Result<T, JobError> {
+    tokio::select! {
+        result = step => Ok(result),
+        () = cancel.cancelled() => Err(capture_cancelled()),
+    }
+}
+
+/// The output bytes until a cancel, which ends them with an error the reading put fails on.
+fn cancellable_chunks<S>(
+    chunks: S,
+    cancel: CancellationToken,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, BackendError>>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, BackendError>> + Unpin,
+{
+    futures_util::stream::unfold(Some((chunks, cancel)), |state| async move {
+        let (mut chunks, cancel) = state?;
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Some((Err(BackendError::Cancelled), None)),
+            chunk = chunks.next() => chunk.map(|chunk| (chunk, Some((chunks, cancel)))),
+        }
+    })
 }
 
 /// Union of the refs every input carries, so an output can never be less
@@ -855,7 +895,7 @@ fn expand_selection(
 #[allow(clippy::too_many_arguments)]
 async fn put_file_output(
     context: &DriverContext,
-    backend: &Arc<dyn ExecutorBackend>,
+    (backend, cancel): (&Arc<dyn ExecutorBackend>, &CancellationToken),
     fence: &FenceContext,
     spec: &ExecutionSpec,
     record: &JobRecord,
@@ -920,14 +960,14 @@ async fn put_file_output(
     .map_err(|error| JobError::retryable(format!("output quota lookup failed: {error}")))?;
     let quota_ceiling = realm_config.quota.effective_group_ceiling(&spec.group_id);
 
-    let fetched = backend
-        .fetch_output(fence, &output.container_path)
-        .await
+    let fetched = until_cancel(cancel, backend.fetch_output(fence, &output.container_path))
+        .await?
         .map_err(|error| output_read_error(&error))?;
     let size = fetched.size;
     let stream_error = Arc::new(std::sync::Mutex::new(None));
     let body_error = stream_error.clone();
-    let body = BackendStream::new(fetched.chunks.map(move |chunk| {
+    let chunks = cancellable_chunks(fetched.chunks, cancel.clone());
+    let body = BackendStream::new(chunks.map(move |chunk| {
         chunk.map_err(|error| {
             if let Ok(mut slot) = body_error.lock() {
                 *slot = Some(error.clone());
@@ -1406,6 +1446,7 @@ fn get_input_retryable(error: &GetObjectError) -> bool {
         GetObjectError::StorageError(error) => storage_retryable(error),
         GetObjectError::ReferenceSourceChanged => true,
         GetObjectError::HistoricalReferenceUnavailable
+        | GetObjectError::ReferenceChecksumMismatch
         | GetObjectError::ReferenceAdvanceExhausted => false,
         _ => false,
     }
@@ -1727,6 +1768,31 @@ mod tests {
             size: 0,
             digest: None,
         }
+    }
+
+    // A cancel ends a stalled output stream with an error the reading put fails on, instead
+    // of the put being dropped halfway; without a cancel every byte passes.
+    #[tokio::test]
+    async fn cancel_fails_stream() {
+        let stalled = futures_util::stream::iter([Ok(bytes::Bytes::from_static(b"ab"))])
+            .chain(futures_util::stream::pending());
+        let cancel = CancellationToken::new();
+        let mut chunks = Box::pin(cancellable_chunks(Box::pin(stalled), cancel.clone()));
+        assert_eq!(chunks.next().await.unwrap().unwrap().as_ref(), b"ab");
+        cancel.cancel();
+        assert!(matches!(
+            chunks.next().await,
+            Some(Err(BackendError::Cancelled))
+        ));
+        assert!(chunks.next().await.is_none());
+
+        let whole = futures_util::stream::iter([
+            Ok(bytes::Bytes::from_static(b"ab")),
+            Ok(bytes::Bytes::from_static(b"cd")),
+        ]);
+        let chunks = cancellable_chunks(whole, CancellationToken::new());
+        let read: Vec<_> = chunks.map(Result::unwrap).collect().await;
+        assert_eq!(read.concat(), b"abcd");
     }
 
     #[test]

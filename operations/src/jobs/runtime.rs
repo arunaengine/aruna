@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
+use aruna_core::heartbeat::RunningJobs;
 use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::structs::execution::job::{
     JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload, JobRecord, JobState,
@@ -51,6 +52,8 @@ struct RunningJob {
     /// zombie's `finish` cannot evict the newer execution that replaced it.
     nonce: u64,
     class: JobExecutionClass,
+    /// A staging import, counted apart in the node's telemetry.
+    import: bool,
     cancel: CancellationToken,
     completion: watch::Sender<bool>,
     claim_token: ulid::Ulid,
@@ -163,6 +166,16 @@ impl JobsRuntime {
         self.state().running.len()
     }
 
+    /// Jobs running here and the staging imports among them, as counts for the node telemetry.
+    pub fn running_jobs(&self) -> RunningJobs {
+        let state = self.state();
+        let imports = state.running.values().filter(|job| job.import).count();
+        RunningJobs {
+            total: u32::try_from(state.running.len()).unwrap_or(u32::MAX),
+            imports: u32::try_from(imports).unwrap_or(u32::MAX),
+        }
+    }
+
     pub(crate) fn is_started(&self) -> bool {
         self.started.load(Ordering::Acquire)
     }
@@ -230,6 +243,7 @@ impl JobsRuntime {
             return;
         };
         let class = record.execution_class;
+        let import = matches!(record.payload, JobPayload::Staging(_));
         let nonce = self.next_nonce.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let (completion, _) = watch::channel(false);
@@ -251,6 +265,7 @@ impl JobsRuntime {
                 RunningJob {
                     nonce,
                     class,
+                    import,
                     cancel: cancel.clone(),
                     completion,
                     claim_token,
@@ -323,6 +338,7 @@ impl JobsRuntime {
                 RunningJob {
                     nonce,
                     class,
+                    import: false,
                     cancel: cancel.clone(),
                     completion,
                     claim_token,
@@ -447,6 +463,7 @@ impl JobsRuntime {
             RunningJob {
                 nonce,
                 class,
+                import: false,
                 cancel: CancellationToken::new(),
                 completion,
                 claim_token: ulid::Ulid::generate(),
@@ -652,7 +669,8 @@ async fn run_job(
 
     let progress = ProgressReporter::from_progress(&record.progress);
     let ctx = JobContext {
-        driver: context.clone(),
+        // Bulk lane: imports and other background payloads must not delay API requests.
+        driver: Arc::new(context.bulk()),
         job_id,
         owner_node_id: record.owner_node_id,
         claim_token: token,
@@ -1875,6 +1893,43 @@ mod tests {
 
         runtime.finish(&ctx, job_id, survivor).await;
         assert_eq!(runtime.running_count(), 0);
+    }
+
+    // The node telemetry counts a job from its spawn until its finish, imports apart.
+    #[tokio::test]
+    async fn counts_running_jobs() {
+        let (_dir, storage) = temp_storage();
+        let ctx = context(storage.clone());
+        let runtime = JobsRuntime::new();
+        let job_id = JobId::from_bytes([0x6B; 16]);
+        let claimed = claim(&storage, probe_record(job_id, 2, 0, None)).await;
+
+        runtime.spawn(ctx, claimed);
+        assert_eq!(
+            runtime.running_jobs(),
+            RunningJobs {
+                total: 1,
+                imports: 0
+            }
+        );
+        let mut finished = runtime.state().running[&job_id].completion.subscribe();
+        tokio::time::timeout(Duration::from_secs(60), finished.wait_for(|done| *done))
+            .await
+            .expect("probe finishes")
+            .unwrap();
+        assert_eq!(runtime.running_jobs(), RunningJobs::default());
+
+        let nonce = runtime.register_test_execution(job_id, JobExecutionClass::InProcess);
+        runtime.state().running.get_mut(&job_id).unwrap().import = true;
+        assert_eq!(
+            runtime.running_jobs(),
+            RunningJobs {
+                total: 1,
+                imports: 1
+            }
+        );
+        runtime.finish(&context(storage), job_id, nonce).await;
+        assert_eq!(runtime.running_jobs(), RunningJobs::default());
     }
 
     #[derive(Default)]

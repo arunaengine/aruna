@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::AuthorizationError;
@@ -57,6 +57,7 @@ pub struct CreatePathRestriction {
 #[schema(as = CreateS3CredentialsRequest)]
 pub struct CreateS3Request {
     pub group_id: String,
+    /// Lifetime in seconds; the credential never outlives the bearer token that creates it.
     #[schema(default = 31536000)]
     pub expires_in_seconds: Option<u64>,
     pub path_restrictions: Option<Vec<CreatePathRestriction>>,
@@ -398,7 +399,7 @@ to the group data root and can never widen them.
         ),
         (
             status = 400,
-            description = "The group id is not a ULID, the lifetime is out of range, a restriction is malformed or exceeds the count limit, too many encrypted buckets are named, `token_public_key` is missing or malformed, `bucket_not_encrypted` when a named bucket does not encrypt, or `bucket_outside_group` when it belongs to another group",
+            description = "The group id is not a ULID, the lifetime is out of range or the bearer token ends within 60 seconds, a restriction is malformed or exceeds the count limit, too many encrypted buckets are named, `token_public_key` is missing or malformed, `bucket_not_encrypted` when a named bucket does not encrypt, or `bucket_outside_group` when it belongs to another group",
             body = ErrorResponse,
             example = json!({"error": "bucket research-raw is not encrypted", "code": "bucket_not_encrypted"})
         ),
@@ -417,9 +418,11 @@ to the group data root and can never widen them.
 pub async fn create_s3_credentials(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateS3Request>,
 ) -> ServerResult<(StatusCode, Json<CreateS3Response>)> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
     let node_id = state.get_node_id();
 
@@ -453,7 +456,11 @@ pub async fn create_s3_credentials(
     {
         return Err(ServerError::BadRequest);
     }
-    let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds)?;
+    let expiry = credential_expiry(
+        SystemTime::now(),
+        request.expires_in_seconds,
+        bearer.expires_at_secs(),
+    )?;
     let buckets: BTreeSet<String> = request
         .encrypted_buckets
         .unwrap_or_default()
@@ -656,7 +663,12 @@ fn format_node_id(bytes: [u8; 32]) -> String {
         .unwrap_or_else(|_| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn credential_expiry(now: SystemTime, expires_in_seconds: Option<u64>) -> ServerResult<SystemTime> {
+/// The requested lifetime, ending no later than the bearer that mints the credential.
+fn credential_expiry(
+    now: SystemTime,
+    expires_in_seconds: Option<u64>,
+    bearer_expiry: u64,
+) -> ServerResult<SystemTime> {
     const MIN_TTL: u64 = 60;
     const MAX_TTL: u64 = DEFAULT_CREDENTIAL_TTL.as_secs();
 
@@ -665,8 +677,16 @@ fn credential_expiry(now: SystemTime, expires_in_seconds: Option<u64>) -> Server
         return Err(ServerError::BadRequest);
     }
 
-    now.checked_add(Duration::from_secs(ttl))
-        .ok_or(ServerError::BadRequest)
+    let requested = now
+        .checked_add(Duration::from_secs(ttl))
+        .ok_or(ServerError::BadRequest)?;
+    let expiry = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(bearer_expiry))
+        .map_or(requested, |bearer_end| requested.min(bearer_end));
+    if expiry < now + Duration::from_secs(MIN_TTL) {
+        return Err(ServerError::BadRequest);
+    }
+    Ok(expiry)
 }
 
 /// Narrows the caller's restrictions to `root` and the requested scopes; never widens them.

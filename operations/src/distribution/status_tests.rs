@@ -111,3 +111,23 @@ fn removed_publisher_unavailable() {
     assert!(status.configuration_unavailable);
     assert!(status.ranges[0].degraded.is_none());
 }
+
+#[test]
+fn reports_current_settings() {
+    // The status carries the settings a change replaced, so a client can edit one field.
+    let settings = DistributionSettings {
+        refresh_secs: Some(600),
+        search_index: true,
+        split_bytes: Some(1 << 30),
+        ..DistributionSettings::default()
+    };
+    let change = DistributionRequest::ChangeSettings {
+        settings: settings.clone(),
+    };
+    let changed = next_snapshot(realm(), Some(view().snapshot()), &change).unwrap();
+    let view = DistributionView {
+        head: SignedSnapshot::sign(changed, realm(), &secret(1)).unwrap(),
+        conflict: None,
+    };
+    assert_eq!(summarize(realm(), &view, only(1), true).settings, settings);
+}

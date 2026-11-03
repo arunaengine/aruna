@@ -135,6 +135,12 @@ fn degraded_names_coordinator() {
             }],
         }],
         recommended_grant: "/r/g/9/data/*/spire/**".to_string(),
+        settings: DistributionSettings {
+            range_behaviour: Some(RangeBehaviour::ServeAndFill),
+            public: true,
+            split_objects: Some(500),
+            ..DistributionSettings::default()
+        },
         lifecycle: LifecycleStatus {
             transfers: vec![TransferStatus {
                 transfer_id: Ulid::from_bytes([4; 16]),
@@ -173,6 +179,10 @@ fn degraded_names_coordinator() {
     assert_eq!(copy.pending_versions, 2);
     assert!(copy.oldest_lag_ms.is_some_and(|lag| lag > 0));
     assert!(response.copies_behind && response.copies_counted);
+    let settings = &response.settings;
+    assert_eq!(settings.range_behaviour, Some(BehaviourName::ServeAndFill));
+    assert!(settings.public && !settings.search_index);
+    assert_eq!(settings.split_objects, Some(500));
 }
 
 #[test]
@@ -196,6 +206,7 @@ fn deletion_names_phase() {
         members: Vec::new(),
         ranges: Vec::new(),
         recommended_grant: "/r/g/9/data/*/spire/**".to_string(),
+        settings: DistributionSettings::default(),
         lifecycle: LifecycleStatus {
             transfers: Vec::new(),
             deletion,

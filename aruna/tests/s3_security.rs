@@ -324,3 +324,106 @@ async fn protocol_errors_mapped() -> TestResult<()> {
     seed.shutdown().await;
     result
 }
+
+// The credential a batch run inside its bucket gets reads and writes that bucket through the
+// gateway's own S3 auth path, and nothing else.
+#[tokio::test]
+async fn workspace_credential_writes() -> TestResult<()> {
+    use aruna_core::structs::execution::job::{
+        ComputeResources, ExecutionSpec, JobId, JobPayload, JobRecord, WorkspaceMode,
+    };
+    use aruna_operations::jobs::workflow::workspace::mint_workspace_credential;
+
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let bearer = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&seed.base_url, &bearer, "workspace-credential").await?;
+        let owner = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
+        let owner = client(&seed, &owner)?;
+        for bucket in ["ws-run", "ws-other"] {
+            owner.create_bucket().bucket(bucket).send().await?;
+        }
+        let spec = ExecutionSpec {
+            group_id: ulid::Ulid::from_string(&group.group_id)?,
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: vec!["true".to_string()],
+            workdir: None,
+            env: Default::default(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        };
+        let node_id = seed.net.node_id();
+        let mut record = JobRecord::new(
+            JobId::from_bytes([0x5A; 16]),
+            JobPayload::Execution(spec.clone()),
+            seed.user_id,
+            node_id,
+            1,
+            1,
+            None,
+        );
+        record.workspace_mode = WorkspaceMode::Existing;
+        record.workspace_bucket = Some("ws-run".to_string());
+        let minted = mint_workspace_credential(
+            seed.context.as_ref(),
+            &spec,
+            &record,
+            node_id,
+            ("ws-run", None),
+        )
+        .await
+        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        let run = client(
+            &seed,
+            &S3Credentials {
+                access_key_id: minted.access_key,
+                access_secret: minted.secret,
+            },
+        )?;
+
+        run.put_object()
+            .bucket("ws-run")
+            .key("probe/probe.txt")
+            .body(ByteStream::from_static(b"probe"))
+            .send()
+            .await?;
+        let listed = run.list_objects_v2().bucket("ws-run").send().await?;
+        let keys: Vec<_> = listed.contents().iter().filter_map(|o| o.key()).collect();
+        assert_eq!(keys, ["probe/probe.txt"]);
+        let read = run
+            .get_object()
+            .bucket("ws-run")
+            .key("probe/probe.txt")
+            .send()
+            .await?;
+        assert_eq!(read.body.collect().await?.into_bytes().as_ref(), b"probe");
+
+        let other = run
+            .put_object()
+            .bucket("ws-other")
+            .key("probe.txt")
+            .body(ByteStream::from_static(b"probe"))
+            .send()
+            .await;
+        assert_eq!(service_error_code(&other).as_deref(), Some("AccessDenied"));
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}

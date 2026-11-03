@@ -82,9 +82,8 @@ async fn seed(context: &DriverContext, actor: &Actor, listed: bool) -> Ulid {
     };
     let metadata = BucketMetadata {
         database: true,
-        title: Some("bakrep".to_string()),
+        dataset: Some(Ulid::from_bytes([9; 16])),
         parser: Some(parser),
-        ..BucketMetadata::default()
     };
     let stored = StoredMetadata {
         incarnation: 0,
@@ -142,7 +141,7 @@ async fn database_identifiers_read() {
         }
         let metadata = view.bucket_metadata.as_ref().unwrap();
         assert!(metadata.database);
-        assert_eq!(metadata.title.as_deref(), Some("bakrep"));
+        assert_eq!(metadata.dataset, Some(Ulid::from_bytes([9; 16])));
         let url = "https://www.ebi.ac.uk/biosamples/samples/SAMN15803895";
         assert_eq!(view.identifiers.len(), 1);
         assert_eq!(view.identifiers[0].value, "SAMN15803895");

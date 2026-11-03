@@ -217,6 +217,28 @@ async fn missing_index_rebuilds() {
     assert_eq!(keys(&fixture.indexes, 2).await, ["k"]);
 }
 
+// A generation left behind by a rebuild that stopped before its prune goes on a later pass.
+#[tokio::test]
+async fn leftover_generation_pruned() {
+    let fixture = fixture().await;
+    let handle = &fixture.handle;
+    let mut feeder = Feeder::new(fixture.indexes.clone(), FeedLimits::default());
+    feeder.pass(&context(handle)).await;
+    assert_eq!(
+        state(handle).await,
+        Some(IndexState::Ready { generation: 1 })
+    );
+    let changes = vec![KeyChange::Remove("k".to_string())];
+    (fixture.indexes.apply(set(), range_id(), 7, changes))
+        .await
+        .unwrap();
+    assert!(fixture.indexes.exists(set(), range_id(), 7).await.unwrap());
+
+    feeder.pass(&context(handle)).await;
+    assert!(!fixture.indexes.exists(set(), range_id(), 7).await.unwrap());
+    assert!(fixture.indexes.exists(set(), range_id(), 1).await.unwrap());
+}
+
 #[tokio::test]
 async fn drops_gone_ranges() {
     let fixture = fixture().await;

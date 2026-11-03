@@ -12,6 +12,7 @@ pub mod forward;
 pub mod get_config;
 pub mod get_nodes;
 pub mod mutate_placement;
+pub mod node_name;
 pub mod peer_trust;
 pub mod promote_node;
 pub mod read_authorization;

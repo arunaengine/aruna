@@ -63,11 +63,31 @@ async fn publishes_changes() {
         search_index: true,
         ..SettingsRequest::default()
     };
-    let Json(changed) = settings(&node, Some(&node.owner), set_id, request)
+    let Json(changed) = settings(&node, Some(&node.owner), set_id, request.clone())
         .await
         .unwrap();
     assert_eq!(changed.set_id, set_id.to_string());
     assert_eq!(changed.revision, before + 1);
+    // The status reads back every setting, unset ones as null, in the shape the change takes.
+    let Json(read) = crate::routes::storage::distributed::get_distributed(
+        State(node.state.clone()),
+        Extension(Some(node.owner.clone())),
+        Path((node.group_id, set_id)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read.settings, request);
+    assert_eq!(
+        serde_json::to_value(&read).unwrap()["settings"],
+        serde_json::json!({
+            "refresh_secs": 600,
+            "range_behaviour": "fill_first",
+            "search_index": true,
+            "public": false,
+            "split_objects": null,
+            "split_bytes": null
+        })
+    );
 
     let (status, Json(deleted)) = delete_distributed(
         State(node.state.clone()),

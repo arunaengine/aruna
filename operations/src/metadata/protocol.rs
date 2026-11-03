@@ -723,6 +723,13 @@ pub struct RealmDocuments {
     /// What the serving node had applied when it made this copy. A device
     /// refuses a copy that has seen less than the one it already holds.
     pub clock: AdminDocumentClock,
+    /// Display names of realm nodes from the serving node's realm config state.
+    pub node_names: std::collections::BTreeMap<aruna_core::NodeId, String>,
+    /// Map places of realm nodes from the serving node's realm config state.
+    pub node_places: std::collections::BTreeMap<
+        aruna_core::NodeId,
+        aruna_core::structs::identity::realm::NodePlace,
+    >,
 }
 
 /// One page of immutable records plus the cursor of the next one.
@@ -962,7 +969,7 @@ where
         .read_exact(&mut bytes[prefix_len..])
         .await
         .map_err(|err| err.to_string())?;
-    let message = postcard::from_bytes(&bytes).map_err(|err| err.to_string())?;
+    let message = decode_message(&bytes).map_err(|err| err.to_string())?;
     let decoded_class = frame_class(&message);
     if decoded_class != class {
         return Err("metadata frame class does not match message".to_string());
@@ -971,6 +978,27 @@ where
         return Err("metadata audit frame exceeds maximum size".to_string());
     }
     Ok((message, permit))
+}
+
+/// Decodes one frame. A realm node that predates `node_places` or `node_names` ends its realm
+/// documents before them, and an empty map is one zero byte; only that exact reply is padded.
+fn decode_message(bytes: &[u8]) -> Result<MetadataTransportMessage, postcard::Error> {
+    postcard::from_bytes(bytes).or_else(|error| {
+        // One zero byte supplies `node_places`, two supply `node_names` as well.
+        for missing in 1..=2 {
+            let padded = [bytes, &vec![0; missing]].concat();
+            if let Ok(message) = postcard::from_bytes::<MetadataTransportMessage>(&padded)
+                && let MetadataTransportMessage::FetchedRealmDocuments {
+                    result: Ok(documents),
+                } = &message
+                && documents.node_places.is_empty()
+                && (missing == 1 || documents.node_names.is_empty())
+            {
+                return Ok(message);
+            }
+        }
+        Err(error)
+    })
 }
 
 fn audit_frame_cap() -> usize {
@@ -1603,6 +1631,122 @@ mod tests {
         .unwrap();
 
         assert!(postcard::from_bytes::<MetadataTransportMessage>(&bytes).is_err());
+    }
+
+    /// The realm documents as realm nodes sent them before the node display names.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct EarlierDocuments {
+        realm_config: Vec<u8>,
+        realm_authorization: Option<Vec<u8>>,
+        owner: Option<Vec<u8>>,
+        groups: Vec<DeviceGroupDocuments>,
+        node_infos: Vec<NodeInfoDocument>,
+        management_urls: Vec<String>,
+        clock: AdminDocumentClock,
+    }
+
+    fn documents(names: &[(u8, &str)]) -> RealmDocuments {
+        RealmDocuments {
+            realm_config: vec![1, 2, 3],
+            realm_authorization: None,
+            owner: Some(vec![4]),
+            groups: Vec::new(),
+            node_infos: Vec::new(),
+            management_urls: vec!["https://m.example".to_string()],
+            clock: AdminDocumentClock::default(),
+            node_names: names
+                .iter()
+                .map(|(seed, name)| {
+                    let node = iroh::SecretKey::from_bytes(&[*seed; 32]).public();
+                    (node, name.to_string())
+                })
+                .collect(),
+            node_places: Default::default(),
+        }
+    }
+
+    fn placed(documents: &mut RealmDocuments) {
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let place = aruna_core::structs::identity::realm::NodePlace {
+            name: Some("Giessen".to_string()),
+            coordinates: None,
+        };
+        documents.node_places.insert(node, place);
+    }
+
+    fn earlier(documents: &RealmDocuments) -> EarlierDocuments {
+        EarlierDocuments {
+            realm_config: documents.realm_config.clone(),
+            realm_authorization: documents.realm_authorization.clone(),
+            owner: documents.owner.clone(),
+            groups: documents.groups.clone(),
+            node_infos: documents.node_infos.clone(),
+            management_urls: documents.management_urls.clone(),
+            clock: documents.clock.clone(),
+        }
+    }
+
+    fn fetched(documents: RealmDocuments) -> Vec<u8> {
+        postcard::to_allocvec(&MetadataTransportMessage::FetchedRealmDocuments {
+            result: Ok(documents),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn realm_documents_compatible() {
+        // Nodes and devices upgrade one by one, so each must read the other's reply.
+        let named = documents(&[(2, "Lab laptop")]);
+        let bytes = fetched(named.clone());
+        let (variant, rest) = postcard::take_from_bytes::<u32>(&bytes).unwrap();
+        let read_by_older: Result<EarlierDocuments, SyncRefusal> =
+            postcard::from_bytes(rest).unwrap();
+        assert_eq!(read_by_older, Ok(earlier(&named)));
+
+        let plain = documents(&[]);
+        let older_reply = [
+            postcard::to_allocvec(&variant).unwrap(),
+            postcard::to_allocvec(&Ok::<_, SyncRefusal>(earlier(&plain))).unwrap(),
+        ]
+        .concat();
+        assert_eq!(
+            decode_message(&older_reply).unwrap(),
+            MetadataTransportMessage::FetchedRealmDocuments { result: Ok(plain) }
+        );
+
+        // A realm node of the build before the places sends the names but no places.
+        let mut with_place = named.clone();
+        placed(&mut with_place);
+        let bytes = fetched(with_place);
+        let (_, rest) = postcard::take_from_bytes::<u32>(&bytes).unwrap();
+        let read_by_older: Result<EarlierDocuments, SyncRefusal> =
+            postcard::from_bytes(rest).unwrap();
+        assert_eq!(read_by_older, Ok(earlier(&named)));
+        let names_only = fetched(named.clone());
+        let names_only = &names_only[..names_only.len() - 1];
+        assert_eq!(
+            decode_message(names_only).unwrap(),
+            MetadataTransportMessage::FetchedRealmDocuments { result: Ok(named) }
+        );
+    }
+
+    #[test]
+    fn refuses_truncated_names() {
+        // Padding a reply cut inside its names would install a name nobody set.
+        let bytes = fetched(documents(&[(2, "Lab laptop")]));
+        let without_places = &bytes[..bytes.len() - 1];
+        assert!(decode_message(&without_places[..without_places.len() - 1]).is_err());
+        // Padding a reply cut inside its places would install a place nobody set.
+        let mut with_place = documents(&[]);
+        placed(&mut with_place);
+        let bytes = fetched(with_place);
+        assert!(decode_message(&bytes[..bytes.len() - 1]).is_err());
+        // Other messages never get the padding.
+        let request = postcard::to_allocvec(&MetadataTransportMessage::FetchRealmDocuments {
+            auth_token: AuthToken::bearer("token").unwrap(),
+        })
+        .unwrap();
+        assert!(decode_message(&request[..request.len() - 1]).is_err());
     }
 
     #[test]

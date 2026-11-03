@@ -195,8 +195,8 @@ pub struct CapturedInput {
     pub link: Option<crate::structs::storage::replication::VersionedObjectArn>,
     /// The external source of a reference version.
     pub source_pin: Option<crate::structs::storage::origin::SourcePin>,
-    /// The source bucket's metadata at admission.
-    pub database: Option<crate::structs::storage::bucket_metadata::BucketMetadata>,
+    /// The source bucket's metadata and its dataset's description at admission.
+    pub database: Option<crate::structs::storage::bucket_metadata::CapturedDatabase>,
     pub releases: Vec<crate::structs::storage::bucket_metadata::ReleaseRef>,
     /// Release membership was checked; false means `releases` proves nothing.
     pub releases_complete: bool,
