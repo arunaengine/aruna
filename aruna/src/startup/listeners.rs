@@ -94,6 +94,20 @@ fn device_cache_env() -> u64 {
     })
 }
 
+/// The import roots groups may use. A missing folder only warns, so a late NFS mount does not
+/// stop the node; its `fs` backends fail until the folder is back.
+fn served_roots(
+    backends: &aruna_core::structs::storage::backends::NodeBackendsConfig,
+) -> std::collections::BTreeMap<String, aruna_core::structs::storage::backends::ImportRoot> {
+    let roots = backends.served_roots();
+    for (name, root) in &roots {
+        if !std::path::Path::new(&root.path).is_dir() {
+            warn!(root = %name, path = %root.path, "import root folder is missing");
+        }
+    }
+    roots
+}
+
 /// The filesystem roots a wipe has to visit, and the backends it cannot erase.
 fn backend_wipe(
     backends: &aruna_core::structs::storage::backends::NodeBackendsConfig,
@@ -279,6 +293,7 @@ async fn bind_all(
     .with_metrics(metrics.clone())
     .with_rocrate_limits(config.rocrate_limits.clone())
     .with_assistant_proxy(config.assistant_proxy)
+    .with_import_roots(served_roots(&config.blob_backends))
     .with_trusted_proxies(config.trusted_proxies.clone())
     .with_rate_limits(aruna_api::rate_limit::ApiRateLimits::new(
         config.rate_limits.ip_per_minute,
@@ -818,6 +833,7 @@ mod pure_tests {
             rules: Vec::new(),
             serve_group_backends: true,
             extra_deny: Vec::new(),
+            import_roots: Default::default(),
         };
 
         let (roots, unsupported) = backend_wipe(&backends);
