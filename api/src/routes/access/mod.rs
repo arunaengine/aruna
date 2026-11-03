@@ -2,8 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod admin_tokens;
 pub mod credentials;
 pub mod group_join;
+pub mod group_stats;
 pub mod groups;
 pub mod service_accounts;
 pub mod sessions;

@@ -95,11 +95,13 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(sync::quarantine::router())
         .merge(execution::compute::router())
         .merge(storage::connectors::router())
+        .merge(access::admin_tokens::router())
         .merge(access::credentials::router())
         .merge(device::router())
         .merge(execution::device_compute::router())
         .merge(access::groups::router())
         .merge(access::group_join::router())
+        .merge(access::group_stats::router())
         .merge(execution::job::session::router())
         .merge(execution::jobs::router())
         .merge(execution::runs::router())
@@ -244,6 +246,9 @@ pub(crate) mod tests {
         ),
         ("DELETE", "/access/groups/{id}"),
         ("DELETE", "/access/groups/{id}/members/{user_id}"),
+        ("DELETE", "/access/groups/{id}/members/{user_id}/tokens"),
+        ("DELETE", "/access/groups/{id}/tokens/{kind}/{token_id}"),
+        ("DELETE", "/access/users/{id}/tokens"),
         ("DELETE", "/access/groups/{id}/roles/{role_id}"),
         ("DELETE", "/metadata/{document_id}"),
         (
@@ -406,6 +411,9 @@ pub(crate) mod tests {
         ("GET", "/access/groups/{id}/data/paths"),
         ("GET", "/access/groups/{id}/service-accounts"),
         ("GET", "/access/groups/{id}/members"),
+        ("GET", "/access/groups/{id}/tokens"),
+        ("GET", "/access/groups/{id}/statistics"),
+        ("GET", "/system/groups/statistics"),
         ("GET", "/access/groups/{id}/usage"),
         ("GET", "/access/groups/{id}/deletion-blockers"),
         ("PATCH", "/access/groups/{id}"),

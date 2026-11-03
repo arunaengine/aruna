@@ -177,6 +177,8 @@ pub struct GroupMemberResponse {
     /// Display name from the user directory; None when the user is unresolvable.
     pub name: Option<String>,
     pub roles: Vec<GroupRoleResponse>,
+    /// The member's roles grant WRITE on the group's admin path.
+    pub admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -351,7 +353,7 @@ fn actor_for(state: &ServerState, auth: &AuthContext) -> Actor {
     }
 }
 
-async fn load_group(
+pub(crate) async fn load_group(
     state: &ServerState,
     group_id: Ulid,
 ) -> ServerResult<(Group, GroupAuthorizationDocument)> {
@@ -1392,6 +1394,8 @@ member list is never exposed to a non-member.
   sorted by role name.
 - A role that applies to everyone contributes no member here, since the principal standing for
   everyone is not a user.
+- `admin` is true when the member's roles grant WRITE on the group's `/{realm}/g/{group}/admin`
+  path and no role denies it. Service accounts are listed like any other member.
 - Display names are resolved from the realm's user directory as a best effort: a member without a
   resolvable record is returned with a null name instead of failing the listing."#,
     params(("id" = String, Path, description = "Group id as a 26-character ULID")),
@@ -1407,14 +1411,16 @@ member list is never exposed to a non-member.
                         "name": "Ada Lovelace",
                         "roles": [
                             {"role_id": "01JROLEADMIN0123456789ABCD", "name": "admin"}
-                        ]
+                        ],
+                        "admin": true
                     },
                     {
                         "user_id": "01JUSER02ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                         "name": null,
                         "roles": [
                             {"role_id": "01JROLEUSER00123456789ABCD", "name": "user"}
-                        ]
+                        ],
+                        "admin": false
                     }
                 ]
             })
@@ -1469,6 +1475,7 @@ pub(crate) async fn run_group_members(
         .map(|(user_id, mut roles)| {
             roles.sort_by(|a, b| a.name.cmp(&b.name));
             GroupMemberResponse {
+                admin: auth_doc.is_admin(auth.realm_id, user_id),
                 name: names.get(&user_id).cloned(),
                 user_id: user_id.to_string(),
                 roles,
