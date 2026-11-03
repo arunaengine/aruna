@@ -68,13 +68,14 @@ pub async fn buckets(context: &mut Context<'_>, command: BucketsCommand) -> Resu
             let session =
                 transfer::open_session(&node_api, &group_id, context.s3_endpoint.as_deref())
                     .await?;
-            let client = transfer::s3_client(&session);
-            client
+            let created = transfer::s3_client(&session)
                 .create_bucket()
                 .bucket(&name)
                 .send()
                 .await
-                .map_err(s3_error)?;
+                .map_err(s3_error);
+            transfer::revoke_session(&node_api, &session).await;
+            created?;
             let node = session.issuer_node.node_id;
             match context.out.json {
                 true => context.out.json(&serde_json::json!({

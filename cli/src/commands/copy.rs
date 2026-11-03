@@ -9,14 +9,11 @@ use crate::error::CliError;
 use crate::output::human_size;
 use crate::remote::{self, Placement, RemotePath};
 use crate::sync::{self, Direction, Plan, RemoteFile};
-use crate::transfer::{self, S3Session};
+use crate::transfer::{self, S3Access};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 const MIB: u64 = 1024 * 1024;
-/// Sessions last an hour; a new one is opened before a transfer starts after this.
-const SESSION_REUSE: Duration = Duration::from_secs(45 * 60);
 
 /// Whether `source` to `target` is an upload: `s3://` decides, else a source that exists here.
 pub fn is_upload(source: &str, target: &str) -> Result<bool, CliError> {
@@ -28,45 +25,48 @@ pub fn is_upload(source: &str, target: &str) -> Result<bool, CliError> {
     }
 }
 
-/// An S3 client for one bucket's node and group, renewed before its session runs out.
+/// One bucket's node and group; its S3 access opens on first use and `close` revokes it.
 struct Bucket {
     placement: Placement,
     node_api: Api,
-    session: S3Session,
-    client: aws_sdk_s3::Client,
-    opened: Instant,
     fallback: Option<String>,
+    read_only: bool,
+    access: Option<S3Access>,
 }
 
 impl Bucket {
-    async fn open(context: &Context<'_>, bucket: &str) -> Result<Self, CliError> {
+    async fn open(context: &Context<'_>, bucket: &str, read_only: bool) -> Result<Self, CliError> {
         let api = context.api()?;
         let (placement, node_api) = remote::locate(&api, bucket, context.node.as_deref()).await?;
-        let fallback = context.s3_endpoint.clone();
-        let session =
-            transfer::open_session(&node_api, &placement.group_id, fallback.as_deref()).await?;
         Ok(Self {
-            fallback,
-            client: transfer::s3_client(&session),
             placement,
             node_api,
-            session,
-            opened: Instant::now(),
+            fallback: context.s3_endpoint.clone(),
+            read_only,
+            access: None,
         })
     }
 
-    async fn client(&mut self) -> Result<&aws_sdk_s3::Client, CliError> {
-        if self.opened.elapsed() > SESSION_REUSE {
-            self.session = transfer::open_session(
-                &self.node_api,
-                &self.placement.group_id,
-                self.fallback.as_deref(),
-            )
-            .await?;
-            self.client = transfer::s3_client(&self.session);
-            self.opened = Instant::now();
+    async fn access(&mut self) -> Result<&mut S3Access, CliError> {
+        let access = match self.access.take() {
+            Some(access) => access,
+            None => {
+                S3Access::open(
+                    &self.node_api,
+                    &self.placement.group_id,
+                    self.fallback.as_deref(),
+                    self.read_only,
+                )
+                .await?
+            }
+        };
+        Ok(self.access.insert(access))
+    }
+
+    async fn close(self) {
+        if let Some(access) = self.access {
+            access.revoke().await;
         }
-        Ok(&self.client)
     }
 }
 
@@ -99,8 +99,10 @@ pub async fn copy(context: &mut Context<'_>, args: CopyArgs) -> Result<(), CliEr
                 let name = local.file_name().unwrap_or_default().to_string_lossy();
                 target.key = format!("{}{name}", target.key);
             }
-            let mut bucket = Bucket::open(context, &target.bucket).await?;
-            upload_one(&mut bucket, &local, &target.key, part_size).await?
+            let mut bucket = Bucket::open(context, &target.bucket, false).await?;
+            let copied = upload_one(&mut bucket, &local, &target.key, part_size).await;
+            bucket.close().await;
+            copied?
         }
         false => {
             let source = RemotePath::parse(&args.source)?;
@@ -114,36 +116,10 @@ pub async fn copy(context: &mut Context<'_>, args: CopyArgs) -> Result<(), CliEr
                 let name = source.key.rsplit('/').next().unwrap_or(&source.key);
                 dest = sync::local_path(&dest, name)?;
             }
-            let mut bucket = Bucket::open(context, &source.bucket).await?;
-            let entry = remote::find_object(&bucket.node_api, &source.bucket, &source.key)
-                .await?
-                .ok_or_else(|| CliError::usage(format!("no object {}", args.source)))?;
-            if entry.blake3().is_none() {
-                eprintln!(
-                    "warning: the node has no BLAKE3 for {}; only the size is checked",
-                    entry.key
-                );
-            }
-            let done = transfer::download(
-                bucket.client().await?,
-                &source.bucket,
-                &source.key,
-                &dest,
-                entry.size,
-                entry.blake3(),
-            )
-            .await?;
-            Copied {
-                direction: Direction::Download,
-                local: dest.display().to_string(),
-                bucket: source.bucket,
-                key: source.key,
-                node_id: bucket.placement.node_id,
-                size: done.size,
-                blake3: done.blake3,
-                verified: entry.blake3().is_some(),
-                resumed: 0,
-            }
+            let mut bucket = Bucket::open(context, &source.bucket, true).await?;
+            let copied = download_one(&mut bucket, &source, &dest).await;
+            bucket.close().await;
+            copied?
         }
     };
     if context.out.json {
@@ -162,6 +138,44 @@ pub async fn copy(context: &mut Context<'_>, args: CopyArgs) -> Result<(), CliEr
         .line(format!("{arrow} ({}, {check})", human_size(copied.size)))
 }
 
+/// Downloads one object and checks it against the size and BLAKE3 the node lists.
+async fn download_one(
+    bucket: &mut Bucket,
+    source: &RemotePath,
+    dest: &Path,
+) -> Result<Copied, CliError> {
+    let entry = remote::find_object(&bucket.node_api, &source.bucket, &source.key)
+        .await?
+        .ok_or_else(|| CliError::usage(format!("no object {}/{}", source.bucket, source.key)))?;
+    if entry.blake3().is_none() {
+        eprintln!(
+            "warning: the node has no BLAKE3 for {}; only the size is checked",
+            entry.key
+        );
+    }
+    let client = bucket.access().await?.client().await?;
+    let done = transfer::download(
+        &client,
+        &source.bucket,
+        &source.key,
+        dest,
+        entry.size,
+        entry.blake3(),
+    )
+    .await?;
+    Ok(Copied {
+        direction: Direction::Download,
+        local: dest.display().to_string(),
+        bucket: source.bucket.clone(),
+        key: source.key.clone(),
+        node_id: bucket.placement.node_id.clone(),
+        size: done.size,
+        blake3: done.blake3,
+        verified: entry.blake3().is_some(),
+        resumed: 0,
+    })
+}
+
 /// Uploads one file and checks the node's BLAKE3 of the stored object against the local one.
 async fn upload_one(
     bucket: &mut Bucket,
@@ -170,7 +184,7 @@ async fn upload_one(
     part_size: u64,
 ) -> Result<Copied, CliError> {
     let name = bucket.placement.bucket.clone();
-    let done = transfer::upload(bucket.client().await?, &name, key, local, part_size).await?;
+    let done = transfer::upload(bucket.access().await?, &name, key, local, part_size).await?;
     let stored = remote::find_object(&bucket.node_api, &name, key).await?;
     let verified = verify_stored(stored.as_ref(), key, done.size, &done.blake3)?;
     Ok(Copied {
@@ -241,7 +255,8 @@ pub async fn sync(context: &mut Context<'_>, args: SyncArgs) -> Result<(), CliEr
     }
     let target = RemotePath::parse(remote_raw)?;
     let prefix = target.folder();
-    let mut bucket = Bucket::open(context, &target.bucket).await?;
+    let read_only = direction == Direction::Download;
+    let mut bucket = Bucket::open(context, &target.bucket, read_only).await?;
     let listed = remote::list_all(&bucket.node_api, &target.bucket, &prefix).await?;
     let remote_files: Vec<RemoteFile> = listed
         .iter()
@@ -293,34 +308,31 @@ pub async fn sync(context: &mut Context<'_>, args: SyncArgs) -> Result<(), CliEr
         return Ok(());
     }
     let part_size = args.part_size * MIB;
-    for item in &plan.transfers {
-        let key = format!("{prefix}{}", item.path);
-        let local = match direction {
-            Direction::Upload => root.join(&item.path),
-            Direction::Download => sync::local_path(&root, &item.path)?,
-        };
-        match direction {
-            Direction::Upload => {
-                upload_one(&mut bucket, &local, &key, part_size).await?;
+    let done = async {
+        for item in &plan.transfers {
+            let key = format!("{prefix}{}", item.path);
+            match direction {
+                Direction::Upload => {
+                    upload_one(&mut bucket, &root.join(&item.path), &key, part_size).await?;
+                }
+                Direction::Download => {
+                    let local = sync::local_path(&root, &item.path)?;
+                    let expected = remote_digest(&listed, &key);
+                    let client = bucket.access().await?.client().await?;
+                    let name = &bucket.placement.bucket;
+                    let size = Some(item.size);
+                    transfer::download(&client, name, &key, &local, size, expected).await?;
+                }
             }
-            Direction::Download => {
-                let expected = remote_digest(&listed, &key);
-                let name = bucket.placement.bucket.clone();
-                transfer::download(
-                    bucket.client().await?,
-                    &name,
-                    &key,
-                    &local,
-                    Some(item.size),
-                    expected,
-                )
-                .await?;
+            if !context.out.json {
+                context.out.line(format!("done {}", item.path))?;
             }
         }
-        if !context.out.json {
-            context.out.line(format!("done {}", item.path))?;
-        }
+        Ok::<(), CliError>(())
     }
+    .await;
+    bucket.close().await;
+    done?;
     match context.out.json {
         true => context.out.json(&report),
         false => context.out.line(format!(

@@ -19,6 +19,8 @@ pub const S3_REGION: &str = "us-east-1";
 const MAX_PARTS: u64 = 10_000;
 const PART_UPLOADS: usize = 4;
 const PARTIAL_SUFFIX: &str = ".aruna-part";
+/// The node refreshes a session from five minutes before its expiry; one minute is kept for skew.
+const REFRESH_BEFORE: chrono::TimeDelta = chrono::TimeDelta::minutes(4);
 
 /// A short-lived S3 session of one group on one node.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -65,32 +67,69 @@ pub async fn open_session(
     group_id: &str,
     fallback: Option<&str>,
 ) -> Result<S3Session, CliError> {
+    match request_session(api, group_id, fallback).await {
+        Err(CliError::Api(error)) if error.status == 403 => Err(refused(group_id)),
+        other => other,
+    }
+}
+
+fn refused(group_id: &str) -> CliError {
+    CliError::routing(format!(
+        "the node refused an S3 session for group {group_id}: your roles grant no \
+         access to the group's data on this node, or the node does not know the group yet"
+    ))
+}
+
+async fn request_session(
+    api: &Api,
+    group_id: &str,
+    fallback: Option<&str>,
+) -> Result<S3Session, CliError> {
     let body = serde_json::json!({ "group_id": group_id });
-    let mut session: S3Session = match api.send(Method::POST, "access/s3/sessions", &body).await {
-        Err(CliError::Api(error)) if error.status == 403 => {
-            return Err(CliError::routing(format!(
-                "the node refused an S3 session for group {group_id}: your roles grant no \
-                 access to the group's data on this node, or the node does not know the group yet"
-            )));
-        }
-        other => other?,
-    };
+    let mut session: S3Session = api.send(Method::POST, "access/s3/sessions", &body).await?;
     session.endpoint = match session.issuer_node.s3_endpoint.clone() {
         Some(endpoint) => endpoint,
-        None => {
-            let info: NodeInfo = api.get("system/info", &[]).await?;
-            let published = info.services.interfaces.s3.url;
-            published
-                .or_else(|| fallback.map(str::to_string))
-                .ok_or_else(|| {
-                    CliError::routing(format!(
-                        "node {} publishes no S3 endpoint; pass --s3-endpoint",
-                        session.issuer_node.node_id
-                    ))
-                })?
-        }
+        None => node_endpoint(api, fallback, &session.issuer_node.node_id).await?,
     };
     Ok(session)
+}
+
+/// The S3 endpoint `api`'s node publishes, else `fallback`.
+async fn node_endpoint(
+    api: &Api,
+    fallback: Option<&str>,
+    node_id: &str,
+) -> Result<String, CliError> {
+    let info: NodeInfo = api.get("system/info", &[]).await?;
+    info.services
+        .interfaces
+        .s3
+        .url
+        .or_else(|| fallback.map(str::to_string))
+        .ok_or_else(|| {
+            CliError::routing(format!(
+                "node {node_id} publishes no S3 endpoint; pass --s3-endpoint"
+            ))
+        })
+}
+
+/// Revokes a session; a failure only warns, as the session ends at its expiry anyway.
+pub async fn revoke_session(api: &Api, session: &S3Session) {
+    let path = format!("access/s3/sessions/{}", session.access_key_id);
+    if let Err(error) = api.delete(&path).await {
+        eprintln!(
+            "warning: the S3 session {} was not revoked: {error}",
+            session.access_key_id
+        );
+    }
+}
+
+fn client_config(endpoint: &str) -> aws_sdk_s3::config::Builder {
+    aws_sdk_s3::config::Builder::new()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new(S3_REGION))
+        .endpoint_url(endpoint)
+        .force_path_style(true)
 }
 
 pub fn s3_client(session: &S3Session) -> aws_sdk_s3::Client {
@@ -101,14 +140,91 @@ pub fn s3_client(session: &S3Session) -> aws_sdk_s3::Client {
         None,
         "aruna-cli",
     );
-    let config = aws_sdk_s3::config::Builder::new()
-        .behavior_version(BehaviorVersion::latest())
-        .region(Region::new(S3_REGION))
+    let config = client_config(&session.endpoint)
         .credentials_provider(credentials)
-        .endpoint_url(&session.endpoint)
-        .force_path_style(true)
         .build();
     aws_sdk_s3::Client::from_conf(config)
+}
+
+/// One group's S3 client on one node: a session that is refreshed before it expires and revoked
+/// at the end, or unsigned reads of public objects for a caller the node gives no session.
+pub struct S3Access {
+    api: Api,
+    session: Option<S3Session>,
+    client: aws_sdk_s3::Client,
+}
+
+impl S3Access {
+    /// Opens a session; with `read_only`, a refused session falls back to unsigned reads.
+    pub async fn open(
+        api: &Api,
+        group_id: &str,
+        fallback: Option<&str>,
+        read_only: bool,
+    ) -> Result<Self, CliError> {
+        let session = match request_session(api, group_id, fallback).await {
+            Err(CliError::Api(error)) if error.status == 403 && read_only => None,
+            Err(CliError::Api(error)) if error.status == 403 => return Err(refused(group_id)),
+            other => Some(other?),
+        };
+        let client = match &session {
+            Some(session) => s3_client(session),
+            None => {
+                let node_id = api.node_id.clone().unwrap_or_default();
+                let endpoint = node_endpoint(api, fallback, &node_id).await?;
+                aws_sdk_s3::Client::from_conf(client_config(&endpoint).allow_no_auth().build())
+            }
+        };
+        Ok(Self {
+            api: api.clone(),
+            session,
+            client,
+        })
+    }
+
+    /// The client, after refreshing a session that is about to expire.
+    pub async fn client(&mut self) -> Result<aws_sdk_s3::Client, CliError> {
+        let Some(session) = &mut self.session else {
+            return Ok(self.client.clone());
+        };
+        let now = chrono::Utc::now();
+        if !expires_within(&session.expires_at, now, REFRESH_BEFORE) {
+            return Ok(self.client.clone());
+        }
+        let path = format!("access/s3/sessions/{}/refresh", session.access_key_id);
+        match self
+            .api
+            .send::<S3Session>(Method::POST, &path, &serde_json::json!({}))
+            .await
+        {
+            Ok(fresh) => {
+                let endpoint = std::mem::take(&mut session.endpoint);
+                *session = S3Session { endpoint, ..fresh };
+                self.client = s3_client(session);
+            }
+            // The node may see the refresh window later; the old pair works until expiry.
+            Err(_) if !expires_within(&session.expires_at, now, chrono::TimeDelta::zero()) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(self.client.clone())
+    }
+
+    /// Revokes the session, so it does not hold one of the few places a group has per node.
+    pub async fn revoke(self) {
+        if let Some(session) = &self.session {
+            revoke_session(&self.api, session).await;
+        }
+    }
+}
+
+/// Whether an RFC 3339 expiry is less than `margin` away; an unreadable one never expires.
+fn expires_within(
+    expires_at: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    margin: chrono::TimeDelta,
+) -> bool {
+    chrono::DateTime::parse_from_rfc3339(expires_at)
+        .is_ok_and(|expiry| expiry.with_timezone(&chrono::Utc) - now < margin)
 }
 
 /// One byte range of a multipart upload; numbers start at 1.
@@ -204,13 +320,14 @@ pub struct Uploaded {
 
 /// Uploads a file; above `part_size` as a multipart upload that continues an unfinished one.
 pub async fn upload(
-    client: &aws_sdk_s3::Client,
+    access: &mut S3Access,
     bucket: &str,
     key: &str,
     path: &Path,
     part_size: u64,
 ) -> Result<Uploaded, CliError> {
     let size = tokio::fs::metadata(path).await?.len();
+    let client = access.client().await?;
     if size <= part_size {
         let blake3 = hash_file(path).await?;
         let body = ByteStream::from_path(path)
@@ -237,9 +354,9 @@ pub async fn upload(
             .await
             .map_err(|error| CliError::Io(std::io::Error::other(error)))??
     };
-    let (upload_id, stored) = match unfinished_upload(client, bucket, key).await? {
+    let (upload_id, stored) = match unfinished_upload(&client, bucket, key).await? {
         Some(upload_id) => {
-            let stored = stored_parts(client, bucket, key, &upload_id).await?;
+            let stored = stored_parts(&client, bucket, key, &upload_id).await?;
             (upload_id, stored)
         }
         None => {
@@ -272,7 +389,8 @@ pub async fn upload(
             let (number, etag) = joined(done)?;
             etags[number as usize - 1] = Some(etag);
         }
-        let (client, bucket, key) = (client.clone(), bucket.to_string(), key.to_string());
+        let client = access.client().await?;
+        let (bucket, key) = (bucket.to_string(), key.to_string());
         let (upload_id, path) = (upload_id.clone(), path.to_path_buf());
         tasks
             .spawn(async move { send_part(&client, &bucket, &key, &upload_id, &path, part).await });
@@ -291,7 +409,9 @@ pub async fn upload(
                 .build()
         })
         .collect();
-    client
+    access
+        .client()
+        .await?
         .complete_multipart_upload()
         .bucket(bucket)
         .key(key)
@@ -545,6 +665,17 @@ mod tests {
         assert_eq!(whole, blake3::hash(&bytes).to_hex().to_string());
         assert_eq!(md5s[1], format!("{:x}", md5::compute(&bytes[1024..2048])));
         assert_eq!(md5s.len(), 3);
+    }
+
+    #[test]
+    fn refreshes_near_expiry() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(expires_within("2026-11-03T12:03:00Z", now, REFRESH_BEFORE));
+        assert!(expires_within("2026-11-03T11:59:00Z", now, REFRESH_BEFORE));
+        assert!(!expires_within("2026-11-03T12:30:00Z", now, REFRESH_BEFORE));
+        assert!(!expires_within("not a time", now, REFRESH_BEFORE));
     }
 
     #[test]
