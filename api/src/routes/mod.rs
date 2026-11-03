@@ -259,6 +259,10 @@ pub(crate) mod tests {
             "DELETE",
             "/metadata/groups/{group_id}/repositories/{connector_id}",
         ),
+        (
+            "POST",
+            "/metadata/groups/{group_id}/repositories/{connector_id}/harvests",
+        ),
         ("DELETE", "/system/notifications/watches/{id}"),
         ("DELETE", "/system/realm/oidc-providers/{id}"),
         ("DELETE", "/system/realm/admins/{user_id}"),
