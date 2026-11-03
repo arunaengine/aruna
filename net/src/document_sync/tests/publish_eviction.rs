@@ -347,3 +347,121 @@ async fn lost_eviction_replays() {
         "an unchanged genesis must keep its cursor instead of reapplying"
     );
 }
+
+/// Opens a document sync service of node `seed` on `doc_dir` with fresh node storage.
+async fn open_at(
+    seed: u8,
+    doc_dir: &std::path::Path,
+    realm_id: RealmId,
+) -> (tempfile::TempDir, DocumentSyncService) {
+    let (dir, storage) = test_storage();
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(seed).await,
+        storage,
+        doc_dir.join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("service opens");
+    (dir, service)
+}
+
+#[tokio::test]
+async fn eviction_survives_restart() {
+    // An eviction whose hand-off never committed is still journalled after a restart, with the
+    // same documents and event ids; once released, a later restart replays nothing.
+    let realm_id = RealmId::from_bytes([81; 32]);
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let (_storage_a, service_a) = open_at(81, dirs[0].path(), realm_id).await;
+    let (_storage_b, service_b) = open_at(82, dirs[1].path(), realm_id).await;
+    let services = [service_a, service_b];
+    let nodes = services
+        .each_ref()
+        .map(|service| service.local_node_id().unwrap());
+    let user_id = UserId::local(Ulid::from_parts(81, 1), realm_id);
+    let target = DocumentTarget::User { user_id };
+    let placement = PlacementRef {
+        strategy_id: Ulid::from_parts(81, 7),
+        shard: 1,
+    };
+    let topic_id = target.sync_topic_id(realm_id, &placement);
+    for (index, service) in services.iter().enumerate() {
+        service
+            .ensure_sync_topics(&[topic_id], vec![nodes[1 - index]])
+            .expect("topic genesis");
+        let seed = index as u8 + 1;
+        let event = test_admin_event(
+            Ulid::from_parts(81, u128::from(seed)),
+            AdminDocumentTarget::User { user_id },
+            &test_actor(seed, user_id, realm_id),
+            1,
+            AdminDocumentOperation::UserNameSet {
+                name: format!("name-{seed}"),
+            },
+        );
+        let origin_signature = sign_as_origin(&event, &placement);
+        let published = service
+            .publish_documents(
+                vec![DocumentSyncPublish::AdminOperation {
+                    target: target.clone(),
+                    event: Box::new(event),
+                    placement,
+                    allow_genesis: true,
+                    origin_signature: Some(origin_signature),
+                }],
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DocumentNetEvent::DocumentsPublished { .. }
+        ));
+    }
+    let genesis = |service: &DocumentSyncService| {
+        let state = service.node().storage().topic_state(&topic_id).unwrap();
+        state.expect("topic exists").genesis
+    };
+    let loser = usize::from(genesis(&services[0]) < genesis(&services[1]));
+    let winner = 1 - loser;
+    let winner_ops =
+        ::irokle::oplog::topological(services[winner].node().storage(), &topic_id).unwrap();
+    let (_ack, evictions) = services[loser]
+        .node()
+        .receive_sync_data_from_evicting(
+            node_to_peer(&nodes[winner]),
+            SyncData {
+                topic_id,
+                ops: winner_ops,
+            },
+        )
+        .expect("the loser admits the winning chain");
+    let eviction = evictions.into_iter().next().expect("one eviction");
+    let entry = services[loser]
+        .consume_eviction(eviction)
+        .await
+        .expect("the eviction is journalled");
+    let [first, second] = services;
+    for service in [first, second] {
+        service.shutdown().await;
+    }
+
+    let seed = 81 + loser as u8;
+    let (_storage, restarted) = open_at(seed, dirs[loser].path(), realm_id).await;
+    let pending = restarted.pending_evictions().await.expect("journal reads");
+    assert_eq!(pending, vec![entry.clone()]);
+    assert!(restarted.eviction_pending(&placement));
+    restarted
+        .clear_eviction(entry.key)
+        .await
+        .expect("entry releases");
+    restarted.shutdown().await;
+    drop(restarted);
+
+    let (_storage, released) = open_at(seed, dirs[loser].path(), realm_id).await;
+    let pending = released.pending_evictions().await.expect("journal reads");
+    assert!(pending.is_empty(), "a released entry must not replay");
+    released.shutdown().await;
+}
