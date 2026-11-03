@@ -854,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_needs_listed_root() {
+    fn requires_listed_root() {
         let storage = record(
             GroupBackendKind::Fs,
             &[("root", "projects"), ("folder", "raw/")],

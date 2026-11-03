@@ -784,7 +784,7 @@ async fn imports_local_folder() {
 }
 
 #[tokio::test]
-async fn refuses_read_only_folder() {
+async fn refuses_unwritable_folder() {
     use super::stream_from_bytes;
     let context = setup_two_backends().await;
     let share = tempfile::tempdir().unwrap();

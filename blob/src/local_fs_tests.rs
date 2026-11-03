@@ -262,7 +262,7 @@ async fn hides_unfinished_writes() {
 }
 
 #[tokio::test]
-async fn deletes_files_and_folders() {
+async fn deletes_entries() {
     let root = tempfile::tempdir().unwrap();
     put(root.path(), "a/file", "file");
     put(root.path(), "full/file", "file");
@@ -278,7 +278,7 @@ async fn deletes_files_and_folders() {
 }
 
 #[tokio::test]
-async fn writes_never_follow_symlinks() {
+async fn writes_avoid_symlinks() {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     put(outside.path(), "secret", "secret");

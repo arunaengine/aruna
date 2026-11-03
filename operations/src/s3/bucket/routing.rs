@@ -486,7 +486,7 @@ mod pure_tests {
     }
 
     #[test]
-    fn folder_routes_imports_only() {
+    fn folder_imports_only() {
         // A local folder takes only the routing rule its import rule wrote for this bucket.
         let folder = Ulid::from_bytes([4u8; 16]);
         let target = RoutingTarget::Backend(aruna_core::structs::storage::blob::BackendRef::Group(

@@ -169,7 +169,7 @@ async fn lists_empty_backends() {
 }
 
 #[tokio::test]
-async fn lists_group_import_roots() {
+async fn lists_import_roots() {
     let test = setup_state().await;
     let root = |groups: Vec<Ulid>, writable| ImportRoot {
         path: "/srv/hidden-path".to_string(),
