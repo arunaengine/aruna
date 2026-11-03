@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio_util::task::AbortOnDropHandle;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -129,9 +130,10 @@ pub async fn download_selection(
     let (writer, reader) = tokio::io::duplex(PIPE_BYTES);
     let context = state.get_ctx();
     let scope = (state.get_realm_id(), state.get_node_id());
-    let task = tokio::spawn(async move {
+    // Dropping the response body drops this handle and cancels the archive writer.
+    let task = AbortOnDropHandle::new(tokio::spawn(async move {
         write_selection(&context, (&auth, scope.0, scope.1), entries, writer).await
-    });
+    }));
     let tail = futures_util::stream::once(async move {
         match task.await {
             Ok(Ok(_)) | Ok(Err(SelectionError::Closed)) => None,
