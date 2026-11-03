@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod abe;
+pub mod archive;
 pub mod blobs;
 pub mod bucket;
 pub mod checks;

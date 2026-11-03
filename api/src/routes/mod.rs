@@ -65,6 +65,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(federation::link::router())
         .merge(federation::login::router())
         .merge(onboarding::router())
+        .merge(storage::archive::router())
         .merge(storage::blobs::router())
         .merge(storage::bucket::usage::router())
         .merge(storage::compression::router())
@@ -255,6 +256,7 @@ pub(crate) mod tests {
         ("DELETE", "/access/users/{id}/tokens"),
         ("DELETE", "/access/groups/{id}/roles/{role_id}"),
         ("DELETE", "/metadata/{document_id}"),
+        ("POST", "/data/archives"),
         (
             "DELETE",
             "/metadata/groups/{group_id}/repositories/{connector_id}",
