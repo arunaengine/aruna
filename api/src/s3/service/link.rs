@@ -35,6 +35,7 @@ fn link_error(error: LinkError) -> s3s::S3Error {
         LinkError::Unavailable(_) => {
             s3_error!(ServiceUnavailable, "The link target is unavailable")
         }
+        LinkError::Invalid(reason) => s3_error!(InvalidArgument, "{reason}"),
     }
 }
 

@@ -204,13 +204,15 @@ async fn source_read_drift() {
 #[tokio::test]
 async fn source_read_unpinned() {
     // Preferred pinning: a source without a strong validator still reads,
-    // unpinned and without an If-Match header.
+    // unpinned and without an If-Match header, and reports the GET's own validators.
     for etag in [None, Some("W/\"v1\"")] {
         let source = SourceListener::bind(etag, false).await;
 
-        let (_, stream) = read_staging_source(&test_guard(), &source.access(), None, None)
+        let (metadata, stream) = read_staging_source(&test_guard(), &source.access(), None, None)
             .await
             .unwrap();
+        assert_eq!(metadata.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(metadata.content_length, 5);
         let chunks: Vec<Bytes> = stream.try_collect().await.unwrap();
 
         assert_eq!(chunks.concat(), b"hello");

@@ -200,6 +200,7 @@ mod tests {
                 epoch,
                 ..ComputeDemandSnapshot::default()
             },
+            jobs: None,
         }
     }
 

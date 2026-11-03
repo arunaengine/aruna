@@ -69,7 +69,7 @@ pub(super) enum BackendSettings {
     None,
     Docker(DockerSettings),
     Apptainer(ApptainerSettings),
-    Kubernetes(KubernetesSettings),
+    Kubernetes(Box<KubernetesSettings>),
 }
 
 /// The operator's compute inputs, parsed at one boundary. Builders consume
@@ -111,8 +111,13 @@ pub(super) struct KubernetesSettings {
     pub(super) s3_cidrs: Vec<String>,
     pub(super) s3_port: Option<String>,
     pub(super) mount_driver: Option<String>,
-    /// KubeDAL driver for run input views, which mount through this node's gateway.
+    /// KubeDAL driver for run input views and session data, which mount through this node's gateway.
     pub(super) kubedal_driver: Option<String>,
+    /// KubeDAL worker cache for cached run inputs, set by its scope.
+    pub(super) kubedal_cache: Option<aruna_compute::KubedalCache>,
+    /// The node's S3 endpoint as task pods reach it, used for their S3 env instead of the
+    /// public one.
+    pub(super) session_endpoint: Option<String>,
     pub(super) policy_manifests: Vec<PathBuf>,
     pub(super) service_account: String,
     pub(super) execution_location: String,

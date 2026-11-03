@@ -101,7 +101,7 @@ pub struct KubernetesConfig {
     pub s3_port: u16,
     /// CSI driver name for S3 mounts; `None` disables the feature.
     pub s3_mount_driver: Option<String>,
-    /// KubeDAL mounts run input views with their own endpoint and credential per volume;
+    /// KubeDAL mounts run input views and session data with their own endpoint and credential;
     /// `None` mounts them through `s3_mount_driver`, whose endpoint is driver wide.
     pub kubedal: Option<Box<KubedalMount>>,
     /// Manifest files the operator adds to the compute namespace, such as a
@@ -155,6 +155,17 @@ pub struct KubedalMount {
     pub driver: String,
     pub endpoint: String,
     pub region: String,
+    /// Worker cache for cached inputs; `None` mounts every input through FUSE.
+    pub cache: Option<KubedalCache>,
+}
+
+/// The KubeDAL content cache this node's runs share on their workers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KubedalCache {
+    /// KubeDAL `cacheScope` of the runs' DataNodes, shared inside the compute namespace.
+    pub scope: String,
+    /// Labels of workers with a cache volume, which runs with cached inputs prefer.
+    pub worker_labels: BTreeMap<String, String>,
 }
 
 impl KubernetesConfig {

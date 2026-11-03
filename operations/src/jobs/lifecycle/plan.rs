@@ -20,6 +20,7 @@ use aruna_core::structs::placement::node_subject::storage_subject;
 use aruna_core::structs::placement::policy::{
     PlacementPolicyRef, PlacementSubject, PolicyResolution,
 };
+use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::structs::storage::blob::{
     BlobVersion, BlobVersionState, VersionKey, group_permission_path,
 };
@@ -125,7 +126,7 @@ fn plan_request(
 /// Node-info documents of every sync-eligible realm member that has one, and
 /// whether a read failed. An unread advertisement may hold the only legal
 /// target, so the round is a continuation rather than a conclusive refusal.
-async fn advertisements(
+pub(super) async fn advertisements(
     context: &DriverContext,
     config: &RealmConfigDocument,
 ) -> (BTreeMap<NodeId, NodeInfoDocument>, bool) {
@@ -147,6 +148,20 @@ async fn advertisements(
         }
     }
     (documents, unread)
+}
+
+/// The first required label no advertised executor carries; no round can place such a request.
+pub(super) fn missing_label<'a>(
+    documents: &BTreeMap<NodeId, NodeInfoDocument>,
+    labels: &'a [LabelMatch],
+) -> Option<&'a LabelMatch> {
+    let executors = documents.values().flat_map(|document| &document.executors);
+    labels.iter().find(|label| {
+        !executors.clone().any(|capability| {
+            let carried = capability.subject.labels.get(label.key.trim());
+            carried.map(|value| value.trim()) == Some(label.value.trim())
+        })
+    })
 }
 
 /// What one paged advertisement walk handed to the planner.
@@ -664,6 +679,25 @@ mod tests {
             .expect("every page continues the scan");
 
         assert_eq!((scan.pages, scan.scanned), (2, 1_031));
+    }
+
+    // A label no executor carries is named, so submit can refuse what no round would place.
+    #[test]
+    fn names_missing_label() {
+        let mut document = advertised(node(1));
+        (document.executors[0].subject.labels).insert("gpu".to_string(), "a100".to_string());
+        let documents = BTreeMap::from([(node(1), document)]);
+        let label = |key: &str, value: &str| LabelMatch {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+
+        let carried = [label("gpu", "a100")];
+        assert_eq!(missing_label(&documents, &carried), None);
+        let wanted = [label("gpu", "a100"), label("aruna-engine.org/node", "n2")];
+        assert_eq!(missing_label(&documents, &wanted), Some(&wanted[1]));
+        let other = [label("gpu", "h100")];
+        assert_eq!(missing_label(&documents, &other), Some(&other[0]));
     }
 
     /// One Docker-shaped site: file staging only, no S3 mount.

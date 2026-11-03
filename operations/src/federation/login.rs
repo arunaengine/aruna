@@ -253,6 +253,7 @@ impl FederatedLoginOperation {
             restrictions: None,
             via,
             auth_time: None,
+            cutoff: None,
         });
         let effects = session.start();
         self.state = FederatedLoginState::Session(session);

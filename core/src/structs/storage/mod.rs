@@ -11,6 +11,7 @@ pub mod broken;
 pub mod bucket_metadata;
 pub mod cleanup;
 pub mod data;
+pub mod dataset_description;
 pub mod dataset_location;
 pub mod delete_audit;
 pub mod discovery;

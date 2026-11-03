@@ -615,7 +615,11 @@ pub struct PreflightVisibleResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[schema(as = MetadataPreflightTargetResponse)]
 pub struct PreflightTargetResponse {
-    pub content_w3id: String,
+    /// The content identity of stored bytes; null for a target named by `location_iri`.
+    pub content_w3id: Option<String>,
+    /// The `s3://bucket/key` location of reference or pending versions, whose bytes were never
+    /// read and so have no content identity; null for a target named by `content_w3id`.
+    pub location_iri: Option<String>,
     pub targeted_versions: Vec<PreflightLocationResponse>,
     pub visible_references: Vec<PreflightVisibleResponse>,
     /// A document the caller may not read references the target, among the documents each

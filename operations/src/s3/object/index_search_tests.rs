@@ -426,12 +426,30 @@ async fn metadata_hits_authorized() {
         }]),
         ..owner(fixture)
     };
-    let first = test.search(metadata(denied, "escherichia"), 2).await;
+    let first = test.search(metadata(denied, "escherichia"), 1).await;
     assert!(first.hits.is_empty());
     let cursor = first
         .next_start_after
         .expect("the budget ends the page early");
     assert!(sealed_position(&cursor));
-    let last = BlobHeadKey::new("spire", "b/").to_bytes().unwrap();
+    let last = BlobHeadKey::new("spire", "a/").to_bytes().unwrap();
     assert_eq!(open_position(&cursor).unwrap(), last);
+}
+
+// A realm-wide scan skips the distributed bucket and names it, so the realm search can search
+// it through its ranges instead.
+#[tokio::test]
+async fn names_skipped_bucket() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["a/needle-1.txt"]).await;
+    let mut input = test.input(owner(&test.fixture), "needle");
+    input.bucket = None;
+
+    let page = crate::s3::object::search::search_local_objects(&test.fixture.context, input)
+        .await
+        .unwrap();
+
+    assert!(page.hits.is_empty());
+    assert_eq!(page.skipped_buckets, ["spire"]);
+    assert_eq!(page.incomplete_ranges, 1);
 }

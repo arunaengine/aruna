@@ -35,6 +35,8 @@ pub enum LinkError {
     NotFound,
     #[error("the link target is unavailable: {0}")]
     Unavailable(String),
+    #[error("the link request is invalid: {0}")]
+    Invalid(String),
 }
 
 /// Who reads through a link, as the node that verified the request's credential saw them.
@@ -316,7 +318,7 @@ async fn remote_target(
     source: &LinkSource,
 ) -> Result<(LinkTarget, SourceMetadata), LinkError> {
     let version = source.version.ok_or_else(|| {
-        LinkError::Unavailable("a link to another node names the exact version".to_string())
+        LinkError::Invalid("a link to another node names the exact version".to_string())
     })?;
     let arn = VersionedObjectArn {
         realm_id: caller.auth.realm_id,
@@ -375,5 +377,35 @@ mod tests {
         assert_eq!(here, Ok(true));
         let there = target_visible(&context, &caller, &target(remote), local).await;
         assert!(matches!(there, Err(LinkError::Unavailable(_))), "{there:?}");
+    }
+
+    #[tokio::test]
+    async fn remote_needs_version() {
+        // A link to another node without a version is a bad request, not an unavailable target.
+        let (_directory, storage) = test_storage();
+        let context = test_context(storage);
+        let (realm_id, group_id) = (RealmId::from_bytes([1; 32]), Ulid::from_parts(2, 2));
+        let local = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let remote = iroh::SecretKey::from_bytes(&[5; 32]).public();
+        let auth = seed_access(&context, (realm_id, group_id, local), "/denied").await;
+        let caller = LinkCaller {
+            auth,
+            credential: ("key".to_string(), group_id, u64::MAX),
+        };
+        let source = LinkSource {
+            node_id: remote,
+            bucket: "work3".to_string(),
+            key: "n3.txt".to_string(),
+            version: None,
+        };
+        let created = create_link(
+            &context,
+            &caller,
+            ("work", "n3.txt", group_id),
+            (local, source),
+        );
+        let error = created.await.unwrap_err();
+        assert!(matches!(&error, LinkError::Invalid(_)), "{error:?}");
+        assert!(error.to_string().contains("names the exact version"));
     }
 }

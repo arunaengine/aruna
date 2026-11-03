@@ -281,6 +281,7 @@ mod tests {
                     epoch,
                     ..ComputeDemandSnapshot::default()
                 },
+                jobs: None,
             },
             age_ms: 5_000,
             received_at_ms: 0,

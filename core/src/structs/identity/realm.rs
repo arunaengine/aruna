@@ -251,6 +251,66 @@ pub fn validate_portal_features(
     Ok(())
 }
 
+/// Longest node display name, in characters.
+pub const MAX_NODE_NAME: usize = 64;
+
+/// The one node display name rule: trimmed, non-empty, at most [`MAX_NODE_NAME`] characters
+/// and free of control characters. `None` means the name is refused.
+pub fn normalize_node_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let length = trimmed.chars().count();
+    ((1..=MAX_NODE_NAME).contains(&length) && !trimmed.chars().any(char::is_control))
+        .then(|| trimmed.to_string())
+}
+
+/// A node's position on a map in degrees times 10^7, so replicated state holds no floats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCoordinates {
+    pub lat_e7: i32,
+    pub lon_e7: i32,
+}
+
+impl NodeCoordinates {
+    /// Rounds finite degrees within the latitude and longitude ranges; others are refused.
+    pub fn from_degrees(lat: f64, lon: f64) -> Option<Self> {
+        let valid = lat.is_finite() && lon.is_finite() && lat.abs() <= 90.0 && lon.abs() <= 180.0;
+        valid.then(|| Self {
+            lat_e7: (lat * 1e7).round() as i32,
+            lon_e7: (lon * 1e7).round() as i32,
+        })
+    }
+
+    /// Latitude and longitude in degrees.
+    pub fn degrees(&self) -> (f64, f64) {
+        (f64::from(self.lat_e7) / 1e7, f64::from(self.lon_e7) / 1e7)
+    }
+
+    pub fn valid(&self) -> bool {
+        self.lat_e7.unsigned_abs() <= 900_000_000 && self.lon_e7.unsigned_abs() <= 1_800_000_000
+    }
+}
+
+/// Where a node is shown on a map: a readable place name and coordinates. Presentation only:
+/// placement, distinct locations and routing never read it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePlace {
+    pub name: Option<String>,
+    pub coordinates: Option<NodeCoordinates>,
+}
+
+impl NodePlace {
+    /// Whether the place holds something, a name in its normalized form and valid coordinates.
+    pub fn valid(&self) -> bool {
+        let name = (self.name.as_ref())
+            .is_none_or(|name| normalize_node_name(name).as_ref() == Some(name));
+        (self.name.is_some() || self.coordinates.is_some())
+            && name
+            && self
+                .coordinates
+                .is_none_or(|coordinates| coordinates.valid())
+    }
+}
+
 /// One realm-wide bearer token revocation. The expiry is the revoked token's
 /// own `exp`: past it the token no longer validates, so the entry is pruned and
 /// the replicated set stays bounded by one token lifetime of revocations.
@@ -1191,7 +1251,10 @@ mod test {
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
-    use super::{JobFamilyError, PortalFeatureError, validate_portal_features};
+    use super::{
+        JobFamilyError, MAX_NODE_NAME, NodeCoordinates, NodePlace, PortalFeatureError,
+        normalize_node_name, validate_portal_features,
+    };
 
     #[test]
     pub fn realm_auth_roundtrip() {
@@ -2256,6 +2319,55 @@ mod test {
             RealmConfigDocument::from_bytes(&encoded).expect("full record decodes"),
             config
         );
+    }
+
+    #[test]
+    fn node_name_rule() {
+        // Every node replicates the name, so the one rule must refuse what a portal cannot show.
+        assert_eq!(
+            normalize_node_name("  Giessen 1 "),
+            Some("Giessen 1".to_string())
+        );
+        assert_eq!(
+            normalize_node_name(&"ä".repeat(MAX_NODE_NAME)).map(|name| name.chars().count()),
+            Some(MAX_NODE_NAME)
+        );
+        assert_eq!(normalize_node_name(&"a".repeat(MAX_NODE_NAME + 1)), None);
+        assert_eq!(normalize_node_name("   "), None);
+        assert_eq!(normalize_node_name("node\u{7}one"), None);
+        assert_eq!(normalize_node_name("two\nlines"), None);
+    }
+
+    #[test]
+    fn node_coordinates_bounded() {
+        // Replicated values are whole numbers, so every node stores the same bytes for a point.
+        let giessen = NodeCoordinates::from_degrees(50.583_6, 8.678_4).unwrap();
+        assert_eq!((giessen.lat_e7, giessen.lon_e7), (505_836_000, 86_784_000));
+        assert_eq!(giessen.degrees(), (50.583_6, 8.678_4));
+        let corner = NodeCoordinates::from_degrees(-90.0, 180.0).unwrap();
+        assert!(corner.valid());
+        for (lat, lon) in [
+            (90.1, 0.0),
+            (0.0, -180.5),
+            (f64::NAN, 0.0),
+            (0.0, f64::INFINITY),
+        ] {
+            assert_eq!(NodeCoordinates::from_degrees(lat, lon), None);
+        }
+        let out = NodeCoordinates {
+            lat_e7: 900_000_001,
+            lon_e7: 0,
+        };
+        assert!(!out.valid());
+        assert!(
+            !NodePlace::default().valid(),
+            "an empty place is a clear, not a value"
+        );
+        let padded = NodePlace {
+            name: Some(" Giessen".to_string()),
+            coordinates: None,
+        };
+        assert!(!padded.valid());
     }
 
     #[test]

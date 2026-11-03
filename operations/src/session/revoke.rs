@@ -2,7 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::revoke_token::{RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation};
+use crate::auth::revoke_token::{
+    RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
+};
+use aruna_core::auth::{user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -15,11 +18,25 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+/// Moves the actor's token cutoff past `issued_at`, which ends every token the actor was issued
+/// up to then. One entry per user, so it is admitted when the per-token set is full.
+pub(crate) fn cutoff_revocation(actor: Actor, issued_at: u64, now: u64) -> RevokeTokenConfig {
+    RevokeTokenConfig {
+        token_hash: user_cutoff_hash(&actor.user_id),
+        expires_at: user_cutoff_expiry(issued_at.saturating_add(1)),
+        token_owner: actor.user_id,
+        admission: RevokeTokenAdmission::Privileged,
+        actor,
+        now,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RevokeSessionState {
     Init,
     ReadSession,
     RevokeToken,
+    RaiseCutoff,
     StartTransaction,
     RereadSession,
     WriteSession,
@@ -155,8 +172,24 @@ impl RevokeSessionOperation {
         let Event::SubOperation(SubOperationEvent::TokenRevoked { result }) = event else {
             return self.unexpected("token revocation result", event);
         };
+        let full = RevokeTokenError::CapacityReached.to_string();
         match result {
             Ok(()) => self.begin_write(),
+            // A full revocation set never keeps a session alive: the user's cutoff moves past
+            // it, which also signs out the user's older sessions.
+            Err(error) if error == full && self.state == RevokeSessionState::RevokeToken => {
+                let Some(session) = self.session.as_ref() else {
+                    return self.emit_error(RevokeSessionError::NotFinished);
+                };
+                let config = cutoff_revocation(self.actor.clone(), session.created_at, self.now);
+                self.state = RevokeSessionState::RaiseCutoff;
+                smallvec![Effect::SubOperation(boxed_suboperation(
+                    RevokeTokenOperation::new(config),
+                    |result| Event::SubOperation(SubOperationEvent::TokenRevoked {
+                        result: result.map(|_| ()).map_err(|error| error.to_string()),
+                    }),
+                ))]
+            }
             Err(error) => self.emit_error(RevokeSessionError::TokenRevoke(error)),
         }
     }
@@ -248,7 +281,9 @@ impl Operation for RevokeSessionOperation {
         match self.state {
             RevokeSessionState::Init => self.start(),
             RevokeSessionState::ReadSession => self.handle_session(event),
-            RevokeSessionState::RevokeToken => self.handle_revoked(event),
+            RevokeSessionState::RevokeToken | RevokeSessionState::RaiseCutoff => {
+                self.handle_revoked(event)
+            }
             RevokeSessionState::StartTransaction => self.handle_started(event),
             RevokeSessionState::RereadSession => self.handle_reread(event),
             RevokeSessionState::WriteSession => self.handle_written(event),
@@ -354,5 +389,80 @@ mod pure_tests {
             value: Some(record.to_bytes().unwrap().into()),
         }));
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    }
+
+    // A full revocation set never keeps a session alive: the user's cutoff moves past it.
+    #[test]
+    fn full_revocation_cutoff() {
+        let realm_id = RealmId::from_bytes([3; 32]);
+        let user_id = UserId::new(Ulid::from_bytes([4; 16]), realm_id);
+        let session_id = Ulid::from_bytes([5; 16]).to_string();
+        let record = UserSession {
+            sid: session_id.clone(),
+            user_id,
+            kind: SessionKind::Portal,
+            label: None,
+            created_at: 10,
+            expires_at: 20,
+            token_hash: "a".repeat(64),
+            revoked: false,
+            via: None,
+        };
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
+            user_id,
+            realm_id,
+        };
+        let mut operation = RevokeSessionOperation::new(actor.clone(), session_id.clone(), 15);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: session_id.as_bytes().into(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+        let full = Err(RevokeTokenError::CapacityReached.to_string());
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+            result: full.clone(),
+        }));
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        assert_eq!(operation.state, RevokeSessionState::RaiseCutoff);
+        let cutoff = cutoff_revocation(actor, record.created_at, 15);
+        assert_eq!(cutoff.token_hash, user_cutoff_hash(&user_id));
+        assert_eq!(cutoff.admission, RevokeTokenAdmission::Privileged);
+        // Tokens issued in the session's second or before are cut off.
+        assert_eq!(cutoff.expires_at, user_cutoff_expiry(11));
+
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+            result: Ok(()),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+
+        // A failed cutoff is reported, never retried as another cutoff.
+        let mut operation = RevokeSessionOperation::new(
+            Actor {
+                node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
+                user_id,
+                realm_id,
+            },
+            session_id.clone(),
+            15,
+        );
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: session_id.as_bytes().into(),
+            value: Some(record.to_bytes().unwrap().into()),
+        }));
+        operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+            result: full.clone(),
+        }));
+        operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+            result: full,
+        }));
+        assert!(matches!(
+            operation.finalize(),
+            Err(RevokeSessionError::TokenRevoke(_))
+        ));
     }
 }

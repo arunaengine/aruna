@@ -619,12 +619,18 @@ fn build_s3_service(
     auth: AuthProvider,
 ) -> Result<S3Service, S3ServerError> {
     let mut builder = S3ServiceBuilder::new(aruna_service.clone());
-    builder.set_host(SingleDomain::new(domain)?);
+    builder.set_host(s3_host(domain)?);
     builder.set_auth(auth.clone());
     builder.set_access(auth);
     builder.set_validation(AwsNameValidation::new());
     builder.set_config(sig_v2_config());
     Ok(builder.build())
+}
+
+/// Reads buckets from subdomains of `domain`; any other host, such as an in-cluster service
+/// name, is path-style instead of being taken as the bucket name.
+fn s3_host(domain: &str) -> Result<SingleDomain, s3s::host::DomainError> {
+    Ok(SingleDomain::new(domain)?.with_cname_fallback(false))
 }
 
 /// Keeps Signature Version 2 requests accepted; s3s 0.17 rejects them by default.
@@ -1045,6 +1051,19 @@ async fn load_bucket_cors(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An in-cluster service host is path-style, not a bucket name (batch run S3 access).
+    #[test]
+    fn cluster_host_paths() {
+        use s3s::host::S3Host;
+        let host = s3_host("s3.example.org").unwrap();
+        let service = host
+            .parse_host_header("aruna-node-2.aruna.svc:1337")
+            .unwrap();
+        assert_eq!(service.bucket(), None);
+        let bucket = host.parse_host_header("data.s3.example.org").unwrap();
+        assert_eq!(bucket.bucket(), Some("data"));
+    }
 
     const TOKEN_CANARY: &str = "group-s-token-canary";
     const TOKEN_AUTH: &str = "AWS4-HMAC-SHA256 Credential=TOKENKEY/20261005/us-east-1/s3/aws4_request, \

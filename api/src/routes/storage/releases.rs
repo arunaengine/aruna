@@ -20,7 +20,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::bucket_metadata::BucketIdentifierBody;
+use super::bucket::metadata::BucketIdentifierBody;
 use super::deletion::bucket_info;
 use super::relay::{relay_json, rest_target};
 use crate::auth::{ValidatedBearer, require_realm_auth};
@@ -187,11 +187,7 @@ fn release_spec(request: &PublishReleaseRequest) -> ServerResult<ReleaseSpec> {
             target: IdentifierTarget::Key,
         })
         .collect();
-    let check = aruna_core::structs::storage::bucket_metadata::BucketMetadata {
-        identifiers: upstream.clone(),
-        ..Default::default()
-    };
-    aruna_core::structs::storage::bucket_metadata::validate_metadata(&check)
+    aruna_core::structs::storage::bucket_metadata::validate_identifiers(&upstream)
         .map_err(ServerError::BadRequestReason)?;
     Ok(ReleaseSpec {
         label: request.label.clone(),

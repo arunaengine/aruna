@@ -194,11 +194,13 @@ pub(crate) async fn read_staging_source(
         .or(metadata.source_version.as_deref())
         .filter(|version| !version.is_empty());
     let strong_etag = strong_etag(metadata.etag.as_deref());
+    let mut unpinned = false;
     if let Some(version) = pinned_version.filter(|_| capability.read_with_version) {
         reader = reader.version(version);
     } else if let Some(etag) = strong_etag.filter(|_| capability.read_with_if_match) {
         reader = reader.if_match(etag);
     } else {
+        unpinned = true;
         tracing::warn!(
             source = %path,
             has_version = pinned_version.is_some(),
@@ -209,7 +211,7 @@ pub(crate) async fn read_staging_source(
     let reader = reader
         .await
         .map_err(|error| map_source_error(error, false))?;
-    let stream = match range {
+    let mut stream = match range {
         Some(range) => reader
             .into_bytes_stream(range)
             .await
@@ -219,8 +221,31 @@ pub(crate) async fn read_staging_source(
             .await
             .map_err(|error| map_source_error(error, false))?,
     };
+    // Nothing pinned this GET, so only its own answer shows which bytes it serves.
+    let metadata = match unpinned {
+        true => read_metadata(stream.metadata().await.ok(), metadata),
+        false => metadata,
+    };
 
     Ok((metadata, BackendStream::new(stream)))
+}
+
+/// The HEAD's metadata with the validators the GET itself answered; without them the read
+/// carries none, so it never proves an observation.
+fn read_metadata(read: Option<opendal::Metadata>, head: SourceMetadata) -> SourceMetadata {
+    match read {
+        Some(read) => SourceMetadata {
+            content_length: read.content_length(),
+            etag: read.etag().map(ToOwned::to_owned),
+            last_modified: read.last_modified().map(Into::into),
+            ..head
+        },
+        None => SourceMetadata {
+            etag: None,
+            last_modified: None,
+            ..head
+        },
+    }
 }
 
 fn strong_etag(etag: Option<&str>) -> Option<&str> {

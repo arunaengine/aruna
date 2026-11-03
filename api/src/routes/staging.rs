@@ -662,7 +662,11 @@ Nothing is authorized later while the job runs.
   byte count; such a row is registered without a HEAD), `checksums` (`[{"algorithm": "md5" |
   "sha1" | "sha256", "column"}]`, hex digests recorded on the reference: a read whose source
   gives no strong ETag checks the whole bytes against them) and `modified` (column of an RFC
-  3339 time, recorded as the file's modification time, or a date, which is only checked). A
+  3339 time, recorded as the file's modification time, or a date, which is only checked).
+  `record` rows are complete object records that are trusted, so the source is never asked:
+  they need `size`, take `checksums` and `modified` like file rows, and the columns `etag`,
+  `content_type` and `metadata` (a JSON object of strings) when the table has them. A record
+  row without a source writes an empty object, such as a folder marker `name/`. A
   bad value fails its row. `connector_id` is always required: every row is read through it, so
   rows that name http(s) URLs need a connector whose base holds them for egress. A list in a
   bucket (`object`) is itself read without the connector. `rate` paces requests to the connector per

@@ -95,6 +95,48 @@ fn preserves_first_seen() {
     );
 }
 
+// A distributed bucket with more hits than one page keeps its continuation in the realm-wide
+// cursor, which stays valid after every node partition is exhausted.
+#[test]
+fn keeps_bucket_continuation() {
+    let secret = iroh::SecretKey::from_bytes(&[34u8; 32]);
+    let signer = secret.public();
+    let fingerprint = [35u8; 32];
+    let exhausted = [ObjectPartitionState {
+        node_id: signer,
+        start_after: None,
+        exhausted: true,
+        observed_at: Some(SystemTime::UNIX_EPOCH),
+    }];
+    let pending = vec![PendingBucket {
+        bucket: "ncbi-refseq".to_string(),
+        cursor: Some("bucket-cursor".to_string()),
+    }];
+    let signed = |pending: &[PendingBucket]| {
+        ObjectCursor::new_signed(
+            fingerprint,
+            SystemTime::UNIX_EPOCH,
+            &exhausted,
+            &[],
+            false,
+            0,
+            pending,
+            signer,
+            |bytes| secret.sign(bytes),
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+    };
+
+    let decoded = ObjectCursor::decode(&signed(&pending), fingerprint, &[signer]).unwrap();
+    assert_eq!(decoded.payload.pending, pending);
+    assert!(matches!(
+        ObjectCursor::decode(&signed(&[]), fingerprint, &[signer]),
+        Err(MetadataApiError::InvalidCursor(_))
+    ));
+}
+
 #[test]
 fn rejects_cursor_tampering() {
     let secret = iroh::SecretKey::from_bytes(&[34u8; 32]);
@@ -113,6 +155,7 @@ fn rejects_cursor_tampering() {
         &[],
         false,
         0,
+        &[],
         signer,
         |bytes| secret.sign(bytes),
     )

@@ -18,7 +18,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_core::structs::storage::data::identity::{
-    CONTENT_URL, DataEntity, ObjectLocation, normalized_id, parse_hash,
+    CONTENT_URL, DataEntity, ObjectLocation, content_id, normalized_id, parse_hash,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -603,29 +603,35 @@ fn capture_entities(
     }
     let mut part_of = Vec::new();
     if let Some(metadata) = &captured.database {
+        let described = &metadata.described;
+        // Each captured description is its own snapshot, based on the dataset it was read from.
         let snapshot = serde_json::to_value(metadata).unwrap_or_default();
         let digest = blake3::hash(snapshot.to_string().as_bytes()).to_hex();
         let database_id = format!("#bucket-metadata-{}", &digest[..16]);
-        let title = metadata.title.as_deref().unwrap_or("Bucket metadata");
+        let title = described.title.as_deref().unwrap_or("Bucket metadata");
         let mut database = json!({
             "@id": database_id.clone(),
             "@type": "Dataset",
             "name": format!("{title} (at admission)")
         });
         for (name, value) in [
-            ("version", &metadata.version),
-            ("license", &metadata.license),
-            ("description", &metadata.description),
+            ("version", &described.version),
+            ("license", &described.license),
+            ("description", &described.description),
         ] {
             if let Some(value) = value {
                 database[name] = json!(value);
             }
         }
-        let links: Vec<_> = (metadata.identifiers.iter())
+        let links: Vec<_> = (described.identifiers.iter())
             .map(|identifier| json!(identifier.url))
             .collect();
         if !links.is_empty() {
             database["identifier"] = json!(links);
+        }
+        if let Some(dataset) = metadata.dataset {
+            database["isBasedOn"] =
+                json!({ "@id": MetadataRegistryRecord::graph_iri_for(dataset) });
         }
         part_of.push(json!({ "@id": database_id }));
         entities.push(database);
@@ -739,9 +745,16 @@ fn build_crate_jsonld(
                       hash: Option<[u8; 32]>,
                       (version, by_version): (Option<String>, bool),
                       file: serde_json::Value| {
-        // Without a hash, a captured input's exact version keeps same-named inputs of two
-        // nodes apart.
+        // Without a hash, or when another input has the same bytes, a captured input's exact
+        // version names it, so two inputs never share an id or fall back to a bucket path.
         let id = match (hash, &version) {
+            (Some(hash), Some(version))
+                if by_version
+                    && used.contains(&content_id(hash))
+                    && used.insert(version.clone()) =>
+            {
+                version.clone()
+            }
             (Some(hash), _) => normalized_id(hash, &location, &mut used),
             (None, Some(version)) if by_version => version.clone(),
             _ => location.to_url(),
@@ -824,6 +837,14 @@ fn build_crate_jsonld(
                     .unwrap_or_default()
                     .to_string();
                 context_entities.entry(context_id).or_insert(context_entity);
+            }
+            // The bucket metadata and releases an input is part of are datasets the root lists.
+            for part in file["isPartOf"].as_array().into_iter().flatten() {
+                if let Some(part) = part["@id"].as_str()
+                    && !part_ids.iter().any(|id| id == part)
+                {
+                    part_ids.push(part.to_string());
+                }
             }
         }
         object_ids.push(json!({ "@id": id.clone() }));
@@ -1399,7 +1420,8 @@ mod pure_tests {
         // Admission's capture names a public source's pin, the bucket's metadata then and the
         // releases that pin the input; unchecked membership is marked on the file.
         use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
-        use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, ReleaseRef};
+        use aruna_core::structs::storage::bucket_metadata::{CapturedDatabase, ReleaseRef};
+        use aruna_core::structs::storage::dataset_description::DatasetDescription;
         use aruna_core::structs::storage::origin::{OriginVersion, SourcePin};
         let (mut record, spec) = execution_record();
         let doi = Identifier {
@@ -1433,12 +1455,16 @@ mod pure_tests {
                 path: "db/in.txt".to_string(),
                 source_version: Some("v6".to_string()),
             }),
-            database: Some(BucketMetadata {
+            database: Some(CapturedDatabase {
                 database: true,
-                title: Some("Bakta".to_string()),
-                version: Some("6.0".to_string()),
-                identifiers: vec![doi.clone()],
-                ..BucketMetadata::default()
+                described: DatasetDescription {
+                    title: Some("Bakta".to_string()),
+                    version: Some("6.0".to_string()),
+                    identifiers: vec![doi.clone()],
+                    ..DatasetDescription::default()
+                },
+                dataset: Some(Ulid::from_bytes([16; 16])),
+                ..CapturedDatabase::default()
             }),
             releases: vec![ReleaseRef {
                 crate_version: crate_version.clone(),
@@ -1465,6 +1491,8 @@ mod pure_tests {
         assert_eq!(values, [json!("db/in.txt"), json!("v6"), json!("\"abc\"")]);
         let part_of = input["isPartOf"].as_array().expect("part of");
         let database = find(&part_of[0]["@id"]).expect("metadata snapshot");
+        let dataset = MetadataRegistryRecord::graph_iri_for(Ulid::from_bytes([16; 16]));
+        assert_eq!(database["isBasedOn"]["@id"], dataset.as_str());
         assert_eq!(database["name"], "Bakta (at admission)");
         assert_eq!(database["version"], "6.0");
         assert_eq!(database["identifier"][0], doi.url.as_str());
@@ -1472,6 +1500,9 @@ mod pure_tests {
         assert_eq!(release["@id"], crate_version.to_id().as_str());
         assert_eq!(release["version"], "6.0");
         assert_eq!(release["isBasedOn"][0]["@id"], doi.url.as_str());
+        // The metadata snapshot and the release must reach the root, or the crate is refused.
+        let checked = craqle::validate_rocrate_jsonld(&value.to_string());
+        assert!(checked.is_ok(), "{checked:?}");
 
         // Membership that was not checked everywhere is marked; a private source stays unnamed.
         let mut unchecked = captured(false);
@@ -1552,6 +1583,69 @@ mod pure_tests {
     }
 
     #[test]
+    fn snapshots_stay_apart() {
+        // Two captures of one dataset with different descriptions stay two snapshots of it.
+        use aruna_core::structs::storage::bucket_metadata::CapturedDatabase;
+        use aruna_core::structs::storage::dataset_description::DatasetDescription;
+        let (mut record, mut spec) = execution_record();
+        let mut second = spec.inputs[0].clone();
+        second.dest_key = "inputs/in2.txt".to_string();
+        second.name = Some("Second sample".to_string());
+        spec.inputs.push(second);
+        let dataset = Ulid::from_bytes([16; 16]);
+        for (destination, seed, title) in [
+            ("inputs/in.txt", 13, "Bakta 5"),
+            ("inputs/in2.txt", 14, "Bakta 6"),
+        ] {
+            record.captured_inputs.push(CapturedInput {
+                destination_key: destination.to_string(),
+                source_node_id: record.owner_node_id,
+                version_id: Ulid::from_bytes([seed; 16]),
+                content: InputContent::Blake3([seed; 32]),
+                bytes: 3,
+                policies: Vec::new(),
+                source_group_id: Ulid::from_bytes([21; 16]),
+                public: false,
+                link: None,
+                source_pin: None,
+                database: Some(CapturedDatabase {
+                    database: true,
+                    described: DatasetDescription {
+                        title: Some(title.to_string()),
+                        ..DatasetDescription::default()
+                    },
+                    dataset: Some(dataset),
+                    ..CapturedDatabase::default()
+                }),
+                releases: Vec::new(),
+                releases_complete: true,
+                grant: None,
+            });
+        }
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let snapshot_of = |name: &str| {
+            let file = graph
+                .iter()
+                .find(|entity| entity["name"] == name)
+                .expect("input entity");
+            let id = &file["isPartOf"][0]["@id"];
+            graph
+                .iter()
+                .find(|entity| entity["@id"] == *id)
+                .expect("snapshot")
+                .clone()
+        };
+        let (first, second) = (snapshot_of("Input sample"), snapshot_of("Second sample"));
+        assert_ne!(first["@id"], second["@id"]);
+        assert_eq!(first["name"], "Bakta 5 (at admission)");
+        assert_eq!(second["name"], "Bakta 6 (at admission)");
+        let source = MetadataRegistryRecord::graph_iri_for(dataset);
+        assert_eq!(first["isBasedOn"]["@id"], source.as_str());
+        assert_eq!(second["isBasedOn"]["@id"], source.as_str());
+    }
+
+    #[test]
     fn names_by_content() {
         // Known digests become content addresses; the same content twice keeps one address,
         // and each entity keeps its own exact version as a second `contentUrl`.
@@ -1604,6 +1698,67 @@ mod pure_tests {
         assert_eq!(output["contentUrl"][1], arn(11));
         let action = graph.iter().find(|e| e["@type"] == "CreateAction").unwrap();
         assert_eq!(action["object"][0]["@id"], content);
+        assert!(craqle::validate_rocrate_jsonld(&value.to_string()).is_ok());
+    }
+
+    #[test]
+    fn same_bytes_versioned() {
+        // A second input with the same bytes, here reached through a link, is named by its
+        // exact version, never by a bucket path another crate could use for other data.
+        let (mut record, mut spec) = execution_record();
+        let mut second = spec.inputs[0].clone();
+        second.dest_key = "inputs/linked.txt".to_string();
+        second.name = Some("Linked sample".to_string());
+        spec.inputs.push(second);
+        let link = VersionedObjectArn::new(
+            record.created_by.realm_id,
+            record.owner_node_id,
+            "work",
+            "links/in.txt",
+            Ulid::from_bytes([15; 16]),
+        )
+        .unwrap();
+        for (destination, link) in [("inputs/in.txt", None), ("inputs/linked.txt", Some(link))] {
+            record.captured_inputs.push(CapturedInput {
+                destination_key: destination.to_string(),
+                source_node_id: record.owner_node_id,
+                version_id: Ulid::from_bytes([13; 16]),
+                content: InputContent::Blake3([9; 32]),
+                bytes: 3,
+                policies: Vec::new(),
+                source_group_id: Default::default(),
+                public: false,
+                link,
+                source_pin: None,
+                database: None,
+                releases: Vec::new(),
+                releases_complete: false,
+                grant: None,
+            });
+        }
+        let value = parse(&record, &spec);
+        let graph = value["@graph"].as_array().unwrap();
+        let id_of = |name: &str| {
+            let file = graph.iter().find(|entity| entity["name"] == name);
+            file.expect("input entity")["@id"].clone()
+        };
+        let exact = VersionedObjectArn::new(
+            record.created_by.realm_id,
+            record.owner_node_id,
+            "src",
+            "in.txt",
+            Ulid::from_bytes([13; 16]),
+        )
+        .unwrap()
+        .to_w3id();
+        let content = aruna_core::structs::storage::data::identity::content_id([9; 32]);
+        assert_eq!(id_of("Input sample"), content);
+        assert_eq!(id_of("Linked sample"), exact);
+        assert!(
+            !graph
+                .iter()
+                .any(|entity| entity["@id"] == "s3://src/in.txt")
+        );
         assert!(craqle::validate_rocrate_jsonld(&value.to_string()).is_ok());
     }
 

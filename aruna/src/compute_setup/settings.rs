@@ -49,7 +49,9 @@ pub(super) fn collect(
         SelectedBackend::None => BackendSettings::None,
         SelectedBackend::Docker => BackendSettings::Docker(collect_docker(env)?),
         SelectedBackend::Apptainer => BackendSettings::Apptainer(collect_apptainer(env)?),
-        SelectedBackend::Kubernetes => BackendSettings::Kubernetes(collect_kubernetes(env)?),
+        SelectedBackend::Kubernetes => {
+            BackendSettings::Kubernetes(Box::new(collect_kubernetes(env)?))
+        }
     };
     let has_backend = !matches!(backend, BackendSettings::None);
     Ok(ComputeSettings {
@@ -156,6 +158,12 @@ fn collect_kubernetes(
         s3_port: parse_nonempty(env.var("ARUNA_COMPUTE_K8S_S3_PORT").as_deref()),
         mount_driver: parse_nonempty(env.var("ARUNA_COMPUTE_K8S_S3_MOUNT_DRIVER").as_deref()),
         kubedal_driver: parse_nonempty(env.var("ARUNA_COMPUTE_K8S_KUBEDAL_DRIVER").as_deref()),
+        kubedal_cache: kubedal_cache(env)?,
+        session_endpoint: parse_nonempty(
+            env.var("ARUNA_COMPUTE_K8S_S3_SESSION_ENDPOINT").as_deref(),
+        )
+        .map(|value| pod_endpoint(&value))
+        .transpose()?,
         policy_manifests,
         service_account: env
             .var("ARUNA_COMPUTE_K8S_SERVICE_ACCOUNT")
@@ -177,6 +185,25 @@ fn collect_kubernetes(
             300,
         )?,
     })
+}
+
+/// The KubeDAL worker cache: a scope enables it, worker labels are optional.
+fn kubedal_cache(
+    env: &dyn crate::settings::SettingsEnv,
+) -> Result<Option<aruna_compute::KubedalCache>, String> {
+    let Some(scope) = parse_nonempty(env.var("ARUNA_COMPUTE_K8S_KUBEDAL_CACHE_SCOPE").as_deref())
+    else {
+        return Ok(None);
+    };
+    let worker_labels = parse_labels(
+        "ARUNA_COMPUTE_K8S_KUBEDAL_CACHE_WORKER_LABELS",
+        env.var("ARUNA_COMPUTE_K8S_KUBEDAL_CACHE_WORKER_LABELS")
+            .as_deref(),
+    )?;
+    Ok(Some(aruna_compute::KubedalCache {
+        scope,
+        worker_labels,
+    }))
 }
 
 /// The gateway address of the Docker session bridge, on the configured S3 port.
@@ -483,6 +510,19 @@ pub(super) fn session_s3_port(
         .unwrap_or(443))
 }
 
+/// An `http` or `https` URL with a host, which task pods use as their S3 endpoint.
+fn pod_endpoint(value: &str) -> Result<String, ComputeBuildError> {
+    let url = reqwest::Url::parse(value)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+    match url {
+        Some(_) => Ok(value.to_string()),
+        None => Err(ComputeBuildError::Invalid(
+            "ARUNA_COMPUTE_K8S_S3_SESSION_ENDPOINT must be an http or https URL".to_string(),
+        )),
+    }
+}
+
 pub(super) fn kubernetes_s3_access(
     workspace: Option<&str>,
     cidrs: Vec<String>,
@@ -647,6 +687,14 @@ mod pure_tests {
     }
 
     #[test]
+    fn checks_pod_endpoint() {
+        let service = "http://aruna-v3-debug-node-2.aruna-v3-debug.svc:1337";
+        assert_eq!(pod_endpoint(service).unwrap(), service);
+        assert!(pod_endpoint("aruna-v3-debug-node-2:1337").is_err());
+        assert!(pod_endpoint("ftp://node:21").is_err());
+    }
+
+    #[test]
     fn derives_s3_port() {
         // An explicit setting stays authoritative; otherwise the policy port is
         // the one pods reach the endpoint on.
@@ -715,5 +763,30 @@ mod pure_tests {
         );
         assert!(parse_positive::<u32>("ARUNA_COMPUTE_MAX_CONCURRENT", "0").is_err());
         assert!(parse_positive::<u64>("ARUNA_COMPUTE_MAX_RAM_BYTES", "-1").is_err());
+    }
+
+    #[test]
+    fn cache_needs_scope() {
+        // Worker labels alone never turn on the cache.
+        let env = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let labels = (
+            "ARUNA_COMPUTE_K8S_KUBEDAL_CACHE_WORKER_LABELS",
+            "cache=large",
+        );
+        assert_eq!(kubedal_cache(&env(&[labels])), Ok(None));
+        let scope = ("ARUNA_COMPUTE_K8S_KUBEDAL_CACHE_SCOPE", "node-2");
+        let cache = kubedal_cache(&env(&[scope, labels])).unwrap().unwrap();
+        assert_eq!(cache.scope, "node-2");
+        assert_eq!(
+            cache.worker_labels.get("cache").map(String::as_str),
+            Some("large")
+        );
+        let bad = ("ARUNA_COMPUTE_K8S_KUBEDAL_CACHE_WORKER_LABELS", "no-value");
+        assert!(kubedal_cache(&env(&[scope, bad])).is_err());
     }
 }

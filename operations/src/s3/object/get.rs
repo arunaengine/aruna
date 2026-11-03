@@ -167,6 +167,8 @@ pub enum GetObjectError {
     InvalidRange,
     #[error("Reference source metadata changed during access.")]
     ReferenceSourceChanged,
+    #[error("The reference source no longer matches its recorded checksum.")]
+    ReferenceChecksumMismatch,
     #[error("The historical reference version is no longer available.")]
     HistoricalReferenceUnavailable,
     #[error(
@@ -1237,7 +1239,7 @@ impl GetObjectOperation {
                 if let (ObservationMatch::Same, Some(stored)) = (comparison, stored) {
                     // Undrifted: serve the recorded observation, bound to its ETag. Without a
                     // source that enforces that binding, recorded digests are checked on the
-                    // whole bytes, and a pinned version without digests is refused.
+                    // whole bytes, and the read response must still match the observation.
                     self.last_refresh = self.reference_last_refresh;
                     let content_type = stored.content_type.clone().or(metadata.content_type);
                     let served = SourceMetadata {
@@ -1250,15 +1252,16 @@ impl GetObjectOperation {
                     });
                     let bound = enforces && strong_validator(served.etag.as_deref());
                     if !bound {
-                        let enforced = served.enforced_checksums();
-                        if enforced.is_empty() && self.reference_explicit {
-                            return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
-                        }
-                        self.verify_digests = enforced;
+                        self.verify_digests = served.enforced_checksums();
                     }
                     return self.serve_reference_source(served, bound);
                 }
-                if comparison == ObservationMatch::Unknown {
+                // Recorded digests decide over a changed time or ETag of the same length.
+                let digests_decide = self.reference_cached.as_ref().is_some_and(|stored| {
+                    !stored.enforced_checksums().is_empty()
+                        && stored.content_length == metadata.content_length
+                });
+                if comparison == ObservationMatch::Unknown || digests_decide {
                     // Nothing proves the bytes unchanged. The whole bytes are checked against the
                     // recorded digests before any is served; without digests a pinned version is
                     // refused, and the current one is served fresh without counting as refreshed.
@@ -1286,7 +1289,7 @@ impl GetObjectOperation {
                 // Recorded digests bind the bytes, so a drifted source never replaces them.
                 let bound = self.reference_cached.as_ref();
                 if bound.is_some_and(|stored| !stored.enforced_checksums().is_empty()) {
-                    return self.emit_error(GetObjectError::ReferenceSourceChanged);
+                    return self.emit_error(GetObjectError::ReferenceChecksumMismatch);
                 }
                 // Current drift records a same-binding successor, but repeated
                 // change fails rather than serving mismatched bytes.
@@ -1815,11 +1818,19 @@ impl GetObjectOperation {
                 let Some(head_metadata) = self.source_metadata.as_ref() else {
                     return self.emit_error(GetObjectError::GetObjectFailed);
                 };
-                if head_metadata.compare(&metadata) == ObservationMatch::Changed {
+                let comparison = head_metadata.compare(&metadata);
+                if comparison == ObservationMatch::Changed {
                     if self.reference_explicit {
                         return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                     }
                     return self.restart_after_conflict();
+                }
+                // Without digests, only the read's own validators prove a pinned version.
+                if comparison == ObservationMatch::Unknown
+                    && self.reference_explicit
+                    && self.verify_digests.is_empty()
+                {
+                    return self.emit_error(GetObjectError::HistoricalReferenceUnavailable);
                 }
                 self.advance_observation = None;
                 // `last_refresh` was set by the head handler from the drift check.
@@ -1919,7 +1930,7 @@ impl GetObjectOperation {
         let expected = std::mem::take(&mut self.verify_digests);
         // Dropping the stream of a spool that missed the digests removes the spool.
         if unmatched_checksum(&expected, &hashes).is_some() {
-            return self.emit_error(GetObjectError::ReferenceSourceChanged);
+            return self.emit_error(GetObjectError::ReferenceChecksumMismatch);
         }
         self.reference_stream = Some(blob);
         self.finish_reference_output()

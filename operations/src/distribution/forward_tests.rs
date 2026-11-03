@@ -116,3 +116,58 @@ fn internal_tokens_refused() {
     assert!(!bearer_only(&internal));
     assert!(bearer_only(&AuthToken::bearer("token").unwrap()));
 }
+
+// The publisher checks a linked dataset with the caller's own access, like the REST route.
+#[tokio::test]
+async fn refuses_unreadable_link() {
+    use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
+    let (_directory, context) = crate::tests::notifications::context_with_storage();
+    let realm = RealmId::from_bytes([9; 32]);
+    let auth = AuthContext {
+        user_id: UserId::nil(realm),
+        realm_id: realm,
+        path_restrictions: None,
+        session: None,
+    };
+    let change = |dataset| DistributionRequest::ChangeMetadata {
+        metadata: Some(Box::new(BucketMetadata {
+            dataset,
+            ..BucketMetadata::default()
+        })),
+        expected: None,
+    };
+    let token = || AuthToken::bearer("token").unwrap();
+    let missing = change(Some(Ulid::from_bytes([7; 16])));
+    let refused = readable_link(&context, (&auth, token()), &missing).await;
+    assert!(
+        matches!(refused, Err(PublishRefusal::Rejected(_))),
+        "{refused:?}"
+    );
+    for unlinked in [
+        change(None),
+        DistributionRequest::ChangeMetadata {
+            metadata: None,
+            expected: None,
+        },
+    ] {
+        let kept = readable_link(&context, (&auth, token()), &unlinked).await;
+        assert_eq!(kept, Ok(()));
+    }
+}
+
+// A refused member's bucket goes, but only while it is still that member's bucket.
+#[tokio::test]
+async fn removes_refused_member() {
+    let (_directory, context) = crate::tests::notifications::context_with_storage();
+    let (set_id, member_id) = (Ulid::from_bytes([3; 16]), Ulid::from_bytes([4; 16]));
+    let create = CreateBucketOperation::new("spire".to_string(), bucket(set_id, member_id, 0));
+    drive(create.mapped(), &context).await.unwrap();
+
+    remove_member(&context, "spire", set_id, Ulid::from_bytes([5; 16])).await;
+    let kept = drive(GetBucketOperation::new("spire".to_string()), &context).await;
+    assert!(kept.is_ok(), "another member's bucket stays");
+
+    remove_member(&context, "spire", set_id, member_id).await;
+    let gone = drive(GetBucketOperation::new("spire".to_string()), &context).await;
+    assert!(gone.is_err(), "the refused member's bucket is deleted");
+}

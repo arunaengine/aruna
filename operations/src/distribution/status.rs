@@ -14,8 +14,8 @@ use aruna_core::keyspaces::{DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionRevision, DistributionSnapshot, DistributionView, MemberState,
-    MetadataCoverage, SetPhase, TransferRole,
+    DataStrategy, DistributionRevision, DistributionSettings, DistributionSnapshot,
+    DistributionView, MemberState, MetadataCoverage, SetPhase, TransferRole,
 };
 use aruna_core::types::GroupId;
 use thiserror::Error;
@@ -103,6 +103,8 @@ pub struct DistributionStatus {
     /// The grant that covers the bucket on every member node, so reads that pull from another
     /// member pass that member's own check.
     pub recommended_grant: String,
+    /// The current settings in full, as a settings change replaces them.
+    pub settings: DistributionSettings,
     pub lifecycle: LifecycleStatus,
     /// The copy queues of the ranges this node coordinates were read to their end, so the
     /// pending counts of `copies` are exact rather than lower bounds.
@@ -206,6 +208,7 @@ pub fn summarize(
         degraded: ranges.iter().any(|range| range.degraded.is_some()),
         members,
         ranges,
+        settings: snapshot.config.settings.clone(),
         lifecycle: lifecycle(snapshot),
         copies_counted: false,
     }

@@ -665,6 +665,10 @@ fn download_error(error: GetObjectError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "the reference source is changing; retry this download",
         ),
+        GetObjectError::ReferenceChecksumMismatch => drs_error(
+            StatusCode::PRECONDITION_FAILED,
+            "the reference source no longer matches its recorded checksum",
+        ),
         GetObjectError::ReferenceAdvanceExhausted => drs_error(
             StatusCode::CONFLICT,
             "the reference binding reached its automatic advance limit; rebind it with an explicit write",

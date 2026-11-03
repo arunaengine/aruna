@@ -263,7 +263,6 @@ async fn releases_pin_versions() -> TestResult<()> {
     };
     let metadata = BucketMetadata {
         database: true,
-        title: Some("Bakta".to_string()),
         ..BucketMetadata::default()
     };
     let set_metadata = PutMetadataOperation::new(
@@ -284,7 +283,12 @@ async fn releases_pin_versions() -> TestResult<()> {
         .await?
         .map_err(|refusal| format!("{refusal:?}"))?;
     let captured = &resolved[0].1;
-    assert_eq!(captured.database.as_ref(), Some(&metadata));
+    // The bucket links no dataset here, so the captured description stays empty.
+    let database = aruna_core::structs::storage::bucket_metadata::CapturedDatabase::new(
+        metadata.clone(),
+        Default::default(),
+    );
+    assert_eq!(captured.database.as_ref(), Some(&database));
     assert_eq!(captured.releases.len(), 1);
     assert_eq!(captured.releases[0].label, "6.0");
     assert!(captured.releases_complete);

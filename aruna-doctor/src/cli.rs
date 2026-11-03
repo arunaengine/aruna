@@ -76,6 +76,14 @@ pub enum Commands {
         #[command(subcommand)]
         command: ReclaimCommands,
     },
+    /// Write the current objects of a bucket as record rows for a `record` table import: one
+    /// TSV per connector id plus `empty.tsv`. Reads the store, so run it on a stopped node or
+    /// on a copy of its database.
+    Export {
+        database_path: String,
+        bucket: String,
+        target_path: String,
+    },
     /// Rewrite legacy job, PID mapping and realm rows, rebuild the identifier index, seal
     /// plain secrets and delete the former node info topics. Writes the database and must run
     /// while the node is stopped. Current rows stay unchanged, so repeating it is safe.

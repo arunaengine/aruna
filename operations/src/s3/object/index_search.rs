@@ -324,6 +324,7 @@ fn page(
         remote_ranges,
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
+        skipped_buckets: Vec::new(),
     }
 }
 

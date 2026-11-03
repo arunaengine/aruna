@@ -640,9 +640,9 @@ fn build_config(
         cap_drop: Some(vec!["ALL".to_string()]),
         security_opt: Some(vec!["no-new-privileges".to_string()]),
         network_mode: match spec.security.network {
-            // A session reaches the node's S3 plane over the internal bridge and
+            // A task reaching its bucket uses the node's S3 plane over the internal bridge and
             // nothing else, so it is isolated from everything external.
-            _ if spec.session && spec.security.network != NetworkAccess::Open => {
+            _ if spec.reaches_s3() && spec.security.network != NetworkAccess::Open => {
                 Some(SESSION_NETWORK.to_string())
             }
             NetworkAccess::Isolated => Some("none".to_string()),
@@ -806,7 +806,7 @@ impl ExecutorBackend for DockerBackend {
             };
         }
         self.ensure_image(&spec.image, cancel).await?;
-        if spec.session && spec.security.network != NetworkAccess::Open {
+        if spec.reaches_s3() && spec.security.network != NetworkAccess::Open {
             self.ensure_session_network().await?;
         }
 

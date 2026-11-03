@@ -163,7 +163,7 @@ pub use self::search::{
     search_objects,
 };
 #[cfg(test)]
-use self::search::{ObjectCursor, ObjectPartitionState};
+use self::search::{ObjectCursor, ObjectPartitionState, PendingBucket};
 
 const REFERENCES_LIMIT: usize = 25;
 

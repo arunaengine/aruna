@@ -181,6 +181,7 @@ async fn create_credential(
     create_s3_credentials(
         State(state.clone()),
         Extension(Some(auth.clone())),
+        Extension(Some(crate::auth::ValidatedBearer::new_for_test("bearer"))),
         Json(CreateS3Request {
             group_id: group_id.to_string(),
             expires_in_seconds: None,
@@ -190,6 +191,23 @@ async fn create_credential(
         }),
     )
     .await
+}
+
+#[test]
+fn bearer_bounds_expiry() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let bearer = 1_000_000 + 3_600;
+    let expiry = credential_expiry(now, None, bearer).unwrap();
+    assert_eq!(expiry, SystemTime::UNIX_EPOCH + Duration::from_secs(bearer));
+    let shorter = credential_expiry(now, Some(600), bearer).unwrap();
+    assert_eq!(shorter, now + Duration::from_secs(600));
+}
+
+#[test]
+fn ending_bearer_refused() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let result = credential_expiry(now, Some(600), 1_000_000 + 30);
+    assert!(matches!(result, Err(ServerError::BadRequest)));
 }
 
 #[tokio::test]

@@ -8,24 +8,40 @@ use ulid::Ulid;
 
 use crate::errors::ConversionError;
 use crate::structs::identity::identifier::{Identifier, IdentifierParser, validate_parser};
+use crate::structs::storage::dataset_description::DatasetDescription;
 use crate::structs::storage::origin::OriginVersion;
 
-/// Metadata of one bucket. The owner is the bucket's group, read from the bucket itself.
+/// Metadata of one bucket. The owner is the bucket's group, read from the bucket itself. Title,
+/// description, license, identifiers and version live only in the linked dataset.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BucketMetadata {
     /// Show the bucket as a database; the server treats it as any bucket.
     pub database: bool,
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub version: Option<String>,
-    /// A license URL or SPDX id.
-    pub license: Option<String>,
-    /// DOI and other identifiers of the bucket.
-    pub identifiers: Vec<Identifier>,
     /// Identifier rules applied to keys and source URLs.
     pub parser: Option<IdentifierParser>,
     /// The dataset document that describes the bucket, if any.
     pub dataset: Option<Ulid>,
+}
+
+/// A database input at admission: the bucket's metadata and its dataset's description then. Job
+/// records store it, and its byte layout is the one they stored before the description moved.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CapturedDatabase {
+    pub database: bool,
+    pub described: DatasetDescription,
+    pub parser: Option<IdentifierParser>,
+    pub dataset: Option<Ulid>,
+}
+
+impl CapturedDatabase {
+    pub fn new(metadata: BucketMetadata, described: DatasetDescription) -> Self {
+        Self {
+            database: metadata.database,
+            described,
+            parser: metadata.parser,
+            dataset: metadata.dataset,
+        }
+    }
 }
 
 /// A release a version is a member of: the release crate's exact version and its label.
@@ -114,12 +130,20 @@ pub fn release_prefix(bucket: &str) -> Vec<u8> {
     key
 }
 
-/// Checks what a reader relies on: identifier rules that compile and http(s) identifier links.
+/// Checks what a reader relies on: identifier rules that compile, and a dataset for a database.
 pub fn validate_metadata(metadata: &BucketMetadata) -> Result<(), String> {
     if let Some(parser) = &metadata.parser {
         validate_parser(parser).map_err(|error| error.to_string())?;
     }
-    for identifier in &metadata.identifiers {
+    if metadata.database && metadata.dataset.is_none() {
+        return Err("a database needs a dataset that describes it".to_string());
+    }
+    Ok(())
+}
+
+/// Checks that every identifier links to an http or https page.
+pub fn validate_identifiers(identifiers: &[Identifier]) -> Result<(), String> {
+    for identifier in identifiers {
         let scheme = identifier.url.split_once("://").map(|(scheme, _)| scheme);
         if !matches!(scheme, Some("http" | "https")) {
             return Err(format!(
@@ -138,19 +162,19 @@ mod tests {
     use crate::structs::identity::realm::RealmId;
     use crate::structs::storage::global_id::GlobalId;
 
-    #[test]
-    fn metadata_round_trip() {
-        let identifier = Identifier {
+    fn doi() -> Identifier {
+        Identifier {
             name: "DOI".to_string(),
             value: "10.5281/zenodo.1".to_string(),
             url: "https://doi.org/10.5281/zenodo.1".to_string(),
             target: IdentifierTarget::Key,
-        };
+        }
+    }
+
+    #[test]
+    fn metadata_round_trip() {
         let metadata = BucketMetadata {
             database: true,
-            title: Some("Bakta DB".to_string()),
-            version: Some("6.0".to_string()),
-            identifiers: vec![identifier.clone()],
             dataset: Some(Ulid::from_bytes([2; 16])),
             ..BucketMetadata::default()
         };
@@ -160,11 +184,76 @@ mod tests {
                 version_id: Ulid::from_bytes([3; 16]),
             }),
             label: "6.0-light".to_string(),
-            upstream: vec![identifier],
+            upstream: vec![doi()],
         };
         let bytes = postcard::to_allocvec(&(metadata.clone(), release.clone())).unwrap();
         let restored: (BucketMetadata, ReleaseRef) = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(restored, (metadata, release));
+        assert!(validate_metadata(&restored.0).is_ok());
+    }
+
+    /// The bucket metadata layout job records and set settings stored before the description
+    /// moved into the dataset.
+    #[derive(Default, Serialize)]
+    struct PreviousMetadata {
+        database: bool,
+        title: Option<String>,
+        description: Option<String>,
+        version: Option<String>,
+        license: Option<String>,
+        identifiers: Vec<Identifier>,
+        parser: Option<IdentifierParser>,
+        dataset: Option<Ulid>,
+    }
+
+    #[test]
+    fn previous_records_decode() {
+        // A job record captured the whole previous metadata; it reads back as the description.
+        let previous = PreviousMetadata {
+            database: true,
+            title: Some("Bakta DB".to_string()),
+            description: Some("Annotation database".to_string()),
+            version: Some("6.0".to_string()),
+            license: Some("CC-BY-4.0".to_string()),
+            identifiers: vec![doi()],
+            parser: Some(IdentifierParser::default()),
+            dataset: Some(Ulid::from_bytes([2; 16])),
+        };
+        let bytes = postcard::to_allocvec(&(Some(&previous), 7u8)).unwrap();
+        let (captured, tail): (Option<CapturedDatabase>, u8) =
+            postcard::from_bytes(&bytes).unwrap();
+        let captured = captured.unwrap();
+        assert_eq!(tail, 7, "the rest of the record still lines up");
+        assert_eq!(captured.described.title.as_deref(), Some("Bakta DB"));
+        assert_eq!(captured.described.license.as_deref(), Some("CC-BY-4.0"));
+        assert_eq!(captured.described.identifiers, vec![doi()]);
+        assert_eq!(captured.parser, Some(IdentifierParser::default()));
+        assert_eq!(captured.dataset, Some(Ulid::from_bytes([2; 16])));
+        // New captures keep that layout.
+        let again = postcard::to_allocvec(&(Some(&captured), 7u8)).unwrap();
+        assert_eq!(again, bytes);
+
+        // Cleared metadata reads the same in both layouts; a filled previous row does not.
+        let cleared = postcard::to_allocvec(&(None::<PreviousMetadata>, 7u8)).unwrap();
+        let read: (Option<BucketMetadata>, u8) = postcard::from_bytes(&cleared).unwrap();
+        assert_eq!(read, (None, 7));
+        let filled = postcard::to_allocvec(&(Some(&previous), 7u8)).unwrap();
+        let read = postcard::from_bytes::<(Option<BucketMetadata>, u8)>(&filled);
+        assert_ne!(read.ok(), Some((Some(BucketMetadata::default()), 7)));
+    }
+
+    #[test]
+    fn database_needs_dataset() {
+        let metadata = BucketMetadata {
+            database: true,
+            ..BucketMetadata::default()
+        };
+        assert!(validate_metadata(&metadata).is_err());
+        assert!(validate_metadata(&BucketMetadata::default()).is_ok());
+        let mut link = doi();
+        assert!(validate_identifiers(std::slice::from_ref(&link)).is_ok());
+        link.url = "ftp://example.org/x".to_string();
+        assert!(validate_identifiers(&[link]).is_err());
     }
 
     #[test]

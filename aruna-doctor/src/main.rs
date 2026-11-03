@@ -13,6 +13,7 @@ use crate::explorer::{
     explore_entries, explore_keyspaces, print_node_state, print_topic_placements,
     print_topic_status, print_topics_list, scan_locations,
 };
+use crate::export::export_bucket;
 use crate::info::print_info;
 use crate::iroh_check::print_iroh_check;
 use crate::migrate::migrate;
@@ -25,6 +26,7 @@ use clap::Parser;
 mod cli;
 mod error;
 mod explorer;
+mod export;
 mod info;
 mod iroh_check;
 mod migrate;
@@ -126,6 +128,11 @@ async fn main() -> Result<(), CliError> {
             } => seed_backend(database_path, backend).await?,
             ReclaimCommands::Status { database_path } => reclaim_status(database_path).await?,
         },
+        Commands::Export {
+            database_path,
+            bucket,
+            target_path,
+        } => export_bucket(database_path, bucket, target_path).await?,
         Commands::Migrate {
             database_path,
             sync_path,

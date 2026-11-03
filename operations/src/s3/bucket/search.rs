@@ -82,7 +82,7 @@ pub struct BucketSearchHit {
     pub created_at: SystemTime,
     /// The distributed bucket this local bucket is a member of; `None` for an ordinary bucket.
     pub set_id: Option<ulid::Ulid>,
-    /// The bucket's metadata, read for a database search only.
+    /// The bucket's current metadata, if it has any.
     pub metadata: Option<BucketMetadata>,
     /// Anyone, also without a login, may read the bucket; set for a database search only.
     pub public: bool,
@@ -335,10 +335,6 @@ impl SearchBucketsOperation {
             metadata: None,
             public: false,
         };
-        if !self.input.database {
-            self.hits.push(hit);
-            return self.continue_search();
-        }
         self.state = SearchBucketsState::ReadMetadata;
         let key: Key = hit.bucket.as_bytes().to_vec().into();
         let reads = match set_id {
@@ -358,7 +354,7 @@ impl SearchBucketsOperation {
         })]
     }
 
-    /// Keeps a pending hit only when its current metadata marks it as a database.
+    /// Adds the current metadata to a pending hit; a database search keeps only databases.
     fn handle_metadata_read(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
@@ -388,7 +384,7 @@ impl SearchBucketsOperation {
                 (None, _) => None,
             },
         };
-        if metadata.as_ref().is_some_and(|metadata| metadata.database) {
+        if !self.input.database || metadata.as_ref().is_some_and(|metadata| metadata.database) {
             hit.metadata = metadata;
             self.hits.push(hit);
         }
@@ -642,6 +638,11 @@ mod tests {
         )
     }
 
+    /// A bucket without metadata; every hit reads it.
+    fn no_metadata() -> Event {
+        Event::Storage(StorageEvent::BatchReadResult { values: Vec::new() })
+    }
+
     #[test]
     fn budget_keeps_position() {
         let mut operation = SearchBucketsOperation::new(scan_input("missing", 1));
@@ -694,6 +695,7 @@ mod tests {
             key: group_id.to_bytes().to_vec().into(),
             value: None,
         }));
+        operation.step(no_metadata());
 
         let output = operation.finalize().unwrap();
         assert_eq!(output.hits.len(), 1);
@@ -729,6 +731,7 @@ mod tests {
                 key: mine.to_bytes().to_vec().into(),
                 value: None,
             }));
+            operation.step(no_metadata());
         }
         let output = operation.finalize().unwrap();
         let names: Vec<_> = output.hits.iter().map(|hit| hit.bucket.as_str()).collect();
@@ -766,6 +769,7 @@ mod tests {
                 key: group_id.to_bytes().to_vec().into(),
                 value: None,
             }));
+            operation.step(no_metadata());
         }
         let output = operation.finalize().unwrap();
         let sets: Vec<_> = output
@@ -943,7 +947,7 @@ mod tests {
                 incarnation: 0,
                 metadata: BucketMetadata {
                     database,
-                    title: Some(bucket.to_string()),
+                    dataset: database.then(|| ulid::Ulid::from_bytes([9; 16])),
                     ..BucketMetadata::default()
                 },
             };
@@ -980,7 +984,7 @@ mod tests {
         assert_eq!(databases[0].bucket, "data-public");
         assert!(databases[0].public);
         let metadata = databases[0].metadata.as_ref().unwrap();
-        assert_eq!(metadata.title.as_deref(), Some("data-public"));
+        assert_eq!(metadata.dataset, Some(ulid::Ulid::from_bytes([9; 16])));
 
         // A cut scan seals its position, which names the unreadable bucket it stopped at.
         let input = SearchBucketsInput {

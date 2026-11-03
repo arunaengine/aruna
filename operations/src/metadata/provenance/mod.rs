@@ -168,7 +168,7 @@ impl ProvenanceCrate {
         if let Some(from) = origin["hop"]["from"].as_str() {
             next.push(based_on(from));
         }
-        self.database(&id, &origin["bucket_metadata"]);
+        self.database(&id, &origin["bucket_metadata"], &origin["description"]);
         next.extend(self.releases(&id, origin));
         next
     }
@@ -242,24 +242,29 @@ impl ProvenanceCrate {
         Some(CrateFile { path, bytes })
     }
 
-    /// The bucket's database metadata now, as a Dataset the version is part of.
-    fn database(&mut self, id: &str, metadata: &Value) {
+    /// The dataset that describes a database bucket now, as a Dataset the version is part of.
+    fn database(&mut self, id: &str, metadata: &Value, described: &Value) {
         if metadata["database"] != json!(true) {
             return;
         }
-        let digest = blake3::hash(metadata.to_string().as_bytes()).to_hex();
-        let key = format!("#database-{}", &digest[..16]);
+        let key = match metadata["dataset"].as_str() {
+            Some(dataset) => format!("https://w3id.org/aruna/{dataset}"),
+            None => {
+                let digest = blake3::hash(metadata.to_string().as_bytes()).to_hex();
+                format!("#database-{}", &digest[..16])
+            }
+        };
         let mut database = entity(&key, "Dataset");
-        let title = metadata["title"]
+        let title = described["title"]
             .as_str()
             .unwrap_or("Bucket with database metadata");
         database.insert("name".into(), json!(format!("{title} (current metadata)")));
         for property in ["version", "license", "description"] {
-            if let Some(value) = metadata[property].as_str() {
+            if let Some(value) = described[property].as_str() {
                 database.insert(property.into(), json!(value));
             }
         }
-        let links: Vec<Value> = (metadata["identifiers"].as_array().into_iter().flatten())
+        let links: Vec<Value> = (described["identifiers"].as_array().into_iter().flatten())
             .filter_map(|identifier| identifier["url"].as_str())
             .map(|url| json!(url))
             .collect();
@@ -327,6 +332,7 @@ impl ProvenanceCrate {
             "denied" => "RunRecordDenied",
             "failed" => "RunRecordFailed",
             "local" => "RunRecordLocal",
+            "pending" => "RunRecordPending",
             _ => return false,
         };
         self.run(hop, None);
@@ -337,6 +343,7 @@ impl ProvenanceCrate {
         self.add_text(&key, "creativeWorkStatus", state);
         let text = match status {
             "local" => "The run record is kept on the device that ran it",
+            "pending" => "The run record is still being written; export again in a few minutes",
             _ => message.unwrap_or("The run record was not written"),
         };
         self.add_text(&key, "description", text);

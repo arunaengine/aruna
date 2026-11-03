@@ -141,7 +141,12 @@ target names content identities directly and checks no storage permission.
 
 **Behavior**
 - The target set is mapped to canonical content identities, which are then queried as canonical
-  and known legacy location IRIs.
+  and known legacy location IRIs. Reference and pending versions have no content identity until
+  their bytes are read: they form targets named by `location_iri` (`s3://bucket/key`), with a
+  null `content_w3id`, and are queried by their `s3://` and path-style IRIs only. Coverage then
+  lists `unread_content_w3id` as excluded: documents that cite those bytes by content w3id are
+  not found. Purging every version of such a key reports
+  `would_remove_last_resolvable_aruna_location`.
 - Local mode reports realm coverage as incomplete; distributed mode fans out to realm nodes and
   reports per-node index freshness, failed partitions and stable cursor pagination.
 - Restricted referencing documents are represented only by `hidden_references_exist`; their count
@@ -167,6 +172,7 @@ target names content identities directly and checks no storage permission.
                 "targets": [
                     {
                         "content_w3id": "https://w3id.org/aruna/data/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "location_iri": null,
                         "targeted_versions": [
                             {
                                 "node_id": "node-a",
@@ -286,6 +292,7 @@ fn map_preflight_response(execution: ReferenceExecution) -> PreflightResponse {
             .into_iter()
             .map(|target| PreflightTargetResponse {
                 content_w3id: target.content_w3id,
+                location_iri: target.location_iri,
                 targeted_versions: target
                     .targeted_versions
                     .into_iter()

@@ -1955,6 +1955,9 @@ async fn federated_profile_synthesized() {
         State(state),
         axum::http::HeaderMap::new(),
         Extension(Some(auth)),
+        axum::extract::Query(super::TokenQuery {
+            expires_in_seconds: None,
+        }),
     )
     .await
     .unwrap_err();

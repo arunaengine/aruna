@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
+use aruna_core::structs::storage::node_info::NODE_LABEL_KEY;
 
 use crate::executor::{BackendCaps, ExecutorBackend};
 use crate::session::SessionRegistry;
@@ -161,9 +162,9 @@ impl ExecutorRegistry {
 
 /// The execution site one backend advertises. A backend whose workers are
 /// neither the controller nor a declared worker site cannot prove placement, so
-/// it advertises no location and no labels rather than the controller's.
+/// it advertises no location and no site labels rather than the controller's.
 fn site(subject: &PlacementSubject, caps: &BackendCaps) -> PlacementSubject {
-    match (caps.local_site, &caps.worker_site) {
+    let mut site = match (caps.local_site, &caps.worker_site) {
         (true, _) => PlacementSubject {
             local_to_controller: true,
             ..subject.clone()
@@ -184,7 +185,11 @@ fn site(subject: &PlacementSubject, caps: &BackendCaps) -> PlacementSubject {
             labels: BTreeMap::new(),
             ..subject.clone()
         },
-    }
+    };
+    // The node runs every backend it offers, so a submission can pin it by its id.
+    site.labels
+        .insert(NODE_LABEL_KEY.to_string(), subject.node_id.to_string());
+    site
 }
 
 #[cfg(test)]
@@ -355,6 +360,7 @@ mod tests {
         assert_eq!(capability.subject.location, "dc-b");
         let mut expected = site.labels.clone();
         expected.insert(LOCATION_LABEL_KEY.to_string(), "dc-b".to_string());
+        expected.insert(NODE_LABEL_KEY.to_string(), subject.node_id.to_string());
         assert_eq!(capability.subject.labels, expected);
         assert!(!capability.subject.local_to_controller);
         assert!(capability.validate(subject.node_id).is_ok());
@@ -363,7 +369,7 @@ mod tests {
     #[test]
     fn hides_unproven_site() {
         // A backend that cannot prove worker placement advertises no site details,
-        // so no location or label rule can match it.
+        // so only a pin to the node itself can match it.
         let mut subject = subject();
         subject.location = "controller-site".to_string();
         subject
@@ -378,7 +384,8 @@ mod tests {
             .remove(0);
 
         assert!(capability.subject.location.is_empty());
-        assert!(capability.subject.labels.is_empty());
+        let node = BTreeMap::from([(NODE_LABEL_KEY.to_string(), subject.node_id.to_string())]);
+        assert_eq!(capability.subject.labels, node);
         assert!(!capability.subject.local_to_controller);
     }
 

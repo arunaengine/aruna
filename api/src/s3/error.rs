@@ -622,6 +622,12 @@ impl IntoS3Error for GetObjectError {
                     "The reference source is changing; retry the request."
                 )
             }
+            GetObjectError::ReferenceChecksumMismatch => {
+                s3_error!(
+                    PreconditionFailed,
+                    "The reference source no longer matches its recorded checksum."
+                )
+            }
             GetObjectError::ReferenceAdvanceExhausted => reference_exhausted_error(),
             error @ GetObjectError::ReferenceTooLarge { .. } => {
                 s3_error!(NotImplemented, "{}", error)
@@ -1019,6 +1025,10 @@ mod tests {
 
         let changed = GetObjectError::ReferenceSourceChanged.into_s3_error();
         assert_eq!(*changed.code(), S3ErrorCode::ServiceUnavailable);
+
+        // A checksum mismatch never clears on a retry.
+        let mismatch = GetObjectError::ReferenceChecksumMismatch.into_s3_error();
+        assert_eq!(*mismatch.code(), S3ErrorCode::PreconditionFailed);
 
         let exhausted = GetObjectError::ReferenceAdvanceExhausted.into_s3_error();
         assert_eq!(

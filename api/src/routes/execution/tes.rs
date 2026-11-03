@@ -1685,6 +1685,8 @@ fn family_record(report: &FamilyReport) -> JobRecord {
     record.workspace_mode = report.job.workspace_mode;
     record.workspace_bucket = report.job.workspace_bucket.clone();
     record.retention_ms = report.spec.retention_ms;
+    // The versions read at accept, so every input projects as its exact ARN.
+    record.captured_inputs = report.spec.captured_inputs.clone();
     record.started_at_ms = report.started_at_ms;
     record.finished_at_ms = report.job.finished_at_ms;
     record.last_error = report.job.last_error.clone();
