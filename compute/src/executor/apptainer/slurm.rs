@@ -59,7 +59,10 @@ pub struct SlurmBackend {
 }
 
 impl SlurmBackend {
-    pub fn with_config(config: SlurmConfig) -> Result<Self, BackendError> {
+    pub fn with_config(mut config: SlurmConfig) -> Result<Self, BackendError> {
+        // Jobs run from their attempt directory, so a relative state root would break there.
+        std::fs::create_dir_all(&config.state_root).map_err(io_error)?;
+        config.state_root = config.state_root.canonicalize().map_err(io_error)?;
         let state = StateRoot::open(&config.state_root)?;
         Ok(Self { config, state })
     }

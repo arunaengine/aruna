@@ -244,3 +244,20 @@ async fn older_generation_fenced() {
     assert!(matches!(submitted, Err(BackendError::Fenced)));
     assert!(fixture.jobs().is_empty());
 }
+
+#[test]
+fn relative_state_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let parents = std::env::current_dir().unwrap().components().count() - 1;
+    let target = dir.path().canonicalize().unwrap();
+    let relative = PathBuf::from("../".repeat(parents))
+        .join(target.strip_prefix("/").unwrap())
+        .join("state");
+    let config = SlurmConfig {
+        state_root: relative,
+        ..SlurmConfig::default()
+    };
+    let backend = SlurmBackend::with_config(config).unwrap();
+    assert_eq!(backend.config.state_root, target.join("state"));
+    assert!(backend.state.attempt_dir(&context()).starts_with(target));
+}
