@@ -556,6 +556,23 @@ mod tests {
     }
 
     #[test]
+    fn refuses_local_folder() {
+        // A local folder serves imports only, never Aruna's own layout.
+        let mut record = storage(&[("root", "projects")]);
+        record.kind = GroupBackendKind::Fs;
+
+        let (operation, effects) = read(None, record, Vec::new());
+
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(
+            operation.finalize(),
+            Err(PutGroupError::InvalidTarget(RoutingError::FolderTarget(
+                backend()
+            )))
+        );
+    }
+
+    #[test]
     fn writes_default_bucket() {
         let record = storage(&[("endpoint", "https://s3.lab")]);
         let (mut operation, effects) = read(Some("lab-default"), record.clone(), Vec::new());

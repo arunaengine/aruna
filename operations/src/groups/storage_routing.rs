@@ -13,8 +13,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::storage::backend_import::BackendImport;
-use aruna_core::structs::storage::discovery::DiscoveryRules;
 use aruna_core::structs::storage::blob::BackendRef;
+use aruna_core::structs::storage::discovery::DiscoveryRules;
 use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, GroupStorageRouting, RoutingError, RoutingTarget, validate_tenant_target,
@@ -349,8 +349,8 @@ impl PutGroupOperation {
 
     fn write_record(&mut self, owned: &BTreeSet<Ulid>, folders: &BTreeSet<Ulid>) -> Effects {
         if let Some(target) = self.record.default_target.as_ref()
-            && let Err(error) = validate_tenant_target(target, owned)
-                .and_then(|()| refuse_folder(target, folders))
+            && let Err(error) =
+                validate_tenant_target(target, owned).and_then(|()| refuse_folder(target, folders))
         {
             return self.fail(error.into());
         }
@@ -694,6 +694,34 @@ mod pure_tests {
             operation.finalize(),
             Err(PutGroupError::InvalidStateEvent { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_folder_default() {
+        // A local folder serves imports only, so it never becomes the group default.
+        let folder = Ulid::from_bytes([4u8; 16]);
+        let mut operation = PutGroupOperation::new(
+            group(),
+            Some(RoutingTarget::Backend(BackendRef::Group(folder))),
+            aruna_core::UserId::default(),
+            SystemTime::UNIX_EPOCH,
+        );
+        operation.start();
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+            result: Ok(GroupRoutingInputs {
+                backend_ids: BTreeSet::from([folder]),
+                folder_ids: BTreeSet::from([folder]),
+                ..Default::default()
+            }),
+        }));
+
+        assert!(effects.is_empty(), "expected no write, got {effects:?}");
+        assert_eq!(
+            operation.finalize(),
+            Err(PutGroupError::InvalidTarget(RoutingError::FolderTarget(
+                folder
+            )))
+        );
     }
 
     #[test]

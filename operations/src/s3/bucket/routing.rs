@@ -486,6 +486,62 @@ mod pure_tests {
     }
 
     #[test]
+    fn folder_routes_imports_only() {
+        // A local folder takes only the routing rule its import rule wrote for this bucket.
+        let folder = Ulid::from_bytes([4u8; 16]);
+        let target = RoutingTarget::Backend(aruna_core::structs::storage::blob::BackendRef::Group(
+            folder,
+        ));
+        let import = aruna_core::structs::storage::backend_import::BackendImport {
+            import_id: Ulid::from_bytes([5u8; 16]),
+            group_id: group(),
+            backend_id: folder,
+            backend_prefix: String::new(),
+            bucket: "b".to_string(),
+            key_prefix: "archive/".to_string(),
+            schedule: None,
+            created_by: aruna_core::UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: String::new(),
+        };
+        let inputs = |imports| GroupRoutingInputs {
+            backend_ids: BTreeSet::from([folder]),
+            folder_ids: BTreeSet::from([folder]),
+            imports,
+            ..Default::default()
+        };
+        let run = |imports| {
+            let rules = vec![rule(target.clone())];
+            let mut operation = PutRoutingOperation::new("b".to_string(), group(), rules);
+            operation.start();
+            let effects =
+                operation.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+                    result: Ok(inputs(imports)),
+                }));
+            (operation, effects)
+        };
+
+        let (operation, effects) = run(Vec::new());
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(
+            operation.finalize(),
+            Err(PutRoutingError::InvalidRules(RoutingError::FolderTarget(
+                folder
+            )))
+        );
+        let (_, effects) = run(vec![import]);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
+    }
+
+    #[test]
     fn accepts_owned_backend() {
         let owned = Ulid::from_bytes([4u8; 16]);
         let rules = vec![rule(RoutingTarget::Backend(BackendRef::Group(owned)))];

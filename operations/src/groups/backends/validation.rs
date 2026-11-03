@@ -312,8 +312,8 @@ fn normalize(
 mod pure_tests {
     use super::{GroupBackendError, check_import_root, validate_backend_input};
     use aruna_core::structs::storage::backends::ImportRoot;
-    use std::collections::BTreeMap;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
 
     fn config(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -646,7 +646,10 @@ mod pure_tests {
         assert!(check_import_root(fs, &kind_public(fs), group, &roots).is_ok());
         let other = ulid::Ulid::nil();
         let error = check_import_root(fs, &kind_public(fs), other, &roots).unwrap_err();
-        assert_eq!(error, GroupBackendError::UnknownRoot("projects".to_string()));
+        assert_eq!(
+            error,
+            GroupBackendError::UnknownRoot("projects".to_string())
+        );
         let unknown = config(&[("root", "scratch")]);
         assert!(check_import_root(fs, &unknown, group, &roots).is_err());
         let s3 = GroupBackendKind::S3;

@@ -17,10 +17,10 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::{BackendImport, valid_pattern};
+use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
-use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_core::structs::storage::group_backend::{
     BUCKET_DELETING, BUCKET_STATE, GroupBackendKind, GroupStorage, MAX_KEY_LEN, path_bucket,
     valid_bucket,
@@ -1121,6 +1121,36 @@ mod tests {
         let mut operation = CreateImportOperation::new(bad);
         assert!(operation.start().is_empty());
         assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+    }
+
+    #[test]
+    fn needs_writable_folder() {
+        use aruna_core::structs::storage::backends::ImportRoot;
+        let mut folder = storage(&[("root", "projects")]);
+        folder.kind = GroupBackendKind::Fs;
+        let root = |writable| ImportRoot {
+            path: "/srv/share".to_string(),
+            groups: vec![group()],
+            writable,
+        };
+
+        // A read-only folder without another write backend is refused before any write.
+        let (operation, effects) = on_split(input("raw/", ""), &folder);
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+        let mut read_only = input("raw/", "");
+        read_only.import_roots = BTreeMap::from([("projects".to_string(), root(false))]);
+        let (operation, effects) = on_split(read_only, &folder);
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+
+        let mut writable = input("raw/", "");
+        writable.import_roots = BTreeMap::from([("projects".to_string(), root(true))]);
+        let (_, effects) = on_split(writable, &folder);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
     }
 
     #[test]
