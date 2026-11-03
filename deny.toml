@@ -24,6 +24,7 @@ ignore = [
     "RUSTSEC-2026-0367", # zip extract keeps SUID/SGID bits
     "RUSTSEC-2026-0368", # zip extract creates symlinks outside the target
     "RUSTSEC-2026-0369", # zip extract applies permissions through symlinks
+    "RUSTSEC-2026-0429", # zip extract aborts on a large symlink entry; ro-crate-rs only, zip 9 pending
 ]
 
 [licenses]

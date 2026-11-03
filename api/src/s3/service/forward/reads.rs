@@ -219,10 +219,9 @@ async fn answer_within(
 }
 
 impl ArunaS3Service {
-    /// The holder a GET or HEAD of `key` goes to, with the range's coordinator, or `None` when
-    /// this member answers it. Only a `pinned` version may come from a copy: a copy may lag
-    /// behind the current version. A delegated read is never sent on, and a current one is
-    /// refused here unless this node still coordinates the range or the sender asked a copy.
+    /// The holder a GET or HEAD of `key` goes to, with the range's coordinator, or `None` here.
+    /// Only a `pinned` version may come from a lagging copy. A delegated read is never sent on;
+    /// a current one is refused unless this node coordinates the range or a copy was asked.
     pub(in crate::s3::service) async fn read_holder(
         &self,
         extensions: &http::Extensions,
