@@ -111,6 +111,15 @@ pub enum NotificationKind {
         group_id: GroupId,
         member_user_id: UserId,
     },
+    /// A visitor uploaded a file through one of the recipient's share links.
+    ShareUpload {
+        share_id: Ulid,
+        node_id: NodeId,
+        group_id: GroupId,
+        bucket: String,
+        key: String,
+        size_bytes: u64,
+    },
 }
 
 impl NotificationKind {
@@ -130,6 +139,7 @@ impl NotificationKind {
             NotificationKind::BucketRestartLocked { .. }
             | NotificationKind::BucketRecoveryDegraded { .. }
             | NotificationKind::BucketKeyPending { .. } => "bucket.encryption",
+            NotificationKind::ShareUpload { .. } => "share.upload",
         }
     }
 
@@ -148,6 +158,7 @@ impl NotificationKind {
             NotificationKind::BucketRestartLocked { .. } => "bucket_locked_by_restart",
             NotificationKind::BucketRecoveryDegraded { .. } => "bucket_recovery_degraded",
             NotificationKind::BucketKeyPending { .. } => "bucket_key_pending",
+            NotificationKind::ShareUpload { .. } => "share_upload",
         }
     }
 }

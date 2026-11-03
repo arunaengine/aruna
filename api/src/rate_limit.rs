@@ -31,6 +31,9 @@ const MAINTENANCE_INTERVAL: u64 = 4_096;
 const LOCAL_PERMITS: usize = 16;
 const LOCAL_TABLE_LIMIT: usize = 4_096;
 const LOCAL_LEASE_LIMIT: usize = 2;
+/// Share link opens per address and per link: each may test a password.
+const SHARE_OPENS_MINUTE: u32 = 30;
+const SHARE_OPENS_BURST: u32 = 10;
 
 type Keyed<K> = RateLimiter<K, DefaultKeyedStateStore<K>, DefaultClock>;
 
@@ -153,6 +156,7 @@ impl std::fmt::Debug for ApiRateLimits {
 pub struct ApiRateLimits {
     per_ip: Keyed<IpAddr>,
     per_principal: Keyed<String>,
+    share_opens: Keyed<String>,
     clock: DefaultClock,
     checks: AtomicU64,
     local: Arc<Mutex<LocalTable>>,
@@ -181,6 +185,7 @@ impl ApiRateLimits {
         Self {
             per_ip: RateLimiter::keyed(quota(ip_per_minute, ip_burst)),
             per_principal: RateLimiter::keyed(quota(principal_per_minute, burst)),
+            share_opens: RateLimiter::keyed(quota(SHARE_OPENS_MINUTE, SHARE_OPENS_BURST)),
             clock: DefaultClock::default(),
             checks: AtomicU64::new(0),
             local: Arc::new(Mutex::new(LocalTable::default())),
@@ -209,6 +214,7 @@ impl ApiRateLimits {
         {
             self.per_ip.retain_recent();
             self.per_principal.retain_recent();
+            self.share_opens.retain_recent();
         }
     }
 
@@ -231,6 +237,21 @@ impl ApiRateLimits {
         self.per_principal
             .check_key(&principal)
             .map_err(|not_until| retry_secs(not_until.wait_time_from(now).as_secs()))
+    }
+}
+
+impl ApiRateLimits {
+    /// Charges one share link open to the client address and to the link, so neither many
+    /// addresses nor many links speed up password guessing.
+    pub fn check_share_open(&self, ip: IpAddr, share_id: ulid::Ulid) -> Result<(), u64> {
+        self.maybe_maintain();
+        let now = self.clock.now();
+        for key in [format!("ip:{ip}"), format!("link:{share_id}")] {
+            self.share_opens
+                .check_key(&key)
+                .map_err(|not_until| retry_secs(not_until.wait_time_from(now).as_secs()))?;
+        }
+        Ok(())
     }
 }
 

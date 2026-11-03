@@ -591,6 +591,10 @@ fn capture_entities(
             entities.extend(value.map(|value| property(term, name, value)));
         }
     }
+    // The one of the version's equal sources that delivered the bytes, when anyone may read it.
+    if let Some(url) = (captured.served_by.as_ref()).and_then(|pin| pin.url.clone()) {
+        entities.push(property("source-served-by", "Served by", url));
+    }
     if !captured.releases_complete {
         let mut marker = property(
             "release-membership",
@@ -1387,6 +1391,7 @@ mod pure_tests {
             releases: Vec::new(),
             releases_complete: true,
             grant: None,
+            served_by: None,
         });
         let value = parse(&record, &spec);
         let graph = value["@graph"].as_array().unwrap();
@@ -1455,6 +1460,7 @@ mod pure_tests {
                 path: "db/in.txt".to_string(),
                 source_version: Some("v6".to_string()),
             }),
+            served_by: None,
             database: Some(CapturedDatabase {
                 database: true,
                 described: DatasetDescription {
@@ -1489,6 +1495,26 @@ mod pure_tests {
             .map(|property| find(&property["@id"]).unwrap()["value"].clone())
             .collect();
         assert_eq!(values, [json!("db/in.txt"), json!("v6"), json!("\"abc\"")]);
+        // The source that delivered the bytes is named beside the pin, a public one only.
+        let mut served = captured(true);
+        served.served_by = Some(SourcePin {
+            url: Some("https://mirror.example.org/db/in.txt".to_string()),
+            path: "db/in.txt".to_string(),
+            source_version: None,
+        });
+        let mut private = captured(true);
+        private.served_by = Some(SourcePin {
+            url: None,
+            path: "secret/in.txt".to_string(),
+            source_version: None,
+        });
+        let mut named = record.clone();
+        named.captured_inputs = vec![served];
+        let rendered = parse(&named, &spec).to_string();
+        assert!(rendered.contains("https://mirror.example.org/db/in.txt"));
+        named.captured_inputs = vec![private];
+        let rendered = parse(&named, &spec).to_string();
+        assert!(rendered.contains("db/in.txt") && !rendered.contains("secret/in.txt"));
         let part_of = input["isPartOf"].as_array().expect("part of");
         let database = find(&part_of[0]["@id"]).expect("metadata snapshot");
         let dataset = MetadataRegistryRecord::graph_iri_for(Ulid::from_bytes([16; 16]));
@@ -1560,6 +1586,7 @@ mod pure_tests {
                 releases: Vec::new(),
                 releases_complete: true,
                 grant: None,
+                served_by: None,
             });
         }
         let value = parse(&record, &spec);
@@ -1608,6 +1635,7 @@ mod pure_tests {
                 public: false,
                 link: None,
                 source_pin: None,
+                served_by: None,
                 database: Some(CapturedDatabase {
                     database: true,
                     described: DatasetDescription {
@@ -1665,6 +1693,7 @@ mod pure_tests {
             releases: Vec::new(),
             releases_complete: false,
             grant: None,
+            served_by: None,
         });
         if let Some(JobResultPayload::Execution { outputs, .. }) = &mut record.result {
             outputs[0].digest = Some(hex::encode([9; 32]));
@@ -1734,6 +1763,7 @@ mod pure_tests {
                 releases: Vec::new(),
                 releases_complete: false,
                 grant: None,
+                served_by: None,
             });
         }
         let value = parse(&record, &spec);

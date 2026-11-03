@@ -12,7 +12,9 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::distribution::bootstrap::bootstrap_key;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
+use aruna_core::structs::storage::distribution::snapshot::RangeFill;
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionRevision, DistributionSettings, DistributionSnapshot,
     DistributionView, MemberState, MetadataCoverage, SetPhase, TransferRole,
@@ -25,6 +27,7 @@ use crate::distribution::index_feed::{IndexProgress, range_progress};
 use crate::driver::DriverContext;
 use crate::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use crate::placement::process_placements::load_realm_config;
+use crate::replication::bootstrap::read_cursor;
 use crate::replication::members::{CopyLag, copy_lag};
 
 #[derive(Debug, Error, PartialEq)]
@@ -72,6 +75,26 @@ pub struct RangeStatus {
     pub search_index: Option<IndexProgress>,
     /// What this node, as the range's coordinator, still owes each member it publishes to.
     pub copies: Vec<CopyStatus>,
+    /// New copies of the range that are still filling.
+    pub fills: Vec<FillStatus>,
+}
+
+/// A new copy of a range while its coordinator fills it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FillStatus {
+    pub fill_id: Ulid,
+    pub member_id: Ulid,
+    /// How far the walk got; only the range's coordinator knows it.
+    pub progress: Option<FillProgress>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FillProgress {
+    /// Versions and delete markers queued for the copy so far, and the bytes of those versions.
+    pub versions: u64,
+    pub bytes: u64,
+    /// The walk reached the end of the range; the last page may still be delivered.
+    pub walked: bool,
 }
 
 /// The deliveries a coordinator still owes one member of a range.
@@ -176,6 +199,14 @@ pub fn summarize(
                 degraded,
                 search_index: None,
                 copies: Vec::new(),
+                fills: (snapshot.lifecycle.fills.iter())
+                    .filter(|fill| fill.range_id == range.range_id)
+                    .map(|fill| FillStatus {
+                        fill_id: fill.fill_id,
+                        member_id: fill.member_id,
+                        progress: None,
+                    })
+                    .collect(),
             }
         })
         .collect();
@@ -384,6 +415,32 @@ pub async fn add_progress(context: &Arc<DriverContext>, status: &mut Distributio
             lag: (lag.get(&(range.range_id, delivery.member_id)).copied()).unwrap_or_default(),
         })
         .collect();
+        if range.coordinator == member.member_id {
+            add_fills(context, status.set_id, range).await;
+        }
+    }
+}
+
+/// The walk of each filling copy of a range this node coordinates, from its cursor.
+async fn add_fills(context: &DriverContext, set_id: Ulid, range: &mut RangeStatus) {
+    for fill in &mut range.fills {
+        let key = bootstrap_key(set_id, fill.member_id, range.range_id);
+        let intent = RangeFill {
+            fill_id: fill.fill_id,
+            range_id: range.range_id,
+            member_id: fill.member_id,
+            admitted: true,
+        }
+        .intent();
+        let cursor = read_cursor(context, key).await.ok().flatten();
+        fill.progress = Some(match cursor.filter(|cursor| cursor.intent == intent) {
+            Some(cursor) => FillProgress {
+                versions: cursor.versions,
+                bytes: cursor.bytes,
+                walked: cursor.walked,
+            },
+            None => FillProgress::default(),
+        });
     }
 }
 

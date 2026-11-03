@@ -405,6 +405,7 @@ async fn batch_rejects_cap() {
             prefixes: None,
             checksum_manifest: None,
             table: None,
+            mirrors: Vec::new(),
         }),
     )
     .await;
@@ -430,6 +431,7 @@ async fn batch_rejects_node() {
             prefixes: None,
             checksum_manifest: None,
             table: None,
+            mirrors: Vec::new(),
         }),
     )
     .await;
@@ -460,6 +462,7 @@ fn job_states_mapped() {
         prefixes: Vec::new(),
         checksum_manifest: None,
         table: None,
+        mirrors: Vec::new(),
     };
     let node = iroh::SecretKey::from_bytes(&[6; 32]).public();
     let job_id = JobId::from_bytes([7; 16]);
@@ -516,6 +519,7 @@ async fn batch_sync_unimplemented() {
             prefixes: None,
             checksum_manifest: None,
             table: None,
+            mirrors: Vec::new(),
         }),
     )
     .await;
@@ -599,6 +603,7 @@ async fn seed_reference_objects(test: &TestState) -> NodeId {
                     root: None,
                 },
                 connector_id: Some(test.connector_id),
+                mirrors: Vec::new(),
             },
             SourceMetadata {
                 content_length: 64,
@@ -634,6 +639,7 @@ async fn seed_reference_objects(test: &TestState) -> NodeId {
                     root: None,
                 },
                 connector_id: None,
+                mirrors: Vec::new(),
             },
             SourceMetadata {
                 content_length: 128,
@@ -935,6 +941,7 @@ mod distributed {
             ),
             checksum_manifest: None,
             table: None,
+            mirrors: Vec::new(),
         }
     }
 

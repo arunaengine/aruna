@@ -95,10 +95,11 @@ impl DistributionSnapshot {
         coordinators
     }
 
-    /// The members a transfer of `range` may go to: its ready `copy` replicas.
+    /// The members a transfer of `range` may go to: its ready `copy` replicas that are filled.
     pub fn transfer_targets(&self, range: &KeyRange) -> Vec<&DistributionMember> {
         (range.replicas.iter())
             .filter(|replica| **replica != range.coordinator)
+            .filter(|replica| !self.filling(range.range_id, **replica))
             .filter_map(|replica| self.member(*replica))
             .filter(|m| m.state == MemberState::Ready && m.strategy == DataStrategy::Copy)
             .collect()
@@ -151,6 +152,9 @@ pub(super) fn prepare_transfer(
     let open = &next.lifecycle.transfers;
     if open.iter().any(|open| open.range_id == plan.range_id) {
         return Err(DistributionError::TransferOpen(plan.range_id));
+    }
+    if (next.lifecycle.fills.iter()).any(|fill| fill.range_id == plan.range_id) {
+        return Err(refused("a new copy of the range is still filling"));
     }
     if (open.iter()).any(|open| open.transfer_id == plan.transfer_id || open.to == plan.to) {
         return Err(refused("the member is already receiving a transfer"));

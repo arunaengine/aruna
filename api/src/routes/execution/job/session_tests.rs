@@ -715,6 +715,7 @@ async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
                 root: None,
             },
             connector_id: Some(Ulid::generate()),
+            mirrors: Vec::new(),
         },
         SourceMetadata {
             content_length: 15,

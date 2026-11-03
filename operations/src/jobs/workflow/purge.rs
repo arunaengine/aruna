@@ -11,8 +11,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::structs::execution::job::{JobError, JobProgress, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::storage::blob::incarnation;
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::blob::{BucketInfo, incarnation};
 use aruna_core::structs::storage::delete_audit::{
     BlobAuditKind, BlobAuditRecord, BlobPurgeKind, delete_audit_key, trail_key,
 };
@@ -29,10 +29,12 @@ use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::drive;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::release::{BucketScope, MembershipQuery};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, version_pins};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 use crate::s3::purge_fence::{PurgeFenceError, acquire_purge_fence};
 
@@ -87,6 +89,7 @@ async fn run_fenced_purge(
     check_stop(ctx)?;
     // The trail is published only for the bucket incarnation the purge began on.
     let mut incarnation = None;
+    let mut bucket_info = None;
     let bucket_exists = match drive(
         GetBucketOperation::new(spec.scope.bucket().to_string()),
         &ctx.driver,
@@ -107,6 +110,7 @@ async fn run_fenced_purge(
                 .map_err(|event| {
                     JobError::retryable(format!("purge bucket read failed: {event:?}"))
                 })?;
+            bucket_info = Some(info);
             true
         }
         Ok(_) => {
@@ -164,9 +168,9 @@ async fn run_fenced_purge(
     );
     persist_progress(ctx).await?;
 
-    if bucket_exists {
+    if let Some(info) = &bucket_info {
         abort_uploads(ctx, spec, &mut checkpoint).await?;
-        delete_versions(ctx, (spec, files), &mut checkpoint).await?;
+        delete_versions(ctx, (spec, files), info, &mut checkpoint).await?;
         final_relist(ctx, &spec.scope).await?;
     }
 
@@ -370,6 +374,7 @@ async fn abort_uploads(
 async fn delete_versions(
     ctx: &JobContext,
     (spec, files): (&StoragePurgeSpec, bool),
+    info: &BucketInfo,
     checkpoint: &mut StoragePurgeCheckpoint,
 ) -> Result<(), PurgeRunError> {
     loop {
@@ -401,6 +406,7 @@ async fn delete_versions(
         {
             authorize_object(ctx, spec, key).await?;
         }
+        let guards = release_guards(ctx, spec, info, &entries).await?;
         let indexes = match files {
             true => plan_files(ctx, spec, &entries).await?,
             false => Vec::new(),
@@ -416,6 +422,7 @@ async fn delete_versions(
                 node_id: spec.node_id,
                 deleted_by: spec.auth_context.user_id,
                 restrictions: spec.auth_context.path_restrictions.clone(),
+                guards,
             },
         )
         .await;
@@ -433,6 +440,42 @@ async fn delete_versions(
         drop_indexes(ctx, indexes).await?;
         checkpoint.batches_completed = checkpoint.batches_completed.saturating_add(1);
         persist_batch(ctx, checkpoint, batch_len).await?;
+    }
+}
+
+/// Refuses the batch while a release pins one of its versions, also one published after the
+/// purge was submitted; else the guards each delete keeps. A bucket purge deletes the releases
+/// with their files.
+async fn release_guards(
+    ctx: &JobContext,
+    spec: &StoragePurgeSpec,
+    info: &BucketInfo,
+    entries: &[BulkDeleteEntry],
+) -> Result<ReleaseGuards, PurgeRunError> {
+    if spec.scope.is_bucket() {
+        return Ok(Vec::new());
+    }
+    let scope = BucketScope {
+        realm_id: spec.auth_context.realm_id,
+        node_id: spec.node_id,
+        bucket: spec.scope.bucket(),
+        info,
+    };
+    let queries: Vec<MembershipQuery> = (entries.iter())
+        .filter_map(|entry| {
+            Some(MembershipQuery {
+                key: entry.key.clone(),
+                version_id: entry.version_id?,
+            })
+        })
+        .collect();
+    let auth = &spec.auth_context;
+    match version_pins(&ctx.driver, scope, auth, &queries).await {
+        Ok((pins, _)) if pins.contains(&true) => {
+            Err(JobError::permanent(PinnedError::Scope.to_string()).into())
+        }
+        Ok((_, guards)) => Ok(guards),
+        Err(error) => Err(JobError::retryable(error.to_string()).into()),
     }
 }
 

@@ -16,6 +16,7 @@ const SET_DOMAIN: &[u8] = b"aruna-distribution-set-v1";
 const STATEMENT_DOMAIN: &str = "aruna-distribution-statement-v1";
 const ADMIT_DOMAIN: &[u8] = b"aruna-distribution-admit-v1";
 const CAUGHT_DOMAIN: &[u8] = b"aruna-distribution-caught-up-v1";
+const COPY_ADMIT_DOMAIN: &[u8] = b"aruna-distribution-copy-admitted-v1";
 
 /// The preimage of a set id: whoever creates the set carries it, every receiver recomputes it.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -87,6 +88,17 @@ pub enum StatementKind {
         ranges: Vec<(Ulid, u64)>,
         watermark: u64,
     },
+    /// The coordinator walked a range for its new copy, everything up to the watermark
+    /// (milliseconds) its walk started at included.
+    CopyFilled {
+        fill_id: Ulid,
+        range_id: Ulid,
+        epoch: u64,
+        member_id: Ulid,
+        watermark: u64,
+    },
+    /// The member's node opened and reserved the ranges of these new copies of it.
+    CopyAdmitted { fill_ids: Vec<Ulid> },
     /// An automatic balancing transfer proposed by the range's coordinator.
     TransferPrepare {
         /// The revision number the coordinator decided on.
@@ -109,6 +121,8 @@ impl StatementKind {
             Self::Split { .. } => "split",
             Self::TransferPrepare { .. } => "transfer prepare",
             Self::CaughtUp { .. } => "caught up",
+            Self::CopyFilled { .. } => "copy filled",
+            Self::CopyAdmitted { .. } => "copy admitted",
         }
     }
 
@@ -162,6 +176,35 @@ impl Statement {
             incarnation,
             intent,
             kind: StatementKind::Admit,
+        }
+    }
+
+    /// The admission of new copies by one member incarnation. Its id is derived from them, so
+    /// a retried admission is the same statement.
+    pub fn copy_admitted(
+        realm_id: RealmId,
+        set_id: Ulid,
+        (member_id, incarnation, intent): (Ulid, u128, [u8; 32]),
+        fill_ids: Vec<Ulid>,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(COPY_ADMIT_DOMAIN);
+        hasher.update(&set_id.to_bytes());
+        hasher.update(&member_id.to_bytes());
+        hasher.update(&incarnation.to_be_bytes());
+        for fill_id in &fill_ids {
+            hasher.update(&fill_id.to_bytes());
+        }
+        let mut id = [0; 16];
+        id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        Self {
+            realm_id,
+            set_id,
+            statement_id: Ulid::from_bytes(id),
+            member_id,
+            incarnation,
+            intent,
+            kind: StatementKind::CopyAdmitted { fill_ids },
         }
     }
 

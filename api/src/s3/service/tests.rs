@@ -1056,6 +1056,7 @@ fn source_binding() -> VersionSourceBinding {
             root: None,
         },
         connector_id: None,
+        mirrors: Vec::new(),
     }
 }
 

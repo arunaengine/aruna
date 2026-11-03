@@ -1,5 +1,5 @@
 //! Publishes and lists database releases: tagged release crate versions that pin the current
-//! files under a prefix.
+//! files under a prefix, and lists the files a release pins.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,19 +10,20 @@ use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
 use aruna_operations::s3::bucket::release::publish::{
     self as release_publish, PublishError, PublishInput, ReleaseSpec,
 };
+use aruna_operations::s3::bucket::release::view::{FilePage, MAX_PAGE, ViewError, release_view};
 use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, release_members};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::bucket::metadata::BucketIdentifierBody;
 use super::deletion::bucket_info;
-use super::relay::{relay_json, rest_target};
+use super::relay::{copy_miss, query_path, read_holders, relay_json, relay_read, rest_target};
 use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -34,6 +35,7 @@ pub struct ReleasesApiDoc;
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(ReleasesApiDoc::openapi())
         .routes(routes!(publish_release, list_releases))
+        .routes(routes!(list_release_files))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -257,6 +259,202 @@ pub async fn list_releases(
         bucket,
         releases,
         complete: found.complete,
+    }))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, IntoParams)]
+pub struct ReleaseFilesParams {
+    /// Key of the release crate, as the release list names it.
+    pub key: String,
+    /// Only files under this prefix.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// `/` groups the files below the next `/` after `prefix` into `folders`.
+    #[serde(default)]
+    pub delimiter: Option<String>,
+    /// The `next` value of the page before.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// Entries per page, files and folders together: 1 to 1000, default 100.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReleaseFileItem {
+    pub key: String,
+    /// The exact version the release pins; read it with this `versionId`.
+    pub version_id: String,
+    pub size: u64,
+    /// The exact id the release crate names the version by.
+    pub id: String,
+    /// The content id, when the bytes had a known BLAKE3 at publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReleaseFilesResponse {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+    pub label: String,
+    /// The prefix the release pinned.
+    pub prefix: String,
+    pub files: Vec<ReleaseFileItem>,
+    /// Folders below `prefix`, each ending with `/`, when `delimiter` is `/`.
+    pub folders: Vec<String>,
+    /// Pass as `after` for the next page; omitted on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/buckets/{bucket}/releases/{version_id}/files",
+    tag = "data/storage",
+    summary = "List the files of a release",
+    description = r#"Lists the files one release pins, with the exact version of each, so the bucket can be browsed and read as of that release.
+
+**Authentication**: realm bearer token with READ on the release crate.
+
+**Behavior**
+- `version_id` is the release crate's version and `key` its key, as the release list names
+  them. A version that is gone or not tagged as a release answers 404.
+- Files come in key order from the release crate. Each names the version id to read it by,
+  for example S3 GET with `versionId`; a later version or a delete marker of the key does not
+  change the release.
+- With `delimiter=/` the keys below the next `/` after `prefix` are grouped into `folders`.
+- In a distributed bucket the crate is read from a member that holds its range, its
+  coordinator last.
+
+**Limits**
+- The crate is read in full for every page, so its size grows with the number of files."#,
+    params(
+        ("bucket" = String, Path, description = "Bucket name on this node"),
+        ("version_id" = String, Path, description = "The release crate's version id"),
+        ReleaseFilesParams
+    ),
+    responses(
+        (status = 200, description = "One page of the release's files", body = ReleaseFilesResponse, example = json!({
+            "bucket": "bakta-db",
+            "key": "releases/6.0.crate.json",
+            "version_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2",
+            "label": "6.0",
+            "prefix": "db/",
+            "files": [{
+                "key": "db/amrfinderplus-db/version.txt",
+                "version_id": "01K8W0Q2C4E6G8J0M2P4R6T8V1",
+                "size": 11,
+                "id": "https://w3id.org/aruna/data/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8/01K8W0Q2C4E6G8J0M2P4R6T8V1",
+                "content_id": "https://w3id.org/aruna/data/5d41402abc4b2a76b9719d911017c5925d41402abc4b2a76b9719d911017c592"
+            }],
+            "folders": ["db/pfam/"],
+            "next": "db/pfam/"
+        })),
+        (status = 400, description = "Invalid version id, delimiter or limit", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "No READ on the release crate", body = ErrorResponse),
+        (status = 404, description = "Bucket not found, or the version is gone or no release", body = ErrorResponse),
+        (status = 503, description = "The release crate could not be read now", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_release_files(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: HeaderMap,
+    Path((bucket, version_id)): Path<(String, String)>,
+    Query(params): Query<ReleaseFilesParams>,
+) -> ServerResult<Json<ReleaseFilesResponse>> {
+    let auth = require_realm_auth(&state, auth)?;
+    let version: Ulid = (version_id.parse())
+        .map_err(|_| ServerError::BadRequestMessage(format!("`{version_id}` is not an id")))?;
+    let folders = match params.delimiter.as_deref() {
+        None => false,
+        Some("/") => true,
+        Some(_) => {
+            return Err(ServerError::BadRequestMessage(
+                "only `/` is a delimiter".to_string(),
+            ));
+        }
+    };
+    let limit = params.limit.unwrap_or(100);
+    if !(1..=MAX_PAGE).contains(&limit) {
+        return Err(ServerError::BadRequestMessage(format!(
+            "`limit` must be 1 to {MAX_PAGE}"
+        )));
+    }
+    let info = bucket_info(&state, &bucket).await?;
+    let relayed = |route: &str| {
+        let mut pairs = vec![("key", params.key.as_str())];
+        let optional = [
+            ("prefix", params.prefix.as_deref()),
+            ("delimiter", params.delimiter.as_deref()),
+            ("after", params.after.as_deref()),
+        ];
+        pairs.extend(
+            optional
+                .into_iter()
+                .filter_map(|(name, value)| Some((name, value?))),
+        );
+        let limit = limit.to_string();
+        query_path(route, &[pairs, vec![("limit", limit.as_str())]].concat())
+    };
+    let route = format!("/data/buckets/{bucket}/releases/{version}/files");
+    if let Some(holders) = read_holders(&state, &info, &params.key, &headers).await? {
+        let answer = relay_read(&state, &holders, &relayed(&route), bearer.as_ref()).await?;
+        return Ok(Json(answer));
+    }
+    let scope = BucketScope {
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        bucket: &bucket,
+        info: &info,
+    };
+    let page = FilePage {
+        prefix: params.prefix.clone().unwrap_or_default(),
+        folders,
+        after: params.after.clone(),
+        limit,
+    };
+    let context = state.get_ctx();
+    let found = release_view(context.as_ref(), scope, &auth, (&params.key, version), page).await;
+    let view = match found {
+        Ok(view) => view,
+        // A copy may not have received the release yet; its coordinator decides.
+        Err(ViewError::Missing) => match copy_miss(&state, &info, &params.key, &headers).await? {
+            Some(holders) => {
+                let path = relayed(&route);
+                return Ok(Json(
+                    relay_read(&state, &holders, &path, bearer.as_ref()).await?,
+                ));
+            }
+            None => return Err(ServerError::NotFound),
+        },
+        Err(ViewError::NoRelease) => return Err(ServerError::NotFound),
+        Err(ViewError::Forbidden) => return Err(ServerError::Forbidden),
+        Err(error) => return Err(ServerError::ServiceUnavailableReason(error.to_string())),
+    };
+    let files = (view.files.into_iter())
+        .map(|file| ReleaseFileItem {
+            key: file.key,
+            version_id: file.version_id.to_string(),
+            size: file.size,
+            id: file.id,
+            content_id: file.content_id,
+        })
+        .collect();
+    Ok(Json(ReleaseFilesResponse {
+        bucket,
+        key: params.key,
+        version_id: version.to_string(),
+        label: view.label,
+        prefix: view.prefix,
+        files,
+        folders: view.folders,
+        next: view.next,
     }))
 }
 

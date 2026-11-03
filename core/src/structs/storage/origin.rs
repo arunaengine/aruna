@@ -96,6 +96,19 @@ pub struct SourcePin {
     pub source_version: Option<String>,
 }
 
+impl SourcePin {
+    /// The pin of one source: its URL only when anyone may read it, as run records are shared.
+    pub fn of(descriptor: &PortableSourceDescriptor) -> Self {
+        Self {
+            url: publishable(descriptor)
+                .then(|| public_source_url(descriptor))
+                .flatten(),
+            path: descriptor.source_path.clone(),
+            source_version: descriptor.version_selector.clone(),
+        }
+    }
+}
+
 /// What a dataset may say about a file's origin, read from the same pinned version. Uploads
 /// and imports in place give nothing: users, devices and storage paths stay private.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

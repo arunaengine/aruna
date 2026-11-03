@@ -2371,6 +2371,7 @@ mod tests {
                         root: None,
                     },
                     connector_id: Some(Ulid::generate()),
+                    mirrors: Vec::new(),
                 },
                 SourceMetadata {
                     content_length: 30,

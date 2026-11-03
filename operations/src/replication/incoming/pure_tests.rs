@@ -423,6 +423,7 @@ fn make_source_binding() -> VersionSourceBinding {
             root: None,
         },
         connector_id: Some(Ulid::from_bytes([0x22; 16])),
+        mirrors: Vec::new(),
     }
 }
 

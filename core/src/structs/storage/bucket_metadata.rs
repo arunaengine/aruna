@@ -130,6 +130,13 @@ pub fn release_prefix(bucket: &str) -> Vec<u8> {
     key
 }
 
+/// The row every new release row of a bucket rewrites with its crate's version id, so a delete
+/// that checked the bucket's releases fails when one was added since. Readers of release rows
+/// skip it, since it carries no version id.
+pub fn release_marker(bucket: &str) -> Vec<u8> {
+    release_prefix(bucket)
+}
+
 /// Checks what a reader relies on: identifier rules that compile, and a dataset for a database.
 pub fn validate_metadata(metadata: &BucketMetadata) -> Result<(), String> {
     if let Some(parser) = &metadata.parser {

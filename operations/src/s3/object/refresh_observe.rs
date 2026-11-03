@@ -216,6 +216,7 @@ mod tests {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
         let observation = SourceMetadata {
             content_length: 4,

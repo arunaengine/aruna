@@ -21,7 +21,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::bucket_metadata::{CapturedDatabase, ReleaseRef};
 use aruna_core::structs::storage::dataset_description::DatasetDescription;
-use aruna_core::structs::storage::origin::{SourcePin, public_source_url, publishable};
+use aruna_core::structs::storage::origin::SourcePin;
 use aruna_core::structs::storage::read_grant::{GrantScope, ReadGrant};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::time::unix_timestamp_millis;
@@ -452,14 +452,7 @@ fn reference_content(
     };
     let range_bound = binding.descriptor.kind.enforces_if_match()
         && crate::s3::object::get::strong_validator(metadata.etag.as_deref());
-    let descriptor = &binding.descriptor;
-    let pin = SourcePin {
-        url: publishable(descriptor)
-            .then(|| public_source_url(descriptor))
-            .flatten(),
-        path: descriptor.source_path.clone(),
-        source_version: descriptor.version_selector.clone(),
-    };
+    let pin = SourcePin::of(&binding.descriptor);
     let content = InputContent::Reference {
         etag: metadata.etag.clone(),
         range_bound,
@@ -1027,6 +1020,7 @@ async fn capture_inputs(
             releases,
             releases_complete,
             grant,
+            served_by: None,
         });
     }
     Ok(captured_inputs)
@@ -2074,6 +2068,7 @@ mod tests {
                     root: None,
                 },
                 connector_id: None,
+                mirrors: Vec::new(),
             }),
         }
     }
@@ -2135,6 +2130,7 @@ mod tests {
             releases: Vec::new(),
             releases_complete: false,
             grant: None,
+            served_by: None,
         }
     }
 

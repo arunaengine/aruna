@@ -260,6 +260,7 @@ async fn capture_inputs(harness: &Harness, spec: &ExecutionSpec) -> Vec<Captured
             releases: Vec::new(),
             releases_complete: false,
             grant: None,
+            served_by: None,
         });
     }
     captured

@@ -382,6 +382,7 @@ mod tests {
                 strategy: StagingStrategy::Reference,
                 descriptor,
                 connector_id: None,
+                mirrors: Vec::new(),
             };
             let observed = SourceMetadata {
                 content_length: 3,

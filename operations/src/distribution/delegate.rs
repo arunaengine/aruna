@@ -159,7 +159,7 @@ async fn storage(context: &DriverContext, effect: StorageEffect) -> Result<Event
 
 /// Records a nonce as spent in one transaction, durably until it expires; a restart never
 /// accepts it again.
-pub(crate) async fn spend_nonce(
+pub async fn spend_nonce(
     context: &DriverContext,
     nonce: [u8; 16],
     expires: u64,
@@ -202,7 +202,7 @@ pub(crate) async fn spend_nonce(
 }
 
 /// Deletes one bounded page of nonce rows that expired before `now`.
-pub(crate) async fn prune_nonces(context: &DriverContext, now: u64) {
+pub async fn prune_nonces(context: &DriverContext, now: u64) {
     let page = StorageEffect::Iter {
         key_space: DELEGATION_NONCE_KEYSPACE.to_string(),
         prefix: None,

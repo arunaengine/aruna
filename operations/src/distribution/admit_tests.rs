@@ -52,6 +52,7 @@ fn config() -> AdmitConfig {
         coverage: MetadataCoverage::Assigned,
         sizes: ranges().iter().map(|range| empty(range.range_id)).collect(),
         capacity: None,
+        fills: Vec::new(),
     }
 }
 
@@ -187,6 +188,26 @@ async fn opens_ranges_once() {
     assert!(opened(&handle, None).await);
     // A retry finds the ranges open and signs the very same statement again.
     assert_eq!(run(&handle, true).await.unwrap(), first);
+}
+
+/// A member with new copies states their admission, not its own, once their ranges opened.
+#[tokio::test]
+async fn admits_new_copies() {
+    let (_dir, handle) = open();
+    bucket(&handle, member_id(), 42, 42).await;
+    let mut copies = config();
+    copies.fills = vec![RangeFill {
+        fill_id: Ulid::from_bytes([30; 16]),
+        range_id: ranges()[1].range_id,
+        member_id: member_id(),
+        admitted: false,
+    }];
+    let signed = run_with(&handle, copies, true).await.unwrap();
+    let identity = (member_id(), 42, [7; 32]);
+    let fill_ids = vec![Ulid::from_bytes([30; 16])];
+    let expected = Statement::copy_admitted(realm(), set_id(), identity, fill_ids);
+    assert_eq!(signed.statement, expected);
+    assert!(opened(&handle, None).await);
 }
 
 #[tokio::test]
@@ -353,6 +374,42 @@ async fn counts_unfilled_reservations() {
         .await
         .unwrap();
     assert!(opened(&handle, None).await);
+}
+
+/// An `all` coverage member that becomes a copy of a range it already opened reserves the
+/// range's bytes on top of its metadata, and is refused while they do not fit.
+#[tokio::test]
+async fn copy_reserves_bytes() {
+    let (_dir, handle) = open();
+    bucket(&handle, member_id(), 42, 42).await;
+    let mut covered = sized(Some(NEED - 1));
+    covered.coverage = MetadataCoverage::All;
+    covered.ranges = ranges();
+    run_with(&handle, covered.clone(), true).await.unwrap();
+    let first = account_key(set_id(), ranges()[0].range_id);
+    let meta = OBJECT_METADATA_BYTES.to_be_bytes().to_vec();
+    assert_eq!(reserved(&handle, first.clone()).await, Some(meta.clone()));
+    let mut copy = covered;
+    copy.ranges[0].replicas = vec![member_id()];
+    copy.fills = vec![RangeFill {
+        fill_id: Ulid::from_bytes([30; 16]),
+        range_id: ranges()[0].range_id,
+        member_id: member_id(),
+        admitted: false,
+    }];
+    let refused = run_with(&handle, copy.clone(), true).await;
+    let free = NEED - 1 - OBJECT_METADATA_BYTES;
+    assert_eq!(
+        refused,
+        Err(AdmitError::InsufficientCapacity { need: 1000, free })
+    );
+    assert_eq!(reserved(&handle, first.clone()).await, Some(meta));
+    copy.capacity = Some(NEED);
+    run_with(&handle, copy, true).await.unwrap();
+    assert_eq!(
+        reserved(&handle, first).await,
+        Some(NEED.to_be_bytes().to_vec())
+    );
 }
 
 /// Without a configured capacity a member with `all` coverage is refused; an assigned one is

@@ -23,7 +23,7 @@ use aruna_core::structs::execution::job::{
     StagingJobPrefix, StagingJobSpec,
 };
 use aruna_core::structs::execution::source_access::{ListRequest, SourceEntry, SourceEntryKind};
-use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::structs::execution::staging::{SourceMapping, StagingStrategy};
 use aruna_core::structs::execution::table::{
     TableImport, TableSource, source_path as table_source_path,
 };
@@ -211,6 +211,12 @@ pub struct StageBatchRequest {
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub table: Option<TableImport>,
+    /// Further sources of each imported file, equal to the first: `{connector_id, from, to}`
+    /// adds the file's source path with `from` replaced by `to`, read through that connector
+    /// of the group. Jobs only, not for distributed buckets.
+    #[serde(default)]
+    #[schema(value_type = Vec<Object>)]
+    pub mirrors: Vec<SourceMapping>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -480,9 +486,10 @@ pub async fn stage_batch(
     if request.strategy == ApiStagingStrategy::Sync {
         return Err(ServerError::Unimplemented);
     }
-    if request.checksum_manifest.is_some() || request.table.is_some() {
+    if request.checksum_manifest.is_some() || request.table.is_some() || !request.mirrors.is_empty()
+    {
         return Err(ServerError::BadRequestReason(
-            "checksum manifests and tables are read by staging jobs only".to_string(),
+            "checksum manifests, tables and mirrors are read by staging jobs only".to_string(),
         ));
     }
     let node_id = request
@@ -673,6 +680,14 @@ Nothing is authorized later while the job runs.
   node (default 10 per second); transient answers back off and honour `Retry-After`. A folder row
   writes a zero-byte folder object at `target/` carrying the row's metadata. The table and every
   row are read under the caller's permissions; rows are authorized by the job, one by one.
+- `mirrors` gives every imported file further sources of the same bytes, all equal to the
+  first: `[{"connector_id", "from", "to"}]` adds the file's source path with `from` replaced by
+  `to`, read through that connector of the group (the caller needs READ below `to`). File and
+  record rows may also name `mirrors` (`[{"connector_id", "source"}]`, a template like
+  `source`). A read tries the sources that did not fail lately first; a source serves only
+  bytes it proves equal to the version (recorded checksums or the same strong ETag). A file
+  whose further source is invalid or unreadable for the caller fails. A re-import without
+  `mirrors` keeps the further sources of unchanged files. Not for distributed buckets.
 - Progress and completion are observed by reading the job by its id.
 - In a distributed bucket every coordinator imports only the keys of the ranges it coordinates:
   this node relays the job to the other coordinators with the caller's bearer token and lists their
@@ -885,6 +900,21 @@ pub async fn submit_staging(
         validate_source_path(name)?;
     }
 
+    let mirror_columns = (table.iter()).flat_map(|table| &table.rows.mirrors);
+    let mirror_connectors = (request.mirrors.iter())
+        .map(|mapping| (mapping.connector_id, mapping.to.as_str()))
+        .chain(mirror_columns.map(|column| (column.connector_id, "")));
+    for (mirror_id, prefix) in mirror_connectors {
+        if bucket_info.distribution.is_some() {
+            return Err(ServerError::BadRequestReason(
+                "imports into a distributed bucket take no further sources".to_string(),
+            ));
+        }
+        local_connector(&state, group_id, mirror_id).await?;
+        let prefix = prefix.trim_matches('/');
+        ensure_prefix_permission(&state, &auth, group_id, mirror_id, prefix).await?;
+    }
+
     crate::routes::storage::relay::relayed_set(&bucket_info, &headers)?;
     let source = local_connector(&state, group_id, connector_id).await?;
     // A distributed bucket imports by range: every coordinator runs a job for its own keys.
@@ -929,6 +959,7 @@ pub async fn submit_staging(
             prefixes,
             checksum_manifest,
             table,
+            mirrors: request.mirrors,
         },
         node_id,
         state.rocrate_limits().artifact_retention_ms,
@@ -1605,6 +1636,7 @@ async fn reference_blob(
             expected_bucket: bucket_info,
             inherited_policies: Vec::new(),
             restrictions: auth.path_restrictions.clone(),
+            mirrors: Vec::new(),
         },
     )
     .await

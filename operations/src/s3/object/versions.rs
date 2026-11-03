@@ -1229,6 +1229,7 @@ mod test {
                         root: None,
                     },
                     connector_id: None,
+                    mirrors: Vec::new(),
                 },
                 source_metadata.clone(),
                 UNIX_EPOCH + Duration::from_secs(5),

@@ -545,6 +545,7 @@ mod tests {
             releases: Vec::new(),
             releases_complete: false,
             grant: None,
+            served_by: None,
         };
 
         let waits = locked_inputs(&context, &[input], node).await.unwrap();
@@ -573,6 +574,7 @@ mod tests {
             releases: Vec::new(),
             releases_complete: false,
             grant: None,
+            served_by: None,
         };
         let remote = iroh::SecretKey::from_bytes(&[2; 32]).public();
         let inputs = [
@@ -627,6 +629,7 @@ mod tests {
             releases: Vec::new(),
             releases_complete: false,
             grant: None,
+            served_by: None,
         });
         insert_job(storage, &record).await.unwrap();
         let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node, 2_000).await.unwrap()

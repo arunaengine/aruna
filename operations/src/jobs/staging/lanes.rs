@@ -592,6 +592,7 @@ mod tests {
                 digests: Default::default(),
             },
             metadata: Default::default(),
+            mirrors: Vec::new(),
         });
         PageImportInput {
             job_id: ctx.job_id,
@@ -612,6 +613,7 @@ mod tests {
             deletes: Vec::new(),
             now: std::time::SystemTime::now(),
             ranges: None,
+            mirror_connectors: Vec::new(),
         }
     }
 

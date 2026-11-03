@@ -311,6 +311,7 @@ fn identity_is_deterministic() {
         releases: Vec::new(),
         releases_complete: false,
         grant: None,
+        served_by: None,
     });
     let pinned_identity = pinned.identity().expect("identity derives");
     assert_ne!(pinned_identity, identity);

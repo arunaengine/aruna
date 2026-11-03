@@ -358,6 +358,7 @@ mod tests {
                 releases: Vec::new(),
                 releases_complete: false,
                 grant: None,
+                served_by: None,
             });
         }
         let (full_inputs, full_captured) = (inputs.clone(), captured.clone());

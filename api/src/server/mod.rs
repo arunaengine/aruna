@@ -31,6 +31,7 @@ const TIMEOUT_EXEMPT_ROUTES: &[&str] = &[
     "/metadata/rocrate/uploads",
     "/git/{repository}/info/lfs/objects/{oid}",
     "/git/{repository}/{service}",
+    "/shares/visit/uploads",
 ];
 
 #[derive(Clone, Debug)]

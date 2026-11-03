@@ -36,6 +36,7 @@ pub mod promotion;
 pub mod repository;
 pub mod rocrate_import;
 pub mod search;
+pub mod shares;
 pub mod staging;
 pub mod storage;
 pub mod sync;
@@ -84,6 +85,8 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(storage::objects::router())
         .merge(storage::organize::router())
         .merge(storage::origin::router())
+        .merge(storage::source_edit::router())
+        .merge(storage::source_health::router())
         .merge(storage::provenance::router())
         .merge(storage::routing::router())
         .merge(sync::router())
@@ -115,6 +118,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(portal::router())
         .merge(promotion::router())
         .merge(search::router())
+        .merge(shares::router())
         .merge(access::service_accounts::router())
         .merge(access::sessions::router())
         .merge(execution::tes::router())
@@ -280,6 +284,7 @@ pub(crate) mod tests {
         ("GET", "/data/buckets/{bucket}/metadata"),
         ("PUT", "/data/buckets/{bucket}/metadata"),
         ("GET", "/data/buckets/{bucket}/releases"),
+        ("GET", "/data/buckets/{bucket}/releases/{version_id}/files"),
         ("POST", "/data/buckets/{bucket}/releases"),
         ("GET", "/data/buckets/{bucket}/objects"),
         ("GET", "/data/buckets/{bucket}/objects/origin"),
@@ -287,6 +292,9 @@ pub(crate) mod tests {
         ("GET", "/data/provenance/crate"),
         ("GET", "/data/buckets/{bucket}/objects/part-of"),
         ("GET", "/data/buckets/{bucket}/sources"),
+        ("GET", "/data/buckets/{bucket}/sources/health"),
+        ("POST", "/data/buckets/{bucket}/sources/add"),
+        ("POST", "/data/buckets/{bucket}/sources/remove"),
         ("POST", "/data/identifier-rules/test"),
         ("POST", "/system/realm/nodes/{node_id}/promote"),
         ("GET", "/data/buckets/{bucket}/placement"),
@@ -437,6 +445,19 @@ pub(crate) mod tests {
         ("GET", "/access/policies/group/{group_id}"),
         ("GET", "/access/policies/realm"),
         ("GET", "/search"),
+        ("POST", "/shares"),
+        ("GET", "/shares"),
+        ("GET", "/shares/{id}"),
+        ("DELETE", "/shares/{id}"),
+        ("GET", "/shares/{id}/log"),
+        ("POST", "/shares/open"),
+        ("GET", "/shares/visit/files"),
+        ("PUT", "/shares/visit/uploads"),
+        ("POST", "/shares/visit/tickets"),
+        ("GET", "/shares/download"),
+        ("GET", "/shares/visit/dataset"),
+        ("GET", "/shares/visit/dataset/files"),
+        ("POST", "/shares/visit/dataset/tickets"),
         ("GET", "/search/buckets"),
         ("GET", "/search/objects"),
         ("GET", "/data/staging/jobs"),
@@ -692,6 +713,14 @@ pub(crate) mod tests {
         (
             "DELETE",
             "/data/groups/{group_id}/distributed-buckets/{set_id}/members/{member_id}",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/copies",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/splits",
         ),
         (
             "POST",

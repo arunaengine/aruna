@@ -588,6 +588,7 @@ async fn preserve_reference(
             metadata: metadata.clone(),
             inherited_policies: head.source_policies,
             connector_guard: None,
+            mirror_guards: Vec::new(),
             restrictions: input.restrictions,
         },
     )
@@ -1002,6 +1003,7 @@ pub(crate) mod test {
                 root: None,
             },
             connector_id: Some(Ulid::generate()),
+            mirrors: Vec::new(),
         };
         write_version(
             &context,
@@ -1112,6 +1114,7 @@ pub(crate) mod test {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
         write_version(
             &context,
@@ -1216,6 +1219,7 @@ pub(crate) mod test {
                 root: None,
             },
             connector_id: None,
+            mirrors: Vec::new(),
         };
         let metadata = SourceMetadata {
             content_length: 15,
@@ -1481,6 +1485,7 @@ pub(crate) mod test {
                 root: None,
             },
             connector_id: Some(Ulid::generate()),
+            mirrors: Vec::new(),
         };
         write_version(
             &context,

@@ -705,6 +705,7 @@ async fn hidden_link(members: &Members, on: usize, key: &str) {
         inherited_policies: Vec::new(),
         connector_guard: None,
         restrictions: None,
+        mirror_guards: Vec::new(),
     };
     write_reference_version(&node.context, write).await.unwrap();
 }

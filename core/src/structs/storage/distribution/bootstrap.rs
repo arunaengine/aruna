@@ -26,6 +26,9 @@ pub struct BootstrapCursor {
     pub walked: bool,
     /// The walk reached the end and its last page was delivered.
     pub done: bool,
+    /// Versions and delete markers queued so far, and the bytes of those versions.
+    pub versions: u64,
+    pub bytes: u64,
 }
 
 impl BootstrapCursor {

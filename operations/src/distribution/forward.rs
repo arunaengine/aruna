@@ -297,6 +297,10 @@ pub(crate) async fn admit_member(
         coverage: member.coverage,
         sizes: sizes.to_vec(),
         capacity: node_routing(context).catalog.capacity(),
+        fills: (snapshot.lifecycle.fills.iter())
+            .filter(|fill| fill.member_id == member_id && !fill.admitted)
+            .cloned()
+            .collect(),
     };
     let admitted = drive(AdmitOperation::new(admit), context.as_ref()).await;
     if let Err(

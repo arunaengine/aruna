@@ -523,6 +523,17 @@ pub const USAGE_PREIMAGE_KEYSPACE: &str = "usage_rebuild_preimages";
 /// bucket and cache budget, and a row per held range by set and range id.
 pub const CAPACITY_RESERVATION_KEYSPACE: &str = "distribution_capacity_reservations";
 
+/// Share link records by link id; sealed at rest, since each row holds the link secret.
+pub const SHARE_LINK_KEYSPACE: &str = "share_links";
+/// Share link ids by creator, so an owner lists their links without a scan.
+pub const SHARE_OWNER_KEYSPACE: &str = "share_owners";
+/// Per-link access log entries by link id and time-ordered entry id.
+pub const SHARE_EVENT_KEYSPACE: &str = "share_events";
+/// Download and upload counts and the last access of each link, by link id.
+pub const SHARE_USE_KEYSPACE: &str = "share_uses";
+/// Upload names claimed by running share uploads, by bucket and key, with the claim's end.
+pub const SHARE_NAME_KEYSPACE: &str = "share_upload_names";
+
 /// Every keyspace this crate defines, so tooling reports a missing one without
 /// maintaining its own copy of the list.
 pub const KEYSPACE_CATALOG: &[&str] = &[
@@ -795,6 +806,11 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     SEARCH_INDEX_KEYSPACE,
     USAGE_PREIMAGE_KEYSPACE,
     CAPACITY_RESERVATION_KEYSPACE,
+    SHARE_LINK_KEYSPACE,
+    SHARE_OWNER_KEYSPACE,
+    SHARE_EVENT_KEYSPACE,
+    SHARE_USE_KEYSPACE,
+    SHARE_NAME_KEYSPACE,
 ];
 
 /// Smallest key strictly greater than every key starting with `prefix`,

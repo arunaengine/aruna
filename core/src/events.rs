@@ -14,6 +14,7 @@ use crate::node_vault::VaultEntry;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::execution::source_access::{
     ListCursor, ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
+    SourceStats,
 };
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::vault::VaultRecords;
@@ -98,6 +99,10 @@ pub enum SubOperationEvent {
         result: Result<GroupRoutingInputs, String>,
     },
     NotificationsEmitted,
+    /// A share link's access log entry and use counters were written.
+    ShareLogged {
+        result: Result<(), String>,
+    },
     TokenRevoked {
         result: Result<(), String>,
     },
@@ -315,6 +320,11 @@ pub enum StagingSourceEvent {
     ReadResult {
         metadata: SourceMetadata,
         stream: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
+    HealthResult {
+        stats: Vec<SourceStats>,
+        /// Uniformly random, so the operation can pick among sources deterministically.
+        draw: u64,
     },
     Error {
         error: StagingSourceError,

@@ -576,6 +576,7 @@ async fn file_rows(
             manifest: entry.digests,
             metadata: entry.metadata,
             modified: entry.modified,
+            mirrors: entry.mirrors,
         })
         .collect();
     let rows = (files, Vec::new(), Vec::new());
@@ -959,6 +960,7 @@ mod tests {
             modified: None,
             etag: None,
             content_type: None,
+            mirrors: Vec::new(),
         };
         let rows = vec![
             entry("a.fq", "x/a.fq"),

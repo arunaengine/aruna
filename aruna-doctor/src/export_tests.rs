@@ -30,6 +30,7 @@ fn reference(path: &str) -> BlobVersion {
             root: Some([3; 32]),
         },
         connector_id: Some(CONNECTOR),
+        mirrors: Vec::new(),
     };
     let md5 = SourceDigest {
         digest: vec![0xab; 16],

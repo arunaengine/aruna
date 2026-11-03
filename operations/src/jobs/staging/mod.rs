@@ -6,6 +6,7 @@
 mod lanes;
 mod limiter;
 mod manifest;
+mod mirrors;
 mod table;
 mod walk;
 
@@ -358,6 +359,7 @@ pub(super) async fn stage_item(
     expected_checksums: Vec<ExpectedChecksum>,
 ) -> Result<u64, ItemFailure> {
     let expected_bucket = ensure_item_permission(ctx, spec, source_path, target_key).await?;
+    let mirrors = mirrors::item_mirrors(ctx, spec, source_path).await?;
     let (size, version_id) = match spec.strategy {
         StagingStrategy::Reference => stage_reference_blob(
             &ctx.driver,
@@ -373,6 +375,7 @@ pub(super) async fn stage_item(
                 expected_bucket,
                 inherited_policies: Vec::new(),
                 restrictions: spec.auth_context.path_restrictions.clone(),
+                mirrors,
             },
         )
         .await
@@ -617,6 +620,7 @@ mod pure_tests {
             }],
             checksum_manifest: None,
             table: None,
+            mirrors: Vec::new(),
         }
     }
 

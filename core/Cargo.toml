@@ -54,6 +54,7 @@ tracing-opentelemetry = { workspace = true }
 zeroize = { workspace = true }
 hpke = { workspace = true }
 pbkdf2 = { workspace = true }
+argon2 = { workspace = true }
 x25519-dalek = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]

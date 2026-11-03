@@ -242,12 +242,7 @@ pub(crate) fn reference_manifest(
         auth_context: job.input.auth_context.clone(),
         blob: None,
         // Members of a set read the source themselves; connector ids are node-local.
-        source: Some(
-            aruna_core::structs::execution::staging::VersionSourceBinding {
-                connector_id: None,
-                ..source
-            },
-        ),
+        source: Some(source.without_connectors()),
         multipart: None,
         reference_intent: true,
         origin: None,

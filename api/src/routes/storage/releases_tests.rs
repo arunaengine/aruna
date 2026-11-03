@@ -243,3 +243,225 @@ async fn lists_readable_crates() {
     assert_eq!(listed.releases[0].label, "6.0");
     assert!(listed.complete);
 }
+
+async fn files(
+    node: &Node,
+    auth: &AuthContext,
+    version_id: &str,
+    params: ReleaseFilesParams,
+) -> ServerResult<ReleaseFilesResponse> {
+    list_release_files(
+        State(node.state.clone()),
+        Extension(Some(auth.clone())),
+        Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
+        HeaderMap::new(),
+        Path((BUCKET.to_string(), version_id.to_string())),
+        Query(params),
+    )
+    .await
+    .map(|Json(answer)| answer)
+}
+
+fn params(prefix: Option<&str>, delimiter: Option<&str>) -> ReleaseFilesParams {
+    ReleaseFilesParams {
+        key: "db/release.json".to_string(),
+        prefix: prefix.map(str::to_string),
+        delimiter: delimiter.map(str::to_string),
+        after: None,
+        limit: None,
+    }
+}
+
+#[tokio::test]
+async fn browses_release_files() {
+    let node = node_state().await;
+    store(&node, "db/a.fasta", ">a").await;
+    store(&node, "db/sub/b.fasta", ">bb").await;
+    store(&node, "other/c.fasta", ">c").await;
+    let doi = "https://doi.org/10.5281/zenodo.1";
+    let release = publish(&node, &node.owner, request(doi)).await.unwrap();
+    let version = release.version_id.as_str();
+
+    let folders = files(&node, &node.owner, version, params(Some("db/"), Some("/")))
+        .await
+        .unwrap();
+    assert_eq!(
+        (folders.label.as_str(), folders.prefix.as_str()),
+        ("6.0", "db/")
+    );
+    let keys: Vec<&str> = folders.files.iter().map(|file| file.key.as_str()).collect();
+    assert_eq!(
+        (keys, folders.folders.clone()),
+        (vec!["db/a.fasta"], vec!["db/sub/".to_string()])
+    );
+    assert_eq!(folders.files[0].size, 2);
+    let pinned = folders.files[0].version_id.clone();
+    // A newer version of a pinned key leaves the release as it was.
+    store(&node, "db/a.fasta", ">a2").await;
+    let all = files(&node, &node.owner, version, params(None, None))
+        .await
+        .unwrap();
+    let keys: Vec<&str> = all.files.iter().map(|file| file.key.as_str()).collect();
+    assert_eq!(keys, ["db/a.fasta", "db/sub/b.fasta"]);
+    assert_eq!(all.files[0].version_id, pinned);
+    assert_eq!(all.next, None);
+
+    let stranger = files(&node, &node.stranger, version, params(None, None)).await;
+    assert!(
+        matches!(stranger, Err(ServerError::Forbidden)),
+        "{stranger:?}"
+    );
+    let unknown = files(
+        &node,
+        &node.owner,
+        &Ulid::from_bytes([77; 16]).to_string(),
+        params(None, None),
+    )
+    .await;
+    assert!(matches!(unknown, Err(ServerError::NotFound)), "{unknown:?}");
+    let pinned_file = ReleaseFilesParams {
+        key: "db/a.fasta".to_string(),
+        ..params(None, None)
+    };
+    let untagged = files(&node, &node.owner, &pinned, pinned_file).await;
+    assert!(
+        matches!(untagged, Err(ServerError::NotFound)),
+        "{untagged:?}"
+    );
+    for bad in [
+        ReleaseFilesParams {
+            limit: Some(0),
+            ..params(None, None)
+        },
+        params(None, Some(",")),
+    ] {
+        let refused = files(&node, &node.owner, version, bad).await;
+        assert!(matches!(refused, Err(ServerError::BadRequestMessage(_))));
+    }
+}
+
+#[tokio::test]
+async fn purge_keeps_pinned() {
+    use crate::routes::storage::deletion::{PurgeScopeRequest, SubmitPurgeRequest, submit_purge};
+    use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
+    use aruna_operations::driver::drive;
+    use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_pinned, refuse_scope};
+    use aruna_operations::s3::object::delete::{
+        DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
+    };
+
+    let node = node_state().await;
+    store(&node, "db/a.fasta", ">a").await;
+    store(&node, "other/c.fasta", ">c").await;
+    let doi = "https://doi.org/10.5281/zenodo.1";
+    let release = publish(&node, &node.owner, request(doi)).await.unwrap();
+    let listed = files(&node, &node.owner, &release.version_id, params(None, None))
+        .await
+        .unwrap();
+    let pinned: Ulid = listed.files[0].version_id.parse().unwrap();
+    store(&node, "db/a.fasta", ">a2").await;
+    let current = origin(&node, "db/a.fasta")
+        .await
+        .version_id
+        .parse()
+        .unwrap();
+
+    let state = &node.state;
+    let info = bucket_info(state, BUCKET).await.unwrap();
+    let scope = BucketScope {
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        bucket: BUCKET,
+        info: &info,
+    };
+    let caller = &node.owner;
+    let context = state.get_ctx();
+    let refused = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", pinned)).await;
+    assert!(
+        matches!(refused, Err(PinnedError::Version { .. })),
+        "the pinned version is kept: {refused:?}"
+    );
+    // A caller who cannot read the release crate is refused too, without its name.
+    let (realm, node_id) = (state.get_realm_id(), state.get_node_id());
+    let path = object_permission_path(realm, node.group_id, node_id, BUCKET, "db/a.fasta");
+    let blind = limited(&node, &[(path, Permission::WRITE)]);
+    let refused = refuse_pinned(context.as_ref(), scope, &blind, ("db/a.fasta", pinned)).await;
+    assert!(matches!(refused, Err(PinnedError::Version { .. })));
+    let file = StoragePurgeScope::File {
+        bucket: BUCKET.to_string(),
+        key: "db/a.fasta".to_string(),
+    };
+    let refused = refuse_scope(context.as_ref(), scope, &blind, &file).await;
+    assert_eq!(refused, Err(PinnedError::Scope));
+    // The newer version and the release crate itself belong to no release.
+    let newer = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", current)).await;
+    let guards = newer.expect("no release pins the newer version");
+    let crate_version = release.version_id.parse().unwrap();
+    let own = refuse_pinned(
+        context.as_ref(),
+        scope,
+        caller,
+        ("db/release.json", crate_version),
+    );
+    assert!(own.await.is_ok());
+    // A release published after the check pins the newer version: the checked delete fails.
+    let mut later = request(doi);
+    later.label = "6.1".to_string();
+    publish(&node, &node.owner, later).await.unwrap();
+    let delete = DeleteObjectOperation::new(DeleteObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "db/a.fasta".to_string(),
+        version_id: Some(current),
+        group_id: info.group_id,
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        deleted_by: node.owner.user_id,
+    })
+    .with_fence(guards, Vec::new());
+    let raced = drive(delete, context.as_ref()).await;
+    assert_eq!(raced, Err(DeleteObjectError::FenceTaken));
+    let again = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", current)).await;
+    assert!(matches!(again, Err(PinnedError::Version { .. })));
+
+    let shared = context.as_ref();
+    let purge = |purged: StoragePurgeScope| async move {
+        refuse_scope(shared, scope, caller, &purged).await
+    };
+    let file = StoragePurgeScope::File {
+        bucket: BUCKET.to_string(),
+        key: "db/a.fasta".to_string(),
+    };
+    assert_eq!(purge(file).await, Err(PinnedError::Scope));
+    let folder = |prefix: &str| StoragePurgeScope::Prefix {
+        bucket: BUCKET.to_string(),
+        prefix: prefix.to_string(),
+    };
+    assert!(
+        purge(folder("d")).await.is_err(),
+        "a folder holding the release"
+    );
+    assert_eq!(purge(folder("other/")).await, Ok(()));
+    let bucket = StoragePurgeScope::Bucket {
+        bucket: BUCKET.to_string(),
+    };
+    assert_eq!(purge(bucket).await, Ok(()));
+
+    let submitted = submit_purge(
+        State(node.state.clone()),
+        Extension(Some(node.owner.clone())),
+        Json(SubmitPurgeRequest {
+            scope: PurgeScopeRequest::File {
+                bucket: BUCKET.to_string(),
+                key: "db/a.fasta".to_string(),
+            },
+            idempotency_key: None,
+            delete_storage_files: false,
+            confirm: None,
+        }),
+    )
+    .await;
+    let Err(ServerError::Conflict(message)) = submitted else {
+        panic!("the purge of a pinned file is refused: {submitted:?}");
+    };
+    assert!(!message.contains("6.0"), "{message}");
+}

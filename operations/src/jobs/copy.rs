@@ -237,6 +237,7 @@ mod tests {
                 root: None,
             },
             connector_id: Some(Ulid::generate()),
+            mirrors: Vec::new(),
         };
         let version = BlobVersion::reference(
             source,

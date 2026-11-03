@@ -525,6 +525,7 @@ mod tests {
                 releases: Vec::new(),
                 releases_complete: false,
                 grant: None,
+                served_by: None,
             },
         }
     }

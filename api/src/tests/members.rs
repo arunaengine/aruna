@@ -384,6 +384,7 @@ async fn admitted_set(
             coverage: member.coverage,
             sizes: with_unopened(&created, &[]),
             capacity: None,
+            fills: Vec::new(),
         };
         let statement = drive(AdmitOperation::new(admit), &node.context)
             .await

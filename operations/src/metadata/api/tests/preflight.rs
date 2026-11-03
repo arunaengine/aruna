@@ -490,6 +490,7 @@ fn unread_versions_located() {
             root: None,
         },
         connector_id: Some(Ulid::from_bytes([2; 16])),
+        mirrors: Vec::new(),
     };
     let observed = SourceMetadata {
         content_length: 7,

@@ -641,6 +641,7 @@ async fn delete_local_bucket(
             node_id,
             deleted_by: folder.created_by,
             restrictions: None,
+            guards: Vec::new(),
         };
         for outcome in delete_objects(context, input).await {
             match outcome.result {
