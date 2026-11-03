@@ -527,6 +527,7 @@ mod tests {
 
     // A link whose target sits outside the offered root must not be served,
     // however it is addressed.
+    #[cfg(unix)]
     #[tokio::test]
     async fn refuses_escaping_link() {
         let root = tempfile::tempdir().unwrap();
@@ -552,6 +553,7 @@ mod tests {
     }
 
     // A link that stays inside the offered directory is ordinary data.
+    #[cfg(unix)]
     #[tokio::test]
     async fn follows_internal_link() {
         let root = tempfile::tempdir().unwrap();
@@ -670,12 +672,9 @@ mod tests {
     #[tokio::test]
     async fn fifo_is_refused() {
         let root = tempfile::tempdir().unwrap();
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            root.path().join("pipe"),
-            rustix::fs::Mode::RUSR,
-        )
-        .unwrap();
+        let fifo = root.path().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.unwrap().success());
         assert!(matches!(
             open_file(root.path().to_str().unwrap(), "pipe").await,
             Err(StagingSourceError::NotFound)
@@ -684,6 +683,7 @@ mod tests {
 
     // A link back to an ancestor inside the offered root must not make the walk
     // circle forever.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bounds_linked_cycle() {
         let root = tempfile::tempdir().unwrap();
