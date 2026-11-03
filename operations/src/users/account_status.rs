@@ -224,6 +224,7 @@ impl AccountStatusOperation {
             )
         };
         self.state = AccountStatusState::UpdateUser;
+        let audit = self.audit_record();
         smallvec![Effect::SubOperation(boxed_suboperation(
             UpdateUserOperation::new(UpdateUserInput {
                 actor: self.config.actor.clone(),
@@ -236,7 +237,8 @@ impl AccountStatusOperation {
                 system: true,
                 alias: None,
                 subject: None,
-            }),
+            })
+            .audited(audit),
             |result| Event::SubOperation(SubOperationEvent::UserUpdated {
                 result: result.map(|_| ()).map_err(|error| error.to_string()),
             }),
@@ -245,7 +247,11 @@ impl AccountStatusOperation {
 
     fn handle_updated(&mut self, event: Event) -> Effects {
         match event {
-            Event::SubOperation(SubOperationEvent::UserUpdated { result: Ok(()) }) => self.finish(),
+            Event::SubOperation(SubOperationEvent::UserUpdated { result: Ok(()) }) => {
+                self.state = AccountStatusState::Finish;
+                self.output = Some(Ok(()));
+                smallvec![]
+            }
             Event::SubOperation(SubOperationEvent::UserUpdated { result: Err(error) }) => {
                 self.fail(AccountStatusError::Update(error))
             }
@@ -273,8 +279,7 @@ impl AccountStatusOperation {
         self.config.target.realm_id != self.config.actor.realm_id
     }
 
-    /// The change is complete; its audit row follows it.
-    fn finish(&mut self) -> Effects {
+    fn audit_record(&self) -> AdminAuditRecord {
         let action = match self.config.active {
             true => AdminAuditAction::AccountReactivated,
             false => AdminAuditAction::AccountDeactivated,
@@ -282,7 +287,12 @@ impl AccountStatusOperation {
         let mut record =
             AdminAuditRecord::new(action, self.config.actor.user_id, self.config.target);
         record.group_id = self.owner_group;
-        let writes = match record.entries() {
+        record
+    }
+
+    /// A federated target has no local user row to commit the audit row with.
+    fn finish(&mut self) -> Effects {
+        let writes = match self.audit_record().entries() {
             Ok(writes) => writes,
             Err(error) => return self.fail(error.into()),
         };
@@ -484,6 +494,16 @@ mod tests {
         record
     }
 
+    /// Checks that the user update commits the audit row and returns that row.
+    fn committed(operation: &mut AccountStatusOperation, effects: Effects) -> AdminAuditRecord {
+        assert!(
+            effects.is_empty(),
+            "no write follows the update: {effects:?}"
+        );
+        assert!(operation.is_complete());
+        operation.audit_record()
+    }
+
     #[test]
     fn service_caller_refused() {
         let fixture = fixture();
@@ -539,7 +559,7 @@ mod tests {
         let effects = operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
             result: Ok(()),
         }));
-        let record = audited(&mut operation, effects);
+        let record = committed(&mut operation, effects);
         assert_eq!(record.action, AdminAuditAction::AccountDeactivated);
         assert_eq!(
             (record.actor, record.target),
@@ -565,7 +585,7 @@ mod tests {
         let effects = operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
             result: Ok(()),
         }));
-        let record = audited(&mut operation, effects);
+        let record = committed(&mut operation, effects);
         assert_eq!(record.action, AdminAuditAction::AccountReactivated);
         assert_eq!(operation.finalize(), Ok(()));
     }
@@ -593,7 +613,7 @@ mod tests {
         let effects = operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
             result: Ok(()),
         }));
-        let record = audited(&mut operation, effects);
+        let record = committed(&mut operation, effects);
         assert_eq!(record.group_id, Some(group));
         assert_eq!(operation.finalize(), Ok(()));
     }
