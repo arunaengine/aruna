@@ -377,6 +377,80 @@ async fn pages_cover_all() {
     assert_eq!(TokenCursor::from_bytes(&[9, 1]), None);
 }
 
+/// A sparse scan spends its page budget, returns no tokens and a cursor, and the next page
+/// resumes after it and finds the token.
+#[test]
+fn budget_returns_cursor() {
+    use super::TokenScan;
+    use aruna_core::effects::{Effect, IterStart};
+    use aruna_core::types::{Key, Value};
+    let realm_id = RealmId::from_bytes([7u8; 32]);
+    let (group_a, group_b) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+    let owner = UserId::local(Ulid::from_parts(4, 1), realm_id);
+    let credential = |n: u64, group_id: GroupId| -> (Key, Value) {
+        let access = UserAccess {
+            access_key: Ulid::from_parts(n, 3).to_string(),
+            user_identity: owner,
+            group_id,
+            secret: EncryptedS3Secret::empty(),
+            expiry: SystemTime::now() + Duration::from_secs(3_600),
+            path_restrictions: None,
+            issued_by: [0u8; 32],
+            revoked_at: None,
+        };
+        let key = access.access_key.as_bytes().to_vec();
+        (key.into(), access.to_bytes().unwrap().into())
+    };
+    let page = |values: Vec<(Key, Value)>, more: bool| {
+        let next_start_after = values.last().filter(|_| more).map(|(key, _)| key.clone());
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        })
+    };
+    let config = || {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        })
+    };
+
+    let mut scan = TokenScan::new((realm_id, group_a), 0, None, 1);
+    scan.start();
+    scan.step(config()).unwrap().unwrap();
+    // No user records, then one foreign credential per page until the budget stops the scan.
+    scan.step(page(Vec::new(), false)).unwrap().unwrap();
+    let stopped = (1..=8).find(|&n| {
+        let foreign = page(vec![credential(n, group_b)], true);
+        scan.step(foreign).unwrap().is_none()
+    });
+    assert!(stopped.is_some());
+    assert!(scan.tokens.is_empty());
+    let next = scan.next.take().unwrap();
+    let last = credential(stopped.unwrap(), group_b).0;
+
+    let cursor = TokenCursor::from_bytes(&next.to_bytes());
+    let mut scan = TokenScan::new((realm_id, group_a), 0, cursor, 1);
+    scan.start();
+    let effects = scan.step(config()).unwrap().unwrap();
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Iter {
+            key_space,
+            start: Some(IterStart::After(after)),
+            ..
+        })] if key_space == USER_ACCESS_KEYSPACE && *after == last
+    ));
+    let (key, value) = credential(20, group_a);
+    assert!(
+        scan.step(page(vec![(key, value)], false))
+            .unwrap()
+            .is_none()
+    );
+    let ids: Vec<_> = scan.tokens.iter().map(|token| token.id.clone()).collect();
+    assert_eq!(ids, vec![Ulid::from_parts(20, 3).to_string()]);
+}
+
 #[tokio::test]
 async fn realm_admin_allowed() {
     let fixture = fixture().await;

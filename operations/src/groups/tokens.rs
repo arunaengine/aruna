@@ -31,6 +31,9 @@ use crate::s3::session::S3SessionError;
 use crate::session::index::{decode_index, owner_key};
 
 const PAGE: usize = 256;
+/// Storage pages one listing request reads before it returns a cursor, so a sparse group pages
+/// in bounded steps; each keyspace change may add one more page.
+const SCAN_PAGES: usize = 4;
 
 /// One page of rows and the key the next page starts after.
 type Page = (Vec<(Key, Value)>, Option<Key>);
@@ -138,7 +141,8 @@ impl TokenCursor {
 }
 
 /// Reads one page of the group's tokens: the sessions of its service accounts, then the S3
-/// credentials and S3 sessions of this node bound to it, stopping once `limit` are found.
+/// credentials and S3 sessions of this node bound to it, stopping once `limit` are found or the
+/// scan budget is spent.
 #[derive(Debug, PartialEq)]
 pub(crate) struct TokenScan {
     realm_id: RealmId,
@@ -153,6 +157,8 @@ pub(crate) struct TokenScan {
     /// The last key of the current user page, and whether another page follows.
     page_end: Option<(Key, bool)>,
     current: Option<(Key, UserId)>,
+    /// Storage pages read so far by this request.
+    pages: usize,
     pub(crate) tokens: Vec<GroupToken>,
     pub(crate) next: Option<TokenCursor>,
 }
@@ -175,6 +181,7 @@ impl TokenScan {
             accounts: Vec::new(),
             page_end: None,
             current: None,
+            pages: 0,
             tokens: Vec::new(),
             next: None,
         }
@@ -187,6 +194,7 @@ impl TokenScan {
 
     fn iter(&mut self, step: ScanStep, start: Option<Key>) -> Effects {
         self.step = step;
+        self.pages += 1;
         let (key_space, prefix) = match step {
             ScanStep::Credentials => (USER_ACCESS_KEYSPACE, None),
             ScanStep::S3Sessions => (S3_SESSION_KEYSPACE, None),
@@ -203,6 +211,10 @@ impl TokenScan {
 
     fn full(&self) -> bool {
         self.tokens.len() >= self.limit
+    }
+
+    fn spent(&self) -> bool {
+        self.pages >= SCAN_PAGES
     }
 
     fn stop(&mut self, step: ScanStep, after: Key) -> Option<Effects> {
@@ -292,6 +304,7 @@ impl TokenScan {
         }
         match self.page_end.take() {
             Some((last, _)) if self.full() => self.stop(ScanStep::Users, last),
+            Some((last, true)) if self.spent() => self.stop(ScanStep::Users, last),
             Some((last, true)) => Some(self.iter(ScanStep::Users, Some(last))),
             _ => Some(self.iter(ScanStep::Credentials, None)),
         }
@@ -325,6 +338,7 @@ impl TokenScan {
             }
         }
         Ok(match (more, step) {
+            (Some(start), _) if self.spent() => self.stop(step, start),
             (Some(start), _) => Some(self.iter(step, Some(start))),
             (None, ScanStep::Credentials) => Some(self.iter(ScanStep::S3Sessions, None)),
             (None, _) => None,
