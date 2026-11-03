@@ -4,6 +4,7 @@
 
 #![recursion_limit = "256"]
 
+use crate::backup::{backup, restore};
 use crate::cli::{
     Cli, Commands, ExploreCommands, IrohCommands, MetadataCommands, PortalCommands,
     ReclaimCommands, TopicCommands, TopicsCommands,
@@ -23,6 +24,7 @@ use crate::storage::{import, snapshot};
 use crate::tokens::{create_bootstrap_token, create_oidc_token, recover_initial_admin, view_token};
 use clap::Parser;
 
+mod backup;
 mod cli;
 mod error;
 mod explorer;
@@ -121,6 +123,14 @@ async fn main() -> Result<(), CliError> {
             snapshot_path,
             target_path,
         } => import(snapshot_path, target_path).await?,
+        Commands::Backup {
+            storage_path,
+            target_path,
+        } => backup(storage_path, target_path).await?,
+        Commands::Restore {
+            backup_path,
+            target_path,
+        } => restore(backup_path, target_path).await?,
         Commands::Iroh { command } => match command {
             IrohCommands::Check {
                 info_url,
