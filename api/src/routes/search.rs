@@ -225,10 +225,10 @@ pub struct ObjectCoverage {
     pub complete: bool,
     pub truncated: bool,
     pub partitions: Vec<ObjectPartitionCoverage>,
-    /// Readable matching keys of the first page's snapshot (`as_of`) that were replaced or
-    /// deleted later, counted through this page and not shown. Zero on the last page means
-    /// the pages together list that snapshot, within the reported coverage.
-    pub changed_keys: usize,
+    /// Readable matching keys of the `as_of` snapshot replaced or deleted later, through this page.
+    /// Zero on the last page means the pages list that snapshot within the reported coverage;
+    /// `null` once a searched range index changed after `as_of`, so removed keys are uncounted.
+    pub changed_keys: Option<usize>,
 }
 
 /// How far a coordinator's search index of one range is.

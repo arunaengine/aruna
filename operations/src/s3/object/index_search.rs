@@ -97,7 +97,7 @@ async fn range_page(
     let record = read_record(context, set_id).await;
     let Some(view) = record.map_err(SearchObjectsError::Storage)? else {
         // Without the record the ranges are unknown, so nothing is covered.
-        return Ok(page(Vec::new(), Vec::new(), None, 1, 0));
+        return Ok(page(Vec::new(), Vec::new(), true, None, 1, 0));
     };
     let after = match input.start_after.as_deref() {
         Some(position) => Some(BlobHeadKey::from_bytes(&open_position(position)?)?.key),
@@ -128,6 +128,7 @@ async fn range_page(
     let mut evaluators = HashMap::new();
     let mut visible = Vec::with_capacity(limit + 1);
     let mut changed = Vec::new();
+    let mut certain = true;
     let (mut examined, mut incomplete) = (0, 0);
     for chunk in local.chunks(RANGE_CONCURRENCY) {
         let query = KeyQuery {
@@ -144,6 +145,9 @@ async fn range_page(
                 incomplete += 1;
                 continue;
             };
+            // A key removed from the index after `as_of` leaves no trace, so a commit since
+            // then makes the changed keys of this page unknown.
+            certain &= found.committed_at.is_some_and(|at| at < input.as_of);
             // Checked once wherever the query ends, so neither coverage nor timing shows the cursor.
             if let Some(through) = through {
                 let shown = readable(context, input, &bucket, &mut evaluators, &through).await?;
@@ -163,7 +167,7 @@ async fn range_page(
                     changed.push(candidate.hit.cursor_key);
                     if changed.len() >= CHANGED_PAGE_CAP {
                         let next = changed.last().cloned();
-                        return Ok(page(visible, changed, next, incomplete, remote));
+                        return Ok(page(visible, changed, certain, next, incomplete, remote));
                     }
                     continue;
                 }
@@ -172,7 +176,7 @@ async fn range_page(
                     let next = visible.get(limit - 1).map(|hit| hit.cursor_key.clone());
                     visible.truncate(limit);
                     changed_until(&mut changed, next.as_deref());
-                    return Ok(page(visible, changed, next, incomplete, remote));
+                    return Ok(page(visible, changed, certain, next, incomplete, remote));
                 }
             }
             if let Some(last) = last {
@@ -182,6 +186,7 @@ async fn range_page(
                 return Ok(page(
                     visible,
                     changed,
+                    certain,
                     Some(seal_position(&position)?),
                     incomplete,
                     remote,
@@ -189,7 +194,7 @@ async fn range_page(
             }
         }
     }
-    Ok(page(visible, changed, None, incomplete, remote))
+    Ok(page(visible, changed, certain, None, incomplete, remote))
 }
 
 /// Queries the indexes of `chunk` at once; `None` for a range without a searchable one. A
@@ -324,6 +329,7 @@ fn overlaps(range: &KeyRange, start: &Bound<String>, end: &Bound<String>) -> boo
 fn page(
     hits: Vec<SearchNodeHit>,
     changed: Vec<Vec<u8>>,
+    certain: bool,
     next_start_after: Option<Vec<u8>>,
     incomplete_ranges: usize,
     remote_ranges: usize,
@@ -337,7 +343,7 @@ fn page(
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
         skipped_buckets: Vec::new(),
-        changed,
+        changed: certain.then_some(changed),
     }
 }
 

@@ -40,8 +40,8 @@ const HEAD_SCAN_BATCH: usize = 1_000;
 pub const SEARCH_MAX_LIMIT: usize = 100;
 /// Changed keys one node page passes at most; the page then ends at the last of them.
 const CHANGED_PAGE_CAP: usize = SEARCH_MAX_LIMIT;
-/// Oldest versions read to learn whether a changed key existed at the snapshot.
-const OLDEST_VERSIONS: usize = 4;
+/// Versions one read returns while learning whether a changed key existed at the snapshot.
+const VERSION_BATCH: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ObjectKeyMatch {
@@ -126,9 +126,9 @@ pub struct SearchNodePage {
     #[serde(default)]
     pub skipped_buckets: Vec<String>,
     /// Cursor keys of readable keys this page passed whose head was replaced or deleted after
-    /// `as_of`; they are counted, not shown.
+    /// `as_of`; they are counted, not shown. `None` when a searched range index changed since.
     #[serde(default)]
-    pub changed: Vec<Vec<u8>>,
+    pub changed: Option<Vec<Vec<u8>>>,
 }
 
 #[derive(Debug, Error)]
@@ -268,7 +268,7 @@ fn node_page(
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
         skipped_buckets,
-        changed,
+        changed: Some(changed),
     }
 }
 
@@ -549,8 +549,8 @@ async fn load_live(
     Ok(live)
 }
 
-/// Whether one of the oldest kept versions of `head` was created by `as_of`. Ids sort by
-/// time, but ids of one millisecond may swap, so a few are read.
+/// Whether the newest version of `head` created by `as_of` is live, so the key existed then.
+/// Ids of one millisecond may swap, so every kept version is read.
 async fn existed_at(
     context: &DriverContext,
     head: &BlobHeadKey,
@@ -558,25 +558,37 @@ async fn existed_at(
     txn_id: TxnId,
 ) -> Result<bool, SearchObjectsError> {
     let prefix = VersionKey::object_prefix(&head.bucket, &head.key)?;
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
-            limit: OLDEST_VERSIONS,
-            txn_id: Some(txn_id),
-        })
-        .await;
-    let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-        return Err(storage_event_error(event));
-    };
-    for (_, value) in values {
-        if BlobVersion::from_bytes(value.as_ref())?.created_at <= as_of {
-            return Ok(true);
+    let (mut start, mut visible) = (None, None);
+    loop {
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                prefix: Some(prefix.clone().into()),
+                start: start.take(),
+                limit: VERSION_BATCH,
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return Err(storage_event_error(event));
+        };
+        for (_, value) in values {
+            let version = BlobVersion::from_bytes(value.as_ref())?;
+            let newer = |(at, _): &(SystemTime, bool)| version.created_at >= *at;
+            if version.created_at <= as_of && visible.as_ref().is_none_or(newer) {
+                visible = Some((version.created_at, !version.is_deleted()));
+            }
+        }
+        match next_start_after {
+            Some(next) => start = Some(IterStart::After(next)),
+            None => return Ok(visible.is_some_and(|(_, live)| live)),
         }
     }
-    Ok(false)
 }
 
 async fn build_hits(
@@ -1188,7 +1200,7 @@ mod tests {
         seed_materialized(&fixture, "visible", "page-foxtrot", later, 17).await;
         let keys = |page: &SearchNodePage| {
             let hits = page.hits.iter().map(|hit| hit.hit.key.clone()).collect();
-            let changed = page.changed.iter();
+            let changed = page.changed.iter().flatten();
             let changed = changed.map(|key| String::from_utf8(key.clone()).unwrap());
             (hits, changed.collect())
         };
@@ -1212,5 +1224,27 @@ mod tests {
         assert_eq!(hits, ["page-echo"]);
         assert_eq!(changed, ["visible/page-delta"]);
         assert_eq!(second.next_start_after, None);
+    }
+
+    #[tokio::test]
+    async fn recreated_keys_unchanged() {
+        // A key deleted before the snapshot and created again after it did not exist then.
+        let fixture = setup().await;
+        let at = |secs| UNIX_EPOCH + Duration::from_secs(secs);
+        seed_materialized(&fixture, "visible", "page-gone", at(0), 21).await;
+        seed_deleted(&fixture, "visible", "page-gone", at(10)).await;
+        seed_materialized(&fixture, "visible", "page-gone", at(30), 22).await;
+        let auth = AuthContext {
+            user_id: fixture.owner,
+            realm_id: fixture.realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let mut input = input(&fixture, auth, "page-", 10);
+        input.as_of = at(20);
+
+        let page = search_local_objects(&fixture.context, input).await.unwrap();
+        assert!(page.hits.is_empty());
+        assert_eq!(page.changed, Some(Vec::new()));
     }
 }

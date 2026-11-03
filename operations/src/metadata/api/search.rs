@@ -138,8 +138,9 @@ pub struct ObjectExecution {
     /// Incomplete ranges answered up to a key, by their coordinator.
     pub partial_ranges: Vec<(NodeId, ulid::Ulid, Option<String>)>,
     pub complete: bool,
-    /// Readable keys of the first page's snapshot replaced or deleted since, through this page.
-    pub changed_keys: usize,
+    /// Readable keys of the first page's snapshot replaced or deleted since, through this page;
+    /// `None` once a searched range index changed after the snapshot.
+    pub changed_keys: Option<usize>,
     /// The part of `changed_keys` this page passed.
     pub page_changed: usize,
 }
@@ -168,7 +169,7 @@ pub(super) struct ObjectCursorPayload {
     pub(super) discovery_failed: bool,
     pub(super) omitted_partitions: usize,
     pub(super) pending: Vec<PendingBucket>,
-    pub(super) changed_keys: usize,
+    pub(super) changed_keys: Option<usize>,
 }
 
 /// A distributed bucket a realm-wide search still owes: its name and the cursor of its own
@@ -298,7 +299,7 @@ impl SignedCursor<ObjectCursorPayload> {
         discovery_failed: bool,
         omitted_partitions: usize,
         pending: &[PendingBucket],
-        changed_keys: usize,
+        changed_keys: Option<usize>,
         signer: NodeId,
         sign: impl FnOnce(&[u8]) -> iroh::Signature,
     ) -> Result<Self, postcard::Error> {
@@ -355,7 +356,7 @@ pub(super) struct ObjectSearchPartitions {
     pub(super) omitted_partitions: usize,
     pub(super) pending: Vec<PendingBucket>,
     /// Changed keys the earlier pages passed.
-    pub(super) changed_keys: usize,
+    pub(super) changed_keys: Option<usize>,
 }
 
 pub async fn search_objects(
@@ -430,7 +431,9 @@ async fn search_until(
         failed += 1;
     }
     let found_changed = found.iter().map(|page| page.page_changed).sum::<usize>();
-    partitions.changed_keys += found_changed;
+    let certain = found.iter().all(|page| page.changed_keys.is_some());
+    partitions.changed_keys =
+        (partitions.changed_keys.filter(|_| certain)).map(|keys| keys + found_changed);
     let mut execution = assemble_object_execution(context, &plan, partitions, parts, fanout_stats)?;
     execution.page_changed += found_changed;
     for page in found {
@@ -616,7 +619,7 @@ pub(super) async fn resolve_object_partitions(
                     Vec::new(),
                     discovery_failed,
                     omitted_partitions,
-                    (Vec::new(), 0),
+                    (Vec::new(), Some(0)),
                 )
             }
         };
@@ -798,7 +801,7 @@ pub(super) fn assemble_object_execution(
     let mut pages = parts.into_iter().collect::<HashMap<_, _>>();
     let mut hits = Vec::with_capacity(plan.limit);
     let mut remaining = plan.limit;
-    let mut page_changed = 0;
+    let (mut page_changed, mut certain) = (0, true);
     for partition in &mut partitions {
         if partition.exhausted {
             continue;
@@ -811,7 +814,8 @@ pub(super) fn assemble_object_execution(
             // A page the next one asks again counts its changed keys then.
             if page.hits.is_empty() && page.next_start_after.is_none() {
                 partition.exhausted = true;
-                page_changed += page.changed.len();
+                certain &= page.changed.is_some();
+                page_changed += page.changed.map_or(0, |changed| changed.len());
             }
             continue;
         }
@@ -830,14 +834,19 @@ pub(super) fn assemble_object_execution(
                 .get(consumed.saturating_sub(1))
                 .map(|candidate| candidate.cursor_key.clone());
             partition.exhausted = false;
-            changed_until(&mut page.changed, partition.start_after.as_deref());
+            if let Some(changed) = &mut page.changed {
+                changed_until(changed, partition.start_after.as_deref());
+            }
         } else if consumed > 0 || page.hits.is_empty() {
             partition.start_after = page.next_start_after;
             partition.exhausted = partition.start_after.is_none();
         }
-        page_changed += page.changed.len();
+        certain &= page.changed.is_some();
+        page_changed += page.changed.map_or(0, |changed| changed.len());
     }
-    let changed_keys = changed_keys + page_changed;
+    let changed_keys = changed_keys
+        .filter(|_| certain)
+        .map(|keys| keys + page_changed);
 
     let unfinished = partitions.iter().any(|partition| !partition.exhausted);
     let next_cursor = if unfinished || !pending.is_empty() {
