@@ -49,13 +49,8 @@ fn document_bytes(serving: RealmNodeKind) -> Value {
     document.to_bytes(&actor()).unwrap().into()
 }
 
-fn config(
-    node_id: NodeId,
-    name: Option<&str>,
-    scope: NameScope,
-    caller: UserId,
-) -> SetNodeNameConfig {
-    SetNodeNameConfig {
+fn config(node_id: NodeId, name: Option<&str>, scope: NameScope, caller: UserId) -> NodeNameConfig {
+    NodeNameConfig {
         actor: Actor {
             user_id: caller,
             ..actor()
@@ -70,7 +65,7 @@ fn config(
     }
 }
 
-fn named(name: Option<&str>) -> Result<NodeDisplay, SetNodeNameError> {
+fn named(name: Option<&str>) -> Result<NodeDisplay, NodeNameError> {
     Ok(NodeDisplay {
         name: name.map(str::to_string),
         place: None,
@@ -79,7 +74,7 @@ fn named(name: Option<&str>) -> Result<NodeDisplay, SetNodeNameError> {
 
 /// Drives the operation to its stored reducer state, given the state it reads.
 fn drive_write(
-    operation: &mut SetNodeNameOperation,
+    operation: &mut NodeNameOperation,
     stored: Option<&AdminDocumentState>,
     serving: RealmNodeKind,
 ) -> Effects {
@@ -120,7 +115,7 @@ fn written_state(effects: &Effects) -> AdminDocumentState {
         .expect("reducer state is written")
 }
 
-fn finish(mut operation: SetNodeNameOperation) -> Result<NodeDisplay, SetNodeNameError> {
+fn finish(mut operation: NodeNameOperation) -> Result<NodeDisplay, NodeNameError> {
     let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),
     }));
@@ -140,7 +135,7 @@ fn finish(mut operation: SetNodeNameOperation) -> Result<NodeDisplay, SetNodeNam
     operation.finalize()
 }
 
-fn refusal(operation: SetNodeNameOperation, effects: Effects) -> SetNodeNameError {
+fn refusal(operation: NodeNameOperation, effects: Effects) -> NodeNameError {
     assert!(effects.iter().all(|effect| matches!(
         effect,
         Effect::Storage(StorageEffect::AbortTransaction { .. })
@@ -152,7 +147,7 @@ fn refusal(operation: SetNodeNameOperation, effects: Effects) -> SetNodeNameErro
 #[test]
 fn admin_sets_name() {
     // The trimmed name is what every node stores and shows.
-    let mut operation = SetNodeNameOperation::new(config(
+    let mut operation = NodeNameOperation::new(config(
         node(2),
         Some("  Giessen storage 1 "),
         NameScope::RealmAdmin,
@@ -171,10 +166,10 @@ fn admin_sets_name() {
 fn admin_clears_name() {
     // A clear must replace the stored name, not leave it behind.
     let mut first =
-        SetNodeNameOperation::new(config(node(2), Some("old"), NameScope::RealmAdmin, user(1)));
+        NodeNameOperation::new(config(node(2), Some("old"), NameScope::RealmAdmin, user(1)));
     let stored = written_state(&drive_write(&mut first, None, RealmNodeKind::Management));
     let mut operation =
-        SetNodeNameOperation::new(config(node(2), None, NameScope::RealmAdmin, user(1)));
+        NodeNameOperation::new(config(node(2), None, NameScope::RealmAdmin, user(1)));
     let effects = drive_write(&mut operation, Some(&stored), RealmNodeKind::Management);
     assert!(written_state(&effects).materialized_node_names().is_empty());
     assert_eq!(finish(operation), named(None));
@@ -184,7 +179,7 @@ fn admin_clears_name() {
 fn owner_names_device() {
     // The owner needs no admin grant for its own device, so no permission check runs.
     let mut operation =
-        SetNodeNameOperation::new(config(node(3), Some("Laptop"), NameScope::Owner, user(3)));
+        NodeNameOperation::new(config(node(3), Some("Laptop"), NameScope::Owner, user(3)));
     let effects = drive_write(&mut operation, None, RealmNodeKind::Management);
     assert_eq!(
         written_state(&effects).materialized_node_names(),
@@ -199,16 +194,16 @@ fn refuses_invalid_name() {
     let long = "a".repeat(MAX_NODE_NAME + 1);
     for name in ["   ", "bell\u{7}", long.as_str()] {
         let mut operation =
-            SetNodeNameOperation::new(config(node(2), Some(name), NameScope::RealmAdmin, user(1)));
+            NodeNameOperation::new(config(node(2), Some(name), NameScope::RealmAdmin, user(1)));
         let effects = operation.start();
         assert!(effects.is_empty());
-        assert_eq!(refusal(operation, effects), SetNodeNameError::InvalidName);
+        assert_eq!(refusal(operation, effects), NodeNameError::InvalidName);
     }
 }
 
 #[test]
 fn refuses_unknown_node() {
-    let mut operation = SetNodeNameOperation::new(config(
+    let mut operation = NodeNameOperation::new(config(
         node(7),
         Some("ghost"),
         NameScope::RealmAdmin,
@@ -217,7 +212,7 @@ fn refuses_unknown_node() {
     let effects = drive_write(&mut operation, None, RealmNodeKind::Management);
     assert_eq!(
         refusal(operation, effects),
-        SetNodeNameError::UnknownNode { node_id: node(7) }
+        NodeNameError::UnknownNode { node_id: node(7) }
     );
 }
 
@@ -226,11 +221,11 @@ fn refuses_foreign_nodes() {
     // The owner scope reaches only the caller's own device, never a server or another device.
     for (node_id, caller) in [(node(3), user(4)), (node(2), user(3))] {
         let mut operation =
-            SetNodeNameOperation::new(config(node_id, Some("mine"), NameScope::Owner, caller));
+            NodeNameOperation::new(config(node_id, Some("mine"), NameScope::Owner, caller));
         let effects = drive_write(&mut operation, None, RealmNodeKind::Management);
         assert_eq!(
             refusal(operation, effects),
-            SetNodeNameError::UnknownNode { node_id }
+            NodeNameError::UnknownNode { node_id }
         );
     }
 }
@@ -238,7 +233,7 @@ fn refuses_foreign_nodes() {
 #[test]
 fn refuses_unauthorized_callers() {
     let mut operation =
-        SetNodeNameOperation::new(config(node(2), Some("x"), NameScope::RealmAdmin, user(1)));
+        NodeNameOperation::new(config(node(2), Some("x"), NameScope::RealmAdmin, user(1)));
     assert!(matches!(
         operation.start().as_slice(),
         [Effect::SubOperation(_)]
@@ -246,7 +241,7 @@ fn refuses_unauthorized_callers() {
     let effects = operation.step(Event::SubOperation(
         SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
     ));
-    assert_eq!(refusal(operation, effects), SetNodeNameError::Unauthorized);
+    assert_eq!(refusal(operation, effects), NodeNameError::Unauthorized);
 
     // A delegated token cannot speak for the owner.
     let mut delegated = config(node(3), Some("x"), NameScope::Owner, user(3));
@@ -254,20 +249,20 @@ fn refuses_unauthorized_callers() {
         pattern: "/**".to_string(),
         permission: Permission::WRITE,
     }]);
-    let mut operation = SetNodeNameOperation::new(delegated);
+    let mut operation = NodeNameOperation::new(delegated);
     let effects = operation.start();
-    assert_eq!(refusal(operation, effects), SetNodeNameError::Unauthorized);
+    assert_eq!(refusal(operation, effects), NodeNameError::Unauthorized);
 }
 
 #[test]
 fn refuses_server_origin() {
     // Peers drop realm config events from other origins, so only a management node writes.
     let mut operation =
-        SetNodeNameOperation::new(config(node(2), Some("x"), NameScope::RealmAdmin, user(1)));
+        NodeNameOperation::new(config(node(2), Some("x"), NameScope::RealmAdmin, user(1)));
     let effects = drive_write(&mut operation, None, RealmNodeKind::Server);
     assert_eq!(
         refusal(operation, effects),
-        SetNodeNameError::NotManagementNode
+        NodeNameError::NotManagementNode
     );
 }
 
@@ -281,7 +276,7 @@ fn reads_stored_names() {
     }));
     assert_eq!(empty.finalize(), Ok(NodeDisplays::default()));
 
-    let mut named = SetNodeNameOperation::new(config(
+    let mut named = NodeNameOperation::new(config(
         node(2),
         Some("Giessen"),
         NameScope::RealmAdmin,
@@ -301,8 +296,8 @@ fn reads_stored_names() {
     );
 }
 
-fn placed(change: NodeChange) -> SetNodeNameOperation {
-    SetNodeNameOperation::new(SetNodeNameConfig {
+fn placed(change: NodeChange) -> NodeNameOperation {
+    NodeNameOperation::new(NodeNameConfig {
         change,
         ..config(node(2), None, NameScope::RealmAdmin, user(1))
     })
@@ -367,20 +362,20 @@ fn refuses_invalid_places() {
         lon_e7: 0,
     };
     let changes = [
-        (NodeChange::default(), SetNodeNameError::EmptyChange),
+        (NodeChange::default(), NodeNameError::EmptyChange),
         (
             NodeChange {
                 place: Some(Some("\u{7}".to_string())),
                 ..NodeChange::default()
             },
-            SetNodeNameError::InvalidName,
+            NodeNameError::InvalidName,
         ),
         (
             NodeChange {
                 coordinates: Some(Some(out)),
                 ..NodeChange::default()
             },
-            SetNodeNameError::InvalidCoordinates,
+            NodeNameError::InvalidCoordinates,
         ),
     ];
     for (change, error) in changes {

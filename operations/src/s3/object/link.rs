@@ -351,7 +351,7 @@ mod tests {
     use crate::tests::s3::{test_context, test_storage};
 
     #[tokio::test]
-    async fn remote_head_asks_target() {
+    async fn head_asks_target() {
         // Local roles allow both targets, but one on another node shows only once that node
         // answers a delegated HEAD, which it cannot without a network here.
         let (_directory, storage) = test_storage();

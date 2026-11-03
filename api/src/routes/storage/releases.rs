@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, release_members};
-use aruna_operations::s3::bucket::release_publish::{
-    self, PublishError, PublishInput, ReleaseSpec,
+use aruna_operations::s3::bucket::release::publish::{
+    self as release_publish, PublishError, PublishInput, ReleaseSpec,
 };
-use aruna_operations::s3::bucket::release_view::{FilePage, MAX_PAGE, ViewError, release_view};
+use aruna_operations::s3::bucket::release::view::{FilePage, MAX_PAGE, ViewError, release_view};
+use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, release_members};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
@@ -21,7 +21,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::bucket_metadata::BucketIdentifierBody;
+use super::bucket::metadata::BucketIdentifierBody;
 use super::deletion::bucket_info;
 use super::relay::{copy_miss, query_path, read_holders, relay_json, relay_read, rest_target};
 use crate::auth::{ValidatedBearer, require_realm_auth};

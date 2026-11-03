@@ -852,7 +852,7 @@ mod pure_tests {
 
     // A user at the session limit still signs in: the oldest session is signed out instead.
     #[tokio::test]
-    async fn full_user_signs_in() {
+    async fn full_user_login() {
         use crate::driver::drive;
         let (_dir, context, config, node_id) = session_realm().await;
         store_user(&context, &config, node_id, Default::default()).await;

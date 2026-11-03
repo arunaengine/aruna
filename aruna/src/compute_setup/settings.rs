@@ -766,7 +766,7 @@ mod pure_tests {
     }
 
     #[test]
-    fn cache_needs_a_scope() {
+    fn cache_needs_scope() {
         // Worker labels alone never turn on the cache.
         let env = |pairs: &[(&str, &str)]| {
             pairs

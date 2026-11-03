@@ -25,9 +25,9 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::deletion::bucket_info;
-use super::distributed::map_create_error;
-use super::routing::ensure_group_admin;
+use super::super::deletion::bucket_info;
+use super::super::distributed::map_create_error;
+use super::super::routing::ensure_group_admin;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
@@ -36,10 +36,10 @@ use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi()]
-pub struct BucketMetadataApiDoc;
+pub struct BucketMetadataDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BucketMetadataApiDoc::openapi())
+    OpenApiRouter::with_openapi(BucketMetadataDoc::openapi())
         .routes(routes!(get_bucket_metadata, put_bucket_metadata))
 }
 
@@ -225,7 +225,8 @@ pub struct BucketMetadataResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct PutBucketMetadataRequest {
+#[schema(as = PutBucketMetadataRequest)]
+pub struct PutMetadataRequest {
     /// Required; `null` clears the metadata.
     #[serde(deserialize_with = "Option::deserialize")]
     pub metadata: Option<BucketMetadataBody>,
@@ -321,7 +322,7 @@ the linked dataset. For a distributed bucket the set's publisher checks the forw
   the bucket still belongs to the group. A distributed bucket's metadata changes in its set;
   a settings change of the set keeps it."#,
     params(("bucket" = String, Path, description = "Bucket name on this node")),
-    request_body(content = PutBucketMetadataRequest, example = json!({
+    request_body(content = PutMetadataRequest, example = json!({
         "metadata": {
             "database": true,
             "dataset": "01JMETADATA0123456789ABCDE"
@@ -347,7 +348,7 @@ pub async fn put_bucket_metadata(
     Extension(auth): Extension<Option<AuthContext>>,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
-    request: Result<Json<PutBucketMetadataRequest>, JsonRejection>,
+    request: Result<Json<PutMetadataRequest>, JsonRejection>,
 ) -> ServerResult<Json<BucketMetadataResponse>> {
     let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
@@ -368,5 +369,5 @@ pub async fn put_bucket_metadata(
 }
 
 #[cfg(test)]
-#[path = "bucket_metadata_tests.rs"]
+#[path = "metadata_tests.rs"]
 mod tests;

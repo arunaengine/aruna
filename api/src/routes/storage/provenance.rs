@@ -26,7 +26,7 @@ use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::provenance::{
     CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
 };
-use aruna_operations::s3::bucket::release_publish::read_crate;
+use aruna_operations::s3::bucket::release::publish::read_crate;
 use async_zip::tokio::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
 use axum::body::Body;

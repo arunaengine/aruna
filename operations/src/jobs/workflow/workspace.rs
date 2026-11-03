@@ -697,10 +697,9 @@ async fn local_hints(
     Ok(hints)
 }
 
-/// Export every declared file output under one write-ahead commit reservation, so
-/// an interrupted capture replays into the same versions instead of new ones.
-/// `cancel` ends the capture cooperatively: a put in flight fails through its own stream and
-/// cleans up after itself, so no write is dropped halfway.
+/// Export every declared file output under one write-ahead commit reservation, so an interrupted
+/// capture replays into the same versions. `cancel` ends the capture cooperatively: a put in
+/// flight fails through its own stream and cleans up after itself, so no write is dropped halfway.
 pub async fn capture_outputs(
     context: &DriverContext,
     backend: &Arc<dyn ExecutorBackend>,

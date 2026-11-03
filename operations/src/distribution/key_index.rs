@@ -81,10 +81,9 @@ pub enum KeyChange {
     Remove(String),
 }
 
-/// Keys between `start` and `end` in key order; with `names`, only keys that hold every name
-/// token of that text, and with `meta`, only searchable keys holding every term of the query.
-/// A query with terms returns at most `limit` matches; one without examines at most `limit` keys
-/// per index segment.
+/// Keys between `start` and `end` in key order; `names` keeps keys with every name token and
+/// `meta` searchable keys with every query term. With terms at most `limit` matches return,
+/// without them each index segment examines at most `limit` keys.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyQuery {
     pub start: Bound<String>,
@@ -567,10 +566,9 @@ fn matched_keys(
     })
 }
 
-/// Walks the key terms of every segment in key order, each at most `query.limit` terms, so
-/// the work is bounded by the limit and never by the range's size. Keys up to the smallest
-/// segment end are examined everywhere; the page continues after that key. With `matching`,
-/// a walked key is kept only when its document holds every one of those terms.
+/// Walks at most `query.limit` key terms of every segment in key order, never the whole range.
+/// Keys up to the smallest segment end are examined everywhere and the page continues after it;
+/// with `matching`, a key stays only when its document holds every one of those terms.
 fn walk_keys(
     searcher: &Searcher,
     fields: Fields,

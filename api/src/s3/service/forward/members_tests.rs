@@ -713,7 +713,7 @@ async fn hidden_link(members: &Members, on: usize, key: &str) {
 // A range that starts with more hidden entries than one request examines goes on from the
 // sealed cursor of its member, here and on another member, so the merged listing completes.
 #[tokio::test]
-async fn listing_passes_hidden_runs() {
+async fn passes_hidden_runs() {
     use aruna_operations::s3::object::visible::SCAN_BUDGET;
     let members = members(3, &["h", "p"], 0).await;
     for key in ["a/1", "k/zz", "q/1"] {
@@ -794,7 +794,7 @@ async fn resumed_copy_stale() {
 // A ListObjects marker that happens to equal a ListObjectsV2 token is a plain key, so the
 // listing starts after it instead of from the first key.
 #[tokio::test]
-async fn v1_marker_stays_key() {
+async fn marker_stays_key() {
     use s3s::dto::ListObjectsInput;
     let members = members(3, &["h", "p"], 0).await;
     for key in ["!a", "~z"] {

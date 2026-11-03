@@ -1,3 +1,4 @@
+//! Tests that a bucket export writes rows a record import maps back to the stored values.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

@@ -21,7 +21,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::release::{BucketScope, load_access};
+use super::{BucketScope, load_access};
 use crate::driver::{DriverContext, drive};
 
 /// The most entries one page lists.
@@ -276,5 +276,5 @@ pub async fn release_view(
 }
 
 #[cfg(test)]
-#[path = "release_view_tests.rs"]
+#[path = "view_tests.rs"]
 mod tests;

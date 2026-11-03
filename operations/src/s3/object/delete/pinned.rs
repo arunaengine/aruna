@@ -16,11 +16,11 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
+use crate::s3::bucket::release::view::{FilePage, ReleaseViewOperation, ViewConfig, ViewError};
 use crate::s3::bucket::release::{
     BucketScope, MembersConfig, MembersOutput, MembershipQuery, ReleaseMembersOperation,
     load_access,
 };
-use crate::s3::bucket::release_view::{FilePage, ReleaseViewOperation, ViewConfig, ViewError};
 
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum PinnedError {
