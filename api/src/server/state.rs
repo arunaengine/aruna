@@ -48,6 +48,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::{Instant, SystemTime};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -219,6 +220,7 @@ pub struct ServerState {
     assistant: AssistantConnections,
     /// The operator's import roots that groups may use on this node.
     import_roots: Arc<BTreeMap<String, ImportRoot>>,
+    started: (SystemTime, Instant),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -356,6 +358,7 @@ impl ServerState {
                 chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             },
             import_roots: Arc::default(),
+            started: (SystemTime::now(), Instant::now()),
         };
         state
             .identity
@@ -517,6 +520,16 @@ impl ServerState {
 
     pub fn node_capabilities(&self) -> &NodeCapabilities {
         &self.identity.node_capabilities
+    }
+
+    /// Wall-clock time this node's API state was created.
+    pub fn started_at(&self) -> SystemTime {
+        self.started.0
+    }
+
+    /// Monotonic time since this node's API state was created.
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started.1.elapsed()
     }
 
     pub fn oidc_validator(&self) -> Result<&OidcValidator, OidcError> {
