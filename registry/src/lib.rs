@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+#![recursion_limit = "256"]
+
 pub mod admin;
 pub mod admin_api;
 pub mod host;
