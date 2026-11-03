@@ -4,8 +4,8 @@
 
 use crate::error::CliError;
 use serde::Serialize;
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
 
 /// Which side is copied onto the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -167,6 +167,78 @@ pub fn walk_local(root: &Path) -> Result<Vec<LocalFile>, CliError> {
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
+}
+
+/// Whether a remote key relative to a folder stays below it on every platform: no empty, `.` or
+/// `..` part, no backslash, no absolute path, and on Windows no colon (drive or stream).
+pub fn is_safe_key(relative: &str) -> bool {
+    !relative.contains('\\')
+        && !(cfg!(windows) && relative.contains(':'))
+        && relative
+            .split('/')
+            .all(|part| !matches!(part, "" | "." | ".."))
+        && Path::new(relative)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+}
+
+/// The path of a remote key below `root`; refuses unsafe keys and linked folders below the root.
+pub fn local_path(root: &Path, relative: &str) -> Result<PathBuf, CliError> {
+    let refuse = |reason: &str| {
+        CliError::usage(format!(
+            "{relative} cannot be saved below {}: {reason}",
+            root.display()
+        ))
+    };
+    if !is_safe_key(relative) {
+        return Err(refuse("the key is not a plain relative path"));
+    }
+    let mut path = root.to_path_buf();
+    let mut checking = true;
+    let parts: Vec<&str> = relative.split('/').collect();
+    for (index, part) in parts.iter().enumerate() {
+        path.push(part);
+        if !checking || index + 1 == parts.len() {
+            continue;
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if is_link(&meta) => return Err(refuse("a folder on the way is a link")),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => checking = false,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match path.starts_with(root) {
+        true => Ok(path),
+        false => Err(refuse("the path leaves the folder")),
+    }
+}
+
+/// Symbolic links, and on Windows also junctions and other reparse points.
+fn is_link(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // The Windows file attribute FILE_ATTRIBUTE_REPARSE_POINT.
+        const REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
+}
+
+/// Paths that differ only in case and so overwrite each other on case-insensitive volumes.
+pub fn case_clashes<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut groups: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    for path in paths {
+        groups.entry(path.to_lowercase()).or_default().insert(path);
+    }
+    groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .flatten()
+        .collect()
 }
 
 #[cfg(test)]

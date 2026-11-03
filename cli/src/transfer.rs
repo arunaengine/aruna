@@ -10,7 +10,7 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinSet;
 
@@ -407,22 +407,29 @@ async fn stored_parts(
     }
 }
 
-/// What a download wrote and how many bytes an earlier attempt had left.
+/// What a download wrote.
 #[derive(Clone, Debug, Serialize)]
 pub struct Downloaded {
     pub size: u64,
     pub blake3: String,
-    pub resumed_bytes: u64,
 }
 
-/// The file a download writes before it is checked and renamed into place.
-pub fn partial_path(dest: &Path) -> PathBuf {
-    let mut name = dest.file_name().unwrap_or_default().to_os_string();
-    name.push(PARTIAL_SUFFIX);
-    dest.with_file_name(name)
+/// A new file `.<name>.<random>.aruna-part` beside `dest`, removed on drop unless persisted.
+fn scratch_file(dest: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    let folder = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut prefix = std::ffi::OsString::from(".");
+    prefix.push(dest.file_name().unwrap_or_default());
+    prefix.push(".");
+    tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(PARTIAL_SUFFIX)
+        .tempfile_in(folder)
 }
 
-/// Downloads into a partial file, continues one a former run left, and checks size and BLAKE3.
+/// Downloads into a scratch file of its own, checks size and BLAKE3, then moves it to `dest`.
 pub async fn download(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -437,42 +444,18 @@ pub async fn download(
     {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let partial = partial_path(dest);
-    let held = match tokio::fs::metadata(&partial).await {
-        Ok(meta) => meta.len(),
-        Err(_) => 0,
-    };
-    // Only a partial file shorter than the known size can be continued.
-    let resumed_bytes = match size {
-        Some(size) if blake3.is_some() && held > 0 && held < size => held,
-        _ => 0,
-    };
-    let mut hasher = blake3::Hasher::new();
-    if resumed_bytes > 0 {
-        let (path, mut prefix) = (partial.clone(), blake3::Hasher::new());
-        hasher = tokio::task::spawn_blocking(move || -> std::io::Result<blake3::Hasher> {
-            prefix.update_reader(std::fs::File::open(path)?)?;
-            Ok(prefix)
-        })
+    let answer = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
         .await
-        .map_err(|error| CliError::Io(std::io::Error::other(error)))??;
-    }
-    let mut request = client.get_object().bucket(bucket).key(key);
-    if resumed_bytes > 0 {
-        request = request.range(format!("bytes={resumed_bytes}-"));
-    }
-    let answer = request.send().await.map_err(s3_error)?;
-    let mut file = match resumed_bytes {
-        0 => tokio::fs::File::create(&partial).await?,
-        _ => {
-            tokio::fs::OpenOptions::new()
-                .append(true)
-                .open(&partial)
-                .await?
-        }
-    };
+        .map_err(s3_error)?;
+    let scratch = scratch_file(dest)?;
+    let mut file = tokio::fs::File::from_std(scratch.as_file().try_clone()?);
+    let mut hasher = blake3::Hasher::new();
     let mut body = answer.body;
-    let mut written = resumed_bytes;
+    let mut written = 0u64;
     while let Some(chunk) = body
         .try_next()
         .await
@@ -488,18 +471,16 @@ pub async fn download(
     let wrong_size = size.is_some_and(|size| size != written);
     let wrong_digest = blake3.is_some_and(|expected| !expected.eq_ignore_ascii_case(&actual));
     if wrong_size || wrong_digest {
-        tokio::fs::remove_file(&partial).await?;
         return Err(CliError::Checksum {
             path: format!("{bucket}/{key}"),
             expected: blake3.unwrap_or("(size only)").to_string(),
             actual: format!("{actual} ({written} bytes)"),
         });
     }
-    tokio::fs::rename(&partial, dest).await?;
+    scratch.persist(dest).map_err(|error| error.error)?;
     Ok(Downloaded {
         size: written,
         blake3: actual,
-        resumed_bytes,
     })
 }
 
@@ -567,8 +548,19 @@ mod tests {
     }
 
     #[test]
-    fn names_partial_file() {
-        let path = partial_path(Path::new("out/data.csv"));
-        assert_eq!(path, Path::new("out/data.csv.aruna-part"));
+    fn keeps_foreign_partials() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("data.csv");
+        let foreign = dir.path().join("data.csv.aruna-part");
+        std::fs::write(&foreign, b"not ours").unwrap();
+        let first = scratch_file(&dest).unwrap();
+        let second = scratch_file(&dest).unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_ne!(first.path(), foreign.as_path());
+        assert!(first.path().to_string_lossy().ends_with(PARTIAL_SUFFIX));
+        let scratch = first.path().to_path_buf();
+        drop(first);
+        assert!(!scratch.exists());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"not ours");
     }
 }

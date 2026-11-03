@@ -119,3 +119,49 @@ fn walks_nested_files() {
         vec![local("sub/deeper/low.txt", 2), local("top.txt", 1)]
     );
 }
+
+#[test]
+fn refuses_unsafe_keys() {
+    for key in ["a/b.txt", "a b/c:d", "x"] {
+        assert_eq!(
+            is_safe_key(key),
+            !cfg!(windows) || !key.contains(':'),
+            "{key}"
+        );
+    }
+    for key in [
+        "../x",
+        "a/../x",
+        "/abs",
+        "a//b",
+        "./a",
+        "..\\outside.txt",
+        "C:\\x",
+        "",
+    ] {
+        assert!(!is_safe_key(key), "{key}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    assert!(local_path(dir.path(), "..\\outside.txt").is_err());
+    let path = local_path(dir.path(), "sub/new/a.txt").unwrap();
+    assert_eq!(path, dir.path().join("sub").join("new").join("a.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_linked_folders() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+    let error = local_path(dir.path(), "link/a.txt").unwrap_err();
+    assert!(error.to_string().contains("is a link"), "{error}");
+    std::fs::create_dir(dir.path().join("real")).unwrap();
+    assert!(local_path(dir.path(), "real/a.txt").is_ok());
+}
+
+#[test]
+fn finds_case_clashes() {
+    let clashes = case_clashes(["A.txt", "b/c", "a.txt", "B/C", "b/c", "d"]);
+    assert_eq!(clashes, vec!["A.txt", "a.txt", "B/C", "b/c"]);
+    assert!(case_clashes(["a", "b", "a"]).is_empty());
+}

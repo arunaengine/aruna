@@ -111,7 +111,8 @@ pub async fn copy(context: &mut Context<'_>, args: CopyArgs) -> Result<(), CliEr
             }
             let mut dest = PathBuf::from(&args.target);
             if dest.is_dir() || args.target.ends_with(['/', std::path::MAIN_SEPARATOR]) {
-                dest = dest.join(source.key.rsplit('/').next().unwrap_or(&source.key));
+                let name = source.key.rsplit('/').next().unwrap_or(&source.key);
+                dest = sync::local_path(&dest, name)?;
             }
             let mut bucket = Bucket::open(context, &source.bucket).await?;
             let entry = remote::find_object(&bucket.node_api, &source.bucket, &source.key)
@@ -141,7 +142,7 @@ pub async fn copy(context: &mut Context<'_>, args: CopyArgs) -> Result<(), CliEr
                 size: done.size,
                 blake3: done.blake3,
                 verified: entry.blake3().is_some(),
-                resumed: done.resumed_bytes,
+                resumed: 0,
             }
         }
     };
@@ -257,6 +258,9 @@ pub async fn sync(context: &mut Context<'_>, args: SyncArgs) -> Result<(), CliEr
         true => sync::walk_local(&root)?,
         false => Vec::new(),
     };
+    if direction == Direction::Download {
+        check_targets(&root, &remote_files, &local_files)?;
+    }
     let plan = {
         let root = root.clone();
         tokio::task::spawn_blocking(move || {
@@ -291,7 +295,10 @@ pub async fn sync(context: &mut Context<'_>, args: SyncArgs) -> Result<(), CliEr
     let part_size = args.part_size * MIB;
     for item in &plan.transfers {
         let key = format!("{prefix}{}", item.path);
-        let local = root.join(&item.path);
+        let local = match direction {
+            Direction::Upload => root.join(&item.path),
+            Direction::Download => sync::local_path(&root, &item.path)?,
+        };
         match direction {
             Direction::Upload => {
                 upload_one(&mut bucket, &local, &key, part_size).await?;
@@ -321,6 +328,36 @@ pub async fn sync(context: &mut Context<'_>, args: SyncArgs) -> Result<(), CliEr
             plan.transfers.len(),
             human_size(plan.bytes())
         )),
+    }
+}
+
+/// Refuses a download whose keys leave `root` or overwrite each other on case-insensitive volumes.
+fn check_targets(
+    root: &Path,
+    remote_files: &[RemoteFile],
+    local_files: &[sync::LocalFile],
+) -> Result<(), CliError> {
+    let unsafe_keys: Vec<&str> = remote_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .filter(|path| !sync::is_safe_key(path))
+        .collect();
+    if !unsafe_keys.is_empty() {
+        return Err(CliError::usage(format!(
+            "these keys cannot be saved below {}: {}",
+            root.display(),
+            unsafe_keys.join(", ")
+        )));
+    }
+    let paths = remote_files.iter().map(|file| file.path.as_str());
+    let clashes =
+        sync::case_clashes(paths.chain(local_files.iter().map(|file| file.path.as_str())));
+    match clashes.is_empty() {
+        true => Ok(()),
+        false => Err(CliError::usage(format!(
+            "these paths differ only in case and would overwrite each other: {}",
+            clashes.join(", ")
+        ))),
     }
 }
 
