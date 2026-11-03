@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ensure_permission, parse_group_id, require_unrestricted_auth};
+use crate::auth::{
+    ensure_permission, parse_group_id, permission_granted, require_unrestricted_auth,
+};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::groups::ensure_group_admin;
 use crate::routes::access::sessions::unix_rfc3339;
@@ -112,6 +114,11 @@ fn map_tokens_error(error: GroupTokensError) -> ServerError {
     match error {
         GroupTokensError::Refused => ServerError::Forbidden,
         GroupTokensError::NotFound => ServerError::NotFound,
+        GroupTokensError::NotConfined => ServerError::Conflict(
+            "a service account's bearer sessions are not confined to one group; a user \
+             administrator ends them with DELETE /access/users/{id}/tokens"
+                .to_string(),
+        ),
         GroupTokensError::Revocation(message) => map_revocation(message),
         error => ServerError::InternalError(error.to_string()),
     }
@@ -225,12 +232,13 @@ pub async fn list_group_tokens(
 **Authentication**: as for `GET /access/groups/{id}/tokens`.
 
 **Behavior**
-- A session is revoked on every node through the realm revocation set; an S3 credential or S3
-  session is deleted on this node, where it lives.
+- An S3 credential or S3 session bound to the group is deleted on this node, where it lives.
 - A token that is already expired or revoked is left as it is, and `revoked` is 0.
+- A bearer `session` is refused with 409: a service account's session may reach other groups, so
+  only a user administrator ends it, with `DELETE /access/users/{id}/tokens`.
 
 **Limits**
-- Only tokens that `GET /access/groups/{id}/tokens` lists on this node can be revoked here."#,
+- Only S3 tokens this node holds can be revoked here."#,
     params(
         ("id" = String, Path, description = "Group id as a 26-character ULID"),
         ("kind" = String, Path, description = "`session`, `s3_credential` or `s3_session`"),
@@ -243,6 +251,7 @@ pub async fn list_group_tokens(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller does not administer the group", body = ErrorResponse),
         (status = 404, description = "This node holds no such token of the group", body = ErrorResponse),
+        (status = 409, description = "The token is a bearer session, which is not confined to the group", body = ErrorResponse),
         (status = 503, description = "The revocation set is at capacity; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -273,7 +282,8 @@ pub async fn revoke_group_token(
 - For a person, the S3 credentials and S3 sessions bound to this group are revoked. Their own
   bearer sessions and their access to other groups stay untouched.
 - For a service account of this group, every token it holds is ended on every node through its
-  revocation cutoff, and `all_tokens` is true.
+  revocation cutoff, and `all_tokens` is true. Its sessions may reach other groups, so this needs
+  WRITE on `/{realm}/admin/u/{user}` as well; a group administrator without it gets 409.
 - Group membership is not changed; remove the member separately.
 
 **Limits**
@@ -288,6 +298,7 @@ pub async fn revoke_group_token(
         (status = 400, description = "Invalid group or user id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller does not administer the group", body = ErrorResponse),
+        (status = 409, description = "The member is a service account of the group and the caller is no user administrator", body = ErrorResponse),
         (status = 503, description = "The revocation set is at capacity; retryable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -300,7 +311,12 @@ pub async fn revoke_member_tokens(
     let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let member = UserId::from_string(&user_id).map_err(|_| ServerError::BadRequest)?;
-    let target = RevokeTarget::Member(member);
+    let path = format!("/{}/admin/u/{member}", auth.realm_id);
+    let account_wide = permission_granted(&state, &auth, path, Permission::WRITE).await?;
+    let target = RevokeTarget::Member {
+        user: member,
+        account_wide,
+    };
     let response = run_revocation(&state, auth, group_id, target).await?;
     Ok((StatusCode::OK, Json(response)))
 }

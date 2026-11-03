@@ -16,8 +16,8 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, USER_ACCESS_KEYSPACE, USER_KEYSPACE, USER_OWNER_KEYSPACE,
-    USER_SESSION_KEYSPACE,
+    ACCESS_OWNER_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, USER_ACCESS_KEYSPACE, USER_KEYSPACE,
+    USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, SessionKind};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -59,16 +59,20 @@ async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<
     ));
 }
 
-async fn exists(context: &DriverContext, key_space: &str, key: &str) -> bool {
+async fn read(context: &DriverContext, key_space: &str, key: &[u8]) -> Option<Vec<u8>> {
     let effect = StorageEffect::Read {
         key_space: key_space.to_string(),
-        key: key.as_bytes().into(),
+        key: key.to_vec().into(),
         txn_id: None,
     };
     match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value.map(|v| v.to_vec()),
         other => panic!("unexpected read result: {other:?}"),
     }
+}
+
+async fn exists(context: &DriverContext, key_space: &str, key: &str) -> bool {
+    read(context, key_space, key.as_bytes()).await.is_some()
 }
 
 async fn seed_group(
@@ -154,6 +158,13 @@ async fn seed_credential(context: &DriverContext, owner: UserId, group_id: Group
         access.to_bytes().unwrap(),
     )
     .await;
+    let key = crate::s3::access::index::owner_key(owner);
+    let stored = read(context, ACCESS_OWNER_KEYSPACE, &key).await;
+    let mut index =
+        crate::s3::access::index::decode_index(stored.map(Into::into).as_ref()).unwrap();
+    index.insert(access_key.clone());
+    let index = crate::s3::access::index::encode_index(&index).unwrap();
+    put(context, ACCESS_OWNER_KEYSPACE, key.to_vec(), index.to_vec()).await;
     access_key
 }
 
@@ -279,7 +290,10 @@ async fn member_refused() {
     let fixture = fixture().await;
     let listed = fixture.list(fixture.member, fixture.group_a).await;
     assert_eq!(listed, Err(GroupTokensError::Refused));
-    let target = RevokeTarget::Member(fixture.account);
+    let target = RevokeTarget::Member {
+        user: fixture.account,
+        account_wide: true,
+    };
     let revoked = fixture
         .revoke(fixture.member, fixture.group_a, target)
         .await;
@@ -348,7 +362,10 @@ async fn member_scoped_revocation() {
     let other = seed_credential(&fixture.context, fixture.member, fixture.group_b).await;
     let personal = seed_session(&fixture.context, fixture.member, fixture.now).await;
 
-    let target = RevokeTarget::Member(fixture.member);
+    let target = RevokeTarget::Member {
+        user: fixture.member,
+        account_wide: false,
+    };
     let revoked = fixture
         .revoke(fixture.admin_a, fixture.group_a, target)
         .await
@@ -358,14 +375,7 @@ async fn member_scoped_revocation() {
     // Access to group B and the member's own sessions stay untouched.
     assert!(exists(&fixture.context, USER_ACCESS_KEYSPACE, &other).await);
     assert!(exists(&fixture.context, USER_SESSION_KEYSPACE, &personal).await);
-    let cutoff = crate::auth::bearer_token::realm_user_cutoff(
-        &fixture.context.storage_handle,
-        fixture.member.realm_id,
-        &fixture.member,
-    )
-    .await
-    .unwrap();
-    assert_eq!(cutoff, None);
+    assert_eq!(cutoff_of(&fixture, fixture.member).await, None);
 }
 
 #[tokio::test]
@@ -383,17 +393,49 @@ async fn foreign_token_missing() {
     assert!(exists(&fixture.context, USER_ACCESS_KEYSPACE, &other).await);
 }
 
+async fn cutoff_of(fixture: &Fixture, user: UserId) -> Option<u64> {
+    crate::auth::bearer_token::realm_user_cutoff(
+        &fixture.context.storage_handle,
+        user.realm_id,
+        &user,
+    )
+    .await
+    .unwrap()
+}
+
+/// A service account of group A that also reaches group B is ended only by a user administrator.
 #[tokio::test]
-async fn service_account_cutoff() {
+async fn service_account_crosses() {
     let fixture = fixture().await;
     let session = seed_session(&fixture.context, fixture.account, fixture.now).await;
-    let target = RevokeTarget::Member(fixture.account);
+    let foreign = seed_credential(&fixture.context, fixture.account, fixture.group_b).await;
+    for account_wide in [false, true] {
+        let target = RevokeTarget::Member {
+            user: fixture.account,
+            account_wide,
+        };
+        let refused = fixture
+            .revoke(fixture.admin_a, fixture.group_a, target)
+            .await;
+        assert_eq!(refused, Err(GroupTokensError::NotConfined));
+    }
+    assert_eq!(cutoff_of(&fixture, fixture.account).await, None);
+    assert!(exists(&fixture.context, USER_ACCESS_KEYSPACE, &foreign).await);
+
+    let target = RevokeTarget::Member {
+        user: fixture.account,
+        account_wide: true,
+    };
     let revoked = fixture
-        .revoke(fixture.admin_a, fixture.group_a, target)
+        .revoke(fixture.realm_admin, fixture.group_a, target)
         .await
         .unwrap();
     assert!(revoked.all_tokens);
     assert_eq!(revoked.revoked, 1);
+    assert_eq!(
+        cutoff_of(&fixture, fixture.account).await,
+        Some(fixture.now + 1)
+    );
     let tokens = fixture
         .list(fixture.admin_a, fixture.group_a)
         .await
@@ -402,30 +444,26 @@ async fn service_account_cutoff() {
     assert_eq!(listed.status, TokenStatus::Revoked);
 }
 
+/// No bearer session is provably confined to one group, so none is revoked through a group.
 #[tokio::test]
-async fn session_revoked_once() {
+async fn session_not_confined() {
     let fixture = fixture().await;
     let session = seed_session(&fixture.context, fixture.account, fixture.now).await;
     let target = RevokeTarget::Token {
         kind: TokenKind::Session,
         id: session.clone(),
     };
-    let first = fixture
-        .revoke(fixture.admin_a, fixture.group_a, target.clone())
-        .await
-        .unwrap();
-    assert_eq!(first.revoked, 1);
-    // Repeating it finds the session already revoked and changes nothing.
-    let again = fixture
-        .revoke(fixture.admin_a, fixture.group_a, target)
-        .await
-        .unwrap();
-    assert_eq!(again.revoked, 0);
+    for caller in [fixture.admin_a, fixture.realm_admin] {
+        let refused = fixture
+            .revoke(caller, fixture.group_a, target.clone())
+            .await;
+        assert_eq!(refused, Err(GroupTokensError::NotConfined));
+    }
     let tokens = fixture
         .list(fixture.admin_a, fixture.group_a)
         .await
         .unwrap();
-    assert_eq!(tokens[0].status, TokenStatus::Revoked);
+    assert_eq!(tokens[0].status, TokenStatus::Active);
 }
 
 #[tokio::test]
@@ -453,12 +491,8 @@ async fn revoke_all_gated() {
     )
     .await
     .unwrap();
-    let cutoff = crate::auth::bearer_token::realm_user_cutoff(
-        &fixture.context.storage_handle,
-        fixture.member.realm_id,
-        &fixture.member,
-    )
-    .await
-    .unwrap();
-    assert_eq!(cutoff, Some(fixture.now + 1));
+    assert_eq!(
+        cutoff_of(&fixture, fixture.member).await,
+        Some(fixture.now + 1)
+    );
 }

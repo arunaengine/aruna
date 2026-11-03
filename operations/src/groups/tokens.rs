@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::s3::session::S3SessionError;
 use crate::session::index::{decode_index, owner_key};
 
 const PAGE: usize = 256;
@@ -71,10 +72,15 @@ pub enum GroupTokensError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Authorization(#[from] AuthorizationError),
+    #[error(transparent)]
+    S3Session(#[from] S3SessionError),
     #[error("caller does not administer this group")]
     Refused,
     #[error("this node holds no such token of the group")]
     NotFound,
+    /// Only the account-wide cutoff ends them, and only a user administrator may move it.
+    #[error("a service account's bearer sessions are not confined to this group")]
+    NotConfined,
     #[error("token revocation failed: {0}")]
     Revocation(String),
     #[error("group token operation did not finish")]
@@ -106,7 +112,7 @@ pub(crate) struct TokenScan {
     now: u64,
     step: ScanStep,
     config: Option<RealmConfigDocument>,
-    pub(crate) accounts: Vec<UserId>,
+    accounts: Vec<UserId>,
     session_ids: Vec<String>,
     pub(crate) tokens: Vec<GroupToken>,
 }
@@ -137,15 +143,8 @@ impl TokenScan {
     }
 
     pub(crate) fn start(&mut self) -> Effects {
-        let target = DocumentTarget::RealmConfig {
-            realm_id: self.realm_id,
-        };
         self.step = ScanStep::Config;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })]
+        smallvec![read_config(self.realm_id)]
     }
 
     fn iter(&mut self, step: ScanStep, key_space: &str, start: Option<Key>) -> Effects {
@@ -158,27 +157,6 @@ impl TokenScan {
             limit: PAGE,
             txn_id: None,
         })]
-    }
-
-    /// A token issued before its owner's cutoff is revoked like a bearer token issued before it.
-    fn status(
-        &self,
-        owner: &UserId,
-        issued: Option<u64>,
-        revoked: bool,
-        expiry: u64,
-    ) -> TokenStatus {
-        let cutoff = self
-            .config
-            .as_ref()
-            .and_then(|config| config.user_cutoff(owner, self.now));
-        if revoked || cutoff.is_some_and(|cutoff| issued.unwrap_or(0) < cutoff) {
-            TokenStatus::Revoked
-        } else if expiry <= self.now {
-            TokenStatus::Expired
-        } else {
-            TokenStatus::Active
-        }
     }
 
     fn unexpected(&self, expected: &'static str, event: Event) -> GroupTokensError {
@@ -196,12 +174,7 @@ impl TokenScan {
         }
         match self.step {
             ScanStep::Config => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return Err(self.unexpected("realm config read", event));
-                };
-                self.config = value
-                    .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
-                    .transpose()?;
+                self.config = parse_config(event)?;
                 Ok(Some(self.iter(ScanStep::Users, USER_KEYSPACE, None)))
             }
             ScanStep::Users => {
@@ -317,13 +290,86 @@ impl TokenScan {
     }
 
     fn push_session(&mut self, session: UserSession) {
+        let token = self.cutoffs().session(session);
+        self.tokens.push(token);
+    }
+
+    fn push_credential(&mut self, access: UserAccess) {
+        let token = self.cutoffs().credential(access);
+        self.tokens.push(token);
+    }
+
+    fn push_s3_session(&mut self, session: S3Session) {
+        let token = self.cutoffs().s3_session(session);
+        self.tokens.push(token);
+    }
+
+    fn cutoffs(&self) -> Cutoffs<'_> {
+        Cutoffs {
+            config: self.config.as_ref(),
+            now: self.now,
+        }
+    }
+}
+
+/// Reads the realm configuration that holds the owners' revocation cutoffs.
+pub(crate) fn read_config(realm_id: RealmId) -> Effect {
+    let target = DocumentTarget::RealmConfig { realm_id };
+    Effect::Storage(StorageEffect::Read {
+        key_space: target.storage_keyspace().to_string(),
+        key: target.storage_key(),
+        txn_id: None,
+    })
+}
+
+pub(crate) fn parse_config(event: Event) -> Result<Option<RealmConfigDocument>, GroupTokensError> {
+    match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
+            .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+            .transpose()?),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(GroupTokensError::UnexpectedEvent {
+            state: "Config".to_string(),
+            expected: "realm config read",
+            got: format!("{other:?}"),
+        }),
+    }
+}
+
+/// Turns stored records into listed tokens, revoked when issued before the owner's cutoff.
+pub(crate) struct Cutoffs<'a> {
+    pub(crate) config: Option<&'a RealmConfigDocument>,
+    pub(crate) now: u64,
+}
+
+impl Cutoffs<'_> {
+    fn status(
+        &self,
+        owner: &UserId,
+        issued: Option<u64>,
+        revoked: bool,
+        expiry: u64,
+    ) -> TokenStatus {
+        let cutoff = self
+            .config
+            .and_then(|config| config.user_cutoff(owner, self.now));
+        if revoked || cutoff.is_some_and(|cutoff| issued.unwrap_or(0) < cutoff) {
+            TokenStatus::Revoked
+        } else if expiry <= self.now {
+            TokenStatus::Expired
+        } else {
+            TokenStatus::Active
+        }
+    }
+
+    pub(crate) fn session(&self, session: UserSession) -> GroupToken {
         let status = self.status(
             &session.user_id,
             Some(session.created_at),
             session.revoked,
             session.expires_at,
         );
-        self.tokens.push(GroupToken {
+        GroupToken {
             kind: TokenKind::Session,
             id: session.sid,
             owner: session.user_id,
@@ -332,15 +378,15 @@ impl TokenScan {
             last_used_at: None,
             status,
             issued_by: None,
-        });
+        }
     }
 
-    fn push_credential(&mut self, access: UserAccess) {
+    pub(crate) fn credential(&self, access: UserAccess) -> GroupToken {
         let created_at = key_time(&access.access_key);
         let expires_at = unix_secs(access.expiry);
         let revoked = access.revoked_at.is_some();
         let status = self.status(&access.user_identity, created_at, revoked, expires_at);
-        self.tokens.push(GroupToken {
+        GroupToken {
             kind: TokenKind::S3Credential,
             id: access.access_key,
             owner: access.user_identity,
@@ -349,15 +395,15 @@ impl TokenScan {
             last_used_at: None,
             status,
             issued_by: Some(access.issued_by),
-        });
+        }
     }
 
-    fn push_s3_session(&mut self, session: S3Session) {
+    pub(crate) fn s3_session(&self, session: S3Session) -> GroupToken {
         let key_id = session.access_key.strip_prefix(SESSION_ACCESS_PREFIX);
         let created_at = key_id.and_then(key_time);
         let expires_at = unix_secs(session.expiry);
         let status = self.status(&session.user_identity, created_at, false, expires_at);
-        self.tokens.push(GroupToken {
+        GroupToken {
             kind: TokenKind::S3Session,
             id: session.access_key,
             owner: session.user_identity,
@@ -366,7 +412,7 @@ impl TokenScan {
             last_used_at: session.last_used_at.map(unix_secs),
             status,
             issued_by: Some(session.issued_by),
-        });
+        }
     }
 }
 
