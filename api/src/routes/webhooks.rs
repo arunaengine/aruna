@@ -7,9 +7,8 @@ use std::sync::Arc;
 use aruna_core::structs::execution::webhook::{WEBHOOK_EVENT, WebhookSubscription};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::driver::drive;
-use aruna_operations::notifications::webhook::{
-    WebhookAction, WebhookError, WebhookOperation, holds_inbox,
-};
+use aruna_operations::notifications::placement::holds_inbox;
+use aruna_operations::notifications::webhook::{WebhookAction, WebhookError, WebhookOperation};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};

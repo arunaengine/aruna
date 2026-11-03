@@ -33,9 +33,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::service::{mint_local_job, submit_local_job};
 use crate::jobs::submit::SubmitJobSpec;
-use crate::metadata::api::load_realm_config;
 use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
-use crate::notifications::placement::resolve_inbox_holder;
 use crate::storage_read::{StorageReadError, parse_storage_read};
 
 const URL_BYTES: usize = 2048;
@@ -274,17 +272,6 @@ fn valid_url(url: &str) -> bool {
                 && parsed.password().is_none()
                 && parsed.host().is_some()
         })
-}
-
-/// Whether this node holds `user_id`'s inbox, the only node its notifications reach.
-pub async fn holds_inbox(context: &DriverContext, user_id: UserId) -> bool {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return true;
-    };
-    let Some(config) = load_realm_config(context, user_id.realm_id).await else {
-        return false;
-    };
-    resolve_inbox_holder(&user_id, &config).is_ok_and(|holder| holder == Some(net_handle.node_id()))
 }
 
 /// Queues one delivery job per newly stored share upload notification whose recipient
