@@ -274,11 +274,7 @@ impl TokenScan {
         }
     }
 
-    fn page(
-        &self,
-        event: Event,
-        expected: &'static str,
-    ) -> Result<Page, GroupTokensError> {
+    fn page(&self, event: Event, expected: &'static str) -> Result<Page, GroupTokensError> {
         match event {
             Event::Storage(StorageEvent::IterResult {
                 values,
