@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use aruna_core::shutdown::Shutdown;
 use aruna_operations::driver::DriverContext;
-use aruna_storage::snapshot::{SnapshotError, SnapshotStats, SnapshotWriter};
+use aruna_storage::snapshot::{SnapshotError, SnapshotStats, SnapshotWriter, consistent_snapshots};
 use tokio::net::UnixListener;
 use tracing::{info, warn};
 
@@ -20,6 +20,8 @@ pub const SYNC_PREFIX: &str = "document-sync/";
 pub const METADATA_PREFIX: &str = "craqle/";
 /// Pseudo keyspace holding the Git repositories: relative path to file bytes, `/` ends a directory.
 pub const GIT_KEYSPACE: &str = "git";
+/// The store prefixes in stream order: node, document sync, metadata.
+pub const PREFIXES: [&str; 3] = [MAIN_PREFIX, SYNC_PREFIX, METADATA_PREFIX];
 
 /// The stores one backup covers.
 #[derive(Clone)]
@@ -30,16 +32,19 @@ pub struct BackupSources {
     pub git_root: PathBuf,
 }
 
-/// Writes one backup stream. Each store is read from its own snapshot, one after another.
+/// Writes one backup stream. The three stores are read from snapshots of one instant; the Git
+/// files are read afterwards. Blob contents are not part of a backup.
 pub fn write_backup(
     out: impl Write,
     sources: &BackupSources,
     created_unix_seconds: u64,
 ) -> Result<SnapshotStats, SnapshotError> {
+    let databases = [&sources.main, &sources.sync, &sources.metadata];
+    let snapshots = consistent_snapshots(&databases)?;
     let mut writer = SnapshotWriter::new(out, created_unix_seconds)?;
-    writer.database(&sources.main, MAIN_PREFIX)?;
-    writer.database(&sources.sync, SYNC_PREFIX)?;
-    writer.database(&sources.metadata, METADATA_PREFIX)?;
+    for ((db, snapshot), prefix) in databases.into_iter().zip(&snapshots).zip(PREFIXES) {
+        writer.database_at(db, snapshot, prefix)?;
+    }
     writer.begin_keyspace(GIT_KEYSPACE)?;
     write_files(&mut writer, &sources.git_root, "")?;
     writer.end_keyspace()?;

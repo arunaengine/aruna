@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use blake3::Hasher;
-use fjall::{Database, KeyspaceCreateOptions, Readable};
+use fjall::{Database, KeyspaceCreateOptions, Readable, Snapshot};
 use std::collections::HashSet;
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 use thiserror::Error;
 
 const SNAPSHOT_MAGIC: &[u8] = b"ARUNA_DB_SNAPSHOT";
@@ -15,6 +16,9 @@ const RECORD_BEGIN_KEYSPACE: u8 = 1;
 const RECORD_ENTRY: u8 = 2;
 const RECORD_END_KEYSPACE: u8 = 3;
 const RECORD_FOOTER: u8 = 4;
+/// Tries and pause between tries to open snapshots of several databases at one instant.
+const CUT_ATTEMPTS: u32 = 1_000;
+const CUT_PAUSE: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotStats {
@@ -49,6 +53,8 @@ pub enum SnapshotError {
     InvalidKeyspaceName,
     #[error("snapshot length does not fit in memory: {0}")]
     LengthOverflow(u64),
+    #[error("the databases kept changing while their snapshots were opened")]
+    BusyDatabases,
 }
 
 /// One record of a snapshot stream, in stream order.
@@ -131,9 +137,18 @@ impl<W: Write> SnapshotWriter<W> {
     /// Writes every keyspace of `db` from one read snapshot, sorted by name and each name
     /// prefixed with `prefix`. The database may keep serving writes meanwhile.
     pub fn database(&mut self, db: &Database, prefix: &str) -> Result<(), SnapshotError> {
+        self.database_at(db, &db.snapshot(), prefix)
+    }
+
+    /// Writes every keyspace of `db` as `snapshot` shows it, like [`Self::database`].
+    pub fn database_at(
+        &mut self,
+        db: &Database,
+        snapshot: &Snapshot,
+        prefix: &str,
+    ) -> Result<(), SnapshotError> {
         let mut names = db.list_keyspace_names();
         names.sort();
-        let snapshot = db.snapshot();
         for name in names {
             let keyspace = db.keyspace(&name, KeyspaceCreateOptions::default)?;
             self.begin_keyspace(&format!("{prefix}{}", &*name))?;
@@ -172,6 +187,28 @@ impl<W: Write> SnapshotWriter<W> {
         self.hasher.update(record);
         Ok(())
     }
+}
+
+/// Opens one read snapshot per database, all showing the same instant. Fjall cannot pause
+/// writers, so a try that a write crossed is dropped and repeated.
+pub fn consistent_snapshots(databases: &[&Database]) -> Result<Vec<Snapshot>, SnapshotError> {
+    for _ in 0..CUT_ATTEMPTS {
+        let snapshots: Vec<Snapshot> = databases.iter().map(|db| db.snapshot()).collect();
+        if same_instant(databases, &snapshots) {
+            return Ok(snapshots);
+        }
+        std::thread::sleep(CUT_PAUSE);
+    }
+    Err(SnapshotError::BusyDatabases)
+}
+
+/// Fjall takes a write's sequence number and publishes it under one journal lock, so a
+/// database whose next number is still its snapshot's has not started a write since.
+fn same_instant(databases: &[&Database], snapshots: &[Snapshot]) -> bool {
+    databases
+        .iter()
+        .zip(snapshots)
+        .all(|(db, snapshot)| db.seqno() == snapshot.seqno())
 }
 
 /// Reads a snapshot stream record by record and rejects bad structure, mismatched counts, a
@@ -349,7 +386,10 @@ fn read_array<const N: usize>(input: &mut impl Read) -> Result<[u8; N], std::io:
 
 #[cfg(test)]
 mod tests {
-    use super::{SnapshotError, SnapshotReader, SnapshotRecord, SnapshotWriter};
+    use super::{
+        SnapshotError, SnapshotReader, SnapshotRecord, SnapshotWriter, consistent_snapshots,
+        same_instant,
+    };
     use fjall::{Database, KeyspaceCreateOptions};
 
     fn sample_stream() -> Vec<u8> {
@@ -417,5 +457,26 @@ mod tests {
                 SnapshotRecord::EndKeyspace,
             ]
         );
+    }
+
+    #[test]
+    fn rejects_crossed_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Database::builder(dir.path().join("first")).open().unwrap();
+        let second = Database::builder(dir.path().join("second")).open().unwrap();
+        let keyspace = second
+            .keyspace("items", KeyspaceCreateOptions::default)
+            .unwrap();
+        keyspace.insert("old", "value").unwrap();
+        let databases = [&first, &second];
+
+        let snapshots = consistent_snapshots(&databases).unwrap();
+        assert!(same_instant(&databases, &snapshots));
+        keyspace.insert("new", "value").unwrap();
+        assert!(!same_instant(&databases, &snapshots));
+
+        let mut writer = SnapshotWriter::new(Vec::new(), 1).unwrap();
+        writer.database_at(&second, &snapshots[1], "").unwrap();
+        assert_eq!(writer.finish().unwrap().1.entry_count, 1);
     }
 }
