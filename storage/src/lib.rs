@@ -1,9 +1,10 @@
-//! Declares the storage crate: the fjall storage module, its errors and compaction.
+//! Declares the storage crate: the fjall storage module, its errors, compaction and snapshots.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod compaction;
 pub mod errors;
+pub mod snapshot;
 pub mod storage;
 
 pub use storage::{

@@ -3,31 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
-use blake3::Hasher;
-use fjall::{
-    KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
-};
-use std::collections::HashSet;
+pub use aruna_storage::snapshot::{SnapshotError, SnapshotStats};
+use aruna_storage::snapshot::{SnapshotReader, SnapshotRecord, SnapshotWriter};
+use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use thiserror::Error;
 
-const SNAPSHOT_MAGIC: &[u8] = b"ARUNA_DB_SNAPSHOT";
-const SNAPSHOT_VERSION: u16 = 1;
-const RECORD_BEGIN_KEYSPACE: u8 = 1;
-const RECORD_ENTRY: u8 = 2;
-const RECORD_END_KEYSPACE: u8 = 3;
-const RECORD_FOOTER: u8 = 4;
 const TXN_ENTRY_LIMIT: usize = 1_000;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotStats {
-    pub created_unix_seconds: u64,
-    pub keyspace_count: u64,
-    pub entry_count: u64,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportStats {
@@ -35,34 +19,6 @@ pub struct ImportStats {
     pub keyspace_count: u64,
     pub entry_count: u64,
     pub target_path: PathBuf,
-}
-
-#[derive(Debug, Error)]
-pub enum SnapshotError {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Fjall(#[from] fjall::Error),
-    #[error("snapshot path already exists: {0}")]
-    SnapshotPathExists(PathBuf),
-    #[error("target database path already exists: {0}")]
-    TargetPathExists(PathBuf),
-    #[error("target database parent directory does not exist: {0}")]
-    TargetParentMissing(PathBuf),
-    #[error("invalid snapshot magic")]
-    InvalidMagic,
-    #[error("unsupported snapshot version: {0}")]
-    UnsupportedVersion(u16),
-    #[error("invalid snapshot structure: {0}")]
-    InvalidStructure(&'static str),
-    #[error("duplicate keyspace in snapshot: {0}")]
-    DuplicateKeyspace(String),
-    #[error("checksum mismatch")]
-    ChecksumMismatch,
-    #[error("snapshot contains invalid UTF-8 keyspace name")]
-    InvalidKeyspaceName,
-    #[error("snapshot length does not fit in memory: {0}")]
-    LengthOverflow(u64),
 }
 
 pub async fn snapshot(database_path: String, target_path: String) -> Result<(), CliError> {
@@ -110,53 +66,15 @@ pub fn snapshot_database(
     }
 
     let db = OptimisticTxDatabase::builder(db_path.as_ref()).open()?;
-    let mut keyspace_names = db.list_keyspace_names();
-    keyspace_names.sort();
-
-    let created_unix_seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(std::io::Error::other)?
-        .as_secs();
-
     let file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(snapshot_path)?;
-    let mut writer = BufWriter::new(file);
-    let mut hasher = Hasher::new();
-    let snapshot = db.read_tx();
-
-    write_header(&mut writer, created_unix_seconds)?;
-
-    let mut keyspace_count = 0_u64;
-    let mut entry_count = 0_u64;
-
-    for keyspace_name in keyspace_names {
-        let keyspace = db.keyspace(&keyspace_name, KeyspaceCreateOptions::default)?;
-        write_keyspace_begin(&mut writer, &mut hasher, &keyspace_name)?;
-
-        let mut keyspace_entry_count = 0_u64;
-        for entry in snapshot.iter(&keyspace) {
-            let (key, value) = entry.into_inner()?;
-            write_entry_record(&mut writer, &mut hasher, &key, &value)?;
-            keyspace_entry_count += 1;
-            entry_count += 1;
-        }
-
-        write_keyspace_end(&mut writer, &mut hasher, keyspace_entry_count)?;
-        keyspace_count += 1;
-    }
-
-    let checksum = *hasher.finalize().as_bytes();
-    write_footer_record(&mut writer, keyspace_count, entry_count, checksum)?;
-    writer.flush()?;
+    let mut writer = SnapshotWriter::new(BufWriter::new(file), unix_now()?)?;
+    writer.database(db.inner(), "")?;
+    let (writer, stats) = writer.finish()?;
     writer.get_ref().sync_all()?;
-
-    Ok(SnapshotStats {
-        created_unix_seconds,
-        keyspace_count,
-        entry_count,
-    })
+    Ok(stats)
 }
 
 pub fn import_new_database(
@@ -168,139 +86,65 @@ pub fn import_new_database(
     ensure_target_path(target_db_path)?;
 
     let file = File::open(snapshot_path)?;
-    let mut reader = BufReader::new(file);
-    let snapshot_created_unix = read_header(&mut reader)?;
-
+    let mut reader = SnapshotReader::new(BufReader::new(file))?;
     let db = OptimisticTxDatabase::builder(target_db_path)
         .manual_journal_persist(true)
         .open()?;
-    let mut hasher = Hasher::new();
-    let mut seen_keyspaces = HashSet::new();
     let mut keyspace_state: Option<ImportKeyspaceState> = None;
-    let mut keyspace_count = 0_u64;
-    let mut entry_count = 0_u64;
 
-    loop {
-        let tag = match read_u8_plain(&mut reader) {
-            Ok(tag) => tag,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                return Err(SnapshotError::InvalidStructure("missing footer record"));
-            }
-            Err(error) => return Err(error.into()),
-        };
-
-        match tag {
-            RECORD_BEGIN_KEYSPACE => {
-                if keyspace_state.is_some() {
-                    return Err(SnapshotError::InvalidStructure(
-                        "encountered a new keyspace before closing the previous keyspace",
-                    ));
-                }
-
-                hasher.update(&[tag]);
-                let name_bytes = read_hashed_bytes(&mut reader, &mut hasher)?;
-                let name = String::from_utf8(name_bytes)
-                    .map_err(|_| SnapshotError::InvalidKeyspaceName)?;
-
-                if !seen_keyspaces.insert(name.clone()) {
-                    return Err(SnapshotError::DuplicateKeyspace(name));
-                }
-
+    while let Some(record) = reader.next_record()? {
+        match record {
+            SnapshotRecord::Keyspace(name) => {
                 let keyspace = db.keyspace(&name, KeyspaceCreateOptions::default)?;
                 keyspace_state = Some(ImportKeyspaceState::new(keyspace));
-                keyspace_count += 1;
             }
-            RECORD_ENTRY => {
-                let Some(state) = keyspace_state.as_mut() else {
-                    return Err(SnapshotError::InvalidStructure(
-                        "encountered an entry outside a keyspace section",
-                    ));
-                };
-
-                hasher.update(&[tag]);
-                let key = read_hashed_bytes(&mut reader, &mut hasher)?;
-                let value = read_hashed_bytes(&mut reader, &mut hasher)?;
-
-                state.insert(&db, key, value)?;
-                state.keyspace_entry_count += 1;
-                entry_count += 1;
+            SnapshotRecord::Entry { key, value } => {
+                if let Some(state) = keyspace_state.as_mut() {
+                    state.insert(&db, key, value)?;
+                }
             }
-            RECORD_END_KEYSPACE => {
-                let Some(mut state) = keyspace_state.take() else {
-                    return Err(SnapshotError::InvalidStructure(
-                        "encountered end-of-keyspace outside a keyspace section",
-                    ));
-                };
-
-                hasher.update(&[tag]);
-                let expected_entry_count = read_u64_hashed(&mut reader, &mut hasher)?;
-                if state.keyspace_entry_count != expected_entry_count {
-                    return Err(SnapshotError::InvalidStructure(
-                        "keyspace entry count did not match the section footer",
-                    ));
+            SnapshotRecord::EndKeyspace => {
+                if let Some(mut state) = keyspace_state.take() {
+                    state.finish()?;
                 }
-
-                state.finish()?;
             }
-            RECORD_FOOTER => {
-                if keyspace_state.is_some() {
-                    return Err(SnapshotError::InvalidStructure(
-                        "encountered footer before closing the active keyspace",
-                    ));
-                }
-
-                let expected_keyspace_count = read_u64_plain(&mut reader)?;
-                let expected_entry_count = read_u64_plain(&mut reader)?;
-                let expected_checksum = read_plain_bytes::<32>(&mut reader)?;
-
-                if keyspace_count != expected_keyspace_count {
-                    return Err(SnapshotError::InvalidStructure(
-                        "keyspace count did not match the footer",
-                    ));
-                }
-                if entry_count != expected_entry_count {
-                    return Err(SnapshotError::InvalidStructure(
-                        "entry count did not match the footer",
-                    ));
-                }
-
-                let checksum = *hasher.finalize().as_bytes();
-                if checksum != expected_checksum {
-                    return Err(SnapshotError::ChecksumMismatch);
-                }
-
-                ensure_reader_exhausted(&mut reader)?;
-                db.persist(PersistMode::Buffer)?;
-                return Ok(ImportStats {
-                    snapshot_created_unix,
-                    keyspace_count,
-                    entry_count,
-                    target_path: target_db_path.to_path_buf(),
-                });
-            }
-            _ => return Err(SnapshotError::InvalidStructure("unknown record tag")),
         }
     }
+
+    db.persist(PersistMode::Buffer)?;
+    let stats = reader.stats();
+    Ok(ImportStats {
+        snapshot_created_unix: stats.created_unix_seconds,
+        keyspace_count: stats.keyspace_count,
+        entry_count: stats.entry_count,
+        target_path: target_db_path.to_path_buf(),
+    })
 }
 
-struct ImportKeyspaceState {
+pub(crate) fn unix_now() -> Result<u64, SnapshotError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_secs())
+}
+
+/// Commits one keyspace's imported entries in transactions of bounded size.
+pub(crate) struct ImportKeyspaceState {
     keyspace: OptimisticTxKeyspace,
-    keyspace_entry_count: u64,
     pending_txn: Option<fjall::OptimisticWriteTx>,
     pending_txn_entries: usize,
 }
 
 impl ImportKeyspaceState {
-    fn new(keyspace: OptimisticTxKeyspace) -> Self {
+    pub(crate) fn new(keyspace: OptimisticTxKeyspace) -> Self {
         Self {
             keyspace,
-            keyspace_entry_count: 0,
             pending_txn: None,
             pending_txn_entries: 0,
         }
     }
 
-    fn insert(
+    pub(crate) fn insert(
         &mut self,
         db: &OptimisticTxDatabase,
         key: Vec<u8>,
@@ -322,7 +166,7 @@ impl ImportKeyspaceState {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<(), SnapshotError> {
+    pub(crate) fn finish(&mut self) -> Result<(), SnapshotError> {
         self.commit_pending_txn()
     }
 
@@ -335,7 +179,7 @@ impl ImportKeyspaceState {
     }
 }
 
-fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
+pub(crate) fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
     if target_db_path.exists() {
         return Err(SnapshotError::TargetPathExists(
             target_db_path.to_path_buf(),
@@ -350,152 +194,6 @@ fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
     }
 
     Ok(())
-}
-
-fn write_header(
-    writer: &mut BufWriter<File>,
-    created_unix_seconds: u64,
-) -> Result<(), SnapshotError> {
-    writer.write_all(SNAPSHOT_MAGIC)?;
-    writer.write_all(&SNAPSHOT_VERSION.to_be_bytes())?;
-    writer.write_all(&created_unix_seconds.to_be_bytes())?;
-    Ok(())
-}
-
-fn read_header(reader: &mut BufReader<File>) -> Result<u64, SnapshotError> {
-    let mut magic = vec![0_u8; SNAPSHOT_MAGIC.len()];
-    reader.read_exact(&mut magic)?;
-    if magic.as_slice() != SNAPSHOT_MAGIC {
-        return Err(SnapshotError::InvalidMagic);
-    }
-
-    let version = read_u16_plain(reader)?;
-    if version != SNAPSHOT_VERSION {
-        return Err(SnapshotError::UnsupportedVersion(version));
-    }
-
-    read_u64_plain(reader)
-}
-
-fn write_keyspace_begin(
-    writer: &mut BufWriter<File>,
-    hasher: &mut Hasher,
-    keyspace_name: &str,
-) -> Result<(), SnapshotError> {
-    let mut record = Vec::with_capacity(1 + 8 + keyspace_name.len());
-    record.push(RECORD_BEGIN_KEYSPACE);
-    push_prefixed_bytes(&mut record, keyspace_name.as_bytes())?;
-    write_payload_record(writer, hasher, &record)
-}
-
-fn write_entry_record(
-    writer: &mut BufWriter<File>,
-    hasher: &mut Hasher,
-    key: &[u8],
-    value: &[u8],
-) -> Result<(), SnapshotError> {
-    let mut record = Vec::with_capacity(1 + 16 + key.len() + value.len());
-    record.push(RECORD_ENTRY);
-    push_prefixed_bytes(&mut record, key)?;
-    push_prefixed_bytes(&mut record, value)?;
-    write_payload_record(writer, hasher, &record)
-}
-
-fn write_keyspace_end(
-    writer: &mut BufWriter<File>,
-    hasher: &mut Hasher,
-    entry_count: u64,
-) -> Result<(), SnapshotError> {
-    let mut record = Vec::with_capacity(9);
-    record.push(RECORD_END_KEYSPACE);
-    record.extend_from_slice(&entry_count.to_be_bytes());
-    write_payload_record(writer, hasher, &record)
-}
-
-fn write_footer_record(
-    writer: &mut BufWriter<File>,
-    keyspace_count: u64,
-    entry_count: u64,
-    checksum: [u8; 32],
-) -> Result<(), SnapshotError> {
-    writer.write_all(&[RECORD_FOOTER])?;
-    writer.write_all(&keyspace_count.to_be_bytes())?;
-    writer.write_all(&entry_count.to_be_bytes())?;
-    writer.write_all(&checksum)?;
-    Ok(())
-}
-
-fn write_payload_record(
-    writer: &mut BufWriter<File>,
-    hasher: &mut Hasher,
-    record: &[u8],
-) -> Result<(), SnapshotError> {
-    writer.write_all(record)?;
-    hasher.update(record);
-    Ok(())
-}
-
-fn push_prefixed_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SnapshotError> {
-    let len = u64::try_from(bytes.len()).map_err(|_| SnapshotError::LengthOverflow(u64::MAX))?;
-    buffer.extend_from_slice(&len.to_be_bytes());
-    buffer.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn read_hashed_bytes(
-    reader: &mut BufReader<File>,
-    hasher: &mut Hasher,
-) -> Result<Vec<u8>, SnapshotError> {
-    let len = read_u64_hashed(reader, hasher)?;
-    let len = usize::try_from(len).map_err(|_| SnapshotError::LengthOverflow(len))?;
-    let mut bytes = vec![0_u8; len];
-    reader.read_exact(&mut bytes)?;
-    hasher.update(&bytes);
-    Ok(bytes)
-}
-
-fn read_u8_plain(reader: &mut BufReader<File>) -> Result<u8, std::io::Error> {
-    let mut bytes = [0_u8; 1];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes[0])
-}
-
-fn read_u16_plain(reader: &mut BufReader<File>) -> Result<u16, SnapshotError> {
-    let bytes = read_plain_bytes::<2>(reader)?;
-    Ok(u16::from_be_bytes(bytes))
-}
-
-fn read_u64_plain(reader: &mut BufReader<File>) -> Result<u64, SnapshotError> {
-    let bytes = read_plain_bytes::<8>(reader)?;
-    Ok(u64::from_be_bytes(bytes))
-}
-
-fn read_u64_hashed(
-    reader: &mut BufReader<File>,
-    hasher: &mut Hasher,
-) -> Result<u64, SnapshotError> {
-    let bytes = read_plain_bytes::<8>(reader)?;
-    hasher.update(&bytes);
-    Ok(u64::from_be_bytes(bytes))
-}
-
-fn read_plain_bytes<const N: usize>(
-    reader: &mut BufReader<File>,
-) -> Result<[u8; N], SnapshotError> {
-    let mut bytes = [0_u8; N];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn ensure_reader_exhausted(reader: &mut BufReader<File>) -> Result<(), SnapshotError> {
-    let mut trailing = [0_u8; 1];
-    match reader.read(&mut trailing) {
-        Ok(0) => Ok(()),
-        Ok(_) => Err(SnapshotError::InvalidStructure(
-            "snapshot has trailing bytes after the footer",
-        )),
-        Err(error) => Err(error.into()),
-    }
 }
 
 #[cfg(test)]

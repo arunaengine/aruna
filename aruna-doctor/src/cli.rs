@@ -62,6 +62,17 @@ pub enum Commands {
         snapshot_path: String,
         target_path: String,
     },
+    /// Write a consistent backup of the running node that uses `storage_path` to a new file,
+    /// read from its `backup.sock`. The node keeps serving while the backup runs.
+    Backup {
+        storage_path: String,
+        target_path: String,
+    },
+    /// Build a new storage directory from a backup file. Start the node on that directory.
+    Restore {
+        backup_path: String,
+        target_path: String,
+    },
     Iroh {
         #[command(subcommand)]
         command: IrohCommands,

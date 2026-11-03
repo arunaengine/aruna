@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::thread;
 
 use fjall::OptimisticTxDatabase;
@@ -10,6 +11,7 @@ use fjall::OptimisticTxDatabase;
 use crate::compaction::Compactor;
 use crate::errors::StorageLibError;
 
+use super::handle::OpenDatabase;
 use super::preimage::flush_empty;
 use super::rebuild::running_rebuild;
 use super::{
@@ -69,6 +71,10 @@ impl FjallStorage {
             .open()?;
 
         let (sender, receivers) = StorageHandle::new();
+        let database = db.inner().clone();
+        let _ = sender
+            .database
+            .set(OpenDatabase(Arc::new(move || database.clone())));
         let mut storage = Self::new(Store::new(db), policy, &sender, read_threads, bulk_threads);
         let channel_closed = sender.metrics.channel_closed.clone();
 
