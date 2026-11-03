@@ -290,6 +290,8 @@ pub const PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_prune_index";
 pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
 /// Each user's webhook subscription on its inbox holder, by user id.
 pub const WEBHOOK_KEYSPACE: &str = "webhook_subscriptions";
+/// Each user's email notification opt-in on its inbox holder, by user id.
+pub const EMAIL_KEYSPACE: &str = "email_preferences";
 pub const WATCH_SUBSCRIPTIONS_KEYSPACE: &str = "notification_watch_subscriptions";
 pub const WATCH_INTEREST_KEYSPACE: &str = "notification_watch_interest";
 /// The newest deletion time of a bucket per recipient, which drops older notices about it.
@@ -704,6 +706,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     PRUNE_INDEX_KEYSPACE,
     NOTIFICATION_OUTBOX_KEYSPACE,
     WEBHOOK_KEYSPACE,
+    EMAIL_KEYSPACE,
     WATCH_SUBSCRIPTIONS_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,
     NOTIFICATION_CUTOFF_KEYSPACE,

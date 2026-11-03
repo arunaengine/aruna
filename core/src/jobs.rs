@@ -34,6 +34,7 @@ pub enum JobKind {
     RegisterIdentifiers,
     BackendImport,
     WebhookDelivery,
+    EmailDelivery,
 }
 
 impl JobKind {
@@ -53,6 +54,7 @@ impl JobKind {
             Self::RegisterIdentifiers => "register_identifiers",
             Self::BackendImport => "backend_import",
             Self::WebhookDelivery => "webhook_delivery",
+            Self::EmailDelivery => "email_delivery",
         }
     }
 
@@ -85,6 +87,7 @@ impl From<&JobPayload> for JobKind {
             JobPayload::RegisterIdentifiers(_) => Self::RegisterIdentifiers,
             JobPayload::BackendImport(_) => Self::BackendImport,
             JobPayload::WebhookDelivery(_) => Self::WebhookDelivery,
+            JobPayload::EmailDelivery(_) => Self::EmailDelivery,
         }
     }
 }
@@ -240,6 +243,7 @@ impl RunningJobView {
             JobPayload::RegisterIdentifiers(spec) => (dataset(spec.document_id), None),
             JobPayload::BackendImport(spec) => (None, Some(spec.group_id)),
             JobPayload::WebhookDelivery(_) => (None, None),
+            JobPayload::EmailDelivery(_) => (None, None),
         };
         Self {
             kind: JobKind::from(&record.payload),

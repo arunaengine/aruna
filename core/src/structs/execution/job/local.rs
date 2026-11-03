@@ -209,6 +209,10 @@ pub enum JobResultPayload {
     Webhook {
         status: Option<u16>,
     },
+    /// Whether a mail was handed to the SMTP server; `false` after the user opted out.
+    Email {
+        sent: bool,
+    },
 }
 
 impl JobResultPayload {
@@ -228,6 +232,7 @@ impl JobResultPayload {
             JobResultPayload::Identifiers { .. } => "identifiers",
             JobResultPayload::BackendImport { .. } => "backend_import",
             JobResultPayload::Webhook { .. } => "webhook",
+            JobResultPayload::Email { .. } => "email",
         }
     }
 
@@ -425,6 +430,7 @@ impl JobResultPayload {
                 "failed": failed,
             }),
             JobResultPayload::Webhook { status } => serde_json::json!({ "status": status }),
+            JobResultPayload::Email { sent } => serde_json::json!({ "sent": sent }),
         }
     }
 }

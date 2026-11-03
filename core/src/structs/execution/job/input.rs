@@ -718,6 +718,8 @@ pub enum JobPayload {
     StoragePurgeFiles(StoragePurgeSpec),
     /// One webhook delivery of one notification. Safe to requeue: receivers deduplicate by id.
     WebhookDelivery(crate::structs::execution::webhook::WebhookDeliverySpec),
+    /// One notification email. Safe to requeue: its message id stays the same.
+    EmailDelivery(crate::structs::execution::email::EmailDeliverySpec),
 }
 
 impl ExecutionSpec {
@@ -751,7 +753,8 @@ impl JobPayload {
             | Self::ExportRoCrate(_)
             | Self::MintPersistentId(_)
             | Self::RegisterIdentifiers(_)
-            | Self::WebhookDelivery(_) => None,
+            | Self::WebhookDelivery(_)
+            | Self::EmailDelivery(_) => None,
         }
     }
 
@@ -773,6 +776,7 @@ impl JobPayload {
             JobPayload::BackendImport(_) => "backend_import",
             JobPayload::StoragePurgeFiles(_) => "storage_purge_files",
             JobPayload::WebhookDelivery(_) => "webhook_delivery",
+            JobPayload::EmailDelivery(_) => "email_delivery",
         }
     }
 
@@ -792,7 +796,8 @@ impl JobPayload {
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. }
             | JobPayload::RegisterIdentifiers(_)
-            | JobPayload::WebhookDelivery(_) => "steps",
+            | JobPayload::WebhookDelivery(_)
+            | JobPayload::EmailDelivery(_) => "steps",
         }
     }
 
@@ -813,7 +818,8 @@ impl JobPayload {
             | JobPayload::CopyObject(_)
             | JobPayload::RegisterIdentifiers(_)
             | JobPayload::BackendImport(_)
-            | JobPayload::WebhookDelivery(_) => JobExecutionClass::InProcess,
+            | JobPayload::WebhookDelivery(_)
+            | JobPayload::EmailDelivery(_) => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
         }
     }
