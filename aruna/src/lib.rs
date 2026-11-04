@@ -13,6 +13,7 @@ pub mod compute_setup;
 pub mod config;
 pub mod default_env;
 pub mod identity;
+pub mod limits;
 pub mod portal;
 pub mod settings;
 pub mod shutdown;

@@ -49,6 +49,7 @@ fn main() {
 async fn run_runtime() {
     dotenv_optional(dotenvy::dotenv()).expect("Failed to load .env file");
     init_tracing();
+    aruna::limits::raise_open_files();
 
     if let Err(error) = report_default_env() {
         eprintln!("{error}");

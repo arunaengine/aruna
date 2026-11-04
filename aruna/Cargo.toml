@@ -64,6 +64,9 @@ ulid = { workspace = true }
 byteview = { workspace = true }
 rand = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 aruna-cli = { workspace = true }
 keyring-core = { workspace = true }
