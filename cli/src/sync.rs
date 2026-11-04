@@ -235,7 +235,8 @@ fn is_link(meta: &std::fs::Metadata) -> bool {
 pub fn case_clashes<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let mut groups: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
     for path in paths {
-        let folded = path.to_lowercase().nfc().collect();
+        // NTFS compares names by their uppercase form, so `Σ` and `ς` share one name.
+        let folded = path.nfc().collect::<String>().to_uppercase();
         groups.entry(folded).or_default().insert(path);
     }
     groups

@@ -177,3 +177,15 @@ fn finds_normalized_clashes() {
     let clashes = case_clashes([composed, decomposed, "CAF\u{c9}.TXT", "other"]);
     assert_eq!(clashes, vec!["CAF\u{c9}.TXT", decomposed, composed]);
 }
+
+#[test]
+fn finds_sigma_clashes() {
+    assert_eq!(
+        case_clashes(["\u{3a3}.txt", "\u{3c2}.txt"]),
+        vec!["\u{3a3}.txt", "\u{3c2}.txt"]
+    );
+    let remote = ["\u{3c3}.txt", "same.txt"];
+    let local = ["\u{3c2}.txt", "same.txt"];
+    let clashes = case_clashes(remote.into_iter().chain(local));
+    assert_eq!(clashes, vec!["\u{3c2}.txt", "\u{3c3}.txt"]);
+}
