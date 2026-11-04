@@ -53,12 +53,12 @@ impl Held for ConflictRecord {
     }
 }
 
-/// Spec digests that current specs and budgets bind by submission, and launch digests that
-/// receipts bind by launch.
+/// Spec digests that current specs and budgets bind by submission, and launch and spec digests
+/// that receipts bind by launch.
 #[derive(Default)]
 pub(super) struct Evidence {
     specs: BTreeSet<(SubmissionId, [u8; 32])>,
-    receipts: BTreeSet<(Ulid, [u8; 32])>,
+    receipts: BTreeSet<(Ulid, [u8; 32], [u8; 32])>,
 }
 
 /// A spec or launch row: its envelope when it reads back unchanged in the current layout, and
@@ -130,8 +130,12 @@ impl Evidence {
                     .insert((budget.submission_id, budget.source_spec_digest));
             }
             JobFamilyRecord::Receipt(receipt) => {
-                self.receipts
-                    .insert((receipt.launch_id, receipt.launch_digest));
+                let bound = (
+                    receipt.launch_id,
+                    receipt.launch_digest,
+                    receipt.spec_digest,
+                );
+                self.receipts.insert(bound);
             }
             _ => {}
         }
@@ -149,10 +153,10 @@ impl Candidate {
             JobFamilyRecord::Spec(spec) => spec.verify_digest().is_err(),
             JobFamilyRecord::Launch(launch) if self.historical => {
                 let spec = (launch.submission_id, launch.spec_digest);
-                let receipt = envelope
-                    .record
-                    .digest()
-                    .is_ok_and(|digest| evidence.receipts.contains(&(launch.launch_id, digest)));
+                let receipt = envelope.record.digest().is_ok_and(|digest| {
+                    let bound = (launch.launch_id, digest, launch.spec_digest);
+                    evidence.receipts.contains(&bound)
+                });
                 !evidence.specs.contains(&spec) && !receipt
             }
             _ => false,
@@ -227,8 +231,8 @@ mod tests {
         FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_RECORD_KEYSPACE,
     };
     use aruna_core::structs::execution::job::{
-        JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordKind, LaunchIntent, SubmissionId,
-        WitnessBudgetRecord,
+        ExecutionReceipt, JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordKind, LaunchIntent,
+        SubmissionId, WitnessBudgetRecord,
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
@@ -464,6 +468,60 @@ mod tests {
 
         let message = "1 job family specs or launches";
         refused_twice(&path, FAMILY_PENDING_KEYSPACE, message);
+    }
+
+    #[test]
+    fn refuses_receipted_aliases() {
+        // A historical receipt binds the aliased launch's digest but its true spec digest, so
+        // it is no evidence for the shifted reading; the migration still refuses.
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let mut launch = old_launch(1);
+        launch.inputs.clear();
+        launch.plan_digest[0] = 0;
+        launch.created_at_ms = 1_730_000_000_000;
+        let spec_digest = launch.spec_digest;
+        let pending = |envelope| OldPending {
+            envelope,
+            need: PendingNeed::Evidence(JobRecordKind::Spec),
+            first_seen_ms: 2_000,
+            attempts: 1,
+        };
+        let bytes = postcard::to_allocvec(&pending(old_envelope(launch))).unwrap();
+        let aliased = super::exact::<PendingRecord>(&bytes).expect("aliases a current row");
+        let receipt = ExecutionReceipt {
+            execution_id: Ulid::from_bytes([10u8; 16]),
+            physical_job_id: JobId::from_bytes([11u8; 16]),
+            launch_id: Ulid::from_bytes([1u8; 16]),
+            launch_digest: aliased.envelope.record.digest().unwrap(),
+            submission_id: SubmissionId([2u8; 32]),
+            request_digest: [3u8; 32],
+            job_id: JobId::from_bytes([5u8; 16]),
+            executor_node_id: secret().public(),
+            target: target(),
+            spec_digest,
+            membership_generation: 1,
+            subject_generation: 1,
+            subject_digest: [12u8; 32],
+            accepted_at_ms: 3_000,
+        };
+        let record = JobFamilyRecord::Receipt(Box::new(receipt));
+        let envelope = JobRecordEnvelope::sign(REALM, record, &secret()).unwrap();
+        let receipt = PendingRecord {
+            envelope,
+            need: PendingNeed::Evidence(JobRecordKind::Spec),
+            first_seen_ms: 3_000,
+            attempts: 1,
+        };
+        let receipt = postcard::to_allocvec(&receipt).unwrap();
+        let rows = vec![(&b"launch"[..], bytes), (&b"receipt"[..], receipt)];
+        write(&path, FAMILY_PENDING_KEYSPACE, rows);
+
+        refused_twice(
+            &path,
+            FAMILY_PENDING_KEYSPACE,
+            "1 job family specs or launches",
+        );
     }
 
     #[test]
