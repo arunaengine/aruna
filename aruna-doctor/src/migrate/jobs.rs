@@ -343,7 +343,7 @@ struct LegacyProgress {
 
 /// Previous shape of `CapturedInput`, before the content identity and the source details.
 #[derive(Serialize, Deserialize)]
-struct LegacyInput {
+pub(super) struct LegacyInput {
     destination_key: String,
     source_node_id: NodeId,
     version_id: Ulid,
