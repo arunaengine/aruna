@@ -57,6 +57,7 @@ use ulid::Ulid;
 
 mod buckets;
 mod cursor_repair;
+mod families;
 mod federation;
 mod git;
 mod info_topics;
@@ -253,6 +254,20 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let snapshot_rows = db.keyspace(NODE_STATS_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
+    families::refuse_specs(&[
+        (
+            FAMILY_RECORD_KEYSPACE,
+            families::old_specs::<JobRecordEnvelope>(&db, &record_rows)?,
+        ),
+        (
+            FAMILY_PENDING_KEYSPACE,
+            families::old_specs::<PendingRecord>(&db, &pending_rows)?,
+        ),
+        (
+            FAMILY_CONFLICT_KEYSPACE,
+            families::old_specs::<ConflictRecord>(&db, &conflict_rows)?,
+        ),
+    ])?;
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
     let pending =
