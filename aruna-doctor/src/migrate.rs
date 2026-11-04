@@ -254,20 +254,22 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let snapshot_rows = db.keyspace(NODE_STATS_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
-    families::refuse_specs(&[
+    let mut evidence = families::Evidence::default();
+    let specs = [
         (
             FAMILY_RECORD_KEYSPACE,
-            families::old_specs::<JobRecordEnvelope>(&db, &record_rows)?,
+            families::scan::<JobRecordEnvelope>(&db, &record_rows, &mut evidence)?,
         ),
         (
             FAMILY_PENDING_KEYSPACE,
-            families::old_specs::<PendingRecord>(&db, &pending_rows)?,
+            families::scan::<PendingRecord>(&db, &pending_rows, &mut evidence)?,
         ),
         (
             FAMILY_CONFLICT_KEYSPACE,
-            families::old_specs::<ConflictRecord>(&db, &conflict_rows)?,
+            families::scan::<ConflictRecord>(&db, &conflict_rows, &mut evidence)?,
         ),
-    ])?;
+    ];
+    families::refuse_specs(&specs, &evidence)?;
     let records =
         rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
     let pending =
