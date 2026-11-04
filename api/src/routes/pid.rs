@@ -252,10 +252,13 @@ async fn profile_landing(
 A browser (`Accept` ranks `text/html` above zero and above `application/ld+json`) is sent to the
 portal page of an active public document or Profile when the realm's federation settings name a
 portal; other clients get the RO-Crate.
+
 An id that provably names no metadata placement of this realm is a 404; a placement this node
-does not know yet, as for a legacy object id, is a retryable 503. That 503 carries the header
-`aruna-placement: unknown` only when no binding and no granted handle range covers the id; a 503
-without it, as during startup or while the PID authority is unreachable, says nothing about the id."#,
+does not know yet, as for a legacy object id, is a retryable 503.
+
+That 503 carries the header `aruna-placement: unknown` only when no binding and no granted handle
+range covers the id; a 503 without it, as during startup or while the PID authority is
+unreachable, says nothing about the id."#,
     params(("rest" = String, Path, description = "The w3id path after `https://w3id.org/aruna/`, for example `01JMETADATA0123456789ABCDE` or `profile/01JMETADATA0123456789ABCDE`")),
     responses(
         (status = 302, description = "Active public document or Profile; `Location` is its portal page for a browser, else its RO-Crate read route, and the answer varies by `Accept`"),
