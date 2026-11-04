@@ -25,7 +25,6 @@ dirs = { workspace = true }
 # Selects the pure Rust backend that zip's deflate support needs.
 flate2 = { workspace = true }
 hostname = { workspace = true }
-keyring = { workspace = true }
 keyring-core = { workspace = true }
 md5 = { workspace = true }
 reqwest = { workspace = true, features = ["query"] }
@@ -37,3 +36,12 @@ tokio = { workspace = true }
 unicode-normalization = { workspace = true }
 url = { workspace = true }
 zip = { workspace = true, features = ["deflate-flate2"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { workspace = true }
+
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+dbus-secret-service-keyring-store = { workspace = true }

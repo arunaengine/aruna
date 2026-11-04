@@ -6,6 +6,7 @@ use crate::error::CliError;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 const KEYRING_SERVICE: &str = "aruna-cli";
 const PROFILE_FILE: &str = "profile.json";
@@ -70,7 +71,7 @@ impl Config {
         }
         match keyring_entry(&profile.api).and_then(|entry| entry.get_password()) {
             Ok(token) => Ok(token.trim().to_string()),
-            Err(keyring::Error::NoEntry) => Err(CliError::NotSignedIn),
+            Err(keyring_core::Error::NoEntry) => Err(CliError::NotSignedIn),
             Err(error) => Err(keyring_missing(error)),
         }
     }
@@ -87,20 +88,40 @@ impl Config {
     }
 }
 
-fn keyring_missing(error: keyring::Error) -> CliError {
+fn keyring_missing(error: keyring_core::Error) -> CliError {
     CliError::usage(format!(
         "the OS keyring is not available ({error}); set ARUNA_API and ARUNA_TOKEN instead of login"
     ))
 }
 
 /// An entry in the store the embedding program set, such as a test's mock, else the OS keyring.
-fn keyring_entry(api: &str) -> keyring::Result<keyring::Entry> {
-    match keyring_core::get_default_store() {
-        Some(_) => Ok(keyring::Entry {
-            inner: keyring_core::Entry::new(KEYRING_SERVICE, api)?,
-        }),
-        None => keyring::Entry::new(KEYRING_SERVICE, api),
+fn keyring_entry(api: &str) -> keyring_core::Result<keyring_core::Entry> {
+    if keyring_core::get_default_store().is_none() && OS_STORE.is_err() {
+        return Err(keyring_core::Error::NoDefaultStore);
     }
+    keyring_core::Entry::new(KEYRING_SERVICE, api)
+}
+
+static OS_STORE: LazyLock<keyring_core::Result<()>> = LazyLock::new(os_store);
+
+/// Makes the platform's credential store the default; other platforms have none.
+fn os_store() -> keyring_core::Result<()> {
+    #[cfg(target_os = "macos")]
+    let store = apple_native_keyring_store::keychain::Store::new()?;
+    #[cfg(target_os = "windows")]
+    let store = windows_native_keyring_store::Store::new()?;
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    let store = dbus_secret_service_keyring_store::Store::new()?;
+    #[cfg(all(any(unix, windows), not(any(target_os = "ios", target_os = "android"))))]
+    {
+        keyring_core::set_default_store(store);
+        Ok(())
+    }
+    #[cfg(not(all(any(unix, windows), not(any(target_os = "ios", target_os = "android")))))]
+    Err(keyring_core::Error::NoDefaultStore)
 }
 
 /// Writes a file only its owner can read, also on the first write.
