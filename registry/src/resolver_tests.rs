@@ -204,15 +204,15 @@ fn parses_every_pattern() {
 
 #[test]
 fn decides_by_priority() {
-    use Holding::{Absent, Holds, Unavailable};
+    use Holding::{Absent, Holds, Unavailable, Undecided};
     let id = minted();
     let realm = |holding| ("realm".to_string(), Source::Realm, holding);
     let other = |holding| ("other".to_string(), Source::Realm, holding);
     let prod = |holding| (format!("{}{id}", V2.page), Source::Legacy, holding);
     let dev = |holding| (format!("{}{id}", V2_DEV.page), Source::Legacy, holding);
-    let document = Shape::Document(id);
     let prod_page = redirect(&format!("{}{id}", V2.page));
     let dev_page = redirect(&format!("{}{id}", V2_DEV.page));
+    let missing = Answer::NotFound("no realm or v2 site holds this identifier");
     let cases = [
         (vec![realm(Holds), prod(Holds)], redirect("realm")),
         (vec![realm(Holds), other(Holds)], Answer::Conflict),
@@ -226,30 +226,27 @@ fn decides_by_priority() {
             dev_page.clone(),
         ),
         (vec![realm(Unavailable), dev(Holds)], dev_page.clone()),
-        // Nobody knows the id: the page the old w3id rule named, unless a realm may hold it.
+        (vec![realm(Undecided), prod(Holds)], prod_page.clone()),
+        // Nobody holds the id: 404, also when a node cannot place it, as for every foreign id.
         (
             vec![realm(Absent), prod(Absent), dev(Absent)],
-            prod_page.clone(),
+            missing.clone(),
         ),
+        (vec![realm(Undecided), prod(Absent)], missing.clone()),
+        (vec![realm(Absent)], missing.clone()),
+        (vec![], missing),
+        // An unreachable v2 site keeps its page; an unreachable realm may hold the id.
         (vec![realm(Absent), prod(Unavailable)], prod_page.clone()),
-        (vec![prod(Absent)], prod_page),
+        (vec![prod(Absent), dev(Unavailable)], dev_page),
         (vec![realm(Unavailable), prod(Absent)], Answer::Unavailable),
+        (
+            vec![realm(Unavailable), prod(Unavailable)],
+            Answer::Unavailable,
+        ),
     ];
     for (answers, expected) in cases {
-        assert_eq!(decide(&document, &answers), expected, "{answers:?}");
+        assert_eq!(decide(&answers), expected, "{answers:?}");
     }
-    // A dev id goes to v2 dev unless a realm holds it, also while a realm is unreachable.
-    let dev_id = Shape::Dev(id);
-    assert_eq!(decide(&dev_id, &[realm(Holds)]), redirect("realm"));
-    assert_eq!(decide(&dev_id, &[realm(Unavailable)]), dev_page);
-    assert_eq!(decide(&dev_id, &[]), dev_page);
-    let profile = Shape::Profile(id);
-    assert_eq!(decide(&profile, &[realm(Holds)]), redirect("realm"));
-    assert!(matches!(
-        decide(&profile, &[realm(Absent)]),
-        Answer::NotFound(_)
-    ));
-    assert_eq!(decide(&profile, &[realm(Unavailable)]), Answer::Unavailable);
 }
 
 #[test]
@@ -260,7 +257,8 @@ fn maps_site_statuses() {
         (Source::Realm, 410, Holding::Holds),
         (Source::Realm, 404, Holding::Absent),
         (Source::Realm, 200, Holding::Unavailable),
-        (Source::Realm, 503, Holding::Unavailable),
+        (Source::Realm, 503, Holding::Undecided),
+        (Source::Realm, 502, Holding::Unavailable),
         (Source::Legacy, 200, Holding::Holds),
         (Source::Legacy, 400, Holding::Holds),
         (Source::Legacy, 404, Holding::Absent),
@@ -326,8 +324,8 @@ async fn kept_realms_rechecked() {
     assert_eq!(sites.checks(), 2);
     // A withdrawn realm is never a kept target: the id is guessed again without it.
     store.withdraw(&realm_id(), now + 2, now).unwrap();
-    let page = redirect(&format!("{}{id}", V2.page));
-    assert_eq!(sites.ask(&resolver, &path, now + 2).await, page);
+    let answer = sites.ask(&resolver, &path, now + 2).await;
+    assert!(matches!(answer, Answer::NotFound(_)), "{answer:?}");
     assert_eq!(sites.asked(), 5);
 }
 
@@ -354,8 +352,8 @@ async fn expired_lease_rechecked() {
         redirect(&format!("{API}/w3id/{id}"))
     );
     // The lease ends while the guess is still kept; the kept realm is no target any more.
-    let page = redirect(&format!("{}{id}", V2.page));
-    assert_eq!(sites.ask(&resolver, &path, now + 20).await, page);
+    let answer = sites.ask(&resolver, &path, now + 20).await;
+    assert!(matches!(answer, Answer::NotFound(_)), "{answer:?}");
     assert_eq!(sites.asked(), 5);
 }
 
@@ -372,10 +370,13 @@ async fn legacy_ids_guessed() {
                 (dev_api.as_str(), Holding::Holds),
                 (prod_api.as_str(), Holding::Holds),
             ],
-            prod_page.clone(),
+            prod_page,
         ),
-        // Unknown everywhere: the old rule's page, which explains itself.
-        (Vec::new(), prod_page),
+        // Unknown everywhere: no redirect to a page that does not hold it.
+        (
+            Vec::new(),
+            Answer::NotFound("no realm or v2 site holds this identifier"),
+        ),
     ];
     for (said, expected) in cases {
         // A fresh resolver each time, so no case reads another's cached answer.
@@ -399,7 +400,7 @@ async fn reserved_handle_skips() {
     assert!(MetaResourceId::from_str(&id.to_string()).is_err());
     let sites = Sites::new(&[(&format!("{API}/w3id/{id}"), Holding::Holds)]);
     let answer = sites.ask(&resolver, &id.to_string(), now).await;
-    assert_eq!(answer, redirect(&format!("{}{id}", V2.page)));
+    assert!(matches!(answer, Answer::NotFound(_)), "{answer:?}");
     assert_eq!(sites.asked(), 2);
 }
 
@@ -431,12 +432,21 @@ async fn dev_and_profiles() {
     let sites = Sites::new(&[(&held, Holding::Holds)]);
     let dev = format!("dev/{id}");
     assert_eq!(sites.ask(&resolver, &dev, now).await, redirect(&held));
-    // Only realms are asked for a dev id; v2 dev is the answer when none holds it.
-    assert_eq!(sites.asked(), 1);
-    let down = Sites::new(&[(&format!("{API}/w3id/{LEGACY}"), Holding::Unavailable)]);
+    // A dev id asks the realms and v2 dev only; v2 dev wins over an unreachable realm.
+    assert_eq!(sites.asked(), 2);
+    let dev_api = format!("{}{LEGACY}", V2_DEV.api);
+    let down = Sites::new(&[
+        (&format!("{API}/w3id/{LEGACY}"), Holding::Unavailable),
+        (&dev_api, Holding::Holds),
+    ]);
     let legacy = format!("dev/{LEGACY}");
     let page = redirect(&format!("{}{LEGACY}", V2_DEV.page));
     assert_eq!(down.ask(&resolver, &legacy, now).await, page);
+    // Not kept from the unreachable ask above: unknown to every site, it is a 404.
+    assert!(matches!(
+        sites.ask(&resolver, &legacy, now).await,
+        Answer::NotFound(_)
+    ));
 
     let profile = format!("{API}/w3id/profile/{id}");
     let sites = Sites::new(&[(&profile, Holding::Holds)]);
@@ -456,7 +466,7 @@ async fn unapproved_never_asked() {
     let id = minted();
     let sites = Sites::new(&[(&format!("{API}/w3id/{id}"), Holding::Holds)]);
     let answer = sites.ask(&resolver, &id.to_string(), now).await;
-    assert_eq!(answer, redirect(&format!("{}{id}", V2.page)));
+    assert!(matches!(answer, Answer::NotFound(_)), "{answer:?}");
     assert_eq!(sites.asked(), 2);
     let realm = realm_id();
     let global = format!("data/{realm}/{id}");
@@ -482,7 +492,7 @@ async fn retired_realms_gone() {
         assert!(matches!(answer, Answer::Gone(_)), "{path}: {answer:?}");
     }
     let answer = sites.ask(&resolver, &id.to_string(), now).await;
-    assert_eq!(answer, redirect(&format!("{}{id}", V2.page)));
+    assert!(matches!(answer, Answer::NotFound(_)), "{answer:?}");
     assert_eq!(sites.asked(), 2);
     let response = respond(Answer::Gone("realm Realm is retired".to_string()));
     assert_eq!(response.status(), StatusCode::GONE);
@@ -544,11 +554,18 @@ async fn mixed_backends_fallback() {
 
 #[tokio::test]
 async fn legacy_never_absent() {
-    // An older node answers 503 for ids it cannot place, which must not send v3 ids to v2.
+    // An unreachable node may hold the id, so it must not end in v2 or a 404.
     let (_dir, resolver, now) = resolver(BASE, true);
     let pid = format!("{API}/pid/{LEGACY}");
     let sites = Sites::old(&[(&pid, Holding::Unavailable)]);
     assert_eq!(sites.ask(&resolver, LEGACY, now).await, Answer::Unavailable);
+    // A node's 503 for an id it cannot place, while v2 lacks it too, is a 404 that is not kept.
+    let unplaced = Sites::old(&[(&pid, Holding::Undecided)]);
+    for _ in 0..2 {
+        let answer = unplaced.ask(&resolver, LEGACY, now).await;
+        assert!(matches!(answer, Answer::NotFound(_)), "{answer:?}");
+    }
+    assert_eq!(unplaced.asked(), 6);
     // A v2 site that knows the id still wins, as it would on newer nodes.
     let dev_api = format!("{}{LEGACY}", V2_DEV.api);
     let known = Sites::old(&[(&pid, Holding::Unavailable), (&dev_api, Holding::Holds)]);
@@ -686,15 +703,15 @@ async fn clients_limited_separately() {
     };
     for nonce in 0..u64::from(CLIENT_BURST) {
         assert!(
-            matches!(ask(nonce, now, busy).await, Answer::Redirect(_)),
+            matches!(ask(nonce, now, busy).await, Answer::NotFound(_)),
             "{nonce}"
         );
     }
     assert_eq!(ask(100, now, busy).await, Answer::Busy);
     let other = IpAddr::from([198, 51, 100, 2]);
-    assert!(matches!(ask(101, now, other).await, Answer::Redirect(_)));
+    assert!(matches!(ask(101, now, other).await, Answer::NotFound(_)));
     // The share refills with request time: one guess per second at 60 per minute.
-    assert!(matches!(ask(102, now + 1, busy).await, Answer::Redirect(_)));
+    assert!(matches!(ask(102, now + 1, busy).await, Answer::NotFound(_)));
     assert_eq!(ask(103, now + 1, busy).await, Answer::Busy);
 }
 
@@ -710,7 +727,7 @@ async fn shared_budget_bounds() {
         let answer = sites
             .ask_from(&resolver, &id.as_ulid().to_string(), now, client)
             .await;
-        assert!(matches!(answer, Answer::Redirect(_)), "{nonce}");
+        assert!(matches!(answer, Answer::NotFound(_)), "{nonce}");
     }
     let client = IpAddr::from([203, 0, 113, 1]);
     assert_eq!(
@@ -822,7 +839,7 @@ async fn probes_follow_nothing() {
         ("/moved", Source::Realm, Holding::Holds),
         ("/gone", Source::Realm, Holding::Holds),
         ("/missing", Source::Realm, Holding::Absent),
-        ("/down", Source::Realm, Holding::Unavailable),
+        ("/down", Source::Realm, Holding::Undecided),
         ("/ok", Source::Legacy, Holding::Holds),
         ("/private", Source::Legacy, Holding::Holds),
         ("/missing", Source::Legacy, Holding::Absent),
