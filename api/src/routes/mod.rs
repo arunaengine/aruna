@@ -27,6 +27,7 @@ pub mod metadata;
 pub mod node_names;
 pub mod notifications;
 pub mod oai;
+pub mod oidc_providers;
 pub mod onboarding;
 pub mod pid;
 pub mod placement;
@@ -120,6 +121,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(notifications::router())
         .merge(policies::router())
         .merge(portal::router())
+        .merge(oidc_providers::router())
         .merge(promotion::router())
         .merge(search::router())
         .merge(shares::router())
@@ -256,6 +258,7 @@ pub(crate) mod tests {
             "/metadata/groups/{group_id}/repositories/{connector_id}",
         ),
         ("DELETE", "/system/notifications/watches/{id}"),
+        ("DELETE", "/system/realm/oidc-providers/{id}"),
         ("DELETE", "/pid/{document_id}"),
         ("DELETE", "/access/credentials/{access_key_id}"),
         ("DELETE", "/system/assistant/providers/{id}"),
@@ -718,6 +721,7 @@ pub(crate) mod tests {
         ),
         ("PUT", "/system/realm/federation"),
         ("PUT", "/system/realm/merge-coordinator"),
+        ("PUT", "/system/realm/oidc-providers/{id}"),
         ("PUT", "/system/realm/portal-features"),
         ("PUT", "/system/realm/quota"),
         ("PUT", "/metadata/{document_id}/rocrate"),

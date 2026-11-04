@@ -738,6 +738,15 @@ impl RealmConfigDocument {
             .unwrap_or(Some(self.metadata_replication.default_replication_factor))
     }
 
+    /// Replaces the provider with the same id in place or appends it. Portals sign in with the
+    /// first provider, so an update must never reorder the list.
+    pub fn upsert_provider(&mut self, provider: OidcProviderConfig) {
+        match self.oidc_providers.iter_mut().find(|p| p.id == provider.id) {
+            Some(existing) => *existing = provider,
+            None => self.oidc_providers.push(provider),
+        }
+    }
+
     pub fn ensure_node(&mut self, node_id: NodeId, kind: RealmNodeKind) {
         let node_id = node_id.to_string();
         if let Some(existing) = self.nodes.iter_mut().find(|node| node.node_id == node_id) {
