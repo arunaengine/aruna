@@ -652,3 +652,156 @@ async fn copies_missing_source() {
     );
     assert!(!root.join("raw/b.txt").exists());
 }
+
+/// The handler with an `fs` group backend that serves `raw/` below `share`.
+fn folder_backend(
+    handler: &crate::blob::BlobHandler,
+    share: &std::path::Path,
+    writable: bool,
+) -> (crate::blob::BlobHandler, BackendRef) {
+    use aruna_core::structs::storage::blob::{Backend, BackendConfig};
+    use aruna_core::structs::storage::group_backend::{GroupBackendKind, PARTS_PREFIX};
+    let config = BackendConfig {
+        backend_type: Backend::Group(GroupBackendKind::Fs),
+        root: "raw/".to_string(),
+        service_config: std::collections::HashMap::from([
+            ("path".to_string(), share.to_str().unwrap().to_string()),
+            ("writable".to_string(), writable.to_string()),
+        ]),
+        bucket_prefix: None,
+        max_bucket_size: None,
+        multipart_bucket: Some(PARTS_PREFIX.to_string()),
+        timeouts: Default::default(),
+    };
+    let backend_id = ulid::Ulid::generate();
+    let entry = std::sync::Arc::new(crate::blob::NodeBackend::new(config, None));
+    let groups = std::collections::HashMap::from([(backend_id, entry)]);
+    let handler = crate::blob::BlobHandler {
+        registry: handler.registry.with_groups(groups),
+        ..handler.clone()
+    };
+    (handler, BackendRef::Group(backend_id))
+}
+
+fn create_only(path: &str) -> aruna_core::structs::storage::backend_import::PlainPath {
+    aruna_core::structs::storage::backend_import::PlainPath {
+        path: path.to_string(),
+        ulid: ulid::Ulid::generate(),
+        version_id: ulid::Ulid::generate(),
+        if_not_exists: true,
+        exact: false,
+    }
+}
+
+#[tokio::test]
+async fn imports_local_folder() {
+    use super::stream_from_bytes;
+    use aruna_core::structs::storage::multipart::MultipartPartKey;
+    let context = setup_two_backends().await;
+    let share = tempfile::tempdir().unwrap();
+    place(share.path(), "raw/b.txt", b"bee");
+    place(share.path(), "raw/sub/a.txt", b"ay");
+    place(share.path(), "outside.txt", b"no");
+    let (handler, backend) = folder_backend(&context.blob_handle.handler, share.path(), true);
+    let resolved = ResolvedBackend::new(backend.clone(), None);
+    let written = |event: &BlobEvent| {
+        matches!(
+            event,
+            BlobEvent::PlainWritten { .. } | BlobEvent::WriteFinished { .. }
+        )
+    };
+
+    let event = handler.list_external(&backend, "", None, 10).await;
+    let BlobEvent::ExternalListed { objects, next } = event else {
+        panic!("listing failed: {event:?}")
+    };
+    let keys: Vec<_> = objects.iter().map(|object| object.key.as_str()).collect();
+    assert_eq!(keys, ["b.txt", "sub/a.txt"]);
+    assert_eq!(next, None);
+    assert!(objects.iter().all(|object| object.modified_ms.is_some()));
+    let BlobEvent::ExternalHashed { location, .. } = handler
+        .hash_external(resolved.clone(), "sub/a.txt".to_string(), test_user_id())
+        .await
+    else {
+        panic!("hash failed")
+    };
+    assert_eq!(read_back(&handler, location).await, b"ay");
+
+    // New files land next to the imported ones, and a create-only write never replaces one.
+    let blob = stream_from_bytes(b"sea");
+    let event = handler
+        .write_plain(
+            resolved.clone(),
+            create_only("new/c.txt"),
+            test_user_id(),
+            blob,
+        )
+        .await;
+    assert!(written(&event), "{event:?}");
+    assert_eq!(
+        std::fs::read(share.path().join("raw/new/c.txt")).unwrap(),
+        b"sea"
+    );
+    let blob = stream_from_bytes(b"other");
+    let event = handler
+        .write_plain(resolved.clone(), create_only("b.txt"), test_user_id(), blob)
+        .await;
+    assert_eq!(event, BlobEvent::Error(BlobError::PathTaken));
+    assert_eq!(
+        std::fs::read(share.path().join("raw/b.txt")).unwrap(),
+        b"bee"
+    );
+
+    // Upload parts wait in Aruna's parts folder and are composed at the target path.
+    let upload = ulid::Ulid::generate();
+    let mut parts = Vec::new();
+    for (number, bytes) in [(1, b"pa".as_slice()), (2, b"rts".as_slice())] {
+        let part = MultipartPartKey::new(upload, number);
+        let blob = stream_from_bytes(bytes);
+        let event = handler
+            .write_blob_part(part, resolved.clone(), test_user_id(), blob)
+            .await;
+        let BlobEvent::WriteFinished { location } = event else {
+            panic!("part write failed: {event:?}")
+        };
+        assert!(
+            location
+                .get_storage_path()
+                .unwrap()
+                .starts_with("_aruna_parts/")
+        );
+        parts.push(location);
+    }
+    let plain = create_only("joined.txt");
+    let event = handler
+        .compose_plain(resolved, plain, test_user_id(), parts)
+        .await;
+    assert!(written(&event), "{event:?}");
+    assert_eq!(
+        std::fs::read(share.path().join("raw/joined.txt")).unwrap(),
+        b"parts"
+    );
+}
+
+#[tokio::test]
+async fn refuses_unwritable_folder() {
+    use super::stream_from_bytes;
+    let context = setup_two_backends().await;
+    let share = tempfile::tempdir().unwrap();
+    place(share.path(), "raw/a.txt", b"a");
+    let (handler, backend) = folder_backend(&context.blob_handle.handler, share.path(), false);
+    let resolved = ResolvedBackend::new(backend, None);
+
+    let blob = stream_from_bytes(b"b");
+    let event = handler
+        .write_plain(resolved, create_only("b.txt"), test_user_id(), blob)
+        .await;
+
+    assert!(matches!(event, BlobEvent::Error(_)), "{event:?}");
+    let mut names: Vec<_> = std::fs::read_dir(share.path().join("raw"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a.txt"]);
+}

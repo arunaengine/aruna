@@ -7,12 +7,12 @@ use crate::error::BlobLibError;
 use crate::opendal::init_operator;
 use aruna_core::errors::BlobError;
 use aruna_core::structs::Status;
-use aruna_core::structs::storage::backends::{NodeBackendEntry, NodeBackendsConfig};
+use aruna_core::structs::storage::backends::{ImportRoot, NodeBackendEntry, NodeBackendsConfig};
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendRef, BlobTimeoutConfig, ResolvedBackend,
 };
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
-use aruna_core::structs::storage::group_backend::DEFAULT_BUCKET;
+use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, GroupBackendKind};
 use aruna_core::structs::storage::routing::{BackendCatalog, NodeRouting, NodeRoutingRule};
 use opendal::Operator;
 use std::collections::{BTreeMap, HashMap};
@@ -20,9 +20,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use ulid::Ulid;
 
-/// A group storage without a pinned bucket: the first folder of each path is the bucket.
+/// A group storage without a pinned bucket: the first folder of each path is the bucket. A
+/// local folder has no buckets at all.
 pub(super) fn splits(config: &BackendConfig) -> bool {
-    matches!(config.backend_type, Backend::Group(_))
+    matches!(config.backend_type, Backend::Group(kind) if kind != GroupBackendKind::Fs)
         && !config.service_config.contains_key("bucket")
 }
 
@@ -72,6 +73,7 @@ pub struct BackendRegistry {
     default_name: String,
     rules: Arc<[NodeRoutingRule]>,
     serve_group_backends: bool,
+    import_roots: Arc<BTreeMap<String, ImportRoot>>,
 }
 
 impl BackendRegistry {
@@ -88,6 +90,7 @@ impl BackendRegistry {
             default_name: BackendRef::DEFAULT_NODE_NAME.to_string(),
             rules: Arc::from([]),
             serve_group_backends: true,
+            import_roots: Arc::default(),
         }
     }
 
@@ -102,6 +105,7 @@ impl BackendRegistry {
         Ok(Self {
             rules: Arc::from(config.rules.clone()),
             serve_group_backends: config.serve_group_backends,
+            import_roots: Arc::new(config.served_roots()),
             ..registry
         })
     }
@@ -121,6 +125,7 @@ impl BackendRegistry {
             default_name,
             rules: Arc::from([]),
             serve_group_backends: true,
+            import_roots: Arc::default(),
         })
     }
 
@@ -157,6 +162,11 @@ impl BackendRegistry {
             .get(&self.default_name)
             .expect("registry always holds its default backend")
             .config
+    }
+
+    /// The folders `fs` group backends may serve; empty while group backends are withdrawn.
+    pub fn import_roots(&self) -> &BTreeMap<String, ImportRoot> {
+        &self.import_roots
     }
 
     pub fn timeouts(&self) -> BlobTimeoutConfig {

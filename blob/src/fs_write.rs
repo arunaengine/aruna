@@ -949,6 +949,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn refuses_escaping_write() {
         let root = tempfile::tempdir().unwrap();
@@ -1011,6 +1012,7 @@ mod tests {
         assert!(!spool.join("leftover").exists());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn refuses_linked_spool() {
         // Reserved bookkeeping must never follow an owner-created symlink.
@@ -1176,6 +1178,7 @@ mod tests {
     }
 
     // A link out of the offered directory must not resolve for a serve either.
+    #[cfg(unix)]
     #[tokio::test]
     async fn refuses_escaping_source() {
         let root = tempfile::tempdir().unwrap();

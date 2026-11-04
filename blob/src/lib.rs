@@ -18,6 +18,7 @@ mod fs_write;
 pub mod git;
 pub mod hash;
 pub mod invenio;
+pub mod local_fs;
 mod messages;
 pub mod opendal;
 pub mod pace;

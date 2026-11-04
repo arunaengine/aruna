@@ -24,6 +24,8 @@ pub enum GroupBackendKind {
     Azblob,
     Azdls,
     B2,
+    /// A folder below an operator's import root on this node.
+    Fs,
 }
 
 impl GroupBackendKind {
@@ -34,17 +36,27 @@ impl GroupBackendKind {
             Self::Azblob => "azblob",
             Self::Azdls => "azdls",
             Self::B2 => "b2",
+            Self::Fs => "fs",
         }
     }
 
-    pub const ALL: [Self; 5] = [Self::S3, Self::Gcs, Self::Azblob, Self::Azdls, Self::B2];
+    pub const ALL: [Self; 6] = [
+        Self::S3,
+        Self::Gcs,
+        Self::Azblob,
+        Self::Azdls,
+        Self::B2,
+        Self::Fs,
+    ];
 
-    /// The config key naming the tenant's own container; nothing is ever minted.
-    pub const fn container_key(self) -> &'static str {
+    /// The config key naming the tenant's own container; nothing is ever minted. A folder
+    /// has none: Aruna keeps its own files in the reserved folders at its top.
+    pub const fn container_key(self) -> Option<&'static str> {
         match self {
-            Self::S3 | Self::Gcs | Self::B2 => "bucket",
-            Self::Azblob => "container",
-            Self::Azdls => "filesystem",
+            Self::S3 | Self::Gcs | Self::B2 => Some("bucket"),
+            Self::Azblob => Some("container"),
+            Self::Azdls => Some("filesystem"),
+            Self::Fs => None,
         }
     }
 }
@@ -82,6 +94,17 @@ pub const BUCKET_DELETE: &str = "bucket_delete";
 
 /// Object keys longer than this are refused by S3, GCS, Azure and B2.
 pub const MAX_KEY_LEN: usize = 1024;
+
+/// A folder below an import root: empty, or names each ended by `/`. No name is empty, `.`
+/// or `..`, and none holds a backslash or a NUL byte.
+pub fn plain_folder(folder: &str) -> bool {
+    let Some(names) = folder.strip_suffix('/') else {
+        return folder.is_empty();
+    };
+    names
+        .split('/')
+        .all(|name| !matches!(name, "" | "." | "..") && !name.contains(['\\', '\0']))
+}
 
 /// The bucket a path names on a storage without a bucket: its first folder.
 pub fn path_bucket(path: &str) -> Option<&str> {
@@ -140,6 +163,7 @@ impl FromStr for GroupBackendKind {
             "azblob" => Ok(Self::Azblob),
             "azdls" => Ok(Self::Azdls),
             "b2" => Ok(Self::B2),
+            "fs" => Ok(Self::Fs),
             other => Err(ConversionError::FromStrError(format!(
                 "unknown group backend kind `{other}`"
             ))),
@@ -176,9 +200,8 @@ impl GroupStorage {
 
     /// The tenant's own container, which also holds Aruna's own layout.
     pub fn container(&self) -> Option<&str> {
-        self.public_config
-            .get(self.kind.container_key())
-            .map(String::as_str)
+        let key = self.kind.container_key()?;
+        self.public_config.get(key).map(String::as_str)
     }
 
     /// An S3 storage without a bucket: the first folder of each path names the bucket.
@@ -438,6 +461,16 @@ mod tests {
             .public_config
             .insert("bucket".to_string(), "fixed".to_string());
         assert!(!record.splits());
+    }
+
+    #[test]
+    fn checks_plain_folders() {
+        for folder in ["", "raw/", "raw/2026/", "a b/c.d/"] {
+            assert!(super::plain_folder(folder), "{folder}");
+        }
+        for folder in ["raw", "/raw/", "raw//", "./", "raw/../", "a\\b/", "/"] {
+            assert!(!super::plain_folder(folder), "{folder}");
+        }
     }
 
     #[test]

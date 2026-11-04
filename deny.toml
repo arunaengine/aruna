@@ -52,5 +52,6 @@ unknown-git = "deny"
 allow-git = [
     "https://github.com/arunaengine/craqle",
     "https://github.com/arunaengine/irokle.git",
+    "https://github.com/arunaengine/pithos",
     "https://github.com/arunaengine/ro-crate-rs.git",
 ]

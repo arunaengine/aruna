@@ -38,6 +38,8 @@ pub enum RoutingError {
     OperatorBackendTarget,
     #[error("storage backend {0} is not registered for this group")]
     ForeignBackend(Ulid),
+    #[error("storage backend {0} is a local folder, which serves backend imports only")]
+    FolderTarget(Ulid),
     #[error(
         "routing rules `{first}` and `{second}` are equally specific and both match the same writes"
     )]
@@ -105,6 +107,8 @@ impl GroupStorageRouting {
 pub struct GroupRoutingInputs {
     pub default_target: Option<RoutingTarget>,
     pub backend_ids: BTreeSet<Ulid>,
+    /// The ids of the group's local folder backends, which only import rules may route to.
+    pub folder_ids: BTreeSet<Ulid>,
     /// The group's backend import rules on this node.
     pub imports: Vec<BackendImport>,
     /// The folders Aruna keeps its own objects in on each enabled group backend.

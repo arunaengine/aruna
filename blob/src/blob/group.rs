@@ -9,15 +9,17 @@ use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
+use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
 use aruna_core::structs::storage::group_backend::{
-    BUCKET_DELETE, BUCKET_PREFIX, BUCKET_STATE, BUCKET_TEMPLATE, GroupStorage, GroupStorageSecret,
-    LAYOUT_BUCKET, PROBE_PREFIX,
+    BUCKET_DELETE, BUCKET_PREFIX, BUCKET_STATE, BUCKET_TEMPLATE, GroupBackendKind, GroupStorage,
+    GroupStorageSecret, LAYOUT_BUCKET, PARTS_PREFIX, PROBE_PREFIX,
 };
 use aruna_core::types::Key;
+use futures::TryStreamExt;
 use opendal::ErrorKind;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use ulid::Ulid;
 
@@ -31,8 +33,12 @@ pub(super) const GROUP_WRITE_CHUNK: usize = 8 * 1024 * 1024;
 pub(super) fn group_entry(
     record: &GroupStorage,
     secret: &GroupStorageSecret,
+    roots: &BTreeMap<String, ImportRoot>,
     timeouts: aruna_core::structs::storage::blob::BlobTimeoutConfig,
 ) -> Result<NodeBackend, BlobError> {
+    if record.kind == GroupBackendKind::Fs {
+        return folder_entry(record, roots, timeouts);
+    }
     let mut service_config: HashMap<String, String> = record.public_config.clone();
     // The default bucket stays for bucket selection; `operator_for` drops it.
     service_config.retain(|key, _| {
@@ -71,6 +77,48 @@ pub(super) fn group_entry(
             bucket_prefix: None,
             max_bucket_size: None,
             multipart_bucket,
+            timeouts,
+        },
+        None,
+    ))
+}
+
+/// A folder storage serves its folder below an import root that lists its group on this node.
+/// Its upload parts wait in Aruna's parts folder at the top of the folder.
+fn folder_entry(
+    record: &GroupStorage,
+    roots: &BTreeMap<String, ImportRoot>,
+    timeouts: aruna_core::structs::storage::blob::BlobTimeoutConfig,
+) -> Result<NodeBackend, BlobError> {
+    let root = record.public_config.get("root");
+    let Some(root) = root.and_then(|name| roots.get(name)) else {
+        return Err(BlobError::OperatorCreationFailed(format!(
+            "group backend {} names an import root this node does not offer",
+            record.backend_id
+        )));
+    };
+    if !root.allows(record.group_id) {
+        return Err(BlobError::OperatorCreationFailed(format!(
+            "the import root of group backend {} does not list its group",
+            record.backend_id
+        )));
+    }
+    let service_config = HashMap::from([
+        ("path".to_string(), root.path.clone()),
+        ("writable".to_string(), root.writable.to_string()),
+    ]);
+    Ok(NodeBackend::new(
+        BackendConfig {
+            backend_type: Backend::Group(GroupBackendKind::Fs),
+            root: record
+                .public_config
+                .get("folder")
+                .cloned()
+                .unwrap_or_default(),
+            service_config,
+            bucket_prefix: None,
+            max_bucket_size: None,
+            multipart_bucket: Some(PARTS_PREFIX.to_string()),
             timeouts,
         },
         None,
@@ -366,7 +414,8 @@ impl BlobHandler {
             GroupStorage::from_bytes(record.as_ref()).map_err(BlobError::ConversionError)?;
         let secret =
             GroupStorageSecret::from_bytes(secret.expose()).map_err(BlobError::ConversionError)?;
-        group_entry(&record, &secret, self.registry.timeouts())
+        let roots = self.registry.import_roots();
+        group_entry(&record, &secret, roots, self.registry.timeouts())
     }
 
     /// Create-time proof that the credentials work and the endpoint is
@@ -376,7 +425,8 @@ impl BlobHandler {
         record: GroupStorage,
         secret: GroupStorageSecret,
     ) -> BlobEvent {
-        let entry = match group_entry(&record, &secret, self.registry.timeouts()) {
+        let roots = self.registry.import_roots();
+        let entry = match group_entry(&record, &secret, roots, self.registry.timeouts()) {
             Ok(entry) => entry,
             Err(error) => return BlobEvent::Error(error),
         };
@@ -393,6 +443,12 @@ impl BlobHandler {
             Ok(operator) => operator,
             Err(error) => return BlobEvent::Error(BlobError::OperatorCreationFailed(error)),
         };
+        if record.kind == GroupBackendKind::Fs {
+            return match check_folder(&operator, record.backend_id, &entry.config.root).await {
+                Ok(()) => BlobEvent::GroupBackendChecked,
+                Err(error) => BlobEvent::Error(error),
+            };
+        }
 
         let (label, name) = container_label(&record);
         match probe(&operator, record.backend_id, label, name).await {
@@ -511,6 +567,35 @@ async fn probe(
     Ok(())
 }
 
+/// Proves a folder storage can be read: its folder exists and lists. A writable one also takes
+/// the test write, and its emptied test folder goes again.
+async fn check_folder(
+    operator: &opendal::Operator,
+    backend_id: Ulid,
+    folder: &str,
+) -> Result<(), BlobError> {
+    let listed = async { operator.lister("/").await?.try_next().await.map(|_| ()) };
+    if let Err(error) = listed.await {
+        tracing::warn!(%backend_id, kind = ?error.kind(), "folder backend test listing failed");
+        let message = match error.kind() {
+            ErrorKind::NotFound | ErrorKind::ConfigInvalid => {
+                format!("The folder `{folder}` does not exist on this node.")
+            }
+            ErrorKind::PermissionDenied => format!("The node may not read the folder `{folder}`."),
+            _ => "The folder could not be read. The node log has details.".to_string(),
+        };
+        return Err(BlobError::ReadError(message));
+    }
+    if !operator.info().capability().write {
+        return Ok(());
+    }
+    probe(operator, backend_id, "folder", folder).await?;
+    if let Err(error) = operator.delete(&format!("{PROBE_PREFIX}/")).await {
+        tracing::warn!(%backend_id, %error, "the empty test folder stays");
+    }
+    Ok(())
+}
+
 /// The config key and name of a storage's fixed container.
 fn container_label(record: &GroupStorage) -> (&'static str, &str) {
     ["bucket", "container", "filesystem"]
@@ -552,17 +637,20 @@ fn probe_message(label: &str, name: &str, error: &opendal::Error, delete: bool) 
 
 #[cfg(test)]
 mod tests {
-    use super::{bucket_answer, container_label, group_entry, group_ids, probe, probe_message};
+    use super::{
+        bucket_answer, check_folder, container_label, group_entry, group_ids, probe, probe_message,
+    };
     use aruna_core::effects::BlobEffect;
     use aruna_core::errors::BlobError;
     use aruna_core::events::BlobEvent;
+    use aruna_core::structs::storage::backends::ImportRoot;
     use aruna_core::structs::storage::blob::{
         Backend, BackendRef, BlobTimeoutConfig, ResolvedBackend,
     };
     use aruna_core::structs::storage::group_backend::{
         GroupBackendKind, GroupStorage, GroupStorageSecret,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -620,6 +708,7 @@ mod tests {
                 ],
             ),
             &secret(),
+            &BTreeMap::new(),
             BlobTimeoutConfig::default(),
         )
         .unwrap();
@@ -655,7 +744,13 @@ mod tests {
     fn entry_without_bucket() {
         // Aruna's own keys never reach the service config.
         let mut storage = record(GroupBackendKind::S3, &[("endpoint", "https://s3.lab")]);
-        let entry = group_entry(&storage, &secret(), BlobTimeoutConfig::default()).unwrap();
+        let entry = group_entry(
+            &storage,
+            &secret(),
+            &BTreeMap::new(),
+            BlobTimeoutConfig::default(),
+        )
+        .unwrap();
         assert!(!entry.config.service_config.contains_key("bucket"));
         assert_eq!(entry.config.multipart_bucket, None);
 
@@ -663,7 +758,13 @@ mod tests {
         storage
             .public_config
             .insert("bucket:lab-raw".to_string(), "created".to_string());
-        let entry = group_entry(&storage, &secret(), BlobTimeoutConfig::default()).unwrap();
+        let entry = group_entry(
+            &storage,
+            &secret(),
+            &BTreeMap::new(),
+            BlobTimeoutConfig::default(),
+        )
+        .unwrap();
         assert_eq!(entry.config.multipart_bucket.as_deref(), Some("lab-raw"));
         storage
             .public_config
@@ -671,7 +772,13 @@ mod tests {
         storage
             .public_config
             .insert("layout:lab-old".to_string(), "true".to_string());
-        let entry = group_entry(&storage, &secret(), BlobTimeoutConfig::default()).unwrap();
+        let entry = group_entry(
+            &storage,
+            &secret(),
+            &BTreeMap::new(),
+            BlobTimeoutConfig::default(),
+        )
+        .unwrap();
         assert_eq!(
             entry.config.multipart_bucket.as_deref(),
             Some("lab-default")
@@ -684,7 +791,15 @@ mod tests {
         );
         // Other kinds still need their container.
         let azure = record(GroupBackendKind::Azblob, &[("endpoint", "https://az")]);
-        assert!(group_entry(&azure, &secret(), BlobTimeoutConfig::default()).is_err());
+        assert!(
+            group_entry(
+                &azure,
+                &secret(),
+                &BTreeMap::new(),
+                BlobTimeoutConfig::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -727,6 +842,73 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    fn import_roots(path: &str, groups: Vec<Ulid>, writable: bool) -> BTreeMap<String, ImportRoot> {
+        let root = ImportRoot {
+            path: path.to_string(),
+            groups,
+            writable,
+        };
+        BTreeMap::from([("projects".to_string(), root)])
+    }
+
+    #[test]
+    fn requires_listed_root() {
+        let storage = record(
+            GroupBackendKind::Fs,
+            &[("root", "projects"), ("folder", "raw/")],
+        );
+        let timeouts = BlobTimeoutConfig::default();
+
+        let roots = import_roots("/srv/share", vec![storage.group_id], true);
+        let entry = group_entry(&storage, &secret(), &roots, timeouts).unwrap();
+        assert_eq!(entry.config.root, "raw/");
+        assert_eq!(entry.config.service_config["path"], "/srv/share");
+        assert_eq!(entry.config.service_config["writable"], "true");
+        assert_eq!(
+            entry.config.multipart_bucket.as_deref(),
+            Some("_aruna_parts")
+        );
+        let other = import_roots("/srv/share", vec![Ulid::nil()], true);
+        assert!(group_entry(&storage, &secret(), &other, timeouts).is_err());
+        assert!(group_entry(&storage, &secret(), &BTreeMap::new(), timeouts).is_err());
+    }
+
+    async fn folder_checked(dir: &std::path::Path, folder: &str, writable: bool) -> bool {
+        let storage = record(
+            GroupBackendKind::Fs,
+            &[("root", "projects"), ("folder", folder)],
+        );
+        let roots = import_roots(dir.to_str().unwrap(), vec![storage.group_id], writable);
+        let entry = group_entry(&storage, &secret(), &roots, BlobTimeoutConfig::default());
+        let mut config = entry.unwrap().config.service_config;
+        config.insert("root".to_string(), folder.to_string());
+        let guard =
+            crate::egress::EgressGuard::new(aruna_core::egress::EgressPolicy::loopback()).unwrap();
+        let operator =
+            crate::opendal::build_group_service(GroupBackendKind::Fs, config, &guard).unwrap();
+        check_folder(&operator, storage.backend_id, folder)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn checks_folder_access() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("raw")).unwrap();
+        std::fs::write(dir.path().join("raw/a.csv"), "a").unwrap();
+
+        assert!(folder_checked(dir.path(), "raw/", false).await);
+        assert!(!folder_checked(dir.path(), "missing/", false).await);
+        assert!(folder_checked(dir.path(), "raw/", true).await);
+        // The test write leaves neither a file nor its folder behind.
+        let mut left: Vec<_> = std::fs::read_dir(dir.path().join("raw"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["a.csv"]);
     }
 
     #[tokio::test]

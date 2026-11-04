@@ -995,6 +995,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn refuses_escaping_link() {
         let root = tempfile::tempdir().unwrap();

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::create::{CreateBackendError, CreateBackendInput};
-use super::validation::{check_identity, validate_backend_input};
+use super::validation::{check_identity, check_import_root, validate_backend_input};
 use super::{backend_key, parse_read, record_writes};
 use crate::storage_read::StorageReadError;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
@@ -121,6 +121,10 @@ impl ReplaceBackendOperation {
             Err(error) => return self.fail(error.into()),
         };
         if let Err(error) = check_identity(&existing, self.input.kind, &normalized.public) {
+            return self.fail(error.into());
+        }
+        let (kind, roots) = (self.input.kind, &self.input.import_roots);
+        if let Err(error) = check_import_root(kind, &normalized.public, existing.group_id, roots) {
             return self.fail(error.into());
         }
 
@@ -395,6 +399,7 @@ mod pure_tests {
                 ("secret_access_key".to_string(), "new-key".to_string()),
             ]),
             cleanup: CleanupStrategy::Retain,
+            import_roots: Default::default(),
         }
     }
 

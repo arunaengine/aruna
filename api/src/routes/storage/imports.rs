@@ -366,6 +366,7 @@ pub async fn create_import(
                 .unwrap_or_else(|| PLAIN_PATTERN.to_string()),
             now: SystemTime::now(),
             move_existing: request.move_existing,
+            import_roots: state.import_roots().clone(),
         }),
         &state.get_ctx(),
     )

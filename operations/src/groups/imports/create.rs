@@ -17,16 +17,19 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::{BackendImport, valid_pattern};
+use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
 use aruna_core::structs::storage::group_backend::{
-    BUCKET_DELETING, BUCKET_STATE, GroupStorage, MAX_KEY_LEN, path_bucket, valid_bucket,
+    BUCKET_DELETING, BUCKET_STATE, GroupBackendKind, GroupStorage, MAX_KEY_LEN, path_bucket,
+    valid_bucket,
 };
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
 
@@ -50,6 +53,8 @@ pub struct CreateImportInput {
     pub now: SystemTime,
     /// Also moves the bucket's stored copies under `key_prefix` to where the rule sends writes.
     pub move_existing: bool,
+    /// This node's import roots, which tell whether a local folder may be written.
+    pub import_roots: BTreeMap<String, ImportRoot>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +196,11 @@ impl CreateImportOperation {
             (Ok(backend), Ok(write_backend)) => (backend, write_backend),
             (Err(error), _) | (_, Err(error)) => return self.fail(error),
         };
+        if read_only(&write_backend, &self.input.import_roots) {
+            return self.invalid(
+                "This local folder is read-only. Name a writable write_backend_id for new files.",
+            );
+        }
         let folders = [
             (backend, self.input.backend_prefix.clone()),
             (write_backend, self.write_folder().to_string()),
@@ -531,6 +541,14 @@ impl CreateImportOperation {
     }
 }
 
+/// Whether `storage` is a local folder whose import root on this node allows no writes.
+fn read_only(storage: &GroupStorage, roots: &BTreeMap<String, ImportRoot>) -> bool {
+    let root = storage.public_config.get("root");
+    let root = root.and_then(|name| roots.get(name));
+    storage.kind == GroupBackendKind::Fs
+        && !root.is_some_and(|root| root.writable && root.allows(storage.group_id))
+}
+
 /// A folder on a storage without a bucket starts with a bucket that never held the default
 /// rule; no folder lies in Aruna's own folders or leaves no room for a file. Answers the
 /// bucket to check.
@@ -687,6 +705,7 @@ mod tests {
             write_pattern: DEFAULT_PATTERN.to_string(),
             now: SystemTime::UNIX_EPOCH,
             move_existing: false,
+            import_roots: BTreeMap::new(),
         }
     }
 
@@ -1102,6 +1121,36 @@ mod tests {
         let mut operation = CreateImportOperation::new(bad);
         assert!(operation.start().is_empty());
         assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+    }
+
+    #[test]
+    fn needs_writable_folder() {
+        use aruna_core::structs::storage::backends::ImportRoot;
+        let mut folder = storage(&[("root", "projects")]);
+        folder.kind = GroupBackendKind::Fs;
+        let root = |writable| ImportRoot {
+            path: "/srv/share".to_string(),
+            groups: vec![group()],
+            writable,
+        };
+
+        // A read-only folder without another write backend is refused before any write.
+        let (operation, effects) = on_split(input("raw/", ""), &folder);
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+        let mut read_only = input("raw/", "");
+        read_only.import_roots = BTreeMap::from([("projects".to_string(), root(false))]);
+        let (operation, effects) = on_split(read_only, &folder);
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
+
+        let mut writable = input("raw/", "");
+        writable.import_roots = BTreeMap::from([("projects".to_string(), root(true))]);
+        let (_, effects) = on_split(writable, &folder);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+        ));
     }
 
     #[test]

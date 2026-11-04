@@ -13,8 +13,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::storage::backend_import::BackendImport;
+use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::discovery::DiscoveryRules;
-use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, GroupStorageRouting, RoutingError, RoutingTarget, validate_tenant_target,
 };
@@ -164,6 +165,9 @@ impl Operation for GroupInputsOperation {
                         let folders = record.reserved_folders();
                         self.inputs.containers.insert(record.backend_id, folders);
                         self.inputs.backend_ids.insert(record.backend_id);
+                        if record.kind == GroupBackendKind::Fs {
+                            self.inputs.folder_ids.insert(record.backend_id);
+                        }
                     }
                     if let Some(start_after) = next_start_after {
                         return self.scan_backends(Some(start_after));
@@ -245,6 +249,19 @@ impl Operation for GroupInputsOperation {
 }
 
 /// Emits the sub-operation that loads a group's routing inputs.
+/// Refuses a target naming a local folder backend; only import rules route to one.
+pub(crate) fn refuse_folder(
+    target: &RoutingTarget,
+    folders: &BTreeSet<Ulid>,
+) -> Result<(), RoutingError> {
+    match target {
+        RoutingTarget::Backend(BackendRef::Group(id)) if folders.contains(id) => {
+            Err(RoutingError::FolderTarget(*id))
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn load_group_inputs(group_id: GroupId) -> Effect {
     Effect::SubOperation(boxed_suboperation(
         GroupInputsOperation::new(group_id),
@@ -330,9 +347,10 @@ impl PutGroupOperation {
         smallvec![]
     }
 
-    fn write_record(&mut self, owned: &BTreeSet<Ulid>) -> Effects {
+    fn write_record(&mut self, owned: &BTreeSet<Ulid>, folders: &BTreeSet<Ulid>) -> Effects {
         if let Some(target) = self.record.default_target.as_ref()
-            && let Err(error) = validate_tenant_target(target, owned)
+            && let Err(error) =
+                validate_tenant_target(target, owned).and_then(|()| refuse_folder(target, folders))
         {
             return self.fail(error.into());
         }
@@ -376,7 +394,7 @@ impl Operation for PutGroupOperation {
                     });
                 };
                 match result {
-                    Ok(inputs) => self.write_record(&inputs.backend_ids),
+                    Ok(inputs) => self.write_record(&inputs.backend_ids, &inputs.folder_ids),
                     Err(error) => self.fail(PutGroupError::InputsUnavailable(error)),
                 }
             }
@@ -676,6 +694,34 @@ mod pure_tests {
             operation.finalize(),
             Err(PutGroupError::InvalidStateEvent { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_folder_default() {
+        // A local folder serves imports only, so it never becomes the group default.
+        let folder = Ulid::from_bytes([4u8; 16]);
+        let mut operation = PutGroupOperation::new(
+            group(),
+            Some(RoutingTarget::Backend(BackendRef::Group(folder))),
+            aruna_core::UserId::default(),
+            SystemTime::UNIX_EPOCH,
+        );
+        operation.start();
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
+            result: Ok(GroupRoutingInputs {
+                backend_ids: BTreeSet::from([folder]),
+                folder_ids: BTreeSet::from([folder]),
+                ..Default::default()
+            }),
+        }));
+
+        assert!(effects.is_empty(), "expected no write, got {effects:?}");
+        assert_eq!(
+            operation.finalize(),
+            Err(PutGroupError::InvalidTarget(RoutingError::FolderTarget(
+                folder
+            )))
+        );
     }
 
     #[test]
