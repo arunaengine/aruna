@@ -122,6 +122,30 @@ Building from source needs the Rust version named in [rust-toolchain.toml](rust-
 The node then serves the API documentation on `http://127.0.0.1:3000/swagger-ui` and the S3
 interface on `http://127.0.0.1:1337`.
 
+## Command Line Client
+
+`aruna-cli` talks to a realm's REST and S3 APIs directly, without a local node. Create a token
+in the portal (Settings, API sessions) and sign in with it:
+
+```bash
+cargo install --path cli
+aruna-cli login --api https://node.example --token <TOKEN>
+aruna-cli buckets ls
+aruna-cli cp results.csv my-bucket/run-42/
+aruna-cli sync ./run-42 my-bucket/run-42 --dry-run
+aruna-cli meta search "proteomics"
+```
+
+The token is kept in the OS keyring. Without a keyring, set `ARUNA_API` and `ARUNA_TOKEN` instead of
+signing in; the token is then never stored.
+`aruna-cli --help` and `aruna-cli <command> --help` describe every command.
+
+On Linux, `aruna-cli` includes a copy of libdbus, built from source, to reach the Secret Service
+keyring. libdbus, part of the freedesktop.org D-Bus project, is offered under the Academic Free
+License version 2.1 or the GPL version 2; `aruna-cli` uses it under the
+[Academic Free License version 2.1](https://spdx.org/licenses/AFL-2.1.html). Its copyright and
+license notices are in the `vendor/dbus` folder of the `libdbus-sys` crate.
+
 ## Encrypted Buckets
 
 A group admin can turn on encryption for a bucket, in the portal or with
