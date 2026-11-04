@@ -79,6 +79,14 @@ pub(super) const LAYOUT: Layout = &[
     ("SourceMetadata", 4),
 ];
 
+/// The same versions whose source binding was stored before it had mirrors.
+const BEFORE_MIRRORS: Layout = &[
+    ("BlobVersion", 6),
+    ("PortableSourceDescriptor", 6),
+    ("SourceMetadata", 4),
+    ("VersionSourceBinding", 3),
+];
+
 impl From<LegacyVersion> for BlobVersion {
     fn from(old: LegacyVersion) -> Self {
         let state = match old.state {
@@ -132,13 +140,14 @@ fn current_version(value: &[u8]) -> Result<(BlobVersion, bool), postcard::Error>
             return Ok((version, true));
         }
     }
-    match session_refs::decode::<BlobVersion>(value, LAYOUT) {
-        Ok(version) => Ok((version, true)),
-        Err(_) => Ok((
-            session_refs::decode::<LegacyVersion>(value, LAYOUT)?.into(),
-            true,
-        )),
+    for layout in [LAYOUT, BEFORE_MIRRORS] {
+        if let Ok(version) = session_refs::decode::<BlobVersion>(value, layout) {
+            return Ok((version, true));
+        }
     }
+    let legacy = session_refs::decode::<LegacyVersion>(value, LAYOUT)
+        .or_else(|_| session_refs::decode::<LegacyVersion>(value, BEFORE_MIRRORS))?;
+    Ok((legacy.into(), true))
 }
 
 /// Root record rows by digest.
@@ -178,7 +187,8 @@ pub(super) fn broken_version(value: &[u8]) -> Result<Option<Vec<u8>>, postcard::
     let broken = session_refs::decode::<BrokenVersion>(value, BEFORE_JOBS)
         .or_else(|_| session_refs::decode::<BrokenVersion>(value, BEFORE_ROOT))
         .or_else(|_| session_refs::decode::<BrokenVersion>(value, BEFORE_BOTH))
-        .or_else(|_| session_refs::decode::<BrokenVersion>(value, LAYOUT))?;
+        .or_else(|_| session_refs::decode::<BrokenVersion>(value, LAYOUT))
+        .or_else(|_| session_refs::decode::<BrokenVersion>(value, BEFORE_MIRRORS))?;
     Ok(Some(postcard::to_allocvec(&broken)?))
 }
 
@@ -411,6 +421,79 @@ mod tests {
         assert_eq!(decoded(b"hopped"), hopped);
         let (listed, _) = compact_version(listed).expect("compacts");
         assert_eq!(decoded(b"listed"), listed);
+        let again = migrate_output(database).expect("migration repeats");
+        assert_eq!(again.versions_rewritten, 0);
+    }
+
+    #[test]
+    fn pads_binding_mirrors() {
+        // A reference stored before its source binding had mirrors decodes with none; the
+        // rewrite is the current encoding and a second pass changes nothing.
+        let descriptor = PortableSourceDescriptor {
+            kind: SourceConnectorKind::Http,
+            public_config: HashMap::new(),
+            source_path: "data/b.csv".to_string(),
+            version_selector: None,
+            capabilities: Vec::new(),
+            origin_node_id: None,
+            namespace: None,
+            root: None,
+        };
+        let metadata = SourceMetadata {
+            content_length: 7,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: BTreeMap::new(),
+        };
+        let binding = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: descriptor.clone(),
+            connector_id: None,
+            mirrors: Vec::new(),
+        };
+        let now = SystemTime::UNIX_EPOCH;
+        let reference = BlobVersion::reference(
+            binding.clone(),
+            metadata.clone(),
+            now,
+            UserId::default(),
+            now,
+        );
+        let current = reference.to_bytes().expect("encodes");
+        let descriptor = postcard::to_allocvec(&descriptor).expect("encodes");
+        // The binding as stored then: its descriptor without the last two fields, no mirrors.
+        let old_binding = strip(
+            &postcard::to_allocvec(&binding).expect("encodes"),
+            &descriptor,
+            2,
+        );
+        let head = strip(&current[..current.len() - 5], &descriptor, 2);
+        let head = strip(&head, &old_binding, 1);
+        let old = strip(
+            &head,
+            &postcard::to_allocvec(&metadata).expect("encodes"),
+            1,
+        );
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let database = path.to_str().expect("path");
+        write(
+            &path,
+            BLOB_VERSIONS_KEYSPACE,
+            vec![(b"bound".as_slice(), old)],
+        );
+
+        let output = migrate_output(database).expect("migration runs");
+
+        assert_eq!(output.versions_rewritten, 1);
+        let rows = read(&path, BLOB_VERSIONS_KEYSPACE);
+        let (compact, _) = compact_version(reference).expect("compacts");
+        assert_eq!(
+            rows[b"bound".as_slice()],
+            compact.to_bytes().expect("encodes")
+        );
         let again = migrate_output(database).expect("migration repeats");
         assert_eq!(again.versions_rewritten, 0);
     }
