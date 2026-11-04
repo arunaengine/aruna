@@ -140,6 +140,12 @@ The token is kept in the OS keyring. Without a keyring, set `ARUNA_API` and `ARU
 signing in; the token is then never stored.
 `aruna-cli --help` and `aruna-cli <command> --help` describe every command.
 
+On Linux, `aruna-cli` includes a copy of libdbus, built from source, to reach the Secret Service
+keyring. libdbus, part of the freedesktop.org D-Bus project, is offered under the Academic Free
+License version 2.1 or the GPL version 2; `aruna-cli` uses it under the
+[Academic Free License version 2.1](https://spdx.org/licenses/AFL-2.1.html). Its copyright and
+license notices are in the `vendor/dbus` folder of the `libdbus-sys` crate.
+
 ## Encrypted Buckets
 
 A group admin can turn on encryption for a bucket, in the portal or with
