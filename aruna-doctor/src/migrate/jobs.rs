@@ -1,5 +1,5 @@
-//! Re-encodes job records and RO-Crate checkpoints from before repository transfers, and job
-//! records whose session references predate the display name or the linked login.
+//! Re-encodes job records and RO-Crate checkpoints from before repository transfers, job pauses
+//! or input content, and job records whose session references predate the linked login.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -11,14 +11,18 @@ use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
 use aruna_core::structs::execution::job::{
     ArtifactRef, AttemptIntent, CapturedInput, CopyJobSpec, ExecutionSpec, ExportOmissionCounts,
-    ExportRoCrateResult, ExportRoCrateSpec, ImportRoCrateResult, ImportRoCrateSpec, JobClaim,
-    JobError, JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload,
-    JobState, OutputObject, RoCrateLimits, WorkspaceMode, encode_dedup_value, parse_dedup_value,
+    ExportRoCrateResult, ExportRoCrateSpec, ImportRoCrateResult, ImportRoCrateSpec, InputContent,
+    JobClaim, JobError, JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord,
+    JobResultPayload, JobState, OutputObject, RoCrateLimits, WorkspaceMode, encode_dedup_value,
+    parse_dedup_value,
 };
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::secondary_id::SecondaryIdentifier;
+use aruna_core::structs::placement::policy::PlacementPolicyRef;
+use aruna_core::structs::secondary_id::{RegisterIdentifiersSpec, SecondaryIdentifier};
+use aruna_core::structs::storage::backend_import::BackendImportSpec;
 use aruna_core::structs::storage::blob::BucketIdentity;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeResult, StoragePurgeSpec};
+use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::jobs::export::ExportCheckpoint;
 use aruna_operations::jobs::import::ImportCheckpoint;
@@ -61,8 +65,17 @@ pub(super) fn job_rows(
 /// A record in the current shape except for its staging spec.
 type StagingJob = LegacyJob<ExportRoCrateSpec, ExportRoCrateResult>;
 
+/// A record of alpha.134: a staging job, progress and captured inputs in their older shapes.
+type InputJob = LegacyJob<ExportRoCrateSpec, ExportRoCrateResult, LegacyProgress, LegacyInput>;
+
 /// The current record of an older row; every byte of the row must be used.
 fn upgraded(value: &[u8]) -> Option<JobRecord> {
+    // The round trip keeps a row of another shape from reading as one of alpha.134.
+    if let Ok(old) = postcard::from_bytes::<InputJob>(value)
+        && postcard::to_allocvec(&old).is_ok_and(|bytes| bytes == value)
+    {
+        return Some(input_record(old));
+    }
     if let Ok(legacy) = session_refs::decode::<LegacyJob>(value, &[]) {
         return Some(legacy.into());
     }
@@ -79,6 +92,17 @@ fn upgraded(value: &[u8]) -> Option<JobRecord> {
         }
     }
     None
+}
+
+/// The inputs of an alpha.134 execution take the group it runs in as their source group.
+fn input_record(old: InputJob) -> JobRecord {
+    let mut record = JobRecord::from(old);
+    if let JobPayload::Execution(spec) = &record.payload {
+        for input in &mut record.captured_inputs {
+            input.source_group_id = spec.group_id;
+        }
+    }
+    record
 }
 
 /// Dedup rows that name a rewritten job with another plan digest than the job now has.
@@ -253,6 +277,9 @@ pub(super) enum LegacyPayload<E> {
     MintPersistentId(MintPersistentSpec),
     StoragePurge(StoragePurgeSpec),
     CopyObject(CopyJobSpec),
+    RegisterIdentifiers(RegisterIdentifiersSpec),
+    BackendImport(BackendImportSpec),
+    StoragePurgeFiles(StoragePurgeSpec),
 }
 
 /// Previous shape of `JobResultPayload`: only the export variant differs.
@@ -296,12 +323,44 @@ pub(super) enum LegacyResult<R> {
         bytes: u64,
         blake3: String,
     },
+    Identifiers {
+        changed: bool,
+    },
+    BackendImport {
+        imported: u64,
+        skipped: u64,
+        failed: u64,
+    },
+}
+
+/// Previous shape of `JobProgress`, before pauses.
+#[derive(Serialize, Deserialize)]
+struct LegacyProgress {
+    current: u64,
+    total: Option<u64>,
+    unit: String,
+}
+
+/// Previous shape of `CapturedInput`, before the content identity and the source details.
+#[derive(Serialize, Deserialize)]
+struct LegacyInput {
+    destination_key: String,
+    source_node_id: NodeId,
+    version_id: Ulid,
+    blake3: [u8; 32],
+    bytes: u64,
+    policies: Vec<PlacementPolicyRef>,
 }
 
 /// Previous shape of `JobRecord`; with the current export shapes, the one before the staging
 /// bucket identity.
 #[derive(Serialize, Deserialize)]
-pub(super) struct LegacyJob<E = LegacyExportSpec, R = LegacyExportResult> {
+pub(super) struct LegacyJob<
+    E = LegacyExportSpec,
+    R = LegacyExportResult,
+    P = JobProgress,
+    I = CapturedInput,
+> {
     pub(super) job_id: JobId,
     pub(super) payload: LegacyPayload<E>,
     pub(super) state: JobState,
@@ -316,7 +375,7 @@ pub(super) struct LegacyJob<E = LegacyExportSpec, R = LegacyExportResult> {
     pub(super) next_attempt_epoch: u64,
     pub(super) has_run: bool,
     pub(super) last_error: Option<JobError>,
-    pub(super) progress: JobProgress,
+    pub(super) progress: P,
     pub(super) cancel_requested: bool,
     pub(super) claim: Option<JobClaim>,
     pub(super) dedup_key: Option<Vec<u8>>,
@@ -326,10 +385,44 @@ pub(super) struct LegacyJob<E = LegacyExportSpec, R = LegacyExportResult> {
     pub(super) attempt_intent: Option<AttemptIntent>,
     pub(super) workspace_bucket: Option<String>,
     pub(super) workspace_mode: WorkspaceMode,
-    pub(super) captured_inputs: Vec<CapturedInput>,
+    pub(super) captured_inputs: Vec<I>,
     pub(super) report_digest: Option<[u8; 32]>,
     pub(super) retention_ms: u64,
     pub(super) locally_exhausted: bool,
+}
+
+impl From<LegacyProgress> for JobProgress {
+    fn from(old: LegacyProgress) -> Self {
+        Self {
+            current: old.current,
+            total: old.total,
+            unit: old.unit,
+            paused_until: None,
+        }
+    }
+}
+
+/// The source group is unknown here; `input_record` sets it.
+impl From<LegacyInput> for CapturedInput {
+    fn from(old: LegacyInput) -> Self {
+        Self {
+            destination_key: old.destination_key,
+            source_node_id: old.source_node_id,
+            version_id: old.version_id,
+            content: InputContent::Blake3(old.blake3),
+            bytes: old.bytes,
+            policies: old.policies,
+            source_group_id: GroupId::default(),
+            public: false,
+            link: None,
+            source_pin: None,
+            served_by: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
+        }
+    }
 }
 
 impl From<LegacyExportSpec> for ExportRoCrateSpec {
@@ -390,6 +483,9 @@ impl<E: Into<ExportRoCrateSpec>> From<LegacyPayload<E>> for JobPayload {
             LegacyPayload::MintPersistentId(spec) => Self::MintPersistentId(spec),
             LegacyPayload::StoragePurge(spec) => Self::StoragePurge(spec),
             LegacyPayload::CopyObject(spec) => Self::CopyObject(spec),
+            LegacyPayload::RegisterIdentifiers(spec) => Self::RegisterIdentifiers(spec),
+            LegacyPayload::BackendImport(spec) => Self::BackendImport(spec),
+            LegacyPayload::StoragePurgeFiles(spec) => Self::StoragePurgeFiles(spec),
         }
     }
 }
@@ -448,16 +544,28 @@ impl<R: Into<ExportRoCrateResult>> From<LegacyResult<R>> for JobResultPayload {
                 bytes,
                 blake3,
             },
+            LegacyResult::Identifiers { changed } => Self::Identifiers { changed },
+            LegacyResult::BackendImport {
+                imported,
+                skipped,
+                failed,
+            } => Self::BackendImport {
+                imported,
+                skipped,
+                failed,
+            },
         }
     }
 }
 
-impl<E, R> From<LegacyJob<E, R>> for JobRecord
+impl<E, R, P, I> From<LegacyJob<E, R, P, I>> for JobRecord
 where
     E: Into<ExportRoCrateSpec>,
     R: Into<ExportRoCrateResult>,
+    P: Into<JobProgress>,
+    I: Into<CapturedInput>,
 {
-    fn from(legacy: LegacyJob<E, R>) -> Self {
+    fn from(legacy: LegacyJob<E, R, P, I>) -> Self {
         Self {
             job_id: legacy.job_id,
             payload: legacy.payload.into(),
@@ -473,7 +581,7 @@ where
             next_attempt_epoch: legacy.next_attempt_epoch,
             has_run: legacy.has_run,
             last_error: legacy.last_error,
-            progress: legacy.progress,
+            progress: legacy.progress.into(),
             cancel_requested: legacy.cancel_requested,
             claim: legacy.claim,
             dedup_key: legacy.dedup_key,
@@ -483,7 +591,7 @@ where
             attempt_intent: legacy.attempt_intent,
             workspace_bucket: legacy.workspace_bucket,
             workspace_mode: legacy.workspace_mode,
-            captured_inputs: legacy.captured_inputs,
+            captured_inputs: legacy.captured_inputs.into_iter().map(Into::into).collect(),
             report_digest: legacy.report_digest,
             retention_ms: legacy.retention_ms,
             locally_exhausted: legacy.locally_exhausted,
@@ -496,17 +604,24 @@ mod tests {
     use super::{LegacyExportResult, LegacyExportSpec, LegacyJob, LegacyPayload, LegacyResult};
     use crate::migrate::migrate_output;
     use crate::migrate::tests::{read, write};
+    use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{JOB_KEYSPACE, JOB_STATE_KEYSPACE};
     use aruna_core::structs::execution::job::{
-        ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec, ImportMetadataTarget,
-        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload, JobRecord,
-        JobResultPayload, JobState, RoCrateLimits, job_record_key,
+        CapturedInput, ExecutionSpec, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
+        ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
+        InputContent, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState,
+        RoCrateLimits, job_record_key,
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::policy::PlacementPolicyRef;
+    use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
+    use aruna_core::structs::storage::backend_import::BackendImportSpec;
+    use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
     use aruna_operations::jobs::export::ExportCheckpoint;
     use aruna_operations::jobs::import::ImportCheckpoint;
+    use serde::Serialize;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -745,5 +860,170 @@ mod tests {
         }
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert_eq!((again.jobs_rewritten, again.job_dedup_rewritten), (0, 0));
+    }
+
+    /// `CapturedInput` as alpha.134 stored it.
+    #[derive(Serialize)]
+    struct OldInput {
+        destination_key: String,
+        source_node_id: NodeId,
+        version_id: Ulid,
+        blake3: [u8; 32],
+        bytes: u64,
+        policies: Vec<PlacementPolicyRef>,
+    }
+
+    fn execution(group_id: Ulid) -> ExecutionSpec {
+        ExecutionSpec {
+            group_id,
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine".to_string(),
+            entrypoint: None,
+            command: vec!["true".to_string()],
+            workdir: None,
+            env: Default::default(),
+            resources: Default::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        }
+    }
+
+    #[test]
+    fn rewrites_hashed_inputs() {
+        // An alpha.134 execution kept its progress without a pause and its inputs with a plain
+        // hash. It gains both, its inputs take the execution's group, and a second run is a no-op.
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let group = Ulid::from_bytes([7u8; 16]);
+        let node = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let policies = vec![PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([6u8; 16]),
+            digest: [7u8; 32],
+        }];
+        let old_input = OldInput {
+            destination_key: "inputs/table.csv".to_string(),
+            source_node_id: node,
+            version_id: Ulid::from_bytes([4u8; 16]),
+            blake3: [5u8; 32],
+            bytes: 42,
+            policies: policies.clone(),
+        };
+        let input = CapturedInput {
+            destination_key: old_input.destination_key.clone(),
+            source_node_id: node,
+            version_id: old_input.version_id,
+            content: InputContent::Blake3([5u8; 32]),
+            bytes: 42,
+            policies,
+            source_group_id: group,
+            public: false,
+            link: None,
+            source_pin: None,
+            served_by: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
+        };
+        let payload = JobPayload::Execution(execution(group));
+        let mut record = JobRecord::new(job_id, payload, UserId::nil(REALM), node, 5, 5, None);
+        record.progress = JobProgress::new("alpha-files");
+        record.captured_inputs = vec![input.clone()];
+        // Alpha.134 lacked the trailing pause byte and wrote each input in its older shape.
+        let progress = postcard::to_allocvec(&record.progress).unwrap();
+        let unpaused = &progress[..progress.len() - 1];
+        let stored = splice(&record.to_bytes().unwrap(), &progress, unpaused);
+        let new_input = postcard::to_allocvec(&input).unwrap();
+        let stored = splice(
+            &stored,
+            &new_input,
+            &postcard::to_allocvec(&old_input).unwrap(),
+        );
+        write(&path, JOB_KEYSPACE, vec![(&job_record_key(job_id), stored)]);
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!((output.jobs_scanned, output.jobs_rewritten), (1, 1));
+        let jobs = read(&path, JOB_KEYSPACE);
+        let migrated = JobRecord::from_bytes(&jobs[job_record_key(job_id).as_ref()]).unwrap();
+        assert_eq!(migrated, record);
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!(again.jobs_rewritten, 0);
+        assert_eq!(read(&path, JOB_KEYSPACE), jobs);
+    }
+
+    #[test]
+    fn rewrites_later_kinds() {
+        // Identifier registrations, backend imports and file purges of alpha.134 differ from the
+        // current shape only by the missing pause byte, and gain it.
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let node = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let group = Ulid::from_bytes([7u8; 16]);
+        let identifiers = JobPayload::RegisterIdentifiers(RegisterIdentifiersSpec {
+            document_id: Ulid::from_bytes([2u8; 16]),
+            identifiers: Vec::new(),
+            auth_context: auth(),
+        });
+        let import = JobPayload::BackendImport(BackendImportSpec {
+            auth_context: auth(),
+            node_id: node,
+            group_id: group,
+            import_id: Ulid::from_bytes([3u8; 16]),
+        });
+        let purge = JobPayload::StoragePurgeFiles(StoragePurgeSpec {
+            scope: StoragePurgeScope::Bucket {
+                bucket: "linked".to_string(),
+            },
+            group_id: group,
+            auth_context: auth(),
+            node_id: node,
+        });
+        let results = [
+            Some(JobResultPayload::Identifiers { changed: true }),
+            Some(JobResultPayload::BackendImport {
+                imported: 4,
+                skipped: 1,
+                failed: 0,
+            }),
+            None,
+        ];
+        let mut records = Vec::new();
+        let mut rows = Vec::new();
+        let payloads = [identifiers, import, purge].into_iter().zip(results);
+        for (seed, (payload, result)) in (1u8..).zip(payloads) {
+            let job_id = JobId::from_bytes([seed; 16]);
+            let mut record = JobRecord::new(job_id, payload, UserId::nil(REALM), node, 5, 5, None);
+            record.progress = JobProgress::new("later-kinds");
+            record.result = result;
+            let progress = postcard::to_allocvec(&record.progress).unwrap();
+            let unpaused = &progress[..progress.len() - 1];
+            let stored = splice(&record.to_bytes().unwrap(), &progress, unpaused);
+            rows.push((job_record_key(job_id), stored));
+            records.push(record);
+        }
+        let entries = rows
+            .iter()
+            .map(|(key, value)| (key.as_ref(), value.clone()));
+        write(&path, JOB_KEYSPACE, entries.collect());
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!((output.jobs_scanned, output.jobs_rewritten), (3, 3));
+        let jobs = read(&path, JOB_KEYSPACE);
+        for record in &records {
+            let key = job_record_key(record.job_id);
+            assert_eq!(JobRecord::from_bytes(&jobs[key.as_ref()]).unwrap(), *record);
+        }
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!(again.jobs_rewritten, 0);
+        assert_eq!(read(&path, JOB_KEYSPACE), jobs);
     }
 }
