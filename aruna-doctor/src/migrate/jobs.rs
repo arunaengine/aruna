@@ -18,7 +18,8 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
-use aruna_core::structs::secondary_id::SecondaryIdentifier;
+use aruna_core::structs::secondary_id::{RegisterIdentifiersSpec, SecondaryIdentifier};
+use aruna_core::structs::storage::backend_import::BackendImportSpec;
 use aruna_core::structs::storage::blob::BucketIdentity;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeResult, StoragePurgeSpec};
 use aruna_core::types::GroupId;
@@ -276,6 +277,9 @@ pub(super) enum LegacyPayload<E> {
     MintPersistentId(MintPersistentSpec),
     StoragePurge(StoragePurgeSpec),
     CopyObject(CopyJobSpec),
+    RegisterIdentifiers(RegisterIdentifiersSpec),
+    BackendImport(BackendImportSpec),
+    StoragePurgeFiles(StoragePurgeSpec),
 }
 
 /// Previous shape of `JobResultPayload`: only the export variant differs.
@@ -318,6 +322,14 @@ pub(super) enum LegacyResult<R> {
         version_id: String,
         bytes: u64,
         blake3: String,
+    },
+    Identifiers {
+        changed: bool,
+    },
+    BackendImport {
+        imported: u64,
+        skipped: u64,
+        failed: u64,
     },
 }
 
@@ -471,6 +483,9 @@ impl<E: Into<ExportRoCrateSpec>> From<LegacyPayload<E>> for JobPayload {
             LegacyPayload::MintPersistentId(spec) => Self::MintPersistentId(spec),
             LegacyPayload::StoragePurge(spec) => Self::StoragePurge(spec),
             LegacyPayload::CopyObject(spec) => Self::CopyObject(spec),
+            LegacyPayload::RegisterIdentifiers(spec) => Self::RegisterIdentifiers(spec),
+            LegacyPayload::BackendImport(spec) => Self::BackendImport(spec),
+            LegacyPayload::StoragePurgeFiles(spec) => Self::StoragePurgeFiles(spec),
         }
     }
 }
@@ -528,6 +543,16 @@ impl<R: Into<ExportRoCrateResult>> From<LegacyResult<R>> for JobResultPayload {
                 version_id,
                 bytes,
                 blake3,
+            },
+            LegacyResult::Identifiers { changed } => Self::Identifiers { changed },
+            LegacyResult::BackendImport {
+                imported,
+                skipped,
+                failed,
+            } => Self::BackendImport {
+                imported,
+                skipped,
+                failed,
             },
         }
     }
@@ -591,6 +616,9 @@ mod tests {
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
+    use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
+    use aruna_core::structs::storage::backend_import::BackendImportSpec;
+    use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
     use aruna_operations::jobs::export::ExportCheckpoint;
     use aruna_operations::jobs::import::ImportCheckpoint;
     use serde::Serialize;
@@ -926,6 +954,74 @@ mod tests {
         let jobs = read(&path, JOB_KEYSPACE);
         let migrated = JobRecord::from_bytes(&jobs[job_record_key(job_id).as_ref()]).unwrap();
         assert_eq!(migrated, record);
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!(again.jobs_rewritten, 0);
+        assert_eq!(read(&path, JOB_KEYSPACE), jobs);
+    }
+
+    #[test]
+    fn rewrites_later_kinds() {
+        // Identifier registrations, backend imports and file purges of alpha.134 differ from the
+        // current shape only by the missing pause byte, and gain it.
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let node = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let group = Ulid::from_bytes([7u8; 16]);
+        let identifiers = JobPayload::RegisterIdentifiers(RegisterIdentifiersSpec {
+            document_id: Ulid::from_bytes([2u8; 16]),
+            identifiers: Vec::new(),
+            auth_context: auth(),
+        });
+        let import = JobPayload::BackendImport(BackendImportSpec {
+            auth_context: auth(),
+            node_id: node,
+            group_id: group,
+            import_id: Ulid::from_bytes([3u8; 16]),
+        });
+        let purge = JobPayload::StoragePurgeFiles(StoragePurgeSpec {
+            scope: StoragePurgeScope::Bucket {
+                bucket: "linked".to_string(),
+            },
+            group_id: group,
+            auth_context: auth(),
+            node_id: node,
+        });
+        let results = [
+            Some(JobResultPayload::Identifiers { changed: true }),
+            Some(JobResultPayload::BackendImport {
+                imported: 4,
+                skipped: 1,
+                failed: 0,
+            }),
+            None,
+        ];
+        let mut records = Vec::new();
+        let mut rows = Vec::new();
+        let payloads = [identifiers, import, purge].into_iter().zip(results);
+        for (seed, (payload, result)) in (1u8..).zip(payloads) {
+            let job_id = JobId::from_bytes([seed; 16]);
+            let mut record = JobRecord::new(job_id, payload, UserId::nil(REALM), node, 5, 5, None);
+            record.progress = JobProgress::new("later-kinds");
+            record.result = result;
+            let progress = postcard::to_allocvec(&record.progress).unwrap();
+            let unpaused = &progress[..progress.len() - 1];
+            let stored = splice(&record.to_bytes().unwrap(), &progress, unpaused);
+            rows.push((job_record_key(job_id), stored));
+            records.push(record);
+        }
+        let entries = rows
+            .iter()
+            .map(|(key, value)| (key.as_ref(), value.clone()));
+        write(&path, JOB_KEYSPACE, entries.collect());
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+        assert_eq!((output.jobs_scanned, output.jobs_rewritten), (3, 3));
+        let jobs = read(&path, JOB_KEYSPACE);
+        for record in &records {
+            let key = job_record_key(record.job_id);
+            assert_eq!(JobRecord::from_bytes(&jobs[key.as_ref()]).unwrap(), *record);
+        }
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert_eq!(again.jobs_rewritten, 0);
         assert_eq!(read(&path, JOB_KEYSPACE), jobs);
