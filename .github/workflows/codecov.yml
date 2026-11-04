@@ -36,6 +36,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
+
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
         with:
@@ -101,6 +104,9 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
 
       - name: Install LLVM tools
         # rust-toolchain.toml supplies the channel, so the tools match the compiler.
