@@ -496,3 +496,455 @@ struct OldEnvelope {
     published_by: NodeId,
     signature: iroh::Signature,
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::explorer::ExplorerError;
+    use crate::migrate::tests::{read, write};
+    use crate::migrate::{MigrateOutput, migrate_output};
+    use aruna_core::NodeId;
+    use aruna_core::UserId;
+    use aruna_core::compute::ExecutionTargetId;
+    use aruna_core::keyspaces::{
+        ACTIVE_USER_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
+        FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+        RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
+    };
+    use aruna_core::structs::execution::job::{
+        EffectiveResources, ExecutionReceipt, ExecutionSpec, JobAdmissionRecord, JobFamilyId,
+        JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, JobRecordKey,
+        JobRecordKind, JobRetryPolicy, RunCrateStatus, SubmissionClaim, SubmissionId,
+    };
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::policy::PlacementPolicyRef;
+    use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_core::types::GroupId;
+    use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_operations::jobs::store::{job_insert_entries, list_user_jobs};
+    use aruna_storage::FjallStorage;
+    use serde::Serialize;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    const REALM: RealmId = RealmId([4u8; 32]);
+    /// The family of every alpha.134 row below.
+    const OLD: JobFamilyId = JobFamilyId {
+        submission_id: SubmissionId([2u8; 32]),
+        request_digest: [3u8; 32],
+    };
+    /// A current family that shares no row with the old one.
+    const KEPT: JobFamilyId = JobFamilyId {
+        submission_id: SubmissionId([12u8; 32]),
+        request_digest: [13u8; 32],
+    };
+
+    /// `PlannedInput` as alpha.134 stored it.
+    #[derive(Serialize)]
+    struct OldPlanned {
+        destination_key: String,
+        version_id: Ulid,
+        blake3: [u8; 32],
+        bytes: u64,
+        policies: Vec<PlacementPolicyRef>,
+        source_node_id: Option<NodeId>,
+        transfer_ms: u64,
+        known_link: bool,
+    }
+
+    /// `LaunchIntent` as alpha.134 stored it, before input pages.
+    #[derive(Serialize)]
+    struct OldLaunch {
+        launch_id: Ulid,
+        submission_id: SubmissionId,
+        request_digest: [u8; 32],
+        job_id: JobId,
+        scheduler_node_id: NodeId,
+        scheduler_seq: u32,
+        witness_placement: PlacementRef,
+        holder_generation: u64,
+        target: ExecutionTargetId,
+        inputs: Vec<OldPlanned>,
+        output_policies: Vec<PlacementPolicyRef>,
+        plan_digest: [u8; 32],
+        spec_digest: [u8; 32],
+        created_at_ms: u64,
+    }
+
+    /// `CapturedInput` as alpha.134 stored it.
+    #[derive(Serialize)]
+    struct OldInput {
+        destination_key: String,
+        source_node_id: NodeId,
+        version_id: Ulid,
+        blake3: [u8; 32],
+        bytes: u64,
+        policies: Vec<PlacementPolicyRef>,
+    }
+
+    /// `LogicalJobSpec` as alpha.134 stored it, before input pages.
+    #[derive(Serialize)]
+    struct OldSpec {
+        submission_id: SubmissionId,
+        job_id: JobId,
+        origin_node_id: NodeId,
+        ingress_node_id: NodeId,
+        realm_id: RealmId,
+        group_id: GroupId,
+        created_by: UserId,
+        created_at_ms: u64,
+        payload: ExecutionSpec,
+        request_digest: [u8; 32],
+        spec_digest: [u8; 32],
+        resources: EffectiveResources,
+        retention_ms: u64,
+        retry: JobRetryPolicy,
+        admission: JobAdmissionRecord,
+        captured_inputs: Vec<OldInput>,
+        output_policies: Vec<PlacementPolicyRef>,
+        placement: PlacementRef,
+    }
+
+    /// `JobFamilyRecord` up to its launch variant; claims and budgets are never written here.
+    #[derive(Serialize)]
+    #[allow(dead_code)]
+    enum OldRecord {
+        Spec(Box<OldSpec>),
+        Claim(()),
+        Budget(()),
+        Launch(Box<OldLaunch>),
+    }
+
+    #[derive(Serialize)]
+    struct OldEnvelope {
+        realm_id: RealmId,
+        record: OldRecord,
+        published_by: NodeId,
+        signature: iroh::Signature,
+    }
+
+    fn secret() -> iroh::SecretKey {
+        iroh::SecretKey::from_bytes(&[7u8; 32])
+    }
+
+    fn user() -> UserId {
+        UserId::new(Ulid::from_bytes([11u8; 16]), REALM)
+    }
+
+    fn target() -> ExecutionTargetId {
+        ExecutionTargetId {
+            node_id: secret().public(),
+            executor_kind: "kubernetes".to_string(),
+        }
+    }
+
+    fn execution() -> ExecutionSpec {
+        ExecutionSpec {
+            group_id: Ulid::from_bytes([14u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine".to_string(),
+            entrypoint: None,
+            command: vec!["true".to_string()],
+            workdir: None,
+            env: Default::default(),
+            resources: Default::default(),
+            executor_constraint: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        }
+    }
+
+    fn old_launch(seed: u8) -> OldLaunch {
+        OldLaunch {
+            launch_id: Ulid::from_bytes([seed; 16]),
+            submission_id: OLD.submission_id,
+            request_digest: OLD.request_digest,
+            job_id: JobId::from_bytes([5u8; 16]),
+            scheduler_node_id: secret().public(),
+            scheduler_seq: 1,
+            witness_placement: PlacementRef::NIL,
+            holder_generation: 1,
+            target: target(),
+            inputs: vec![OldPlanned {
+                destination_key: "inputs/table.csv".to_string(),
+                version_id: Ulid::from_bytes([6u8; 16]),
+                blake3: [7u8; 32],
+                bytes: 42,
+                policies: Vec::new(),
+                source_node_id: None,
+                transfer_ms: 0,
+                known_link: false,
+            }],
+            output_policies: Vec::new(),
+            plan_digest: [8u8; 32],
+            spec_digest: [9u8; 32],
+            created_at_ms: 1_000,
+        }
+    }
+
+    fn old_spec() -> OldSpec {
+        let resources = EffectiveResources {
+            cpu_cores: 1,
+            ram_bytes: 1024,
+            disk_bytes: 0,
+            max_walltime_ms: 60_000,
+            preemptible: false,
+        };
+        let group_id = Ulid::from_bytes([14u8; 16]);
+        let job_id = JobId::from_bytes([5u8; 16]);
+        OldSpec {
+            submission_id: OLD.submission_id,
+            job_id,
+            origin_node_id: secret().public(),
+            ingress_node_id: secret().public(),
+            realm_id: REALM,
+            group_id,
+            created_by: user(),
+            created_at_ms: 1_000,
+            payload: execution(),
+            request_digest: OLD.request_digest,
+            spec_digest: [9u8; 32],
+            resources,
+            retention_ms: 60_000,
+            retry: JobRetryPolicy {
+                launches_per_witness: 1,
+            },
+            admission: JobAdmissionRecord {
+                submission_id: OLD.submission_id,
+                request_digest: OLD.request_digest,
+                job_id,
+                group_id,
+                admitting_node_id: secret().public(),
+                membership_generation: 1,
+                resources,
+                admitted_at_ms: 1_000,
+            },
+            captured_inputs: vec![OldInput {
+                destination_key: "inputs/table.csv".to_string(),
+                source_node_id: secret().public(),
+                version_id: Ulid::from_bytes([6u8; 16]),
+                blake3: [7u8; 32],
+                bytes: 42,
+                policies: Vec::new(),
+            }],
+            output_policies: Vec::new(),
+            placement: PlacementRef::NIL,
+        }
+    }
+
+    fn old_envelope(record: OldRecord) -> OldEnvelope {
+        OldEnvelope {
+            realm_id: REALM,
+            record,
+            published_by: secret().public(),
+            signature: secret().sign(b"old"),
+        }
+    }
+
+    fn old_bytes(record: OldRecord) -> Vec<u8> {
+        postcard::to_allocvec(&old_envelope(record)).unwrap()
+    }
+
+    fn signed(record: JobFamilyRecord) -> Vec<u8> {
+        let envelope = JobRecordEnvelope::sign(REALM, record, &secret()).unwrap();
+        postcard::to_allocvec(&envelope).unwrap()
+    }
+
+    fn claim(family: JobFamilyId, job_id: JobId) -> Vec<u8> {
+        signed(JobFamilyRecord::Claim(SubmissionClaim {
+            submission_id: family.submission_id,
+            job_id,
+            request_digest: family.request_digest,
+            spec_digest: [9u8; 32],
+            committing_node_id: secret().public(),
+            accepted_at_ms: 2_000,
+        }))
+    }
+
+    fn receipt(physical_job_id: JobId, execution_id: Ulid, launch_digest: [u8; 32]) -> Vec<u8> {
+        let receipt = ExecutionReceipt {
+            execution_id,
+            physical_job_id,
+            launch_id: Ulid::from_bytes([1u8; 16]),
+            launch_digest,
+            submission_id: OLD.submission_id,
+            request_digest: OLD.request_digest,
+            job_id: JobId::from_bytes([5u8; 16]),
+            executor_node_id: secret().public(),
+            target: target(),
+            spec_digest: [9u8; 32],
+            membership_generation: 1,
+            subject_generation: 1,
+            subject_digest: [12u8; 32],
+            accepted_at_ms: 3_000,
+        };
+        signed(JobFamilyRecord::Receipt(Box::new(receipt)))
+    }
+
+    /// The storage key of a record of `kind` in `family`.
+    fn key(family: JobFamilyId, kind: JobRecordKind, seed: u8) -> Vec<u8> {
+        let key = JobRecordKey {
+            family,
+            kind,
+            subject: [seed; 32],
+            sequence: 0,
+        };
+        key.to_bytes().to_vec()
+    }
+
+    /// Stores a queued execution job with its index rows, as the node writes them.
+    fn store_job(path: &Path, job_id: JobId) {
+        let record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(execution()),
+            user(),
+            secret().public(),
+            1_000,
+            1_000,
+            None,
+        );
+        for (keyspace, key, value) in job_insert_entries(&record).unwrap() {
+            write(path, &keyspace, vec![(key.as_ref(), value.to_vec())]);
+        }
+    }
+
+    /// Every keyspace an old family or its runs may hold rows in.
+    const TOUCHED: [&str; 9] = [
+        FAMILY_RECORD_KEYSPACE,
+        FAMILY_ALIAS_KEYSPACE,
+        FAMILY_OUTBOX_KEYSPACE,
+        WITNESS_DEADLINE_KEYSPACE,
+        JOB_KEYSPACE,
+        JOB_INDEX_KEYSPACE,
+        SCHEDULE_INDEX_KEYSPACE,
+        ACTIVE_USER_KEYSPACE,
+        JOB_RESERVATION_KEYSPACE,
+    ];
+
+    fn snapshot(path: &Path) -> BTreeMap<&'static str, BTreeMap<Vec<u8>, Vec<u8>>> {
+        TOUCHED
+            .iter()
+            .map(|name| (*name, read(path, name)))
+            .collect()
+    }
+
+    fn deleted(output: &MigrateOutput, keyspace: &str) -> usize {
+        output.old_runs_deleted.get(keyspace).copied().unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn deletes_old_families() {
+        // An alpha.134 spec and launch take their whole family, its local jobs and execution
+        // with them. A current family and its job stay, the run crate stays, and the node lists
+        // and recovers jobs from what is left. A second run changes nothing.
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let kept_job = JobId::from_bytes([21u8; 16]);
+        let kept_claim = key(KEPT, JobRecordKind::Claim, 21);
+        write(
+            &path,
+            FAMILY_RECORD_KEYSPACE,
+            vec![(&kept_claim, claim(KEPT, kept_job))],
+        );
+        let alias = [kept_job.to_bytes().as_slice(), &KEPT.to_bytes()].concat();
+        write(&path, FAMILY_ALIAS_KEYSPACE, vec![(&alias, vec![1])]);
+        store_job(&path, kept_job);
+        let kept = snapshot(&path);
+
+        let (logical, physical) = (JobId::from_bytes([5u8; 16]), JobId::from_bytes([22u8; 16]));
+        let execution = Ulid::from_bytes([23u8; 16]);
+        let rows = [
+            (
+                key(OLD, JobRecordKind::Spec, 5),
+                old_bytes(OldRecord::Spec(Box::new(old_spec()))),
+            ),
+            (
+                key(OLD, JobRecordKind::Launch, 1),
+                old_bytes(OldRecord::Launch(Box::new(old_launch(1)))),
+            ),
+            (key(OLD, JobRecordKind::Claim, 5), claim(OLD, logical)),
+            (
+                key(OLD, JobRecordKind::Receipt, 23),
+                receipt(physical, execution, [10u8; 32]),
+            ),
+        ];
+        let rows = rows
+            .iter()
+            .map(|(key, value)| (key.as_slice(), value.clone()));
+        write(&path, FAMILY_RECORD_KEYSPACE, rows.collect());
+        let alias = [logical.to_bytes().as_slice(), &OLD.to_bytes()].concat();
+        write(&path, FAMILY_ALIAS_KEYSPACE, vec![(&alias, vec![1])]);
+        let outbox = key(OLD, JobRecordKind::Claim, 5);
+        write(&path, FAMILY_OUTBOX_KEYSPACE, vec![(&outbox, vec![1])]);
+        let deadline = [7u64.to_be_bytes().as_slice(), &OLD.to_bytes()].concat();
+        write(&path, WITNESS_DEADLINE_KEYSPACE, vec![(&deadline, vec![1])]);
+        write(
+            &path,
+            JOB_RESERVATION_KEYSPACE,
+            vec![(&execution.to_bytes(), vec![1])],
+        );
+        let written = RunCrateStatus::Written {
+            resource: "crate".to_string(),
+        };
+        let crate_key = physical.to_bytes();
+        let crates = vec![(&crate_key[..], written.to_bytes().unwrap())];
+        write(&path, RUN_CRATE_KEYSPACE, crates);
+        store_job(&path, logical);
+        store_job(&path, physical);
+        let run_crate = read(&path, RUN_CRATE_KEYSPACE);
+
+        let output = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            (output.old_families_deleted, output.run_crates_kept),
+            (1, 1)
+        );
+        assert_eq!(deleted(&output, FAMILY_RECORD_KEYSPACE), 4);
+        assert_eq!(deleted(&output, FAMILY_ALIAS_KEYSPACE), 1);
+        assert_eq!(deleted(&output, JOB_KEYSPACE), 2);
+        assert_eq!(deleted(&output, JOB_RESERVATION_KEYSPACE), 1);
+        assert_eq!(snapshot(&path), kept);
+        assert_eq!(read(&path, RUN_CRATE_KEYSPACE), run_crate);
+
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert_eq!(again.old_families_deleted, 0);
+        assert!(again.old_runs_deleted.is_empty());
+        assert_eq!(snapshot(&path), kept);
+
+        let storage = FjallStorage::open(path.to_str().unwrap()).unwrap();
+        let (jobs, _) = list_user_jobs(&storage, user(), None, 10, |_| true)
+            .await
+            .unwrap();
+        let listed: Vec<JobId> = jobs.iter().map(|job| job.job_id).collect();
+        assert_eq!(listed, [kept_job]);
+        let recovered = JobsRuntime::new().recover_stale_jobs(&storage).await;
+        assert_eq!(recovered, Ok(0), "startup recovery reads what is left");
+    }
+
+    #[test]
+    fn refuses_unreadable_specs() {
+        // A spec row that reads in neither layout names no family, so the migration refuses
+        // before any write, also on a second run.
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("db");
+        let value = [[4u8; 32].as_slice(), &[0u8, 0xff, 0xff, 0xff]].concat();
+        let row = key(OLD, JobRecordKind::Spec, 1);
+        write(&path, FAMILY_RECORD_KEYSPACE, vec![(&row, value)]);
+        let rows = read(&path, FAMILY_RECORD_KEYSPACE);
+        for _ in 0..2 {
+            let error = migrate_output(path.to_str().unwrap()).unwrap_err();
+            let ExplorerError::Refused(text) = error else {
+                panic!("the migration refuses: {error}");
+            };
+            let message = "1 job family specs or launches read in neither";
+            assert!(text.starts_with(message), "{text}");
+            assert!(text.contains("job_family_records: 1"), "{text}");
+            assert_eq!(read(&path, FAMILY_RECORD_KEYSPACE), rows);
+        }
+    }
+}
