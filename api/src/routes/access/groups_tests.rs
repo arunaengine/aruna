@@ -694,6 +694,7 @@ async fn joins_member_names() {
         .find(|member| member.user_id == owner.to_string())
         .unwrap();
     assert_eq!(member.name.as_deref(), Some("Owner"));
+    assert!(member.admin, "the group creator holds the admin role");
 }
 
 #[tokio::test]
@@ -718,6 +719,170 @@ async fn unresolved_member_none() {
         .find(|member| member.user_id == owner.to_string())
         .unwrap();
     assert_eq!(member.name, None);
+}
+
+/// A realm admin who is no member reads the numbers, and nothing of the data or metadata.
+#[tokio::test]
+async fn realm_admin_statistics() {
+    use crate::routes::access::group_stats::{get_group_statistics, list_group_statistics};
+    let (state, _tempdir) = setup_state().await;
+    let realm_id = state.get_realm_id();
+    let owner = UserId::local(Ulid::generate(), realm_id);
+    let admin = UserId::local(Ulid::generate(), realm_id);
+    let outsider = UserId::local(Ulid::generate(), realm_id);
+    let group_id = seed_group(&state, owner).await;
+    let mut realm_doc =
+        aruna_core::structs::identity::realm::RealmAuthorizationDocument::default_realm_doc(
+            realm_id,
+        );
+    for role in realm_doc.roles.values_mut() {
+        role.assigned_users.insert(admin);
+    }
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: admin,
+        realm_id,
+    };
+    store_bytes(
+        &state,
+        AUTH_KEYSPACE,
+        realm_id.as_bytes().to_vec(),
+        realm_doc.to_bytes(&actor).unwrap(),
+    )
+    .await;
+
+    let stats = |user: UserId| {
+        get_group_statistics(
+            State(state.clone()),
+            Extension(Some(member_auth(user))),
+            Path(group_id.to_string()),
+        )
+    };
+    let (_, Json(single)) = stats(admin).await.unwrap();
+    assert_eq!((single.members, single.admins), (1, 1));
+    let overview = |user: UserId, offset: u32| {
+        list_group_statistics(
+            State(state.clone()),
+            Extension(Some(member_auth(user))),
+            Query(super::PaginationParams {
+                limit: Some(1),
+                offset: Some(offset),
+            }),
+        )
+    };
+    // One group per page: the two pages hold both groups, and the third is empty.
+    let second = seed_group(&state, owner).await;
+    let mut listed = Vec::new();
+    for offset in 0..3 {
+        let (_, Json(page)) = overview(admin, offset).await.unwrap();
+        assert_eq!(page.groups.len(), usize::from(offset < 2));
+        listed.extend(page.groups.into_iter().map(|group| group.group_id));
+    }
+    listed.sort();
+    let mut expected = vec![group_id.to_string(), second.to_string()];
+    expected.sort();
+    assert_eq!(listed, expected);
+    // The group's own admin reads its statistics but not the realm overview.
+    assert!(stats(owner).await.is_ok());
+    assert!(matches!(
+        overview(owner, 0).await,
+        Err(ServerError::Forbidden)
+    ));
+    assert!(matches!(stats(outsider).await, Err(ServerError::Forbidden)));
+
+    let node = state.get_node_id();
+    for path in [
+        format!("/{realm_id}/g/{group_id}/data/{node}/bucket"),
+        format!("/{realm_id}/g/{group_id}/data/{node}/bucket/object.txt"),
+        format!("/{realm_id}/g/{group_id}/meta/{}", Ulid::generate()),
+    ] {
+        let granted = crate::auth::permission_granted(
+            &state,
+            &member_auth(admin),
+            path.clone(),
+            Permission::READ,
+        )
+        .await
+        .unwrap();
+        assert!(!granted, "realm admin may read {path}");
+    }
+    let usage = run_group_usage(&state, Some(member_auth(admin)), &group_id.to_string()).await;
+    assert!(matches!(usage, Err(ServerError::Forbidden)));
+}
+
+/// Request policies that deny the admin paths also close the token and statistics routes.
+#[tokio::test]
+async fn policy_denies_admins() {
+    use crate::routes::access::admin_tokens::{list_group_tokens, revoke_user_tokens};
+    use crate::routes::access::group_stats::{get_group_statistics, list_group_statistics};
+    let (state, admin, _tempdir) = setup_admin_state().await;
+    let realm_id = state.get_realm_id();
+    let owner = UserId::local(Ulid::generate(), realm_id);
+    let group_id = seed_group(&state, owner).await;
+    let stats = |user: UserId| {
+        get_group_statistics(
+            State(state.clone()),
+            Extension(Some(member_auth(user))),
+            Path(group_id.to_string()),
+        )
+    };
+    let tokens = |user: UserId| {
+        list_group_tokens(
+            State(state.clone()),
+            Extension(Some(member_auth(user))),
+            Path(group_id.to_string()),
+            Query(Default::default()),
+        )
+    };
+    let overview = || {
+        list_group_statistics(
+            State(state.clone()),
+            Extension(Some(member_auth(admin))),
+            Query(Default::default()),
+        )
+    };
+    let revoke_all = || {
+        revoke_user_tokens(
+            State(state.clone()),
+            Extension(Some(member_auth(admin))),
+            Path(owner.to_string()),
+        )
+    };
+    assert!(stats(owner).await.is_ok() && tokens(owner).await.is_ok());
+    assert!(stats(admin).await.is_ok() && tokens(admin).await.is_ok());
+    assert!(overview().await.is_ok() && revoke_all().await.is_ok());
+
+    let deny = |paths: Vec<String>| {
+        update_config(&state, move |config| {
+            for path in &paths {
+                config
+                    .request_policies
+                    .push(aruna_core::request_policy::RequestPolicy {
+                        policy_id: Ulid::generate(),
+                        name: format!("deny {path}"),
+                        kind: aruna_core::request_policy::PolicyKind::Deny,
+                        when: None,
+                        expression: format!("path == '{path}'"),
+                        enabled: true,
+                    });
+            }
+        })
+    };
+    // A deny on the group path alone also binds the realm groups admin.
+    deny(vec![format!("/{realm_id}/g/{group_id}/admin")]).await;
+    for user in [owner, admin] {
+        assert!(matches!(stats(user).await, Err(ServerError::Forbidden)));
+        assert!(matches!(tokens(user).await, Err(ServerError::Forbidden)));
+    }
+    assert!(overview().await.is_ok());
+
+    deny(vec![
+        format!("/{realm_id}/admin/groups"),
+        format!("/{realm_id}/admin/u/{owner}"),
+    ])
+    .await;
+    assert!(matches!(overview().await, Err(ServerError::Forbidden)));
+    assert!(matches!(revoke_all().await, Err(ServerError::Forbidden)));
 }
 
 async fn seed_bucket(state: &ServerState, bucket: &str, group_id: Ulid) {

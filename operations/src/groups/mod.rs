@@ -4,6 +4,7 @@
 
 pub mod add_member;
 pub mod add_role;
+pub mod admin_check;
 pub mod backends;
 pub mod bucket_jobs;
 pub mod bucket_storage;
@@ -22,6 +23,7 @@ pub mod remove_role;
 pub mod search_groups;
 pub mod set_policies;
 pub mod storage_routing;
+pub mod tokens;
 pub mod update_group;
 
 use aruna_core::errors::ConversionError;

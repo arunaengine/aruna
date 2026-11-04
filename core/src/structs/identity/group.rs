@@ -4,6 +4,7 @@
 
 use crate::UserId;
 use crate::errors::ConversionError;
+use crate::permission_path::permission_pattern_matches;
 use crate::structs::identity::auth::Actor;
 use crate::structs::identity::auth::{Permission, Role};
 use crate::structs::identity::realm::RealmId;
@@ -132,6 +133,27 @@ impl GroupAuthorizationDocument {
             .collect()
     }
 
+    /// Whether the user's roles here grant WRITE on the group's admin path, with DENY winning.
+    pub fn is_admin(&self, realm_id: RealmId, user_id: UserId) -> bool {
+        let path = format!("/{realm_id}/g/{}/admin", self.group_id);
+        let mut granted = false;
+        let held = self
+            .roles
+            .values()
+            .filter(|role| !user_id.is_nil() && role.assigned_users.contains(&user_id));
+        for (pattern, permission) in held.flat_map(|role| role.permissions.iter()) {
+            if !permission_pattern_matches(pattern, &path) {
+                continue;
+            }
+            match permission {
+                Permission::DENY => return false,
+                Permission::WRITE => granted = true,
+                Permission::READ => {}
+            }
+        }
+        granted
+    }
+
     pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }
@@ -168,6 +190,36 @@ mod test {
         let hydrated_group = Group::from_bytes(&bytes).unwrap();
 
         assert_eq!(group, hydrated_group);
+    }
+
+    #[test]
+    fn admin_role_detected() {
+        let realm_id = RealmId([0u8; 32]);
+        let (owner, other) = (
+            UserId::local(Ulid::from_parts(1, 1), realm_id),
+            UserId::local(Ulid::from_parts(2, 2), realm_id),
+        );
+        let mut doc =
+            GroupAuthorizationDocument::default_group_doc(owner, realm_id, Ulid::generate());
+        let user_role = doc
+            .roles
+            .values_mut()
+            .find(|role| role.name == "user")
+            .unwrap();
+        user_role.assigned_users.insert(other);
+        assert!(doc.is_admin(realm_id, owner));
+        assert!(!doc.is_admin(realm_id, other));
+        // A deny on the admin path outweighs the admin role.
+        let admin_role = doc
+            .roles
+            .values_mut()
+            .find(|role| role.name == "admin")
+            .unwrap();
+        let path = format!("/{realm_id}/g/{}/admin", doc.group_id);
+        admin_role
+            .permissions
+            .insert(path, crate::structs::identity::auth::Permission::DENY);
+        assert!(!doc.is_admin(realm_id, owner));
     }
 
     #[test]

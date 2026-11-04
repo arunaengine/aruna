@@ -123,11 +123,11 @@ pub struct S3SessionCredentials {
     pub session: S3Session,
 }
 
-fn owner_key(user_identity: UserId, group_id: GroupId) -> Key {
+pub(crate) fn owner_key(user_identity: UserId, group_id: GroupId) -> Key {
     crate::owner_index::owner_key(user_identity, Some(group_id))
 }
 
-fn decode_index(value: Option<&ByteView>) -> Result<BTreeSet<String>, S3SessionError> {
+pub(crate) fn decode_index(value: Option<&ByteView>) -> Result<BTreeSet<String>, S3SessionError> {
     crate::owner_index::decode_index(
         value,
         MAX_GROUP_SESSIONS,

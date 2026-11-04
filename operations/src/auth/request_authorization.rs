@@ -77,6 +77,41 @@ pub async fn authorize(
     Ok(())
 }
 
+/// Authorizes `permission` by RBAC on `path` or else on `alternative`, then always enforces the
+/// policies of `path`, and of `alternative` when only it granted. A policy denial is final.
+pub async fn authorize_either(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: &AuthContext,
+    (path, alternative): (&str, &str),
+    permission: &Permission,
+) -> Result<(), AuthorizeError> {
+    let granted = |path: &str| {
+        drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: auth.clone(),
+                path: path.to_string(),
+                required_permission: permission.clone(),
+            }),
+            context,
+        )
+    };
+    let direct = granted(path).await.map_err(check_error)?;
+    if !direct && !granted(alternative).await.map_err(check_error)? {
+        return Err(AuthorizeError::PermissionDenied);
+    }
+    let extras = PolicyRequestExtras::rest();
+    let mut checked = vec![path];
+    if !direct {
+        checked.push(alternative);
+    }
+    for path in checked {
+        let request = policy_request_with(path, permission, Some(auth), extras.clone());
+        enforce_policies(context, realm_id, &request).await?;
+    }
+    Ok(())
+}
+
 /// Authorizes reading the metadata document at `path`: a public one needs only the request
 /// policies, as every metadata read decides it, a private one also READ by role.
 pub async fn authorize_document(

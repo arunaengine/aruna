@@ -20,6 +20,7 @@ pub mod persistent_id;
 pub(crate) mod protocol;
 pub mod prune;
 pub mod quota;
+pub mod recent;
 pub mod reconcile;
 pub mod records;
 pub mod remote_key;

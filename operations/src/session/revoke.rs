@@ -5,6 +5,7 @@
 use crate::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
+use aruna_core::UserId;
 use aruna_core::auth::{user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -21,10 +22,16 @@ use ulid::Ulid;
 /// Moves the actor's token cutoff past `issued_at`, which ends every token the actor was issued
 /// up to then. One entry per user, so it is admitted when the per-token set is full.
 pub(crate) fn cutoff_revocation(actor: Actor, issued_at: u64, now: u64) -> RevokeTokenConfig {
+    let owner = actor.user_id;
+    owner_cutoff(actor, owner, issued_at, now)
+}
+
+/// Moves `owner`'s token cutoff past `issued_at` on behalf of `actor`.
+pub fn owner_cutoff(actor: Actor, owner: UserId, issued_at: u64, now: u64) -> RevokeTokenConfig {
     RevokeTokenConfig {
-        token_hash: user_cutoff_hash(&actor.user_id),
+        token_hash: user_cutoff_hash(&owner),
         expires_at: user_cutoff_expiry(issued_at.saturating_add(1)),
-        token_owner: actor.user_id,
+        token_owner: owner,
         admission: RevokeTokenAdmission::Privileged,
         actor,
         now,
@@ -68,6 +75,7 @@ pub enum RevokeSessionError {
 #[derive(Debug, PartialEq)]
 pub struct RevokeSessionOperation {
     actor: Actor,
+    owner: UserId,
     session_id: String,
     now: u64,
     session: Option<UserSession>,
@@ -78,8 +86,15 @@ pub struct RevokeSessionOperation {
 
 impl RevokeSessionOperation {
     pub fn new(actor: Actor, session_id: String, now: u64) -> Self {
+        let owner = actor.user_id;
+        Self::for_owner(actor, owner, session_id, now)
+    }
+
+    /// Revokes a session of `owner`; the caller has authorized `actor` to do so.
+    pub fn for_owner(actor: Actor, owner: UserId, session_id: String, now: u64) -> Self {
         Self {
             actor,
+            owner,
             session_id,
             now,
             session: None,
@@ -116,7 +131,7 @@ impl RevokeSessionOperation {
         let session = UserSession::from_bytes(value)?;
         if session.sid.as_bytes() != key
             || session.sid != self.session_id
-            || session.user_id != self.actor.user_id
+            || session.user_id != self.owner
         {
             return Err(RevokeSessionError::NotFound);
         }
@@ -159,7 +174,10 @@ impl RevokeSessionOperation {
                 token_hash: session.token_hash,
                 expires_at: session.expires_at,
                 token_owner: session.user_id,
-                admission: RevokeTokenAdmission::SelfService,
+                admission: match session.user_id == self.actor.user_id {
+                    true => RevokeTokenAdmission::SelfService,
+                    false => RevokeTokenAdmission::Privileged,
+                },
                 now: self.now,
             }),
             |result| Event::SubOperation(SubOperationEvent::TokenRevoked {
@@ -181,7 +199,8 @@ impl RevokeSessionOperation {
                 let Some(session) = self.session.as_ref() else {
                     return self.emit_error(RevokeSessionError::NotFinished);
                 };
-                let config = cutoff_revocation(self.actor.clone(), session.created_at, self.now);
+                let config =
+                    owner_cutoff(self.actor.clone(), self.owner, session.created_at, self.now);
                 self.state = RevokeSessionState::RaiseCutoff;
                 smallvec![Effect::SubOperation(boxed_suboperation(
                     RevokeTokenOperation::new(config),

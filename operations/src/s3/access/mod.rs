@@ -4,6 +4,6 @@
 
 pub mod create;
 pub mod get;
-mod index;
+pub(crate) mod index;
 pub mod list;
 pub mod revoke;
