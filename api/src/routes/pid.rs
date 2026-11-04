@@ -108,7 +108,7 @@ fn rocrate_location(document_id: Ulid) -> String {
                 "status": "withdrawn"
             })
         ),
-        (status = 503, description = "The PID authority is unreachable, which is reported instead of a false 404; retryable")
+        (status = 503, description = "The PID authority is unreachable, which is reported instead of a false 404, or the header `aruna-placement: unknown` marks an id no granted handle range covers; retryable")
     ),
     security(())
 )]
@@ -201,7 +201,7 @@ Privacy, lifecycle, authority and browser handling match `GET /pid/{document_id}
         (status = 302, description = "Active public Profile identifier; the Location header points at the portal page for a browser, else at the RO-Crate read route"),
         (status = 404, description = "Unknown, private, non-Profile or non-active identifier"),
         (status = 410, description = "The Profile identifier was withdrawn and stays withdrawn"),
-        (status = 503, description = "The PID authority is unreachable; retryable")
+        (status = 503, description = "The PID authority is unreachable, or the header `aruna-placement: unknown` marks an id no granted handle range covers; retryable")
     ),
     security(())
 )]
@@ -253,7 +253,9 @@ A browser (`Accept` ranks `text/html` above zero and above `application/ld+json`
 portal page of an active public document or Profile when the realm's federation settings name a
 portal; other clients get the RO-Crate.
 An id that provably names no metadata placement of this realm is a 404; a placement this node
-does not know yet, as for a legacy object id, is a retryable 503."#,
+does not know yet, as for a legacy object id, is a retryable 503. That 503 carries the header
+`aruna-placement: unknown` only when no binding and no granted handle range covers the id; a 503
+without it, as during startup or while the PID authority is unreachable, says nothing about the id."#,
     params(("rest" = String, Path, description = "The w3id path after `https://w3id.org/aruna/`, for example `01JMETADATA0123456789ABCDE` or `profile/01JMETADATA0123456789ABCDE`")),
     responses(
         (status = 302, description = "Active public document or Profile; `Location` is its portal page for a browser, else its RO-Crate read route, and the answer varies by `Accept`"),
@@ -269,7 +271,7 @@ does not know yet, as for a legacy object id, is a retryable 503."#,
                 "status": "withdrawn"
             })
         ),
-        (status = 503, description = "The PID authority is unreachable; retryable")
+        (status = 503, description = "The PID authority is unreachable, or the header `aruna-placement: unknown` marks an id no granted handle range covers; retryable")
     ),
     security(())
 )]
@@ -368,6 +370,11 @@ fn landing_response(
         Ok(PersistentIdResolution::Redirect) => redirect(&rocrate_location(document_id)),
         Ok(PersistentIdResolution::Gone { pid }) => gone(&pid),
         Ok(PersistentIdResolution::Missing) => StatusCode::NOT_FOUND.into_response(),
+        Ok(PersistentIdResolution::Unplaced) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("aruna-placement", "unknown")],
+        )
+            .into_response(),
         Err(MetadataApiError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -924,6 +931,21 @@ mod tests {
         assert_eq!(
             status(Err(MetadataApiError::ServiceUnavailable)),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Only an id no granted range covers is marked; an authority failure says nothing.
+        let marker = |resolved| {
+            let response = landing_response(id, resolved);
+            let marker = response.headers().get("aruna-placement").cloned();
+            (response.status(), marker)
+        };
+        let unknown = HeaderValue::from_static("unknown");
+        assert_eq!(
+            marker(Ok(PersistentIdResolution::Unplaced)),
+            (StatusCode::SERVICE_UNAVAILABLE, Some(unknown))
+        );
+        assert_eq!(
+            marker(Err(MetadataApiError::ServiceUnavailable)),
+            (StatusCode::SERVICE_UNAVAILABLE, None)
         );
     }
 
