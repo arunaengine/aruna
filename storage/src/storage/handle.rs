@@ -172,6 +172,17 @@ impl StorageHandle {
         self.database.get().map(|database| (database.0)())
     }
 
+    /// False once fjall refuses writes after a failed flush or commit. The buffered journal
+    /// persist is the call the worker already makes after every commit.
+    pub async fn accepts_writes(&self) -> bool {
+        let Some(database) = self.database() else {
+            return true;
+        };
+        tokio::task::spawn_blocking(move || database.persist(fjall::PersistMode::Buffer).is_ok())
+            .await
+            .unwrap_or(false)
+    }
+
     /// New channels sharing this handle's metrics, for test proxies that forward effects to
     /// this handle and must report its realm config change count.
     #[doc(hidden)]

@@ -320,7 +320,11 @@ async fn check_storage(ctx: &DriverContext) -> CheckOutcome {
         txn_id: None,
     });
     match tokio::time::timeout(STORAGE_PROBE_TIMEOUT, probe).await {
-        Ok(Event::Storage(StorageEvent::ReadResult { .. })) => CheckOutcome::ok(),
+        Ok(Event::Storage(StorageEvent::ReadResult { .. })) => {
+            let writes =
+                tokio::time::timeout(STORAGE_PROBE_TIMEOUT, ctx.storage_handle.accepts_writes());
+            write_outcome(writes.await.ok())
+        }
         Ok(Event::Storage(StorageEvent::Error { error })) => {
             tracing::warn!(%error, "readiness storage probe failed");
             CheckOutcome::failed("storage read failed")
@@ -330,6 +334,16 @@ async fn check_storage(ctx: &DriverContext) -> CheckOutcome {
             CheckOutcome::failed("unexpected storage event")
         }
         Err(_) => CheckOutcome::failed("storage probe timed out"),
+    }
+}
+
+/// A poisoned fjall database still serves reads, so readiness also needs writes accepted.
+/// `None` means the write check timed out.
+fn write_outcome(accepts: Option<bool>) -> CheckOutcome {
+    match accepts {
+        Some(true) => CheckOutcome::ok(),
+        Some(false) => CheckOutcome::failed("storage refuses writes"),
+        None => CheckOutcome::failed("storage write check timed out"),
     }
 }
 
@@ -798,6 +812,16 @@ mod tests {
         // Sync still fails without an attached net handle, but startup is now ok.
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains("\"startup\":\"ok\""), "{body}");
+        assert!(body.contains("\"storage\":\"ok\""), "{body}");
+    }
+
+    #[test]
+    fn refused_writes_fail() {
+        assert!(write_outcome(Some(true)).ok);
+        let refused = write_outcome(Some(false));
+        assert!(!refused.ok);
+        assert_eq!(refused.status, "failed: storage refuses writes");
+        assert!(!write_outcome(None).ok);
     }
 
     #[tokio::test]
