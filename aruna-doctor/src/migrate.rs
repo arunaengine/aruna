@@ -1,5 +1,5 @@
 //! Re-encodes legacy rows, adds missing event size rows, seals plain secrets and moves node secrets
-//! to the node vault; deletes unreadable S3 sessions, uploads and old node info topics. Repeatable.
+//! to the node vault; deletes unreadable S3 sessions, uploads, old job families, old info topics.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -14,16 +14,17 @@ use aruna_core::git::{GitRecord, LOCAL_OBJECTS, StoredObject};
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BROKEN_VERSION_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
-    COPY_WAIT_KEYSPACE, DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
-    FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
-    FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE,
-    JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
-    NODE_STATS_KEYSPACE, NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, QUARANTINE_USAGE_KEYSPACE,
+    COPY_WAIT_KEYSPACE, DEADLINE_INDEX_KEYSPACE, DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE,
+    EVENT_SIZE_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
+    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+    GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE,
+    NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_STATS_KEYSPACE,
+    NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, QUARANTINE_USAGE_KEYSPACE,
     REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE, ROOT_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE,
     SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE,
     STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE, USER_SESSION_KEYSPACE,
+    UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE, USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
@@ -88,6 +89,13 @@ pub struct MigrateOutput {
     pub pending_rewritten: usize,
     pub conflicts_scanned: usize,
     pub conflicts_rewritten: usize,
+    /// Job families with a spec or launch stored in the alpha.134 layout, or that cannot be told
+    /// apart from it. Their digests cannot be rewritten, so each family and its runs are deleted.
+    pub old_families_deleted: usize,
+    /// Rows of those families and of their local job and execution records, by keyspace.
+    pub old_runs_deleted: BTreeMap<String, usize>,
+    /// Run crate documents of the deleted runs; the documents and their status rows stay.
+    pub run_crates_kept: usize,
     /// Derived projection rows dropped. The reader rebuilds a missing one from
     /// the immutable records, so clearing them needs no re-encode.
     pub projections_cleared: usize,
@@ -269,13 +277,35 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             families::scan::<ConflictRecord>(&db, &conflict_rows, &mut evidence)?,
         ),
     ];
-    families::refuse_specs(&specs, &evidence)?;
-    let records =
-        rewrites::<JobRecordEnvelope, LegacyEnvelope>(&db, &record_rows, FAMILY_RECORD_KEYSPACE)?;
-    let pending =
-        rewrites::<PendingRecord, LegacyPending>(&db, &pending_rows, FAMILY_PENDING_KEYSPACE)?;
-    let conflicts =
-        rewrites::<ConflictRecord, LegacyConflict>(&db, &conflict_rows, FAMILY_CONFLICT_KEYSPACE)?;
+    let mut removal = families::old_families(&specs, &evidence)?;
+    // Family keyspaces with the byte offset of the family in their keys.
+    for (name, offset) in [
+        (FAMILY_RECORD_KEYSPACE, 0),
+        (FAMILY_PENDING_KEYSPACE, 0),
+        (FAMILY_CONFLICT_KEYSPACE, 0),
+        (FAMILY_OUTBOX_KEYSPACE, 0),
+        (FAMILY_ALIAS_KEYSPACE, 16),
+        (WITNESS_DEADLINE_KEYSPACE, 8),
+        (DEADLINE_INDEX_KEYSPACE, 0),
+        (PLAN_EXPLAIN_KEYSPACE, 0),
+    ] {
+        removal.family_rows(&db, name, offset)?;
+    }
+    let records = removal.rewrites::<JobRecordEnvelope, LegacyEnvelope>(
+        &db,
+        &record_rows,
+        FAMILY_RECORD_KEYSPACE,
+    )?;
+    let pending = removal.rewrites::<PendingRecord, LegacyPending>(
+        &db,
+        &pending_rows,
+        FAMILY_PENDING_KEYSPACE,
+    )?;
+    let conflicts = removal.rewrites::<ConflictRecord, LegacyConflict>(
+        &db,
+        &conflict_rows,
+        FAMILY_CONFLICT_KEYSPACE,
+    )?;
     let projections = keys(&db, &cache_rows)?;
     let configs = realm_configs(&db, &config_rows)?;
     let mappings =
@@ -329,9 +359,12 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         ID_MAPPING_KEYSPACE,
     )?;
     let identities = staging::identities(&db, &bucket_rows, &buckets.rows, S3_BUCKET_KEYSPACE)?;
-    let jobs = jobs::job_rows(&db, &job_rows, JOB_KEYSPACE, &identities)?;
+    let mut jobs = jobs::job_rows(&db, &job_rows, JOB_KEYSPACE, &identities)?;
+    removal.job_rows(&db, &job_rows, &jobs.rows)?;
     let dedup = jobs::dedup_rows(&db, &dedup_rows, &jobs.rows, DEDUP_INDEX_KEYSPACE)?;
     let kinds = jobs::checkpoint_kinds(&db, &job_rows, &jobs.rows, JOB_KEYSPACE)?;
+    jobs.rows
+        .retain(|(key, _)| !removal.holds(JOB_KEYSPACE, key));
     let checkpoints = jobs::checkpoint_rows(&db, &state_rows, &kinds, JOB_STATE_KEYSPACE)?;
     let staged = staging::checkpoint_rows(&db, &staging_rows, STAGING_STATE_KEYSPACE)?;
     let mut relaid_rows = vec![
@@ -495,6 +528,12 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     if let Some(usage) = &info.usage {
         txn.insert(usage_rows.clone(), QUARANTINE_USAGE_KEY, usage.clone());
     }
+    for (name, keys) in &removal.rows {
+        let keyspace = db.keyspace(name, KeyspaceCreateOptions::default)?;
+        for key in keys {
+            txn.remove(keyspace.clone(), key.clone());
+        }
+    }
     txn.commit()?.map_err(|_| {
         ExplorerError::Decode("migration conflicted with a running node".to_string())
     })?;
@@ -509,6 +548,9 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         pending_rewritten: pending.rows.len(),
         conflicts_scanned: conflicts.scanned,
         conflicts_rewritten: conflicts.rows.len(),
+        old_families_deleted: removal.family_count(),
+        old_runs_deleted: removal.counts(),
+        run_crates_kept: removal.run_crates,
         projections_cleared: projections.len(),
         realm_configs_scanned: configs.scanned,
         realm_configs_rewritten: configs.rows.len(),
