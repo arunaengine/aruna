@@ -800,8 +800,12 @@ pub enum PersistentIdOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistentIdResolution {
     Redirect,
-    Gone { pid: String },
+    Gone {
+        pid: String,
+    },
     Missing,
+    /// This node knows no binding for the id's handle and no granted range covers it.
+    Unplaced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

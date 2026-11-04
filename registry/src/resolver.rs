@@ -92,6 +92,8 @@ pub enum Holding {
     Holds,
     Absent,
     Unavailable,
+    /// A realm node answered a 503 marked `aruna-placement: unknown`: it can place no such id.
+    Undecided,
 }
 
 /// Realm nodes answer their PID routes, v2 sites their resources route.
@@ -377,6 +379,7 @@ impl Resolver {
         };
         let legacy = match shape {
             Shape::Document(_) => vec![V2, V2_DEV],
+            Shape::Dev(_) => vec![V2_DEV],
             _ => Vec::new(),
         };
         let probe = &probe;
@@ -407,13 +410,13 @@ impl Resolver {
             .collect()
             .await;
         answers.extend(legacy_answers);
-        let answer = decide(&shape, &answers);
+        let answer = decide(&answers);
         if answer == Answer::Conflict {
             warn!(id = %id, "More than one approved realm claims one identifier");
         }
         let settled = answers
             .iter()
-            .all(|(_, _, holding)| *holding != Holding::Unavailable);
+            .all(|(_, _, holding)| matches!(holding, Holding::Holds | Holding::Absent));
         let kept = match &answer {
             Answer::Redirect(target) => realm_answers
                 .iter()
@@ -564,7 +567,7 @@ impl Resolver {
         let (state, until) = match holding {
             Holding::Holds => (RouteState::Known(Routes::W3id), now + ROUTES_SECS),
             Holding::Absent => (RouteState::Known(Routes::Legacy), now + ROUTES_SECS),
-            Holding::Unavailable => (RouteState::Failed, now + RETRY_SECS),
+            Holding::Unavailable | Holding::Undecided => (RouteState::Failed, now + RETRY_SECS),
         };
         if let Ok(mut known) = self.routes.lock() {
             known.insert(realm, (api_url.clone(), state, until));
@@ -593,8 +596,8 @@ fn storage_failed(error: StoreError) -> Answer {
 }
 
 /// The guess from every answer: one realm holder wins, two conflict; then a v2 site that knows
-/// the id; then the most likely page, unless an unreachable realm may hold the id.
-fn decide(shape: &Shape, answers: &[Asked]) -> Answer {
+/// the id; an unreachable realm gives 503, an unreachable v2 site its page, nobody holding 404.
+fn decide(answers: &[Asked]) -> Answer {
     let said = |source, holding| {
         answers
             .iter()
@@ -610,18 +613,18 @@ fn decide(shape: &Shape, answers: &[Asked]) -> Answer {
     if let Some(page) = said(Source::Legacy, Holding::Holds).next() {
         return Answer::Redirect(page.clone());
     }
-    let realm_down = said(Source::Realm, Holding::Unavailable).next().is_some();
-    match shape {
-        Shape::Dev(id) => Answer::Redirect(format!("{}{id}", V2_DEV.page)),
-        _ if realm_down => Answer::Unavailable,
-        Shape::Document(id) => Answer::Redirect(format!("{}{id}", V2.page)),
-        _ => Answer::NotFound("no realm holds this identifier"),
+    if said(Source::Realm, Holding::Unavailable).next().is_some() {
+        return Answer::Unavailable;
+    }
+    match said(Source::Legacy, Holding::Unavailable).next() {
+        Some(page) => Answer::Redirect(page.clone()),
+        None => Answer::NotFound("no realm or v2 site holds this identifier"),
     }
 }
 
 /// A realm holds an id when its node redirects to a page or reports it withdrawn; a v2 site
 /// when it serves the resource or refuses it as not public; a node serves the w3id route when
-/// it redirects the route check. A 503, as older nodes give for foreign ids, is never absence.
+/// it redirects the route check. A 503, as during startup or an authority failure, is no absence.
 pub fn holding(source: Source, status: StatusCode) -> Holding {
     match (source, status.as_u16()) {
         (Source::Realm, 301 | 302 | 303 | 307 | 308 | 410) => Holding::Holds,
@@ -647,7 +650,17 @@ pub async fn probe(egress: &EgressGuard, url: Url, source: Source) -> Holding {
         .send()
         .await
     {
-        Ok(response) => holding(source, response.status()),
+        Ok(response) => {
+            let unplaced = response.status() == StatusCode::SERVICE_UNAVAILABLE
+                && response
+                    .headers()
+                    .get("aruna-placement")
+                    .is_some_and(|value| value == "unknown");
+            match source {
+                Source::Realm if unplaced => Holding::Undecided,
+                _ => holding(source, response.status()),
+            }
+        }
         Err(_) => Holding::Unavailable,
     }
 }

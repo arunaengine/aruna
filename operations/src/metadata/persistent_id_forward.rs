@@ -16,6 +16,7 @@ use crate::placement::process_placements::load_realm_config;
 use crate::placement::resolve_shard_holders;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
+use aruna_core::StructuredId;
 use aruna_core::UserId;
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::PersistentIdFailure;
@@ -24,7 +25,10 @@ use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::record::{DocumentClass, PlacementScope};
+use aruna_core::structs::placement::binding_directory::BindingError;
+use aruna_core::structs::placement::record::{
+    DocumentClass, FIRST_GRANTABLE_HANDLE, PlacementScope,
+};
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use std::sync::Arc;
 use tracing::warn;
@@ -72,6 +76,25 @@ fn outside_realm(config: &RealmConfigDocument, realm_id: RealmId, document_id: U
         }
         Err(_) => false,
     }
+}
+
+/// True when the id's handle has no binding here and lies in no granted handle range, so no
+/// node can have bound it yet; a covered handle may still be replicating its binding.
+fn unplaced(config: &RealmConfigDocument, document_id: Ulid) -> bool {
+    let Ok(id) = MetaResourceId::from_bytes(document_id.to_bytes()) else {
+        return false;
+    };
+    let handle = id.placement_handle();
+    let unbound = matches!(
+        config.binding_directory().resolve(handle),
+        Err(BindingError::Unknown(_))
+    );
+    unbound
+        && handle.get() >= FIRST_GRANTABLE_HANDLE
+        && !config
+            .placement_handle_ranges
+            .iter()
+            .any(|range| range.contains(handle.get()))
 }
 
 pub(super) async fn pid_authority(
@@ -423,8 +446,11 @@ pub async fn resolve_pid_routed(
     if outside_realm(&config, realm_id, document_id) {
         return Ok(PersistentIdResolution::Missing);
     }
-    let authority = pid_authority_node(&config, realm_id, document_id)
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let authority = match pid_authority_node(&config, realm_id, document_id) {
+        Some(authority) => authority,
+        None if unplaced(&config, document_id) => return Ok(PersistentIdResolution::Unplaced),
+        None => return Err(MetadataApiError::ServiceUnavailable),
+    };
     if is_local_node(context, authority) {
         return local_pid_resolution(context, realm_id, document_id, &pid).await;
     }
@@ -817,6 +843,15 @@ mod tests {
         let handle = PlacementHandle::new(METADATA_HANDLE).unwrap();
         let far = MetaResourceId::from_parts(1, handle, BucketId::new(4095).unwrap(), 7).unwrap();
         assert!(!outside_realm(&config, realm_id, far.as_ulid()));
+        // Only an unbound handle that no granted range covers is unplaced; the rest may replicate.
+        assert!(unplaced(
+            &config,
+            minted(FIRST_GRANTABLE_HANDLE + HANDLE_RANGE_SIZE)
+        ));
+        for handle in [METADATA_HANDLE, 2, 503, 504] {
+            assert!(!unplaced(&config, minted(handle)), "{handle}");
+        }
+        assert!(!unplaced(&config, reserved));
         // A strategy unknown here is indeterminate too.
         config
             .strategies
