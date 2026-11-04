@@ -328,12 +328,11 @@ pub(in crate::document_sync) fn overlay_realm_config(
         let Some(provider_id) = parse_config_oidc(path) else {
             continue;
         };
-        remove_oidc_provider(config, provider_id);
-        if reducer_state.conflicts.contains_key(path) {
-            continue;
-        }
-        if let Some(provider) = materialized_providers.get(provider_id) {
-            config.oidc_providers.push(provider.clone());
+        match materialized_providers.get(provider_id) {
+            Some(provider) if !reducer_state.conflicts.contains_key(path) => {
+                config.upsert_provider(provider.clone())
+            }
+            _ => remove_oidc_provider(config, provider_id),
         }
     }
 

@@ -2735,9 +2735,9 @@ async fn oidc_updates_merge() {
     let removed = test_oidc_provider("removed", "removed");
     let first = test_oidc_provider("default", "one");
     let second = test_oidc_provider("partner", "two");
+    let replaced = test_oidc_provider("existing", "replaced");
     let seed_node = node(16);
-    let mut seed_config =
-        RealmConfigDocument::new(realm_id, vec![existing.clone(), removed.clone()], 5);
+    let mut seed_config = RealmConfigDocument::new(realm_id, vec![existing, removed.clone()], 5);
     seed_config.discovery = RealmDiscoveryConfig::Static {
         endpoints: vec![StaticRealmEndpoint {
             node_id: seed_node.to_string(),
@@ -2777,6 +2777,12 @@ async fn oidc_updates_merge() {
                 provider_id: removed.id.clone(),
             },
         ),
+        (
+            4,
+            AdminDocumentOperation::OidcProviderUpserted {
+                provider: replaced.clone(),
+            },
+        ),
     ] {
         apply_admin_operation(
             &storage,
@@ -2803,14 +2809,8 @@ async fn oidc_updates_merge() {
         realm_config_nodes(&config),
         realm_config_nodes(&seed_config)
     );
-    assert_eq!(
-        config_oidc_providers(&config),
-        BTreeMap::from([
-            ("default".to_string(), first),
-            ("existing".to_string(), existing),
-            ("partner".to_string(), second),
-        ])
-    );
+    // A replaced provider keeps its place and new ones follow, so the portal's first stays first.
+    assert_eq!(config.oidc_providers, vec![replaced, first, second]);
 }
 
 #[tokio::test]
