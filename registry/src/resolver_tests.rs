@@ -227,7 +227,7 @@ fn decides_by_priority() {
         ),
         (vec![realm(Unavailable), dev(Holds)], dev_page.clone()),
         (vec![realm(Undecided), prod(Holds)], prod_page.clone()),
-        // Nobody holds the id: 404, also when a node cannot place it, as for every foreign id.
+        // Nobody holds the id: 404, also when a node marks it as a placement it cannot know.
         (
             vec![realm(Absent), prod(Absent), dev(Absent)],
             missing.clone(),
@@ -257,7 +257,7 @@ fn maps_site_statuses() {
         (Source::Realm, 410, Holding::Holds),
         (Source::Realm, 404, Holding::Absent),
         (Source::Realm, 200, Holding::Unavailable),
-        (Source::Realm, 503, Holding::Undecided),
+        (Source::Realm, 503, Holding::Unavailable),
         (Source::Realm, 502, Holding::Unavailable),
         (Source::Legacy, 200, Holding::Holds),
         (Source::Legacy, 400, Holding::Holds),
@@ -559,7 +559,7 @@ async fn legacy_never_absent() {
     let pid = format!("{API}/pid/{LEGACY}");
     let sites = Sites::old(&[(&pid, Holding::Unavailable)]);
     assert_eq!(sites.ask(&resolver, LEGACY, now).await, Answer::Unavailable);
-    // A node's 503 for an id it cannot place, while v2 lacks it too, is a 404 that is not kept.
+    // A 503 marked as an unknown placement, while v2 lacks the id too, is a 404 that is not kept.
     let unplaced = Sites::old(&[(&pid, Holding::Undecided)]);
     for _ in 0..2 {
         let answer = unplaced.ask(&resolver, LEGACY, now).await;
@@ -571,6 +571,73 @@ async fn legacy_never_absent() {
     let known = Sites::old(&[(&pid, Holding::Unavailable), (&dev_api, Holding::Holds)]);
     let page = redirect(&format!("{}{LEGACY}", V2_DEV.page));
     assert_eq!(known.ask(&resolver, LEGACY, now).await, page);
+}
+
+/// A realm node that answers every route with 503, marked as an unknown placement when
+/// `marked`; its base URL and the count of requests it served.
+async fn failing_node(marked: bool) -> (Url, Arc<AtomicUsize>) {
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = served.clone();
+    let router = Router::new().fallback(move || {
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
+            if marked {
+                let unknown = HeaderValue::from_static("unknown");
+                response.headers_mut().insert("aruna-placement", unknown);
+            }
+            response
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (base, served)
+}
+
+/// Resolves `path` with every realm probe sent to `node` and both v2 sites answering 404.
+async fn ask_node(resolver: &Resolver, node: &Url, path: &str, now: u64) -> Answer {
+    let egress = EgressGuard::new(EgressPolicy::loopback()).unwrap();
+    let asking = |url: Url, source| {
+        let egress = &egress;
+        let local = node.join(url.path()).unwrap();
+        async move {
+            match source {
+                Source::Realm => probe(egress, local, source).await,
+                Source::Legacy | Source::Routes => Holding::Absent,
+            }
+        }
+    };
+    let client = IpAddr::from([192, 0, 2, 1]);
+    resolver.answer(parse_path(path), now, client, asking).await
+}
+
+#[tokio::test]
+async fn authority_failure_unavailable() {
+    // A held dataset or Profile whose node answers a plain 503, as while its PID authority is
+    // unreachable, stays a 503 although no v2 site knows it.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let (node, served) = failing_node(false).await;
+    let id = minted();
+    for path in [id.to_string(), format!("profile/{id}")] {
+        let answer = ask_node(&resolver, &node, &path, now).await;
+        assert_eq!(answer, Answer::Unavailable, "{path}");
+    }
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn unplaced_absent_uncached() {
+    // A 503 marked as an unknown placement, with both v2 sites answering 404, is a 404 that
+    // is asked again each time.
+    let (_dir, resolver, now) = resolver(BASE, true);
+    let (node, served) = failing_node(true).await;
+    for _ in 0..2 {
+        let answer = ask_node(&resolver, &node, LEGACY, now).await;
+        assert!(matches!(answer, Answer::NotFound(_)), "{answer:?}");
+    }
+    assert_eq!(served.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -828,6 +895,15 @@ async fn probes_follow_nothing() {
         )
         .route("/gone", get(status(410)))
         .route("/down", get(status(503)))
+        .route(
+            "/unplaced",
+            get(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("aruna-placement", "unknown")],
+                )
+            }),
+        )
         .route("/ok", get(status(200)))
         .route("/private", get(status(400)));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -839,7 +915,10 @@ async fn probes_follow_nothing() {
         ("/moved", Source::Realm, Holding::Holds),
         ("/gone", Source::Realm, Holding::Holds),
         ("/missing", Source::Realm, Holding::Absent),
-        ("/down", Source::Realm, Holding::Undecided),
+        // Only the marked 503 of a realm node is undecided; a plain one may hide a holder.
+        ("/down", Source::Realm, Holding::Unavailable),
+        ("/unplaced", Source::Realm, Holding::Undecided),
+        ("/unplaced", Source::Legacy, Holding::Unavailable),
         ("/ok", Source::Legacy, Holding::Holds),
         ("/private", Source::Legacy, Holding::Holds),
         ("/missing", Source::Legacy, Holding::Absent),

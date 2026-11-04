@@ -92,7 +92,7 @@ pub enum Holding {
     Holds,
     Absent,
     Unavailable,
-    /// A realm node answered but cannot place the id yet, as it does for every foreign id.
+    /// A realm node answered a 503 marked `aruna-placement: unknown`: it can place no such id.
     Undecided,
 }
 
@@ -624,11 +624,10 @@ fn decide(answers: &[Asked]) -> Answer {
 
 /// A realm holds an id when its node redirects to a page or reports it withdrawn; a v2 site
 /// when it serves the resource or refuses it as not public; a node serves the w3id route when
-/// it redirects the route check. A node's own 503 means it cannot place the id: undecided.
+/// it redirects the route check. A 503, as during startup or an authority failure, is no absence.
 pub fn holding(source: Source, status: StatusCode) -> Holding {
     match (source, status.as_u16()) {
         (Source::Realm, 301 | 302 | 303 | 307 | 308 | 410) => Holding::Holds,
-        (Source::Realm, 503) => Holding::Undecided,
         (Source::Legacy, 200 | 400) => Holding::Holds,
         (Source::Routes, 307) => Holding::Holds,
         (_, 404) => Holding::Absent,
@@ -651,7 +650,17 @@ pub async fn probe(egress: &EgressGuard, url: Url, source: Source) -> Holding {
         .send()
         .await
     {
-        Ok(response) => holding(source, response.status()),
+        Ok(response) => {
+            let unplaced = response.status() == StatusCode::SERVICE_UNAVAILABLE
+                && response
+                    .headers()
+                    .get("aruna-placement")
+                    .is_some_and(|value| value == "unknown");
+            match source {
+                Source::Realm if unplaced => Holding::Undecided,
+                _ => holding(source, response.status()),
+            }
+        }
         Err(_) => Holding::Unavailable,
     }
 }
