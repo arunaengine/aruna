@@ -254,37 +254,6 @@ async fn read_realm_config(driver_ctx: &DriverContext, realm_id: &RealmId) -> Re
     }
 }
 
-async fn add_provider(
-    driver_ctx: &DriverContext,
-    realm_id: RealmId,
-    node_id: aruna_core::NodeId,
-    provider: OidcProviderConfig,
-) {
-    let mut config = read_realm_config(driver_ctx, &realm_id).await;
-    config.oidc_providers.push(provider);
-    match driver_ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(realm_id.as_bytes().to_vec()),
-            value: ByteView::from(
-                config
-                    .to_bytes(&Actor {
-                        node_id,
-                        user_id: UserId::nil(realm_id),
-                        realm_id,
-                    })
-                    .unwrap(),
-            ),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => panic!("unexpected realm config write result: {other:?}"),
-    }
-}
-
 async fn spawn_test_node(provider: OidcProviderConfig, claim_initial_admin: bool) -> TestNode {
     spawn_node(provider, claim_initial_admin, false, true).await
 }
@@ -376,7 +345,29 @@ async fn spawn_node(
     .await
     .unwrap();
 
-    add_provider(driver_ctx.as_ref(), realm_id, node_id, provider).await;
+    let mut config = read_realm_config(driver_ctx.as_ref(), &realm_id).await;
+    config.oidc_providers.push(provider);
+    match driver_ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(realm_id.as_bytes().to_vec()),
+            value: ByteView::from(
+                config
+                    .to_bytes(&Actor {
+                        node_id,
+                        user_id: UserId::nil(realm_id),
+                        realm_id,
+                    })
+                    .unwrap(),
+            ),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected realm config write result: {other:?}"),
+    }
 
     let state = Arc::new(
         ServerState::new(
@@ -1616,18 +1607,39 @@ async fn registered_user_token() {
     oidc_task.abort();
 }
 
-// A second provider with its own issuer and audience signs in on its own, keyed by its `iss`.
+// A provider added through the route signs in with its own audience, keyed by its `iss`.
 #[tokio::test]
 async fn second_provider_registers() {
     let (kid, first_key, second_key) = ("key", generate_signing_key(), generate_signing_key());
     let (first, first_task) = spawn_oidc_provider("https://first.example", kid, &first_key).await;
     let issuer = "https://second.example";
-    let (mut second, second_task) = spawn_oidc_provider(issuer, kid, &second_key).await;
-    second.id = "second".to_string();
-    second.audience = "second-client".to_string();
+    let (second, second_task) = spawn_oidc_provider(issuer, kid, &second_key).await;
     let node = spawn_test_node(first, true).await;
-    let node_id = node.net.node_id();
-    add_provider(node.context.as_ref(), node.realm_id, node_id, second).await;
+    let client = reqwest::Client::new();
+    let admin_token = sign_aruna_token(&node, node.realm_admin_id, None);
+    let added = client
+        .put(format!(
+            "{}/api/v1/system/realm/oidc-providers/second",
+            node.base_url
+        ))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({
+            "issuer": second.issuer,
+            "audience": "second-client",
+            "discovery_url": second.discovery_url,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::OK);
+    let ids: Vec<String> = added
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .unwrap()
+        .iter()
+        .map(|provider| provider["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["main", "second"]);
 
     let claims = |aud: &str| TestOidcClaims {
         sub: "subject-123".to_string(),
@@ -1640,7 +1652,6 @@ async fn second_provider_registers() {
         email_verified: None,
     };
     let oidc_token = sign_claims(kid, &second_key, &claims("second-client"));
-    let client = reqwest::Client::new();
     let register = client
         .post(format!("{}/api/v1/access/users/register", node.base_url))
         .bearer_auth(&oidc_token)

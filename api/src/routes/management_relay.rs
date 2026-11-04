@@ -51,6 +51,7 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/access/devices/{node_id}"),
     ("DELETE", "/access/onboarding/secrets/{id}"),
     ("DELETE", "/access/users/me/devices/{id}"),
+    ("DELETE", "/system/realm/oidc-providers/{id}"),
     ("GET", "/access/groups/{id}/service-accounts"),
     ("GET", "/access/onboarding/secrets"),
     ("GET", "/access/onboarding/secrets/{id}/status"),
@@ -73,6 +74,7 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("PUT", "/access/users/{id}/status"),
     ("PUT", "/compute/config"),
     ("PUT", "/system/realm/federation"),
+    ("PUT", "/system/realm/oidc-providers/{id}"),
     ("PUT", "/system/realm/portal-features"),
     ("PUT", "/system/realm/quota"),
 ];
