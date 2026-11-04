@@ -39,6 +39,15 @@ jobs:
       - name: Free disk space
         uses: ./.github/actions/free-disk
 
+      # The instrumented build peaked near the runner's 16 GB and then lost the runner.
+      - name: Add swap space
+        run: |
+          sudo fallocate -l 8G /mnt/build.swap
+          sudo chmod 600 /mnt/build.swap
+          sudo mkswap /mnt/build.swap
+          sudo swapon /mnt/build.swap
+          free -m
+
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
         with:
