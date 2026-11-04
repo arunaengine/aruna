@@ -69,6 +69,12 @@ pub struct LoginOption {
     /// Extra parameters that link this login to the signed-in account; empty means not linkable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub link_params: BTreeMap<String, String>,
+    /// The `id` of the realm OIDC provider that issues this option's ID tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Base URL of the login bridge; the portal calls `<bridge>/authorize` and `<bridge>/token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<String>,
 }
 
 #[derive(Clone)]
@@ -586,7 +592,10 @@ mod tests {
         std::fs::write(tempdir.path().join("index.html"), "<html>portal</html>").unwrap();
         enable_portal(&state, tempdir.path()).await;
         let login: super::PortalLogin = serde_json::from_value(serde_json::json!({
-            "options": [{"name": "Example SSO", "params": {"kc_idp_hint": "example"}}],
+            "options": [
+                {"name": "Example SSO", "params": {"kc_idp_hint": "example"}},
+                {"name": "Upstream", "provider": "up", "bridge": "https://bridge.example/up"}
+            ],
             "accountUrl": "https://idp.example.org/account"
         }))
         .unwrap();
@@ -609,7 +618,10 @@ mod tests {
         assert_eq!(
             config["login"],
             serde_json::json!({
-                "options": [{"name": "Example SSO", "params": {"kc_idp_hint": "example"}}],
+                "options": [
+                    {"name": "Example SSO", "params": {"kc_idp_hint": "example"}},
+                    {"name": "Upstream", "provider": "up", "bridge": "https://bridge.example/up"}
+                ],
                 "accountUrl": "https://idp.example.org/account"
             })
         );

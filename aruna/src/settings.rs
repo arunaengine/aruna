@@ -655,6 +655,27 @@ fn portal_login_env(env: &dyn SettingsEnv) -> Result<Option<PortalLogin>, SetupE
             "every option needs a name",
         ));
     }
+    for option in &login.options {
+        if option
+            .provider
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(invalid_config_value(
+                KEY,
+                value,
+                "provider must not be empty",
+            ));
+        }
+        let bridge = option.bridge.as_deref().map(reqwest::Url::parse);
+        if bridge.is_some_and(|url| !url.is_ok_and(|url| url.scheme() == "https")) {
+            return Err(invalid_config_value(
+                KEY,
+                value,
+                "bridge must be an HTTPS URL",
+            ));
+        }
+    }
     Ok(Some(login))
 }
 
@@ -1312,9 +1333,22 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(parsed.options[0].params["kc_idp_hint"], "sso");
+        let upstream = login(
+            r#"{"options":[{"name":"LS","provider":"ls","bridge":"https://bridge.example/ls"}]}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(upstream.options[0].provider.as_deref(), Some("ls"));
+        assert_eq!(
+            upstream.options[0].bridge.as_deref(),
+            Some("https://bridge.example/ls")
+        );
         assert_eq!(login("").unwrap(), None);
         for invalid in [
             r#"{"options":[{"name":" "}]}"#,
+            r#"{"options":[{"name":"LS","provider":" "}]}"#,
+            r#"{"options":[{"name":"LS","bridge":"http://bridge.example"}]}"#,
+            r#"{"options":[{"name":"LS","bridge":"bridge.example"}]}"#,
             r#"{"option":[]}"#,
             "not json",
         ] {

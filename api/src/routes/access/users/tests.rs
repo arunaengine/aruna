@@ -36,6 +36,7 @@ use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperat
 use aruna_operations::realm::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
 use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::tasks::incoming::start_task_queues;
+use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::Json;
@@ -253,6 +254,37 @@ async fn read_realm_config(driver_ctx: &DriverContext, realm_id: &RealmId) -> Re
     }
 }
 
+async fn add_provider(
+    driver_ctx: &DriverContext,
+    realm_id: RealmId,
+    node_id: aruna_core::NodeId,
+    provider: OidcProviderConfig,
+) {
+    let mut config = read_realm_config(driver_ctx, &realm_id).await;
+    config.oidc_providers.push(provider);
+    match driver_ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(realm_id.as_bytes().to_vec()),
+            value: ByteView::from(
+                config
+                    .to_bytes(&Actor {
+                        node_id,
+                        user_id: UserId::nil(realm_id),
+                        realm_id,
+                    })
+                    .unwrap(),
+            ),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected realm config write result: {other:?}"),
+    }
+}
+
 async fn spawn_test_node(provider: OidcProviderConfig, claim_initial_admin: bool) -> TestNode {
     spawn_node(provider, claim_initial_admin, false, true).await
 }
@@ -344,29 +376,7 @@ async fn spawn_node(
     .await
     .unwrap();
 
-    let mut config = read_realm_config(driver_ctx.as_ref(), &realm_id).await;
-    config.oidc_providers.push(provider);
-    match driver_ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(realm_id.as_bytes().to_vec()),
-            value: ByteView::from(
-                config
-                    .to_bytes(&Actor {
-                        node_id,
-                        user_id: UserId::nil(realm_id),
-                        realm_id,
-                    })
-                    .unwrap(),
-            ),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => panic!("unexpected realm config write result: {other:?}"),
-    }
+    add_provider(driver_ctx.as_ref(), realm_id, node_id, provider).await;
 
     let state = Arc::new(
         ServerState::new(
@@ -1604,6 +1614,83 @@ async fn registered_user_token() {
     node.server_task.abort();
     node.net.shutdown().await;
     oidc_task.abort();
+}
+
+// A second provider with its own issuer and audience signs in on its own, keyed by its `iss`.
+#[tokio::test]
+async fn second_provider_registers() {
+    let (kid, first_key, second_key) = ("key", generate_signing_key(), generate_signing_key());
+    let (first, first_task) = spawn_oidc_provider("https://first.example", kid, &first_key).await;
+    let issuer = "https://second.example";
+    let (mut second, second_task) = spawn_oidc_provider(issuer, kid, &second_key).await;
+    second.id = "second".to_string();
+    second.audience = "second-client".to_string();
+    let node = spawn_test_node(first, true).await;
+    let node_id = node.net.node_id();
+    add_provider(node.context.as_ref(), node.realm_id, node_id, second).await;
+
+    let claims = |aud: &str| TestOidcClaims {
+        sub: "subject-123".to_string(),
+        iss: issuer.to_string(),
+        aud: aud.to_string(),
+        exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
+        name: Some("Alice".to_string()),
+        auth_time: None,
+        email: None,
+        email_verified: None,
+    };
+    let oidc_token = sign_claims(kid, &second_key, &claims("second-client"));
+    let client = reqwest::Client::new();
+    let register = client
+        .post(format!("{}/api/v1/access/users/register", node.base_url))
+        .bearer_auth(&oidc_token)
+        .json(&RegisterUserRequest {
+            onboarding_secret: None,
+            create_new: false,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(register.status(), StatusCode::CREATED);
+    let registered: RegisterUserResponse = register.json().await.unwrap();
+
+    let token_response = client
+        .get(format!("{}/api/v1/access/token", node.base_url))
+        .bearer_auth(&oidc_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(token_response.status(), StatusCode::OK);
+    let token: GetTokenResponse = token_response.json().await.unwrap();
+    let claims_out = handle_token(node.state.as_ref(), &token.token)
+        .await
+        .unwrap();
+    assert_eq!(claims_out.sub, registered.id);
+    let lookup = |issuer: &str| {
+        GetOidcOperation::new(GetOidcInput {
+            issuer: issuer.to_string(),
+            subject_id: "subject-123".to_string(),
+        })
+    };
+    let user = drive(lookup(issuer), node.context.as_ref()).await.unwrap();
+    assert_eq!(user.user_id.to_string(), registered.id);
+    let other = drive(lookup("https://first.example"), node.context.as_ref()).await;
+    assert_eq!(other.unwrap_err(), GetOidcError::UserNotFound);
+
+    // The first provider's audience does not select the second provider.
+    let wrong_audience = sign_claims(kid, &second_key, &claims("aruna-api"));
+    let rejected = client
+        .get(format!("{}/api/v1/access/token", node.base_url))
+        .bearer_auth(&wrong_audience)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+    node.server_task.abort();
+    node.net.shutdown().await;
+    first_task.abort();
+    second_task.abort();
 }
 
 #[tokio::test]
