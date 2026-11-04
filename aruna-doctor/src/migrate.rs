@@ -57,6 +57,7 @@ use ulid::Ulid;
 
 mod buckets;
 mod cursor_repair;
+mod federation;
 mod git;
 mod info_topics;
 mod jobs;
@@ -647,6 +648,7 @@ fn realm_configs(
             continue;
         }
         let bytes = realm_config_suffix(&value)
+            .or_else(|| federation::upgraded(&value))
             .ok_or_else(|| decode_error(REALM_CONFIG_KEYSPACE, &key, "unknown shape"))?;
         rows.push((key.to_vec(), bytes));
     }
