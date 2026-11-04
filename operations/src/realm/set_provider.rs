@@ -480,3 +480,187 @@ fn apply_reducer_provider(
         _ => document.oidc_providers.retain(|p| p.id != provider_id),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+    use aruna_core::task::TaskKey;
+    use std::time::Duration;
+    use ulid::Ulid;
+
+    fn actor() -> Actor {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([1u8; 16]), realm_id),
+            realm_id,
+        }
+    }
+
+    fn provider(id: &str, issuer: &str) -> OidcProviderConfig {
+        OidcProviderConfig {
+            id: id.to_string(),
+            issuer: issuer.to_string(),
+            audience: "client".to_string(),
+            discovery_url: format!("{issuer}/.well-known/openid-configuration"),
+        }
+    }
+
+    fn operation(change: ProviderChange) -> SetProviderOperation {
+        let actor = actor();
+        SetProviderOperation::new(SetProviderConfig {
+            auth_context: AuthContext {
+                user_id: actor.user_id,
+                realm_id: actor.realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            actor,
+            change,
+        })
+    }
+
+    /// Steps an operation to its document write against a management node config;
+    /// `None` when it aborts there instead.
+    fn written(
+        operation: &mut SetProviderOperation,
+        providers: Vec<OidcProviderConfig>,
+    ) -> Option<RealmConfigDocument> {
+        let actor = actor();
+        let mut config = RealmConfigDocument::new(actor.realm_id, providers, 3);
+        config.ensure_node(actor.node_id, RealmNodeKind::Management);
+        operation.start();
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from_bytes([2u8; 16]),
+        }));
+        let value: Value = config.to_bytes(&actor).unwrap().into();
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Key::from(b"config".as_slice()), Some(value)),
+                (Key::from(b"state".as_slice()), None),
+            ],
+        }));
+        match effects.as_slice() {
+            [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] => {
+                Some(RealmConfigDocument::from_bytes(&writes[0].2).unwrap())
+            }
+            [Effect::Storage(StorageEffect::AbortTransaction { .. })] => None,
+            other => panic!("unexpected effects: {other:?}"),
+        }
+    }
+
+    fn ids(document: &RealmConfigDocument) -> Vec<&str> {
+        document
+            .oidc_providers
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn start_checks_permission() {
+        let mut operation = operation(ProviderChange::Upsert(provider("ls", "https://ls.example")));
+        let effects = operation.start();
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let emitted = format!("{effects:?}");
+        assert!(emitted.contains(&policy_admin_path(actor().realm_id)));
+        assert!(emitted.contains("WRITE"));
+    }
+
+    #[test]
+    fn denied_is_terminal() {
+        let mut operation = operation(ProviderChange::Upsert(provider("ls", "https://ls.example")));
+        operation.start();
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+        ));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize(), Err(SetProviderError::Unauthorized));
+    }
+
+    #[test]
+    fn rejects_invalid_fields() {
+        // Validation runs before any effect, so a bad entry never reaches storage.
+        let mut plain_http = provider("ls", "http://ls.example");
+        let mut blank_audience = provider("ls", "https://ls.example");
+        blank_audience.audience = " ".to_string();
+        let bad_id = provider("l s", "https://ls.example");
+        plain_http.discovery_url = "https://ls.example/discovery".to_string();
+        for invalid in [plain_http, blank_audience, bad_id] {
+            let mut operation = operation(ProviderChange::Upsert(invalid));
+            assert!(operation.start().is_empty());
+            assert!(matches!(
+                operation.finalize(),
+                Err(SetProviderError::InvalidProvider { .. })
+            ));
+        }
+        assert!(validate_provider(&provider("dev", "http://127.0.0.1:8080")).is_ok());
+    }
+
+    #[test]
+    fn upsert_keeps_order() {
+        let main = provider("main", "https://keycloak.example");
+        let ls = provider("ls", "https://ls.example");
+        let mut appended = operation(ProviderChange::Upsert(ls.clone()));
+        let document = written(&mut appended, vec![main.clone()]).unwrap();
+        assert_eq!(ids(&document), ["main", "ls"]);
+
+        let replaced = provider("main", "https://replaced.example");
+        let mut replace = operation(ProviderChange::Upsert(replaced.clone()));
+        let document = written(&mut replace, vec![main, ls.clone()]).unwrap();
+        assert_eq!(document.oidc_providers, vec![replaced, ls]);
+    }
+
+    #[test]
+    fn upsert_completes() {
+        let main = provider("main", "https://keycloak.example");
+        let mut operation = operation(ProviderChange::Upsert(provider("ls", "https://ls.example")));
+        written(&mut operation, vec![main]).unwrap();
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: Ulid::from_bytes([2u8; 16]),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Task(aruna_core::task::TaskEffect::ResetTimer {
+                key: TaskKey::DrainSyncOutbox,
+                ..
+            })]
+        ));
+        assert!(!operation.is_complete());
+        operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainSyncOutbox,
+            after: Duration::ZERO,
+        }));
+        assert!(operation.is_complete());
+        assert_eq!(ids(&operation.finalize().unwrap()), ["main", "ls"]);
+    }
+
+    #[test]
+    fn remove_guards_last() {
+        let main = provider("main", "https://keycloak.example");
+        let ls = provider("ls", "https://ls.example");
+        let mut remove = operation(ProviderChange::Remove("ls".to_string()));
+        let document = written(&mut remove, vec![main.clone(), ls]).unwrap();
+        assert_eq!(ids(&document), ["main"]);
+
+        let mut last = operation(ProviderChange::Remove("main".to_string()));
+        assert_eq!(written(&mut last, vec![main.clone()]), None);
+        assert_eq!(last.finalize(), Err(SetProviderError::LastProvider));
+        let mut unknown = operation(ProviderChange::Remove("ls".to_string()));
+        assert_eq!(written(&mut unknown, vec![main]), None);
+        assert_eq!(unknown.finalize(), Err(SetProviderError::UnknownProvider));
+    }
+}
