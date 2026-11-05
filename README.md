@@ -77,9 +77,12 @@ You need Docker. The node image is published on Harbor for linux/amd64. It conta
 `aruna-doctor` and the web portal:
 
 ```bash
-IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3-demo:v3.0.0-alpha.157-test.2a6fb687d-portal.7c844cae
+IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3-demo:v3
 docker pull "$IMAGE"
 ```
+
+The tag `v3` follows the newest v3 release. To pin one release, use its version as the tag, for
+example `v3.0.0-alpha.157`.
 
 To build the image from a checkout of this repository instead, run `docker build -t aruna:local .`
 and set `IMAGE=aruna:local`. A first build takes 10 to 30 minutes. A built image has no web portal
