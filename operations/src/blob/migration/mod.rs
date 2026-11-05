@@ -2291,12 +2291,13 @@ pub async fn settle_move(
     intents: &[(Vec<u8>, WriteIntent)],
 ) -> Result<bool, String> {
     let storage = &context.storage_handle;
+    let key: Key = version
+        .to_bytes()
+        .map_err(|error| error.to_string())?
+        .into();
     let read = StorageEffect::Read {
         key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-        key: version
-            .to_bytes()
-            .map_err(|error| error.to_string())?
-            .into(),
+        key: key.clone(),
         txn_id: None,
     };
     let present = match storage.send_storage_effect(read).await {
@@ -2318,6 +2319,12 @@ pub async fn settle_move(
     // A run that ends on its own decided the version's file; any intent it leaves is stale.
     match crate::driver::drive(operation, context).await {
         Ok(_) => retire_intents(context, version, intents).await,
+        // A copy the storage check records as broken never moves, so its intents are stale too.
+        Err(_) if is_broken(context, &key).await => {
+            let (bucket, version_id) = (version.bucket.as_str(), version.version_id);
+            tracing::warn!(bucket, %version_id, "A moved version has no stored copy");
+            retire_intents(context, version, intents).await
+        }
         Err(error) => {
             tracing::warn!(%error, "A move did not settle yet");
             Ok(false)
