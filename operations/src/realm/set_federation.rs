@@ -13,7 +13,9 @@ use aruna_core::federation::{
 };
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_FEDERATION_PATH};
+use aruna_core::reducer::{
+    AdminDocumentError, AdminDocumentState, CONFIG_DESCRIPTION_PATH, CONFIG_FEDERATION_PATH,
+};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -45,6 +47,7 @@ pub struct SetFederationConfig {
     pub node_capabilities: NodeCapabilities,
     pub name: String,
     /// `None` keeps the stored description, or the realm description at first setup.
+    /// A given description also replaces the realm description.
     pub description: Option<String>,
     pub contact: Option<String>,
     /// Ids of configured OIDC providers to show in the descriptor.
@@ -218,6 +221,22 @@ impl SetFederationOperation {
         )?;
         // Materialized reducer state keeps local and replicated conflict outcomes equal.
         apply_reducer_federation(&mut document, &reducer_state);
+        let mut admin_events = vec![admin_event];
+        if let Some(description) = self.config.description.clone()
+            && description != document.description
+        {
+            admin_events.push(reducer_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::ConfigDescriptionSet { description },
+            )?);
+            if !reducer_state
+                .conflicts
+                .contains_key(CONFIG_DESCRIPTION_PATH)
+                && let Some(description) = reducer_state.materialized_realm_description()
+            {
+                document.description = description;
+            }
+        }
 
         let stale_conflict_deletes =
             stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
@@ -231,16 +250,18 @@ impl SetFederationOperation {
             ),
             reducer_state_entry(&reducer_state)?,
         ];
-        let record = new_identified_record(
-            admin_event.event_id,
-            self.config.actor.node_id,
-            document_target,
-            Vec::new(),
-            DocumentOutboxEvent::admin(admin_event),
-            placement,
-            false,
-        );
-        writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        for admin_event in admin_events {
+            let record = new_identified_record(
+                admin_event.event_id,
+                self.config.actor.node_id,
+                document_target.clone(),
+                Vec::new(),
+                DocumentOutboxEvent::admin(admin_event),
+                placement,
+                false,
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
         self.output = Some(Ok(document.clone()));
@@ -561,8 +582,9 @@ mod tests {
     use crate::realm::get_config::GetConfigOperation;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentDot;
+    use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::events::StorageEvent;
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_core::reducer::{AdminConflict, AdminConflictValue};
     use aruna_core::structs::identity::realm::{
         OidcProviderConfig, RealmAuthorizationDocument, RealmId, RealmNodeKind,
@@ -793,6 +815,88 @@ mod tests {
         document.federation = Some(stored);
         let signed = operation.signed_settings(&document, &state).unwrap();
         assert_eq!(signed.descriptor.payload.issued_at, 501);
+    }
+
+    /// Steps to the batch write without I/O and returns the written realm config and admin ops.
+    fn written_ops(
+        description: Option<&str>,
+    ) -> (SetFederationOperation, String, Vec<AdminDocumentOperation>) {
+        let actor = actor();
+        let mut config = request(&actor, "https://api.example.org");
+        config.description = description.map(str::to_string);
+        let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        document.description = "Old_Realm".to_string();
+        document.ensure_node(actor.node_id, RealmNodeKind::Management);
+        let value = Value::from(document.to_bytes(&actor).unwrap());
+        let mut operation = SetFederationOperation::new(config);
+        assert!(matches!(
+            operation.start().as_slice(),
+            [Effect::SubOperation(_)]
+        ));
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        let txn_id = Ulid::from_bytes([7u8; 16]);
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Key::from(b"config".as_slice()), Some(value)),
+                (Key::from(b"state".as_slice()), None),
+            ],
+        }));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write, got {effects:?}");
+        };
+        let stored = RealmConfigDocument::from_bytes(&writes[0].2).unwrap();
+        let ops = writes
+            .iter()
+            .filter(|(key_space, _, _)| key_space == SYNC_OUTBOX_KEYSPACE)
+            .map(|(_, _, value)| {
+                let record: DocumentOutboxRecord = postcard::from_bytes(value).unwrap();
+                match record.event {
+                    DocumentOutboxEvent::AdminOperation { event, .. } => event.op,
+                    other => panic!("expected an admin operation, got {other:?}"),
+                }
+            })
+            .collect();
+        (operation, stored.description, ops)
+    }
+
+    #[test]
+    fn description_sets_realm() {
+        // A changed description also replaces the replicated realm description in the same write.
+        let (mut operation, description, ops) = written_ops(Some("NFDI4LS"));
+        assert_eq!(description, "NFDI4LS");
+        assert!(matches!(
+            ops.as_slice(),
+            [
+                AdminDocumentOperation::ConfigFederationSet { .. },
+                AdminDocumentOperation::ConfigDescriptionSet { description },
+            ] if description == "NFDI4LS"
+        ));
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let txn_id = Ulid::from_bytes([7u8; 16]);
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainSyncOutbox,
+            after: std::time::Duration::ZERO,
+        }));
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize().unwrap().description, "NFDI4LS");
+
+        // Without a description, or with the current one, the realm description stays.
+        for kept in [None, Some("Old_Realm")] {
+            let (_, description, ops) = written_ops(kept);
+            assert_eq!(description, "Old_Realm");
+            assert!(matches!(
+                ops.as_slice(),
+                [AdminDocumentOperation::ConfigFederationSet { .. }]
+            ));
+        }
     }
 
     #[tokio::test]

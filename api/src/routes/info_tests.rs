@@ -1319,6 +1319,45 @@ async fn federation_preconditions() {
 }
 
 #[tokio::test]
+async fn federation_sets_description() {
+    // A given description becomes the realm description; a non-admin changes nothing.
+    let (state, realm_id, admin, _tempdir) = setup_management_state().await;
+    let auth = admin_auth(realm_id, admin);
+    let body = RealmFederation {
+        description: Some("NFDI4LS".to_string()),
+        ..federation_body("NFDI4LS")
+    };
+    let description = || async {
+        let (_, Json(info)) = get_realm_info(State(state.clone()), Extension(Some(auth.clone())))
+            .await
+            .unwrap();
+        info.description
+    };
+
+    let stranger = admin_auth(realm_id, UserId::local(Ulid::generate(), realm_id));
+    let refused = set_realm_federation(
+        State(state.clone()),
+        Extension(Some(stranger)),
+        first_setup(),
+        Json(body.clone()),
+    )
+    .await;
+    assert!(matches!(refused, Err(ServerError::Forbidden)));
+    assert_eq!(description().await, "Realm");
+
+    let (_, Json(stored)) = set_realm_federation(
+        State(state.clone()),
+        Extension(Some(auth.clone())),
+        first_setup(),
+        Json(body),
+    )
+    .await
+    .expect("an admin sets the description");
+    assert_eq!(stored.description.as_deref(), Some("NFDI4LS"));
+    assert_eq!(description().await, "NFDI4LS");
+}
+
+#[tokio::test]
 async fn federation_no_config() {
     // Without a realm config the policy check cannot load, so the answer is 503, not 403.
     let (state, _tempdir) = setup_state().await;
