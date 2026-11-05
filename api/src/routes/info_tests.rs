@@ -137,7 +137,7 @@ async fn anonymous_info_hides() {
         );
         assert_eq!(
             key_set(&body["node"]),
-            std::collections::HashSet::from(["status", "realm_id"])
+            std::collections::HashSet::from(["status", "realm_id", "peer_id"])
         );
         assert_eq!(
             key_set(&body["services"]),
