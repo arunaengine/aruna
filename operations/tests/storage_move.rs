@@ -340,3 +340,52 @@ async fn settles_gone_versions() {
     );
     assert!(read(&context, IMPORT_INTENT_KEYSPACE, key).await.is_none());
 }
+
+#[tokio::test]
+async fn settles_missing_copies() {
+    // A version whose copy the storage lost cannot move. Its move settles once the storage
+    // check records it as broken, instead of failing on every pass; the version row stays.
+    use aruna_core::keyspaces::{BROKEN_VERSION_KEYSPACE, IMPORT_INTENT_KEYSPACE};
+    use aruna_core::structs::storage::backend_import::{WriteIntent, intent_key};
+    use aruna_core::structs::storage::broken::{BrokenReason, BrokenVersion};
+    use aruna_operations::blob::migration::settle_move;
+    let context = setup_context().await;
+    let id = put(&context, "data/a.txt", b"lost research data").await;
+    let stored = version(&context, "data/a.txt", id).await;
+    let key = stored.location_key().unwrap().to_bytes();
+    let location = read(&context, BLOB_LOCATIONS_KEYSPACE, key).await.unwrap();
+    let location = BackendLocation::from_bytes(&location).unwrap();
+    let blob = context.driver.blob_handle.as_ref().unwrap();
+    let deleted = blob.send_blob_effect(BlobEffect::Delete { location }).await;
+    assert!(matches!(deleted, Event::Blob(BlobEvent::DeleteFinished)));
+    route_cold(&context, "data/").await;
+    let intent = WriteIntent {
+        key: "data/a.txt".to_string(),
+        version_id: id,
+        backend: BackendRef::node_default(),
+        created_by: context.user_id,
+        written: Some([1; 32]),
+        mover: Some(7),
+    };
+    let row = intent_key(Ulid::generate(), "raw/a.txt~X", id).to_vec();
+    let write = StorageEffect::Write {
+        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+        key: row.clone().into(),
+        value: intent.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    context
+        .driver
+        .storage_handle
+        .send_storage_effect(write)
+        .await;
+    let moved = VersionKey::new(BUCKET, "data/a.txt", id);
+
+    let settled = settle_move(&context.driver, &moved, &[(row.clone(), intent)]).await;
+    assert!(settled.unwrap(), "a missing copy must settle its move");
+    assert!(read(&context, IMPORT_INTENT_KEYSPACE, row).await.is_none());
+    let broken = read(&context, BROKEN_VERSION_KEYSPACE, moved.to_bytes().unwrap()).await;
+    let broken = BrokenVersion::from_bytes(&broken.unwrap()).unwrap();
+    assert_eq!(broken.reason, BrokenReason::MissingBlob);
+    assert_eq!(version(&context, "data/a.txt", id).await, stored);
+}

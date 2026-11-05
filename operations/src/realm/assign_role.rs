@@ -642,7 +642,7 @@ fn apply_reducer_updates(
     Ok(admin_events)
 }
 
-fn should_seed_role(state: &AdminDocumentState, role_id: RoleId) -> bool {
+pub(crate) fn should_seed_role(state: &AdminDocumentState, role_id: RoleId) -> bool {
     !state.materialized_realm_roles().contains(&role_id)
         && !state
             .conflicts
