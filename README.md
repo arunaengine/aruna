@@ -26,6 +26,8 @@
   <a href="https://api.node-1.v3.aruna-engine.org/swagger-ui/">Swagger UI</a> ·
   <a href="#features">Features</a> ·
   <a href="#getting-started">Getting started</a> ·
+  <a href="#command-line-client">Command line client</a> ·
+  <a href="#desktop-app">Desktop app</a> ·
   <a href="#concepts-in-brief">Concepts</a> ·
   <a href="#operations">Operations</a> ·
   <a href="#feedback-and-contributions">Contributing</a>
@@ -152,29 +154,92 @@ stop it. The local nodes run compute jobs with Docker by default.
 For development, `just local` builds the image and starts one node with a test login server,
 Prometheus and Grafana in Docker Compose. It uses host networking, so it needs Linux.
 
-### Command line client
+## Command line client
 
-`aruna-cli` works with a realm's REST and S3 APIs directly. It needs no local node. There is no
-release binary yet, so install it from this checkout with Rust:
+`aruna-cli` works with a realm from the terminal. It talks to a node's REST and S3 APIs and needs
+no local node. With it you can:
+
+- list buckets and objects, and create buckets,
+- copy files and sync folders, with multipart uploads that resume,
+- search the realm and create, import, validate and export RO-Crate metadata,
+- submit and follow compute jobs through GA4GH TES,
+- create share links and print S3 credentials for other tools.
+
+### Install
+
+There are no release binaries yet. Install it with Rust 1.97.1 or newer, from a checkout of this
+repository or straight from Git:
 
 ```bash
-cargo install --path cli
+cargo install --locked --path cli
+cargo install --locked --git https://github.com/arunaengine/aruna aruna-cli
+```
+
+Pre-built binaries are planned. They will appear on the
+[releases page](https://github.com/arunaengine/aruna/releases) with tags that start with `cli-v`.
+
+### Sign in
+
+Create a token in the portal under Settings, API sessions. Then sign in with the API address of
+your node:
+
+```bash
 aruna-cli login --api https://node.example --token <TOKEN>
+aruna-cli whoami
+```
+
+`login` creates a CLI session and keeps its token in the OS keyring. Without `--token` it reads the
+token from standard input. Without a keyring, set `ARUNA_API` and `ARUNA_TOKEN` instead of signing
+in. Scripts can do the same.
+
+### Examples
+
+```bash
 aruna-cli buckets ls
 aruna-cli cp results.csv my-bucket/run-42/
 aruna-cli sync ./run-42 my-bucket/run-42 --dry-run
 aruna-cli meta search "proteomics"
+aruna-cli jobs submit task.json
+aruna-cli share my-bucket/run-42/ --expires 7d
 ```
 
-Create the token in the portal under Settings, API sessions. The token is kept in the OS keyring.
-Without a keyring, set `ARUNA_API` and `ARUNA_TOKEN` instead of signing in. `aruna-cli --help`
-describes every command.
+For `cp` and `sync`, the source sets the direction: a local source uploads, a remote one
+downloads. `aruna-cli --help` describes every command.
+
+### Third-party notice
 
 On Linux, `aruna-cli` includes a copy of libdbus, built from source, to reach the Secret Service
 keyring. libdbus, part of the freedesktop.org D-Bus project, is offered under the Academic Free
 License version 2.1 or the GPL version 2; `aruna-cli` uses it under the
 [Academic Free License version 2.1](https://spdx.org/licenses/AFL-2.1.html). Its copyright and
 license notices are in the `vendor/dbus` folder of the `libdbus-sys` crate.
+
+## Desktop app
+
+[Aruna Desktop](https://github.com/arunaengine/aruna-desktop) connects your computer to a realm. It
+runs a small Aruna node on your computer and shows the same portal as the web. With it you can:
+
+- sign in with your realm account, through the login providers of your realm,
+- browse, upload and share data in the built-in portal,
+- link a local folder to a bucket and keep both in sync, one way or both ways,
+- run jobs on your computer with Docker, or Apptainer on Linux,
+- pause the device, which stops sync and local jobs until you resume.
+
+### Download
+
+Installers will appear as pre-releases on the
+[Aruna Desktop releases page](https://github.com/arunaengine/aruna-desktop/releases). They cover
+Linux (`.deb`, `.rpm`, `.AppImage`), Windows (`-setup.exe`) and macOS on Apple silicon (`.dmg`).
+Pick the release whose version matches the version your realm runs. The
+[Aruna Desktop readme](https://github.com/arunaengine/aruna-desktop#how-to-install) explains how
+to install it on each system and how to add your computer as a device.
+
+### Build from source
+
+Aruna Desktop is a [Tauri](https://tauri.app/) app. A build bundles an `aruna` node from this
+repository and the portal, both at the versions pinned in its `versions.json`. The
+[release workflow](https://github.com/arunaengine/aruna-desktop/blob/main/.github/workflows/release.yml)
+shows every step.
 
 ## Concepts in brief
 
