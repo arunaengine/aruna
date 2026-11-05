@@ -133,6 +133,17 @@ pub(crate) fn anonymous_read_allowed(operation_name: &str) -> bool {
     matches!(operation_name, "GetObject")
 }
 
+/// Reads a signed caller may make on another group's bucket, as Everyone.
+pub(crate) fn public_read_allowed(operation_name: &str, has_key: bool) -> bool {
+    match has_key {
+        true => matches!(operation_name, "GetObject" | "HeadObject"),
+        false => matches!(
+            operation_name,
+            "HeadBucket" | "GetBucketLocation" | "ListObjects" | "ListObjectsV2"
+        ),
+    }
+}
+
 pub(crate) fn validate_object_key(key: &str) -> S3Result<()> {
     if key.is_empty() {
         return Err(s3_error!(InvalidArgument, "Object key must not be empty"));
@@ -445,7 +456,7 @@ mod tests {
     use super::{
         S3ChecksumAlgorithm, anonymous_read_allowed, bucket_name_reason, checksum_response_hashes,
         declared_trailer_algorithm, operation_permission, parse_copy_source, parse_part_number,
-        parse_source_range, validate_object_key,
+        parse_source_range, public_read_allowed, validate_object_key,
     };
     use crate::s3::auth::Action;
     use crate::s3::checksum::parse_upload_checksum;
@@ -650,6 +661,31 @@ mod tests {
                 !anonymous_read_allowed(operation),
                 "{operation} must not be allowed anonymously"
             );
+        }
+    }
+
+    #[test]
+    fn public_reads_listed() {
+        for operation in ["GetObject", "HeadObject"] {
+            assert!(public_read_allowed(operation, true));
+            assert!(!public_read_allowed(operation, false));
+        }
+        for operation in [
+            "HeadBucket",
+            "GetBucketLocation",
+            "ListObjects",
+            "ListObjectsV2",
+        ] {
+            assert!(public_read_allowed(operation, false));
+            assert!(!public_read_allowed(operation, true));
+        }
+        for operation in [
+            "ListObjectVersions",
+            "ListMultipartUploads",
+            "GetObjectTagging",
+        ] {
+            assert!(!public_read_allowed(operation, false));
+            assert!(!public_read_allowed(operation, true));
         }
     }
 

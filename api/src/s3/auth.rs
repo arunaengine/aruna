@@ -5,7 +5,7 @@
 use super::scope::resolve_scope;
 use super::server::S3OpLabel;
 use super::service::forwarded_digest;
-use super::util::{anonymous_read_allowed, operation_permission};
+use super::util::{anonymous_read_allowed, operation_permission, public_read_allowed};
 use crate::object_key::ObjectKey;
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
 use crate::s3::service::InputView;
@@ -262,8 +262,9 @@ impl S3Access for AuthProvider {
             Action::Write => Permission::WRITE,
         };
 
+        let mut user_access = user_access;
         let (path, auth_context) = self
-            .build_authorization_path(cx, &user_access, &action)
+            .build_authorization_path(cx, &mut user_access, &action)
             .await?;
 
         // An offered directory is an observation of the owner's own files: it is
@@ -1031,7 +1032,7 @@ impl AuthProvider {
     async fn build_authorization_path(
         &self,
         cx: &mut S3AccessContext<'_>,
-        user_access: &UserAccess,
+        user_access: &mut UserAccess,
         action: &Action,
     ) -> S3Result<(String, AuthContext)> {
         let mut auth_context = AuthContext {
@@ -1049,15 +1050,19 @@ impl AuthProvider {
             Some(bucket_info) => {
                 if bucket_info.group_id != user_access.group_id {
                     if !matches!(action, Action::Read)
-                        || !anonymous_read_allowed(cx.s3_op().name())
-                        || key.is_none()
+                        || !public_read_allowed(cx.s3_op().name(), key.is_some())
                     {
                         return Err(s3_error!(
                             AccessDenied,
                             "Bucket belongs to a different group"
                         ));
                     }
+                    // Another group's bucket is read as Everyone in that group, so a part
+                    // forwarded to another node asks as Everyone too.
                     auth_context = AuthContext::anonymous(self.realm_id);
+                    user_access.user_identity = UserId::nil(self.realm_id);
+                    user_access.group_id = bucket_info.group_id;
+                    user_access.path_restrictions = None;
                 }
                 cx.extensions_mut().insert(bucket_info.clone());
                 bucket_info.group_id

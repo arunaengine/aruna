@@ -557,7 +557,7 @@ mod tests {
             info.services.interfaces.rest.url.as_deref(),
             Some(api_url.as_str())
         );
-        assert!(info.node.peer_id.is_none());
+        assert!(info.node.peer_id.is_some());
         assert!(info.services.network.is_none());
         node.shutdown().await;
     }

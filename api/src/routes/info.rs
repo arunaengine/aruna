@@ -77,8 +77,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_usage))
 }
 
-/// Node information. `node.status`, `node.realm_id` and `api_version` are public;
-/// node identity, addresses, peer topology, backend detail and warnings need a realm
+/// Node information. `node.status`, `node.realm_id`, `node.peer_id` and `api_version` are
+/// public; capabilities, addresses, peer topology, backend detail and warnings need a realm
 /// token or config admin, and gated values are absent, never restructured.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
@@ -96,8 +96,8 @@ pub struct InfoResponse {
     pub warnings: Vec<String>,
 }
 
-/// Node health and identity. `status` and `realm_id` are public; `peer_id` and
-/// `capabilities` need a token of this realm.
+/// Node health and identity. `status`, `realm_id` and `peer_id` are public, as the
+/// realm node list is; `capabilities` need a token of this realm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct NodeStatus {
     pub status: ServiceStatus,
@@ -2603,7 +2603,7 @@ anonymous.
     responses(
         (
             status = 200,
-            description = "Node health and version; node identity, addresses and topology for realm-authenticated callers, backend detail for realm admins",
+            description = "Node health, version and node id; capabilities, addresses and topology for realm-authenticated callers, backend detail for realm admins",
             body = InfoResponse,
             examples(
                 ("Anonymous" = (
@@ -2697,7 +2697,7 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
         node: NodeStatus {
             status: ServiceStatus::Available,
             realm_id: state.get_realm_id().to_string(),
-            peer_id: realm.then(|| state.get_node_id().to_string()),
+            peer_id: Some(state.get_node_id().to_string()),
             capabilities: realm.then(|| NodeCapabilityKind::from(state.node_capabilities())),
         },
         api_version: env!("CARGO_PKG_VERSION").to_string(),

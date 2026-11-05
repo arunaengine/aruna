@@ -93,8 +93,8 @@ fn key_set(value: &serde_json::Value) -> std::collections::HashSet<&str> {
 }
 
 /// Anonymous and foreign-realm callers keep the flat shape, but every gated
-/// value is absent or empty: only health, realm and public interface urls
-/// remain, never identity, topology, backend detail or warnings.
+/// value is absent or empty: only health, realm, node id and public interface
+/// urls remain, never capabilities, topology, backend detail or warnings.
 #[tokio::test]
 async fn anonymous_info_hides() {
     let (state, _tempdir) = setup_state().await;
@@ -107,7 +107,7 @@ async fn anonymous_info_hides() {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.node.status, ServiceStatus::Available);
-        assert!(response.node.peer_id.is_none());
+        assert_eq!(response.node.peer_id, Some(state.get_node_id().to_string()));
         assert!(response.node.capabilities.is_none());
         assert!(response.portal.is_none());
         assert!(response.my_addresses.is_empty());
@@ -137,7 +137,7 @@ async fn anonymous_info_hides() {
         );
         assert_eq!(
             key_set(&body["node"]),
-            std::collections::HashSet::from(["status", "realm_id"])
+            std::collections::HashSet::from(["status", "realm_id", "peer_id"])
         );
         assert_eq!(
             key_set(&body["services"]),
