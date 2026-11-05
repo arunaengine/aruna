@@ -34,6 +34,7 @@ pub mod placement;
 pub mod policies;
 pub mod portal;
 pub mod promotion;
+pub mod realm_admins;
 pub mod repository;
 pub mod rocrate_import;
 pub mod running_jobs;
@@ -123,6 +124,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(portal::router())
         .merge(oidc_providers::router())
         .merge(promotion::router())
+        .merge(realm_admins::router())
         .merge(search::router())
         .merge(shares::router())
         .merge(access::service_accounts::router())
