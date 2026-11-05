@@ -73,15 +73,17 @@ without giving it to a central service.
 
 ### Run with Docker: single node
 
-You need Docker and a checkout of this repository. There is no published image yet, so build it
-first. A first build takes 10 to 30 minutes.
+You need Docker. The node image is published on Harbor for linux/amd64. It contains `aruna`,
+`aruna-doctor` and the web portal:
 
 ```bash
-docker build -t aruna:local .
+IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3-demo:v3.0.0-alpha.157-test.2a6fb687d-portal.7c844cae
+docker pull "$IMAGE"
 ```
 
-The image contains `aruna` and `aruna-doctor`. It has no web portal unless you stage one (see the
-[operations guide](docs/operations.md#configuration)).
+To build the image from a checkout of this repository instead, run `docker build -t aruna:local .`
+and set `IMAGE=aruna:local`. A first build takes 10 to 30 minutes. A built image has no web portal
+unless you stage one (see the [operations guide](docs/operations.md#configuration)).
 
 Create a file `aruna.env`. The node reads it as `/run/.env`. Replace the OIDC values with those of
 your login server.
@@ -110,7 +112,7 @@ docker run -d --name aruna \
   -v aruna-data:/data \
   -v "$PWD/backups:/backups" \
   -v "$PWD/aruna.env:/run/.env:ro" \
-  aruna:local
+  "$IMAGE"
 curl http://127.0.0.1:3002/readyz
 ```
 
@@ -124,7 +126,7 @@ secret:
 ```bash
 docker stop aruna
 SECRET=$(docker run --rm -v aruna-data:/data -v "$PWD/aruna.env:/run/.env:ro" \
-  aruna:local /run/aruna-doctor recover-admin | tail -n 1)
+  "$IMAGE" /run/aruna-doctor recover-admin | tail -n 1)
 docker start aruna
 
 export ARUNA_OIDC_PASSWORD='<password of your OIDC user>'
@@ -266,9 +268,10 @@ stays responsible for its own data.
   separately, or stop the node and copy the whole data folder. In Docker:
   `docker exec aruna /run/aruna-doctor backup /data /backups/aruna.bak`.
 - **Upgrades**: take a backup and stop the node. Then run `aruna-doctor migrate` with the new
-  version and start it. In Docker, rebuild the image, then remove the old container with
+  version and start it. In Docker, pull or build the new image and set `IMAGE` to it, then remove
+  the old container with
   `docker stop aruna && docker rm aruna`. Migrate with
-  `docker run --rm -v aruna-data:/data aruna:local /run/aruna-doctor migrate /data` and start a
+  `docker run --rm -v aruna-data:/data "$IMAGE" /run/aruna-doctor migrate /data` and start a
   new container with the same `docker run` command as above.
 - **Local and NFS folders**: groups can import folders of the node in place. In a container, the
   folder must be mounted, and its path is the path inside the container.
