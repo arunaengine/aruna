@@ -1,0 +1,184 @@
+<!-- Operations guide: node configuration, backups, storage, encryption and the realm registry. -->
+<!-- Copyright (c) 2026 The Aruna Contributors -->
+<!-- SPDX-License-Identifier: MIT or Apache-2.0 -->
+
+# Operations guide
+
+This guide is for people who run Aruna nodes and for group admins who manage storage. Start with
+the [README](../README.md) to get a node running.
+
+## Configuration
+
+- **Environment variables.** The node reads its settings from environment variables. It also loads
+  a `.env` file from its working directory, which is `/run/.env` in the image. Values set in the
+  process environment win over the file. [`.env.example`](../.env.example) lists every variable
+  with its default.
+- **Ports.** `3000` serves REST and the Swagger UI, `1337` S3, `3001` UDP for connections between
+  nodes, `3002` health and metrics, and `3003` the portal. Inside a container, bind `0.0.0.0` for
+  every port you publish. Port `3002` has no authentication, so publish it on loopback only.
+- **Data folder.** Everything below `STORAGE_PATH` is node state: the database, metadata, document
+  sync, Git repositories, the node identity and, by default, the stored files (`blobstore`). One
+  volume at `STORAGE_PATH` holds all of it unless you point `BLOB_ROOT` or `BLOB_BACKENDS_PATH`
+  elsewhere.
+- **Keys.** The node creates its realm and node keys on the first start and keeps them in the data
+  folder. There is nothing to generate. The tracked `.env` in this repository holds published demo
+  keys, and a node refuses to start while they are set.
+- **Public addresses.** Set `API_PUBLIC_URL`, `S3_PUBLIC_URL` and, with a portal,
+  `PORTAL_PUBLIC_URL` to the addresses clients use. Set `TRUSTED_PROXIES` when a reverse proxy sets
+  `x-forwarded-*` headers.
+- **Sign-in.** The portal needs at least one OIDC provider: `OIDC_PROVIDER_IDS`, then
+  `OIDC_<ID>_ISSUER`, `OIDC_<ID>_AUDIENCE` and `OIDC_<ID>_DISCOVERY_URL` for each id.
+- **Portal.** The image contains the portal only when the built
+  [website](https://github.com/arunaengine/website) is staged in `.portal-embed` before the build.
+  A node can also download a portal release archive with `PORTAL_MODE=artifact` and
+  `PORTAL_ARTIFACT_URL`. An enabled portal needs `PORTAL_SOCKET_ADDRESS`, `API_PUBLIC_URL` and the
+  portal origin in `CORS_ALLOWED_ORIGINS`.
+- **Compute.** `ARUNA_COMPUTE_EXECUTOR` is `none` by default. The `docker` executor needs the host's
+  Docker socket and an S3 address that job containers can reach.
+
+## Settings to check
+
+- **The first start decides the realm.** Without `ONBOARDING_SECRET`, a node with an empty data
+  folder creates a new realm. With it, the node joins an existing realm. Changing the setting later
+  does not move the node. To start over, use a new, empty data folder.
+- **How changes are saved.** By default Aruna favors speed, and the last few changes can be lost on
+  power loss. Set `ARUNA_FJALL_PERSIST_MODE=sync_all` if that is not acceptable.
+- **Database cache.** `ARUNA_FJALL_CACHE_MIB` sets the block cache of the node database (default
+  256). Nodes with much memory and slow disks read less from disk with a larger cache.
+- **Free disk space.** Importing a large dataset briefly needs about twice its size.
+- **Notebook networks.** Notebook sessions run in their own network so they can only reach your
+  data. Make sure `ARUNA_COMPUTE_DOCKER_SESSION_SUBNET` does not overlap with other networks on
+  the host.
+- **Git.** Log in to the Git repository of a dataset with an Aruna access token as the password.
+  Pull before you push, and store large files with Git LFS. See the
+  [native Git guide](../scripts/arc-native/README.md).
+
+## Backups, restore and upgrades
+
+- **Live backup.** `aruna-doctor backup <data folder> <target file>` writes a consistent copy of the
+  running node's database. It works on Unix only and refuses to overwrite an existing file. The
+  stored files (`BLOB_ROOT` and other storage backends) are not part of it. Copy them separately.
+- **Full copy.** To back up everything at once, stop the node and copy the whole data folder. The
+  folder holds the node identity, which protects stored secrets such as access tokens. A node
+  restored without it cannot read these secrets.
+- **Restore.** `aruna-doctor restore <backup file> <new folder>` builds a new data folder from a
+  backup. The new folder must not exist yet. Start the node with `STORAGE_PATH` set to it. The
+  node then checks every bucket, and `GET /data/buckets/{bucket}/storage/check` lists versions
+  whose stored file is missing.
+- **Upgrade.** Stop the node, run `aruna-doctor migrate <data folder>` with the new version, then
+  start the new version. Running the migration twice does no harm. Keep the backup until the new
+  version has run well.
+
+## Encrypted buckets
+
+A group admin can turn on encryption for a bucket, in the portal or with
+`PUT /data/buckets/{bucket}/storage/encryption`. The node then stores new files of that bucket
+encrypted.
+
+- **Two modes.** `node_managed` is the simple choice: the node keeps the bucket key and opens it
+  after a restart, so everything works without unlocking. Use `vault_locked` when the node should
+  hold no key: a key holder must unlock the bucket in the portal, and the key stays only in the
+  node's memory until it is locked again, a time limit ends, or the node restarts.
+- **Key holders.** The bucket creator, the group admins and users granted explicitly hold a sealed
+  copy of the bucket key. Keep at least two holders, or one with a recovery key, so the data is not
+  lost with one person's key.
+- **While locked.** Uploads, listings and object info still work. People with a key grant for a
+  folder or file can read it in the portal while the bucket stays locked. Plain S3 tools, jobs,
+  copies to another bucket and moves to other storage need an unlock; S3 answers
+  `403 AccessDenied` with the header `x-aruna-bucket-locked: true`.
+- **Token credentials.** A key holder can create an S3 credential that reads chosen buckets while
+  they are locked: list them in `encrypted_buckets` of `POST /access/credentials`. Each bucket
+  must be unlocked at that moment. The answer contains a `session_token` once; the node does not
+  keep it. Set it as `aws_session_token` next to the access key and secret, for example in
+  `~/.aws/credentials`. The token only works in the signed request header, never in presigned
+  URLs. It stops working when the credential is revoked, when its creator stops being a key
+  holder, or after a key rotation. `GET /data/buckets/{bucket}/storage/encryption/tokens` lists
+  the token credentials of a bucket.
+- **S3 clients.** Encrypted buckets report `AES256` server-side encryption. `PutBucketEncryption`
+  with `AES256` turns on `node_managed` mode; turning encryption off is only possible through the
+  REST API. Other encryption headers, such as KMS or customer keys, are refused.
+- **What is not covered.** Turning on encryption does not remove plaintext that existed before:
+  backups, old disk blocks and copies on other systems stay as they were. Deleting a file is not
+  secure erasure. Job and notebook working directories are removed when the job or session ends,
+  but logs, reports and files written by your own code are kept as they are; only files written
+  to an encrypted bucket are encrypted.
+- **Content fingerprints.** For deduplication, the node keeps content hashes of encrypted
+  objects. These hashes are extra plaintext fingerprints: they can show that two files are equal.
+- **Copies and sync to other nodes.** A target bucket that encrypts stores every copy sealed to
+  its own key. When both buckets encrypt, the source node grants each encrypted file to the key of
+  the target bucket, so the target never needs the source key. While the source bucket is locked,
+  its copies wait and run after the next unlock; the sync status shows how many wait. The target
+  checks the content of such a copy when its own bucket is next unlocked. A target bucket without
+  encryption gets copies of an encrypted bucket only when the request sets `plaintext: true` and
+  the requester holds the key of the source bucket.
+
+## Your own storage
+
+A group can keep its files in its own S3 storage instead of Aruna's storage on the node. Add it in
+the group's Storage tab with the endpoint and keys; it needs no bucket. Then add rules:
+
+- **Default rule.** New uploads of all the group's buckets go into one bucket of your storage, in
+  Aruna's own layout. Aruna finds or creates the bucket when you save the rule and never reads it
+  back. A group has at most one default rule. "Use as default" on Aruna storage sends new uploads
+  to the node again; files already stored stay where they are until you move them.
+- **Linked buckets.** A bucket (or folder) in Aruna and a bucket (or folder) in your storage show
+  the same files both ways: a run imports files found there, and new uploads are stored there
+  under their own names. Aruna never deletes them.
+- **No overlaps.** Two linked rules may not share folders of one bucket, and no linked rule may use
+  the default rule's bucket. Paths in your storage are at most 1024 bytes long.
+- **Move files.** Moving a bucket copies its stored files to where the rules send new uploads
+  now, then deletes the old copies. A new linked rule can move the folder's files at once.
+  Encrypted buckets cannot move yet.
+- **Broken files.** A check finds files whose stored copy is gone, for example after a storage
+  was removed, and lists them; a cleanup deletes them.
+
+`PUT /data/groups/{group_id}/storage/routing` sets the default rule; linked rules live under
+`/data/groups/{group_id}/storage/imports`; `/data/buckets/{bucket}/storage/move` counts and moves
+stored files, and `/data/buckets/{bucket}/storage/check` finds and deletes broken files.
+
+## Local and NFS folders
+
+A node operator can let groups import a folder of the node in place, for example an NFS share.
+Approve the folder in the backends file (`BLOB_BACKENDS_PATH`, which also needs a default
+`[backend.<name>]`):
+
+```toml
+[import_root.projects]
+path = "/mnt/nfs/projects"      # absolute path on this node
+groups = ["01JABCDEF0123456789ABCDEFG"]
+writable = false                # the default; true lets Aruna write new files here
+```
+
+- **Containers.** When the node runs in a container, mount the folder into it first. `path` is the
+  path inside the container.
+- **Groups.** Only the listed groups see the root. A group lists its roots with
+  `GET /data/groups/{group_id}/storage/import-roots`, which never shows paths, and adds a storage
+  of kind `fs` with `root` and an optional `folder` below it, like `raw/2026/`.
+- **Imports only.** An `fs` storage is the source of linked rules. It cannot be the default rule or
+  a bucket routing target. A read-only root needs another, writable storage for new uploads.
+- **Safety.** Aruna never follows a symlink below the root and skips special files. A missing
+  folder only logs a warning at start, so a late mount does not stop the node.
+  `[egress] serve_group_backends = false` withdraws these storages too.
+- **NFS.** Use NFSv4 with a `hard` mount, never `soft`, and keep locking on (no `nolock`). The
+  server should export the share with `sync`. Aruna writes new files to a temporary name and links
+  or renames them into place, which needs hard links on the share. Reading a large share hashes
+  every new or changed file once, so schedule runs at quiet times.
+
+## Realm registry
+
+By default, a realm lists itself in the global registry at `https://registry.aruna-engine.org`,
+so the portals of other realms can find it.
+
+- **What it sends.** A registration signed with the realm key, renewed every 6 hours. It holds
+  the realm's public facts (realm id, name, description, public API and portal URL) and three
+  counts: live datasets, groups and configured nodes. It holds no users, data or metadata.
+- **How it starts.** When the realm has no federation settings, one management node creates them
+  on start: the name from `REALM_DESCRIPTION`, the URLs from `API_PUBLIC_URL` and
+  `PORTAL_PUBLIC_URL`, the default registry and registration turned on. Existing settings are
+  never changed.
+- **Only public realms.** No settings are created when one of the two URLs is missing or points
+  to a loopback or private address. The local `just` recipes never register.
+- **Opting out.** Before the first start, set `FEDERATION_REGISTRY_URL` to another registry, or to
+  an empty value to turn the default off. Once the settings exist, a realm admin changes them with
+  `PUT /api/v1/system/realm/federation`. Turning registration off sends up to three withdrawals;
+  removing the registry sends nothing more, and the entry expires after 72 hours.

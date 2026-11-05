@@ -25,120 +25,193 @@
   <a href="https://v3.aruna-engine.org/app/docs/v1">Portal documentation</a> ·
   <a href="https://api.node-1.v3.aruna-engine.org/swagger-ui/">Swagger UI</a> ·
   <a href="#features">Features</a> ·
-  <a href="#architecture-and-goals">Architecture</a> ·
   <a href="#getting-started">Getting started</a> ·
-  <a href="#avoiding-common-pitfalls">Pitfalls</a> ·
-  <a href="#feedback--contributions">Contributing</a>
+  <a href="#command-line-client">Command line client</a> ·
+  <a href="#desktop-app">Desktop app</a> ·
+  <a href="#concepts-in-brief">Concepts</a> ·
+  <a href="#operations">Operations</a> ·
+  <a href="#feedback-and-contributions">Contributing</a>
 </p>
 
 > [!NOTE]
 > **Aruna v3 is now in public testing.** You can [try it out](https://v3.aruna-engine.org) and share feedback through [GitHub issues](https://github.com/arunaengine/aruna/issues). Aruna v2 remains available on the [v2 branch](https://github.com/arunaengine/aruna/tree/v2).
 
-Aruna helps research organizations store, describe, share and reuse data while keeping control
-of their own infrastructure. Research data is often spread across universities, labs, archives
-and computing centers, each with its own storage systems and access rules. With Aruna, each
-organization runs a node that connects directly to other nodes. Researchers can find and work
-with data across institutions, with descriptions that help them understand what each dataset
-contains, how it was created and how it can be reused.
+Aruna helps research organizations store, describe, share and reuse data. Each organization runs
+its own node and keeps control of its storage and access rules. Nodes connect directly to each
+other. Researchers can then find and use data across institutions.
+
+Aruna is for research groups, institutes, consortia and computing centers that want to share data
+without giving it to a central service.
 
 ## Features
 
-- **Web portal**: browse files, edit datasets, manage access and follow compute runs in the browser.
-- **Works with your existing tools**: every node offers an [S3](https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html)-compatible interface, so common tools, scripts and workflow systems work without changes.
-- **Rich dataset descriptions**: datasets are described with [RO-Crate](https://www.researchobject.org/ro-crate/), a widely used standard that covers files, people, instruments, software and workflows. Crates reference other crates to connect datasets with their sources and the analyses that produced them.
-- **Quality checks**: profiles specify which details a dataset description should include, and Aruna highlights anything missing.
-- **Search across nodes**: find datasets on all connected nodes, limited to what you are allowed to see.
-- **Groups and permissions**: control who can access your data, with permissions for individuals, groups and roles.
-- **Automatic merging**: edits made on different nodes are combined automatically when the nodes reconnect, including edits made offline.
-- **Native Git for datasets**: every dataset is also a Git repository in the [ARC](https://arc-rdm.org/) layout. Clone it, work on branches and push changes back; the dataset description stays in sync.
-- **Dataset history**: see every version of a dataset, compare versions and merge draft changes in the portal.
-- **Publish with a DOI**: send datasets to [Zenodo](https://zenodo.org/) or other [InvenioRDM](https://inveniordm.docs.cern.ch/) repositories and keep both in sync. Existing records can be imported, too.
-- **Compute jobs**: run analysis containers on your own infrastructure from the portal or through the standard [GA4GH TES](https://www.ga4gh.org/product/task-execution-service-tes/) interface.
-- **Interactive notebooks**: write and run Jupyter notebooks in the portal, with direct access to your data.
-- **AI assistants**: connect AI assistants through [MCP](https://modelcontextprotocol.io/) so they can search, read and work with your data, with your permissions.
-- **Flexible storage**: keep data on local disks or connect other storage systems. Buckets can combine local files, copies and references to files on other nodes.
-- **Encrypted buckets**: a bucket can store new files encrypted, with keys that stay with the people you choose.
-- **Safe transfers**: Aruna checks files when storing and copying them to detect data corruption early.
-- **Open standards**: single sign-on with [OIDC](https://openid.net/connect/), data references with [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) and metadata harvesting with [OAI-PMH](https://www.openarchives.org/pmh/).
-- **Simple to deploy**: run a single node as one program, or a cluster of nodes.
+- **Web portal**: browse files, edit datasets, manage access and follow compute runs.
+- **S3 interface**: every node speaks [S3](https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html), so common tools and workflow systems work as they are.
+- **Dataset descriptions**: datasets use [RO-Crate](https://www.researchobject.org/ro-crate/). Profiles check that a description is complete.
+- **Native Git**: every dataset is also a Git repository in the [ARC](https://arc-rdm.org/) layout.
+- **History**: see every version of a dataset, compare versions and merge drafts.
+- **Search**: find datasets on all connected nodes, limited to what you may see.
+- **Access control**: permissions for people, groups and roles. Group admins see group statistics and can revoke group tokens.
+- **Offline edits**: edits made on different nodes merge when the nodes reconnect.
+- **Persistent identifiers**: datasets resolve through `https://w3id.org/aruna/<id>`.
+- **Publishing**: send datasets with a DOI to [Zenodo](https://zenodo.org/) or other [InvenioRDM](https://inveniordm.docs.cern.ch/) repositories.
+- **Compute**: run analysis containers from the portal or through [GA4GH TES](https://www.ga4gh.org/product/task-execution-service-tes/), and write Jupyter notebooks in the portal.
+- **AI assistants**: connect assistants through [MCP](https://modelcontextprotocol.io/). They act with your permissions.
+- **Flexible storage**: use local disks, your own S3 storage, or local and NFS folders imported in place.
+- **Encrypted buckets**: new files are stored encrypted, with keys held by the people you choose.
+- **Safe transfers**: files are checked when they are stored and copied.
+- **Open standards**: [OIDC](https://openid.net/connect/) sign-in, [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) and [OAI-PMH](https://www.openarchives.org/pmh/).
+- **Simple to run**: one program or one container per node, with live backups.
 
-## Architecture and Goals
+## Getting started
 
-Institutions need to control where their data is stored and who can access it. Moving files
-manually takes time, and the context needed to understand them can get lost along the way.
-Aruna helps institutions share data while retaining control over its storage and access.
+### Try it online
 
-- **Nodes**: each organization runs its own node. The node decides where the organization's data
-  lives and who may access it.
-- **Realms**: nodes that trust each other form a realm, for example an institute, a consortium or a
-  project. Being in the same realm does not give anyone access to data; access is always granted
-  explicitly through groups, roles and permissions.
-- **Direct connections**: nodes can connect to each other automatically, including from behind firewalls. No
-  central server is needed, and a node keeps working when others are offline. Changes are shared
-  again once the nodes can reach each other.
-- **Data and description together**: files and their descriptions move together, so a dataset stays
-  understandable wherever it is used. Crates reference other crates, forming a provenance graph
-  that connects source data, analyses and results. These links help researchers trace how a result
-  was produced and understand what they need to reproduce it.
-
-The goal is to make research data FAIR: findable, accessible, interoperable and reusable, while each
-institution stays responsible for its own data.
-
-## Getting Started
-
-Start with the public portal, or run Aruna yourself using one of the options below.
-
-### 1. Try it online
-
-You can explore Aruna without installing anything:
-
-- Open the [public v3 portal](https://v3.aruna-engine.org) and look around.
+- Open the [public v3 portal](https://v3.aruna-engine.org).
 - Read the [portal documentation](https://v3.aruna-engine.org/app/docs/v1) for step-by-step guides.
-- Developers can explore the REST API in the [Swagger UI](https://api.node-1.v3.aruna-engine.org/swagger-ui/).
+- Explore the REST API in the [Swagger UI](https://api.node-1.v3.aruna-engine.org/swagger-ui/).
 
-### 2. Run a small cluster on your computer
+### Run with Docker: single node
 
-This starts three connected nodes on your machine, so you can see how nodes work together. You
-need `docker` with Docker Compose and, for convenience, [`just`](https://github.com/casey/just).
+You need Docker. The node image is published on Harbor for linux/amd64. It contains `aruna`,
+`aruna-doctor` and the web portal:
 
 ```bash
-just preview          # three nodes, a login server and the web portal
-just local-cluster    # three nodes without the portal
+IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3-demo:v3
+docker pull "$IMAGE"
 ```
 
-When everything is ready, the command prints the addresses of each node, test logins and an
-admin token. Press Ctrl-C to stop the cluster, or run `just stop` if the terminal was closed.
+The tag `v3` follows the newest v3 release. To pin one release, use its version as the tag, for
+example `v3.0.0-alpha.157`.
 
-### 3. Run a single node
+To build the image from a checkout of this repository instead, run `docker build -t aruna:local .`
+and set `IMAGE=aruna:local`. A first build takes 10 to 30 minutes. A built image has no web portal
+unless you stage one (see the [operations guide](docs/operations.md#configuration)).
 
-To run one node yourself, for example to test it with your own login server:
+Create a file `aruna.env`. The node reads it as `/run/.env`. Replace the OIDC values with those of
+your login server.
 
 ```bash
-cp .env.example .env
-cargo run -p aruna
+STORAGE_PATH=/data
+SOCKET_ADDRESS=0.0.0.0:3000
+P2P_SOCKET_ADDRESS=0.0.0.0:3001
+OPS_SOCKET_ADDRESS=0.0.0.0:3002
+S3_ADDRESS=0.0.0.0:1337
+S3_HOST=127.0.0.1:1337
+API_PUBLIC_URL=http://127.0.0.1:3000
+S3_PUBLIC_URL=http://127.0.0.1:1337
+REALM_DESCRIPTION="My realm"
+OIDC_PROVIDER_IDS=main
+OIDC_MAIN_ISSUER=https://id.example.org/realms/aruna
+OIDC_MAIN_AUDIENCE=aruna-api
+OIDC_MAIN_DISCOVERY_URL=https://id.example.org/realms/aruna/.well-known/openid-configuration
 ```
 
-Building from source needs the Rust version named in [rust-toolchain.toml](rust-toolchain.toml).
-The node then serves the API documentation on `http://127.0.0.1:3000/swagger-ui` and the S3
-interface on `http://127.0.0.1:1337`.
-
-## Command Line Client
-
-`aruna-cli` talks to a realm's REST and S3 APIs directly, without a local node. Create a token
-in the portal (Settings, API sessions) and sign in with it:
+Start the node and check that it is ready:
 
 ```bash
-cargo install --path cli
+docker run -d --name aruna \
+  -p 3000:3000 -p 1337:1337 -p 3001:3001/udp -p 127.0.0.1:3002:3002 \
+  -v aruna-data:/data \
+  -v "$PWD/backups:/backups" \
+  -v "$PWD/aruna.env:/run/.env:ro" \
+  "$IMAGE"
+curl http://127.0.0.1:3002/readyz
+```
+
+The first start creates a new realm. The API documentation is then at
+`http://127.0.0.1:3000/swagger-ui` and S3 at `http://127.0.0.1:1337`. Port 3002 serves health and
+metrics without sign-in, so it stays on loopback.
+
+Create the first admin token. The database allows one writer, so stop the node to mint the
+secret:
+
+```bash
+docker stop aruna
+SECRET=$(docker run --rm -v aruna-data:/data -v "$PWD/aruna.env:/run/.env:ro" \
+  "$IMAGE" /run/aruna-doctor recover-admin | tail -n 1)
+docker start aruna
+
+export ARUNA_OIDC_PASSWORD='<password of your OIDC user>'
+docker exec -e ARUNA_OIDC_PASSWORD aruna /run/aruna-doctor create-token \
+  --oidc-username <your OIDC user> --bootstrap-secret "$SECRET"
+```
+
+The last line printed is the admin token. `create-token` signs in with the OIDC password grant, so
+the OIDC client must allow direct access grants.
+
+### Small local realm
+
+This starts three connected nodes as local processes, with a test login server and a portal per
+node. It runs on Linux and needs Rust (see [rust-toolchain.toml](rust-toolchain.toml)),
+[`just`](https://github.com/casey/just), `curl`, `ss` and Docker for the login server. The first
+run builds the workspace from source and downloads the latest portal prerelease.
+
+```bash
+just preview          # three nodes, a login server and a portal per node
+just local-cluster    # three nodes without login server and portal
+just stop             # stop everything, also after the terminal was closed
+```
+
+The command prints the address of each node, test logins and admin credentials. Press Ctrl-C to
+stop it. The local nodes run compute jobs with Docker by default.
+
+For development, `just local` builds the image and starts one node with a test login server,
+Prometheus and Grafana in Docker Compose. It uses host networking, so it needs Linux.
+
+## Command line client
+
+`aruna-cli` works with a realm from the terminal. It talks to a node's REST and S3 APIs and needs
+no local node. With it you can:
+
+- list buckets and objects, and create buckets,
+- copy files and sync folders, with multipart uploads that resume,
+- search the realm and create, import, validate and export RO-Crate metadata,
+- submit and follow compute jobs through GA4GH TES,
+- create share links and print S3 credentials for other tools.
+
+### Install
+
+There are no release binaries yet. Install it with Rust 1.97.1 or newer, from a checkout of this
+repository or straight from Git:
+
+```bash
+cargo install --locked --path cli
+cargo install --locked --git https://github.com/arunaengine/aruna aruna-cli
+```
+
+Pre-built binaries are planned. They will appear on the
+[releases page](https://github.com/arunaengine/aruna/releases) with tags that start with `cli-v`.
+
+### Sign in
+
+Create a token in the portal under Settings, API sessions. Then sign in with the API address of
+your node:
+
+```bash
 aruna-cli login --api https://node.example --token <TOKEN>
+aruna-cli whoami
+```
+
+`login` creates a CLI session and keeps its token in the OS keyring. Without `--token` it reads the
+token from standard input. Without a keyring, set `ARUNA_API` and `ARUNA_TOKEN` instead of signing
+in. Scripts can do the same.
+
+### Examples
+
+```bash
 aruna-cli buckets ls
 aruna-cli cp results.csv my-bucket/run-42/
 aruna-cli sync ./run-42 my-bucket/run-42 --dry-run
 aruna-cli meta search "proteomics"
+aruna-cli jobs submit task.json
+aruna-cli share my-bucket/run-42/ --expires 7d
 ```
 
-The token is kept in the OS keyring. Without a keyring, set `ARUNA_API` and `ARUNA_TOKEN` instead of
-signing in; the token is then never stored.
-`aruna-cli --help` and `aruna-cli <command> --help` describe every command.
+For `cp` and `sync`, the source sets the direction: a local source uploads, a remote one
+downloads. `aruna-cli --help` describes every command.
+
+### Third-party notice
 
 On Linux, `aruna-cli` includes a copy of libdbus, built from source, to reach the Secret Service
 keyring. libdbus, part of the freedesktop.org D-Bus project, is offered under the Academic Free
@@ -146,151 +219,76 @@ License version 2.1 or the GPL version 2; `aruna-cli` uses it under the
 [Academic Free License version 2.1](https://spdx.org/licenses/AFL-2.1.html). Its copyright and
 license notices are in the `vendor/dbus` folder of the `libdbus-sys` crate.
 
-## Encrypted Buckets
+## Desktop app
 
-A group admin can turn on encryption for a bucket, in the portal or with
-`PUT /data/buckets/{bucket}/storage/encryption`. The node then stores new files of that bucket
-encrypted.
+[Aruna Desktop](https://github.com/arunaengine/aruna-desktop) connects your computer to a realm. It
+runs a small Aruna node on your computer and shows the same portal as the web. With it you can:
 
-- **Two modes.** `node_managed` is the simple choice: the node keeps the bucket key and opens it
-  after a restart, so everything works without unlocking. Use `vault_locked` when the node should
-  hold no key: a key holder must unlock the bucket in the portal, and the key stays only in the
-  node's memory until it is locked again, a time limit ends, or the node restarts.
-- **Key holders.** The bucket creator, the group admins and users granted explicitly hold a sealed
-  copy of the bucket key. Keep at least two holders, or one with a recovery key, so the data is not
-  lost with one person's key.
-- **While locked.** Uploads, listings and object info still work. People with a key grant for a
-  folder or file can read it in the portal while the bucket stays locked. Plain S3 tools, jobs,
-  copies to another bucket and moves to other storage need an unlock; S3 answers
-  `403 AccessDenied` with the header `x-aruna-bucket-locked: true`.
-- **Token credentials.** A key holder can create an S3 credential that reads chosen buckets while
-  they are locked: list them in `encrypted_buckets` of `POST /access/credentials`. Each bucket
-  must be unlocked at that moment. The answer contains a `session_token` once; the node does not
-  keep it. Set it as `aws_session_token` next to the access key and secret, for example in
-  `~/.aws/credentials`. The token only works in the signed request header, never in presigned
-  URLs. It stops working when the credential is revoked, when its creator stops being a key
-  holder, or after a key rotation. `GET /data/buckets/{bucket}/storage/encryption/tokens` lists
-  the token credentials of a bucket.
-- **S3 clients.** Encrypted buckets report `AES256` server-side encryption. `PutBucketEncryption`
-  with `AES256` turns on `node_managed` mode; turning encryption off is only possible through the
-  REST API. Other encryption headers, such as KMS or customer keys, are refused.
-- **What is not covered.** Turning on encryption does not remove plaintext that existed before:
-  backups, old disk blocks and copies on other systems stay as they were. Deleting a file is not
-  secure erasure. Job and notebook working directories are removed when the job or session ends,
-  but logs, reports and files written by your own code are kept as they are; only files written
-  to an encrypted bucket are encrypted.
-- **Content fingerprints.** For deduplication, the node keeps content hashes of encrypted
-  objects. These hashes are extra plaintext fingerprints: they can show that two files are equal.
-- **Copies and sync to other nodes.** A target bucket that encrypts stores every copy sealed to
-  its own key. When both buckets encrypt, the source node grants each encrypted file to the key of
-  the target bucket, so the target never needs the source key. While the source bucket is locked,
-  its copies wait and run after the next unlock; the sync status shows how many wait. The target
-  checks the content of such a copy when its own bucket is next unlocked. A target bucket without
-  encryption gets copies of an encrypted bucket only when the request sets `plaintext: true` and
-  the requester holds the key of the source bucket.
+- sign in with your realm account, through the login providers of your realm,
+- browse, upload and share data in the built-in portal,
+- link a local folder to a bucket and keep both in sync, one way or both ways,
+- run jobs on your computer with Docker, or Apptainer on Linux,
+- pause the device, which stops sync and local jobs until you resume.
 
-## Your Own Storage
+### Download
 
-A group can keep its files in its own S3 storage instead of Aruna's storage on the node. Add it in
-the group's Storage tab with the endpoint and keys; it needs no bucket. Then add rules:
+Installers will appear as pre-releases on the
+[Aruna Desktop releases page](https://github.com/arunaengine/aruna-desktop/releases). They cover
+Linux (`.deb`, `.rpm`, `.AppImage`), Windows (`-setup.exe`) and macOS on Apple silicon (`.dmg`).
+Pick the release whose version matches the version your realm runs. The
+[Aruna Desktop readme](https://github.com/arunaengine/aruna-desktop#how-to-install) explains how
+to install it on each system and how to add your computer as a device.
 
-- **Default rule.** New uploads of all the group's buckets go into one bucket of your storage, in
-  Aruna's own layout. Aruna finds or creates the bucket when you save the rule and never reads it
-  back. A group has at most one default rule. "Use as default" on Aruna storage sends new uploads
-  to the node again; files already stored stay where they are until you move them.
-- **Linked buckets.** A bucket (or folder) in Aruna and a bucket (or folder) in your storage show
-  the same files both ways: a run imports files found there, and new uploads are stored there
-  under their own names. Aruna never deletes them.
-- **No overlaps.** Two linked rules may not share folders of one bucket, and no linked rule may use
-  the default rule's bucket. Paths in your storage are at most 1024 bytes long.
-- **Move files.** Moving a bucket copies its stored files to where the rules send new uploads
-  now, then deletes the old copies. A new linked rule can move the folder's files at once.
-  Encrypted buckets cannot move yet.
-- **Broken files.** A check finds files whose stored copy is gone, for example after a storage
-  was removed, and lists them; a cleanup deletes them.
+### Build from source
 
-`PUT /data/groups/{group_id}/storage/routing` sets the default rule; linked rules live under
-`/data/groups/{group_id}/storage/imports`; `/data/buckets/{bucket}/storage/move` counts and moves
-stored files, and `/data/buckets/{bucket}/storage/check` finds and deletes broken files.
+Aruna Desktop is a [Tauri](https://tauri.app/) app. A build bundles an `aruna` node from this
+repository and the portal, both at the versions pinned in its `versions.json`. The
+[release workflow](https://github.com/arunaengine/aruna-desktop/blob/main/.github/workflows/release.yml)
+shows every step.
 
-### Local and NFS folders
+## Concepts in brief
 
-A node operator can let groups import a folder of the node in place, for example an NFS share.
-Approve the folder in the backends file (`BLOB_BACKENDS_PATH`, which also needs a default
-`[backend.<name>]`):
+- **Node**: one organization's server. It decides where the data lives and who may access it.
+- **Realm**: nodes that trust each other, for example an institute or a consortium. Being in a
+  realm gives no access to data. Access is always granted through groups, roles and permissions.
+- **Direct connections**: nodes connect to each other, also from behind firewalls. A node keeps
+  working while others are offline and shares its changes once they are back.
+- **Datasets**: files and their descriptions move together. Crates can reference other crates, so
+  you can trace how a result was produced.
 
-```toml
-[import_root.projects]
-path = "/mnt/nfs/projects"      # absolute path on this node
-groups = ["01JABCDEF0123456789ABCDEFG"]
-writable = false                # the default; true lets Aruna write new files here
-```
+The goal is FAIR research data: findable, accessible, interoperable and reusable. Each institution
+stays responsible for its own data.
 
-- **Groups.** Only the listed groups see the root. A group lists its roots with
-  `GET /data/groups/{group_id}/storage/import-roots`, which never shows paths, and adds a storage
-  of kind `fs` with `root` and an optional `folder` below it, like `raw/2026/`.
-- **Imports only.** An `fs` storage is the source of linked rules. It cannot be the default rule or
-  a bucket routing target. A read-only root needs another, writable storage for new uploads.
-- **Safety.** Aruna never follows a symlink below the root and skips special files. A missing
-  folder only logs a warning at start, so a late mount does not stop the node.
-  `[egress] serve_group_backends = false` withdraws these storages too.
-- **NFS.** Use NFSv4 with a `hard` mount, never `soft`, and keep locking on (no `nolock`). The
-  server should export the share with `sync`. Aruna writes new files to a temporary name and links
-  or renames them into place, which needs hard links on the share. Reading a large share hashes
-  every new or changed file once, so schedule runs at quiet times.
+## Operations
 
-## Realm Registry
+- **Configuration**: the node reads environment variables and a `.env` file.
+  [`.env.example`](.env.example) lists every variable with its default.
+- **Keys**: the node creates its realm and node keys on the first start. The tracked `.env` holds
+  published demo keys, and a node refuses to start with them.
+- **First start**: a node with an empty data folder creates a new realm. With `ONBOARDING_SECRET`
+  it joins an existing realm instead. This works only on the first start.
+- **Backups**: `aruna-doctor backup` copies the database of a running node. Copy the stored files
+  separately, or stop the node and copy the whole data folder. In Docker:
+  `docker exec aruna /run/aruna-doctor backup /data /backups/aruna.bak`.
+- **Upgrades**: take a backup and stop the node. Then run `aruna-doctor migrate` with the new
+  version and start it. In Docker, pull or build the new image and set `IMAGE` to it, then remove
+  the old container with
+  `docker stop aruna && docker rm aruna`. Migrate with
+  `docker run --rm -v aruna-data:/data "$IMAGE" /run/aruna-doctor migrate /data` and start a
+  new container with the same `docker run` command as above.
+- **Local and NFS folders**: groups can import folders of the node in place. In a container, the
+  folder must be mounted, and its path is the path inside the container.
+- **Realm registry**: a realm with public addresses lists itself in the global registry. Set
+  `FEDERATION_REGISTRY_URL=` (empty) before the first start to opt out.
 
-By default, a realm lists itself in the global registry at `https://registry.aruna-engine.org`,
-so the portals of other realms can find it.
+The [operations guide](docs/operations.md) covers configuration, restore, encrypted buckets, your
+own storage, NFS settings and the registry in detail.
 
-- **What it sends.** A registration signed with the realm key, renewed every 6 hours. It holds
-  the realm's public facts (realm id, name, description, public API and portal URL) and three
-  counts: live datasets, groups and configured nodes. It holds no users, data or metadata.
-- **How it starts.** When the realm has no federation settings, one management node creates them
-  on start: the name from `REALM_DESCRIPTION`, the URLs from `API_PUBLIC_URL` and
-  `PORTAL_PUBLIC_URL`, the default registry and registration turned on. Existing settings are
-  never changed.
-- **Only public realms.** No settings are created when one of the two URLs is missing or points
-  to a loopback or private address. Local tools (`just preview`, `just local-cluster`, Compose)
-  never register.
-- **Opting out.** Before the first start, set `FEDERATION_REGISTRY_URL` to another registry, or to
-  an empty value to turn the default off. Once the settings exist, a realm admin changes them with
-  `PUT /api/v1/system/realm/federation`. Turning registration off sends up to three withdrawals;
-  removing the registry sends nothing more, and the entry expires after 72 hours.
-
-## Avoiding Common Pitfalls
-
-Most problems with a new node come from a few settings. These tips help you avoid them.
-
-- **Use your own keys.** The example configuration contains demo keys that everybody can see. A
-  node refuses to start with them. Create your own realm and node keys (`REALM_*_KEY` and
-  `NODE_*_KEY`) before running a real node.
-- **Set up a node right the first time.** A node creates or joins its realm only on its very first
-  start: without `ONBOARDING_SECRET` it creates a new realm, with it it joins an existing one.
-  Changing the configuration afterwards does not move it to another realm. To start over, use a
-  new, empty data directory.
-- **Back up the whole data directory.** The data directory (`STORAGE_PATH`) also holds the node's
-  identity, which protects stored secrets such as access tokens. A node restored without it cannot
-  read these secrets anymore.
-- **Migrate before upgrading.** Stop the node, run `aruna-doctor migrate` on its data directory,
-  then start the new version. Running the migration twice does no harm.
-- **Keep enough free disk space.** Importing a large dataset briefly needs about twice its size.
-- **Decide how changes are saved.** By default, Aruna favors speed: the last few changes can be
-  lost if the machine loses power. Set `ARUNA_FJALL_PERSIST_MODE=sync_all` if that is not
-  acceptable for you.
-- **Size the database cache.** `ARUNA_FJALL_CACHE_MIB` sets the block cache of the node database
-  (default 256). Nodes with much memory and slow disks read less from disk with a larger cache.
-- **Keep notebook networks separate.** Notebook sessions run in their own network so they can only
-  reach your data. Make sure this network (`ARUNA_COMPUTE_DOCKER_SESSION_SUBNET`) does not overlap
-  with other networks on the host.
-- **Use Git the usual way.** Log in to the Git repository of a dataset with an Aruna access token
-  as the password, pull before you push, and store large files with Git LFS.
-
-## Learn More
+## Learn more
 
 - [Portal documentation](https://v3.aruna-engine.org/app/docs/v1): how to use Aruna in the browser.
 - [Swagger UI](https://api.node-1.v3.aruna-engine.org/swagger-ui/): the full REST API.
+- [Operations guide](docs/operations.md): running nodes and managing storage.
 - [Native Git guide](scripts/arc-native/README.md): working with datasets as Git repositories.
 - [Repository structure](REPO_STRUCTURE.md): how the source code is organized.
 
@@ -304,6 +302,6 @@ Aruna is licensed under either of
 at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in Aruna by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
 
-## Feedback & Contributions
+## Feedback and contributions
 
 Found a bug or have an idea? Open an [issue](https://github.com/arunaengine/aruna/issues) or send a pull request. Reports from the v3 public test phase help us understand what works and what needs attention. See the [Contributor Guidelines](./CONTRIBUTING.md) and [Code of Conduct](./CODE_OF_CONDUCT.md) before contributing.
