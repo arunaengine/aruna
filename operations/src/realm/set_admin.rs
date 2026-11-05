@@ -406,3 +406,7 @@ impl Operation for SetAdminOperation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "set_admin_tests.rs"]
+mod tests;
