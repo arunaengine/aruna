@@ -273,7 +273,8 @@ management node serves the call and signs the descriptor; every other node relay
   descriptor. Each change issues a newer descriptor, and the reporting management node sends it
   to the registry within seconds. The realm id never changes.
 - `description` is optional; a request without it keeps the stored description (at first setup,
-  the realm description). `contact` is an optional email address; an empty value clears it.
+  the realm description). A given description also replaces the realm description in
+  `GET /system/realm`. `contact` is an optional email address; an empty value clears it.
 - `login_providers` names configured OIDC provider ids; the descriptor carries each with its
   issuer. An unknown id answers 400.
 - `registry_url` is optional; without it the realm sends nothing to a registry.
