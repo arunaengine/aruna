@@ -1149,6 +1149,192 @@ mod pure_tests {
         assert!(still_retained.publishers.contains(&node(9)));
     }
 
+    /// A full turnover of bucket 7 from `old` to `target`: barriers from `frozen`, proofs from every
+    /// target, and a forced cutover when an old holder never froze.
+    fn full_turnover(
+        strategy_id: Ulid,
+        seed: u8,
+        (old, target, frozen): (&[u8], &[u8], &[u8]),
+    ) -> aruna_core::structs::placement::transition::PlacementTransition {
+        use aruna_core::structs::placement::transition::{
+            BucketBarrier, BucketForceFinalize, BucketPlan, PlacementTransition, ProofClaim,
+            TransitionLimits, TransitionPlan,
+        };
+        let nodes = |seeds: &[u8]| seeds.iter().map(|seed| node(*seed)).collect::<Vec<_>>();
+        let mut transition = PlacementTransition::new(TransitionPlan {
+            transition_id: Ulid::from_bytes([seed; 16]),
+            strategy_id,
+            buckets: vec![BucketPlan {
+                bucket: 7,
+                old_holders: nodes(old),
+                target_holders: nodes(target),
+                predecessor_epoch: u64::from(seed),
+            }],
+            target_map_epoch: u64::from(seed) + 1,
+            limits: TransitionLimits {
+                max_incomplete_buckets: 1,
+                grace_ms: 1_000,
+            },
+            created_by: node(1),
+            created_at_ms: 1,
+        });
+        for holder in frozen {
+            transition.barriers.push(BucketBarrier {
+                bucket: 7,
+                reported_by: node(*holder),
+                frontier: vec![*holder],
+            });
+        }
+        for holder in target {
+            let digest = transition.barrier_digest(7);
+            let claim = ProofClaim {
+                realm_id: RealmId::from_bytes([3u8; 32]),
+                transition_id: transition.plan.transition_id,
+                strategy_id,
+                bucket: 7,
+                old_activation_epoch: u64::from(seed),
+                target_map_epoch: u64::from(seed) + 1,
+                barrier_digest: digest,
+                checkpoint_root: [seed; 32],
+                holder: node(*holder),
+            };
+            let secret = iroh::SecretKey::from_bytes(&[*holder; 32]);
+            transition.proofs.push(claim.sign(&secret));
+        }
+        if !transition.bucket_ready(7) {
+            transition.forced.push(BucketForceFinalize {
+                bucket: 7,
+                at_risk_report: "old holder unavailable".to_string(),
+            });
+        }
+        transition
+    }
+
+    #[test]
+    fn repeated_turnover_bounded() {
+        // Two full turnovers with grace, while old holder 9 never answers: the cutover needs
+        // the operator's force, holder 9 stays retained without its drain report, and the next
+        // turnover adds only its own departing holders until they drain.
+        use aruna_core::structs::placement::transition::{
+            BucketCompletion, BucketDrain, FrozenStrategySelector, PlacementTransition,
+        };
+        let (mut config, placement) = config_and_placement();
+        let strategy_id = placement.strategy_id;
+        // Map 1 places bucket 7 on 9 and 10, map 2 on 12 and 13, map 3 on 14 and 15.
+        let map = |epoch: u64, seeds: [u8; 2]| CandidatePlacementMap {
+            epoch,
+            nodes: seeds
+                .iter()
+                .map(|seed| CandidateMapNode {
+                    node_id: node(*seed),
+                    kind: RealmNodeKind::Server,
+                    location: "eu".to_string(),
+                    weight: 100,
+                    full: false,
+                    draining: false,
+                    labels: std::collections::BTreeMap::new(),
+                })
+                .collect(),
+            selectors: vec![FrozenStrategySelector {
+                strategy_id,
+                replica_count: Some(2),
+                distinct_locations: false,
+                affinity: Vec::new(),
+            }],
+            shard_overrides: Vec::new(),
+        };
+        config.candidate_maps = vec![map(1, [9, 10]), map(2, [12, 13]), map(3, [14, 15])];
+        config.placement_activations = vec![PlacementActivation {
+            strategy_id,
+            shard: 7,
+            activation_epoch: 1,
+            candidate_map_epoch: 1,
+            transition_id: None,
+        }];
+        // The cutover rule of the reducer: a ready bucket planned on the current epoch advances.
+        let activate = |config: &mut RealmConfigDocument, transition: &PlacementTransition| {
+            let plan = transition.plan.bucket_plan(7).expect("bucket 7 planned");
+            let activation = &mut config.placement_activations[0];
+            assert!(transition.bucket_ready(7));
+            assert_eq!(plan.predecessor_epoch, activation.activation_epoch);
+            activation.candidate_map_epoch = transition.plan.target_map_epoch;
+            activation.activation_epoch += 1;
+        };
+        let sorted = |seeds: &[u8]| {
+            let mut nodes: Vec<NodeId> = seeds.iter().map(|seed| node(*seed)).collect();
+            nodes.sort_by_key(|node_id| *node_id.as_bytes());
+            nodes
+        };
+        let sets = |config: &RealmConfigDocument, now_ms: u64| {
+            let membership = bucket_membership(config, &placement, now_ms);
+            let mut members = membership.members;
+            let mut publishers = membership.publishers;
+            members.sort_by_key(|node_id| *node_id.as_bytes());
+            publishers.sort_by_key(|node_id| *node_id.as_bytes());
+            (members, publishers)
+        };
+        let both = |seeds: &[u8]| (sorted(seeds), sorted(seeds));
+        let active = |config: &RealmConfigDocument| {
+            let mut holders = resolve_shard_holders(config, &placement);
+            holders.sort_by_key(|node_id| *node_id.as_bytes());
+            holders
+        };
+        assert_eq!(active(&config), sorted(&[9, 10]));
+
+        let mut first = full_turnover(strategy_id, 1, (&[9, 10], &[12, 13], &[10]));
+        assert_eq!(
+            first.forced.len(),
+            1,
+            "a missing barrier needs a forced cutover"
+        );
+        first.completed.push(BucketCompletion {
+            bucket: 7,
+            completed_at_ms: 100,
+        });
+        first.drained.push(BucketDrain {
+            bucket: 7,
+            reported_by: node(10),
+        });
+        activate(&mut config, &first);
+        config.placement_transitions.push(first);
+        assert_eq!(
+            active(&config),
+            sorted(&[12, 13]),
+            "the replacements are active"
+        );
+        assert_eq!(sets(&config, 500), both(&[9, 10, 12, 13]));
+        assert_eq!(sets(&config, 1_100), both(&[9, 12, 13]));
+        assert!(config.placement_transitions[0].is_terminal());
+        assert!(!config.placement_transitions[0].released(u64::MAX));
+
+        let mut second = full_turnover(strategy_id, 2, (&[12, 13], &[14, 15], &[12, 13]));
+        assert!(second.forced.is_empty(), "every old holder froze");
+        second.completed.push(BucketCompletion {
+            bucket: 7,
+            completed_at_ms: 2_000,
+        });
+        for holder in [12, 13] {
+            second.drained.push(BucketDrain {
+                bucket: 7,
+                reported_by: node(holder),
+            });
+        }
+        activate(&mut config, &second);
+        config.placement_transitions.push(second);
+        assert_eq!(
+            active(&config),
+            sorted(&[14, 15]),
+            "the replacements are active"
+        );
+        assert_eq!(sets(&config, 2_500), both(&[9, 12, 13, 14, 15]));
+        assert_eq!(sets(&config, 3_100), both(&[9, 14, 15]));
+        assert!(config.placement_transitions[1].released(3_100));
+        assert!(
+            drain_pending(&config, 3_100),
+            "holder 9 still owes its report"
+        );
+    }
+
     #[test]
     fn release_deadline_derived() {
         // Before the grace end the deadline is completion plus grace; past it

@@ -1,4 +1,4 @@
-<!-- Operations guide: node configuration, backups, storage, encryption and the realm registry. -->
+<!-- Operations guide: configuration, backups, storage, encryption, registry and node trust. -->
 <!-- Copyright (c) 2026 The Aruna Contributors -->
 <!-- SPDX-License-Identifier: MIT or Apache-2.0 -->
 
@@ -182,3 +182,25 @@ so the portals of other realms can find it.
   an empty value to turn the default off. Once the settings exist, a realm admin changes them with
   `PUT /api/v1/system/realm/federation`. Turning registration off sends up to three withdrawals;
   removing the registry sends nothing more, and the entry expires after 72 hours.
+
+## Trust between nodes
+
+Nodes of a realm read, copy and forward files for their users. The node that receives such a
+request from another node decides what it may do as follows.
+
+- **Infrastructure nodes speak for users.** A server or management node configured in the realm
+  may say which user a copy, a read or a forwarded request is for, with that user's restrictions.
+  The receiving node checks this user's permissions and restrictions itself, so the request can
+  do no more than the user could. A taken-over infrastructure node can therefore act as any user
+  of its realm: protect node keys like realm administrator credentials.
+- **Devices speak only for their owner.** A user node can say a request is for a user only when
+  that user is the owner the realm configuration names. A device never sends copies to other
+  nodes and is never told where copies are stored.
+- **Bearer tokens speak for their user.** Any configured node of the realm, a user node too, may
+  pass on a user's valid bearer token, for example with a search or a graph query. The receiving
+  node validates the token itself and serves the token's user, whoever owns the sending node.
+- **Copies keep their source.** A node accepts an update of a reference only from the node that
+  sent the reference, and only for the same source.
+- **Unknown nodes and other realms are refused.** A request from a node that is not configured in
+  the realm, or that names another realm to serve it, is refused before any data is read. A user
+  of another realm is served as that user, with the roles this realm granted.

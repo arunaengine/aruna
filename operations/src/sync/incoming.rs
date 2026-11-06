@@ -1406,6 +1406,95 @@ mod tests {
         }
     }
 
+    /// One evicted delete of a lifecycle document, re-emitted under its own event id.
+    fn evicted(seed: u8) -> DocumentEvictedDocument {
+        let event_id = Ulid::from_parts(u64::from(seed), u128::from(seed));
+        let placement = aruna_core::structs::placement::record::PlacementRef::NIL;
+        let change = aruna_core::document::DocumentChange {
+            base: None,
+            current: aruna_core::document::DocumentSyncRevision {
+                generation: 1,
+                event_id,
+                actor: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+                updated_at_ms: u64::from(seed),
+            },
+            kind: aruna_core::document::DocumentChangeKind::Delete,
+            placement,
+        };
+        DocumentEvictedDocument {
+            event_id,
+            target: DocumentTarget::MetadataDocumentLifecycle {
+                document_id: event_id,
+            },
+            event: aruna_core::document::DocumentOutboxEvent::Delete { change },
+            placement,
+            allow_genesis: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn reemit_lands_once() {
+        // A failed first write reports the hand-off incomplete, so the journal keeps it; after
+        // recovery every replay writes each document once, under its evicted event id.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().join("storage").to_str().unwrap()).unwrap();
+        let net_handle = aruna_net::NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                sync_storage_path: Some(dir.path().join("document-sync")),
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        let context = |storage_handle| DriverContext {
+            storage_handle,
+            net_handle: Some(net_handle.clone()),
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let documents = vec![evicted(1), evicted(2)];
+        let (failed, receivers) = aruna_storage::StorageHandle::new();
+        drop(receivers);
+        let failed = context(failed);
+        assert!(!reemit_evicted_documents(&failed, documents.clone()).await);
+
+        let recovered = context(storage.clone());
+        for _ in 0..2 {
+            assert!(reemit_evicted_documents(&recovered, documents.clone()).await);
+        }
+        let rows = match storage
+            .send_storage_effect(aruna_core::effects::StorageEffect::Iter {
+                key_space: aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 16,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+            other => panic!("unexpected outbox read: {other:?}"),
+        };
+        let mut ids: Vec<_> = rows
+            .iter()
+            .map(|(_, value)| {
+                postcard::from_bytes::<aruna_core::document::DocumentOutboxRecord>(value)
+                    .unwrap()
+                    .outbox_id
+            })
+            .collect();
+        ids.sort();
+        let expected: Vec<_> = documents.iter().map(|document| document.event_id).collect();
+        assert_eq!(ids, expected);
+        net_handle.shutdown().await;
+    }
+
     #[tokio::test]
     async fn rejects_foreign_peer() {
         // The blob replication plane must refuse peers that are unknown or not
