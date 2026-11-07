@@ -27,7 +27,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::request_authorization::AuthorizeError;
-use crate::auth::request_policy::PolicyRequestExtras;
+use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::forward::authorize::authorize_create;
 use crate::forward::transport::MetadataWriteError;
 use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
@@ -579,9 +579,12 @@ async fn authorize_write(
     .await;
     match checked {
         Ok(()) => Ok(path),
-        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => Err(permanent(
-            format!("harvest write to [{path}] is not permitted"),
-        )),
+        Err(
+            AuthorizeError::PermissionDenied
+            | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
+        ) => Err(permanent(format!(
+            "harvest write to [{path}] is not permitted"
+        ))),
         Err(error) => Err(retryable(format!("harvest permission check: {error}"))),
     }
 }
