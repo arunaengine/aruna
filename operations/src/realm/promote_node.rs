@@ -9,6 +9,7 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW};
 use aruna_core::structs::identity::auth::Actor;
@@ -68,6 +69,8 @@ pub enum PromoteNodeError {
 /// 30 second management relay timeout, so a relayed caller gets the answer.
 pub const CALL_BUDGET: Duration = Duration::from_secs(20);
 const READY_INTERVAL: Duration = Duration::from_millis(500);
+/// Listing attempts of one call; each one that loses its commit to another writer runs again.
+const LIST_ATTEMPTS: usize = 5;
 
 /// Hands the key first: an unreachable node leaves the realm unchanged and the call can be
 /// repeated. Only a confirmed hand-off marks the node as management. `Ok(true)` means the
@@ -97,19 +100,35 @@ pub async fn promote_node(
         .await;
     handoff_outcome(reply)?;
     let target = config.node_id;
-    drive(
-        EnsureConfigOperation::new(EnsureConfigParams {
-            actor: config.actor,
-            target_node_id: config.node_id,
-            target_node_kind: RealmNodeKind::Management,
-            metadata_replication_factor: METADATA_REPLICATION_FACTOR,
-            realm_description: String::new(),
-            create_if_missing: false,
-            reject_kind_mismatch: false,
-        }),
-        context.as_ref(),
-    )
-    .await?;
+    // Other writers of the realm configuration, such as a joining node's sync, can win the
+    // commit; a refused commit wrote nothing, so the listing runs again.
+    let mut attempts = 1;
+    loop {
+        let listed = drive(
+            EnsureConfigOperation::new(EnsureConfigParams {
+                actor: config.actor.clone(),
+                target_node_id: config.node_id,
+                target_node_kind: RealmNodeKind::Management,
+                metadata_replication_factor: METADATA_REPLICATION_FACTOR,
+                realm_description: String::new(),
+                create_if_missing: false,
+                reject_kind_mismatch: false,
+            }),
+            context.as_ref(),
+        )
+        .await;
+        match listed {
+            Err(EnsureConfigError::StorageError(StorageError::TransactionConflict))
+                if attempts < LIST_ATTEMPTS =>
+            {
+                attempts += 1;
+            }
+            result => {
+                result?;
+                break;
+            }
+        }
+    }
     Ok(wait_ready(deadline, READY_INTERVAL, || ask_ready(metadata, target)).await)
 }
 

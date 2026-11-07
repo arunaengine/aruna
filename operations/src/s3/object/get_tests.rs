@@ -3087,6 +3087,42 @@ fn sources_fail_over() {
     assert_eq!(served.descriptor.source_path, "mirror/file.txt");
 }
 
+// Absence is the answer only when every source lacks the file; an outage or a refusal of
+// another source stays the answer, so the read is not reported as lost.
+#[test]
+fn absence_needs_all() {
+    let outage = || StagingSourceError::StatError("timed out".to_string());
+    let cases = [
+        (outage(), StagingSourceError::NotFound, outage()),
+        (StagingSourceError::NotFound, outage(), outage()),
+        (
+            StagingSourceError::AccessDenied,
+            StagingSourceError::NotFound,
+            StagingSourceError::AccessDenied,
+        ),
+        (
+            StagingSourceError::NotFound,
+            StagingSourceError::NotFound,
+            StagingSourceError::NotFound,
+        ),
+    ];
+    for (first, second, expected) in cases {
+        let mut operation = mirrored_operation(observation(9));
+        let effects = ranked_head(&mut operation, vec![false, false]);
+        assert_eq!(headed_path(&effects), "folder/file.txt");
+        let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
+            error: first,
+        }));
+        assert_eq!(headed_path(&effects), "mirror/file.txt");
+        operation.step(Event::StagingSource(StagingSourceEvent::Error {
+            error: second,
+        }));
+        assert!(operation.is_complete());
+        let error = operation.finalize().unwrap_err();
+        assert_eq!(error, GetObjectError::StagingSourceError(expected));
+    }
+}
+
 // Without digests nothing proves another source's bytes, so the read moves on to the source
 // whose validators the version recorded.
 #[test]

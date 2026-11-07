@@ -1101,6 +1101,40 @@ mod tests {
         );
     }
 
+    // HEAD and GET of one reference answer a source failure alike: lost is 404, refused is 403,
+    // and an outage or a changing source is a retryable 503.
+    #[test]
+    fn reference_failures_agree() {
+        let failures = || {
+            [
+                StagingSourceError::NotFound,
+                StagingSourceError::AccessDenied,
+                StagingSourceError::StatError("down".to_string()),
+                StagingSourceError::ReadError("down".to_string()),
+                StagingSourceError::SourceUnstable,
+            ]
+        };
+        let expected = [
+            S3ErrorCode::NoSuchKey,
+            S3ErrorCode::AccessDenied,
+            S3ErrorCode::ServiceUnavailable,
+            S3ErrorCode::ServiceUnavailable,
+            S3ErrorCode::ServiceUnavailable,
+        ];
+        let pairs = failures().into_iter().zip(failures()).zip(expected);
+        for ((get, head), code) in pairs {
+            let get = GetObjectError::StagingSourceError(get).into_s3_error();
+            let head = HeadObjectError::StagingSourceError(head).into_s3_error();
+            assert_eq!((get.code(), head.code()), (&code, &code));
+            assert_eq!(get.status_code(), head.status_code());
+        }
+        let resolve = || SourceResolutionError::ResolveFailed;
+        let get = GetObjectError::ResolveReferenceError(resolve()).into_s3_error();
+        let head = HeadObjectError::ResolveReferenceError(resolve()).into_s3_error();
+        assert_eq!(get.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(head.code(), get.code());
+    }
+
     #[test]
     fn maps_head_denial() {
         let error =

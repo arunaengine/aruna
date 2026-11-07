@@ -434,6 +434,8 @@ mod tests {
                 realm_id: RealmId::from_bytes([1u8; 32]).to_string(),
                 peer_id: Some(node_id.to_string()),
                 capabilities: Some(NodeCapabilityKind::Management),
+                started_at: None,
+                uptime_secs: None,
             },
             api_version: "test".to_string(),
             portal: None,

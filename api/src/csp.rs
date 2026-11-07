@@ -23,7 +23,8 @@ const FONT_STYLE_ORIGIN: &str = "https://fonts.googleapis.com";
 const FONT_FILE_ORIGIN: &str = "https://fonts.gstatic.com";
 const PYPI_ORIGIN: &str = "https://pypi.org";
 const NPM_ORIGIN: &str = "https://registry.npmjs.org";
-const LOCAL_MODEL_ORIGINS: &str = "http://localhost:* http://127.0.0.1:* http://[::1]:*";
+// CSP host sources cannot name IPv6 literals; a model server on ::1 is reached as localhost.
+const LOCAL_MODEL_ORIGINS: &str = "http://localhost:* http://127.0.0.1:*";
 
 /// Anti-clickjacking policy every response carries when it has no stricter one.
 const BASELINE_CSP: &str = "frame-ancestors 'none'";
@@ -465,7 +466,10 @@ mod tests {
 
         assert!(policy.contains("http://localhost:*"));
         assert!(policy.contains("http://127.0.0.1:*"));
-        assert!(policy.contains("http://[::1]:*"));
+        assert!(
+            !policy.contains('['),
+            "browsers reject IPv6 literal sources"
+        );
         assert!(!policy.contains("http://192.168.0.1:*"));
     }
 

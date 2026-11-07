@@ -10,7 +10,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
-use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata};
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketLocationConstraint, CompletedMultipartUpload, CompletedPart, CreateBucketConfiguration,
@@ -351,10 +351,7 @@ impl NativeMultipart {
             },
             Some(501) => Err(BlobError::ConditionalUnsupported),
             _ if error.code() == Some("NotImplemented") => Err(BlobError::ConditionalUnsupported),
-            _ => Err(BlobError::WriteError(format!(
-                "reserve the path: {}",
-                DisplayErrorContext(&error)
-            ))),
+            _ => Err(BlobError::WriteError(reason("reserve the path", &error))),
         }
     }
 
@@ -372,8 +369,7 @@ impl NativeMultipart {
             Ok(output) => output,
             Err(error) if status(&error) == Some(404) => return Ok(None),
             Err(error) => {
-                let message = format!("head object: {}", DisplayErrorContext(&error));
-                return Err(BlobError::ReadError(message));
+                return Err(BlobError::ReadError(reason("head object", &error)));
             }
         };
         let version = output.metadata().and_then(|found| found.get(RESERVATION));
@@ -406,10 +402,7 @@ impl NativeMultipart {
         };
         match status(&error) {
             Some(404) => Ok(()),
-            _ => Err(BlobError::DeleteError(format!(
-                "delete reservation: {}",
-                DisplayErrorContext(&error)
-            ))),
+            _ => Err(BlobError::DeleteError(reason("delete reservation", &error))),
         }
     }
 
@@ -476,9 +469,9 @@ impl NativeMultipart {
             {
                 Ok(())
             }
-            Err(error) => Err(BlobError::DeleteError(format!(
-                "abort multipart upload: {}",
-                DisplayErrorContext(&error)
+            Err(error) => Err(BlobError::DeleteError(reason(
+                "abort multipart upload",
+                &error,
             ))),
         }
     }
@@ -501,10 +494,7 @@ impl NativeMultipart {
                 .boxed()
                 .await
                 .map_err(|error| {
-                    BlobError::DeleteError(format!(
-                        "list multipart uploads: {}",
-                        DisplayErrorContext(&error)
-                    ))
+                    BlobError::DeleteError(reason("list multipart uploads", &error))
                 })?;
             for upload in page.uploads() {
                 if upload.key() != Some(key.as_str()) {
@@ -698,14 +688,23 @@ where
     BlobError::WriteError(message)
 }
 
-fn write_error<E>(call: &str, error: aws_sdk_s3::error::SdkError<E>) -> BlobError
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    BlobError::WriteError(format!(
-        "{call} multipart upload: {}",
-        DisplayErrorContext(&error)
-    ))
+fn write_error<E: ProvideErrorMetadata>(call: &str, error: SdkError<E>) -> BlobError {
+    BlobError::WriteError(reason(&format!("{call} multipart upload"), &error))
+}
+
+/// Names only the call, HTTP status and S3 error code: provider bodies and headers can reflect
+/// signatures or signed URLs, so they never reach logs or error messages.
+fn reason<E: ProvideErrorMetadata>(call: &str, error: &SdkError<E>) -> String {
+    let status = match (status(error), error) {
+        (Some(status), _) => status.to_string(),
+        (None, SdkError::TimeoutError(_)) => "timeout".to_string(),
+        (None, SdkError::DispatchFailure(_)) => "unreachable".to_string(),
+        (None, _) => "none".to_string(),
+    };
+    format!(
+        "{call}: status {status}, code {}",
+        error.code().unwrap_or("none")
+    )
 }
 
 /// A refused copy: a source that lost its ETag, a storage that cannot copy, or another error.
@@ -790,7 +789,7 @@ mod tests {
         assert!(matches!(err, SdkError::DispatchFailure(_)), "{err:?}");
     }
 
-    /// Answers every request with `status` and an S3 error `code`.
+    /// Answers every request with `status`, an S3 error `code` and a message reflecting a signature.
     async fn answering(status: &'static str, code: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -799,7 +798,9 @@ mod tests {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let mut buffer = vec![0u8; 8192];
                 let _ = stream.read(&mut buffer).await;
-                let body = format!("<Error><Code>{code}</Code></Error>");
+                let body = format!(
+                    "<Error><Code>{code}</Code><Message>X-Amz-Signature=leaked</Message></Error>"
+                );
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -828,6 +829,36 @@ mod tests {
         // Any other refusal stays an error, so the cleanup is tried again.
         let denied = config(answering("403 Forbidden", "AccessDenied").await);
         assert!(delete_empty(&denied, "team-a-x", &guard).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn hides_provider_message() {
+        let guard = EgressGuard::new(aruna_core::egress::EgressPolicy::loopback()).unwrap();
+        let config = HashMap::from([
+            (
+                "endpoint".to_string(),
+                answering("403 Forbidden", "AccessDenied").await,
+            ),
+            ("region".to_string(), "us-east-1".to_string()),
+            ("access_key_id".to_string(), "key".to_string()),
+            ("secret_access_key".to_string(), "secret".to_string()),
+        ]);
+        let native = NativeMultipart::from_config(&config, "bucket", "", Some(&guard)).unwrap();
+        let errors = [
+            native.create("a").await.unwrap_err(),
+            native
+                .complete("a", "u", &[(1, "e".into())], false)
+                .await
+                .unwrap_err(),
+            native.abort("a", "u").await.unwrap_err(),
+            native.abort_path("a").await.unwrap_err(),
+            native.reserve("a", "v").await.unwrap_err(),
+        ];
+        for error in errors {
+            let text = error.to_string();
+            assert!(text.contains("status 403, code AccessDenied"), "{text}");
+            assert!(!text.contains("leaked"), "{text}");
+        }
     }
 
     #[test]

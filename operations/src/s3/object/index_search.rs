@@ -21,9 +21,9 @@ use futures_util::future::join_all;
 use ulid::Ulid;
 
 use super::{
-    HeadCandidate, ObjectKeyMatch, SEARCH_MAX_LIMIT, SearchNodeHit, SearchNodePage,
-    SearchObjectsError, SearchObjectsInput, authorize, batch_read, build_hits, finish_read,
-    load_live, retain_matches, start_read,
+    CHANGED_PAGE_CAP, Candidate, HeadCandidate, ObjectKeyMatch, SEARCH_MAX_LIMIT, SearchNodeHit,
+    SearchNodePage, SearchObjectsError, SearchObjectsInput, authorize, batch_read, build_hits,
+    changed_until, finish_read, load_live, retain_matches, start_read,
 };
 use crate::auth::request_policy::PolicyEvaluator;
 use crate::distribution::index_feed::{range_progress, state_key};
@@ -50,9 +50,16 @@ pub(super) async fn search_ranges(
     input: &SearchObjectsInput,
     search: RangeSearch,
 ) -> Result<SearchNodePage, SearchObjectsError> {
-    let indexes = search.indexes.clone();
+    let (indexes, set_id) = (search.indexes.clone(), search.binding.set_id);
+    let record = read_record(context, set_id).await;
+    let Some(view) = record.map_err(SearchObjectsError::Storage)? else {
+        // Without the record the ranges are unknown, so nothing is covered.
+        return Ok(page(Vec::new(), Vec::new(), true, None, 1, 0));
+    };
+    let ranges = &view.head.snapshot.config.ranges;
     let mut unready = Vec::new();
-    let mut page = range_page(context, input, search, &mut unready).await?;
+    let mut page = range_page(context, input, search, ranges, &mut unready).await?;
+    page.layout = Some((set_id, layout_digest(ranges)));
     page.partial_ranges = (unready.iter())
         .filter_map(|(range_id, partial)| Some((*range_id, partial.clone()?)))
         .collect();
@@ -75,8 +82,8 @@ async fn readable(
     evaluators: &mut HashMap<(RealmId, GroupId), PolicyEvaluator>,
     key: &str,
 ) -> Result<bool, SearchObjectsError> {
-    for hit in resolve_keys(context, input, bucket, &[key.to_string()]).await? {
-        if authorize(context, input, evaluators, &hit).await? {
+    for candidate in resolve_keys(context, input, bucket, &[key.to_string()]).await? {
+        if authorize(context, input, evaluators, &candidate.hit).await? {
             return Ok(true);
         }
     }
@@ -88,17 +95,12 @@ async fn range_page(
     context: &DriverContext,
     input: &SearchObjectsInput,
     search: RangeSearch,
+    ranges: &[KeyRange],
     unready: &mut Vec<(Ulid, Option<Option<String>>)>,
 ) -> Result<SearchNodePage, SearchObjectsError> {
     let bucket = input.bucket.clone().unwrap_or_default();
     let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
     let budget = search.budget.max(1);
-    let set_id = search.binding.set_id;
-    let record = read_record(context, set_id).await;
-    let Some(view) = record.map_err(SearchObjectsError::Storage)? else {
-        // Without the record the ranges are unknown, so nothing is covered.
-        return Ok(page(Vec::new(), None, 1, 0));
-    };
     let after = match input.start_after.as_deref() {
         Some(position) => Some(BlobHeadKey::from_bytes(&open_position(position)?)?.key),
         None => None,
@@ -106,7 +108,7 @@ async fn range_page(
     let (start, end) = window(input, after);
     let mut local = Vec::new();
     let mut remote = 0;
-    for range in &view.head.snapshot.config.ranges {
+    for range in ranges {
         if !overlaps(range, &start, &end) {
             continue;
         }
@@ -127,6 +129,8 @@ async fn range_page(
     });
     let mut evaluators = HashMap::new();
     let mut visible = Vec::with_capacity(limit + 1);
+    let mut changed = Vec::new();
+    let mut certain = true;
     let (mut examined, mut incomplete) = (0, 0);
     for chunk in local.chunks(RANGE_CONCURRENCY) {
         let query = KeyQuery {
@@ -143,6 +147,9 @@ async fn range_page(
                 incomplete += 1;
                 continue;
             };
+            // A key removed from the index after `as_of` leaves no trace, so a commit since
+            // then makes the changed keys of this page unknown.
+            certain &= found.committed_at.is_some_and(|at| at < input.as_of);
             // Checked once wherever the query ends, so neither coverage nor timing shows the cursor.
             if let Some(through) = through {
                 let shown = readable(context, input, &bucket, &mut evaluators, &through).await?;
@@ -155,14 +162,23 @@ async fn range_page(
             let (mut keys, last) = (found.keys, found.last);
             keys.retain(|key| input.key_match.matches(key, &input.query));
             for candidate in resolve_keys(context, input, &bucket, &keys).await? {
-                if !authorize(context, input, &mut evaluators, &candidate).await? {
+                if !authorize(context, input, &mut evaluators, &candidate.hit).await? {
                     continue;
                 }
-                visible.push(candidate);
+                if candidate.changed {
+                    changed.push(candidate.hit.cursor_key);
+                    if changed.len() >= CHANGED_PAGE_CAP {
+                        let next = changed.last().cloned();
+                        return Ok(page(visible, changed, certain, next, incomplete, remote));
+                    }
+                    continue;
+                }
+                visible.push(candidate.hit);
                 if visible.len() > limit {
                     let next = visible.get(limit - 1).map(|hit| hit.cursor_key.clone());
                     visible.truncate(limit);
-                    return Ok(page(visible, next, incomplete, remote));
+                    changed_until(&mut changed, next.as_deref());
+                    return Ok(page(visible, changed, certain, next, incomplete, remote));
                 }
             }
             if let Some(last) = last {
@@ -171,6 +187,8 @@ async fn range_page(
                 let position = BlobHeadKey::new(bucket.as_str(), last).to_bytes()?;
                 return Ok(page(
                     visible,
+                    changed,
+                    certain,
                     Some(seal_position(&position)?),
                     incomplete,
                     remote,
@@ -178,7 +196,7 @@ async fn range_page(
             }
         }
     }
-    Ok(page(visible, None, incomplete, remote))
+    Ok(page(visible, changed, certain, None, incomplete, remote))
 }
 
 /// Queries the indexes of `chunk` at once; `None` for a range without a searchable one. A
@@ -312,6 +330,8 @@ fn overlaps(range: &KeyRange, start: &Bound<String>, end: &Bound<String>) -> boo
 
 fn page(
     hits: Vec<SearchNodeHit>,
+    changed: Vec<Vec<u8>>,
+    certain: bool,
     next_start_after: Option<Vec<u8>>,
     incomplete_ranges: usize,
     remote_ranges: usize,
@@ -325,7 +345,20 @@ fn page(
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
         skipped_buckets: Vec::new(),
+        changed: certain.then_some(changed),
+        layout: None,
     }
+}
+
+/// Which member searches which keys: the ranges' bounds, coordinators and epochs.
+fn layout_digest(ranges: &[KeyRange]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for range in ranges {
+        let bounds = (range.range_id, &range.lower, &range.upper);
+        let owner = (range.coordinator, range.epoch);
+        hasher.update(&postcard::to_allocvec(&(bounds, owner)).unwrap_or_default());
+    }
+    *hasher.finalize().as_bytes()
 }
 
 /// The hits of the current heads of `keys`, in their order; keys without a live head are
@@ -335,7 +368,7 @@ async fn resolve_keys(
     input: &SearchObjectsInput,
     bucket: &str,
     keys: &[String],
-) -> Result<Vec<SearchNodeHit>, SearchObjectsError> {
+) -> Result<Vec<Candidate>, SearchObjectsError> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -350,7 +383,7 @@ async fn resolve_heads(
     bucket: &str,
     keys: &[String],
     txn_id: TxnId,
-) -> Result<Vec<SearchNodeHit>, SearchObjectsError> {
+) -> Result<Vec<Candidate>, SearchObjectsError> {
     let heads: Vec<_> = (keys.iter())
         .map(|key| BlobHeadKey::new(bucket, key.as_str()))
         .collect();
