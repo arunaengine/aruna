@@ -153,7 +153,7 @@ async fn submit_reuses_source() {
     assert_eq!(replay.job_id, first.job_id);
     assert!(!replay.created);
 
-    // One run per source: a later run waits until the first one finished.
+    // One run per source: a later run waits until the first one ended.
     let running = submit(
         &setup,
         setup.owner.clone(),
@@ -165,7 +165,7 @@ async fn submit_reuses_source() {
     let job_id = first.job_id.parse().unwrap();
     let context = setup.state.get_ctx();
     mutate_job(&context.storage_handle, job_id, |record| {
-        record.state = JobState::Succeeded;
+        record.state = JobState::Cancelled;
         Ok(JobMutation::Persist)
     })
     .await
