@@ -13,6 +13,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{reducer_state_entry, sync_revision_entry};
+use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
@@ -226,6 +227,13 @@ impl CreateServiceOperation {
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         }
         writes.push(reducer_state_entry(&reducer_state)?);
+        let mut audit = AdminAuditRecord::new(
+            AdminAuditAction::ServiceAccountCreated,
+            actor.user_id,
+            user.user_id,
+        );
+        audit.group_id = Some(self.config.group_id);
+        writes.extend(audit.entries()?);
         self.state = CreateServiceState::WriteUser { txn_id, user };
         Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,

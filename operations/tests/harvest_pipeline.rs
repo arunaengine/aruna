@@ -19,7 +19,7 @@ use aruna_core::structs::execution::harvest::{
     RepositoryConnector, RepositoryConnectorKind,
 };
 use aruna_core::structs::execution::job::{JobError, JobErrorKind, JobProgress, JobResultPayload};
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
@@ -1272,6 +1272,38 @@ async fn parse_failures_classified() -> Result<(), BoxError> {
         failure(&run(&fixture, &source).await).kind == JobErrorKind::Permanent,
         "a protocol rejection is permanent"
     );
+
+    server.abort();
+    fixture.stop().await;
+    Ok(())
+}
+
+/// A DENY under the target prefix stops the run before any document is written there.
+#[tokio::test]
+async fn denied_prefix_refused() -> Result<(), BoxError> {
+    let fixture = build_fixture().await?;
+    let (realm_id, group_id) = (fixture.actor.realm_id, fixture.group_id);
+    let mut group =
+        GroupAuthorizationDocument::default_group_doc(fixture.actor.user_id, realm_id, group_id);
+    for role in group.roles.values_mut() {
+        let denied = format!("/{realm_id}/g/{group_id}/meta/imported/**");
+        role.permissions.insert(denied, Permission::DENY);
+    }
+    let storage = &fixture.context.storage_handle;
+    let bytes = group.to_bytes(&fixture.actor)?;
+    write_value(storage, AUTH_KEYSPACE, group_id.to_bytes().to_vec(), bytes).await?;
+    let (provider, server) = serve_oai().await?;
+    let source = seed_source(&fixture, &provider.endpoint).await?;
+    provider.script("identify", identify_page());
+    provider.script(
+        "start",
+        list_page(&[live_record(ALPHA, "2026-01-02T00:00:00Z", "Alpha")], None),
+    );
+
+    let error = failure(&run(&fixture, &source).await).clone();
+    assert_eq!(error.kind, JobErrorKind::Permanent, "{error:?}");
+    let alpha = provenance(&fixture, group_id, ALPHA).await?;
+    assert!(alpha.is_none_or(|row| row.state != HarvestRecordState::Live));
 
     server.abort();
     fixture.stop().await;

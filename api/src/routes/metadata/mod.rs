@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub(crate) mod documents;
+pub(crate) mod harvests;
 pub(crate) mod links;
 pub(crate) mod query;
 pub(crate) mod references;
@@ -78,4 +79,5 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
             repositories::replace_repository,
             repositories::delete_repository
         ))
+        .routes(routes!(harvests::submit_harvest))
 }

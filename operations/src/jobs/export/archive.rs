@@ -327,7 +327,7 @@ pub(super) fn term_value(term: &Term) -> Option<String> {
     }
 }
 
-pub(super) fn safe_zip_path(value: &str) -> Option<String> {
+pub(crate) fn safe_zip_path(value: &str) -> Option<String> {
     let mut value = value;
     while let Some(stripped) = value.strip_prefix("./") {
         value = stripped;
@@ -1088,7 +1088,7 @@ pub(super) async fn write_archive_checked(
     Ok(())
 }
 
-pub(super) fn zip_entry(path: &str, modified_ms: u64) -> ZipEntryBuilder {
+pub(crate) fn zip_entry(path: &str, modified_ms: u64) -> ZipEntryBuilder {
     // A regular file readable by everyone, so an unpacked archive opens without a chmod.
     ZipEntryBuilder::new(path.to_string().into(), Compression::Stored)
         .last_modification_date(zip_date(modified_ms))
