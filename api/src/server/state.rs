@@ -221,6 +221,7 @@ pub struct ServerState {
     /// The operator's import roots that groups may use on this node.
     import_roots: Arc<BTreeMap<String, ImportRoot>>,
     started: (SystemTime, Instant),
+    archive_links: Arc<crate::routes::storage::archive::ArchiveLinks>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -359,6 +360,7 @@ impl ServerState {
             },
             import_roots: Arc::default(),
             started: (SystemTime::now(), Instant::now()),
+            archive_links: Arc::default(),
         };
         state
             .identity
@@ -437,6 +439,11 @@ impl ServerState {
     pub fn with_rate_limits(mut self, limits: crate::rate_limit::ApiRateLimits) -> Self {
         self.limits.rate_limits = Arc::new(limits);
         self
+    }
+
+    /// The unredeemed archive download links of this node.
+    pub(crate) fn archive_links(&self) -> &crate::routes::storage::archive::ArchiveLinks {
+        &self.archive_links
     }
 
     pub fn rate_limits(&self) -> &crate::rate_limit::ApiRateLimits {

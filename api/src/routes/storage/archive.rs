@@ -1,23 +1,29 @@
-//! Downloads a selection of this node's files and folders as one streamed ZIP.
+//! Downloads a selection of this node's files and folders as one streamed ZIP, directly or
+//! through a single-use link a browser can open.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use aruna_core::UserId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::backend_import::TokenGrant;
+use aruna_operations::auth::bearer_token::{grant_valid, token_grant};
 use aruna_operations::s3::object::archive::{SelectionEntry, validate_selection, write_selection};
 use aruna_operations::s3::object::pages::PageScope;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio_util::task::AbortOnDropHandle;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -25,18 +31,25 @@ use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::download::{self, AdmissionError, DownloadPermit};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
+use crate::routes::shares::{rfc3339, unix_now};
 use crate::routes::storage::objects::BearerRelay;
 use crate::server::state::ServerState;
 
 /// Bytes buffered between the archive writer and the response body.
 const PIPE_BYTES: usize = 128 * 1024;
+/// Seconds an archive link works at most.
+const LINK_SECS: u64 = 60;
+const DOWNLOAD_PATH: &str = "/api/v1/data/archives/download";
 
 #[derive(OpenApi)]
 #[openapi()]
 pub struct ArchiveDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ArchiveDoc::openapi()).routes(routes!(download_selection))
+    OpenApiRouter::with_openapi(ArchiveDoc::openapi())
+        .routes(routes!(download_selection))
+        .routes(routes!(create_link))
+        .routes(routes!(download_link))
 }
 
 /// One file with `key`, or one folder with `prefix`.
@@ -60,6 +73,20 @@ pub struct ArchiveEntry {
 #[serde(deny_unknown_fields)]
 pub struct ArchiveRequest {
     pub entries: Vec<ArchiveEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct LinkResponse {
+    /// Single-use download URL path on this node.
+    pub path: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct LinkQuery {
+    /// Archive ticket; single use, never logged.
+    pub ticket: String,
 }
 
 /// The selection a request names, checked before anything is admitted.
@@ -210,6 +237,199 @@ pub async fn download_selection(
     let entries = selection(request)?;
     let permit = admitted(&state, auth.user_id)?;
     Ok(archive_response(state, (auth, bearer), entries, permit))
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/archives/links",
+    tag = "data/storage",
+    summary = "Get a download link for a ZIP",
+    description = r#"Returns a single-use download URL for the ZIP of a selection, so a browser downloads it without the bearer token.
+
+**Authentication**: realm bearer token.
+
+**Behavior**
+- The selection is checked as for `POST /data/archives`; the archive itself is built when the
+  link is opened, with the same versions, paths and report rules.
+- The URL works once, within 60 seconds and never after the token expires. A newer link of the
+  same user replaces the older one. Links live in this node's memory and end on a restart.
+- Opening the link checks the token again: an expired or revoked token is refused, and the
+  token's restrictions and session apply to every entry.
+- The ticket travels only in the `ticket` query value of the fixed download path, which logs
+  never record. The answer carries `Cache-Control: no-store`."#,
+    request_body(content = ArchiveRequest, example = json!({
+        "entries": [{"bucket": "lab-data", "prefix": "runs/2026-11-03/"}]
+    })),
+    responses(
+        (status = 200, description = "The download URL path", body = LinkResponse, example = json!({"path": "/api/v1/data/archives/download?ticket=<single-use-ticket>", "expires_at": "2026-11-07T10:01:00Z"})),
+        (status = 400, description = "An empty selection, an entry with both or neither of key and prefix, an invalid bucket name or version id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_link(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    Json(request): Json<ArchiveRequest>,
+) -> ServerResult<Response> {
+    let auth = require_realm_auth(&state, auth)?;
+    let bearer = bearer.ok_or(ServerError::Unauthorized)?;
+    let grant = token_grant(bearer.as_str()).map_err(|_| ServerError::Unauthorized)?;
+    let entries = selection(request)?;
+    let now = unix_now();
+    let link = PendingLink {
+        auth,
+        grant,
+        bearer,
+        entries,
+        expires_at: 0,
+    };
+    let (ticket, expires_at) = state.archive_links().create(link, now);
+    let body = LinkResponse {
+        path: format!("{DOWNLOAD_PATH}?ticket={ticket}"),
+        expires_at: rfc3339(expires_at),
+    };
+    let no_store = [(CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(body)).into_response())
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/archives/download",
+    tag = "data/storage",
+    summary = "Download a ZIP with a link",
+    description = r#"Streams the ZIP of the selection an archive link names, as an attachment.
+
+**Authentication**: the `ticket` query value only; it works once, within 60 seconds.
+
+**Behavior**
+- The download is admitted against the link creator's downloads before the ticket is used, so
+  a refusal for capacity leaves the link usable until it expires.
+- The creator's token is checked again; READ is checked per file and per folder page with the
+  token's restrictions, and the archive follows the rules of `POST /data/archives`.
+- The answer carries `Cache-Control: no-store`."#,
+    params(LinkQuery),
+    responses(
+        (status = 200, description = "The archive as an `application/zip` stream with an attachment `Content-Disposition`"),
+        (status = 401, description = "The creator's token expired or was revoked", body = ErrorResponse),
+        (status = 404, description = "The ticket was used, expired, replaced by a newer link or never issued", body = ErrorResponse),
+        (status = 503, description = "No free download capacity, or the token could not be checked", body = ErrorResponse)
+    ),
+    security(())
+)]
+pub async fn download_link(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<LinkQuery>,
+) -> ServerResult<Response> {
+    let now = unix_now();
+    let links = state.archive_links();
+    let creator = links
+        .creator(&query.ticket, now)
+        .ok_or(ServerError::NotFound)?;
+    let permit = admitted(&state, creator)?;
+    let link = links
+        .redeem(&query.ticket, now)
+        .ok_or(ServerError::NotFound)?;
+    let storage = &state.get_ctx().storage_handle;
+    match grant_valid(storage, &link.grant, &link.auth.user_id).await {
+        Ok(true) => {}
+        Ok(false) => return Err(ServerError::Unauthorized),
+        Err(_) => {
+            return Err(ServerError::ServiceUnavailableReason(
+                "the token behind the link could not be checked".to_string(),
+            ));
+        }
+    }
+    let caller = (link.auth, Some(link.bearer));
+    Ok(archive_response(state, caller, link.entries, permit))
+}
+
+/// What an unredeemed link runs as. The bearer stays in memory for relayed listings and is
+/// never stored or logged, so this has no `Debug`.
+pub(crate) struct PendingLink {
+    pub auth: AuthContext,
+    pub grant: TokenGrant,
+    pub bearer: ValidatedBearer,
+    pub entries: Vec<SelectionEntry>,
+    /// Unix seconds; set when the link is created.
+    pub expires_at: u64,
+}
+
+/// The unredeemed archive links of this node, at most one per user.
+#[derive(Default)]
+pub(crate) struct ArchiveLinks {
+    table: Mutex<LinkTable>,
+}
+
+// Shows only the number of links, never a ticket or token.
+impl std::fmt::Debug for ArchiveLinks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let links = self.table().tickets.len();
+        formatter
+            .debug_struct("ArchiveLinks")
+            .field("links", &links)
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct LinkTable {
+    tickets: HashMap<[u8; 32], PendingLink>,
+    users: HashMap<UserId, [u8; 32]>,
+}
+
+impl LinkTable {
+    fn prune(&mut self, now: u64) {
+        self.tickets.retain(|_, link| link.expires_at > now);
+        let tickets = &self.tickets;
+        self.users.retain(|_, ticket| tickets.contains_key(ticket));
+    }
+}
+
+/// Tickets are kept by digest, so the table never holds one that could be replayed.
+fn ticket_digest(ticket: &str) -> [u8; 32] {
+    blake3::hash(ticket.as_bytes()).into()
+}
+
+impl ArchiveLinks {
+    fn table(&self) -> std::sync::MutexGuard<'_, LinkTable> {
+        self.table.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keeps `link` as its user's only link and returns its ticket and expiry; `now` is Unix
+    /// seconds.
+    pub(crate) fn create(&self, mut link: PendingLink, now: u64) -> (String, u64) {
+        let ticket = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+        link.expires_at = (now + LINK_SECS).min(link.grant.expires_at_secs);
+        let expires_at = link.expires_at;
+        let user_id = link.auth.user_id;
+        let digest = ticket_digest(&ticket);
+        let mut table = self.table();
+        table.prune(now);
+        if let Some(older) = table.users.insert(user_id, digest) {
+            table.tickets.remove(&older);
+        }
+        table.tickets.insert(digest, link);
+        (ticket, expires_at)
+    }
+
+    /// The user an unexpired ticket belongs to, without using it.
+    pub(crate) fn creator(&self, ticket: &str, now: u64) -> Option<UserId> {
+        let mut table = self.table();
+        table.prune(now);
+        let link = table.tickets.get(&ticket_digest(ticket))?;
+        Some(link.auth.user_id)
+    }
+
+    /// Uses an unexpired ticket once.
+    pub(crate) fn redeem(&self, ticket: &str, now: u64) -> Option<PendingLink> {
+        let mut table = self.table();
+        table.prune(now);
+        let link = table.tickets.remove(&ticket_digest(ticket))?;
+        table.users.remove(&link.auth.user_id);
+        Some(link)
+    }
 }
 
 #[cfg(test)]
