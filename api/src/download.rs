@@ -1,4 +1,5 @@
-//! Admits downloads against rate limits and streams the body under idle and lifetime limits.
+//! Admits downloads against rate limits and streams bodies under idle limits, file bodies also
+//! under a lifetime limit.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,6 +9,8 @@ use aruna_core::stream::{BackendStream, StreamError};
 use axum::body::Body;
 use bytes::Bytes;
 use futures_util::StreamExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
@@ -48,6 +51,54 @@ pub(crate) fn body(
         receiver,
         |mut receiver| async move { receiver.recv().await.map(|item| (item, receiver)) },
     ))
+}
+
+/// A body without a lifetime bound, for archives that take as long as their selection. Only a
+/// client that stops reading for the idle limit stalls it; then, or on any other cut, the body
+/// ends with an error, never with a clean end a client could take for a complete archive.
+pub(crate) fn archive_body(
+    source: BackendStream<Result<Bytes, StreamError>>,
+    permit: DownloadPermit,
+) -> Body {
+    let (sender, receiver) = mpsc::channel(CHANNEL_SIZE);
+    let finished = Arc::new(AtomicBool::new(false));
+    tokio::spawn(archive_pump(source, sender, permit, finished.clone()));
+    Body::from_stream(futures_util::stream::unfold(
+        Some(receiver),
+        move |receiver| {
+            let finished = finished.clone();
+            async move {
+                let mut receiver = receiver?;
+                match receiver.recv().await {
+                    Some(item) => Some((item, Some(receiver))),
+                    None if finished.load(Ordering::Acquire) => None,
+                    None => Some((Err(StreamError(Box::new(cut()))), None)),
+                }
+            }
+        },
+    ))
+}
+
+fn cut() -> std::io::Error {
+    std::io::Error::other("the archive download was cut before its end")
+}
+
+async fn archive_pump(
+    mut source: BackendStream<Result<Bytes, StreamError>>,
+    sender: mpsc::Sender<Result<Bytes, StreamError>>,
+    permit: DownloadPermit,
+    finished: Arc<AtomicBool>,
+) {
+    let _permit = permit;
+    // Waiting for the source is the archive's own work, so only a pending send counts.
+    while let Some(item) = source.next().await {
+        let failed = item.is_err();
+        match tokio::time::timeout(IDLE_LIMIT, sender.send(item)).await {
+            Ok(Ok(())) if !failed => {}
+            _ => return,
+        }
+    }
+    finished.store(true, Ordering::Release);
 }
 
 async fn pump(
@@ -92,7 +143,7 @@ async fn pump(
 
 #[cfg(test)]
 mod tests {
-    use super::{CHANNEL_SIZE, DownloadPermit, IDLE_LIMIT, body};
+    use super::{CHANNEL_SIZE, DownloadPermit, IDLE_LIMIT, archive_body, body};
     use aruna_core::stream::BackendStream;
     use axum::body::to_bytes;
     use bytes::Bytes;
@@ -143,6 +194,50 @@ mod tests {
         .await;
         tokio::task::yield_now().await;
         assert!(result.is_err());
+        assert_eq!(limit.available_permits(), 1);
+    }
+
+    fn permit(limit: &Arc<Semaphore>) -> DownloadPermit {
+        DownloadPermit {
+            total: limit.clone().try_acquire_owned().expect("permit"),
+            user: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_archive_errors() {
+        let limit = Arc::new(Semaphore::new(1));
+        let source = BackendStream::new(stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"one")),
+            Ok(Bytes::from_static(b"two")),
+            Ok(Bytes::from_static(b"three")),
+        ]));
+        let archive = archive_body(source, permit(&limit));
+        // Nobody reads, so the pump waits on a full channel until the idle limit cuts it.
+        tokio::task::yield_now().await;
+        tokio::time::advance(IDLE_LIMIT).await;
+        tokio::task::yield_now().await;
+        assert_eq!(limit.available_permits(), 1);
+        assert!(
+            to_bytes(archive, 1024).await.is_err(),
+            "a cut is never a clean end"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_archive_continues() {
+        let limit = Arc::new(Semaphore::new(1));
+        let late = stream::once(async {
+            tokio::time::sleep(IDLE_LIMIT * 3).await;
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"late"))
+        });
+        let source = BackendStream::new(late);
+        let archive = archive_body(source, permit(&limit));
+        let bytes = to_bytes(archive, 1024)
+            .await
+            .expect("a slow source is no stall");
+        assert_eq!(bytes, Bytes::from_static(b"late"));
+        tokio::task::yield_now().await;
         assert_eq!(limit.available_permits(), 1);
     }
 }
