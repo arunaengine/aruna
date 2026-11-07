@@ -8,7 +8,7 @@ use crate::auth::{
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
 use crate::routes::git::location::StorageLocationRequest;
-use crate::routes::storage::objects::{ListRequest, object_page};
+use crate::routes::storage::objects::object_page;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
@@ -47,6 +47,7 @@ use aruna_operations::metadata::stats::count_group_purpose;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
+use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -2254,6 +2255,7 @@ async fn list_bucket_objects(
         delimiter: delimiter.map(str::to_string),
         cursor: continuation_token.map(str::to_string),
         limit,
+        partial: false,
     };
     let expiry = bearer.map_or(0, crate::auth::ValidatedBearer::expires_at_secs);
     let page = object_page(state, &info, (bearer, Some((auth, expiry))), request).await?;
