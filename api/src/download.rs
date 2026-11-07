@@ -90,8 +90,16 @@ async fn archive_pump(
     finished: Arc<AtomicBool>,
 ) {
     let _permit = permit;
-    // Waiting for the source is the archive's own work, so only a pending send counts.
-    while let Some(item) = source.next().await {
+    loop {
+        // Waiting for the source is the archive's own work, so only a pending send counts; a
+        // client that leaves meanwhile drops the source at once.
+        let item = tokio::select! {
+            _ = sender.closed() => return,
+            item = source.next() => item,
+        };
+        let Some(item) = item else {
+            break;
+        };
         let failed = item.is_err();
         match tokio::time::timeout(IDLE_LIMIT, sender.send(item)).await {
             Ok(Ok(())) if !failed => {}
@@ -147,7 +155,7 @@ mod tests {
     use aruna_core::stream::BackendStream;
     use axum::body::to_bytes;
     use bytes::Bytes;
-    use futures_util::stream;
+    use futures_util::{StreamExt, stream};
     use std::sync::Arc;
     use tokio::sync::Semaphore;
 
@@ -238,6 +246,36 @@ mod tests {
             .expect("a slow source is no stall");
         assert_eq!(bytes, Bytes::from_static(b"late"));
         tokio::task::yield_now().await;
+        assert_eq!(limit.available_permits(), 1);
+    }
+
+    /// Signals when the stream that owns it is dropped.
+    struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_archive_cancels() {
+        let limit = Arc::new(Semaphore::new(1));
+        let (signal, dropped) = tokio::sync::oneshot::channel();
+        let guard = Dropped(Some(signal));
+        let waiting = stream::pending::<Result<Bytes, std::io::Error>>().map(move |item| {
+            let _owned = &guard;
+            item
+        });
+        let archive = archive_body(BackendStream::new(waiting), permit(&limit));
+        drop(archive);
+        let released = tokio::time::timeout(IDLE_LIMIT, dropped).await;
+        assert!(
+            released.is_ok(),
+            "a dropped body drops a source that is still waiting"
+        );
         assert_eq!(limit.available_permits(), 1);
     }
 }
