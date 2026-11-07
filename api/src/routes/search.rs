@@ -227,8 +227,7 @@ pub struct ObjectCoverage {
     pub partitions: Vec<ObjectPartitionCoverage>,
     /// Readable matching keys of the `as_of` snapshot replaced or deleted later, through this page.
     /// Zero on the last page means the pages list that snapshot within the reported coverage;
-    /// `null` once a searched range index changed after `as_of`, so removed keys are uncounted,
-    /// or once a range changed coordinator or bounds during the search.
+    /// `null` once a searched range index or the range layout changed during the search.
     pub changed_keys: Option<usize>,
 }
 
