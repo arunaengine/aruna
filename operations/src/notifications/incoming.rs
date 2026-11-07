@@ -118,8 +118,8 @@ async fn build_response(
                 Ok(outcome) => {
                     wake_recipients(net_handle, &outcome.recipients);
                     if outcome.written > 0 {
-                        enqueue_webhooks(context, local_node_id, &records).await;
-                        enqueue_emails(context, local_node_id, &records).await;
+                        enqueue_webhooks(context, local_node_id, &outcome.held).await;
+                        enqueue_emails(context, local_node_id, &outcome.held).await;
                     }
                     NotificationTransportMessage::DeliverAck {
                         written: outcome.written as u32,

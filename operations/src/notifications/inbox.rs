@@ -33,6 +33,8 @@ pub struct InboxWriteOutcome {
     pub recipients: Vec<UserId>,
     pub purged: usize,
     pub cutoffs: usize,
+    /// Batch records the inbox holds after the write, new or already present, never discarded.
+    pub held: Vec<NotificationRecord>,
 }
 
 /// Idempotent holder-local upsert: existing primary keys are skipped inside the
@@ -227,6 +229,7 @@ pub(crate) async fn upsert_transactionally(
     let mut writes: Vec<(KeySpace, Key, Value)> = Vec::new();
     let mut transient_counts = BTreeMap::new();
     for (record, (_, existing_value)) in records.iter().zip(existing) {
+        outcome.held.push((*record).clone());
         if existing_value.is_some() {
             continue;
         }

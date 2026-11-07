@@ -830,13 +830,13 @@ impl OperationsTaskHandler {
                             crate::notifications::webhook::enqueue_webhooks(
                                 &self.context,
                                 local_node_id,
-                                &local_records,
+                                &outcome.held,
                             )
                             .await;
                             crate::notifications::email::enqueue_emails(
                                 &self.context,
                                 local_node_id,
-                                &local_records,
+                                &outcome.held,
                             )
                             .await;
                         }
