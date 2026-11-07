@@ -6,6 +6,7 @@ use super::routing::ensure_group_admin;
 use crate::auth::require_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
@@ -26,6 +27,9 @@ use utoipa_axum::routes;
 
 /// zstd level used when a request enables zstd without naming one.
 const DEFAULT_LEVEL: u8 = 3;
+
+/// Saves at most this often for one request; the migration task updates the record a save reads.
+const PUT_ATTEMPTS: usize = 5;
 
 #[derive(OpenApi)]
 #[openapi()]
@@ -244,6 +248,7 @@ pub async fn get_bucket_compression(
   `migration`; the `transition` field of `GET .../storage/encryption` reports the progress.
 - A change while an encryption transition of the bucket is unfinished answers 409
   `transition_running`.
+- A save that keeps conflicting with the running re-encoding answers 409 `bucket_busy`; retry it.
 
 **Limits**
 - `level` is 1 to 22 and only allowed with `zstd`; `zstd` without a level uses 3."#,
@@ -264,7 +269,7 @@ pub async fn get_bucket_compression(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse),
-        (status = 409, description = "`transition_running`: an encryption transition of the bucket is unfinished", body = ErrorResponse)
+        (status = 409, description = "`transition_running`: an encryption transition of the bucket is unfinished; `bucket_busy`: the save kept conflicting with the running re-encoding", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -284,12 +289,20 @@ pub async fn put_bucket_compression(
         })?
         .group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
-    let migration = drive(
-        PutCompressionOperation::new(bucket.clone(), group_id, compression, now_ms()),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(put_refusal)?;
+    let mut attempts = 1;
+    let migration = loop {
+        let operation =
+            PutCompressionOperation::new(bucket.clone(), group_id, compression, now_ms());
+        match drive(operation, &state.get_ctx()).await {
+            // A refused commit wrote nothing, so the save runs again.
+            Err(PutCompressionError::StorageError(StorageError::TransactionConflict))
+                if attempts < PUT_ATTEMPTS =>
+            {
+                attempts += 1;
+            }
+            result => break result.map_err(put_refusal)?,
+        }
+    };
     Ok(Json(BucketCompressionResponse::new(
         bucket,
         compression,
@@ -315,6 +328,14 @@ fn put_refusal(error: PutCompressionError) -> ServerError {
         error @ PutCompressionError::Mapped => {
             ServerError::Refused(StatusCode::CONFLICT, "mapped_bucket", error.to_string())
         }
+        PutCompressionError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::Refused(
+                StatusCode::CONFLICT,
+                "bucket_busy",
+                "the bucket's migration record kept changing during the save; try again"
+                    .to_string(),
+            )
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -333,6 +354,15 @@ mod tests {
         assert_eq!(refusal.status_code(), StatusCode::CONFLICT);
         let code = refusal.response_body().code;
         assert_eq!(code.as_deref(), Some("transition_running"));
+    }
+
+    #[test]
+    fn storage_conflict_retryable() {
+        let conflict = PutCompressionError::StorageError(StorageError::TransactionConflict);
+        let refusal = put_refusal(conflict);
+        assert_eq!(refusal.status_code(), StatusCode::CONFLICT);
+        let code = refusal.response_body().code;
+        assert_eq!(code.as_deref(), Some("bucket_busy"));
     }
 
     #[test]
