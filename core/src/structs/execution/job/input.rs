@@ -850,6 +850,8 @@ impl JobPayload {
                 JobPayload::MintPersistentId(_)
                     | JobPayload::StoragePurge(_)
                     | JobPayload::StoragePurgeFiles(_)
+                    | JobPayload::WebhookDelivery(_)
+                    | JobPayload::EmailDelivery(_)
             )
     }
 

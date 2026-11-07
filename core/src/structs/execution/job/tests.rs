@@ -32,6 +32,31 @@ fn digest_ignores_minter() {
     assert_eq!(first.plan_digest(), second.plan_digest());
 }
 
+// A settled delivery keeps its dedup row, so a returning notification is not sent again.
+#[test]
+fn deliveries_keep_dedup() {
+    let notification = crate::structs::execution::notification::NotificationRecord::new(
+        user(1, 2),
+        crate::structs::execution::notification::NotificationClass::Direct,
+        crate::structs::execution::notification::NotificationKind::AddedToGroup {
+            group_id: Ulid::from_bytes([3; 16]),
+            actor_user_id: user(1, 2),
+        },
+        42,
+    );
+    let webhook =
+        JobPayload::WebhookDelivery(crate::structs::execution::webhook::WebhookDeliverySpec {
+            subscription_id: Ulid::from_bytes([4; 16]),
+            notification: notification.clone(),
+        });
+    let email = JobPayload::EmailDelivery(crate::structs::execution::email::EmailDeliverySpec {
+        preference_id: Ulid::from_bytes([5; 16]),
+        notification,
+    });
+    assert!(webhook.dedup_until_prune());
+    assert!(email.dedup_until_prune());
+}
+
 fn probe_record(job_id: JobId, created_at_ms: u64) -> JobRecord {
     JobRecord::new(
         job_id,
