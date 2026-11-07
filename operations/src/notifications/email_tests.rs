@@ -249,14 +249,14 @@ async fn queues_each_once() {
     });
     watched.notification_id = Ulid::from_parts(8, 8);
     let records = [share_upload(), watched];
-    enqueue_emails(context, node(), &records).await;
+    enqueue_emails(context, node(), &records).await.unwrap();
     let key = |id: Ulid| user_dedup_key(user(), &format!("email/{id}"));
     let storage = &context.storage_handle;
     let first = find_dedup_plan(storage, user(), &key(records[0].notification_id), None)
         .await
         .unwrap()
         .expect("the opted notice is queued");
-    enqueue_emails(context, node(), &records).await;
+    enqueue_emails(context, node(), &records).await.unwrap();
     let again = find_dedup_plan(storage, user(), &key(records[0].notification_id), None)
         .await
         .unwrap();

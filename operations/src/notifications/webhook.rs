@@ -26,7 +26,6 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -274,13 +273,13 @@ fn valid_url(url: &str) -> bool {
         })
 }
 
-/// Queues one delivery job per newly stored share upload notification whose recipient
-/// subscribed here. The notification id deduplicates, so a redelivered record queues nothing.
+/// Queues one delivery job per held share upload notification whose recipient subscribed here.
+/// The notification id deduplicates; a failure is returned so the sender delivers again.
 pub async fn enqueue_webhooks(
     context: &DriverContext,
     owner_node_id: NodeId,
     records: &[NotificationRecord],
-) {
+) -> Result<(), String> {
     for record in records {
         if !matches!(record.kind, NotificationKind::ShareUpload { .. }) {
             continue;
@@ -296,10 +295,7 @@ pub async fn enqueue_webhooks(
                 ..
             }) => subscription,
             Ok(_) => continue,
-            Err(error) => {
-                warn!(error = %error, "Failed to read a webhook subscription");
-                continue;
-            }
+            Err(error) => return Err(format!("webhook subscription read: {error}")),
         };
         let dedup_key = user_dedup_key(
             record.recipient,
@@ -324,10 +320,11 @@ pub async fn enqueue_webhooks(
             };
             submit_local_job(context, spec, job_id).await
         };
-        if let Err(error) = submitted.await {
-            warn!(error = %error, "Failed to queue a webhook delivery");
-        }
+        submitted
+            .await
+            .map_err(|error| format!("webhook delivery queue: {error}"))?;
     }
+    Ok(())
 }
 
 /// Sends one signed delivery. A missing or replaced subscription sends nothing; a 4xx answer

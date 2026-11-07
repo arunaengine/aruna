@@ -117,9 +117,16 @@ async fn build_response(
             match upsert_with_report(&context.storage_handle, &records).await {
                 Ok(outcome) => {
                     wake_recipients(net_handle, &outcome.recipients);
-                    if outcome.written > 0 {
-                        enqueue_webhooks(context, local_node_id, &outcome.held).await;
-                        enqueue_emails(context, local_node_id, &outcome.held).await;
+                    // Every attempt queues the held records, so a delivery a failed queue left
+                    // behind is queued when the sender delivers again.
+                    if let Err(error) =
+                        enqueue_webhooks(context, local_node_id, &outcome.held).await
+                    {
+                        return NotificationTransportMessage::Reject(error);
+                    }
+                    if let Err(error) = enqueue_emails(context, local_node_id, &outcome.held).await
+                    {
+                        return NotificationTransportMessage::Reject(error);
                     }
                     NotificationTransportMessage::DeliverAck {
                         written: outcome.written as u32,

@@ -34,7 +34,6 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -415,28 +414,25 @@ fn address_entry(preference_id: Ulid) -> VaultEntry {
     VaultEntry::new(VaultPurpose::EmailAddress, preference_id)
 }
 
-/// Queues one email job per newly stored notice of an opted-in category. The notification id
-/// deduplicates, so a redelivered record queues nothing.
+/// Queues one email job per held notice of an opted-in category. The notification id
+/// deduplicates; a failure is returned so the sender delivers again.
 pub async fn enqueue_emails(
     context: &DriverContext,
     owner_node_id: NodeId,
     records: &[NotificationRecord],
-) {
+) -> Result<(), String> {
     let mut preferences: HashMap<UserId, Option<EmailPreference>> = HashMap::new();
     for record in records {
         if !EMAIL_CATEGORIES.contains(&record.kind.category()) {
             continue;
         }
         if let Entry::Vacant(slot) = preferences.entry(record.recipient) {
-            let read = drive(
+            let preference = drive(
                 EmailOperation::new(record.recipient, EmailAction::Read),
                 context,
             )
-            .await;
-            let preference = read.unwrap_or_else(|error| {
-                warn!(error = %error, "Failed to read an email opt-in");
-                None
-            });
+            .await
+            .map_err(|error| format!("email opt-in read: {error}"))?;
             slot.insert(preference);
         }
         let Some(preference) = preferences[&record.recipient]
@@ -468,10 +464,11 @@ pub async fn enqueue_emails(
             };
             submit_local_job(context, spec, job_id).await
         };
-        if let Err(error) = submitted.await {
-            warn!(error = %error, "Failed to queue a notification email");
-        }
+        submitted
+            .await
+            .map_err(|error| format!("email delivery queue: {error}"))?;
     }
+    Ok(())
 }
 
 /// Sends one notification email. A removed or replaced opt-in sends nothing; a permanent

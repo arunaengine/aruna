@@ -387,6 +387,27 @@ async fn dropped_upload_unqueued() {
     );
 }
 
+/// A batch whose webhook cannot be queued stays unacknowledged, and the next delivery queues
+/// it although the inbox already holds the record.
+#[tokio::test]
+async fn retry_queues_webhook() {
+    let (a, b, recipient, config) = webhook_pair(74).await;
+    let upload = share_upload(&a, recipient, "inbox", 1_700_000_000_000);
+    let refused = deliver_remote(&a.net, b.net.node_id(), vec![upload.clone()]).await;
+    assert!(refused.is_err(), "a failed queue refuses the batch");
+    assert_eq!(read_inbox(&b).await, vec![upload.clone()]);
+
+    grant_jobs(&b, config).await;
+    let written = deliver_remote(&a.net, b.net.node_id(), vec![upload.clone()])
+        .await
+        .expect("retry delivered");
+    assert_eq!(written, 0);
+    assert!(
+        webhook_queued(&b, &upload).await,
+        "the retry queues the held record"
+    );
+}
+
 #[tokio::test]
 async fn remote_upserts_deliver() {
     let realm_id = RealmId::from_bytes([40u8; 32]);
