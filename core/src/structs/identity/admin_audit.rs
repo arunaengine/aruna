@@ -105,8 +105,8 @@ mod tests {
         record.group_id = Some(group);
         let entries = record.entries().unwrap();
         assert_eq!(entries.len(), 2);
-        assert!(entries[0].1.starts_with(&audit_prefix(None)));
-        assert!(entries[1].1.starts_with(&audit_prefix(Some(group))));
+        assert!(entries[0].1.starts_with(audit_prefix(None)));
+        assert!(entries[1].1.starts_with(audit_prefix(Some(group))));
         let other = audit_prefix(Some(Ulid::from_parts(3, 3)));
         assert!(!entries[1].1.starts_with(&other));
         assert_eq!(AdminAuditRecord::from_bytes(&entries[1].2).unwrap(), record);
