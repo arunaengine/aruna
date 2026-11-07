@@ -166,6 +166,19 @@ async fn realm_sees_topology() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response.node.peer_id, Some(state.get_node_id().to_string()));
     assert_eq!(response.node.capabilities, Some(NodeCapabilityKind::User));
+    let started_at = response
+        .node
+        .started_at
+        .as_deref()
+        .expect("realm token sees start");
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(started_at)
+            .unwrap()
+            .timestamp(),
+        chrono::DateTime::<chrono::Utc>::from(state.started_at()).timestamp()
+    );
+    let uptime_secs = response.node.uptime_secs.expect("realm token sees uptime");
+    assert!(uptime_secs <= state.uptime().as_secs());
     let network = response.services.network.expect("realm token sees network");
     assert_eq!(network.status, ServiceStatus::Unavailable);
     assert!(

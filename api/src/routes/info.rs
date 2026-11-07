@@ -97,7 +97,7 @@ pub struct InfoResponse {
 }
 
 /// Node health and identity. `status`, `realm_id` and `peer_id` are public, as the
-/// realm node list is; `capabilities` need a token of this realm.
+/// realm node list is; `capabilities`, `started_at` and `uptime_secs` need a token of this realm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct NodeStatus {
     pub status: ServiceStatus,
@@ -106,6 +106,14 @@ pub struct NodeStatus {
     pub peer_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<NodeCapabilityKind>,
+    /// RFC 3339 time at which this node process started serving.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "2026-04-09T14:23:11Z")]
+    pub started_at: Option<String>,
+    /// Whole seconds since `started_at`, from a monotonic clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 86400)]
+    pub uptime_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -2591,8 +2599,8 @@ anonymous.
 - The route always returns 200 for a node that is serving requests at all.
 - An anonymous caller sees only what health-checks the node and says where to authenticate: node
   status, realm id, api version and the public interface urls.
-- A bearer token of this realm adds the node's own identity and capability kind, its listen
-  addresses, its peer connections and the network service summary.
+- A bearer token of this realm adds the node's own identity and capability kind, its start time
+  and uptime, its listen addresses, its peer connections and the network service summary.
 - A token with WRITE on the realm configuration admin path additionally reveals the blob and
   database services, every registered storage backend with its quota and used bytes, the portal
   deployment state, operational warnings and the last error of each peer connection.
@@ -2629,7 +2637,9 @@ anonymous.
                             "status": "available",
                             "realm_id": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
                             "peer_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978",
-                            "capabilities": "server"
+                            "capabilities": "server",
+                            "started_at": "2026-04-09T14:23:11Z",
+                            "uptime_secs": 86400
                         },
                         "api_version": "3.0.0-alpha.41",
                         "my_addresses": ["192.0.2.10:4433", "https://relay.example.test/"],
@@ -2699,6 +2709,11 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
             realm_id: state.get_realm_id().to_string(),
             peer_id: Some(state.get_node_id().to_string()),
             capabilities: realm.then(|| NodeCapabilityKind::from(state.node_capabilities())),
+            started_at: realm.then(|| {
+                chrono::DateTime::<chrono::Utc>::from(state.started_at())
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            }),
+            uptime_secs: realm.then(|| state.uptime().as_secs()),
         },
         api_version: env!("CARGO_PKG_VERSION").to_string(),
         portal: None,

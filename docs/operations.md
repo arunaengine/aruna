@@ -136,6 +136,27 @@ the group's Storage tab with the endpoint and keys; it needs no bucket. Then add
 `/data/groups/{group_id}/storage/imports`; `/data/buckets/{bucket}/storage/move` counts and moves
 stored files, and `/data/buckets/{bucket}/storage/check` finds and deletes broken files.
 
+## Referenced files
+
+An import keeps a file either as a **snapshot** (Aruna copies the bytes once) or as a
+**reference** (Aruna records where the file is and reads it from there). A reference version
+stores what the source reported when it was recorded: size, ETag, time and checksums.
+
+- **HEAD** of a reference to external storage answers from this record and does not ask the
+  source. A reference to a file on another Aruna node asks that node, so a lost permission or an
+  unreachable node fails the HEAD like a GET.
+- **Changed source.** A read of the current version that finds a changed file records a new
+  version for it and serves that one, at most 100 times per reference (then
+  `409 ReferenceAdvanceExhausted`; write the reference again). A file that no longer matches its
+  recorded checksums answers `412 PreconditionFailed`. A read of an older version
+  (`versionId`) whose file changed answers `404 NoSuchVersion`: its bytes were never kept.
+- **Failures are explicit.** A missing file answers `404 NoSuchKey`, a refusal `403 AccessDenied`,
+  and an unreachable, failing or changing source `503 ServiceUnavailable`, which a retry may
+  clear. With several sources, `404` means that every source lacks the file.
+- **Ranges** are read from the source with the same checks. A source whose bytes are checked by
+  checksum is read whole first, then the range is cut from it.
+- **Snapshots** never read their source again, so a changed or lost source does not affect them.
+
 ## Local and NFS folders
 
 A node operator can let groups import a folder of the node in place, for example an NFS share.

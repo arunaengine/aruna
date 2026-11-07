@@ -506,3 +506,37 @@ async fn names_skipped_bucket() {
     assert_eq!(page.skipped_buckets, ["spire"]);
     assert_eq!(page.incomplete_ranges, 1);
 }
+
+#[tokio::test]
+async fn removed_keys_uncounted() {
+    // The feed drops a deleted key from the index, so a commit after `as_of` leaves the
+    // changed keys unknown instead of zero.
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["a/needle-1.txt", "b/needle-2.txt"]).await;
+    let input = test.input(owner(&test.fixture), "needle");
+    let before = test.search(input.clone(), 100).await;
+    assert_eq!(keys(&before), ["a/needle-1.txt", "b/needle-2.txt"]);
+    assert_eq!(before.changed, Some(Vec::new()));
+
+    let removed = vec![KeyChange::Remove("b/needle-2.txt".to_string())];
+    let (set_id, lower) = (test.binding.set_id, test.lower);
+    test.indexes.apply(set_id, lower, 1, removed).await.unwrap();
+
+    let after = test.search(input, 100).await;
+    assert_eq!(keys(&after), ["a/needle-1.txt"]);
+    assert_eq!(after.changed, None);
+}
+
+#[test]
+fn layout_tracks_coordinators() {
+    let (snapshot, _) = record(true);
+    let ranges = snapshot.config.ranges;
+    let mut moved = ranges.clone();
+    moved[0].coordinator = Ulid::from_bytes([9; 16]);
+    moved[0].epoch += 1;
+    let mut replicated = ranges.clone();
+    replicated[0].replicas.push(Ulid::from_bytes([8; 16]));
+    assert_eq!(layout_digest(&ranges), layout_digest(&ranges.clone()));
+    assert_ne!(layout_digest(&ranges), layout_digest(&moved));
+    assert_eq!(layout_digest(&ranges), layout_digest(&replicated));
+}

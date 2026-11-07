@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::keyspaces::prefix_upper_bound;
 use aruna_core::structs::execution::table::PREFIX_CHARS;
@@ -105,6 +106,8 @@ pub struct KeyPage {
     pub examined: usize,
     /// The last examined key when the window continues after it; `None` once it is read.
     pub last: Option<String>,
+    /// When the index last committed, read after the search; `None` without a recorded time.
+    pub committed_at: Option<SystemTime>,
 }
 
 #[derive(Clone, Copy)]
@@ -237,7 +240,9 @@ impl RangeIndexes {
         let dir = self.directory(set_id, range_id, generation);
         self.blocking(move |indexes| {
             let open = indexes.open_index(&dir, false)?;
-            search_keys(&open, &query, indexes.scan_limit, indexes.range_bytes)
+            let mut page = search_keys(&open, &query, indexes.scan_limit, indexes.range_bytes)?;
+            page.committed_at = committed_at(&open.index)?;
+            Ok(page)
         })
         .await
     }
@@ -481,9 +486,19 @@ fn write_batch(
             writer.add_document(document)?;
         }
     }
-    writer.commit()?;
+    // Each commit records its time, so searches learn when the range last changed.
+    let since = (SystemTime::now().duration_since(UNIX_EPOCH)).unwrap_or_default();
+    let nanos = u64::try_from(since.as_nanos()).unwrap_or(u64::MAX);
+    let mut commit = writer.prepare_commit()?;
+    commit.set_payload(&nanos.to_string());
+    commit.commit()?;
     open.reader.reload()?;
     Ok(())
+}
+
+fn committed_at(index: &Index) -> Result<Option<SystemTime>, KeyIndexError> {
+    let nanos = (index.load_metas()?.payload).and_then(|payload| payload.parse().ok());
+    Ok(nanos.map(|nanos| UNIX_EPOCH + Duration::from_nanos(nanos)))
 }
 
 /// The live keys of the window that hold every term of the query, in key order. A query whose
@@ -661,6 +676,7 @@ fn matched_keys(
         examined: keys.len(),
         keys,
         last,
+        committed_at: None,
     })
 }
 
@@ -744,6 +760,7 @@ fn walk_keys(
         keys,
         examined,
         last: end,
+        committed_at: None,
     })
 }
 

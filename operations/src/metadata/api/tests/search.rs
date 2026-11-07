@@ -5,7 +5,8 @@
 use super::*;
 
 use super::super::search::{
-    ObjectSearchPartitions, ObjectSearchPlan, assemble_object_execution, plan_object_search,
+    ObjectSearchPartitions, ObjectSearchPlan, RangeLayout, assemble_object_execution,
+    plan_object_search,
 };
 
 #[tokio::test]
@@ -452,6 +453,8 @@ fn search_assembly_order() {
         discovery_failed: false,
         omitted_partitions: 0,
         pending: Vec::new(),
+        changed_keys: Some(0),
+        layout: RangeLayout::default(),
     };
     let page = |node_id, key: Option<&str>| SearchNodePage {
         hits: key
@@ -479,6 +482,8 @@ fn search_assembly_order() {
         index_progress: Vec::new(),
         partial_ranges: Vec::new(),
         skipped_buckets: Vec::new(),
+        changed: Some(Vec::new()),
+        layout: None,
     };
     let stats = || MetadataFanoutStats {
         nodes_queried: 2,
@@ -555,4 +560,74 @@ fn search_assembly_order() {
     );
     assert!(execution.complete);
     assert!(execution.next_cursor.is_none());
+
+    // Changed keys of finished pages add to the total the earlier pages carried.
+    let changed = |node_id, key: Option<&str>, changed: &str| SearchNodePage {
+        changed: Some(vec![changed.as_bytes().to_vec()]),
+        ..page(node_id, key)
+    };
+    let carried = ObjectSearchPartitions {
+        changed_keys: Some(3),
+        ..partitions()
+    };
+    let parts = vec![
+        (first, changed(first, Some("b"), "a")),
+        (second, changed(second, None, "z")),
+    ];
+    let execution = assemble_object_execution(&test.context, &plan, carried, parts, stats())
+        .expect("exhausted partitions assemble without a net handle");
+    assert_eq!(execution.page_changed, 2);
+    assert_eq!(execution.changed_keys, Some(5));
+
+    // A range that moved between nodes or pages may hold keys no member searched.
+    let laid = |node_id, set: u8, layout: u8| SearchNodePage {
+        layout: Some((Ulid::from_bytes([set; 16]), [layout; 32])),
+        ..page(node_id, None)
+    };
+    let seen = |set: u8, layout: u8, changed: bool| ObjectSearchPartitions {
+        layout: RangeLayout {
+            seen: vec![(Ulid::from_bytes([set; 16]), [layout; 32])],
+            changed,
+        },
+        ..partitions()
+    };
+    let cases = [
+        (partitions(), [laid(first, 1, 1), laid(second, 1, 2)], false),
+        // Two sets of one bucket name on other members are independent.
+        (partitions(), [laid(first, 1, 1), laid(second, 2, 2)], true),
+        (
+            seen(1, 1, false),
+            [laid(first, 1, 2), page(second, None)],
+            false,
+        ),
+        (
+            seen(1, 1, false),
+            [laid(first, 1, 1), laid(second, 1, 1)],
+            true,
+        ),
+        (
+            seen(1, 1, true),
+            [laid(first, 1, 1), page(second, None)],
+            false,
+        ),
+    ];
+    for (carried, [left, right], kept) in cases {
+        let parts = vec![(first, left), (second, right)];
+        let execution = assemble_object_execution(&test.context, &plan, carried, parts, stats())
+            .expect("exhausted partitions assemble without a net handle");
+        assert_eq!(execution.complete, kept);
+        assert_eq!(execution.layout_changed, !kept);
+        assert_eq!(execution.changed_keys, kept.then_some(0));
+    }
+    let strict = ObjectSearchPlan {
+        mode: ObjectQueryMode::DistributedStrict,
+        ..plan
+    };
+    let parts = vec![(first, laid(first, 1, 2)), (second, page(second, None))];
+    let refused =
+        assemble_object_execution(&test.context, &strict, seen(1, 1, false), parts, stats());
+    assert!(matches!(
+        refused,
+        Err(MetadataApiError::SearchIncomplete(_))
+    ));
 }

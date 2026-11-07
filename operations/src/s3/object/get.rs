@@ -926,6 +926,12 @@ impl GetObjectOperation {
     /// A distributed member whose source failed reads the bytes from a member keeping a copy,
     /// so data stays readable without its origin; elsewhere the failure stands.
     fn source_failed(&mut self, error: GetObjectError) -> Effects {
+        // A source that lacks the object never hides another source's outage or refusal.
+        let absent = GetObjectError::StagingSourceError(StagingSourceError::NotFound);
+        let error = match self.source_failure.take() {
+            Some(earlier) if error == absent => earlier,
+            _ => error,
+        };
         if !self.source_queue.is_empty() {
             debug!(slot = self.source_slot, error = %error, "Reference source failed, trying another");
             self.source_failure = Some(error);
