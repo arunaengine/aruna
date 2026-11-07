@@ -195,6 +195,23 @@ async fn distributed_folder_ranges() {
     assert_eq!((report.totals.included, report.totals.unavailable), (2, 1));
 }
 
+// A holder that refuses its range costs that range only, never the keys listed before it.
+#[tokio::test]
+async fn refused_range_continues() {
+    let node = node_state().await;
+    store(&node, &["a.md", "b.md"]).await;
+    let snapshot = distribute(&node.state, node.group_id, BUCKET).await;
+    let refusal = mock_peer(StatusCode::FORBIDDEN, r#"{"error":"no grant"}"#).await;
+    publish_api(&node.state, node_id(PEER), &refusal.url).await;
+    let response = archive(&node, &node.owner, whole_bucket()).await.unwrap();
+    let (names, report) = unzip(response).await;
+    assert_eq!(names, ["routed/a.md", "routed/b.md"]);
+    let range_id = snapshot.config.ranges[1].range_id.to_string();
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.entries[0].range_id, Some(range_id));
+    assert_eq!(report.entries[0].status, EntryStatus::Unavailable);
+}
+
 #[tokio::test]
 async fn link_redeems_once() {
     let node = node_state().await;

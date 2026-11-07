@@ -45,8 +45,8 @@ pub struct ListRequest {
     pub delimiter: Option<String>,
     pub cursor: Option<String>,
     pub limit: usize,
-    /// A range nobody answers is named in `unavailable_ranges` and skipped, instead of failing
-    /// the page.
+    /// A range no holder serves, unanswered or refused, is named in `unavailable_ranges` and
+    /// skipped, instead of failing the page.
     pub partial: bool,
 }
 
@@ -58,7 +58,7 @@ pub struct ObjectPage<O> {
     pub next_cursor: Option<String>,
     /// Ranges a copy listed because their coordinator could not answer; it may be behind.
     pub stale_ranges: Vec<String>,
-    /// Ranges a partial listing skipped because no holder answered.
+    /// Ranges a partial listing skipped because no holder served them.
     pub unavailable_ranges: Vec<String>,
 }
 
@@ -516,15 +516,16 @@ async fn merged_page<R: RangeRelay>(
                             }
                         }
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => Some(Err(error)),
                 }
             }
         };
+        // A partial listing keeps what it collected and goes on past a range no holder served.
         let remote = match remote {
-            Some(Err(PageError::Unanswered { range_id, .. })) if request.partial => {
-                page.stale_ranges
-                    .retain(|stale| *stale != range_id.to_string());
-                page.unavailable_ranges.push(range_id.to_string());
+            Some(Err(PageError::Unanswered { .. } | PageError::Relay(_))) if request.partial => {
+                let range_id = range.range_id.to_string();
+                page.stale_ranges.retain(|stale| *stale != range_id);
+                page.unavailable_ranges.push(range_id);
                 skipped = true;
                 continue;
             }
