@@ -5,7 +5,8 @@
 use super::*;
 
 use super::super::search::{
-    ObjectSearchPartitions, ObjectSearchPlan, assemble_object_execution, plan_object_search,
+    ObjectSearchPartitions, ObjectSearchPlan, RangeLayout, assemble_object_execution,
+    plan_object_search,
 };
 
 #[tokio::test]
@@ -453,6 +454,7 @@ fn search_assembly_order() {
         omitted_partitions: 0,
         pending: Vec::new(),
         changed_keys: Some(0),
+        layout: RangeLayout::Unknown,
     };
     let page = |node_id, key: Option<&str>| SearchNodePage {
         hits: key
@@ -481,6 +483,7 @@ fn search_assembly_order() {
         partial_ranges: Vec::new(),
         skipped_buckets: Vec::new(),
         changed: Some(Vec::new()),
+        layout: None,
     };
     let stats = || MetadataFanoutStats {
         nodes_queried: 2,
@@ -575,4 +578,36 @@ fn search_assembly_order() {
         .expect("exhausted partitions assemble without a net handle");
     assert_eq!(execution.page_changed, 2);
     assert_eq!(execution.changed_keys, Some(5));
+
+    // A range that moved between nodes or pages may hold keys no member searched.
+    let laid = |node_id, layout: u8| SearchNodePage {
+        layout: Some([layout; 32]),
+        ..page(node_id, None)
+    };
+    let seen = |layout: u8| ObjectSearchPartitions {
+        layout: RangeLayout::Seen([layout; 32]),
+        ..partitions()
+    };
+    let cases = [
+        (partitions(), [laid(first, 1), laid(second, 2)], false),
+        (seen(1), [laid(first, 2), page(second, None)], false),
+        (seen(1), [laid(first, 1), laid(second, 1)], true),
+    ];
+    for (carried, [left, right], kept) in cases {
+        let parts = vec![(first, left), (second, right)];
+        let execution = assemble_object_execution(&test.context, &plan, carried, parts, stats())
+            .expect("exhausted partitions assemble without a net handle");
+        assert_eq!(execution.complete, kept);
+        assert_eq!(execution.changed_keys, kept.then_some(0));
+    }
+    let strict = ObjectSearchPlan {
+        mode: ObjectQueryMode::DistributedStrict,
+        ..plan
+    };
+    let parts = vec![(first, laid(first, 2)), (second, page(second, None))];
+    let refused = assemble_object_execution(&test.context, &strict, seen(1), parts, stats());
+    assert!(matches!(
+        refused,
+        Err(MetadataApiError::SearchIncomplete(_))
+    ));
 }

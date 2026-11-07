@@ -170,6 +170,29 @@ pub(super) struct ObjectCursorPayload {
     pub(super) omitted_partitions: usize,
     pub(super) pending: Vec<PendingBucket>,
     pub(super) changed_keys: Option<usize>,
+    pub(super) layout: RangeLayout,
+}
+
+/// The key ranges of a distributed bucket the pages of one search were answered under.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum RangeLayout {
+    /// No page searched a distributed bucket yet.
+    #[default]
+    Unknown,
+    Seen([u8; 32]),
+    /// A range changed coordinator or bounds between pages or between nodes, so a member may
+    /// have skipped keys another member no longer searched.
+    Changed,
+}
+
+impl RangeLayout {
+    pub(super) fn observe(self, digest: [u8; 32]) -> Self {
+        match self {
+            Self::Unknown => Self::Seen(digest),
+            Self::Seen(seen) if seen == digest => self,
+            Self::Seen(_) | Self::Changed => Self::Changed,
+        }
+    }
 }
 
 /// A distributed bucket a realm-wide search still owes: its name and the cursor of its own
@@ -299,7 +322,7 @@ impl SignedCursor<ObjectCursorPayload> {
         discovery_failed: bool,
         omitted_partitions: usize,
         pending: &[PendingBucket],
-        changed_keys: Option<usize>,
+        (changed_keys, layout): (Option<usize>, RangeLayout),
         signer: NodeId,
         sign: impl FnOnce(&[u8]) -> iroh::Signature,
     ) -> Result<Self, postcard::Error> {
@@ -328,6 +351,7 @@ impl SignedCursor<ObjectCursorPayload> {
                 omitted_partitions,
                 pending: pending.to_vec(),
                 changed_keys,
+                layout,
             },
             signer,
             sign,
@@ -357,6 +381,7 @@ pub(super) struct ObjectSearchPartitions {
     pub(super) pending: Vec<PendingBucket>,
     /// Changed keys the earlier pages passed.
     pub(super) changed_keys: Option<usize>,
+    pub(super) layout: RangeLayout,
 }
 
 pub async fn search_objects(
@@ -563,7 +588,11 @@ pub(super) async fn resolve_object_partitions(
                     cursor.failed_nodes()?,
                     cursor.payload.discovery_failed,
                     cursor.payload.omitted_partitions,
-                    (cursor.payload.pending.clone(), cursor.payload.changed_keys),
+                    (
+                        cursor.payload.pending.clone(),
+                        cursor.payload.changed_keys,
+                        cursor.payload.layout,
+                    ),
                 )
             }
             None => {
@@ -619,12 +648,12 @@ pub(super) async fn resolve_object_partitions(
                     Vec::new(),
                     discovery_failed,
                     omitted_partitions,
-                    (Vec::new(), Some(0)),
+                    (Vec::new(), Some(0), RangeLayout::Unknown),
                 )
             }
         };
-    // The pending buckets and the changed keys the earlier pages passed.
-    let (pending, changed_keys) = carried;
+    // The pending buckets, the changed keys and the range layout of the earlier pages.
+    let (pending, changed_keys, layout) = carried;
 
     if plan.mode == ObjectQueryMode::DistributedStrict
         && (discovery_failed || omitted_partitions > 0 || !failed_partitions.is_empty())
@@ -644,6 +673,7 @@ pub(super) async fn resolve_object_partitions(
         omitted_partitions,
         pending,
         changed_keys,
+        layout,
     })
 }
 
@@ -765,6 +795,7 @@ pub(super) fn assemble_object_execution(
         omitted_partitions,
         pending,
         changed_keys,
+        layout,
     } = partitions;
     let newly_failed = fanout_stats.failed_partitions.clone();
     failed_partitions.extend(newly_failed.iter().copied());
@@ -797,6 +828,16 @@ pub(super) fn assemble_object_execution(
             partial_ranges.len(),
             &index_progress,
         )));
+    }
+    let layout = (parts.iter())
+        .filter_map(|(_, page)| page.layout)
+        .fold(layout, RangeLayout::observe);
+    let moved = layout == RangeLayout::Changed;
+    if plan.mode == ObjectQueryMode::DistributedStrict && moved {
+        return Err(MetadataApiError::SearchIncomplete(
+            "the key ranges of the distributed bucket changed during the search; start it again"
+                .to_string(),
+        ));
     }
     let mut pages = parts.into_iter().collect::<HashMap<_, _>>();
     let mut hits = Vec::with_capacity(plan.limit);
@@ -845,7 +886,7 @@ pub(super) fn assemble_object_execution(
         page_changed += page.changed.map_or(0, |changed| changed.len());
     }
     let changed_keys = changed_keys
-        .filter(|_| certain)
+        .filter(|_| certain && !moved)
         .map(|keys| keys + page_changed);
 
     let unfinished = partitions.iter().any(|partition| !partition.exhausted);
@@ -864,7 +905,7 @@ pub(super) fn assemble_object_execution(
                 discovery_failed,
                 omitted_partitions,
                 &pending,
-                changed_keys,
+                (changed_keys, layout),
                 net.node_id(),
                 |bytes| net.sign(bytes),
             )
@@ -891,7 +932,7 @@ pub(super) fn assemble_object_execution(
     fanout_stats.failed_partitions = failed_partitions;
     fanout_stats.nodes_failed =
         fanout_stats.failed_partitions.len() + omitted_partitions + usize::from(discovery_failed);
-    let complete = fanout_stats.nodes_failed == 0 && incomplete_ranges == 0;
+    let complete = fanout_stats.nodes_failed == 0 && incomplete_ranges == 0 && !moved;
     Ok(ObjectExecution {
         hits,
         next_cursor,

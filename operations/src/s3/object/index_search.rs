@@ -51,8 +51,15 @@ pub(super) async fn search_ranges(
     search: RangeSearch,
 ) -> Result<SearchNodePage, SearchObjectsError> {
     let indexes = search.indexes.clone();
+    let record = read_record(context, search.binding.set_id).await;
+    let Some(view) = record.map_err(SearchObjectsError::Storage)? else {
+        // Without the record the ranges are unknown, so nothing is covered.
+        return Ok(page(Vec::new(), Vec::new(), true, None, 1, 0));
+    };
+    let ranges = &view.head.snapshot.config.ranges;
     let mut unready = Vec::new();
-    let mut page = range_page(context, input, search, &mut unready).await?;
+    let mut page = range_page(context, input, search, ranges, &mut unready).await?;
+    page.layout = Some(layout_digest(ranges));
     page.partial_ranges = (unready.iter())
         .filter_map(|(range_id, partial)| Some((*range_id, partial.clone()?)))
         .collect();
@@ -88,17 +95,12 @@ async fn range_page(
     context: &DriverContext,
     input: &SearchObjectsInput,
     search: RangeSearch,
+    ranges: &[KeyRange],
     unready: &mut Vec<(Ulid, Option<Option<String>>)>,
 ) -> Result<SearchNodePage, SearchObjectsError> {
     let bucket = input.bucket.clone().unwrap_or_default();
     let limit = input.limit.clamp(1, SEARCH_MAX_LIMIT);
     let budget = search.budget.max(1);
-    let set_id = search.binding.set_id;
-    let record = read_record(context, set_id).await;
-    let Some(view) = record.map_err(SearchObjectsError::Storage)? else {
-        // Without the record the ranges are unknown, so nothing is covered.
-        return Ok(page(Vec::new(), Vec::new(), true, None, 1, 0));
-    };
     let after = match input.start_after.as_deref() {
         Some(position) => Some(BlobHeadKey::from_bytes(&open_position(position)?)?.key),
         None => None,
@@ -106,7 +108,7 @@ async fn range_page(
     let (start, end) = window(input, after);
     let mut local = Vec::new();
     let mut remote = 0;
-    for range in &view.head.snapshot.config.ranges {
+    for range in ranges {
         if !overlaps(range, &start, &end) {
             continue;
         }
@@ -344,7 +346,19 @@ fn page(
         partial_ranges: Vec::new(),
         skipped_buckets: Vec::new(),
         changed: certain.then_some(changed),
+        layout: None,
     }
+}
+
+/// Which member searches which keys: the ranges' bounds, coordinators and epochs.
+fn layout_digest(ranges: &[KeyRange]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for range in ranges {
+        let bounds = (range.range_id, &range.lower, &range.upper);
+        let owner = (range.coordinator, range.epoch);
+        hasher.update(&postcard::to_allocvec(&(bounds, owner)).unwrap_or_default());
+    }
+    *hasher.finalize().as_bytes()
 }
 
 /// The hits of the current heads of `keys`, in their order; keys without a live head are

@@ -227,7 +227,8 @@ pub struct ObjectCoverage {
     pub partitions: Vec<ObjectPartitionCoverage>,
     /// Readable matching keys of the `as_of` snapshot replaced or deleted later, through this page.
     /// Zero on the last page means the pages list that snapshot within the reported coverage;
-    /// `null` once a searched range index changed after `as_of`, so removed keys are uncounted.
+    /// `null` once a searched range index changed after `as_of`, so removed keys are uncounted,
+    /// or once a range changed coordinator or bounds during the search.
     pub changed_keys: Option<usize>,
 }
 
@@ -544,6 +545,9 @@ restrictions and request policies before it can be returned.
   `coverage.index_progress` lists the keys indexed so far and the range's key count for each
   such range whose coordinator answered. `distributed_strict` answers 503 while any remain, and
   the error message says how many ranges and about how many keys are still to be indexed.
+  When a range changes coordinator or bounds during a paged search, members may have skipped its
+  keys: that page and every later one answer `complete: false` and `changed_keys: null`, and
+  `distributed_strict` answers 503. Start the search again for a full listing.
 - `match=metadata` matches object metadata instead of keys, for objects whose version names
   searchable columns in `aruna-search-text` and `aruna-search-exact` (table imports set both).
   Words of `q` must all appear in the text columns (case-insensitive; a word of at least 3

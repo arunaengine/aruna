@@ -526,3 +526,17 @@ async fn removed_keys_uncounted() {
     assert_eq!(keys(&after), ["a/needle-1.txt"]);
     assert_eq!(after.changed, None);
 }
+
+#[test]
+fn layout_tracks_coordinators() {
+    let (snapshot, _) = record(true);
+    let ranges = snapshot.config.ranges;
+    let mut moved = ranges.clone();
+    moved[0].coordinator = Ulid::from_bytes([9; 16]);
+    moved[0].epoch += 1;
+    let mut replicated = ranges.clone();
+    replicated[0].replicas.push(Ulid::from_bytes([8; 16]));
+    assert_eq!(layout_digest(&ranges), layout_digest(&ranges.clone()));
+    assert_ne!(layout_digest(&ranges), layout_digest(&moved));
+    assert_eq!(layout_digest(&ranges), layout_digest(&replicated));
+}

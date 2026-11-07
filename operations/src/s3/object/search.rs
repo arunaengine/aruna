@@ -129,6 +129,10 @@ pub struct SearchNodePage {
     /// `as_of`; they are counted, not shown. `None` when a searched range index changed since.
     #[serde(default)]
     pub changed: Option<Vec<Vec<u8>>>,
+    /// A digest of the distributed bucket's key ranges and their coordinators this page
+    /// searched under; `None` for other buckets.
+    #[serde(default)]
+    pub layout: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Error)]
@@ -269,6 +273,7 @@ fn node_page(
         partial_ranges: Vec::new(),
         skipped_buckets,
         changed: Some(changed),
+        layout: None,
     }
 }
 

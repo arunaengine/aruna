@@ -4,6 +4,7 @@
 
 use super::list::{auth_for, user_role, write_policy_docs};
 use super::*;
+use crate::metadata::api::search::RangeLayout;
 
 // Fan-out follows the live holders of the stored bucket; the event-time
 // holder stamp on the record is ignored, and no config means local only.
@@ -121,7 +122,7 @@ fn keeps_bucket_continuation() {
             false,
             0,
             pending,
-            Some(0),
+            (Some(0), RangeLayout::Unknown),
             signer,
             |bytes| secret.sign(bytes),
         )
@@ -157,7 +158,7 @@ fn rejects_cursor_tampering() {
         false,
         0,
         &[],
-        Some(0),
+        (Some(0), RangeLayout::Unknown),
         signer,
         |bytes| secret.sign(bytes),
     )
