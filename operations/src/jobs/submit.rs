@@ -12,9 +12,10 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, BACKEND_IMPORT_KEYSPACE, DEDUP_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE,
-    JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
+    HARVEST_SOURCE_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::harvest::HarvestSource;
 use aruna_core::structs::execution::job::{
     ActiveJobKind, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
     RoCrateUploadRecord, WorkspaceMode, job_active_prefix, job_record_key, parse_dedup_value,
@@ -35,6 +36,7 @@ use tracing::warn;
 use super::import::{UploadClaimError, claim_upload, upload_key};
 use super::store::{decode_job_record, dedup_index_key, job_insert_entries};
 use crate::groups::imports::schedule::is_running;
+use crate::harvest::repository::source_key;
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_drain_effect() -> Effect {
@@ -119,6 +121,10 @@ pub enum SubmitJobError {
     ImportMissing,
     #[error("the last run of this import has not finished")]
     ImportRunning,
+    #[error("the harvest source does not exist")]
+    SourceMissing,
+    #[error("the last run of this harvest source has not finished")]
+    SourceRunning,
     #[error("unexpected event while submitting job: {0}")]
     UnexpectedEvent(String),
     #[error("a key range of distributed bucket {0} is moving away from this node; retry later")]
@@ -151,6 +157,13 @@ enum SubmitState {
         txn_id: TxnId,
     },
     CheckImportRun {
+        txn_id: TxnId,
+    },
+    /// Reads a harvest source, then the run it last started.
+    ReadSource {
+        txn_id: TxnId,
+    },
+    CheckSourceRun {
         txn_id: TxnId,
     },
     /// Reads the destination of a staging job, then the record of its distributed set.
@@ -187,6 +200,9 @@ pub struct SubmitJobOperation {
     import_rule: Option<BackendImport>,
     /// The rule of a backend import run with this job as its last run, written with the job.
     import_claim: Option<(String, Key, Value)>,
+    source_checked: bool,
+    harvest_source: Option<HarvestSource>,
+    source_claim: Option<(String, Key, Value)>,
     staging_checked: bool,
     active_cap: Option<u32>,
     state: SubmitState,
@@ -230,6 +246,9 @@ impl SubmitJobOperation {
             import_checked: false,
             import_rule: None,
             import_claim: None,
+            source_checked: false,
+            harvest_source: None,
+            source_claim: None,
             staging_checked: false,
             active_cap,
             state: SubmitState::Init,
@@ -246,6 +265,8 @@ impl SubmitJobOperation {
             | SubmitState::ClaimUpload { txn_id }
             | SubmitState::ReadImport { txn_id }
             | SubmitState::CheckImportRun { txn_id }
+            | SubmitState::ReadSource { txn_id }
+            | SubmitState::CheckSourceRun { txn_id }
             | SubmitState::ReadBucket { txn_id }
             | SubmitState::ReadRecord { txn_id, .. }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
@@ -266,6 +287,9 @@ impl SubmitJobOperation {
         self.import_checked = false;
         self.import_rule = None;
         self.import_claim = None;
+        self.source_checked = false;
+        self.harvest_source = None;
+        self.source_claim = None;
         self.staging_checked = false;
         self.state = SubmitState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -376,6 +400,21 @@ impl SubmitJobOperation {
                 txn_id: Some(txn_id),
             })];
         }
+        // A harvest source records its run with the job, the same way.
+        if !self.source_checked
+            && let JobPayload::Harvest(spec) = &self.record.payload
+        {
+            let Some(txn_id) = txn_id else {
+                return self.start_transaction();
+            };
+            let key = source_key(spec.group_id, spec.source_id);
+            self.state = SubmitState::ReadSource { txn_id };
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: HARVEST_SOURCE_KEYSPACE.to_string(),
+                key,
+                txn_id: Some(txn_id),
+            })];
+        }
         // A staging job waits while a range of its distributed destination moves away.
         if !self.staging_checked
             && let JobPayload::Staging(spec) = &self.record.payload
@@ -397,6 +436,7 @@ impl SubmitJobOperation {
         };
         writes.extend(self.upload_claim.clone());
         writes.extend(self.import_claim.clone());
+        writes.extend(self.source_claim.clone());
         self.state = SubmitState::WriteJob { txn_id };
         smallvec![Effect::Storage(StorageEffect::BatchWrite {
             writes,
@@ -481,6 +521,54 @@ impl SubmitJobOperation {
                 let key_space = BACKEND_IMPORT_KEYSPACE.to_string();
                 self.import_claim = Some((key_space, rule.key(), value.into()));
                 self.import_checked = true;
+                self.write_job(Some(txn_id))
+            }
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    /// Reads the run the source last started, or records this job when it has none.
+    fn source_read(&mut self, txn_id: TxnId, value: Option<&[u8]>) -> Effects {
+        let Some(value) = value else {
+            return self.fail(SubmitJobError::SourceMissing);
+        };
+        let source = match HarvestSource::from_bytes(value) {
+            Ok(source) => source,
+            Err(error) => return self.fail(error.into()),
+        };
+        let Some(last_job) = source.last_job else {
+            return self.claim_source(txn_id, source);
+        };
+        self.harvest_source = Some(source);
+        self.state = SubmitState::CheckSourceRun { txn_id };
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: JOB_KEYSPACE.to_string(),
+            key: job_record_key(last_job),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn source_run_read(&mut self, txn_id: TxnId, value: Option<&[u8]>) -> Effects {
+        let Some(source) = self.harvest_source.take() else {
+            return self.fail(SubmitJobError::UnexpectedEvent(
+                "source run check without a source".to_string(),
+            ));
+        };
+        match value.map(decode_job_record).transpose() {
+            Ok(Some(last)) if is_running(last.state) => self.fail(SubmitJobError::SourceRunning),
+            Ok(_) => self.claim_source(txn_id, source),
+            Err(error) => self.fail(error.into()),
+        }
+    }
+
+    fn claim_source(&mut self, txn_id: TxnId, mut source: HarvestSource) -> Effects {
+        source.last_job = Some(self.record.job_id);
+        match source.to_bytes() {
+            Ok(value) => {
+                let key = source_key(source.group_id, source.source_id);
+                let key_space = HARVEST_SOURCE_KEYSPACE.to_string();
+                self.source_claim = Some((key_space, key, value.into()));
+                self.source_checked = true;
                 self.write_job(Some(txn_id))
             }
             Err(error) => self.fail(error.into()),
@@ -695,6 +783,20 @@ impl Operation for SubmitJobOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
             },
+            SubmitState::ReadSource { txn_id } => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    self.source_read(txn_id, value.as_deref())
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
+            SubmitState::CheckSourceRun { txn_id } => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    self.source_run_read(txn_id, value.as_deref())
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+            },
             SubmitState::ReadBucket { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.bucket_read(txn_id, value.as_deref())
@@ -768,6 +870,8 @@ impl Operation for SubmitJobOperation {
             | SubmitState::ClaimUpload { txn_id }
             | SubmitState::ReadImport { txn_id }
             | SubmitState::CheckImportRun { txn_id }
+            | SubmitState::ReadSource { txn_id }
+            | SubmitState::CheckSourceRun { txn_id }
             | SubmitState::ReadBucket { txn_id }
             | SubmitState::ReadRecord { txn_id, .. }
             | SubmitState::CommitTransaction { txn_id } => Some(txn_id),
@@ -1016,6 +1120,59 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected write event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn records_source_run() {
+        use aruna_core::structs::execution::harvest::{HarvestJobSpec, HarvestSelector};
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let ctx = context(storage.clone());
+        let source = HarvestSource::new(
+            Ulid::from_bytes([6u8; 16]),
+            Ulid::from_bytes([3u8; 16]),
+            Ulid::from_bytes([5u8; 16]),
+            "zenodo".to_string(),
+            "imported".to_string(),
+            HarvestSelector::default(),
+            None,
+            std::time::SystemTime::UNIX_EPOCH,
+            spec(None).created_by,
+        );
+        let run = || SubmitJobSpec {
+            payload: JobPayload::Harvest(HarvestJobSpec {
+                source_id: source.source_id,
+                group_id: source.group_id,
+            }),
+            ..spec(None)
+        };
+        let missing = drive(operation(run()), &ctx).await;
+        assert_eq!(missing, Err(SubmitJobError::SourceMissing));
+
+        let key = source_key(source.group_id, source.source_id);
+        let value = ByteView::from(source.to_bytes().unwrap());
+        write_raw(&storage, HARVEST_SOURCE_KEYSPACE, key.clone(), value).await;
+        let first = drive(operation(run()), &ctx).await.unwrap();
+        let event = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: HARVEST_SOURCE_KEYSPACE.to_string(),
+                key,
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = event
+        else {
+            panic!("the source is missing: {event:?}")
+        };
+        let stored = HarvestSource::from_bytes(&value).unwrap();
+        assert_eq!(stored.last_job, Some(first.job_id));
+
+        // While the first run is queued, a second run of the source is refused.
+        let second = drive(operation(run()), &ctx).await;
+        assert_eq!(second, Err(SubmitJobError::SourceRunning));
+        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
     }
 
     #[tokio::test]

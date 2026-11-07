@@ -65,6 +65,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(federation::link::router())
         .merge(federation::login::router())
         .merge(onboarding::router())
+        .merge(storage::archive::router())
         .merge(storage::blobs::router())
         .merge(storage::bucket::usage::router())
         .merge(storage::compression::router())
@@ -98,6 +99,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(execution::compute::router())
         .merge(storage::connectors::router())
         .merge(access::admin_tokens::router())
+        .merge(access::audit::router())
         .merge(access::credentials::router())
         .merge(device::router())
         .merge(execution::device_compute::router())
@@ -255,9 +257,15 @@ pub(crate) mod tests {
         ("DELETE", "/access/users/{id}/tokens"),
         ("DELETE", "/access/groups/{id}/roles/{role_id}"),
         ("DELETE", "/metadata/{document_id}"),
+        ("POST", "/data/archives"),
+        ("GET", "/access/audit"),
         (
             "DELETE",
             "/metadata/groups/{group_id}/repositories/{connector_id}",
+        ),
+        (
+            "POST",
+            "/metadata/groups/{group_id}/repositories/{connector_id}/harvests",
         ),
         ("DELETE", "/system/notifications/watches/{id}"),
         ("DELETE", "/system/realm/oidc-providers/{id}"),

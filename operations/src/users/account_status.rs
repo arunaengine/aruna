@@ -10,10 +10,11 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::Effects;
+use aruna_core::types::{Effects, GroupId};
 use aruna_core::user::validation::DEACTIVATED_ATTRIBUTE;
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -71,6 +72,7 @@ enum AccountStatusState {
     Authorize { administrator: bool },
     UpdateUser,
     WriteCutoff,
+    WriteAudit,
     Finish,
     Error,
 }
@@ -81,6 +83,8 @@ enum AccountStatusState {
 pub struct AccountStatusOperation {
     config: AccountStatusConfig,
     state: AccountStatusState,
+    /// The group owning a service account target, whose administrators may read its audit row.
+    owner_group: Option<GroupId>,
     output: Option<Result<(), AccountStatusError>>,
 }
 
@@ -89,6 +93,7 @@ impl AccountStatusOperation {
         Self {
             config,
             state: AccountStatusState::Init,
+            owner_group: None,
             output: None,
         }
     }
@@ -148,7 +153,8 @@ impl AccountStatusOperation {
             Err(error) => return self.fail(error.into()),
         };
         let realm_id = self.config.actor.realm_id;
-        let path = match target.as_ref().and_then(User::service_group) {
+        self.owner_group = target.as_ref().and_then(User::service_group);
+        let path = match self.owner_group {
             Some(group_id) => format!("/{realm_id}/g/{group_id}/admin"),
             None => format!("/{realm_id}/admin/config"),
         };
@@ -218,6 +224,7 @@ impl AccountStatusOperation {
             )
         };
         self.state = AccountStatusState::UpdateUser;
+        let audit = self.audit_record();
         smallvec![Effect::SubOperation(boxed_suboperation(
             UpdateUserOperation::new(UpdateUserInput {
                 actor: self.config.actor.clone(),
@@ -230,7 +237,8 @@ impl AccountStatusOperation {
                 system: true,
                 alias: None,
                 subject: None,
-            }),
+            })
+            .audited(audit),
             |result| Event::SubOperation(SubOperationEvent::UserUpdated {
                 result: result.map(|_| ()).map_err(|error| error.to_string()),
             }),
@@ -239,7 +247,11 @@ impl AccountStatusOperation {
 
     fn handle_updated(&mut self, event: Event) -> Effects {
         match event {
-            Event::SubOperation(SubOperationEvent::UserUpdated { result: Ok(()) }) => self.finish(),
+            Event::SubOperation(SubOperationEvent::UserUpdated { result: Ok(()) }) => {
+                self.state = AccountStatusState::Finish;
+                self.output = Some(Ok(()));
+                smallvec![]
+            }
             Event::SubOperation(SubOperationEvent::UserUpdated { result: Err(error) }) => {
                 self.fail(AccountStatusError::Update(error))
             }
@@ -267,10 +279,40 @@ impl AccountStatusOperation {
         self.config.target.realm_id != self.config.actor.realm_id
     }
 
+    fn audit_record(&self) -> AdminAuditRecord {
+        let action = match self.config.active {
+            true => AdminAuditAction::AccountReactivated,
+            false => AdminAuditAction::AccountDeactivated,
+        };
+        let mut record =
+            AdminAuditRecord::new(action, self.config.actor.user_id, self.config.target);
+        record.group_id = self.owner_group;
+        record
+    }
+
+    /// A federated target has no local user row to commit the audit row with.
     fn finish(&mut self) -> Effects {
-        self.state = AccountStatusState::Finish;
-        self.output = Some(Ok(()));
-        smallvec![]
+        let writes = match self.audit_record().entries() {
+            Ok(writes) => writes,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = AccountStatusState::WriteAudit;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })]
+    }
+
+    fn handle_audited(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                self.state = AccountStatusState::Finish;
+                self.output = Some(Ok(()));
+                smallvec![]
+            }
+            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+            other => self.unexpected("audit write", other),
+        }
     }
 }
 
@@ -316,6 +358,7 @@ impl Operation for AccountStatusOperation {
             }
             AccountStatusState::UpdateUser => self.handle_updated(event),
             AccountStatusState::WriteCutoff => self.handle_cutoff(event),
+            AccountStatusState::WriteAudit => self.handle_audited(event),
             AccountStatusState::Init => self.unexpected("no event before start", event),
             state @ (AccountStatusState::Finish | AccountStatusState::Error) => {
                 self.state = state;
@@ -436,6 +479,31 @@ mod tests {
         operation.finalize().unwrap_err()
     }
 
+    /// Feeds the audit write and returns the row the operation recorded.
+    fn audited(operation: &mut AccountStatusOperation, effects: Effects) -> AdminAuditRecord {
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice()
+        else {
+            panic!("expected the audit write, got {effects:?}");
+        };
+        assert!(txn_id.is_none());
+        let record = AdminAuditRecord::from_bytes(&writes[0].2).unwrap();
+        assert!(!operation.is_complete());
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        record
+    }
+
+    /// Checks that the user update commits the audit row and returns that row.
+    fn committed(operation: &mut AccountStatusOperation, effects: Effects) -> AdminAuditRecord {
+        assert!(
+            effects.is_empty(),
+            "no write follows the update: {effects:?}"
+        );
+        assert!(operation.is_complete());
+        operation.audit_record()
+    }
+
     #[test]
     fn service_caller_refused() {
         let fixture = fixture();
@@ -488,9 +556,16 @@ mod tests {
         }));
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         assert!(!operation.is_complete());
-        operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
             result: Ok(()),
         }));
+        let record = committed(&mut operation, effects);
+        assert_eq!(record.action, AdminAuditAction::AccountDeactivated);
+        assert_eq!(
+            (record.actor, record.target),
+            (fixture.actor.user_id, fixture.target)
+        );
+        assert_eq!(record.group_id, None);
         assert_eq!(operation.finalize(), Ok(()));
     }
 
@@ -507,9 +582,39 @@ mod tests {
         ));
         let effects = operation.step(allowed());
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
             result: Ok(()),
         }));
+        let record = committed(&mut operation, effects);
+        assert_eq!(record.action, AdminAuditAction::AccountReactivated);
+        assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn service_target_audited() {
+        // The owning group's administrators may read the row of a service account change.
+        let fixture = fixture();
+        let group = Ulid::from_bytes([9u8; 16]);
+        let mut operation = operation(&fixture, false);
+        operation.start();
+        operation.step(records(
+            user_bytes(
+                &fixture,
+                fixture.target,
+                &[(SERVICE_GROUP_ATTRIBUTE, &group.to_string())],
+            ),
+            None,
+            realm_auth(&fixture, &[fixture.other]),
+        ));
+        operation.step(allowed());
+        operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
+            result: Ok(()),
+        }));
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
+            result: Ok(()),
+        }));
+        let record = committed(&mut operation, effects);
+        assert_eq!(record.group_id, Some(group));
         assert_eq!(operation.finalize(), Ok(()));
     }
 
@@ -549,7 +654,7 @@ mod tests {
         let effects = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
             result: Ok(()),
         }));
-        assert!(effects.is_empty());
+        audited(&mut operation, effects);
         assert_eq!(operation.finalize(), Ok(()));
     }
 
