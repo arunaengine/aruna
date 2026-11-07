@@ -10,8 +10,10 @@ use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
 };
 use aruna_core::UserId;
+use aruna_core::structs::execution::job::JobState;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_operations::harvest::create_source::source_id;
+use aruna_operations::jobs::store::{JobMutation, mutate_job};
 use tempfile::TempDir;
 
 struct Setup {
@@ -150,6 +152,24 @@ async fn submit_reuses_source() {
     .unwrap();
     assert_eq!(replay.job_id, first.job_id);
     assert!(!replay.created);
+
+    // One run per source: a later run waits until the first one finished.
+    let running = submit(
+        &setup,
+        setup.owner.clone(),
+        &connector_id,
+        request("imported/zenodo", None),
+    )
+    .await;
+    assert!(matches!(running, Err(ServerError::Conflict(_))));
+    let job_id = first.job_id.parse().unwrap();
+    let context = setup.state.get_ctx();
+    mutate_job(&context.storage_handle, job_id, |record| {
+        record.state = JobState::Succeeded;
+        Ok(JobMutation::Persist)
+    })
+    .await
+    .unwrap();
 
     // A later run keeps the source, so it continues from the stored cursor.
     let next = submit(
