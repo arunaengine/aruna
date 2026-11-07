@@ -39,8 +39,8 @@ pub(super) fn vault_rows(
     let plain = |value: &[u8]| match purpose {
         VaultPurpose::SourceConnector => SourceConnectorSecret::from_bytes(value).is_ok(),
         VaultPurpose::GroupBackend => GroupStorageSecret::from_bytes(value).is_ok(),
-        // Bucket keys were never stored outside the node vault.
-        VaultPurpose::BucketKey => false,
+        // These secrets were never stored outside the node vault.
+        VaultPurpose::BucketKey | VaultPurpose::Webhook | VaultPurpose::EmailAddress => false,
     };
     let mut moves = Moves {
         scanned: 0,
