@@ -143,6 +143,8 @@ pub struct ObjectExecution {
     pub changed_keys: Option<usize>,
     /// The part of `changed_keys` this page passed.
     pub page_changed: usize,
+    /// A distributed bucket's ranges changed during the search, so later pages stay incomplete.
+    pub layout_changed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -173,25 +175,23 @@ pub(super) struct ObjectCursorPayload {
     pub(super) layout: RangeLayout,
 }
 
-/// The key ranges of a distributed bucket the pages of one search were answered under.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) enum RangeLayout {
-    /// No page searched a distributed bucket yet.
-    #[default]
-    Unknown,
-    Seen([u8; 32]),
-    /// A range changed coordinator or bounds between pages or between nodes, so a member may
-    /// have skipped keys another member no longer searched.
-    Changed,
+/// The key ranges of the distributed buckets the pages of one search were answered under.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct RangeLayout {
+    /// The layout digest each distributed set answered with first, by set id.
+    pub(super) seen: Vec<(ulid::Ulid, [u8; 32])>,
+    /// A set's ranges changed coordinator or bounds between pages or between nodes, so a
+    /// member may have skipped keys another member no longer searched.
+    pub(super) changed: bool,
 }
 
 impl RangeLayout {
-    pub(super) fn observe(self, digest: [u8; 32]) -> Self {
-        match self {
-            Self::Unknown => Self::Seen(digest),
-            Self::Seen(seen) if seen == digest => self,
-            Self::Seen(_) | Self::Changed => Self::Changed,
+    pub(super) fn observe(mut self, (set_id, digest): (ulid::Ulid, [u8; 32])) -> Self {
+        match self.seen.iter().find(|(seen_id, _)| *seen_id == set_id) {
+            Some((_, seen)) => self.changed |= *seen != digest,
+            None => self.seen.push((set_id, digest)),
         }
+        self
     }
 }
 
@@ -455,6 +455,8 @@ async fn search_until(
         partitions.pending.pop();
         failed += 1;
     }
+    // A bucket search that ended after its ranges moved keeps the rest of this search incomplete.
+    partitions.layout.changed |= found.iter().any(|page| page.layout_changed);
     let found_changed = found.iter().map(|page| page.page_changed).sum::<usize>();
     let certain = found.iter().all(|page| page.changed_keys.is_some());
     partitions.changed_keys =
@@ -591,7 +593,7 @@ pub(super) async fn resolve_object_partitions(
                     (
                         cursor.payload.pending.clone(),
                         cursor.payload.changed_keys,
-                        cursor.payload.layout,
+                        cursor.payload.layout.clone(),
                     ),
                 )
             }
@@ -648,7 +650,7 @@ pub(super) async fn resolve_object_partitions(
                     Vec::new(),
                     discovery_failed,
                     omitted_partitions,
-                    (Vec::new(), Some(0), RangeLayout::Unknown),
+                    (Vec::new(), Some(0), RangeLayout::default()),
                 )
             }
         };
@@ -832,7 +834,7 @@ pub(super) fn assemble_object_execution(
     let layout = (parts.iter())
         .filter_map(|(_, page)| page.layout)
         .fold(layout, RangeLayout::observe);
-    let moved = layout == RangeLayout::Changed;
+    let moved = layout.changed;
     if plan.mode == ObjectQueryMode::DistributedStrict && moved {
         return Err(MetadataApiError::SearchIncomplete(
             "the key ranges of the distributed bucket changed during the search; start it again"
@@ -946,6 +948,7 @@ pub(super) fn assemble_object_execution(
         complete,
         changed_keys,
         page_changed,
+        layout_changed: moved,
     })
 }
 

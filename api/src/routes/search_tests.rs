@@ -970,6 +970,7 @@ fn search_maps_partiality() {
         complete: false,
         changed_keys: Some(2),
         page_changed: 1,
+        layout_changed: false,
     };
 
     let response = map_search_response(result, ObjectMode::DistributedBestEffort);

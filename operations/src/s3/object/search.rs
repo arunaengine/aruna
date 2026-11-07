@@ -129,10 +129,10 @@ pub struct SearchNodePage {
     /// `as_of`; they are counted, not shown. `None` when a searched range index changed since.
     #[serde(default)]
     pub changed: Option<Vec<Vec<u8>>>,
-    /// A digest of the distributed bucket's key ranges and their coordinators this page
-    /// searched under; `None` for other buckets.
+    /// The distributed set this page searched and a digest of its key ranges and their
+    /// coordinators; `None` for other buckets.
     #[serde(default)]
-    pub layout: Option<[u8; 32]>,
+    pub layout: Option<(ulid::Ulid, [u8; 32])>,
 }
 
 #[derive(Debug, Error)]

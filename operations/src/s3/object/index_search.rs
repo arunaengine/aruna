@@ -50,8 +50,8 @@ pub(super) async fn search_ranges(
     input: &SearchObjectsInput,
     search: RangeSearch,
 ) -> Result<SearchNodePage, SearchObjectsError> {
-    let indexes = search.indexes.clone();
-    let record = read_record(context, search.binding.set_id).await;
+    let (indexes, set_id) = (search.indexes.clone(), search.binding.set_id);
+    let record = read_record(context, set_id).await;
     let Some(view) = record.map_err(SearchObjectsError::Storage)? else {
         // Without the record the ranges are unknown, so nothing is covered.
         return Ok(page(Vec::new(), Vec::new(), true, None, 1, 0));
@@ -59,7 +59,7 @@ pub(super) async fn search_ranges(
     let ranges = &view.head.snapshot.config.ranges;
     let mut unready = Vec::new();
     let mut page = range_page(context, input, search, ranges, &mut unready).await?;
-    page.layout = Some(layout_digest(ranges));
+    page.layout = Some((set_id, layout_digest(ranges)));
     page.partial_ranges = (unready.iter())
         .filter_map(|(range_id, partial)| Some((*range_id, partial.clone()?)))
         .collect();

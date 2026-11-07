@@ -122,7 +122,7 @@ fn keeps_bucket_continuation() {
             false,
             0,
             pending,
-            (Some(0), RangeLayout::Unknown),
+            (Some(0), RangeLayout::default()),
             signer,
             |bytes| secret.sign(bytes),
         )
@@ -158,7 +158,7 @@ fn rejects_cursor_tampering() {
         false,
         0,
         &[],
-        (Some(0), RangeLayout::Unknown),
+        (Some(0), RangeLayout::default()),
         signer,
         |bytes| secret.sign(bytes),
     )
