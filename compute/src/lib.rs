@@ -9,7 +9,7 @@ pub mod session;
 pub use executor::ExecutorBackend;
 pub use executor::config::{
     ApptainerConfig, ComputeConfig, DEFAULT_WORKLOAD_SA, DockerConfig, KubedalCache, KubedalMount,
-    KubernetesConfig,
+    KubernetesConfig, SlurmConfig,
 };
 pub use executor::dispatch_helper;
 pub use registry::ExecutorRegistry;

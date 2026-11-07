@@ -102,7 +102,8 @@ pub struct ReplaceDatasetInput {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SparqlInput {
     /// SPARQL SELECT or ASK query of at most 65536 bytes and LIMIT at most 10000.
-    /// Realm-wide SELECT must be DISTINCT over one triple pattern with no OFFSET or SERVICE.
+    /// Realm-wide SELECT must be DISTINCT over one triple pattern with no OFFSET or SERVICE,
+    /// or over two patterns that share a variable with no modifier but LIMIT.
     pub query: String,
     /// Run the query against one document's graph instead of all visible
     /// metadata, given as that document's bare 26-character ULID from
@@ -441,7 +442,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Run a read-only SPARQL SELECT or ASK query over visible metadata, or over one document when document_id is given, and return the solutions or the boolean with the fan-out counters. Use search_datasets for plain text lookup and this tool only for questions the typed tools cannot answer, such as relationships between entities. Do not use it to count datasets or documents: count_datasets returns the caller's dataset, Profile, and process-run totals, get_group_usage one group's counts, and get_realm_info the realm-wide document count. Without document_id the query fans out across realm nodes and must be an ASK or a SELECT DISTINCT over a single triple pattern with no OFFSET; with document_id it runs locally without that restriction. At most 10000 rows are returned and the query is cut off after ten seconds.",
+        description = "Run a read-only SPARQL SELECT or ASK query over visible metadata, or over one document when document_id is given, and return the solutions or the boolean with the fan-out counters. Use search_datasets for plain text lookup and this tool only for questions the typed tools cannot answer, such as relationships between entities. Do not use it to count datasets or documents: count_datasets returns the caller's dataset, Profile, and process-run totals, get_group_usage one group's counts, and get_realm_info the realm-wide document count. Without document_id the query fans out across realm nodes and must be an ASK, a SELECT DISTINCT over a single triple pattern with no OFFSET, or a SELECT DISTINCT over two triple patterns that share a variable with at most a LIMIT (each pattern at most 5000 rows); with document_id it runs locally without that restriction. At most 10000 rows are returned and the query is cut off after ten seconds.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -636,8 +637,9 @@ fn query_error(error: crate::error::ServerError, document_scoped: bool) -> CallT
         ),
         crate::error::ServerError::BadRequest => explained(
             error,
-            "a query over all visible metadata must be an ASK or a SELECT DISTINCT over a single \
-             triple pattern with no OFFSET, at most 65536 bytes, with every prefix declared, no \
+            "a query over all visible metadata must be an ASK, a SELECT DISTINCT over a single \
+             triple pattern with no OFFSET, or a SELECT DISTINCT over two triple patterns that \
+             share a variable with at most a LIMIT, at most 65536 bytes, with every prefix declared, no \
              SERVICE clause, and no LIMIT above 10000; pass document_id to run a full query \
              against one document",
         ),

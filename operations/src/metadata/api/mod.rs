@@ -117,6 +117,7 @@ mod bucket_page;
 mod distributed;
 mod export;
 mod fanout;
+mod join;
 mod links;
 mod list;
 mod path;

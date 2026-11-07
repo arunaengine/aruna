@@ -822,7 +822,7 @@ pub(crate) struct RealmNodeDiscovery {
     pub(crate) failed: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct MetadataFanoutScope {
     pub(super) mode: Option<ApiQueryMode>,
     pub(super) target_nodes: Option<Vec<NodeId>>,

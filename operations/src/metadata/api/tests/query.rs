@@ -5,6 +5,7 @@
 use super::*;
 
 use super::super::distributed::{fetch_ties, merge_ordered, order_solutions, ordered_query};
+use super::super::join::{JOIN_SIDE_ROWS, join_plan, join_rows};
 
 const INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
@@ -591,4 +592,94 @@ fn partition_query_widest() {
     let widest = QUERY_MAX_ROWS.to_string().len() - 1;
     let (partition, _) = ordered_query(&query(fill - widest)).unwrap().unwrap();
     assert_eq!(partition.len() + widest, QUERY_MAX_BYTES);
+}
+
+/// The rows `query` returns on one shard holding `triples`.
+fn shard_rows(query: &str, triples: &[(&str, &str, &str)]) -> Vec<BTreeMap<String, String>> {
+    let mut dataset = oxrdf::Dataset::new();
+    for (subject, predicate, object) in triples {
+        dataset.insert(&oxrdf::Quad::new(
+            oxrdf::NamedNode::new_unchecked(*subject),
+            oxrdf::NamedNode::new_unchecked(*predicate),
+            object.parse::<oxrdf::Term>().unwrap(),
+            oxrdf::GraphName::DefaultGraph,
+        ));
+    }
+    let query = spargebra::SparqlParser::new().parse_query(query).unwrap();
+    let evaluator = spareval::QueryEvaluator::new();
+    let Ok(spareval::QueryResults::Solutions(solutions)) =
+        evaluator.prepare(&query).execute(&dataset)
+    else {
+        panic!("expected solutions");
+    };
+    solutions
+        .map(|solution| {
+            let solution = solution.unwrap();
+            solution
+                .iter()
+                .map(|(variable, term)| (variable.as_str().to_string(), term.to_string()))
+                .collect()
+        })
+        .collect()
+}
+
+const JOIN_QUERY: &str = "SELECT DISTINCT ?dataset ?name WHERE { \
+    ?dataset <urn:hasPart> ?file . ?file <urn:name> ?name } LIMIT 10";
+
+#[test]
+fn join_finds_split() {
+    // A dataset on one shard names a file whose name lives on another shard.
+    let first = [
+        ("urn:d1", "urn:hasPart", "<urn:f1>"),
+        ("urn:d2", "urn:hasPart", "<urn:f2>"),
+    ];
+    let second = [
+        ("urn:f1", "urn:name", "\"reads.fastq\""),
+        ("urn:f3", "urn:name", "\"other.txt\""),
+    ];
+    assert!(shard_rows(JOIN_QUERY, &first).is_empty());
+    assert!(shard_rows(JOIN_QUERY, &second).is_empty());
+    let union = shard_rows(JOIN_QUERY, &[first.as_slice(), &second].concat());
+    assert_eq!(union.len(), 1);
+
+    let plan = join_plan(JOIN_QUERY).unwrap();
+    assert!(plan.sides.iter().all(|side| query_union_safe(side)));
+    let side = |query: &str| [shard_rows(query, &first), shard_rows(query, &second)].concat();
+    let (left, right) = (side(&plan.sides[0]), side(&plan.sides[1]));
+    let cancel = spareval::CancellationToken::new();
+    let joined = join_rows(&plan, left.clone(), right.clone(), &cancel).unwrap();
+    assert_eq!(joined, union);
+    // A join past its deadline stops instead of holding the merge permit.
+    cancel.cancel();
+    let stopped = join_rows(&plan, left, right, &cancel);
+    assert!(matches!(stopped, Err(MetadataApiError::ServiceUnavailable)));
+}
+
+#[test]
+fn join_plan_rejects() {
+    for query in [
+        "SELECT ?s WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x }",
+        "SELECT DISTINCT ?s WHERE { ?s <urn:a> ?o . ?x <urn:b> ?y }",
+        "SELECT DISTINCT ?s WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x . ?x <urn:c> ?y }",
+        "SELECT DISTINCT ?s WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x } ORDER BY ?s",
+        "SELECT DISTINCT ?s WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x } OFFSET 1",
+        "SELECT DISTINCT ?s WHERE { ?s <urn:a> _:b . _:b <urn:b> ?x }",
+        "SELECT DISTINCT ?s WHERE { ?s <urn:a> ?o OPTIONAL { ?o <urn:b> ?x } }",
+        "SELECT DISTINCT ?s FROM <urn:g> WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x }",
+        "ASK WHERE { ?s <urn:a> ?o . ?o <urn:b> ?x }",
+    ] {
+        assert!(join_plan(query).is_none(), "{query}");
+    }
+}
+
+#[test]
+fn join_refuses_oversize() {
+    // A side past its bound refuses the join rather than answering from a cut input.
+    let plan = join_plan(JOIN_QUERY).unwrap();
+    let rows = (0..=JOIN_SIDE_ROWS)
+        .map(|index| solution_row(&[("dataset", &format!("<urn:d{index}>")), ("file", "<urn:f>")]))
+        .collect();
+    let cancel = spareval::CancellationToken::new();
+    let refused = join_rows(&plan, rows, Vec::new(), &cancel);
+    assert!(matches!(refused, Err(MetadataApiError::InvalidQuery(_))));
 }

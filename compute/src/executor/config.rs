@@ -1,4 +1,4 @@
-//! Holds the compute backend settings for Docker, Apptainer and Kubernetes.
+//! Holds the compute backend settings for Docker, Apptainer, Kubernetes and Slurm.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -85,6 +85,50 @@ impl Default for ApptainerConfig {
             pull_deadline: Duration::from_secs(300),
             default_mem_bytes: Some(2 * 1024 * 1024 * 1024),
             default_cpu_cores: Some(2),
+            envelope: ResourceEnvelope::default(),
+        }
+    }
+}
+
+/// One Slurm cluster whose compute nodes run Apptainer and share `state_root` with this node.
+#[derive(Clone, Debug)]
+pub struct SlurmConfig {
+    pub state_root: PathBuf,
+    pub sbatch: PathBuf,
+    pub squeue: PathBuf,
+    pub sacct: PathBuf,
+    pub scancel: PathBuf,
+    /// The Apptainer command on the compute nodes.
+    pub apptainer: String,
+    pub partition: Option<String>,
+    pub account: Option<String>,
+    /// How long one Slurm command may take.
+    pub command_timeout: Duration,
+    /// Applied when a request declares no ceiling, so no job runs without one.
+    pub default_mem_bytes: Option<u64>,
+    pub default_cpu_cores: Option<u32>,
+    /// Placement location of the compute nodes; empty leaves their site unproven.
+    pub execution_location: String,
+    pub execution_labels: BTreeMap<String, String>,
+    pub envelope: ResourceEnvelope,
+}
+
+impl Default for SlurmConfig {
+    fn default() -> Self {
+        Self {
+            state_root: PathBuf::from("./compute-state/slurm"),
+            sbatch: PathBuf::from("sbatch"),
+            squeue: PathBuf::from("squeue"),
+            sacct: PathBuf::from("sacct"),
+            scancel: PathBuf::from("scancel"),
+            apptainer: "apptainer".to_string(),
+            partition: None,
+            account: None,
+            command_timeout: Duration::from_secs(30),
+            default_mem_bytes: Some(2 * 1024 * 1024 * 1024),
+            default_cpu_cores: Some(2),
+            execution_location: String::new(),
+            execution_labels: BTreeMap::new(),
             envelope: ResourceEnvelope::default(),
         }
     }

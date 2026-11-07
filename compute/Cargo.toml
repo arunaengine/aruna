@@ -17,6 +17,8 @@ default = ["docker", "apptainer", "kubernetes"]
 docker = ["dep:bollard"]
 apptainer = ["dep:nix", "dep:rustix"]
 kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:json-patch", "dep:serde-saphyr"]
+# Runs Apptainer containers as Slurm jobs, so it builds on the Apptainer backend.
+slurm = ["apptainer"]
 
 [dependencies]
 aruna-core = { workspace = true }
