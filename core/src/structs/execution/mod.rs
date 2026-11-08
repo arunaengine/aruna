@@ -8,6 +8,7 @@ pub mod job;
 pub mod notification;
 pub mod notification_watch;
 pub mod offered_directory;
+pub mod setting;
 pub mod source_access;
 pub mod source_connector;
 pub mod staging;
