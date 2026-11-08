@@ -86,7 +86,7 @@ use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnaps
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
-use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
+use aruna_operations::auth::request_authorization::{AuthorizeError, BucketAccess, authorize};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::{
     DriverContext, bucket_snapshot, drive, drive_until, gate_context, now_ms, routing_snapshot,
@@ -296,7 +296,7 @@ impl ArunaS3Service {
             }
             None => {
                 let page = self
-                    .run_object_listing(input, (None, None), false, None, (None, None))
+                    .run_object_listing(input, (None, None), false, (None, None), (None, None))
                     .await?;
                 (page, Vec::new(), false)
             }
@@ -729,6 +729,22 @@ impl S3 for ArunaS3Service {
                 return Err(s3_error!(AccessDenied, "Permission denied"));
             }
         }
+        // A share link's listing shows each key only as that share session may read it.
+        let shared = (req.extensions.get::<DelegatedRequest>())
+            .and_then(|delegated| delegated.share.as_ref());
+        let access = match shared {
+            Some(auth) => Some(
+                BucketAccess::load(
+                    &self.state,
+                    auth,
+                    (self.realm_id, group_id, self.node_id),
+                    &bucket,
+                )
+                .await
+                .map_err(|error| s3_error!(InternalError, "{error}"))?,
+            ),
+            None => None,
+        };
 
         let owner = req.input.fetch_owner.unwrap_or(false).then(|| Owner {
             display_name: None,
@@ -768,7 +784,7 @@ impl S3 for ArunaS3Service {
                         input,
                         (owner, Some(&user_access)),
                         url_encoded,
-                        scope.as_ref(),
+                        (scope.as_ref(), access.as_ref()),
                         (bounds, hidden),
                     )
                     .await?;
@@ -938,7 +954,7 @@ impl S3 for ArunaS3Service {
                         input,
                         (owner, Some(&user_access)),
                         url_encoded,
-                        scope.as_ref(),
+                        (scope.as_ref(), None),
                         (None, hidden),
                     )
                     .await?;

@@ -8,8 +8,10 @@ use crate::s3::error::IntoS3Error;
 use crate::s3::scope::SubpathScope;
 use crate::s3::util::{map_checksum_algorithm, map_checksum_type};
 use aruna_core::structs::checksum::HASH_MD5;
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::BlobHeadKey;
 use aruna_core::structs::storage::blob::UserAccess;
+use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::multipart::parts::ListPartsResult;
 use aruna_operations::s3::multipart::uploads::ListUploadsResult;
@@ -117,18 +119,21 @@ impl ArunaS3Service {
     }
 
     /// Runs one listing page shared by ListObjects and ListObjectsV2. Only entries the reader
-    /// may see show, a common prefix once one below it does; a page that stopped among hidden
-    /// entries continues from a sealed cursor.
+    /// may see show, a common prefix once one below it does, and with `access` only what that
+    /// share session may read; a page that stopped among hidden entries continues sealed.
     pub(super) async fn run_object_listing(
         &self,
         input: LOV2I,
         (owner, reader): (Option<Owner>, Option<&UserAccess>),
         url_encoded: bool,
-        scope: Option<&SubpathScope>,
+        (scope, access): (Option<&SubpathScope>, Option<&BucketAccess>),
         (bounds, hidden): (Option<(String, Option<String>)>, Option<HiddenCursor>),
     ) -> S3Result<ObjectListingPage> {
         let bucket = input.bucket.clone();
-        let groups = |prefix: &str| scope.is_none_or(|scope| scope.allows_prefix(prefix));
+        let reads =
+            |key: &str| access.is_none_or(|access| access.allows(Some(key), &Permission::READ));
+        let groups =
+            |prefix: &str| scope.is_none_or(|scope| scope.allows_prefix(prefix)) && reads(prefix);
         let listed = visible_page(
             self.state.as_ref(),
             input,
@@ -137,7 +142,9 @@ impl ArunaS3Service {
                 let object = object.clone();
                 let bucket = &bucket;
                 Box::pin(async move {
-                    if !scope.is_none_or(|scope| scope.allows_key(&object.head.key)) {
+                    if !scope.is_none_or(|scope| scope.allows_key(&object.head.key))
+                        || !reads(&object.head.key)
+                    {
                         return Ok(false);
                     }
                     self.link_listable(reader, bucket, &object).await

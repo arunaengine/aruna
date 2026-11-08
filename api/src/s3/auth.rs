@@ -97,6 +97,8 @@ pub(crate) struct DelegatedRequest {
     pub payload: Payload,
     /// The issuer asked this node as a copy, so a current read is answered and marked stale.
     pub copy_read: bool,
+    /// The share session a link's request runs as; its listing shows only what it may read.
+    pub share: Option<AuthContext>,
 }
 
 /// The body binding each forwarded operation must carry.
@@ -840,6 +842,7 @@ impl AuthProvider {
             nonce: delegation.nonce,
             payload: delegation.payload.clone(),
             copy_read,
+            share: auth_context.session.is_some().then_some(auth_context),
         });
         cx.extensions_mut().insert(user_access);
         Ok(())

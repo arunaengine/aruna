@@ -171,7 +171,7 @@ pub fn decode_resume<E>(cursor: &str) -> Result<Resume, PageError<E>> {
 }
 
 /// The token that resumes a local listing after `key`, or past the whole `group`.
-fn resume_token<E>(
+pub fn resume_token<E>(
     bucket: &str,
     key: &str,
     group: Option<&str>,
@@ -245,7 +245,7 @@ fn local_token<E>(
 }
 
 /// The cursor of a local listing that stopped after `token`.
-fn after_cursor<E>(token: ListContinuationToken) -> Result<String, PageError<E>> {
+pub fn after_cursor<E>(token: ListContinuationToken) -> Result<String, PageError<E>> {
     let key = BlobHeadKey::from_bytes(&token.last_key)
         .map_err(PageError::internal)?
         .key;
