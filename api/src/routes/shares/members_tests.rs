@@ -624,25 +624,16 @@ async fn dataset_part_group() {
     assert_eq!(member_part(&test, other).await.unwrap(), b"remote");
 }
 
-// A part named only by its global version or content hash is served when this node is a bound
-// member of the set it resolves to, though no other part names that set or bucket.
-#[tokio::test]
-async fn dataset_global_parts() {
-    use super::dataset::{DatasetTicketRequest, dataset_ticket, read_dataset};
-    use crate::tests::distributed::{PEER, distribute, node_id, publish_urls, write};
+/// Indexes a new version of `x/a.txt` with content `hash` in `set_id` on this member, as
+/// replication of the other member's range leaves it, and returns its id.
+async fn index_content(state: &ServerState, set_id: Ulid, hash: [u8; 32]) -> Ulid {
+    use crate::tests::distributed::write;
     use aruna_core::keyspaces::{CONTENT_INDEX_KEYSPACE, VERSION_INDEX_KEYSPACE};
-    use aruna_core::structs::storage::data::identity::content_id;
-    use aruna_core::structs::storage::distribution::OriginalEpoch;
-    use aruna_core::structs::storage::distribution::SetHint;
     use aruna_core::structs::storage::distribution::hint::mint_version;
     use aruna_core::structs::storage::distribution::inventory::{
         IndexEntry, VersionEntry, content_key, index_key, version_position,
     };
-    use aruna_core::structs::storage::global_id::GlobalId;
-    let test = crate::routes::metadata::tests::setup_network_state().await;
-    let state = test.state.clone();
-    let set_id = distribute(&state, test.group_id, "spire").await.set_id();
-    // This member's indexes name a version of the other member's range, as replication does.
+    use aruna_core::structs::storage::distribution::{OriginalEpoch, SetHint};
     let version = mint_version(Some(SetHint::of_set(set_id)));
     let position = version_position(set_id, "x/a.txt", OriginalEpoch(1), 1, version);
     let entry = IndexEntry {
@@ -651,15 +642,30 @@ async fn dataset_global_parts() {
     };
     let index = index_key(set_id, version);
     write(
-        &state,
+        state,
         VERSION_INDEX_KEYSPACE,
         index,
         entry.to_bytes().unwrap(),
     )
     .await;
-    let hash = [9; 32];
     let content = content_key(set_id, &hash, version);
-    write(&state, CONTENT_INDEX_KEYSPACE, content, Vec::new()).await;
+    write(state, CONTENT_INDEX_KEYSPACE, content, Vec::new()).await;
+    version
+}
+
+// A part named only by its global version or content hash is served when this node is a bound
+// member of the set it resolves to, though no other part names that set or bucket.
+#[tokio::test]
+async fn dataset_global_parts() {
+    use super::dataset::{DatasetTicketRequest, dataset_ticket, read_dataset};
+    use crate::tests::distributed::{PEER, distribute, node_id, publish_urls};
+    use aruna_core::structs::storage::data::identity::content_id;
+    use aruna_core::structs::storage::global_id::GlobalId;
+    let test = crate::routes::metadata::tests::setup_network_state().await;
+    let state = test.state.clone();
+    let set_id = distribute(&state, test.group_id, "spire").await.set_id();
+    let hash = [9; 32];
+    let version = index_content(&state, set_id, hash).await;
     let (url, server) = listing_peer(test.group_id).await;
     publish_urls(&state, node_id(PEER), (&url, Some(&url))).await;
     let global = GlobalId::Version {
@@ -753,4 +759,102 @@ async fn escaped_folder_listed() {
     );
     let visit = opened.await.unwrap().0.visit_token;
     assert_eq!(names(&shared, &visit, "", 100).await.unwrap(), ["a.txt"]);
+}
+
+// Identical content in several sets is served from the first one the link's creator may read;
+// a set the creator cannot read is passed over, though it resolves first.
+#[tokio::test]
+async fn content_skips_unreadable() {
+    use super::dataset::{DatasetTicketRequest, dataset_ticket, read_dataset};
+    use crate::tests::distributed::{LOCAL, PEER, distribute, node_id, publish_urls};
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::storage::data::identity::content_id;
+    use aruna_core::structs::storage::distribution::SetRoot;
+    let test = crate::routes::metadata::tests::setup_network_state().await;
+    let state = test.state.clone();
+    let set_of = |owner_group| {
+        let publisher = node_id(LOCAL);
+        let nonce = [7; 16];
+        SetRoot {
+            publisher,
+            owner_group,
+            nonce,
+        }
+        .set_id()
+    };
+    // Sets resolve in id order, so the closed group's set must sort before the open one.
+    let open_set = set_of(test.group_id);
+    let closed = (1..=u8::MAX)
+        .map(|seed| Ulid::from_bytes([seed; 16]))
+        .find(|group| set_of(*group) < open_set)
+        .unwrap();
+    let stranger = aruna_core::UserId::local(Ulid::from_bytes([98; 16]), test.auth.realm_id);
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: stranger,
+        realm_id: test.auth.realm_id,
+    };
+    let (context, realm) = (state.get_ctx(), test.auth.realm_id);
+    crate::tests::routes::seed_group_docs(&context, realm, &actor, closed, "closed", stranger)
+        .await;
+    let hash = [9; 32];
+    for (group, bucket) in [(closed, "closed"), (test.group_id, "spire")] {
+        let set_id = distribute(&state, group, bucket).await.set_id();
+        index_content(&state, set_id, hash).await;
+    }
+    let (url, server) = listing_peer(test.group_id).await;
+    publish_urls(&state, node_id(PEER), (&url, Some(&url))).await;
+    let content = content_id(hash);
+    let parts = [(content.as_str(), "File")];
+    let describe = crate::tests::datasets::describe_parts(&test, "/shared", false, &parts);
+    let document_id = describe.await;
+    let request = CreateShareRequest {
+        target: ShareTargetBody::Dataset {
+            dataset_id: document_id.to_string(),
+        },
+        mode: ShareModeBody::Read,
+        label: String::new(),
+        expires_at: None,
+        password: None,
+    };
+    let auth = Extension(Some(test.auth.clone()));
+    let (_, Json(link)) = create_share(State(state.clone()), auth, Json(request))
+        .await
+        .unwrap();
+    let open = Some(Json(OpenShareRequest::default()));
+    let opened = open_share(
+        State(state.clone()),
+        peer(),
+        share_headers(&link.token),
+        open,
+    )
+    .await;
+    let visit = opened.unwrap().0.visit_token;
+    let Json(dataset) = read_dataset(State(state.clone()), share_headers(&visit))
+        .await
+        .unwrap();
+    let ids: Vec<_> = (dataset.files.iter())
+        .map(|file| file.entity_id.clone())
+        .collect();
+    assert_eq!(ids, std::slice::from_ref(&content));
+    let request = Json(DatasetTicketRequest {
+        entity_id: content,
+        name: None,
+    });
+    let ticket = dataset_ticket(State(state.clone()), share_headers(&visit), request).await;
+    let ticket = ticket
+        .unwrap()
+        .0
+        .path
+        .split_once("ticket=")
+        .unwrap()
+        .1
+        .to_string();
+    let query = Query(DownloadQuery { ticket });
+    let response = download_file(State(state.clone()), peer(), HeaderMap::new(), query).await;
+    let bytes = to_bytes(response.unwrap().into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), b"remote");
+    server.abort();
 }

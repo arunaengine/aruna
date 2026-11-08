@@ -219,7 +219,7 @@ async fn local_parts(
                     .map(|index| (index.bucket, index.key, index.version_id));
                 let found = match local {
                     Some(found) => Some(found),
-                    None => member_content(state, *hash).await,
+                    None => member_content(state, link, *hash).await,
                 };
                 let Some((bucket, key, version_id)) = found else {
                     continue;
@@ -279,17 +279,35 @@ async fn member_sets(state: &ServerState, named: NamedSets) -> Vec<MemberSet> {
     sets
 }
 
-/// The first version of `hash` in a set this node is a bound member of, by the sets' content
-/// indexes; no other part needs to name that set.
-async fn member_content(state: &ServerState, hash: [u8; 32]) -> Option<(String, String, Ulid)> {
+/// The first version of `hash` in a set this node is a bound member of that the link's
+/// creator may read, by the sets' content indexes; no other part needs to name that set.
+async fn member_content(
+    state: &ServerState,
+    link: &ShareLink,
+    hash: [u8; 32],
+) -> Option<(String, String, Ulid)> {
     let deadline = Instant::now() + RESOLVE_TIMEOUT;
     let found = resolve_content(&state.get_ctx(), hash, deadline).await;
     for found in found.versions {
-        if bound_here(state, found.set_id, &found.bucket).await {
+        let (bucket, key) = (found.bucket.as_str(), found.key.as_str());
+        if bound_here(state, found.set_id, bucket).await
+            && reads_object(state, link, bucket, key).await
+        {
             return Some((found.bucket, found.key, found.version_id));
         }
     }
     None
+}
+
+/// Whether the link's creator may read `key` of `bucket` for this visit now.
+async fn reads_object(state: &ServerState, link: &ShareLink, bucket: &str, key: &str) -> bool {
+    let Ok((bucket, info, auth)) = object_scope(state, link, bucket, key).await else {
+        return false;
+    };
+    let permission = (Permission::READ, "share.read");
+    authorize_object(state, &auth, (&bucket, &info), key, permission)
+        .await
+        .is_ok()
 }
 
 /// Whether this node's bucket `bucket` is the admitted member of `set_id`.
@@ -393,15 +411,7 @@ pub async fn read_dataset(
         // A part in a bucket this node does not hold is skipped, never the whole dataset.
         let readable = match part.folder {
             true => bucket_info(&state, &part.bucket).await.is_ok(),
-            false => match object_scope(&state, &link, &part.bucket, &part.key).await {
-                Ok((bucket, info, auth)) => {
-                    let permission = (Permission::READ, "share.read");
-                    authorize_object(&state, &auth, (&bucket, &info), &part.key, permission)
-                        .await
-                        .is_ok()
-                }
-                Err(_) => false,
-            },
+            false => reads_object(&state, &link, &part.bucket, &part.key).await,
         };
         if readable {
             visible.push(DatasetFileView {
