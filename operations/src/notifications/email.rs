@@ -17,6 +17,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{EMAIL_KEYSPACE, USER_KEYSPACE};
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
+pub use aruna_core::structs::execution::email::SmtpTls;
 use aruna_core::structs::execution::email::{
     EMAIL_CATEGORIES, EmailDeliverySpec, EmailPreference, email_key,
 };
@@ -44,16 +45,6 @@ use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
 
 /// Time one SMTP exchange may take; the job runtime retries a timed out attempt.
 const SMTP_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SmtpTls {
-    /// Plain connection upgraded with STARTTLS, which must succeed.
-    Starttls,
-    /// TLS from the first byte.
-    Tls,
-    /// No TLS, for a relay on the same host or network only.
-    Plain,
-}
 
 /// The one SMTP profile of a node.
 #[derive(Clone, PartialEq, Eq)]

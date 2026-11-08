@@ -219,6 +219,8 @@ pub struct RealmConfigDocument {
     pub portal_features: BTreeMap<String, bool>,
     /// Whether replicas count toward group quotas; set with the quota policy.
     pub replica_quota: ReplicaQuota,
+    /// The realm SMTP profile; a conflict or a removal turns email off.
+    pub email: Option<crate::structs::execution::email::RealmEmailProfile>,
     /// Sealed realm vault records, sorted by entry key. A conflicting or deleted entry is absent.
     pub vault: Vec<crate::realm_vault::RealmVaultRecord>,
 }
@@ -581,9 +583,10 @@ impl RealmConfigDocument {
         // Exclude request policies because they do not route requests; each receiver enforces its local set,
         // and nodes without a realm-config bucket may never observe them.
         canonical.request_policies.clear();
-        // Exclude federation settings, portal features and the vault: they never route requests.
+        // Exclude federation, portal features, email and the vault: they never route requests.
         canonical.federation = None;
         canonical.portal_features.clear();
+        canonical.email = None;
         canonical.vault.clear();
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
@@ -624,6 +627,7 @@ impl RealmConfigDocument {
             federation: None,
             portal_features: BTreeMap::new(),
             replica_quota: ReplicaQuota::default(),
+            email: None,
             vault: Vec::new(),
         }
     }
@@ -1335,6 +1339,7 @@ mod test {
             federation: None,
             portal_features: BTreeMap::new(),
             replica_quota: Default::default(),
+            email: None,
             vault: Vec::new(),
         };
         let actor = Actor {
@@ -1479,10 +1484,21 @@ mod test {
 
     #[test]
     fn digest_ignores_vault() {
-        // Vault records never route requests; a rotation must not reject forwarded writes.
+        // Email and vault records never route requests; a change must not reject forwarded writes.
         use crate::realm_vault::{RealmVaultEntry, RealmVaultPurpose, RealmVaultRecord};
         let config = RealmConfigDocument::new(RealmId([7u8; 32]), Vec::new(), 3);
         let mut sealed = config.clone();
+        sealed.email = Some(crate::structs::execution::email::RealmEmailProfile {
+            revision: Ulid::from_bytes([6; 16]),
+            host: "smtp.example.org".to_string(),
+            port: None,
+            tls: crate::structs::execution::email::SmtpTls::Starttls,
+            username: None,
+            from: "aruna@example.org".to_string(),
+            password: None,
+            changed_by: crate::UserId::local(Ulid::from_bytes([4; 16]), config.realm_id),
+            changed_at_ms: 5,
+        });
         sealed.vault.push(RealmVaultRecord {
             entry: RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, Ulid::from_bytes([1; 16])),
             revision: Ulid::from_bytes([2; 16]),
@@ -1936,6 +1952,7 @@ mod test {
             federation: None,
             portal_features: BTreeMap::new(),
             replica_quota: Default::default(),
+            email: None,
             vault: Vec::new(),
         };
 

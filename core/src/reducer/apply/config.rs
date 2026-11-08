@@ -67,6 +67,15 @@ impl AdminDocumentState {
                     .map_err(|_| AdminDocumentError::InvalidVaultRecord)?;
                 self.apply_node_value(event, vault_entry_path(entry), value);
             }
+            AdminDocumentOperation::ConfigEmailSet { profile } => {
+                if profile.as_ref().is_some_and(|profile| !profile.valid()) {
+                    return Err(AdminDocumentError::InvalidEmailProfile);
+                }
+                let value = (profile.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidEmailProfile)?;
+                self.apply_node_value(event, CONFIG_EMAIL_PATH.to_string(), value);
+            }
             AdminDocumentOperation::ConfigReplicasSet { replicas } => {
                 let value = replicas_value(replicas);
                 self.apply_config_setting(event, CONFIG_REPLICAS_PATH, value);

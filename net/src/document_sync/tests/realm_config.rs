@@ -3024,3 +3024,90 @@ async fn kind_conflict_withholds() {
         .is_some()
     );
 }
+
+#[tokio::test]
+async fn email_vault_replicate() {
+    // Set, replace and delete of the profile and its vault entry reach a second node unchanged.
+    use aruna_core::realm_vault::{
+        RealmSecretRef, RealmVaultEntry, RealmVaultPurpose, RealmVaultRecord,
+    };
+    use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
+    let realm_id = RealmId::from_bytes([58; 32]);
+    let user = UserId::local(Ulid::from_parts(1_620, 1), realm_id);
+    let actor = test_actor(9, user, realm_id);
+    let target = AdminDocumentTarget::RealmConfig { realm_id };
+    let document = DocumentTarget::RealmConfig { realm_id };
+    let entry = RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, Ulid::from_parts(1_621, 1));
+    let record = |revision: u128| RealmVaultRecord {
+        entry,
+        revision: Ulid::from_parts(1_622, revision),
+        sealed: vec![revision as u8; 40],
+        changed_by: user,
+        changed_at_ms: 1,
+    };
+    let profile = |revision: u128| RealmEmailProfile {
+        revision: Ulid::from_parts(1_623, revision),
+        host: "smtp.example.org".to_string(),
+        port: Some(587),
+        tls: SmtpTls::Starttls,
+        username: Some("aruna".to_string()),
+        from: "aruna@example.org".to_string(),
+        password: Some(RealmSecretRef {
+            entry,
+            revision: Ulid::from_parts(1_622, revision),
+        }),
+        changed_by: user,
+        changed_at_ms: 1,
+    };
+    let operations = [
+        AdminDocumentOperation::ConfigSettingsSet {
+            metadata_replication: MetadataReplicationConfig::new(3),
+            discovery: test_discovery(25, "https://email.example:443"),
+        },
+        AdminDocumentOperation::ConfigVaultSet {
+            entry,
+            record: Some(record(1)),
+        },
+        AdminDocumentOperation::ConfigEmailSet {
+            profile: Some(profile(1)),
+        },
+        AdminDocumentOperation::ConfigVaultSet {
+            entry,
+            record: Some(record(2)),
+        },
+        AdminDocumentOperation::ConfigEmailSet {
+            profile: Some(profile(2)),
+        },
+        AdminDocumentOperation::ConfigVaultSet {
+            entry,
+            record: None,
+        },
+        AdminDocumentOperation::ConfigEmailSet { profile: None },
+    ];
+    let (_first_dir, first) = test_storage();
+    let (_second_dir, second) = test_storage();
+    let mut seen = Vec::new();
+    for (seq, op) in operations.into_iter().enumerate() {
+        let event = test_admin_event(
+            Ulid::from_parts(1_624, seq as u128),
+            target.clone(),
+            &actor,
+            seq as u64 + 1,
+            op,
+        );
+        for storage in [&first, &second] {
+            apply_admin_operation(storage, document.clone(), event.clone())
+                .await
+                .expect("event applies");
+        }
+        let configs = [
+            stored_realm_config(&first, realm_id).await,
+            stored_realm_config(&second, realm_id).await,
+        ];
+        assert_eq!(configs[0], configs[1]);
+        seen.push((configs[1].email.clone(), configs[1].vault.clone()));
+    }
+    assert_eq!(seen[2], (Some(profile(1)), vec![record(1)]));
+    assert_eq!(seen[4], (Some(profile(2)), vec![record(2)]));
+    assert_eq!(seen[6], (None, Vec::new()));
+}

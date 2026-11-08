@@ -988,3 +988,58 @@ fn vault_conflict_absent() {
     first.apply(&tombstone).unwrap();
     assert!(first.materialized_realm_vault().is_empty());
 }
+
+fn email_set(host: Option<&str>) -> AdminDocumentOperation {
+    use crate::structs::execution::email::{RealmEmailProfile, SmtpTls};
+    let profile = host.map(|host| RealmEmailProfile {
+        revision: Ulid::from_bytes([1; 16]),
+        host: host.to_string(),
+        port: Some(587),
+        tls: SmtpTls::Starttls,
+        username: None,
+        from: "aruna@example.org".to_string(),
+        password: None,
+        changed_by: UserId::local(Ulid::from_bytes([9; 16]), realm_id()),
+        changed_at_ms: 1,
+    });
+    AdminDocumentOperation::ConfigEmailSet { profile }
+}
+
+#[test]
+fn email_conflict_off() {
+    // A profile conflict means no email on every node, whatever the order; a later write resolves it.
+    let base = AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+        realm_id: realm_id(),
+    });
+    let mut first = base.clone();
+    let one = first
+        .apply_operation(&actor(node(1)), email_set(Some("one.example.org")))
+        .unwrap();
+    assert_eq!(
+        first.materialized_realm_email().map(|profile| profile.host),
+        Some("one.example.org".to_string())
+    );
+    let mut second = base.clone();
+    let two = second
+        .apply_operation(&actor(node(2)), email_set(Some("two.example.org")))
+        .unwrap();
+    first.apply(&two).unwrap();
+    second.apply(&one).unwrap();
+    for state in [&first, &second] {
+        assert_eq!(state.materialized_realm_email(), None);
+        assert_eq!(state.realm_email_candidates().len(), 2);
+    }
+    first
+        .apply_operation(&actor(node(1)), email_set(Some("three.example.org")))
+        .unwrap();
+    assert_eq!(first.realm_email_candidates().len(), 1);
+    first
+        .apply_operation(&actor(node(1)), email_set(None))
+        .unwrap();
+    assert_eq!(first.materialized_realm_email(), None);
+    assert!(first.realm_email_candidates().is_empty());
+    assert_eq!(
+        first.apply_operation(&actor(node(1)), email_set(Some(" "))),
+        Err(AdminDocumentError::InvalidEmailProfile)
+    );
+}

@@ -9,6 +9,7 @@ use ulid::Ulid;
 
 use crate::UserId;
 use crate::errors::ConversionError;
+use crate::realm_vault::{RealmSecretRef, RealmVaultPurpose};
 use crate::structs::execution::notification::NotificationRecord;
 
 /// The notification categories a user may receive by email.
@@ -39,6 +40,47 @@ impl EmailPreference {
 
 pub fn email_key(user_id: &UserId) -> Vec<u8> {
     user_id.to_bytes()
+}
+
+/// How a connection to the mail server is secured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SmtpTls {
+    /// Plain connection upgraded with STARTTLS, which must succeed.
+    Starttls,
+    /// TLS from the first byte.
+    Tls,
+    /// No TLS, for a relay on the same host or network only.
+    Plain,
+}
+
+/// The SMTP profile every infrastructure node of the realm sends notification emails with.
+/// The password is a realm vault entry; the profile only points at one revision of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealmEmailProfile {
+    /// New on every change; nodes key their mail sender by it.
+    pub revision: Ulid,
+    pub host: String,
+    pub port: Option<u16>,
+    pub tls: SmtpTls,
+    pub username: Option<String>,
+    pub from: String,
+    /// `None` sends without SMTP authentication.
+    pub password: Option<RealmSecretRef>,
+    pub changed_by: UserId,
+    pub changed_at_ms: u64,
+}
+
+impl RealmEmailProfile {
+    /// A host and sender are set, a password comes with a username and is an SMTP password entry.
+    pub fn valid(&self) -> bool {
+        let filled = |text: &str| !text.trim().is_empty() && !text.chars().any(char::is_control);
+        filled(&self.host)
+            && filled(&self.from)
+            && self.username.as_deref().is_none_or(filled)
+            && (self.password).is_none_or(|password| {
+                self.username.is_some() && password.entry.purpose == RealmVaultPurpose::SmtpPassword
+            })
+    }
 }
 
 /// One email for one notification to the address of `preference_id`.

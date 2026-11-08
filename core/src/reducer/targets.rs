@@ -325,6 +325,34 @@ impl AdminDocumentState {
             .and_then(|value| serde_json::from_str(value).ok())
     }
 
+    /// The realm email profile; never set, removed and conflicting profiles all mean no email.
+    pub fn materialized_realm_email(
+        &self,
+    ) -> Option<crate::structs::execution::email::RealmEmailProfile> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return None;
+        }
+        self.user_subject_ids
+            .get(CONFIG_EMAIL_PATH)
+            .and_then(|version| version.value.as_deref())
+            .and_then(|value| serde_json::from_str(value).ok())
+    }
+
+    /// The current profile and every conflicting one, so a resolving write can retire their entries.
+    pub fn realm_email_candidates(
+        &self,
+    ) -> Vec<crate::structs::execution::email::RealmEmailProfile> {
+        let conflicting = (self.conflicts.get(CONFIG_EMAIL_PATH).into_iter())
+            .flat_map(|conflict| &conflict.values)
+            .filter_map(|candidate| candidate.value.as_deref());
+        (self.user_subject_ids.get(CONFIG_EMAIL_PATH))
+            .and_then(|version| version.value.as_deref())
+            .into_iter()
+            .chain(conflicting)
+            .filter_map(|value| serde_json::from_str(value).ok())
+            .collect()
+    }
+
     /// Realm vault records sorted by entry key. A never set, deleted or conflicting entry is absent.
     pub fn materialized_realm_vault(&self) -> Vec<crate::realm_vault::RealmVaultRecord> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {

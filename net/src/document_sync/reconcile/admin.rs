@@ -850,6 +850,7 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::ConfigTokenRevoked { .. }
             | AdminDocumentOperation::MergeCoordinatorSet { .. }
             | AdminDocumentOperation::ConfigVaultSet { .. }
+            | AdminDocumentOperation::ConfigEmailSet { .. }
     )
 }
 

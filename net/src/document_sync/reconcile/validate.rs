@@ -1598,6 +1598,13 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("realm vault record is malformed".to_string());
             }
         }
+        AdminDocumentOperation::ConfigEmailSet {
+            profile: Some(profile),
+        } => {
+            if !profile.valid() {
+                return Err("realm email profile is malformed".to_string());
+            }
+        }
         AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
@@ -1820,6 +1827,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::NodePlaceSet { .. }
         | AdminDocumentOperation::MergeCoordinatorSet { .. }
         | AdminDocumentOperation::ConfigVaultSet { .. }
+        | AdminDocumentOperation::ConfigEmailSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
         AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
     };
