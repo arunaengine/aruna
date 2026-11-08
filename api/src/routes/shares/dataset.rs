@@ -6,33 +6,45 @@
 use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::{AuthContext, Permission, SessionKind, SessionRef};
-use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::share::{ShareLink, ShareTarget, TicketBody};
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
+use aruna_operations::distribution::guard::bound_view;
+use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content, resolve_version};
+use aruna_operations::distribution::status::read_view;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{
     ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
 };
 use aruna_operations::metadata::forward::export_rocrate_here;
-use aruna_operations::shares::dataset::{DatasetFile, FilePlace, dataset_files};
-use aruna_operations::shares::rules::{exact_pattern, relative_path, visit_context};
+use aruna_operations::shares::dataset::{
+    DatasetFile, FilePlace, MemberSet, NamedSets, dataset_files, named_sets,
+};
+use aruna_operations::shares::rules::{
+    NodeScope, bucket_pattern, exact_pattern, relative_path, visit_context,
+};
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
 use ulid::Ulid;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use super::relay::share_access;
 use super::visit::{
-    TicketResponse, VisitListQuery, VisitListing, authorize_object, current_version, list_below,
+    TicketResponse, VisitListQuery, VisitListing, authorize_object, head_version, list_below,
     sign_ticket, unavailable, visit_scope, visited_link,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
+
+/// How long resolving one global version or content hash of a dataset may take.
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(OpenApi)]
 #[openapi()]
@@ -187,8 +199,10 @@ async fn local_parts(
     let rocrate: serde_json::Value = serde_json::from_str(&jsonld)
         .map_err(|error| ServerError::InternalError(error.to_string()))?;
     let (realm, node) = (state.get_realm_id(), state.get_node_id());
+    let named = named_sets(&rocrate, &record.graph_iri, realm);
+    let sets = member_sets(state, named).await;
     let mut parts = Vec::new();
-    for file in dataset_files(&rocrate, &record.graph_iri, realm, node) {
+    for file in dataset_files(&rocrate, &record.graph_iri, (realm, node), &sets) {
         let (bucket, key, version_id, folder) = match &file.place {
             FilePlace::Object {
                 bucket,
@@ -200,13 +214,28 @@ async fn local_parts(
                 let indexed = drive(ResolvePathsOperation::new(*hash), &state.get_ctx())
                     .await
                     .unwrap_or_default();
-                let Some(index) = indexed
-                    .into_iter()
+                let local = (indexed.into_iter())
                     .find(|index| index.realm_id == realm && index.node_id == node)
-                else {
+                    .map(|index| (index.bucket, index.key, index.version_id));
+                let found = match local {
+                    Some(found) => Some(found),
+                    None => member_content(state, *hash, &sets).await,
+                };
+                let Some((bucket, key, version_id)) = found else {
                     continue;
                 };
-                (index.bucket, index.key, Some(index.version_id), false)
+                (bucket, key, Some(version_id), false)
+            }
+            FilePlace::Version(version_id) => {
+                let deadline = Instant::now() + RESOLVE_TIMEOUT;
+                let resolved = resolve_version(&state.get_ctx(), *version_id, deadline).await;
+                let GlobalResolution::Found(found) = resolved else {
+                    continue;
+                };
+                if !sets.iter().any(|set| set.set_id == found.set_id) {
+                    continue;
+                }
+                (found.bucket, found.key, Some(found.version_id), false)
             }
         };
         parts.push(LocalPart {
@@ -220,8 +249,54 @@ async fn local_parts(
     Ok((document_id, rocrate, parts))
 }
 
-/// The ordinary bucket of one part and the creator narrowed to `pattern` in it; `pattern`
-/// gets the bucket's permission path ending with `/`.
+/// The member sets among the buckets and sets a dataset names: distributed buckets this node is
+/// a bound member of. A bucket or set this node cannot read is left out.
+async fn member_sets(state: &ServerState, named: NamedSets) -> Vec<MemberSet> {
+    let context = state.get_ctx();
+    let mut buckets = named.buckets;
+    for set_id in named.sets {
+        if let Ok(Some(view)) = read_view(&context, set_id).await {
+            buckets.insert(view.snapshot().config.bucket.clone());
+        }
+    }
+    let mut sets = Vec::new();
+    for bucket in buckets {
+        let Ok(info) = bucket_info(state, &bucket).await else {
+            continue;
+        };
+        let Some(binding) = info.distribution.as_ref() else {
+            continue;
+        };
+        if let Ok(view) = bound_view(&context, binding).await {
+            let members = &view.snapshot().config.members;
+            sets.push(MemberSet {
+                set_id: binding.set_id,
+                bucket,
+                nodes: members.iter().map(|member| member.node_id).collect(),
+            });
+        }
+    }
+    sets
+}
+
+/// The first version of `hash` in one of `sets`, by the sets' content indexes.
+async fn member_content(
+    state: &ServerState,
+    hash: [u8; 32],
+    sets: &[MemberSet],
+) -> Option<(String, String, Ulid)> {
+    if sets.is_empty() {
+        return None;
+    }
+    let deadline = Instant::now() + RESOLVE_TIMEOUT;
+    let found = resolve_content(&state.get_ctx(), hash, deadline).await;
+    (found.versions.into_iter())
+        .find(|found| sets.iter().any(|set| set.set_id == found.set_id))
+        .map(|found| (found.bucket, found.key, found.version_id))
+}
+
+/// The bucket of one part and the creator narrowed to `pattern` in it; `pattern` gets the
+/// pattern of the bucket's permission path, on every member of a distributed one, with `/`.
 async fn part_scope(
     state: &ServerState,
     link: &ShareLink,
@@ -231,17 +306,9 @@ async fn part_scope(
     let info = bucket_info(state, bucket)
         .await
         .map_err(|_| unavailable())?;
-    if info.distribution.is_some() {
-        return Err(unavailable());
-    }
-    let base = object_permission_path(
-        state.get_realm_id(),
-        info.group_id,
-        state.get_node_id(),
-        bucket,
-        "",
-    );
-    let auth = visit_context(link, state.get_realm_id(), pattern(&base));
+    let nodes = NodeScope::of(&info, state.get_node_id());
+    let base = bucket_pattern(state.get_realm_id(), info.group_id, nodes, bucket);
+    let auth = visit_context(link, state.get_realm_id(), pattern(&format!("{base}/")));
     Ok((bucket.to_string(), info, auth))
 }
 
@@ -253,7 +320,7 @@ async fn object_scope(
     key: &str,
 ) -> ServerResult<(String, BucketInfo, AuthContext)> {
     part_scope(state, link, bucket, |base| {
-        exact_pattern(&format!("{base}{key}"))
+        format!("{base}{}", exact_pattern(key))
     })
     .await
 }
@@ -292,9 +359,12 @@ pub(crate) async fn ticket_scope(
 **Authentication**: `Authorization: Share <visit token>` of a dataset link.
 
 **Behavior**
-- Files and folder or bucket parts of ordinary buckets on this node are listed; a folder part
-  is browsed with `/shares/visit/dataset/files`.
-- Parts on other nodes, in distributed buckets or outside Aruna stay in the metadata only.
+- Files and folder or bucket parts on this node are listed; a folder part is browsed with
+  `/shares/visit/dataset/files`.
+- Parts of distributed buckets this node is a member of are listed too, named by set, by
+  global version, by content hash or by another member's ARN; other members serve their keys.
+- Parts on other nodes, in other distributed buckets or outside Aruna stay in the metadata
+  only.
 - Files the creator can no longer read, and parts in buckets this node lacks, are left out."#,
     responses(
         (status = 200, description = "The dataset and its local parts", body = DatasetView, example = json!({"dataset_id": "01JMETADATA0123456789ABCDE", "rocrate": {"@context": "https://w3id.org/ro/crate/1.2/context", "@graph": []}, "files": [{"entity_id": "https://w3id.org/aruna/data/<blake3>", "name": "table.csv", "kind": "file"}]})),
@@ -313,9 +383,7 @@ pub async fn read_dataset(
     for part in parts {
         // A part in a bucket this node does not hold is skipped, never the whole dataset.
         let readable = match part.folder {
-            true => bucket_info(&state, &part.bucket)
-                .await
-                .is_ok_and(|info| info.distribution.is_none()),
+            true => bucket_info(&state, &part.bucket).await.is_ok(),
             false => match object_scope(&state, &link, &part.bucket, &part.key).await {
                 Ok((bucket, info, auth)) => {
                     let permission = (Permission::READ, "share.read");
@@ -386,7 +454,7 @@ pub async fn list_part(
     }
     let prefix = part.key.clone();
     let (bucket, info, auth) = part_scope(&state, &link, &part.bucket, |base| {
-        format!("{}**", exact_pattern(&format!("{base}{prefix}")))
+        format!("{base}{}**", exact_pattern(&prefix))
     })
     .await?;
     let list = VisitListQuery {
@@ -444,7 +512,10 @@ pub async fn dataset_ticket(
     authorize_object(&state, &auth, (&bucket, &info), &key, permission).await?;
     let version = match part.version_id {
         Some(version) => Some(version),
-        None => current_version(&state, &bucket, &key).await?,
+        None => {
+            let user = share_access(&state, &link, &auth, visit_end);
+            head_version(&state, (&bucket, &info), &key, &user).await?
+        }
     };
     Ok(Json(sign_ticket(
         (&link, visit_end),

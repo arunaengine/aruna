@@ -459,3 +459,92 @@ async fn ended_link_refused() {
     let listed = page(&shared, &opened, ("", None, None)).await.unwrap_err();
     assert_eq!(code(listed), "share_unavailable");
 }
+
+/// A peer S3 endpoint that lists `x/a.txt` for every listing and serves it for every read.
+async fn listing_peer() -> (String, tokio::task::JoinHandle<()>) {
+    let answer = |uri: http::Uri| async move {
+        let listing = uri
+            .query()
+            .is_some_and(|query| query.contains("list-type=2"));
+        let body = match listing {
+            true => {
+                "<ListBucketResult><Contents><Key>x/a.txt</Key><Size>6</Size>\
+                     <LastModified>2026-10-30T08:00:00.000Z</LastModified></Contents>\
+                     </ListBucketResult>"
+            }
+            false => "remote",
+        };
+        let headers = [("x-amz-version-id", "01ARZ3NDEKTSV4RRFFQ69G5FAV")];
+        (http::StatusCode::OK, headers, body)
+    };
+    crate::tests::assistant::spawn_mock(axum::Router::new().fallback(answer)).await
+}
+
+// A dataset whose folder part lies in another member's range is browsed and downloaded
+// through the link's member.
+#[tokio::test]
+async fn dataset_member_folder() {
+    use super::dataset::{
+        DatasetTicketRequest, PartQuery, dataset_ticket, list_part, read_dataset,
+    };
+    use crate::tests::distributed::{PEER, distribute, node_id, publish_urls};
+    let test = crate::routes::metadata::tests::setup_network_state().await;
+    let state = test.state.clone();
+    distribute(&state, test.group_id, "spire").await;
+    let (url, server) = listing_peer().await;
+    publish_urls(&state, node_id(PEER), (&url, Some(&url))).await;
+    let folder = format!(
+        "arn:aruna:{}:{}:s3/spire/x/",
+        state.get_realm_id(),
+        state.get_node_id()
+    );
+    let document_id = crate::tests::datasets::describe(&test, "/shared", false, &folder).await;
+    let request = CreateShareRequest {
+        target: ShareTargetBody::Dataset {
+            dataset_id: document_id.to_string(),
+        },
+        mode: ShareModeBody::Read,
+        label: String::new(),
+        expires_at: None,
+        password: None,
+    };
+    let auth = Extension(Some(test.auth.clone()));
+    let (_, Json(link)) = create_share(State(state.clone()), auth, Json(request))
+        .await
+        .unwrap();
+    let open = Some(Json(OpenShareRequest::default()));
+    let headers = share_headers(&link.token);
+    let opened = open_share(State(state.clone()), peer(), headers, open).await;
+    let visit = opened.unwrap().0.visit_token;
+    let Json(dataset) = read_dataset(State(state.clone()), share_headers(&visit))
+        .await
+        .unwrap();
+    assert_eq!(dataset.files.len(), 1, "{:?}", dataset.files);
+    assert_eq!(dataset.files[0].kind, "folder");
+    let part = dataset.files[0].entity_id.clone();
+    let query = Query(PartQuery {
+        part: part.clone(),
+        prefix: None,
+        cursor: None,
+        limit: None,
+    });
+    let Json(listed) = list_part(State(state.clone()), share_headers(&visit), query)
+        .await
+        .unwrap();
+    let names: Vec<_> = listed.files.iter().map(|file| file.name.as_str()).collect();
+    assert_eq!(names, ["a.txt"]);
+    let request = Json(DatasetTicketRequest {
+        entity_id: part,
+        name: Some("a.txt".to_string()),
+    });
+    let ticket = dataset_ticket(State(state.clone()), share_headers(&visit), request).await;
+    let Json(ticket) = ticket.unwrap();
+    let ticket = ticket.path.split_once("ticket=").unwrap().1.to_string();
+    let query = Query(DownloadQuery { ticket });
+    let response = download_file(State(state.clone()), peer(), HeaderMap::new(), query).await;
+    let bytes = to_bytes(response.unwrap().into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), b"remote");
+    server.abort();
+}
