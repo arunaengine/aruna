@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod email;
 pub mod harvest;
 pub mod job;
 pub mod notification;
@@ -11,3 +12,4 @@ pub mod source_access;
 pub mod source_connector;
 pub mod staging;
 pub mod table;
+pub mod webhook;

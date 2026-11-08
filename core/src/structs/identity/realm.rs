@@ -219,6 +219,10 @@ pub struct RealmConfigDocument {
     pub portal_features: BTreeMap<String, bool>,
     /// Whether replicas count toward group quotas; set with the quota policy.
     pub replica_quota: ReplicaQuota,
+    /// The realm SMTP profile; a conflict or a removal turns email off.
+    pub email: Option<crate::structs::execution::email::RealmEmailProfile>,
+    /// Sealed realm vault records, sorted by entry key. A conflicting or deleted entry is absent.
+    pub vault: Vec<crate::realm_vault::RealmVaultRecord>,
 }
 
 pub const MAX_PORTAL_FEATURES: usize = 64;
@@ -579,9 +583,11 @@ impl RealmConfigDocument {
         // Exclude request policies because they do not route requests; each receiver enforces its local set,
         // and nodes without a realm-config bucket may never observe them.
         canonical.request_policies.clear();
-        // Exclude federation settings and portal features: they never route requests.
+        // Exclude federation, portal features, email and the vault: they never route requests.
         canonical.federation = None;
         canonical.portal_features.clear();
+        canonical.email = None;
+        canonical.vault.clear();
         let encoded = postcard::to_allocvec(&canonical)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"aruna-realm-config-v1");
@@ -621,6 +627,8 @@ impl RealmConfigDocument {
             federation: None,
             portal_features: BTreeMap::new(),
             replica_quota: ReplicaQuota::default(),
+            email: None,
+            vault: Vec::new(),
         }
     }
 
@@ -1331,6 +1339,8 @@ mod test {
             federation: None,
             portal_features: BTreeMap::new(),
             replica_quota: Default::default(),
+            email: None,
+            vault: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -1358,7 +1368,7 @@ mod test {
     fn config_bytes_canonical() {
         // Pins the canonical wire form. Postcard is positional, so the field
         // occupies a fixed slot that a shorter encoding cannot satisfy.
-        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712c0ee6d00000000";
+        const ENCODED: &str = "01010101010101010101010101010101010101010101010101010101010101010300000001020001026e300101ac023c00006e5500010300000000000000001a3032303831303430473230383130343047323038313034304732000000000000000000000000a0f8fa05e0a712b0ea01000000000000000000e0a712c0ee6d000000000000";
         let mut config = RealmConfigDocument::new(RealmId([1u8; 32]), Vec::new(), 3);
         config.family_strategy_id = Ulid::from_bytes([2u8; 16]);
 
@@ -1470,6 +1480,36 @@ mod test {
         });
 
         assert_eq!(config.digest().unwrap(), denied.digest().unwrap());
+    }
+
+    #[test]
+    fn digest_ignores_vault() {
+        // Email and vault records never route requests; a change must not reject forwarded writes.
+        use crate::realm_vault::{RealmVaultEntry, RealmVaultPurpose, RealmVaultRecord};
+        let config = RealmConfigDocument::new(RealmId([7u8; 32]), Vec::new(), 3);
+        let mut sealed = config.clone();
+        sealed.email = Some(crate::structs::execution::email::RealmEmailProfile {
+            revision: Ulid::from_bytes([6; 16]),
+            host: "smtp.example.org".to_string(),
+            port: None,
+            tls: crate::structs::execution::email::SmtpTls::Starttls,
+            username: None,
+            from: "aruna@example.org".to_string(),
+            password: None,
+            changed_by: crate::UserId::local(Ulid::from_bytes([4; 16]), config.realm_id),
+            changed_at_ms: 5,
+        });
+        sealed.vault.push(RealmVaultRecord {
+            entry: RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, Ulid::from_bytes([1; 16])),
+            revision: Ulid::from_bytes([2; 16]),
+            sealed: vec![3; 40],
+            changed_by: crate::UserId::local(Ulid::from_bytes([4; 16]), config.realm_id),
+            changed_at_ms: 5,
+        });
+
+        assert_eq!(config.digest().unwrap(), sealed.digest().unwrap());
+        let bytes = postcard::to_allocvec(&sealed).unwrap();
+        assert_eq!(RealmConfigDocument::from_bytes(&bytes).unwrap(), sealed);
     }
 
     #[test]
@@ -1912,6 +1952,8 @@ mod test {
             federation: None,
             portal_features: BTreeMap::new(),
             replica_quota: Default::default(),
+            email: None,
+            vault: Vec::new(),
         };
 
         assert_eq!(document.replication_factor_for(other_group_id, None), 3);
@@ -2317,6 +2359,8 @@ mod test {
             &config.federation,
             &config.portal_features,
             &config.replica_quota,
+            &config.email,
+            &config.vault,
         ))
         .expect("tail encodes");
         assert!(encoded.ends_with(&tail));

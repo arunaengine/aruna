@@ -424,6 +424,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
             range_turns: Default::default(),
+            mail: Default::default(),
         };
         let mut checkpoint = checkpoint();
         // Digests an earlier chunk stored, and one of another folder's manifest.

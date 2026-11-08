@@ -1166,6 +1166,7 @@ impl OperationsTaskHandler {
                     .await;
                 }
                 refresh_target_interest(self.context.as_ref(), &refresh_targets).await;
+                crate::notifications::email::config_applied(self.context.as_ref(), &targets).await;
                 let project_started = Instant::now();
                 let projected = self
                     .project_create_events(retry_key, targets, metadata_create_events)

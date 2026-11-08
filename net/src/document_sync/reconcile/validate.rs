@@ -1589,6 +1589,22 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("node place is empty or not valid".to_string());
             }
         }
+        // The purpose tag is checked when the event decodes; management origin in the authority.
+        AdminDocumentOperation::ConfigVaultSet {
+            entry,
+            record: Some(record),
+        } => {
+            if record.entry != *entry || record.sealed.is_empty() {
+                return Err("realm vault record is malformed".to_string());
+            }
+        }
+        AdminDocumentOperation::ConfigEmailSet {
+            profile: Some(profile),
+        } => {
+            if !profile.valid() {
+                return Err("realm email profile is malformed".to_string());
+            }
+        }
         AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
@@ -1810,6 +1826,8 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::NodeNameSet { .. }
         | AdminDocumentOperation::NodePlaceSet { .. }
         | AdminDocumentOperation::MergeCoordinatorSet { .. }
+        | AdminDocumentOperation::ConfigVaultSet { .. }
+        | AdminDocumentOperation::ConfigEmailSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
         AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
     };

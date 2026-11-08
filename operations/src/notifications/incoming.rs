@@ -27,6 +27,7 @@ use crate::notifications::client::{
     close_stream, drain_request_stream, read_message, write_message,
 };
 use crate::notifications::dispatch::{list_on_holder, mark_on_holder, unread_on_holder};
+use crate::notifications::email::enqueue_emails;
 use crate::notifications::inbox::upsert_with_report;
 use crate::notifications::mark_read::MARK_MAX_IDS;
 use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
@@ -43,6 +44,7 @@ use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE, create_holder_watch,
     delete_holder_watch,
 };
+use crate::notifications::webhook::enqueue_webhooks;
 
 const MAX_FUTURE_SKEW: u64 = 5 * 60 * 1000;
 const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -115,6 +117,17 @@ async fn build_response(
             match upsert_with_report(&context.storage_handle, &records).await {
                 Ok(outcome) => {
                     wake_recipients(net_handle, &outcome.recipients);
+                    // Every attempt queues the held records, so a delivery a failed queue left
+                    // behind is queued when the sender delivers again.
+                    if let Err(error) =
+                        enqueue_webhooks(context, local_node_id, &outcome.held).await
+                    {
+                        return NotificationTransportMessage::Reject(error);
+                    }
+                    if let Err(error) = enqueue_emails(context, local_node_id, &outcome.held).await
+                    {
+                        return NotificationTransportMessage::Reject(error);
+                    }
                     NotificationTransportMessage::DeliverAck {
                         written: outcome.written as u32,
                     }

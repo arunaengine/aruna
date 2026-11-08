@@ -212,7 +212,7 @@ impl std::fmt::Display for MetadataRequestError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MetadataHandleOptions {
     pub search_storage: MetadataSearchStorage,
     pub sync_persist_policy: FjallPersistPolicy,
@@ -223,9 +223,16 @@ pub struct MetadataHandleOptions {
     /// Test/maintenance fault injection. Tagged writes fail closed while an
     /// untagged crate continues through ordinary structural validation.
     pub profile_validation_disabled: bool,
+    /// Present on management nodes only: opens realm vault records and serves fetches.
+    pub realm_vault_key: Option<Arc<aruna_core::realm_vault::RealmVaultKey>>,
 }
 
 impl MetadataHandleOptions {
+    pub fn with_vault_key(mut self, key: aruna_core::realm_vault::RealmVaultKey) -> Self {
+        self.realm_vault_key = Some(Arc::new(key));
+        self
+    }
+
     pub fn with_search_storage(mut self, search_storage: MetadataSearchStorage) -> Self {
         self.search_storage = search_storage;
         self
@@ -280,6 +287,8 @@ struct MetadataInner {
     deferred_persist_requested: AtomicBool,
     deferred_persist_running: AtomicBool,
     profile_validation_disabled: bool,
+    realm_vault_key: Option<Arc<aruna_core::realm_vault::RealmVaultKey>>,
+    mail: std::sync::OnceLock<Arc<crate::notifications::email::MailProfiles>>,
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
     peer_contacts: PeerContacts,
     sync_pulls: crate::metadata::device_pull::PullRegistry,
@@ -557,6 +566,8 @@ impl MetadataHandle {
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
                 profile_validation_disabled: metadata_options.profile_validation_disabled,
+                realm_vault_key: metadata_options.realm_vault_key,
+                mail: std::sync::OnceLock::new(),
                 profile_shacl,
                 peer_contacts: PeerContacts::default(),
                 sync_pulls: Default::default(),
@@ -690,6 +701,20 @@ impl MetadataHandle {
 
     pub(crate) fn visibility_generation(&self) -> u64 {
         self.inner.visibility_cache.current_generation()
+    }
+
+    /// The realm vault key; only management nodes hold one.
+    pub fn realm_vault_key(&self) -> Option<Arc<aruna_core::realm_vault::RealmVaultKey>> {
+        self.inner.realm_vault_key.clone()
+    }
+
+    /// Shares the job runtime's mail senders, so every applied realm config change refreshes them.
+    pub fn share_mail(&self, mail: Arc<crate::notifications::email::MailProfiles>) {
+        let _ = self.inner.mail.set(mail);
+    }
+
+    pub fn mail(&self) -> Option<Arc<crate::notifications::email::MailProfiles>> {
+        self.inner.mail.get().cloned()
     }
 
     pub(crate) fn profile_validation_available(&self) -> bool {

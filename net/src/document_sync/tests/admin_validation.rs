@@ -172,3 +172,48 @@ fn removal_needs_management() {
         ));
     }
 }
+
+#[test]
+fn secrets_need_management() {
+    // A server or user node never writes vault records or the email profile; management does.
+    use aruna_core::realm_vault::{RealmVaultEntry, RealmVaultPurpose};
+    let realm_id = RealmId::from_bytes([62u8; 32]);
+    let mut config =
+        aruna_core::structs::identity::realm::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.ensure_node(node(1), RealmNodeKind::Management);
+    config.ensure_node(node(2), RealmNodeKind::Server);
+    let owner = UserId::nil(realm_id);
+    config.ensure_node(node(3), RealmNodeKind::User { owner });
+    let entry = RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, Ulid::from_parts(1, 1));
+    let judge = |seed: u8, op: AdminDocumentOperation| {
+        let actor = test_actor(seed, owner, realm_id);
+        let event = test_admin_event(
+            Ulid::from_parts(1_710, seed as u128),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &actor,
+            1,
+            op,
+        );
+        validate_config_authority(Some(&config), &event, None).expect("validation runs")
+    };
+    let vault = AdminDocumentOperation::ConfigVaultSet {
+        entry,
+        record: None,
+    };
+    let email = AdminDocumentOperation::ConfigEmailSet { profile: None };
+    for op in [vault, email] {
+        assert!(matches!(
+            judge(1, op.clone()),
+            AdminEventValidation::Accepted
+        ));
+        assert!(matches!(
+            judge(2, op.clone()),
+            AdminEventValidation::Rejected(_)
+        ));
+        assert!(matches!(
+            judge(3, op.clone()),
+            AdminEventValidation::Rejected(_)
+        ));
+        assert!(matches!(judge(4, op), AdminEventValidation::Rejected(_)));
+    }
+}

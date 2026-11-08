@@ -770,3 +770,23 @@ async fn delete_respects_policy() {
             .is_ok()
     );
 }
+
+#[test]
+fn gateway_names_cause() {
+    // A transient mirror failure stays a retryable 502, and its body says which failure it was.
+    let timed_out = MetadataError::Backend("sync mirror request timed out".to_string());
+    let ServerError::BadGatewayReason(reason) = map_mirror_error(timed_out) else {
+        panic!("a mirror timeout is a 502 with its reason");
+    };
+    assert!(reason.contains("sync mirror request timed out"));
+    let internal = map_mirror_error(MetadataError::Backend("mirror_internal".to_string()));
+    assert!(
+        matches!(internal, ServerError::BadGatewayReason(reason) if reason.contains("mirror_internal"))
+    );
+    let refused = map_mirror_error(MetadataError::Backend("access_denied".to_string()));
+    assert!(matches!(refused, ServerError::Forbidden));
+    assert!(matches!(
+        map_mirror_error(MetadataError::HandleMissing),
+        ServerError::BadGatewayReason(_)
+    ));
+}

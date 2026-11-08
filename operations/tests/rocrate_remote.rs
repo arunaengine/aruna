@@ -607,6 +607,7 @@ async fn claim_context(
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
+        mail: Default::default(),
     })
 }
 

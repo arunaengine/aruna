@@ -36,6 +36,7 @@ pub mod onboarding;
 pub mod operation;
 pub mod password;
 pub mod permission_path;
+pub mod realm_vault;
 pub mod recovery_code;
 pub mod reducer;
 pub mod repo_layout;

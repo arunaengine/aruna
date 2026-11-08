@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::drive;
+use crate::jobs::store::find_dedup_plan;
+use crate::metadata::api::load_realm_config;
 use crate::notifications::client::{
     create_watch_remote, delete_watch_remote, deliver_events_remote, deliver_remote, list_remote,
     list_watches_remote, mark_read_remote, send_notification_request, unread_count_remote,
@@ -11,12 +14,15 @@ use crate::notifications::inbox::upsert_inbox_records;
 use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, create_local_watch, list_watch_subscriptions,
 };
+use crate::notifications::webhook::{WebhookAction, WebhookOperation};
 use crate::sync::incoming::initialize_incoming_fixture;
 use aruna_core::UserId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, WATCH_INTEREST_KEYSPACE,
 };
+use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+use aruna_core::structs::execution::job::user_dedup_key;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
@@ -301,6 +307,105 @@ async fn delivery_pair(realm_seed: u8) -> (Node, Node, UserId) {
     .await;
     let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
     (a, b, recipient)
+}
+
+/// Two nodes whose holder `b` keeps a webhook subscription for the returned recipient. The
+/// stored realm config gives `b` no job control yet.
+async fn webhook_pair(realm_seed: u8) -> (Node, Node, UserId, RealmConfigDocument) {
+    let (a, b, recipient) = delivery_pair(realm_seed).await;
+    let config = load_realm_config(&b.context, recipient.realm_id)
+        .await
+        .expect("realm config");
+    b.context.storage_handle.open_vault(NodeVaultKey::random());
+    let url = "https://hooks.example.org/aruna".to_string();
+    drive(
+        WebhookOperation::new(recipient, WebhookAction::Set { url }),
+        &b.context,
+    )
+    .await
+    .expect("webhook subscription");
+    (a, b, recipient, config)
+}
+
+async fn grant_jobs(node: &Node, mut config: RealmConfigDocument) {
+    config.seed_default_placement();
+    config.seed_job_control(node.net.node_id(), 0);
+    write_config(node, config.realm_id, &config).await;
+}
+
+fn share_upload(from: &Node, recipient: UserId, bucket: &str, at: u64) -> NotificationRecord {
+    let kind = NotificationKind::ShareUpload {
+        share_id: Ulid::generate(),
+        node_id: from.net.node_id(),
+        group_id: data_group_id(),
+        bucket: bucket.to_string(),
+        key: "a.csv".to_string(),
+        size_bytes: 1,
+    };
+    NotificationRecord::new(recipient, NotificationClass::Direct, kind, at)
+}
+
+async fn webhook_queued(node: &Node, record: &NotificationRecord) -> bool {
+    let key = format!("webhook/{}", record.notification_id);
+    let key = user_dedup_key(record.recipient, &key);
+    find_dedup_plan(&node.context.storage_handle, record.recipient, &key, None)
+        .await
+        .expect("dedup read")
+        .is_some()
+}
+
+/// An upload the inbox drops after its bucket's deletion queues no webhook, even beside a
+/// stored record of the same batch.
+#[tokio::test]
+async fn dropped_upload_unqueued() {
+    let (a, b, recipient, config) = webhook_pair(72).await;
+    grant_jobs(&b, config).await;
+    let at = 1_700_000_000_000;
+    let deleted = NotificationKind::BucketDeleted {
+        bucket: "inbox".to_string(),
+        node_id: a.net.node_id(),
+        group_id: data_group_id(),
+    };
+    let deletion = NotificationRecord::new(recipient, NotificationClass::Direct, deleted, at);
+    deliver_remote(&a.net, b.net.node_id(), vec![deletion])
+        .await
+        .expect("deletion delivered");
+
+    let late = share_upload(&a, recipient, "inbox", at - 1);
+    let fresh = share_upload(&a, recipient, "other", at + 1);
+    let written = deliver_remote(&a.net, b.net.node_id(), vec![late.clone(), fresh.clone()])
+        .await
+        .expect("batch delivered");
+    assert_eq!(written, 1);
+    assert!(
+        webhook_queued(&b, &fresh).await,
+        "the stored upload is queued"
+    );
+    assert!(
+        !webhook_queued(&b, &late).await,
+        "the dropped upload is not"
+    );
+}
+
+/// A batch whose webhook cannot be queued stays unacknowledged, and the next delivery queues
+/// it although the inbox already holds the record.
+#[tokio::test]
+async fn retry_queues_webhook() {
+    let (a, b, recipient, config) = webhook_pair(74).await;
+    let upload = share_upload(&a, recipient, "inbox", 1_700_000_000_000);
+    let refused = deliver_remote(&a.net, b.net.node_id(), vec![upload.clone()]).await;
+    assert!(refused.is_err(), "a failed queue refuses the batch");
+    assert_eq!(read_inbox(&b).await, vec![upload.clone()]);
+
+    grant_jobs(&b, config).await;
+    let written = deliver_remote(&a.net, b.net.node_id(), vec![upload.clone()])
+        .await
+        .expect("retry delivered");
+    assert_eq!(written, 0);
+    assert!(
+        webhook_queued(&b, &upload).await,
+        "the retry queues the held record"
+    );
 }
 
 #[tokio::test]

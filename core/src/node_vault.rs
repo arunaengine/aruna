@@ -20,14 +20,23 @@ pub enum VaultPurpose {
     GroupBackend,
     /// The node copy of a `node_managed` bucket key, under its key record id.
     BucketKey,
+    /// The signing secret of a webhook subscription, under its subscription id.
+    Webhook,
+    /// The address of an email notification opt-in, under its preference id.
+    EmailAddress,
+    /// A fetched realm vault secret, under its realm vault entry id.
+    RealmSecret,
 }
 
 impl VaultPurpose {
-    const fn tag(self) -> u8 {
+    pub const fn tag(self) -> u8 {
         match self {
             Self::SourceConnector => 1,
             Self::GroupBackend => 2,
             Self::BucketKey => 3,
+            Self::Webhook => 4,
+            Self::EmailAddress => 5,
+            Self::RealmSecret => 6,
         }
     }
 }

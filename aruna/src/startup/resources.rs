@@ -403,6 +403,18 @@ async fn fill(
     checkpoint(StartupStage::Net)?;
     stopped(stop)?;
 
+    let mut metadata_options = MetadataHandleOptions::default()
+        .with_search_storage(config.metadata_search_storage)
+        .with_sync_policy(config.fjall_persist_policy);
+    // Only holders of the realm signing key derive the realm vault key.
+    if let aruna_core::structs::identity::auth::NodeCapabilities::Management {
+        realm_signing_key,
+        ..
+    } = &config.node_capabilities
+    {
+        let key = aruna_core::realm_vault::RealmVaultKey::derive(realm_signing_key);
+        metadata_options = metadata_options.with_vault_key(key);
+    }
     let metadata_handle = MetadataHandle::new_with_options(
         &config.metadata_storage_path,
         config.node_id,
@@ -410,10 +422,9 @@ async fn fill(
         Some(net_handle.clone()),
         Some(net_handle.document_sync_node()),
         Some(net_handle.document_sync_database()),
-        MetadataHandleOptions::default()
-            .with_search_storage(config.metadata_search_storage)
-            .with_sync_policy(config.fjall_persist_policy),
+        metadata_options,
     )?;
+    metadata_handle.share_mail(acquired.jobs_runtime.mail());
     acquired.metadata_handle = Some(metadata_handle.clone());
     checkpoint(StartupStage::Metadata)?;
     stopped(stop)?;
@@ -492,6 +503,10 @@ async fn fill(
     // Node-managed bucket keys open before content work; vault-locked keys stay locked.
     open_managed_keys(driver_ctx.as_ref(), config).await?;
     record_restart_locks(driver_ctx.as_ref(), config).await?;
+    // Cached realm secrets the config no longer names go before any email job runs.
+    let mail = acquired.jobs_runtime.mail();
+    aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id, Some(&mail))
+        .await;
     // Recovery that weakened while the node was down, or later through role changes, is told.
     let origin = (config.realm_id, config.node_id);
     aruna_operations::s3::bucket::key_recovery::spawn_recovery_sweep(

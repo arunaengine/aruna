@@ -718,6 +718,7 @@ pub(crate) async fn unheld_bucket(
             &aruna_core::structs::execution::job::JobProgress::new("entries"),
         ),
         range_turns: Default::default(),
+        mail: Default::default(),
     };
     resolve_entries(
         &ctx,

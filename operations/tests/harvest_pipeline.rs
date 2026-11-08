@@ -91,6 +91,7 @@ impl Fixture {
             shutdown: shutdown.clone(),
             progress: ProgressReporter::from_progress(&JobProgress::new("records")),
             range_turns: Default::default(),
+            mail: Default::default(),
         };
         (ctx, cancel, shutdown)
     }

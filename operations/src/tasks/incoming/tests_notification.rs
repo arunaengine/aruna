@@ -191,6 +191,85 @@ async fn notification_drain_warn() {
     assert!(remaining.records.is_empty());
 }
 
+/// A local drain whose webhook cannot be queued keeps its outbox row, and the next drain
+/// queues the delivery of the record the inbox already holds.
+#[tokio::test]
+async fn drain_retries_queueing() {
+    let realm_id = RealmId::from_bytes([9u8; 32]);
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    let net_handle = make_net_handle(realm_id, &storage, [26u8; 32]).await;
+    let node_id = net_handle.node_id();
+
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.seed_default_placement();
+    config.ensure_node(node_id, RealmNodeKind::Server);
+    write_realm_config(&storage, realm_id, &config, node_id).await;
+
+    let recipient = notification_recipient(realm_id);
+    let kind = NotificationKind::ShareUpload {
+        share_id: Ulid::from_bytes([2u8; 16]),
+        node_id,
+        group_id: Ulid::from_bytes([1u8; 16]),
+        bucket: "inbox".to_string(),
+        key: "a.csv".to_string(),
+        size_bytes: 1,
+    };
+    let record = NotificationRecord::new(
+        recipient,
+        NotificationClass::Direct,
+        kind,
+        1_700_000_000_000,
+    );
+    write_notification_outbox(&storage, &new_outbox_record(record.clone())).await;
+
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: Some(net_handle),
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    });
+    let url = "https://hooks.example.org/aruna".to_string();
+    let subscribe = crate::notifications::webhook::WebhookOperation::new(
+        recipient,
+        crate::notifications::webhook::WebhookAction::Set { url },
+    );
+    crate::driver::drive(subscribe, &context)
+        .await
+        .expect("webhook subscription");
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+    handler.drain_notification_outbox().await;
+
+    assert_eq!(read_inbox_records(&storage).await, vec![record.clone()]);
+    let remaining = read_outbox_batch(&storage, None, 1024, None)
+        .await
+        .expect("outbox read");
+    assert_eq!(
+        remaining.records.len(),
+        1,
+        "a failed queue keeps the outbox row"
+    );
+
+    config.seed_job_control(node_id, 0);
+    write_realm_config(&storage, realm_id, &config, node_id).await;
+    handler.drain_notification_outbox().await;
+
+    let remaining = read_outbox_batch(&storage, None, 1024, None)
+        .await
+        .expect("outbox read");
+    assert!(remaining.records.is_empty());
+    let key = format!("webhook/{}", record.notification_id);
+    let key = aruna_core::structs::execution::job::user_dedup_key(recipient, &key);
+    let queued = crate::jobs::store::find_dedup_plan(&storage, recipient, &key, None)
+        .await
+        .expect("dedup read");
+    assert!(queued.is_some(), "the retry queues the held record");
+}
+
 async fn write_notification_outbox(
     storage: &aruna_storage::StorageHandle,
     record: &NotificationOutboxRecord,

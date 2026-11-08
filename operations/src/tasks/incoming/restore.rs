@@ -826,7 +826,25 @@ impl OperationsTaskHandler {
                         for recipient in &outcome.recipients {
                             net_handle.notify_inbox_activity(*recipient);
                         }
-                        if let Err(error) =
+                        let mut queued = crate::notifications::webhook::enqueue_webhooks(
+                            &self.context,
+                            local_node_id,
+                            &outcome.held,
+                        )
+                        .await;
+                        if queued.is_ok() {
+                            queued = crate::notifications::email::enqueue_emails(
+                                &self.context,
+                                local_node_id,
+                                &outcome.held,
+                            )
+                            .await;
+                        }
+                        // The outbox rows stay until their deliveries are queued.
+                        if let Err(error) = queued {
+                            warn!(task_id = ?retry_key, error = %error, "Failed to queue notification deliveries");
+                            retry_needed = true;
+                        } else if let Err(error) =
                             delete_outbox_records(&self.context.storage_handle, local_keys).await
                         {
                             warn!(task_id = ?retry_key, error = %error, "Failed to delete delivered notification outbox records");

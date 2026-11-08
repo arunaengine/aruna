@@ -160,6 +160,8 @@ impl From<LegacyConfig> for RealmConfigDocument {
             federation: old.federation.map(Into::into),
             portal_features: old.portal_features,
             replica_quota: ReplicaQuota::default(),
+            email: None,
+            vault: Vec::new(),
         }
     }
 }
@@ -172,6 +174,8 @@ mod tests {
         AcceptedRealms, DESCRIPTOR_DOMAIN, FederationSettings, RegistrationMode, Signer,
     };
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::realm_vault::RealmVaultRecord;
+    use aruna_core::structs::execution::email::RealmEmailProfile;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, ReplicaQuota};
     use ed25519_dalek::{Signer as _, SigningKey};
     use reqwest::Url;
@@ -249,8 +253,11 @@ mod tests {
         let unfederated = postcard::to_allocvec(&current).unwrap();
         let features = postcard::to_allocvec(&BTreeMap::<String, bool>::new()).unwrap();
         let replicas = postcard::to_allocvec(&ReplicaQuota::default()).unwrap();
-        // The config ends with the federation, the portal features and the replica quota.
-        let head = &unfederated[..unfederated.len() - 1 - features.len() - replicas.len()];
+        let secrets = (None::<RealmEmailProfile>, Vec::<RealmVaultRecord>::new());
+        let secrets = postcard::to_allocvec(&secrets).unwrap();
+        // The config ends with federation, portal features, replica quota, email and vault.
+        let tail = 1 + features.len() + replicas.len() + secrets.len();
+        let head = &unfederated[..unfederated.len() - tail];
         let federation = postcard::to_allocvec(&Some(old_federation(&key, realm_id))).unwrap();
         let old = [head, &federation, &features].concat();
         write(&path, REALM_CONFIG_KEYSPACE, vec![(b"config", old)]);

@@ -290,6 +290,7 @@ async fn crate_stays_local() -> TestResult<()> {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
         range_turns: Default::default(),
+        mail: Default::default(),
     };
 
     assert!(matches!(
@@ -427,6 +428,7 @@ async fn crate_redrive_links() -> TestResult<()> {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
         range_turns: Default::default(),
+        mail: Default::default(),
     };
     let JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource }) =
         write_run_crate(&context(), job_id).await

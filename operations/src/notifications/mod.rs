@@ -4,6 +4,7 @@
 
 pub mod client;
 pub mod dispatch;
+pub mod email;
 pub mod emit;
 pub mod inbox;
 pub mod incoming;
@@ -18,3 +19,4 @@ pub mod routing;
 mod tests;
 pub mod unread;
 pub mod watch;
+pub mod webhook;

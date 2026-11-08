@@ -110,6 +110,8 @@ pub struct JobContext {
     pub shutdown: CancellationToken,
     pub progress: ProgressReporter,
     pub range_turns: RangeTurns,
+    /// Senders of the realm email profile, shared by every job of this node.
+    pub mail: Arc<crate::notifications::email::MailProfiles>,
 }
 
 /// One turn per distribution range, shared by every job on this node: page imports into one
@@ -230,6 +232,12 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             ))
             .await
         }
+        JobPayload::WebhookDelivery(spec) => {
+            Box::pin(crate::notifications::webhook::run_webhook_job(ctx, spec)).await
+        }
+        JobPayload::EmailDelivery(spec) => {
+            Box::pin(crate::notifications::email::run_email_job(ctx, spec)).await
+        }
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",
@@ -258,7 +266,9 @@ pub fn run_cleanup(payload: &JobPayload) {
         | JobPayload::TerminalCleanup { .. }
         | JobPayload::CopyObject(_)
         | JobPayload::RegisterIdentifiers(_)
-        | JobPayload::BackendImport(_) => {}
+        | JobPayload::BackendImport(_)
+        | JobPayload::WebhookDelivery(_)
+        | JobPayload::EmailDelivery(_) => {}
     }
 }
 

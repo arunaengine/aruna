@@ -939,6 +939,8 @@ mod tests {
             admin_withdraw_pid(&ctx, realm(), id, user(), "reason".into(), 4)
                 .await
                 .unwrap();
+            // Dropping the handle does not wait for the worker to release the file lock.
+            ctx.storage_handle.close().await;
         }
         let ctx = context_at(&path);
         let mapping = read_mapping(&ctx, id).await.unwrap().unwrap();

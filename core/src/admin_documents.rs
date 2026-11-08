@@ -420,6 +420,19 @@ pub enum AdminDocumentOperation {
     MergeCoordinatorSet {
         node_id: NodeId,
     },
+    /// Sets or deletes one realm vault record. Each entry is its own path, so writes to
+    /// different entries never conflict; concurrent writes of one entry leave it absent.
+    #[serde(rename = "RealmConfigVaultSet")]
+    ConfigVaultSet {
+        entry: crate::realm_vault::RealmVaultEntry,
+        record: Option<crate::realm_vault::RealmVaultRecord>,
+    },
+    /// Sets or removes the realm email profile. Concurrent writes turn email off on every node
+    /// until a realm admin sets it again.
+    #[serde(rename = "RealmConfigEmailSet")]
+    ConfigEmailSet {
+        profile: Option<crate::structs::execution::email::RealmEmailProfile>,
+    },
 }
 
 impl AdminDocumentOperation {

@@ -16,6 +16,8 @@ pub mod assistant;
 pub mod audit;
 pub mod device;
 pub mod drs;
+pub mod email_profile;
+pub mod emails;
 pub mod execution;
 pub mod federation;
 pub mod git;
@@ -43,6 +45,7 @@ pub mod shares;
 pub mod staging;
 pub mod storage;
 pub mod sync;
+pub mod webhooks;
 
 // Temporary aliases for the pre-family module paths; the access, execution
 // and storage families own these modules now. Remove once consumers migrate.
@@ -122,6 +125,9 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(link_routes::router())
         .merge(node_names::router())
         .merge(notifications::router())
+        .merge(webhooks::router())
+        .merge(emails::router())
+        .merge(email_profile::router())
         .merge(policies::router())
         .merge(portal::router())
         .merge(oidc_providers::router())
@@ -261,6 +267,12 @@ pub(crate) mod tests {
         ("POST", "/data/archives/links"),
         ("GET", "/data/archives/download"),
         ("GET", "/access/audit"),
+        ("GET", "/system/notifications/webhook"),
+        ("PUT", "/system/notifications/webhook"),
+        ("DELETE", "/system/notifications/webhook"),
+        ("GET", "/system/notifications/email"),
+        ("PUT", "/system/notifications/email"),
+        ("DELETE", "/system/notifications/email"),
         (
             "DELETE",
             "/metadata/groups/{group_id}/repositories/{connector_id}",
@@ -437,6 +449,9 @@ pub(crate) mod tests {
         ("GET", "/system/jobs"),
         ("GET", "/system/realm"),
         ("GET", "/system/realm/descriptor"),
+        ("GET", "/system/realm/email"),
+        ("PUT", "/system/realm/email"),
+        ("DELETE", "/system/realm/email"),
         ("GET", "/system/realm/federation"),
         ("GET", "/system/realm/placement"),
         ("GET", "/system/realm/portal-features"),

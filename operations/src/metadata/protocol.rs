@@ -662,6 +662,14 @@ pub enum MetadataTransportMessage {
     ReleaseHolderResults {
         result: Result<HolderAnswer, MetadataReadError>,
     },
+    /// One revision of a realm vault entry, asked of a management node; Debug hides the secret.
+    RealmSecret {
+        entry: aruna_core::realm_vault::RealmVaultEntry,
+        revision: ulid::Ulid,
+    },
+    RealmSecretResult {
+        result: Result<aruna_core::compute::SecretBytes, MetadataReadError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.

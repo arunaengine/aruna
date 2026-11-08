@@ -590,6 +590,25 @@ pub async fn submit_rocrate_import(
     .await
 }
 
+/// The job and plan digest a dedup key names, if that job's record still exists.
+pub(crate) async fn find_dedup_job(
+    context: &DriverContext,
+    created_by: UserId,
+    dedup_key: &[u8],
+) -> Result<Option<(JobId, [u8; 32])>, SubmitJobError> {
+    let Some((job_id, digest)) =
+        find_dedup_plan(&context.storage_handle, created_by, dedup_key, None)
+            .await
+            .map_err(SubmitJobError::UnexpectedEvent)?
+    else {
+        return Ok(None);
+    };
+    let record = read_job_record(&context.storage_handle, job_id, None)
+        .await
+        .map_err(SubmitJobError::UnexpectedEvent)?;
+    Ok(record.map(|_| (job_id, digest)))
+}
+
 pub async fn lookup_job_dedup(
     context: &DriverContext,
     created_by: UserId,
@@ -597,20 +616,10 @@ pub async fn lookup_job_dedup(
     plan_digest: [u8; 32],
 ) -> Result<Option<SubmitJobResult>, SubmitJobError> {
     let dedup_key = user_dedup_key(created_by, idempotency_key);
-    let Some((job_id, existing_digest)) =
-        find_dedup_plan(&context.storage_handle, created_by, &dedup_key, None)
-            .await
-            .map_err(SubmitJobError::UnexpectedEvent)?
+    let Some((job_id, existing_digest)) = find_dedup_job(context, created_by, &dedup_key).await?
     else {
         return Ok(None);
     };
-    if read_job_record(&context.storage_handle, job_id, None)
-        .await
-        .map_err(SubmitJobError::UnexpectedEvent)?
-        .is_none()
-    {
-        return Ok(None);
-    }
     if existing_digest != plan_digest {
         return Err(SubmitJobError::JobPlanConflict {
             existing_job_id: job_id,

@@ -113,6 +113,10 @@ pub enum AdminDocumentError {
     InvalidCutoffs,
     #[error("node place is empty, or its name or coordinates are invalid")]
     InvalidNodePlace,
+    #[error("realm vault record does not belong to the entry it is written to")]
+    InvalidVaultRecord,
+    #[error("realm email profile needs a host, a sender and a username with its password")]
+    InvalidEmailProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

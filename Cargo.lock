@@ -303,7 +303,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "ahash",
  "aruna-blob",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "aruna-core",
  "aruna-kpabe",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-cli"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "apple-native-keyring-store",
  "aws-sdk-s3",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "rustix",
  "serde_json",
@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -564,6 +564,7 @@ dependencies = [
  "getrandom 0.4.3",
  "globset",
  "hex",
+ "hmac 0.13.0",
  "hpke",
  "ipnet",
  "iroh",
@@ -596,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "ahash",
  "aruna",
@@ -639,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "aes-gcm 0.11.1",
  "bls12_381_plus",
@@ -655,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe-wasm"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "aruna-kpabe",
  "blake3",
@@ -669,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -697,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -727,6 +728,7 @@ dependencies = [
  "iroh",
  "irokle",
  "jsonwebtoken",
+ "lettre",
  "lru",
  "md5",
  "opentelemetry",
@@ -762,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-registry"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -792,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -810,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.169"
+version = "3.0.0-alpha.170"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -3109,6 +3111,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "email-encoding"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "420b9da095f052ea597503e39073b5b3c522f7db933fbac202d91d24492693fd"
+dependencies = [
+ "base64 0.23.1",
+ "memchr",
+]
+
+[[package]]
+name = "email_address"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
+
+[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5017,6 +5035,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 dependencies = [
  "spin 0.9.9",
+]
+
+[[package]]
+name = "lettre"
+version = "0.11.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2c646bd5cc763b1087b15493e29a64be6147ba8f19342004fa52048ee596eae"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "email-encoding",
+ "email_address",
+ "fastrand",
+ "futures-io",
+ "futures-util",
+ "httpdate",
+ "idna",
+ "mime",
+ "nom 8.0.0",
+ "percent-encoding",
+ "quoted_printable",
+ "rustls",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "url",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -7387,6 +7432,12 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "quoted_printable"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "478e0585659a122aa407eb7e3c0e1fa51b1d8a870038bd29f0cf4a8551eea972"
 
 [[package]]
 name = "r-efi"

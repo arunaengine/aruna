@@ -982,6 +982,7 @@ async fn reconcile_inbound_topics(
         crate::federation::publish::publish_soon(context, realm_id, node_id).await;
     }
     refresh_usage_targets(context, net_handle.node_id(), &targets.targets).await;
+    crate::notifications::email::config_applied(context, &targets.targets).await;
     // An installed record may name a member this node bootstraps.
     wake_bootstrap(context).await;
     refresh_target_interest(context, &targets.targets).await;

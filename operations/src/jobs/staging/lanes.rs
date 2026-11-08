@@ -909,6 +909,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
             range_turns: ctx.range_turns.clone(),
+            mail: Default::default(),
         }
     }
 
@@ -1050,6 +1051,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
             range_turns: Default::default(),
+            mail: Default::default(),
         };
         (ctx, spec, test._tempdir)
     }
