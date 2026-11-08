@@ -102,7 +102,7 @@ pub fn restrictions_cover_subtree<'a>(
             _ => {
                 covered |= pattern == "/**"
                     || pattern.ends_with("/**")
-                        && pattern_root(pattern).is_some_and(|base| path_within(root, base));
+                        && pattern_root(pattern).is_some_and(|base| path_within(root, &base));
             }
         }
     }
@@ -114,12 +114,29 @@ const GLOB_CHARS: [char; 6] = ['*', '?', '[', ']', '{', '}'];
 /// The literal subtree a pattern grants on: the pattern itself when it holds no
 /// wildcard, the parent of a trailing `/**`, and nothing otherwise, so an
 /// unsupported wildcard never widens a derived scope.
-fn pattern_root(pattern: &str) -> Option<&str> {
+fn pattern_root(pattern: &str) -> Option<String> {
     if let Some(root) = pattern.strip_suffix("/**") {
-        return (!root.is_empty() && !root.contains(['*', '?', '[', ']', '{', '}']))
-            .then_some(root);
+        return literal_path(root).filter(|root| !root.is_empty());
     }
-    (!pattern.contains(['*', '?', '[', ']', '{', '}'])).then_some(pattern)
+    literal_path(pattern)
+}
+
+/// The path a pattern without wildcards names. A one-character class such as `[*]`, as
+/// `globset::escape` writes a glob character, is that character.
+fn literal_path(pattern: &str) -> Option<String> {
+    let mut literal = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(next) = chars.next() {
+        match next {
+            '[' => {
+                let escaped = chars.next()?;
+                (chars.next()? == ']').then(|| literal.push(escaped))?;
+            }
+            next if GLOB_CHARS.contains(&next) => return None,
+            next => literal.push(next),
+        }
+    }
+    Some(literal)
 }
 
 /// Splits patterns into the allowed and denied roots at or below `root`. A
@@ -134,9 +151,7 @@ fn split_roots<'a>(
         let covered = if permission_pattern_matches(pattern, root) {
             Some(root.to_string())
         } else {
-            pattern_root(pattern)
-                .filter(|candidate| path_within(candidate, root))
-                .map(str::to_string)
+            pattern_root(pattern).filter(|candidate| path_within(candidate, root))
         };
         let Some(covered) = covered else {
             continue;
@@ -474,6 +489,26 @@ mod tests {
             readable_roots(&granted, Some(&restrictions), "/r/g/G/data/n2"),
             vec!["/r/g/G/data/n2/b".to_string()]
         );
+    }
+
+    #[test]
+    fn escaped_literal_roots() {
+        // A restriction that escapes glob characters of a folder name names that literal folder.
+        let granted = granted(&[("/r/g/G/data/**", Permission::READ)]);
+        let restrictions = [PathRestriction {
+            pattern: "/r/g/G/data/*/b/results [[]1[]] [*][?][{][}]/**".to_string(),
+            permission: Permission::READ,
+        }];
+        assert_eq!(
+            readable_roots(&granted, Some(&restrictions), "/r/g/G/data/n2/b"),
+            vec!["/r/g/G/data/n2/b/results [1] *?{}".to_string()]
+        );
+        // A class of more than one character stays a wildcard and grants nothing.
+        let class = [PathRestriction {
+            pattern: "/r/g/G/data/*/b/results [12]/**".to_string(),
+            permission: Permission::READ,
+        }];
+        assert!(readable_roots(&granted, Some(&class), "/r/g/G/data/n2/b").is_empty());
     }
 
     #[test]

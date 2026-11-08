@@ -723,3 +723,34 @@ async fn dataset_global_parts() {
     assert_eq!(bytes.as_ref(), b"remote");
     server.abort();
 }
+
+// A folder whose name holds glob characters is listed at the member that holds it, which
+// admits the link's escaped folder scope as that literal folder.
+#[tokio::test]
+async fn escaped_folder_listed() {
+    let shared = shared().await;
+    put(&shared, 1, "results [1]/a.txt", "far").await;
+    put(&shared, 1, "results [2]/b.txt", "other").await;
+    let request = CreateShareRequest {
+        target: ShareTargetBody::Folder {
+            bucket: BUCKET.to_string(),
+            prefix: "results [1]/".to_string(),
+        },
+        mode: ShareModeBody::Read,
+        label: String::new(),
+        expires_at: None,
+        password: None,
+    };
+    let state = State(shared.state.clone());
+    let auth = Extension(Some(shared.owner.clone()));
+    let (_, Json(link)) = create_share(state, auth, Json(request)).await.unwrap();
+    let open = Some(Json(OpenShareRequest::default()));
+    let opened = open_share(
+        State(shared.state.clone()),
+        peer(),
+        share_headers(&link.token),
+        open,
+    );
+    let visit = opened.await.unwrap().0.visit_token;
+    assert_eq!(names(&shared, &visit, "", 100).await.unwrap(), ["a.txt"]);
+}
