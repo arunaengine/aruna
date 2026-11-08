@@ -295,7 +295,9 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
 **Limits**
 - Source and target must differ.
 - Bucket names must be non-empty and free of `/`, and workspace buckets are refused.
-- A prefix, when given, must be a confined relative path."#,
+- A prefix, when given, must be a confined relative path.
+- A create that reaches the target more than 10 s after this node gave up on it can store the
+  target's mirror again after the rollback removed it. That mirror receives no data."#,
     request_body(
         content = CreateSyncRequest,
         description = "Source endpoint on this node, target endpoint on the receiving node, and the sync mode. `reference_handling` defaults to `materialize` and `replicate_deletes` to false.",
@@ -1223,6 +1225,8 @@ fn map_create_error(error: SyncRelationshipError) -> ServerError {
         SyncRelationshipError::Duplicate => {
             ServerError::Conflict("sync relationship already exists".to_string())
         }
+        // The target's answer was lost and repair rolls the mirror back; the caller may retry.
+        SyncRelationshipError::RolledBack => ServerError::BadGateway,
         other => ServerError::InternalError(other.to_string()),
     }
 }
