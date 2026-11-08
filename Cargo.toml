@@ -25,7 +25,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.166"
+version = "3.0.0-alpha.168"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -257,7 +257,7 @@ windows-native-keyring-store = "1.1.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
 zeroize = "1.9.1"
-zip = { version = "9.0.3", default-features = false }
+zip = { version = "9.1.0", default-features = false }
 zstd = "0.14.2"
 
 [profile.release]

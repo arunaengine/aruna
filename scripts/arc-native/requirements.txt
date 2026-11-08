@@ -1,2 +1,2 @@
 -r ../../blob/arc-requirements.txt
-boto3==1.43.99
+boto3==1.43.126
