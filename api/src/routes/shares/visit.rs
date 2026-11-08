@@ -48,8 +48,9 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::forwarded::client_ip;
 use crate::rate_limit::LocalKey;
 use crate::routes::storage::deletion::bucket_info;
-use crate::routes::storage::objects::{ListRequest, object_page};
+use crate::routes::storage::objects::object_page;
 use crate::server::state::ServerState;
+use aruna_operations::s3::object::pages::ListRequest;
 
 /// Entries per listing page when the visitor names no limit.
 const PAGE: usize = 100;
@@ -472,6 +473,7 @@ pub(crate) async fn list_below(
         delimiter: Some("/".to_string()),
         cursor: query.cursor,
         limit,
+        partial: false,
     };
     let expiry = link_expiry.unwrap_or(u64::MAX);
     let page = object_page(state, info, (None, Some((auth, expiry))), request).await?;

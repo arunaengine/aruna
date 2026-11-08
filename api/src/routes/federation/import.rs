@@ -298,7 +298,7 @@ async fn source_request(
 }
 
 /// A `Sync` byte stream over a response body, as the upload writer needs.
-fn shared_stream(
+pub(crate) fn shared_stream(
     body: impl Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
 ) -> BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>> {
     let body = Mutex::new(Box::pin(

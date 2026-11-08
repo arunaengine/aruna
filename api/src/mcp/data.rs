@@ -7,7 +7,7 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, explained, internal_error, request_auth,
     server_error, tool_extras,
 };
-use crate::routes::storage::objects::{ListRequest, object_page};
+use crate::routes::storage::objects::object_page;
 use crate::routes::storage::relay::{relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::stream::BackendStream;
@@ -27,6 +27,7 @@ use aruna_operations::s3::object::get::{
 };
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::list::ListedObject;
+use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
@@ -450,6 +451,7 @@ impl McpServer {
             delimiter: None,
             cursor: input.cursor,
             limit,
+            partial: false,
         };
         let expiry = bearer
             .as_ref()
@@ -663,6 +665,7 @@ impl McpServer {
                 delimiter: None,
                 cursor,
                 limit: SCAN_PAGE_KEYS,
+                partial: false,
             };
             let caller = (bearer.as_ref(), Some((&auth, expiry)));
             let page = object_page(&self.state, &bucket_info, caller, request)

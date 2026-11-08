@@ -258,6 +258,8 @@ pub(crate) mod tests {
         ("DELETE", "/access/groups/{id}/roles/{role_id}"),
         ("DELETE", "/metadata/{document_id}"),
         ("POST", "/data/archives"),
+        ("POST", "/data/archives/links"),
+        ("GET", "/data/archives/download"),
         ("GET", "/access/audit"),
         (
             "DELETE",

@@ -382,13 +382,22 @@ async fn install(
 
 /// Publishes `api` as the api url of `node_id` in its node info document.
 pub(crate) async fn publish_api(state: &ServerState, node_id: NodeId, api: &str) {
+    publish_urls(state, node_id, (api, None)).await;
+}
+
+/// Publishes the api and S3 urls of `node_id` in its node info document.
+pub(crate) async fn publish_urls(
+    state: &ServerState,
+    node_id: NodeId,
+    (api, s3): (&str, Option<&str>),
+) {
     let document = NodeInfoDocument {
         node_id,
         executors: Vec::new(),
         labels: Default::default(),
         urls: NodeUrls {
             api: Some(api.to_string()),
-            s3: None,
+            s3: s3.map(str::to_string),
         },
         utilization: NodeUtilization {
             storage_bytes_used: 0,
