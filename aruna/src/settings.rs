@@ -20,7 +20,6 @@ use aruna_core::structs::storage::node_info::{
 };
 use aruna_net::IrohRuntimeConfig;
 use aruna_operations::metadata::MetadataSearchStorage;
-use aruna_operations::notifications::email::{SmtpSettings, SmtpTls};
 use aruna_storage::{CACHE_BYTES, FjallPersistPolicy};
 
 use crate::config::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};
@@ -112,8 +111,6 @@ pub struct Settings {
     pub realm_description: String,
     pub portal: PortalConfig,
     pub assistant_proxy: bool,
-    /// `None` unless `SMTP_HOST` is set: no email notifications.
-    pub smtp: Option<SmtpSettings>,
     pub node_labels: BTreeMap<String, String>,
     pub node_location: Option<String>,
     pub node_weight: Option<u32>,
@@ -306,7 +303,6 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
     let oidc_providers = load_oidc_providers(env)?;
     let portal = portal_config_env(env)?;
     let assistant_proxy = assistant_proxy_env(env)?;
-    let smtp = smtp_env(env)?;
     // The SPA is served from another origin than the API, so it cannot reach a
     // relative API path and needs the advertised one.
     if matches!(portal, PortalConfig::Artifact { .. }) && api_public_url.is_none() {
@@ -361,7 +357,6 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         realm_description,
         portal,
         assistant_proxy,
-        smtp,
         node_labels,
         node_location,
         node_weight,
@@ -816,51 +811,6 @@ fn assistant_proxy_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
     }
 }
 
-/// The SMTP profile; `SMTP_FROM` is required once `SMTP_HOST` turns email on.
-fn smtp_env(env: &dyn SettingsEnv) -> Result<Option<SmtpSettings>, SetupError> {
-    let Some(host) = optional_nonempty_env(env, "SMTP_HOST")? else {
-        return Ok(None);
-    };
-    let port = match optional_nonempty_env(env, "SMTP_PORT")? {
-        Some(value) => Some(
-            value
-                .trim()
-                .parse::<u16>()
-                .map_err(|_| invalid_config_value("SMTP_PORT", value, "expected a port number"))?,
-        ),
-        None => None,
-    };
-    let tls = match optional_nonempty_env(env, "SMTP_TLS")?.map(|value| normalize_env_value(&value))
-    {
-        None => SmtpTls::Starttls,
-        Some(value) if value == "starttls" => SmtpTls::Starttls,
-        Some(value) if value == "tls" => SmtpTls::Tls,
-        Some(value) if value == "plain" => SmtpTls::Plain,
-        Some(value) => {
-            return Err(invalid_config_value(
-                "SMTP_TLS",
-                value,
-                "expected starttls, tls or plain",
-            ));
-        }
-    };
-    let username = optional_nonempty_env(env, "SMTP_USERNAME")?;
-    let password = optional_nonempty_env(env, "SMTP_PASSWORD")?;
-    if username.is_some() != password.is_some() {
-        return Err(SetupError::MissingConfigValue(
-            "SMTP_USERNAME and SMTP_PASSWORD",
-        ));
-    }
-    Ok(Some(SmtpSettings {
-        host: host.trim().to_string(),
-        port,
-        tls,
-        username,
-        password,
-        from: required_nonempty_env(env, "SMTP_FROM")?,
-    }))
-}
-
 fn mcp_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
     const KEY: &str = "MCP";
     match env.var(KEY).as_deref().map(normalize_env_value) {
@@ -1236,37 +1186,6 @@ mod tests {
         assert_eq!(raised.fjall_cache_bytes, 4 << 30);
         let error = parse(&[("ARUNA_FJALL_CACHE_MIB", "0")]).unwrap_err();
         assert_eq!(invalid_key(error), "ARUNA_FJALL_CACHE_MIB");
-    }
-
-    #[test]
-    fn smtp_default_off() {
-        assert_eq!(parse(&[]).unwrap().smtp, None);
-        assert!(matches!(
-            parse(&[("SMTP_HOST", "mail.example.org")]),
-            Err(SetupError::MissingConfigValue("SMTP_FROM"))
-        ));
-        let smtp = parse(&[
-            ("SMTP_HOST", "mail.example.org"),
-            ("SMTP_FROM", "Aruna <aruna@example.org>"),
-            ("SMTP_USERNAME", "aruna"),
-            ("SMTP_PASSWORD", "canary-5e1f"),
-            ("SMTP_TLS", "tls"),
-        ])
-        .unwrap()
-        .smtp
-        .unwrap();
-        assert_eq!(smtp.tls, SmtpTls::Tls);
-        assert!(!format!("{smtp:?}").contains("canary-5e1f"));
-        assert_eq!(invalid_key(parse_smtp_tls("ssl")), "SMTP_TLS");
-    }
-
-    fn parse_smtp_tls(value: &str) -> SetupError {
-        parse(&[
-            ("SMTP_HOST", "mail.example.org"),
-            ("SMTP_FROM", "aruna@example.org"),
-            ("SMTP_TLS", value),
-        ])
-        .unwrap_err()
     }
 
     #[test]
