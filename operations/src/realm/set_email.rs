@@ -497,3 +497,7 @@ impl Operation for SetEmailOperation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "set_email_tests.rs"]
+mod tests;
