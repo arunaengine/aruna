@@ -501,9 +501,23 @@ async fn ended_link_refused() {
     assert_eq!(code(listed), "share_unavailable");
 }
 
-/// A peer S3 endpoint that lists `x/a.txt` for every listing and serves it for every read.
-async fn listing_peer() -> (String, tokio::task::JoinHandle<()>) {
-    let answer = |uri: http::Uri| async move {
+/// A peer S3 endpoint that lists `x/a.txt` for every listing and serves it for every read; a
+/// request whose delegation names another group than `group` is denied, as a member does.
+async fn listing_peer(group: Ulid) -> (String, tokio::task::JoinHandle<()>) {
+    use aruna_core::structs::storage::distribution::delegation::{
+        DELEGATION_HEADER, SignedDelegation,
+    };
+    let answer = move |uri: http::Uri, headers: HeaderMap| async move {
+        let delegation = (headers.get(DELEGATION_HEADER))
+            .and_then(|value| SignedDelegation::decode(value.to_str().ok()?).ok());
+        if delegation.is_none_or(|signed| signed.delegation.group_id != group) {
+            let denied = "<Error><Code>AccessDenied</Code><Message>group</Message></Error>";
+            return (
+                http::StatusCode::FORBIDDEN,
+                [("x-amz-version-id", "")],
+                denied,
+            );
+        }
         let listing = uri
             .query()
             .is_some_and(|query| query.contains("list-type=2"));
@@ -515,31 +529,32 @@ async fn listing_peer() -> (String, tokio::task::JoinHandle<()>) {
             }
             false => "remote",
         };
-        let headers = [("x-amz-version-id", "01ARZ3NDEKTSV4RRFFQ69G5FAV")];
-        (http::StatusCode::OK, headers, body)
+        let version = [("x-amz-version-id", "01ARZ3NDEKTSV4RRFFQ69G5FAV")];
+        (http::StatusCode::OK, version, body)
     };
     crate::tests::assistant::spawn_mock(axum::Router::new().fallback(answer)).await
 }
 
-// A dataset whose folder part lies in another member's range is browsed and downloaded
-// through the link's member.
-#[tokio::test]
-async fn dataset_member_folder() {
+/// Shares a dataset whose folder part lies in another member's range of a bucket in
+/// `bucket_group`, then browses and downloads that part through the link's member.
+async fn member_part(
+    test: &crate::routes::metadata::tests::TestState,
+    bucket_group: Ulid,
+) -> ServerResult<Vec<u8>> {
     use super::dataset::{
         DatasetTicketRequest, PartQuery, dataset_ticket, list_part, read_dataset,
     };
     use crate::tests::distributed::{PEER, distribute, node_id, publish_urls};
-    let test = crate::routes::metadata::tests::setup_network_state().await;
     let state = test.state.clone();
-    distribute(&state, test.group_id, "spire").await;
-    let (url, server) = listing_peer().await;
+    distribute(&state, bucket_group, "spire").await;
+    let (url, server) = listing_peer(bucket_group).await;
     publish_urls(&state, node_id(PEER), (&url, Some(&url))).await;
     let folder = format!(
         "arn:aruna:{}:{}:s3/spire/x/",
         state.get_realm_id(),
         state.get_node_id()
     );
-    let document_id = crate::tests::datasets::describe(&test, "/shared", false, &folder).await;
+    let document_id = crate::tests::datasets::describe(test, "/shared", false, &folder).await;
     let request = CreateShareRequest {
         target: ShareTargetBody::Dataset {
             dataset_id: document_id.to_string(),
@@ -550,16 +565,12 @@ async fn dataset_member_folder() {
         password: None,
     };
     let auth = Extension(Some(test.auth.clone()));
-    let (_, Json(link)) = create_share(State(state.clone()), auth, Json(request))
-        .await
-        .unwrap();
+    let (_, Json(link)) = create_share(State(state.clone()), auth, Json(request)).await?;
     let open = Some(Json(OpenShareRequest::default()));
     let headers = share_headers(&link.token);
     let opened = open_share(State(state.clone()), peer(), headers, open).await;
-    let visit = opened.unwrap().0.visit_token;
-    let Json(dataset) = read_dataset(State(state.clone()), share_headers(&visit))
-        .await
-        .unwrap();
+    let visit = opened?.0.visit_token;
+    let Json(dataset) = read_dataset(State(state.clone()), share_headers(&visit)).await?;
     assert_eq!(dataset.files.len(), 1, "{:?}", dataset.files);
     assert_eq!(dataset.files[0].kind, "folder");
     let part = dataset.files[0].entity_id.clone();
@@ -569,9 +580,7 @@ async fn dataset_member_folder() {
         cursor: None,
         limit: None,
     });
-    let Json(listed) = list_part(State(state.clone()), share_headers(&visit), query)
-        .await
-        .unwrap();
+    let Json(listed) = list_part(State(state.clone()), share_headers(&visit), query).await?;
     let names: Vec<_> = listed.files.iter().map(|file| file.name.as_str()).collect();
     assert_eq!(names, ["a.txt"]);
     let request = Json(DatasetTicketRequest {
@@ -579,13 +588,38 @@ async fn dataset_member_folder() {
         name: Some("a.txt".to_string()),
     });
     let ticket = dataset_ticket(State(state.clone()), share_headers(&visit), request).await;
-    let Json(ticket) = ticket.unwrap();
+    let Json(ticket) = ticket?;
     let ticket = ticket.path.split_once("ticket=").unwrap().1.to_string();
     let query = Query(DownloadQuery { ticket });
     let response = download_file(State(state.clone()), peer(), HeaderMap::new(), query).await;
-    let bytes = to_bytes(response.unwrap().into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(bytes.as_ref(), b"remote");
+    let bytes = to_bytes(response?.into_body(), usize::MAX).await.unwrap();
     server.abort();
+    Ok(bytes.to_vec())
+}
+
+// A dataset whose folder part lies in another member's range is browsed and downloaded
+// through the link's member.
+#[tokio::test]
+async fn dataset_member_folder() {
+    let test = crate::routes::metadata::tests::setup_network_state().await;
+    let group = test.group_id;
+    assert_eq!(member_part(&test, group).await.unwrap(), b"remote");
+}
+
+// A part in a bucket of another group than the dataset's is read as that bucket's group, which
+// the member checks the delegation against.
+#[tokio::test]
+async fn dataset_part_group() {
+    use aruna_core::structs::identity::auth::Actor;
+    let test = crate::routes::metadata::tests::setup_network_state().await;
+    let other = Ulid::from_bytes([31; 16]);
+    let actor = Actor {
+        node_id: test.state.get_node_id(),
+        user_id: test.auth.user_id,
+        realm_id: test.auth.realm_id,
+    };
+    let context = test.state.get_ctx();
+    let (realm, owner) = (test.auth.realm_id, test.auth.user_id);
+    crate::tests::routes::seed_group_docs(&context, realm, &actor, other, "other", owner).await;
+    assert_eq!(member_part(&test, other).await.unwrap(), b"remote");
 }

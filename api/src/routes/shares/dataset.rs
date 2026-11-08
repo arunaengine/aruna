@@ -513,7 +513,7 @@ pub async fn dataset_ticket(
     let version = match part.version_id {
         Some(version) => Some(version),
         None => {
-            let user = share_access(&state, &link, &auth, visit_end);
+            let user = share_access(&state, &link, (&auth, &info), visit_end);
             head_version(&state, (&bucket, &info), &key, &user).await?
         }
     };

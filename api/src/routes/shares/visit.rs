@@ -499,7 +499,7 @@ pub(crate) async fn list_below(
     };
     let relay = ShareRelay {
         state,
-        user: share_access(state, link, auth, visit_end),
+        user: share_access(state, link, (auth, info), visit_end),
     };
     let context = state.get_ctx();
     let scope = PageScope {
@@ -661,7 +661,7 @@ pub async fn create_ticket(
         (Permission::READ, "share.read"),
     )
     .await?;
-    let user = share_access(&state, &link, &auth, visit_end);
+    let user = share_access(&state, &link, (&auth, &info), visit_end);
     let version = head_version(&state, (&bucket, &info), &key, &user).await?;
     Ok(Json(sign_ticket(
         (&link, visit_end),
@@ -744,7 +744,7 @@ pub async fn download_file(
     // A key another member serves streams from there; the holder checks the creator again.
     let remote = match info.distribution.is_some() {
         true => {
-            let user = share_access(&state, &link, &auth, ticket.expires_at);
+            let user = share_access(&state, &link, (&auth, &info), ticket.expires_at);
             let service = member_service(&state).await;
             let read = service.member_get(&user, (&bucket, &info), &ticket.key, ticket.version_id);
             match read.await.map_err(|error| member_error(&error))? {
@@ -889,7 +889,7 @@ pub async fn upload_file(
     guard_bucket_write(state.get_ctx().as_ref(), &bucket)
         .await
         .map_err(|_| ServerError::Forbidden)?;
-    let user = share_access(&state, &link, &auth, visit_end);
+    let user = share_access(&state, &link, (&auth, &info), visit_end);
     let key = claim_key(&state, &auth, (&bucket, &info), &wanted, &user).await?;
     let content_length = headers
         .get(header::CONTENT_LENGTH)

@@ -11,7 +11,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::blob::UserAccess;
+use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::share::{SHARE_CREDENTIAL_PREFIX, ShareLink};
 use aruna_operations::s3::object::pages::{ObjectPage, RangeCall, RangeRelay};
 use axum::http::StatusCode;
@@ -24,12 +24,12 @@ use crate::mcp::data::ObjectOutput;
 use crate::s3::service::ArunaS3Service;
 use crate::server::state::ServerState;
 
-/// What a visit sends other members: the creator narrowed as `auth` is, until `expiry` (Unix
-/// seconds). It is no stored credential and has no secret; holders check it on their own path.
+/// What a visit sends other members about `info`'s bucket: the creator narrowed as `auth` is,
+/// until `expiry` (Unix seconds). No stored credential and no secret; holders check it there.
 pub(crate) fn share_access(
     state: &ServerState,
     link: &ShareLink,
-    auth: &AuthContext,
+    (auth, info): (&AuthContext, &BucketInfo),
     expiry: u64,
 ) -> UserAccess {
     // An expiry past what `SystemTime` holds becomes the latest one it always holds.
@@ -39,7 +39,8 @@ pub(crate) fn share_access(
     UserAccess {
         access_key: format!("{SHARE_CREDENTIAL_PREFIX}{}", link.id),
         user_identity: link.created_by,
-        group_id: link.group_id,
+        // A dataset's part may lie in a bucket of another group than the dataset's.
+        group_id: info.group_id,
         secret: EncryptedS3Secret::empty(),
         expiry,
         path_restrictions: auth.path_restrictions.clone(),
