@@ -1090,6 +1090,7 @@ impl S3 for ArunaS3Service {
         );
         // A forwarded copy keeps its source's placement refs and origin, as a local copy does.
         let copied = forward::copy_context(&req.extensions, &req.headers)?;
+        let create_only = (req.input.if_none_match.as_ref()).is_some_and(|tag| tag.is_any());
         let routing = match bucket_info.as_ref() {
             Some(info) => bucket_snapshot(&self.state, info).await,
             None => routing_snapshot(&self.state, group_id, &replication_bucket).await,
@@ -1128,6 +1129,9 @@ impl S3 for ArunaS3Service {
         };
         if let Some(gate) = gate {
             operation = operation.with_gate(gate);
+        }
+        if create_only {
+            operation = operation.create_only();
         }
 
         let result = drive(operation, &self.state)

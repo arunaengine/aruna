@@ -434,6 +434,10 @@ impl IntoS3Error for PutObjectError {
             PutObjectError::Distribution(ref error) => guard_error(error),
             PutObjectError::BlobWriteFailed(BlobError::PathTaken) => path_taken_error(),
             PutObjectError::BlobWriteFailed(BlobError::KeyTooLong) => long_key_error(),
+            PutObjectError::ObjectExists => s3_error!(
+                PreconditionFailed,
+                "An object exists at this key; If-None-Match: * allows only a new key"
+            ),
             err => internal_error(err),
         }
     }
