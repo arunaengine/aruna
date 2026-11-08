@@ -29,7 +29,8 @@ use crate::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken, ListedObject,
 };
 use crate::s3::object::visible::{
-    HiddenCursor, NextPage, VisibleError, is_sealed, open_cursor, visible_page,
+    HiddenCursor, Listed, Lister, NextPage, VisibleError, after_entry, is_sealed, open_cursor,
+    visible_from, visible_page,
 };
 
 /// Ranges one merged page visits at most, so its fan-out stays bounded.
@@ -101,6 +102,11 @@ pub trait RangeRelay: Sync {
     ) -> impl Future<Output = Result<Option<ObjectPage<Self::Object>>, Self::Error>> + Send;
     /// Whether a holder's refusal is its own fault, so a copy may list instead.
     fn is_fault(error: &Self::Error) -> bool;
+    /// Whether this node also checks the caller on each entry other members list, as for a
+    /// share visit, whose downloads this node authorizes on its own path.
+    fn checks_here(&self) -> bool {
+        false
+    }
 }
 
 /// What a listing runs with: this node, its records and the relay to other members.
@@ -171,7 +177,7 @@ pub fn decode_resume<E>(cursor: &str) -> Result<Resume, PageError<E>> {
 }
 
 /// The token that resumes a local listing after `key`, or past the whole `group`.
-fn resume_token<E>(
+pub fn resume_token<E>(
     bucket: &str,
     key: &str,
     group: Option<&str>,
@@ -245,7 +251,7 @@ fn local_token<E>(
 }
 
 /// The cursor of a local listing that stopped after `token`.
-fn after_cursor<E>(token: ListContinuationToken) -> Result<String, PageError<E>> {
+pub fn after_cursor<E>(token: ListContinuationToken) -> Result<String, PageError<E>> {
     let key = BlobHeadKey::from_bytes(&token.last_key)
         .map_err(PageError::internal)?
         .key;
@@ -358,15 +364,171 @@ async fn shown_part<R: RangeRelay>(
     })
 }
 
+/// One range at one member, listed through the relay for a page this node checks again.
+struct MemberRange<'a, R> {
+    relay: &'a R,
+    call: (Ulid, NodeId, bool),
+    range: &'a KeyRange,
+}
+
+impl<R: RangeRelay> Lister for MemberRange<'_, R> {
+    type Object = R::Object;
+    type Error = PageError<R::Error>;
+
+    async fn list(&self, input: &ListBucketInput) -> Result<Listed<R::Object>, Self::Error> {
+        let (set_id, node_id, copy) = self.call;
+        let request = ListRequest {
+            bucket: input.bucket.clone(),
+            prefix: input.prefix.clone(),
+            delimiter: input.delimiter.clone(),
+            cursor: None,
+            limit: (input.max_keys).unwrap_or(ListBucketOperation::DEFAULT_MAX_KEYS),
+            partial: false,
+        };
+        let mut cursor = input
+            .continuation_token
+            .clone()
+            .map(after_cursor)
+            .transpose()?;
+        loop {
+            let call = RangeCall {
+                set_id,
+                node_id,
+                range: self.range,
+                request: &request,
+                cursor: cursor.as_deref(),
+                copy,
+            };
+            let unanswered = PageError::Unanswered {
+                range_id: self.range.range_id,
+                set_id,
+            };
+            let page = self
+                .relay
+                .list_range(call)
+                .await
+                .map_err(PageError::Relay)?;
+            let page = page.ok_or(unanswered)?;
+            let shown = !page.objects.is_empty() || !page.prefixes.is_empty();
+            // A member that hid its whole page goes on from its own sealed cursor.
+            let next = match page.next_cursor.clone() {
+                Some(next) if is_sealed(&next) && !shown => {
+                    cursor = Some(next);
+                    continue;
+                }
+                Some(next) if is_sealed(&next) => last_entry(&request.bucket, &page),
+                Some(next) => match decode_resume(&next)? {
+                    Resume::After { key, group } => {
+                        Some(resume_token(&request.bucket, &key, group.as_deref())?)
+                    }
+                    Resume::From(_) | Resume::Hidden { .. } => return Err(PageError::Cursor),
+                },
+                None => None,
+            };
+            return Ok(Listed {
+                objects: page.objects,
+                prefixes: page.prefixes,
+                next,
+            });
+        }
+    }
+
+    fn key(object: &R::Object) -> &str {
+        object.key()
+    }
+}
+
+/// The position after the last entry of `page` in key order.
+fn last_entry<O: PageObject>(bucket: &str, page: &ObjectPage<O>) -> Option<ListContinuationToken> {
+    let objects = page.objects.iter().map(|object| (object.key(), false));
+    let groups = page.prefixes.iter().map(|group| (group.as_str(), true));
+    let (name, group) = objects.chain(groups).max()?;
+    Some(after_entry(bucket, name, group))
+}
+
+/// One range's page as this node's own rules show it to the caller, read from `node_id`:
+/// a key shows when `access` allows it, a common prefix once a key below it does, and a page
+/// that stops among hidden entries ends with this node's sealed cursor.
+async fn checked_part<R: RangeRelay>(
+    relay: &R,
+    (access, group_id): (&BucketAccess, Ulid),
+    (set_id, node_id, range, copy): (Ulid, NodeId, &KeyRange, bool),
+    (request, cursor): (&ListRequest, Option<&str>),
+) -> Result<ObjectPage<R::Object>, PageError<R::Error>> {
+    let (token, hidden) = match cursor {
+        Some(cursor) if is_sealed(cursor) => (
+            None,
+            Some(open_cursor::<HiddenCursor>(cursor).ok_or(PageError::Cursor)?),
+        ),
+        Some(cursor) => match decode_resume(cursor)? {
+            Resume::After { key, group } => (
+                Some(resume_token(&request.bucket, &key, group.as_deref())?),
+                None,
+            ),
+            Resume::From(_) | Resume::Hidden { .. } => return Err(PageError::Cursor),
+        },
+        None => (None, None),
+    };
+    let input = ListBucketInput {
+        bucket: request.bucket.clone(),
+        group_id,
+        continuation_token: token,
+        max_keys: Some(request.limit),
+        prefix: request.prefix.clone().filter(|prefix| !prefix.is_empty()),
+        delimiter: (request.delimiter.clone()).filter(|delimiter| !delimiter.is_empty()),
+        start_after: None,
+    };
+    let lister = MemberRange {
+        relay,
+        call: (set_id, node_id, copy),
+        range,
+    };
+    let shows = |object: &R::Object| {
+        let shown = access.allows(Some(object.key()), &Permission::READ);
+        Box::pin(async move { Ok::<bool, std::convert::Infallible>(shown) })
+            as futures_util::future::BoxFuture<'static, _>
+    };
+    let groups = |prefix: &str| access.allows(Some(prefix), &Permission::READ);
+    let page = visible_from(&lister, input, hidden, shows, groups).await;
+    let page = page.map_err(|error| match error {
+        VisibleError::List(error) => error,
+        VisibleError::Shows(never) => match never {},
+        VisibleError::Cursor => PageError::Internal("listing cursor not sealed".into()),
+    })?;
+    let next_cursor = match page.next {
+        Some(NextPage::After(token)) => Some(after_cursor(token)?),
+        Some(NextPage::Sealed(sealed)) => Some(sealed),
+        None => None,
+    };
+    Ok(ObjectPage {
+        objects: page.objects,
+        prefixes: page.prefixes,
+        next_cursor,
+        ..ObjectPage::default()
+    })
+}
+
 /// One range's page from a holder of the range, with the holder that answered; only a range
-/// nobody answers ends the page.
+/// nobody answers ends the page. With `checks`, this node checks the caller on each entry too.
 async fn remote_part<R: RangeRelay>(
     relay: &R,
-    (binding, holders): (&DistributionBinding, Vec<NodeId>),
+    (binding, holders, checks): (
+        &DistributionBinding,
+        Vec<NodeId>,
+        Option<(&BucketAccess, Ulid)>,
+    ),
     (range, copy): (&KeyRange, bool),
     (request, cursor): (&ListRequest, Option<String>),
 ) -> Result<(ObjectPage<R::Object>, NodeId), PageError<R::Error>> {
     for node_id in holders {
+        if let Some(checks) = checks {
+            let call = (binding.set_id, node_id, range, copy);
+            match checked_part(relay, checks, call, (request, cursor.as_deref())).await {
+                Ok(page) => return Ok((page, node_id)),
+                Err(PageError::Unanswered { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
         let call = RangeCall {
             set_id: binding.set_id,
             node_id,
@@ -402,6 +564,16 @@ async fn merged_page<R: RangeRelay>(
     request: ListRequest,
 ) -> PageResult<R::Object, R::Error> {
     let (context, relay) = (scope.context, scope.relay);
+    // A relay whose downloads this node authorizes has this node check every remote entry.
+    let access = match caller.filter(|_| relay.checks_here()) {
+        Some((auth, _)) => {
+            let ids = (scope.realm_id, info.group_id, scope.node_id);
+            let access = BucketAccess::load(context, auth, ids, &request.bucket).await;
+            Some(access.map_err(PageError::internal)?)
+        }
+        None => None,
+    };
+    let checks = access.as_ref().map(|access| (access, info.group_id));
     let view = bound_view(context, binding).await?;
     let snapshot = view.snapshot();
     let fence = local_fence(context, binding.set_id).await?;
@@ -481,7 +653,7 @@ async fn merged_page<R: RangeRelay>(
             (true, _) => None,
             (false, Some((node, copy, cursor))) => {
                 let asked = (&sub, Some(cursor.clone()));
-                let holder = (binding, vec![*node]);
+                let holder = (binding, vec![*node], checks);
                 let part = remote_part(relay, holder, (range, *copy), asked).await;
                 Some(part.map(|part| (part, *copy)))
             }
@@ -498,7 +670,7 @@ async fn merged_page<R: RangeRelay>(
                 };
                 let holders = others(snapshot.list_holder(range).into_iter().collect());
                 let asked = (&sub, cursor.clone());
-                match remote_part(relay, (binding, holders), (range, false), asked).await {
+                match remote_part(relay, (binding, holders, checks), (range, false), asked).await {
                     Ok(part) => Some(Ok((part, false))),
                     // The coordinator cannot answer, so this member's copy or another lists.
                     Err(error) if holder_fault::<R>(&error) => {
@@ -510,8 +682,12 @@ async fn merged_page<R: RangeRelay>(
                             false => {
                                 let copies = others(snapshot.copy_holders(range));
                                 let asked = (&sub, cursor);
-                                let part =
-                                    remote_part(relay, (binding, copies), (range, true), asked);
+                                let part = remote_part(
+                                    relay,
+                                    (binding, copies, checks),
+                                    (range, true),
+                                    asked,
+                                );
                                 Some(part.await.map(|part| (part, true)))
                             }
                         }

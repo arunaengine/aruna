@@ -107,7 +107,7 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 /// The coordinator a write goes to when this node does not coordinate the key's range.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct Forward {
+pub(crate) struct Forward {
     pub set_id: Ulid,
     pub range_id: Ulid,
     pub node_id: NodeId,
@@ -395,7 +395,7 @@ pub(super) fn header(response: &reqwest::Response, name: &str) -> Option<String>
 impl ArunaS3Service {
     /// The coordinator a write to `key` goes to, or `None` when this node writes it. A request
     /// that arrived with a delegation is never forwarded again.
-    pub(super) async fn forward_target(
+    pub(crate) async fn forward_target(
         &self,
         extensions: &http::Extensions,
         bucket: Option<&BucketInfo>,
@@ -589,6 +589,34 @@ impl ArunaS3Service {
         }
         let body = response.text().await.unwrap_or_default();
         Err(coordinator_error(forward, status, &body))
+    }
+
+    /// Sends a new object `key` to its coordinator for a caller another surface verified;
+    /// `If-None-Match: *` makes the coordinator keep a live key as it is.
+    pub(crate) async fn member_put(
+        &self,
+        user: &UserAccess,
+        forward: &Forward,
+        (bucket, key): (&str, &str),
+        (body, content_length, content_type): (StreamingBlob, Option<u64>, &str),
+    ) -> S3Result<reqwest::Response> {
+        let mut headers = vec![
+            ("content-type".to_string(), content_type.to_string()),
+            ("if-none-match".to_string(), "*".to_string()),
+        ];
+        headers.extend(
+            content_length.map(|length| ("content-length".to_string(), length.to_string())),
+        );
+        let request = ForwardRequest {
+            method: Method::PUT,
+            operation: "PutObject",
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            query: None,
+            headers,
+            body: ForwardBody::Stream(body, None),
+        };
+        self.forward_write(user, forward, request).await
     }
 
     /// The stored upload a request names. A distributed bucket's upload id names its set, range

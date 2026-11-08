@@ -39,6 +39,7 @@ use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
 
 mod dataset;
+mod relay;
 mod visit;
 
 /// Bytes of a link password; argon2id hashes any length, this only bounds the request.
@@ -313,14 +314,6 @@ async fn resolve_target(
         ),
     };
     let info = bucket_info(state, bucket).await?;
-    // First layer: links name ordinary buckets of this node only.
-    if info.distribution.is_some() {
-        return Err(ServerError::Refused(
-            StatusCode::CONFLICT,
-            "distributed_bucket",
-            "share links do not cover distributed buckets yet".to_string(),
-        ));
-    }
     let (realm, node) = (state.get_realm_id(), state.get_node_id());
     let path = match &target {
         ShareTarget::Folder { prefix, .. } | ShareTarget::Object { key: prefix, .. } => {
@@ -375,7 +368,9 @@ The caller needs READ on the target, or WRITE for `read_upload` and `upload`.
 - Every visit acts as the creator and is checked again on each request, so the link stops
   working as soon as the creator loses access. Uploads count against the bucket's group quota.
 - `upload` links let visitors add files without seeing anything stored.
-- Upload modes need a bucket or folder target. Distributed buckets are not supported yet.
+- Upload modes need a bucket or folder target.
+- A link to a distributed bucket is served by this node, which reads and writes the keys of
+  other members' ranges there; each member checks the creator on its own path.
 - The returned `token` goes into the URL fragment (`/s/<node>#<token>`), never into a path.
   The owner can read it again with `GET /shares/{id}`.
 - Realm and group policies see the operation `share.create` with the target and mode."#,
@@ -395,7 +390,7 @@ The caller needs READ on the target, or WRITE for `read_upload` and `upload`.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller lacks access to the target, holds a restricted, assistant or federated session, or a policy denies the link", body = ErrorResponse),
         (status = 404, description = "No such bucket or dataset on this node", body = ErrorResponse),
-        (status = 409, description = "`distributed_bucket` for a distributed bucket, `dataset_not_here` when this node holds no copy of the dataset", body = ErrorResponse)
+        (status = 409, description = "`dataset_not_here` when this node holds no copy of the dataset", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -539,7 +534,10 @@ pub async fn get_share(
 
 **Authentication**: realm bearer token without path restrictions; only the creator revokes.
 
-**Behavior**: the link stays in the owner's list as revoked, with its access log."#,
+**Behavior**
+- The link stays in the owner's list as revoked, with its access log.
+- Open visits fail on their next request, also for keys other members of a distributed bucket
+  serve; a download that already started runs to its end."#,
     params(("id" = String, Path, description = "Share link id")),
     responses(
         (status = 204, description = "Revoked, or already revoked"),
@@ -645,6 +643,8 @@ pub(crate) async fn log_event(state: &ServerState, share_id: Ulid, event: ShareE
     }
 }
 
+#[cfg(test)]
+mod members_tests;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

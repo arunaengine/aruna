@@ -12,6 +12,7 @@ use aruna_operations::distribution::guard::{
     bound_view, copies_interval, lists_interval, local_fence,
 };
 use aruna_operations::s3::object::list::{ListBucketInput, ListContinuationToken};
+use aruna_operations::s3::object::pages::{self, ListRequest, ObjectPage};
 use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed, open_cursor};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -206,7 +207,110 @@ fn scope_part(part: &mut ObjectListingPage, scope: &SubpathScope, url_encoded: b
     (part.common_prefixes).retain(|group| scope.allows_prefix(&raw(group.prefix.as_ref())));
 }
 
+/// An object another member listed, as its listing names it; `last_modified` is ISO 8601.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MemberObject {
+    pub key: String,
+    pub size: Option<u64>,
+    pub last_modified: Option<String>,
+    pub etag: Option<String>,
+}
+
+/// The S3 continuation token a holder resumes a `pages` cursor at; a sealed one passes as is.
+fn holder_token(bucket: &str, cursor: Option<&str>) -> S3Result<Option<String>> {
+    let invalid = || s3_error!(InvalidArgument, "Invalid continuation token");
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    if is_sealed(cursor) {
+        return Ok(Some(cursor.to_string()));
+    }
+    match pages::decode_resume::<()>(cursor).map_err(|_| invalid())? {
+        pages::Resume::After { key, group } => {
+            let token = pages::resume_token::<()>(bucket, &key, group.as_deref());
+            ArunaS3Service::encode_list_token(Some(&token.map_err(|_| invalid())?))
+        }
+        pages::Resume::From(_) | pages::Resume::Hidden { .. } => Err(invalid()),
+    }
+}
+
+/// The `pages` cursor a holder's next token continues at; a sealed one passes as is.
+fn page_cursor(token: Option<String>) -> S3Result<Option<String>> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    if is_sealed(&token) {
+        return Ok(Some(token));
+    }
+    let decoded = ArunaS3Service::decode_list_token(Some(&token))?;
+    let cursor = decoded.map(pages::after_cursor::<()>).transpose();
+    cursor.map_err(|_| s3_error!(InternalError, "A member answered with an invalid token"))
+}
+
+/// A holder's listing body as one page of `pages`.
+fn member_page(body: &str) -> S3Result<ObjectPage<MemberObject>> {
+    let objects = (elements(body, "Contents").into_iter())
+        .filter_map(|entry| {
+            Some(MemberObject {
+                key: xml_field(entry, "Key")?,
+                size: xml_field(entry, "Size").and_then(|size| size.parse().ok()),
+                last_modified: xml_field(entry, "LastModified"),
+                etag: xml_field(entry, "ETag"),
+            })
+        })
+        .collect();
+    let prefixes = (elements(body, "CommonPrefixes").into_iter())
+        .filter_map(|entry| xml_field(entry, "Prefix"))
+        .collect();
+    Ok(ObjectPage {
+        objects,
+        prefixes,
+        next_cursor: page_cursor(xml_field(body, "NextContinuationToken"))?,
+        ..ObjectPage::default()
+    })
+}
+
 impl ArunaS3Service {
+    /// One range's page from member `node_id`, or with `copy` from its copy, for a caller
+    /// another surface verified; cursors in and out are cursors of `pages`.
+    pub(crate) async fn member_list(
+        &self,
+        user: &UserAccess,
+        (set_id, node_id, copy): (Ulid, aruna_core::NodeId, bool),
+        range: &KeyRange,
+        (request, cursor): (&ListRequest, Option<&str>),
+    ) -> S3Result<ObjectPage<MemberObject>> {
+        let mut base = vec![
+            ("list-type", "2".to_string()),
+            ("max-keys", request.limit.to_string()),
+        ];
+        let named = |value: &Option<String>| value.clone().filter(|value| !value.is_empty());
+        base.extend(named(&request.prefix).map(|prefix| ("prefix", prefix)));
+        base.extend(named(&request.delimiter).map(|delimiter| ("delimiter", delimiter)));
+        let token = holder_token(&request.bucket, cursor)?;
+        base.extend(token.map(|token| ("continuation-token", token)));
+        let query = match copy {
+            true => format!("{}&{COPY_PARAM}=1", range_query(&base, range)),
+            false => range_query(&base, range),
+        };
+        let forward = Forward {
+            set_id,
+            range_id: range.range_id,
+            node_id,
+        };
+        let listing = ForwardRequest {
+            method: Method::GET,
+            operation: "ListObjectsV2",
+            bucket: request.bucket.clone(),
+            key: String::new(),
+            query: Some(query),
+            headers: Vec::new(),
+            body: ForwardBody::Empty,
+        };
+        let response = self.forward_read(user, &forward, listing).await?;
+        member_page(&answer_text(response).await?)
+    }
+
     pub(in crate::s3::service) fn encoded(&self, value: String, url_encoded: bool) -> String {
         match url_encoded {
             true => utf8_percent_encode(&value, URL_ENCODE_SET).to_string(),
@@ -552,8 +656,13 @@ impl ArunaS3Service {
                     };
                     let bounds = Some((range.lower.clone(), range.upper.clone()));
                     let reader = (owner.clone(), Some(user));
-                    let part =
-                        self.run_object_listing(sub, reader, url_encoded, scope, (bounds, hidden));
+                    let part = self.run_object_listing(
+                        sub,
+                        reader,
+                        url_encoded,
+                        (scope, None),
+                        (bounds, hidden),
+                    );
                     // Listing here instead of the coordinator lists this member's copy.
                     let copy = resumed.as_ref().map_or(!local, |(_, copy, _)| *copy);
                     (part.await?, self.node_id, copy)
@@ -694,6 +803,46 @@ mod tests {
         // A scope without grants hides what the holder listed under its own rules.
         scope_part(&mut part, &SubpathScope::default(), false);
         assert!(part.contents.is_empty() && part.common_prefixes.is_empty());
+    }
+
+    // A `pages` cursor reaches a holder as its S3 token, and the holder's token comes back
+    // as a `pages` cursor; sealed cursors pass both ways unread.
+    #[test]
+    fn member_cursors_map() {
+        let after = pages::Resume::After {
+            key: "m/a".to_string(),
+            group: Some("m/".to_string()),
+        };
+        let cursor = pages::encode_resume::<()>(&after).unwrap();
+        let token = holder_token("spire", Some(&cursor)).unwrap().unwrap();
+        let sent = ArunaS3Service::decode_list_token(Some(&token))
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.last_common_prefix.as_deref(), Some("m/"));
+        assert_eq!(BlobHeadKey::from_bytes(&sent.last_key).unwrap().key, "m/");
+        // A position inside a common prefix resumes past the whole prefix.
+        let back = page_cursor(Some(token)).unwrap().unwrap();
+        let past = pages::Resume::After {
+            key: "m/".to_string(),
+            group: Some("m/".to_string()),
+        };
+        assert_eq!(pages::decode_resume::<()>(&back).unwrap(), past);
+        let from = pages::encode_resume::<()>(&pages::Resume::From("m".to_string())).unwrap();
+        assert!(holder_token("spire", Some(&from)).is_err());
+        let sealed = aruna_operations::s3::object::visible::seal_cursor(&1u8).unwrap();
+        assert_eq!(
+            holder_token("spire", Some(&sealed)).unwrap(),
+            Some(sealed.clone())
+        );
+        assert_eq!(page_cursor(Some(sealed.clone())).unwrap(), Some(sealed));
+        let body = "<ListBucketResult><Contents><Key>m/x</Key><Size>3</Size>\
+                    <LastModified>2026-10-30T08:00:00.000Z</LastModified></Contents>\
+                    <CommonPrefixes><Prefix>m/d/</Prefix></CommonPrefixes></ListBucketResult>";
+        let page = member_page(body).unwrap();
+        assert_eq!(page.objects[0].key, "m/x");
+        assert_eq!(page.objects[0].size, Some(3));
+        assert_eq!(page.prefixes, ["m/d/"]);
+        assert!(page.next_cursor.is_none());
     }
 
     #[test]

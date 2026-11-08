@@ -10,7 +10,9 @@ use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{BucketInfo, CONTENT_TYPE_KEY, object_permission_path};
+use aruna_core::structs::storage::blob::{
+    BucketInfo, CONTENT_TYPE_KEY, UserAccess, object_permission_path,
+};
 use aruna_core::structs::storage::share::{
     SHARE_SCHEME, ShareAction, ShareEvent, ShareLink, ShareTarget, ShareToken, TICKET_SECS,
     TicketBody, client_network,
@@ -25,7 +27,7 @@ use aruna_operations::shares::lifecycle::{
 };
 use aruna_operations::shares::names::{ClaimNameOperation, ReleaseNameOperation};
 use aruna_operations::shares::rules::{
-    numbered_key, relative_path, scope_pattern, upload_key, visit_context,
+    NodeScope, numbered_key, relative_path, scope_pattern, upload_key, visit_context,
 };
 use aruna_operations::shares::store::GetShareOperation;
 use aruna_operations::staging::offered_directory::guard_bucket_write;
@@ -41,16 +43,23 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use super::relay::{
+    ShareRelay, UploadStream, counted_blob, member_error, share_access, upload_error,
+};
 use super::{ShareModeBody, log_event, rfc3339, unix_now};
 use crate::auth::ensure_permission_with;
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::forwarded::client_ip;
+use crate::mcp::data::store_stream;
 use crate::rate_limit::LocalKey;
+use crate::routes::federation::import::shared_stream;
 use crate::routes::storage::deletion::bucket_info;
-use crate::routes::storage::objects::object_page;
+use crate::routes::storage::objects::page_error;
+use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
-use aruna_operations::s3::object::pages::ListRequest;
+use aruna_operations::s3::object::pages::{self, ListRequest, PageError, PageScope};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Entries per listing page when the visitor names no limit.
 const PAGE: usize = 100;
@@ -183,6 +192,15 @@ pub(crate) fn visit_error(error: ShareError) -> ServerError {
     }
 }
 
+/// The answer while the member holding part of a distributed bucket cannot be reached.
+pub(crate) fn range_unavailable(action: &str) -> ServerError {
+    ServerError::Refused(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "range_unavailable",
+        format!("part of this folder {action} right now; try again later"),
+    )
+}
+
 /// The one answer for unknown, expired, revoked and mistyped links.
 pub(crate) fn unavailable() -> ServerError {
     ServerError::Refused(
@@ -269,9 +287,9 @@ pub(crate) async fn visit_scope(
     let info = bucket_info(state, bucket)
         .await
         .map_err(|_| unavailable())?;
-    let pattern =
-        scope_pattern(link, state.get_realm_id(), state.get_node_id()).ok_or_else(unavailable)?;
-    if info.distribution.is_some() || info.group_id != link.group_id {
+    let nodes = NodeScope::of(&info, state.get_node_id());
+    let pattern = scope_pattern(link, state.get_realm_id(), nodes).ok_or_else(unavailable)?;
+    if info.group_id != link.group_id {
         return Err(unavailable());
     }
     let auth = visit_context(link, state.get_realm_id(), pattern);
@@ -424,14 +442,16 @@ pub async fn open_share(
 **Authentication**: `Authorization: Share <visit token>`.
 
 **Behavior**
-- Only what the link's creator may still read shows.
+- Only what the link's creator may still read shows; in a distributed bucket each member
+  decides for its own keys.
 - Upload-only links list nothing and answer 403 `upload_only`."#,
     params(VisitListQuery),
     responses(
         (status = 200, description = "One page of the folder", body = VisitListing, example = json!({"files": [{"name": "table.csv", "size": 2048, "last_modified": "2026-10-30T08:00:00Z"}], "folders": ["plots/"], "next_cursor": null})),
         (status = 400, description = "Malformed prefix, cursor or limit, or `dataset_link`", body = ErrorResponse),
         (status = 403, description = "`upload_only`", body = ErrorResponse),
-        (status = 404, description = "`share_unavailable`", body = ErrorResponse)
+        (status = 404, description = "`share_unavailable`", body = ErrorResponse),
+        (status = 503, description = "`range_unavailable`: the member holding part of a distributed bucket cannot be reached", body = ErrorResponse)
     ),
     security(("share_token" = []))
 )]
@@ -440,24 +460,26 @@ pub async fn list_files(
     headers: HeaderMap,
     Query(query): Query<VisitListQuery>,
 ) -> ServerResult<Json<VisitListing>> {
-    let (link, _) = visited_link(&state, &headers).await?;
+    let (link, visit_end) = visited_link(&state, &headers).await?;
     require_reads(&link)?;
     let (bucket, info, auth) = visit_scope(&state, &link).await?;
     let root = root(&link.target).to_string();
     let covers = |key: &str| link.target.covers(&bucket, key);
     let scope = (bucket.as_str(), &info, &auth);
-    let listing = list_below(&state, scope, &root, query, link.expires_at, covers).await?;
+    let visit = (&link, visit_end);
+    let listing = list_below(&state, scope, &root, query, visit, covers).await?;
     Ok(Json(listing))
 }
 
 /// One folder level below `root` of a bucket as the narrowed creator sees it, names relative
-/// to `root`; only keys `covers` admits show.
+/// to `root`; only keys `covers` admits show. Other members list their ranges of a
+/// distributed bucket for the visit, which ends at `visit_end`.
 pub(crate) async fn list_below(
     state: &ServerState,
     (bucket, info, auth): (&str, &BucketInfo, &AuthContext),
     root: &str,
     query: VisitListQuery,
-    link_expiry: Option<u64>,
+    (link, visit_end): (&ShareLink, u64),
     covers: impl Fn(&str) -> bool,
 ) -> ServerResult<VisitListing> {
     let limit = query.limit.unwrap_or(PAGE);
@@ -475,8 +497,22 @@ pub(crate) async fn list_below(
         limit,
         partial: false,
     };
-    let expiry = link_expiry.unwrap_or(u64::MAX);
-    let page = object_page(state, info, (None, Some((auth, expiry))), request).await?;
+    let relay = ShareRelay {
+        state,
+        user: share_access(state, link, (auth, info), visit_end),
+    };
+    let context = state.get_ctx();
+    let scope = PageScope {
+        context: context.as_ref(),
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        relay: &relay,
+    };
+    let page = pages::object_page(&scope, info, Some((auth, visit_end)), request).await;
+    let page = page.map_err(|error| match error {
+        PageError::Unanswered { .. } => range_unavailable("cannot be listed"),
+        error => page_error(error),
+    })?;
     let relative = |key: &str| key.strip_prefix(root).map(str::to_string);
     Ok(VisitListing {
         files: page
@@ -558,6 +594,31 @@ pub(crate) async fn current_version(
     }
 }
 
+/// The current version of `key` as the range's coordinator of a distributed bucket names it,
+/// asked as `user`; an ordinary bucket answers here. 404 when there is none.
+pub(crate) async fn head_version(
+    state: &ServerState,
+    (bucket, info): (&str, &BucketInfo),
+    key: &str,
+    user: &UserAccess,
+) -> ServerResult<Option<Ulid>> {
+    if info.distribution.is_none() {
+        return current_version(state, bucket, key).await;
+    }
+    let service = member_service(state).await;
+    match service.member_head(user, (bucket, info), key).await {
+        Ok(ReadAnswer::Local(_)) => current_version(state, bucket, key).await,
+        Ok(ReadAnswer::Forwarded(response, _)) => Ok((response.headers().get("x-amz-version-id"))
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Ulid::from_string(value).ok())),
+        Err(error) => Err(member_error(&error)),
+    }
+}
+
+async fn member_service(state: &ServerState) -> ArunaS3Service {
+    ArunaS3Service::new(state.get_ctx(), state.get_realm_id(), state.get_node_id()).await
+}
+
 #[utoipa::path(
     post,
     path = "/shares/visit/tickets",
@@ -573,7 +634,8 @@ pub(crate) async fn current_version(
         (status = 200, description = "The download URL path", body = TicketResponse, example = json!({"path": "/api/v1/shares/download?ticket=<single-use-ticket>", "expires_at": "2026-10-31T10:01:00Z"})),
         (status = 400, description = "Malformed name, or `dataset_link`", body = ErrorResponse),
         (status = 403, description = "`upload_only`", body = ErrorResponse),
-        (status = 404, description = "`share_unavailable`, or no such file", body = ErrorResponse)
+        (status = 404, description = "`share_unavailable`, or no such file", body = ErrorResponse),
+        (status = 503, description = "`range_unavailable`: the member holding the file cannot be reached", body = ErrorResponse)
     ),
     security(("share_token" = []))
 )]
@@ -599,7 +661,8 @@ pub async fn create_ticket(
         (Permission::READ, "share.read"),
     )
     .await?;
-    let version = current_version(&state, &bucket, &key).await?;
+    let user = share_access(&state, &link, (&auth, &info), visit_end);
+    let version = head_version(&state, (&bucket, &info), &key, &user).await?;
     Ok(Json(sign_ticket(
         (&link, visit_end),
         (&bucket, &key),
@@ -636,7 +699,7 @@ fn ticket_share(ticket: &str) -> Option<Ulid> {
     responses(
         (status = 200, description = "The file bytes"),
         (status = 404, description = "`share_unavailable`: ticket used, expired, forged, or the link ended", body = ErrorResponse),
-        (status = 503, description = "The node's download capacity is exhausted, or the bucket is locked", body = ErrorResponse)
+        (status = 503, description = "The node's download capacity is exhausted, the bucket is locked, or `range_unavailable` when the member holding the file cannot be reached", body = ErrorResponse)
     ),
     security(())
 )]
@@ -678,34 +741,58 @@ pub async fn download_file(
             "too many downloads at once".to_string(),
         ),
     })?;
-    let result = get_object_routed(
-        &state.get_ctx(),
-        GetObjectInput {
-            bucket: bucket.clone(),
-            key: ticket.key.clone(),
-            version_id: ticket.version_id,
-            range: None,
-            group_id: info.group_id,
-            user_identity: auth.user_id,
-            realm_id: state.get_realm_id(),
-            node_id: state.get_node_id(),
-        },
-        auth.path_restrictions.clone(),
-    )
-    .await
-    .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
-    let size = result.info.size;
+    // A key another member serves streams from there; the holder checks the creator again.
+    let remote = match info.distribution.is_some() {
+        true => {
+            let user = share_access(&state, &link, (&auth, &info), ticket.expires_at);
+            let service = member_service(&state).await;
+            let read = service.member_get(&user, (&bucket, &info), &ticket.key, ticket.version_id);
+            match read.await.map_err(|error| member_error(&error))? {
+                ReadAnswer::Forwarded(response, _) => {
+                    let size = (response.headers().get(header::CONTENT_LENGTH))
+                        .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
+                    Some((shared_stream(response.bytes_stream()), size))
+                }
+                ReadAnswer::Local(_) => None,
+            }
+        }
+        false => None,
+    };
+    let (blob, size) = match remote {
+        Some(remote) => remote,
+        None => {
+            let result = get_object_routed(
+                &state.get_ctx(),
+                GetObjectInput {
+                    bucket: bucket.clone(),
+                    key: ticket.key.clone(),
+                    version_id: ticket.version_id,
+                    range: None,
+                    group_id: info.group_id,
+                    user_identity: auth.user_id,
+                    realm_id: state.get_realm_id(),
+                    node_id: state.get_node_id(),
+                },
+                auth.path_restrictions.clone(),
+            )
+            .await
+            .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
+            (result.blob, Some(result.info.size))
+        }
+    };
     let mut logged = event(ShareAction::Download, Some(ticket.key.clone()), ip);
-    logged.bytes = Some(size);
+    logged.bytes = size;
     log_event(&state, link.id, logged).await;
     let name = ticket.key.rsplit('/').next().unwrap_or("download");
     let disposition = format!(
         "attachment; filename*=UTF-8''{}",
         utf8_percent_encode(name, NON_ALPHANUMERIC)
     );
-    let mut response = Response::new(download::body(result.blob, permit));
+    let mut response = Response::new(download::body(blob, permit));
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+    if let Some(size) = size {
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+    }
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
@@ -724,6 +811,7 @@ async fn claim_key(
     auth: &AuthContext,
     (bucket, info): (&str, &BucketInfo),
     wanted: &str,
+    user: &UserAccess,
 ) -> ServerResult<String> {
     let now = unix_now();
     let until = now + UPLOAD_SECS.as_secs();
@@ -734,7 +822,7 @@ async fn claim_key(
             number => numbered_key(wanted, number),
         };
         number += 1;
-        match current_version(state, bucket, &candidate).await {
+        match head_version(state, (bucket, info), &candidate, user).await {
             Err(ServerError::NotFound) => {}
             Err(error) => return Err(error),
             Ok(_) => continue,
@@ -759,7 +847,8 @@ async fn claim_key(
 
 **Behavior**
 - The file lands like any upload of the link's creator: everyone with access to the bucket sees
-  it, and it counts against the bucket's group quota.
+  it, and it counts against the bucket's group quota. In a distributed bucket it is written,
+  and its quota charged, at the member that coordinates its key.
 - An upload never replaces a file: a taken name gets a number, such as `report (1).pdf`.
   When another writer creates the same name during the upload, it fails with 409
   `name_taken` and the client uploads again.
@@ -771,7 +860,8 @@ async fn claim_key(
         (status = 400, description = "The name is not a valid relative path", body = ErrorResponse),
         (status = 403, description = "The link does not accept uploads, or the folder is read-only", body = ErrorResponse),
         (status = 404, description = "`share_unavailable`", body = ErrorResponse),
-        (status = 409, description = "The group storage quota is exhausted, or `name_taken`", body = ErrorResponse)
+        (status = 409, description = "The group storage quota is exhausted, or `name_taken`", body = ErrorResponse),
+        (status = 503, description = "`range_unavailable`: the member that coordinates the name cannot be reached", body = ErrorResponse)
     ),
     security(("share_token" = []))
 )]
@@ -783,7 +873,7 @@ pub async fn upload_file(
     body: Body,
 ) -> ServerResult<(StatusCode, Json<UploadResponse>)> {
     let ip = visitor_ip(&state, peer, &headers);
-    let (link, _) = visited_link(&state, &headers).await?;
+    let (link, visit_end) = visited_link(&state, &headers).await?;
     if !link.mode.uploads() {
         return Err(ServerError::Refused(
             StatusCode::FORBIDDEN,
@@ -799,7 +889,8 @@ pub async fn upload_file(
     guard_bucket_write(state.get_ctx().as_ref(), &bucket)
         .await
         .map_err(|_| ServerError::Forbidden)?;
-    let key = claim_key(&state, &auth, (&bucket, &info), &wanted).await?;
+    let user = share_access(&state, &link, (&auth, &info), visit_end);
+    let key = claim_key(&state, &auth, (&bucket, &info), &wanted, &user).await?;
     let content_length = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -812,21 +903,13 @@ pub async fn upload_file(
         .to_string();
     let deadline = tokio::time::Instant::now() + UPLOAD_SECS;
     let stream = crate::routes::rocrate_import::upload_body_stream(body, deadline);
-    let stored = crate::mcp::data::store_stream(
-        &state,
-        &auth,
-        &info,
-        (&bucket, &key),
-        (stream, content_length),
-        ([(CONTENT_TYPE_KEY.to_string(), content_type)].into(), true),
-    )
-    .await;
+    let upload = (stream, content_length, content_type);
+    let stored = store_upload(&state, (&auth, &user), (&bucket, &info), &key, upload).await;
     let release = ReleaseNameOperation::new(&bucket, &key);
     if let Err(error) = drive(release, &state.get_ctx()).await {
         tracing::warn!(share_id = %link.id, error = %error, "Share upload name claim not released");
     }
-    let stored = stored?;
-    let size = stored.location.blob_size;
+    let size = stored?;
     let mut logged = event(ShareAction::Upload, Some(key.clone()), ip);
     logged.bytes = Some(size);
     log_event(&state, link.id, logged).await;
@@ -836,6 +919,34 @@ pub async fn upload_file(
         .unwrap_or(&key)
         .to_string();
     Ok((StatusCode::CREATED, Json(UploadResponse { name, size })))
+}
+
+/// Stores an upload create-only at the coordinator of its key and returns its size. Another
+/// member's range takes it as `user`, and its quota is charged there.
+async fn store_upload(
+    state: &Arc<ServerState>,
+    (auth, user): (&AuthContext, &UserAccess),
+    (bucket, info): (&str, &BucketInfo),
+    key: &str,
+    (stream, content_length, content_type): (UploadStream, Option<u64>, String),
+) -> ServerResult<u64> {
+    let service = member_service(state).await;
+    let extensions = axum::http::Extensions::new();
+    let target = service.forward_target(&extensions, Some(info), key).await;
+    let Some(forward) = target.map_err(|error| upload_error(&error))? else {
+        let metadata = [(CONTENT_TYPE_KEY.to_string(), content_type)].into();
+        let upload = (stream, content_length);
+        let stored = store_stream(state, auth, info, (bucket, key), upload, (metadata, true));
+        return Ok(stored.await?.location.blob_size);
+    };
+    let counted = Arc::new(AtomicU64::new(0));
+    let body = counted_blob(stream, counted.clone());
+    let upload = (body, content_length, content_type.as_str());
+    let sent = service
+        .member_put(user, &forward, (bucket, key), upload)
+        .await;
+    sent.map_err(|error| upload_error(&error))?;
+    Ok(counted.load(Ordering::Relaxed))
 }
 
 /// Tells the link's creator about an upload; a failed notice never fails the upload.

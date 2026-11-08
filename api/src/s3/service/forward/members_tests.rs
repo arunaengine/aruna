@@ -223,6 +223,49 @@ async fn unreachable_coordinator_fails() {
     assert_eq!(errors[0].code.as_deref(), Some("CoordinatorUnreachable"));
 }
 
+/// Puts `key` through node `on` with `If-None-Match: *`, so only a new key is written.
+async fn put_new(members: &Members, on: usize, key: &str) -> s3s::S3Result<()> {
+    let node = &members.nodes[on];
+    let input = PutObjectInput {
+        bucket: BUCKET.to_string(),
+        key: key.to_string(),
+        content_length: Some(3),
+        body: Some(StreamingBlob::from(bytes::Bytes::from_static(b"new"))),
+        if_none_match: Some(s3s::dto::ETagCondition::Any),
+        ..Default::default()
+    };
+    let mut put = request(input, Method::PUT, members.user_on(on), node.bucket().await);
+    put.headers.insert("if-none-match", "*".parse().unwrap());
+    node.service.put_object(put).await.map(|_| ())
+}
+
+// `If-None-Match: *` writes only a key without a live version, here and at the coordinator.
+#[tokio::test]
+async fn put_if_absent() {
+    let members = members(3, &["h", "p"], 0).await;
+    for key in ["a/local", "k/forwarded"] {
+        put_new(&members, 0, key).await.unwrap();
+        let taken = put_new(&members, 0, key).await.unwrap_err();
+        assert_eq!(*taken.code(), s3s::S3ErrorCode::PreconditionFailed, "{key}");
+        assert_eq!(
+            taken.status_code(),
+            Some(http::StatusCode::PRECONDITION_FAILED)
+        );
+    }
+    // A deleted key takes a new version again.
+    let entries = vec![BulkDeleteEntry {
+        key: "k/forwarded".to_string(),
+        version_id: None,
+    }];
+    let info = members.nodes[0].bucket().await;
+    let target = (BUCKET, Some(&info));
+    let (_, deleted, errors) = (members.nodes[0].service)
+        .forward_deletes(&Extensions::new(), target, &members.user_on(0), entries)
+        .await;
+    assert!(errors.is_empty() && deleted.len() == 1, "{errors:?}");
+    put_new(&members, 0, "k/forwarded").await.unwrap();
+}
+
 // Every member checks the caller on its own node path: a grant for this node only is
 // refused by the coordinator, and the answer says that node globs fix it.
 #[tokio::test]

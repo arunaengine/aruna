@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::future::Future;
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::future::BoxFuture;
@@ -69,18 +71,76 @@ pub enum NextPage {
 }
 
 /// One page of shown entries.
-#[derive(Debug, Default)]
-pub struct VisiblePage {
-    pub objects: Vec<ListedObject>,
+#[derive(Debug)]
+pub struct VisiblePage<O = ListedObject> {
+    pub objects: Vec<O>,
     pub prefixes: Vec<String>,
     pub next: Option<NextPage>,
 }
 
+impl<O> Default for VisiblePage<O> {
+    fn default() -> Self {
+        Self {
+            objects: Vec::new(),
+            prefixes: Vec::new(),
+            next: None,
+        }
+    }
+}
+
 #[derive(Debug)]
-pub enum VisibleError<E> {
-    List(ListBucketError),
+pub enum VisibleError<E, L = ListBucketError> {
+    List(L),
     Shows(E),
     Cursor,
+}
+
+/// One page a lister answered at a position, in its own key order.
+pub struct Listed<O> {
+    pub objects: Vec<O>,
+    pub prefixes: Vec<String>,
+    pub next: Option<ListContinuationToken>,
+}
+
+/// Where a visible listing reads its pages: this node's records, or another member's.
+pub trait Lister: Sync {
+    type Object: Send;
+    type Error: Send;
+    fn list(
+        &self,
+        input: &ListBucketInput,
+    ) -> impl Future<Output = Result<Listed<Self::Object>, Self::Error>> + Send;
+    fn key(object: &Self::Object) -> &str;
+}
+
+/// This node's records of a bucket, inside `bounds` when given.
+struct Records<'a> {
+    context: &'a DriverContext,
+    bounds: Option<(String, Option<String>)>,
+}
+
+impl Lister for Records<'_> {
+    type Object = ListedObject;
+    type Error = ListBucketError;
+
+    async fn list(&self, input: &ListBucketInput) -> Result<Listed<ListedObject>, ListBucketError> {
+        let operation = match self.bounds.clone() {
+            Some((lower, upper)) => {
+                ListBucketOperation::new(input.clone()).with_bounds(lower, upper)
+            }
+            None => ListBucketOperation::new(input.clone()),
+        };
+        let listed = drive(operation, self.context).await?;
+        Ok(Listed {
+            objects: listed.objects,
+            prefixes: listed.common_prefixes,
+            next: listed.continuation_token,
+        })
+    }
+
+    fn key(object: &ListedObject) -> &str {
+        &object.head.key
+    }
 }
 
 /// The token that resumes after `entry`, past its whole group when it is a common prefix.
@@ -97,28 +157,16 @@ enum Probe {
     Stopped(Vec<u8>),
 }
 
-async fn list_once<E>(
-    context: &DriverContext,
-    input: &ListBucketInput,
-    bounds: &Option<(String, Option<String>)>,
-) -> Result<crate::s3::object::list::ListBucketResult, VisibleError<E>> {
-    let operation = match bounds.clone() {
-        Some((lower, upper)) => ListBucketOperation::new(input.clone()).with_bounds(lower, upper),
-        None => ListBucketOperation::new(input.clone()),
-    };
-    drive(operation, context).await.map_err(VisibleError::List)
-}
-
 /// Seeks one shown entry below `group` from `at`, spending the budget on hidden ones.
-async fn probe<'s, E, F>(
-    context: &DriverContext,
-    (input, bounds): (&ListBucketInput, &Option<(String, Option<String>)>),
+async fn probe<'s, L: Lister, E, F>(
+    lister: &L,
+    input: &ListBucketInput,
     (group, at): (&str, Option<Vec<u8>>),
     budget: &mut usize,
     shows: &mut F,
-) -> Result<Probe, VisibleError<E>>
+) -> Result<Probe, VisibleError<E, L::Error>>
 where
-    F: FnMut(&ListedObject) -> BoxFuture<'s, Result<bool, E>>,
+    F: FnMut(&L::Object) -> BoxFuture<'s, Result<bool, E>>,
 {
     // The first page holds one entry, as the first entry of a prefix usually shows.
     let mut probe = ListBucketInput {
@@ -133,18 +181,18 @@ where
         ..input.clone()
     };
     loop {
-        let list = list_once(context, &probe, bounds).await?;
+        let list = lister.list(&probe).await.map_err(VisibleError::List)?;
         for object in list.objects {
             if shows(&object).await.map_err(VisibleError::Shows)? {
                 return Ok(Probe::Shown);
             }
             *budget = budget.saturating_sub(1);
             if *budget == 0 {
-                let at = object.head.to_bytes().map_err(|_| VisibleError::Cursor)?;
+                let at = after_entry(&input.bucket, L::key(&object), false).last_key;
                 return Ok(Probe::Stopped(at));
             }
         }
-        match list.continuation_token {
+        match list.next {
             Some(token) => probe.continuation_token = Some(token),
             None => return Ok(Probe::Empty),
         }
@@ -152,23 +200,23 @@ where
     }
 }
 
-enum Entry {
-    Object(ListedObject),
+enum Entry<O> {
+    Object(O),
     Group(String),
 }
 
 /// The entries of one listed page in key order.
-fn in_order(objects: Vec<ListedObject>, prefixes: Vec<String>) -> Vec<Entry> {
-    let mut entries: Vec<Entry> = (objects.into_iter().map(Entry::Object))
+fn in_order<L: Lister>(objects: Vec<L::Object>, prefixes: Vec<String>) -> Vec<Entry<L::Object>> {
+    let mut entries: Vec<Entry<L::Object>> = (objects.into_iter().map(Entry::Object))
         .chain(prefixes.into_iter().map(Entry::Group))
         .collect();
-    entries.sort_by(|left, right| name(left).cmp(name(right)));
+    entries.sort_by(|left, right| name::<L>(left).cmp(name::<L>(right)));
     entries
 }
 
-fn name(entry: &Entry) -> &str {
+fn name<L: Lister>(entry: &Entry<L::Object>) -> &str {
     match entry {
-        Entry::Object(object) => &object.head.key,
+        Entry::Object(object) => L::key(object),
         Entry::Group(group) => group,
     }
 }
@@ -178,13 +226,28 @@ fn name(entry: &Entry) -> &str {
 /// that met hidden entries ends after its last shown one, or sealed when it showed none.
 pub async fn visible_page<'s, E, F>(
     context: &DriverContext,
-    mut input: ListBucketInput,
+    input: ListBucketInput,
     (hidden, bounds): (Option<HiddenCursor>, Option<(String, Option<String>)>),
-    mut shows: F,
+    shows: F,
     groups: impl Fn(&str) -> bool,
 ) -> Result<VisiblePage, VisibleError<E>>
 where
     F: FnMut(&ListedObject) -> BoxFuture<'s, Result<bool, E>>,
+{
+    let records = Records { context, bounds };
+    visible_from(&records, input, hidden, shows, groups).await
+}
+
+/// `visible_page` over the pages of `lister`.
+pub async fn visible_from<'s, L: Lister, E, F>(
+    lister: &L,
+    mut input: ListBucketInput,
+    hidden: Option<HiddenCursor>,
+    mut shows: F,
+    groups: impl Fn(&str) -> bool,
+) -> Result<VisiblePage<L::Object>, VisibleError<E, L::Error>>
+where
+    F: FnMut(&L::Object) -> BoxFuture<'s, Result<bool, E>>,
 {
     let max = (input.max_keys).unwrap_or(ListBucketOperation::DEFAULT_MAX_KEYS);
     let bucket = input.bucket.clone();
@@ -203,13 +266,7 @@ where
         input.continuation_token = hidden.position.clone();
         input.start_after = None;
         if let Some((group, at)) = hidden.pending.clone() {
-            let probed = probe(
-                context,
-                (&input, &bounds),
-                (&group, at),
-                &mut budget,
-                &mut shows,
-            );
+            let probed = probe(lister, &input, (&group, at), &mut budget, &mut shows);
             match probed.await? {
                 Probe::Shown => {
                     page.prefixes.push(group.clone());
@@ -231,13 +288,13 @@ where
         }
     }
     loop {
-        let list = list_once(context, &input, &bounds).await?;
-        let more = list.continuation_token.clone();
-        let entries = in_order(list.objects, list.common_prefixes);
+        let list = lister.list(&input).await.map_err(VisibleError::List)?;
+        let more = list.next.clone();
+        let entries = in_order::<L>(list.objects, list.prefixes);
         let count = entries.len();
         for (index, entry) in entries.into_iter().enumerate() {
             let (entry_name, group) = match &entry {
-                Entry::Object(object) => (object.head.key.clone(), false),
+                Entry::Object(object) => (L::key(object).to_string(), false),
                 Entry::Group(group) => (group.clone(), true),
             };
             let position = Some(after_entry(&bucket, &entry_name, group));
@@ -251,13 +308,7 @@ where
                     false => (false, 1),
                 },
                 Entry::Group(group) if groups(&group) => {
-                    let probed = probe(
-                        context,
-                        (&input, &bounds),
-                        (&group, None),
-                        &mut budget,
-                        &mut shows,
-                    );
+                    let probed = probe(lister, &input, (&group, None), &mut budget, &mut shows);
                     match probed.await? {
                         Probe::Shown => {
                             page.prefixes.push(group);
