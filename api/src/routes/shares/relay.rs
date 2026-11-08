@@ -155,4 +155,8 @@ impl RangeRelay for ShareRelay<'_> {
     fn is_fault(error: &ServerError) -> bool {
         error.status_code().is_server_error()
     }
+
+    fn checks_here(&self) -> bool {
+        true
+    }
 }

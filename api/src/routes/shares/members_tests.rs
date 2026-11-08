@@ -278,6 +278,47 @@ async fn holder_policy_hides() {
     assert!(stored(&shared, 1, "private/secret.txt").await.is_some());
 }
 
+// The serving member decides the keys another member lists as it decides its own tickets: a
+// share policy on this member hides them, and no cursor names a hidden entry.
+#[tokio::test]
+async fn serving_policy_hides() {
+    use aruna_operations::s3::object::pages::{Resume, decode_resume};
+    let shared = shared().await;
+    put(&shared, 1, "private/secret.txt", "closed").await;
+    put(&shared, 1, "public.txt", "open").await;
+    let expression = "request.session.kind == 'share' && path.contains('/private/')";
+    shared.members.deny_on(0, expression).await;
+    let (_, visit) = visit(&shared, ShareModeBody::Read).await;
+    let error = ticket(&shared, &visit, "private/secret.txt")
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), "share_unavailable");
+    assert_eq!(
+        names(&shared, &visit, "", 100).await.unwrap(),
+        ["public.txt"]
+    );
+    let listed = page(&shared, &visit, ("private/", None, None))
+        .await
+        .unwrap();
+    assert!(listed.files.is_empty() && listed.folders.is_empty());
+    let (mut cursor, mut shown) = (None, Vec::new());
+    loop {
+        let listed = page(&shared, &visit, ("", cursor, Some(1))).await.unwrap();
+        shown.extend(listed.files.into_iter().map(|file| file.name));
+        shown.extend(listed.folders);
+        let Some(next) = listed.next_cursor else {
+            break;
+        };
+        if let Ok(Resume::After { key, group }) = decode_resume::<()>(&next) {
+            assert!(
+                !key.contains("private") && group.is_none_or(|group| !group.contains("private"))
+            );
+        }
+        cursor = Some(next);
+    }
+    assert_eq!(shown, ["public.txt"]);
+}
+
 // A range whose coordinator is down cannot be listed or written, and the visitor is told to
 // retry; this member's own range still takes uploads.
 #[tokio::test]
