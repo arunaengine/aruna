@@ -789,4 +789,8 @@ fn gateway_names_cause() {
         map_mirror_error(MetadataError::HandleMissing),
         ServerError::BadGatewayReason(_)
     ));
+    assert!(matches!(
+        map_create_error(SyncRelationshipError::RolledBack),
+        ServerError::BadGatewayReason(reason) if reason.contains("rolled back")
+    ));
 }

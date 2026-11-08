@@ -1226,7 +1226,9 @@ fn map_create_error(error: SyncRelationshipError) -> ServerError {
             ServerError::Conflict("sync relationship already exists".to_string())
         }
         // The target's answer was lost and repair rolls the mirror back; the caller may retry.
-        SyncRelationshipError::RolledBack => ServerError::BadGateway,
+        SyncRelationshipError::RolledBack => ServerError::BadGatewayReason(
+            "the target did not confirm the mirror and it was rolled back".to_string(),
+        ),
         other => ServerError::InternalError(other.to_string()),
     }
 }
