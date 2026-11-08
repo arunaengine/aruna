@@ -219,7 +219,7 @@ async fn local_parts(
                     .map(|index| (index.bucket, index.key, index.version_id));
                 let found = match local {
                     Some(found) => Some(found),
-                    None => member_content(state, *hash, &sets).await,
+                    None => member_content(state, *hash).await,
                 };
                 let Some((bucket, key, version_id)) = found else {
                     continue;
@@ -232,7 +232,7 @@ async fn local_parts(
                 let GlobalResolution::Found(found) = resolved else {
                     continue;
                 };
-                if !sets.iter().any(|set| set.set_id == found.set_id) {
+                if !bound_here(state, found.set_id, &found.bucket).await {
                     continue;
                 }
                 (found.bucket, found.key, Some(found.version_id), false)
@@ -279,20 +279,29 @@ async fn member_sets(state: &ServerState, named: NamedSets) -> Vec<MemberSet> {
     sets
 }
 
-/// The first version of `hash` in one of `sets`, by the sets' content indexes.
-async fn member_content(
-    state: &ServerState,
-    hash: [u8; 32],
-    sets: &[MemberSet],
-) -> Option<(String, String, Ulid)> {
-    if sets.is_empty() {
-        return None;
-    }
+/// The first version of `hash` in a set this node is a bound member of, by the sets' content
+/// indexes; no other part needs to name that set.
+async fn member_content(state: &ServerState, hash: [u8; 32]) -> Option<(String, String, Ulid)> {
     let deadline = Instant::now() + RESOLVE_TIMEOUT;
     let found = resolve_content(&state.get_ctx(), hash, deadline).await;
-    (found.versions.into_iter())
-        .find(|found| sets.iter().any(|set| set.set_id == found.set_id))
-        .map(|found| (found.bucket, found.key, found.version_id))
+    for found in found.versions {
+        if bound_here(state, found.set_id, &found.bucket).await {
+            return Some((found.bucket, found.key, found.version_id));
+        }
+    }
+    None
+}
+
+/// Whether this node's bucket `bucket` is the admitted member of `set_id`.
+async fn bound_here(state: &ServerState, set_id: Ulid, bucket: &str) -> bool {
+    let Ok(info) = bucket_info(state, bucket).await else {
+        return false;
+    };
+    let binding = info.distribution.as_ref();
+    match binding.filter(|binding| binding.set_id == set_id) {
+        Some(binding) => bound_view(&state.get_ctx(), binding).await.is_ok(),
+        None => false,
+    }
 }
 
 /// The bucket of one part and the creator narrowed to `pattern` in it; `pattern` gets the

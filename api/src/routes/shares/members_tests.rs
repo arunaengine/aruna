@@ -623,3 +623,103 @@ async fn dataset_part_group() {
     crate::tests::routes::seed_group_docs(&context, realm, &actor, other, "other", owner).await;
     assert_eq!(member_part(&test, other).await.unwrap(), b"remote");
 }
+
+// A part named only by its global version or content hash is served when this node is a bound
+// member of the set it resolves to, though no other part names that set or bucket.
+#[tokio::test]
+async fn dataset_global_parts() {
+    use super::dataset::{DatasetTicketRequest, dataset_ticket, read_dataset};
+    use crate::tests::distributed::{PEER, distribute, node_id, publish_urls, write};
+    use aruna_core::keyspaces::{CONTENT_INDEX_KEYSPACE, VERSION_INDEX_KEYSPACE};
+    use aruna_core::structs::storage::data::identity::content_id;
+    use aruna_core::structs::storage::distribution::OriginalEpoch;
+    use aruna_core::structs::storage::distribution::SetHint;
+    use aruna_core::structs::storage::distribution::hint::mint_version;
+    use aruna_core::structs::storage::distribution::inventory::{
+        IndexEntry, VersionEntry, content_key, index_key, version_position,
+    };
+    use aruna_core::structs::storage::global_id::GlobalId;
+    let test = crate::routes::metadata::tests::setup_network_state().await;
+    let state = test.state.clone();
+    let set_id = distribute(&state, test.group_id, "spire").await.set_id();
+    // This member's indexes name a version of the other member's range, as replication does.
+    let version = mint_version(Some(SetHint::of_set(set_id)));
+    let position = version_position(set_id, "x/a.txt", OriginalEpoch(1), 1, version);
+    let entry = IndexEntry {
+        position,
+        version: VersionEntry::default(),
+    };
+    let index = index_key(set_id, version);
+    write(
+        &state,
+        VERSION_INDEX_KEYSPACE,
+        index,
+        entry.to_bytes().unwrap(),
+    )
+    .await;
+    let hash = [9; 32];
+    let content = content_key(set_id, &hash, version);
+    write(&state, CONTENT_INDEX_KEYSPACE, content, Vec::new()).await;
+    let (url, server) = listing_peer(test.group_id).await;
+    publish_urls(&state, node_id(PEER), (&url, Some(&url))).await;
+    let global = GlobalId::Version {
+        realm_id: state.get_realm_id(),
+        version_id: version,
+    }
+    .to_url();
+    let parts = [(global.as_str(), "File"), (&content_id(hash), "File")];
+    let describe = crate::tests::datasets::describe_parts(&test, "/shared", false, &parts);
+    let document_id = describe.await;
+    let request = CreateShareRequest {
+        target: ShareTargetBody::Dataset {
+            dataset_id: document_id.to_string(),
+        },
+        mode: ShareModeBody::Read,
+        label: String::new(),
+        expires_at: None,
+        password: None,
+    };
+    let auth = Extension(Some(test.auth.clone()));
+    let (_, Json(link)) = create_share(State(state.clone()), auth, Json(request))
+        .await
+        .unwrap();
+    let open = Some(Json(OpenShareRequest::default()));
+    let opened = open_share(
+        State(state.clone()),
+        peer(),
+        share_headers(&link.token),
+        open,
+    )
+    .await;
+    let visit = opened.unwrap().0.visit_token;
+    let Json(dataset) = read_dataset(State(state.clone()), share_headers(&visit))
+        .await
+        .unwrap();
+    let mut ids: Vec<_> = (dataset.files.iter())
+        .map(|file| file.entity_id.clone())
+        .collect();
+    ids.sort();
+    let mut expected = [global.clone(), content_id(hash)];
+    expected.sort();
+    assert_eq!(ids, expected);
+    let request = Json(DatasetTicketRequest {
+        entity_id: global.clone(),
+        name: None,
+    });
+    let ticket = dataset_ticket(State(state.clone()), share_headers(&visit), request).await;
+    let ticket = ticket
+        .unwrap()
+        .0
+        .path
+        .split_once("ticket=")
+        .unwrap()
+        .1
+        .to_string();
+    let query = Query(DownloadQuery { ticket });
+    let response = download_file(State(state.clone()), peer(), HeaderMap::new(), query).await;
+    let bytes = to_bytes(response.unwrap().into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), b"remote");
+    server.abort();
+}
