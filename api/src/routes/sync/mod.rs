@@ -1204,16 +1204,17 @@ async fn clear_repair(
     }
 }
 
+/// A failure without a verdict of the target is a retryable 502 that names its cause.
 fn map_mirror_error(error: MetadataError) -> ServerError {
     let message = match &error {
         MetadataError::Backend(message) | MetadataError::InvalidInput(message) => message.as_str(),
-        _ => return ServerError::BadGateway,
+        _ => "",
     };
     match message {
         "access_denied" => ServerError::Forbidden,
         "not_found" => ServerError::NotFound,
         "invalid_relationship" => ServerError::BadRequest,
-        _ => ServerError::BadGateway,
+        _ => ServerError::BadGatewayReason(format!("the target did not store the mirror: {error}")),
     }
 }
 
