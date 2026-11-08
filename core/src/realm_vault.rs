@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn differs_from_node_vault() {
+    fn distinct_from_node() {
         // Equal input bytes must not give the node vault key, or a node secret could open realm records.
         let bytes = [7u8; 32];
         let realm = RealmVaultKey::derive(&SigningKey::from_bytes(&bytes));

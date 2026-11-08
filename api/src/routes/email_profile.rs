@@ -31,10 +31,10 @@ use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
 #[openapi(tags((name = "system/realm", description = "Realm configuration, placement and quota")))]
-pub struct EmailProfileApiDoc;
+pub struct ProfileApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(EmailProfileApiDoc::openapi()).routes(routes!(
+    OpenApiRouter::with_openapi(ProfileApiDoc::openapi()).routes(routes!(
         get_email_profile,
         set_email_profile,
         delete_email_profile

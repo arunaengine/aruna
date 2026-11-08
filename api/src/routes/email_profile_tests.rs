@@ -71,7 +71,7 @@ fn body(password: Option<&str>) -> Json<EmailProfileRequest> {
 }
 
 #[tokio::test]
-async fn admin_sets_member_reads() {
+async fn admin_sets_profile() {
     let (_dir, state, admin) = setup_state().await;
     let member = UserId::local(Ulid::generate(), state.get_realm_id());
     let get = |user_id| get_email_profile(State(state.clone()), Extension(auth(&state, user_id)));

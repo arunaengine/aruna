@@ -315,7 +315,7 @@ impl SetEmailOperation {
                 document_target.clone(),
                 Vec::new(),
                 DocumentOutboxEvent::admin(event),
-                placement.clone(),
+                placement,
                 false,
             );
             writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);

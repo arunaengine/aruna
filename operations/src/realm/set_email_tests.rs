@@ -97,11 +97,9 @@ async fn set(
     ctx: &DriverContext,
     actor: &Actor,
     profile: Option<EmailInput>,
-) -> SetEmailOperationResult {
+) -> Result<Option<RealmEmailProfile>, SetEmailError> {
     drive(SetEmailOperation::new(email_config(actor, profile)), ctx).await
 }
-
-type SetEmailOperationResult = Result<Option<RealmEmailProfile>, SetEmailError>;
 
 fn opened(config: &RealmConfigDocument) -> Vec<Vec<u8>> {
     (config.vault.iter())
@@ -245,7 +243,7 @@ fn delete_tombstones_candidates() {
 }
 
 #[test]
-fn resolving_put_keeps_new() {
+fn resolving_put_wins() {
     // The write that resolves the conflict mints its own entry and tombstones both candidates.
     let (mut state, entries) = concurrent_firsts();
     let resolved = apply_change(&mut state, Some(input(Some("mailer"), Some("final"))));

@@ -912,7 +912,7 @@ fn vault_revisions(state: &AdminDocumentState) -> Vec<(Ulid, Ulid)> {
 }
 
 #[test]
-fn vault_sets_replaces_deletes() {
+fn vault_entry_writes() {
     // Different entries never conflict; a write that saw the record replaces or deletes it.
     let mut state =
         AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
