@@ -442,14 +442,16 @@ pub async fn open_share(
 **Authentication**: `Authorization: Share <visit token>`.
 
 **Behavior**
-- Only what the link's creator may still read shows.
+- Only what the link's creator may still read shows; in a distributed bucket each member
+  decides for its own keys.
 - Upload-only links list nothing and answer 403 `upload_only`."#,
     params(VisitListQuery),
     responses(
         (status = 200, description = "One page of the folder", body = VisitListing, example = json!({"files": [{"name": "table.csv", "size": 2048, "last_modified": "2026-10-30T08:00:00Z"}], "folders": ["plots/"], "next_cursor": null})),
         (status = 400, description = "Malformed prefix, cursor or limit, or `dataset_link`", body = ErrorResponse),
         (status = 403, description = "`upload_only`", body = ErrorResponse),
-        (status = 404, description = "`share_unavailable`", body = ErrorResponse)
+        (status = 404, description = "`share_unavailable`", body = ErrorResponse),
+        (status = 503, description = "`range_unavailable`: the member holding part of a distributed bucket cannot be reached", body = ErrorResponse)
     ),
     security(("share_token" = []))
 )]
@@ -632,7 +634,8 @@ async fn member_service(state: &ServerState) -> ArunaS3Service {
         (status = 200, description = "The download URL path", body = TicketResponse, example = json!({"path": "/api/v1/shares/download?ticket=<single-use-ticket>", "expires_at": "2026-10-31T10:01:00Z"})),
         (status = 400, description = "Malformed name, or `dataset_link`", body = ErrorResponse),
         (status = 403, description = "`upload_only`", body = ErrorResponse),
-        (status = 404, description = "`share_unavailable`, or no such file", body = ErrorResponse)
+        (status = 404, description = "`share_unavailable`, or no such file", body = ErrorResponse),
+        (status = 503, description = "`range_unavailable`: the member holding the file cannot be reached", body = ErrorResponse)
     ),
     security(("share_token" = []))
 )]
@@ -696,7 +699,7 @@ fn ticket_share(ticket: &str) -> Option<Ulid> {
     responses(
         (status = 200, description = "The file bytes"),
         (status = 404, description = "`share_unavailable`: ticket used, expired, forged, or the link ended", body = ErrorResponse),
-        (status = 503, description = "The node's download capacity is exhausted, or the bucket is locked", body = ErrorResponse)
+        (status = 503, description = "The node's download capacity is exhausted, the bucket is locked, or `range_unavailable` when the member holding the file cannot be reached", body = ErrorResponse)
     ),
     security(())
 )]
@@ -844,7 +847,8 @@ async fn claim_key(
 
 **Behavior**
 - The file lands like any upload of the link's creator: everyone with access to the bucket sees
-  it, and it counts against the bucket's group quota.
+  it, and it counts against the bucket's group quota. In a distributed bucket it is written,
+  and its quota charged, at the member that coordinates its key.
 - An upload never replaces a file: a taken name gets a number, such as `report (1).pdf`.
   When another writer creates the same name during the upload, it fails with 409
   `name_taken` and the client uploads again.
@@ -856,7 +860,8 @@ async fn claim_key(
         (status = 400, description = "The name is not a valid relative path", body = ErrorResponse),
         (status = 403, description = "The link does not accept uploads, or the folder is read-only", body = ErrorResponse),
         (status = 404, description = "`share_unavailable`", body = ErrorResponse),
-        (status = 409, description = "The group storage quota is exhausted, or `name_taken`", body = ErrorResponse)
+        (status = 409, description = "The group storage quota is exhausted, or `name_taken`", body = ErrorResponse),
+        (status = 503, description = "`range_unavailable`: the member that coordinates the name cannot be reached", body = ErrorResponse)
     ),
     security(("share_token" = []))
 )]

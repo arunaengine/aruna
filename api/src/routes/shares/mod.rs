@@ -534,7 +534,10 @@ pub async fn get_share(
 
 **Authentication**: realm bearer token without path restrictions; only the creator revokes.
 
-**Behavior**: the link stays in the owner's list as revoked, with its access log."#,
+**Behavior**
+- The link stays in the owner's list as revoked, with its access log.
+- Open visits fail on their next request, also for keys other members of a distributed bucket
+  serve; a download that already started runs to its end."#,
     params(("id" = String, Path, description = "Share link id")),
     responses(
         (status = 204, description = "Revoked, or already revoked"),
