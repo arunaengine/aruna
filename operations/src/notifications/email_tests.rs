@@ -269,3 +269,29 @@ async fn queues_each_once() {
         "a category outside the opt-in queues nothing"
     );
 }
+
+#[tokio::test]
+async fn replacement_keeps_job() {
+    // A retry after the opt-in was replaced finds the queued job instead of a conflict.
+    let staging = setup_driver_context().await;
+    let context = &staging.driver_context;
+    seed_user(context).await;
+    act(context, opt_in(ADDRESS, &["share.upload"]))
+        .await
+        .unwrap();
+    let records = [share_upload()];
+    enqueue_emails(context, node(), &records).await.unwrap();
+    let key = user_dedup_key(user(), &format!("email/{}", records[0].notification_id));
+    let storage = &context.storage_handle;
+    let first = find_dedup_plan(storage, user(), &key, None).await.unwrap();
+    assert!(first.is_some(), "the opted notice is queued");
+
+    act(context, opt_in(ADDRESS, &["share.upload"]))
+        .await
+        .unwrap();
+    enqueue_emails(context, node(), &records)
+        .await
+        .expect("a replaced opt-in does not conflict");
+    let again = find_dedup_plan(storage, user(), &key, None).await.unwrap();
+    assert_eq!(again, first);
+}

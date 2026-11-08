@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::jobs::executor::ProgressReporter;
+use crate::jobs::store::find_dedup_plan;
 use crate::jobs::submit::mint_job_id;
 use crate::tests::staging::setup_driver_context;
 
@@ -204,4 +205,30 @@ async fn replaced_subscription_skips() {
         JobRunOutcome::Succeeded(JobResultPayload::Webhook { status: None })
     ));
     assert!(received.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn replacement_keeps_job() {
+    // A retry after the subscription was replaced finds the queued job instead of a conflict.
+    let staging = setup_driver_context().await;
+    let context = &staging.driver_context;
+    let url = "https://hooks.example.org/aruna".to_string();
+    act(context, WebhookAction::Set { url: url.clone() })
+        .await
+        .unwrap();
+    let records = [upload(user())];
+    let owner = iroh::SecretKey::from_bytes(&[8; 32]).public();
+    enqueue_webhooks(context, owner, &records).await.unwrap();
+    let key = format!("webhook/{}", records[0].notification_id);
+    let key = user_dedup_key(user(), &key);
+    let storage = &context.storage_handle;
+    let first = find_dedup_plan(storage, user(), &key, None).await.unwrap();
+    assert!(first.is_some(), "the upload is queued");
+
+    act(context, WebhookAction::Set { url }).await.unwrap();
+    enqueue_webhooks(context, owner, &records)
+        .await
+        .expect("a replaced subscription does not conflict");
+    let again = find_dedup_plan(storage, user(), &key, None).await.unwrap();
+    assert_eq!(again, first);
 }

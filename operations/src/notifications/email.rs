@@ -38,7 +38,7 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
-use crate::jobs::service::{mint_local_job, submit_local_job};
+use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
 use crate::jobs::submit::SubmitJobSpec;
 use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
 
@@ -445,6 +445,14 @@ pub async fn enqueue_emails(
             record.recipient,
             &format!("email/{}", record.notification_id),
         );
+        // A queued job keeps the settings it was queued with, so changed settings never conflict.
+        let queued = find_dedup_job(context, record.recipient, &dedup_key).await;
+        if queued
+            .map_err(|error| format!("email delivery lookup: {error}"))?
+            .is_some()
+        {
+            continue;
+        }
         let realm_id = record.recipient.realm_id;
         let submitted = async {
             let job_id = mint_local_job(context, realm_id, owner_node_id, Some(&dedup_key)).await?;
