@@ -16,6 +16,7 @@ pub mod assistant;
 pub mod audit;
 pub mod device;
 pub mod drs;
+pub mod email_profile;
 pub mod emails;
 pub mod execution;
 pub mod federation;
@@ -126,6 +127,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(notifications::router())
         .merge(webhooks::router())
         .merge(emails::router())
+        .merge(email_profile::router())
         .merge(policies::router())
         .merge(portal::router())
         .merge(oidc_providers::router())
@@ -447,6 +449,9 @@ pub(crate) mod tests {
         ("GET", "/system/jobs"),
         ("GET", "/system/realm"),
         ("GET", "/system/realm/descriptor"),
+        ("GET", "/system/realm/email"),
+        ("PUT", "/system/realm/email"),
+        ("DELETE", "/system/realm/email"),
         ("GET", "/system/realm/federation"),
         ("GET", "/system/realm/placement"),
         ("GET", "/system/realm/portal-features"),
