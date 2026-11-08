@@ -224,43 +224,20 @@ impl ReplicationHarness {
         Ok(())
     }
 
-    /// A 502 means the target did not store its mirror and nothing was created; the route
-    /// documents it as retryable, so a slow or briefly unreachable target is asked again.
     async fn post_sync(
         &self,
         base_url: &str,
         bearer_token: &str,
         request: CreateSyncRequest,
     ) -> TestResult<SyncRelationshipResponse> {
-        let answer = std::sync::Mutex::new(None);
-        let waited = wait_until(
-            "sync relationship creation",
-            shared::WAIT_CAP,
-            Duration::from_millis(200),
-            || async {
-                let response = reqwest::Client::new()
-                    .post(format!("{base_url}/api/v1/data/sync/relationships"))
-                    .bearer_auth(bearer_token)
-                    .json(&request)
-                    .send()
-                    .await;
-                let Ok(response) = response else {
-                    return false;
-                };
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let retry = status == StatusCode::BAD_GATEWAY;
-                *answer.lock().expect("sync answer lock") = Some((status, body));
-                !retry
-            },
-        )
-        .await;
-        // A lasting 502 is reported with its reason rather than as a bare timeout.
-        let Some((status, body)) = answer.into_inner().expect("sync answer lock") else {
-            let missing =
-                || std::io::Error::other("sync relationship creation had no answer").into();
-            return Err(waited.err().unwrap_or_else(missing));
-        };
+        let response = reqwest::Client::new()
+            .post(format!("{}/api/v1/data/sync/relationships", base_url))
+            .bearer_auth(bearer_token)
+            .json(&request)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
         if status != StatusCode::CREATED {
             return Err(std::io::Error::other(format!(
                 "sync relationship creation returned {status}: {body}"
