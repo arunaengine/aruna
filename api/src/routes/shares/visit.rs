@@ -25,7 +25,7 @@ use aruna_operations::shares::lifecycle::{
 };
 use aruna_operations::shares::names::{ClaimNameOperation, ReleaseNameOperation};
 use aruna_operations::shares::rules::{
-    numbered_key, relative_path, scope_pattern, upload_key, visit_context,
+    NodeScope, numbered_key, relative_path, scope_pattern, upload_key, visit_context,
 };
 use aruna_operations::shares::store::GetShareOperation;
 use aruna_operations::staging::offered_directory::guard_bucket_write;
@@ -269,9 +269,9 @@ pub(crate) async fn visit_scope(
     let info = bucket_info(state, bucket)
         .await
         .map_err(|_| unavailable())?;
-    let pattern =
-        scope_pattern(link, state.get_realm_id(), state.get_node_id()).ok_or_else(unavailable)?;
-    if info.distribution.is_some() || info.group_id != link.group_id {
+    let nodes = NodeScope::of(&info, state.get_node_id());
+    let pattern = scope_pattern(link, state.get_realm_id(), nodes).ok_or_else(unavailable)?;
+    if info.group_id != link.group_id {
         return Err(unavailable());
     }
     let auth = visit_context(link, state.get_realm_id(), pattern);

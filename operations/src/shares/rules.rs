@@ -8,8 +8,9 @@ use aruna_core::structs::identity::auth::{
     AuthContext, PathRestriction, Permission, SessionKind, SessionRef,
 };
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
+use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::share::{ShareLink, ShareMode, ShareTarget, VISIT_SECS};
+use aruna_core::types::GroupId;
 use thiserror::Error;
 
 /// Bytes of a label; it names the link in the owner's list only.
@@ -63,17 +64,48 @@ pub fn required_permission(mode: ShareMode) -> Permission {
     }
 }
 
+/// The node paths a visit's restriction covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeScope {
+    /// This node only, for an ordinary bucket.
+    Node(NodeId),
+    /// Every member of a distributed bucket; each checks the visit on its own node path.
+    Members,
+}
+
+impl NodeScope {
+    /// The scope of `info` as this node `node_id` holds it.
+    pub fn of(info: &BucketInfo, node_id: NodeId) -> Self {
+        match info.distribution {
+            Some(_) => Self::Members,
+            None => Self::Node(node_id),
+        }
+    }
+}
+
+/// The pattern of `bucket`'s permission path in `nodes`, without a trailing `/`.
+pub fn bucket_pattern(
+    realm_id: RealmId,
+    group_id: GroupId,
+    nodes: NodeScope,
+    bucket: &str,
+) -> String {
+    match nodes {
+        NodeScope::Node(node_id) => {
+            globset::escape(&bucket_permission_path(realm_id, group_id, node_id, bucket))
+        }
+        NodeScope::Members => format!(
+            "{}/*/{}",
+            globset::escape(&format!("/{realm_id}/g/{group_id}/data")),
+            globset::escape(bucket)
+        ),
+    }
+}
+
 /// The path pattern a bucket, folder or object visit is confined to; `None` for a dataset,
 /// whose files are confined one object at a time.
-pub fn scope_pattern(link: &ShareLink, realm_id: RealmId, node_id: NodeId) -> Option<String> {
-    let bucket_path = |bucket: &str| {
-        globset::escape(&bucket_permission_path(
-            realm_id,
-            link.group_id,
-            node_id,
-            bucket,
-        ))
-    };
+pub fn scope_pattern(link: &ShareLink, realm_id: RealmId, nodes: NodeScope) -> Option<String> {
+    let bucket_path = |bucket: &str| bucket_pattern(realm_id, link.group_id, nodes, bucket);
     match &link.target {
         ShareTarget::Bucket { bucket } => Some(format!("{}/**", bucket_path(bucket))),
         ShareTarget::Folder { bucket, prefix } => Some(format!(
@@ -81,13 +113,9 @@ pub fn scope_pattern(link: &ShareLink, realm_id: RealmId, node_id: NodeId) -> Op
             bucket_path(bucket),
             globset::escape(prefix)
         )),
-        ShareTarget::Object { bucket, key } => Some(exact_pattern(&object_permission_path(
-            realm_id,
-            link.group_id,
-            node_id,
-            bucket,
-            key,
-        ))),
+        ShareTarget::Object { bucket, key } => {
+            Some(format!("{}/{}", bucket_path(bucket), globset::escape(key)))
+        }
         ShareTarget::Dataset { .. } => None,
     }
 }

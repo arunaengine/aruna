@@ -5,6 +5,7 @@
 use super::*;
 use aruna_core::UserId;
 use aruna_core::permission_path::permission_pattern_matches;
+use aruna_core::structs::storage::blob::object_permission_path;
 use ulid::Ulid;
 
 fn realm() -> RealmId {
@@ -88,7 +89,7 @@ fn rejects_bad_links() {
 #[test]
 fn scope_confines_visit() {
     let share = link(folder("in [1]/"), ShareMode::Read);
-    let pattern = scope_pattern(&share, realm(), node()).unwrap();
+    let pattern = scope_pattern(&share, realm(), NodeScope::Node(node())).unwrap();
     let path = |key: &str| object_permission_path(realm(), share.group_id, node(), "data", key);
     assert!(permission_pattern_matches(&pattern, &path("in [1]/a.txt")));
     assert!(!permission_pattern_matches(&pattern, &path("in 1/a.txt")));
@@ -101,6 +102,50 @@ fn scope_confines_visit() {
         .path_restrictions
         .unwrap()[0];
     assert_eq!(restriction.permission, Permission::WRITE);
+}
+
+#[test]
+fn members_share_scope() {
+    // Every member checks the visit on its own node path, and nothing outside the target.
+    let share = link(folder("in [1]/"), ShareMode::Read);
+    let pattern = scope_pattern(&share, realm(), NodeScope::Members).unwrap();
+    let other = iroh::SecretKey::from_bytes(&[9; 32]).public();
+    let path = |node, group, bucket: &str, key: &str| {
+        object_permission_path(realm(), group, node, bucket, key)
+    };
+    for member in [node(), other] {
+        assert!(permission_pattern_matches(
+            &pattern,
+            &path(member, share.group_id, "data", "in [1]/a")
+        ));
+    }
+    assert!(!permission_pattern_matches(
+        &pattern,
+        &path(other, share.group_id, "data", "in 1/a")
+    ));
+    assert!(!permission_pattern_matches(
+        &pattern,
+        &path(other, share.group_id, "other", "in [1]/a")
+    ));
+    let group = Ulid::from_bytes([8; 16]);
+    assert!(!permission_pattern_matches(
+        &pattern,
+        &path(other, group, "data", "in [1]/a")
+    ));
+    let object = ShareTarget::Object {
+        bucket: "data".into(),
+        key: "in/a.txt".into(),
+    };
+    let pattern = scope_pattern(&link(object, ShareMode::Read), realm(), NodeScope::Members);
+    let pattern = pattern.unwrap();
+    assert!(permission_pattern_matches(
+        &pattern,
+        &path(other, share.group_id, "data", "in/a.txt")
+    ));
+    assert!(!permission_pattern_matches(
+        &pattern,
+        &path(other, share.group_id, "data", "in/b.txt")
+    ));
 }
 
 #[test]
