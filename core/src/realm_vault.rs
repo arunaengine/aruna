@@ -199,6 +199,8 @@ impl PartialEq for RealmVaultKey {
     }
 }
 
+impl Eq for RealmVaultKey {}
+
 impl Drop for RealmVaultKey {
     fn drop(&mut self) {
         self.0.zeroize();

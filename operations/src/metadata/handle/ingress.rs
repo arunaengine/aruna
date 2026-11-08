@@ -1160,6 +1160,14 @@ impl MetadataHandle {
                 let result = Box::pin(stored).await;
                 (MetadataTransportMessage::RealmKeyStored { result }, None)
             }
+            MetadataTransportMessage::RealmSecret { entry, revision } => {
+                let request = aruna_core::realm_vault::RealmSecretRef { entry, revision };
+                let key = self.realm_vault_key();
+                let served =
+                    crate::realm_vault::serve_realm_secret(context, key.as_deref(), peer, request);
+                let result = Box::pin(served).await;
+                (MetadataTransportMessage::RealmSecretResult { result }, None)
+            }
             MetadataTransportMessage::PromotionCheck => {
                 let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
                 let result = Box::pin(ready).await;

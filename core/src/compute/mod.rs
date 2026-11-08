@@ -549,6 +549,7 @@ impl Drop for Secret {
 
 /// Secret bytes such as keys or sealed payloads in plain form. Debug output is
 /// redacted, the bytes are zeroed on drop, and equality runs in constant time.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {

@@ -409,6 +409,18 @@ async fn fill(
     checkpoint(StartupStage::Net)?;
     stopped(stop)?;
 
+    let mut metadata_options = MetadataHandleOptions::default()
+        .with_search_storage(config.metadata_search_storage)
+        .with_sync_policy(config.fjall_persist_policy);
+    // Only holders of the realm signing key derive the realm vault key.
+    if let aruna_core::structs::identity::auth::NodeCapabilities::Management {
+        realm_signing_key,
+        ..
+    } = &config.node_capabilities
+    {
+        let key = aruna_core::realm_vault::RealmVaultKey::derive(realm_signing_key);
+        metadata_options = metadata_options.with_vault_key(key);
+    }
     let metadata_handle = MetadataHandle::new_with_options(
         &config.metadata_storage_path,
         config.node_id,
@@ -416,9 +428,7 @@ async fn fill(
         Some(net_handle.clone()),
         Some(net_handle.document_sync_node()),
         Some(net_handle.document_sync_database()),
-        MetadataHandleOptions::default()
-            .with_search_storage(config.metadata_search_storage)
-            .with_sync_policy(config.fjall_persist_policy),
+        metadata_options,
     )?;
     acquired.metadata_handle = Some(metadata_handle.clone());
     checkpoint(StartupStage::Metadata)?;

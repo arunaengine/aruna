@@ -532,6 +532,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::InputPageResult { .. } => "job_input_page_result",
         MetadataTransportMessage::ResolveJobInputs { .. } => "resolve_job_inputs",
         MetadataTransportMessage::ResolvedJobInputs { .. } => "resolved_job_inputs",
+        MetadataTransportMessage::RealmSecret { .. } => "realm_secret",
+        MetadataTransportMessage::RealmSecretResult { .. } => "realm_secret_result",
     }
 }
 
@@ -744,6 +746,25 @@ impl MetadataHandle {
                 transport_message_kind(&other)
             )),
             Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// The current revision of a realm vault entry from the management node `node_id`.
+    pub async fn request_realm_secret(
+        &self,
+        node_id: NodeId,
+        reference: aruna_core::realm_vault::RealmSecretRef,
+    ) -> Result<aruna_core::compute::SecretBytes, MetadataReadError> {
+        let request = MetadataTransportMessage::RealmSecret {
+            entry: reference.entry,
+            revision: reference.revision,
+        };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::RealmSecretResult { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
         }
     }
 
