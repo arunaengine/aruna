@@ -73,6 +73,9 @@ pub enum EntryStatus {
     Missing,
     Locked,
     Unavailable,
+    /// Written from this node's copy of a range while its coordinator could not answer, so it
+    /// may be behind.
+    Stale,
 }
 
 /// One entry that is not in the archive at its own path: a file, a folder, or a key range of a
@@ -102,6 +105,7 @@ pub struct Totals {
     pub missing: u64,
     pub locked: u64,
     pub unavailable: u64,
+    pub stale: u64,
     pub bytes: u64,
 }
 
@@ -126,6 +130,7 @@ impl Report {
             EntryStatus::Missing => &mut totals.missing,
             EntryStatus::Locked => &mut totals.locked,
             EntryStatus::Unavailable => &mut totals.unavailable,
+            EntryStatus::Stale => &mut totals.stale,
         };
         *counter += 1;
     }
@@ -135,10 +140,15 @@ type Blob = BackendStream<Result<Bytes, StreamError>>;
 
 /// Where a member of a distributed bucket reads a key for the caller.
 pub enum MemberRead {
-    /// This node reads its own records.
-    Local,
+    /// This node reads its own records; `Some` names a range its copy serves while the
+    /// coordinator cannot, so the version may be behind.
+    Local(Option<Ulid>),
     /// The member that serves the key answered with this version and its bytes.
-    Remote { version: Ulid, blob: Blob },
+    Remote {
+        version: Ulid,
+        blob: Blob,
+        stale: Option<Ulid>,
+    },
 }
 
 /// One key of a distributed bucket the archive reads for its caller.
@@ -159,10 +169,12 @@ pub trait MemberReader: RangeRelay {
     ) -> impl Future<Output = Result<MemberRead, EntryStatus>> + Send;
 }
 
-/// A version pinned for writing, with its bytes when another member already sent them.
+/// A version pinned for writing: its bytes when another member already sent them, and the
+/// range whose copy here answered for a coordinator that could not.
 struct Pinned {
     version: Ulid,
     blob: Option<Blob>,
+    stale: Option<Ulid>,
 }
 
 #[derive(Debug, Error)]
@@ -433,7 +445,11 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
         key: &str,
         pinned: Pinned,
     ) -> Result<Result<(), EntryStatus>, SelectionError> {
-        let Pinned { version, blob } = pinned;
+        let Pinned {
+            version,
+            blob,
+            stale,
+        } = pinned;
         let (path, renamed) = self.paths.place(bucket, key, version);
         let input = GetObjectInput {
             bucket: bucket.to_string(),
@@ -458,7 +474,13 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
         if !renamed {
             self.paths.record(&path);
         }
-        if renamed {
+        if let Some(range_id) = stale {
+            self.report.add(ReportRow {
+                range_id: Some(range_id.to_string()),
+                path: renamed.then_some(path),
+                ..file_row(bucket, key, Some(version), EntryStatus::Stale)
+            });
+        } else if renamed {
             self.report.add(ReportRow {
                 path: Some(path),
                 ..file_row(bucket, key, Some(version), EntryStatus::Renamed)
@@ -610,7 +632,7 @@ async fn resolve<R: MemberReader>(
     let path = object_permission_path(realm_id, info.group_id, node_id, bucket, key);
     // A denied caller learns nothing about whether the key exists.
     authorization(scope, auth, &path).await?;
-    let mut catching_up = false;
+    let (mut catching_up, mut stale) = (false, None);
     if let Some(binding) = info.distribution.as_ref() {
         let call = MemberCall {
             auth,
@@ -620,11 +642,19 @@ async fn resolve<R: MemberReader>(
             version: requested,
         };
         match scope.relay.member_read(call).await? {
-            MemberRead::Remote { version, blob } => {
+            MemberRead::Remote {
+                version,
+                blob,
+                stale,
+            } => {
                 let blob = Some(blob);
-                return Ok(Pinned { version, blob });
+                return Ok(Pinned {
+                    version,
+                    blob,
+                    stale,
+                });
             }
-            MemberRead::Local => {}
+            MemberRead::Local(range_id) => stale = range_id,
         }
         // Without records of the key's range here, a miss would prove nothing.
         match route_read(scope.context, binding, key, false).await {
@@ -652,6 +682,7 @@ async fn resolve<R: MemberReader>(
     Ok(Pinned {
         version,
         blob: None,
+        stale,
     })
 }
 

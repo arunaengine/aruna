@@ -51,7 +51,7 @@ impl RangeRelay for NoRelay {
 
 impl MemberReader for NoRelay {
     async fn member_read(&self, _: MemberCall<'_>) -> Result<MemberRead, EntryStatus> {
-        Ok(MemberRead::Local)
+        Ok(MemberRead::Local(None))
     }
 }
 

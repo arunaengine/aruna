@@ -197,15 +197,16 @@ READ on its prefix, as the object listing requires.
   archive reaches it, and that version is then read to its end.
 - A key of a distributed bucket is read where an S3 GET of the caller would be: a current
   version from its range's coordinator, a pinned one from any member that keeps its records,
-  with the caller's credential, restrictions and expiry.
+  with the caller's credential, restrictions and expiry. While the coordinator cannot answer,
+  a copy's version is written and reported as `stale` with its `range_id`.
 - A version is written once, at `{bucket}/{key}`. A key that is unsafe as a ZIP path, or whose
   path equals a written path, lies below a written file, or equals a written path's folder,
   moves to `_renamed/{bucket}/{version_id}`. The same selection over unchanged data yields the
   same paths.
 - The last archive entry, `_report.json`, holds `totals` (entries per status and bytes written)
   and one row in `entries` for each file, folder or key range that is not included at its own
-  path: `renamed` with its `path`, `denied`, `missing`, `locked` (bucket key not unlocked) or
-  `unavailable`. A folder the caller may not list is one `denied` row and is never
+  path: `renamed` with its `path`, `stale`, `denied`, `missing`, `locked` (bucket key not
+  unlocked) or `unavailable`. A folder the caller may not list is one `denied` row and is never
   enumerated; entries the listing hides never appear. A key range no holder answered or served,
   or one a copy listed because its coordinator could not, is one `unavailable` row with its
   `range_id`, the folder's other ranges still follow, and the archive is incomplete.
@@ -379,14 +380,18 @@ impl MemberReader for BearerRelay<'_> {
         };
         let read = service.member_get(&user, (call.bucket, call.info), call.key, call.version);
         match read.await {
-            Ok(ReadAnswer::Local(_)) => Ok(MemberRead::Local),
-            Ok(ReadAnswer::Forwarded(response, _)) => {
+            Ok(ReadAnswer::Local(range_id)) => Ok(MemberRead::Local(range_id)),
+            Ok(ReadAnswer::Forwarded(response, stale)) => {
                 let version = (response.headers().get("x-amz-version-id"))
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| ulid::Ulid::from_string(value).ok())
                     .ok_or(EntryStatus::Unavailable)?;
                 let blob = shared_stream(response.bytes_stream());
-                Ok(MemberRead::Remote { version, blob })
+                Ok(MemberRead::Remote {
+                    version,
+                    blob,
+                    stale,
+                })
             }
             Err(error) => Err(match error.code() {
                 s3s::S3ErrorCode::NoSuchKey

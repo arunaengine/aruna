@@ -9,7 +9,7 @@ use crate::routes::storage::deletion::bucket_info;
 use crate::tests::assistant::spawn_mock;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
-    publish_urls, unsigned_token,
+    publish_urls, replicate, unsigned_token,
 };
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -256,6 +256,38 @@ async fn remote_range_read() {
     let report: Report = serde_json::from_slice(&files[2].1).unwrap();
     assert!(report.entries.is_empty(), "{:?}", report.entries);
     assert_eq!(report.totals.included, 2);
+}
+
+// A copy's head may be behind, so a current version comes from the coordinator; a copy answers
+// only while the coordinator cannot, and the report says so.
+#[tokio::test]
+async fn coordinator_version_wins() {
+    let node = node_state().await;
+    store(&node, &["a.md"]).await;
+    let snapshot = replicate(&node.state, node.group_id, BUCKET).await;
+    let s3 = mock_s3(REMOTE_VERSION, "coordinator").await;
+    publish_urls(&node.state, node_id(PEER), (CLOSED_API, Some(&s3.0))).await;
+    let file = || request(vec![entry(Some("a.md"), None, None)]);
+    let current = files(archive(&node, &node.owner, file()).await.unwrap()).await;
+    assert_eq!(
+        current[0],
+        ("routed/a.md".to_string(), b"coordinator".to_vec())
+    );
+    let report: Report = serde_json::from_slice(&current[1].1).unwrap();
+    assert!(report.entries.is_empty());
+
+    publish_urls(&node.state, node_id(PEER), (CLOSED_API, Some(CLOSED_API))).await;
+    let response = archive(&node, &node.owner, file()).await.unwrap();
+    let (names, report) = unzip(response).await;
+    assert_eq!(names, ["routed/a.md"]);
+    assert_eq!(report.entries.len(), 1);
+    let row = &report.entries[0];
+    assert_eq!(row.status, EntryStatus::Stale);
+    assert_eq!(
+        row.range_id,
+        Some(snapshot.config.ranges[0].range_id.to_string())
+    );
+    assert_eq!(report.totals.stale, 1);
 }
 
 // A holder that refuses its range costs that range only, never the keys listed before it.
