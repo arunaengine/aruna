@@ -479,19 +479,7 @@ pub async fn create_sync(
             .await
             .map_err(ServerError::InternalError)?;
     }
-    if let Err(error) = create_sync_relationship(&context, relationship.clone())
-        .await
-        .map_err(map_create_error)
-    {
-        if let Err(stage_error) = stage_mirror_delete(&context, &relationship).await {
-            warn!(%stage_error, relationship_id = %relationship.id, "Failed to stage sync mirror rollback");
-        }
-        kick_mirror_repair(&context).await;
-        if remove_mirror(&state, &relationship).await {
-            clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
-        }
-        return Err(error);
-    }
+    activate_sync(&state, &relationship).await?;
 
     if matches!(relationship.mode, SyncMode::Once | SyncMode::Reference)
         && let Err(error) = queue_relationship(&state, &auth, &relationship).await
@@ -1182,6 +1170,28 @@ async fn create_mirror(
     )
     .await
     .map_err(map_mirror_error)
+}
+
+/// Stores the outgoing record, or removes the mirror again when that fails. A create that repair
+/// already rolled back stays with repair: an ordinary delete could leave a detached stub.
+async fn activate_sync(state: &ServerState, relationship: &SyncRelationship) -> ServerResult<()> {
+    let context = state.get_ctx();
+    let error = match create_sync_relationship(&context, relationship.clone()).await {
+        Ok(_) => return Ok(()),
+        Err(SyncRelationshipError::RolledBack) => {
+            kick_mirror_repair(&context).await;
+            return Err(map_create_error(SyncRelationshipError::RolledBack));
+        }
+        Err(error) => map_create_error(error),
+    };
+    if let Err(stage_error) = stage_mirror_delete(&context, relationship).await {
+        warn!(%stage_error, relationship_id = %relationship.id, "Failed to stage sync mirror rollback");
+    }
+    kick_mirror_repair(&context).await;
+    if remove_mirror(state, relationship).await {
+        clear_repair(state, relationship, SyncMirrorIntent::Delete).await;
+    }
+    Err(error)
 }
 
 async fn remove_mirror(state: &ServerState, relationship: &SyncRelationship) -> bool {

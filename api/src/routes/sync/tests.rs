@@ -12,7 +12,8 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE,
-    MIRROR_REPAIR_KEYSPACE, REPLICATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
+    MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
+    REPLICATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -23,6 +24,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_operations::sync::mirror_repair::{SyncMirrorRecord, process_mirror_repairs};
 use tempfile::TempDir;
 
 fn test_node(seed: u8) -> NodeId {
@@ -793,4 +795,137 @@ fn gateway_names_cause() {
         map_create_error(SyncRelationshipError::RolledBack),
         ServerError::BadGatewayReason(reason) if reason.contains("rolled back")
     ));
+}
+
+/// A same-node reference sync whose mirror exists and whose create repair claimed for rollback.
+async fn claimed_create(state: &ServerState) -> SyncRelationship {
+    let context = state.get_ctx();
+    let mut relationship = local_relationship(state.get_node_id());
+    relationship.mode = SyncMode::Reference;
+    relationship.set_reference_handling(ReferenceHandling::Preserve);
+    drive(
+        StoreRelationshipOperation::new(relationship.clone(), SyncRelationshipDirection::Incoming),
+        &context,
+    )
+    .await
+    .unwrap();
+    let record = SyncMirrorRecord {
+        relationship: relationship.clone(),
+        intent: SyncMirrorIntent::Reconcile,
+        due_at_ms: 0,
+        attempts: 0,
+        last_error: None,
+        rollback: false,
+    };
+    write_doc(
+        &context,
+        MIRROR_REPAIR_KEYSPACE,
+        relationship.id.to_bytes().to_vec().into(),
+        postcard::to_allocvec(&record).unwrap().into(),
+    )
+    .await;
+    process_mirror_repairs(&context, state.get_node_id())
+        .await
+        .unwrap();
+    assert!(
+        repair_record(state, &relationship)
+            .await
+            .is_some_and(|record| record.rollback)
+    );
+    relationship
+}
+
+async fn repair_record(
+    state: &ServerState,
+    relationship: &SyncRelationship,
+) -> Option<SyncMirrorRecord> {
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+            key: relationship.id.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("missing mirror repair read result");
+    };
+    value.map(|value| postcard::from_bytes(&value).unwrap())
+}
+
+async fn row_count(state: &ServerState, key_space: &str) -> usize {
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = state
+        .get_ctx()
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: None,
+            start: None,
+            limit: 16,
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("missing keyspace iteration result");
+    };
+    values.len()
+}
+
+async fn retry_create(state: Arc<ServerState>, auth: AuthContext) {
+    let mut request = create_request(state.get_node_id());
+    request.mode = ApiSyncMode::Reference;
+    let (status, _) = create_sync(
+        State(state.clone()),
+        Extension(Some(auth)),
+        Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
+        Json(request),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(row_count(&state, RELATIONSHIP_OUT_KEYSPACE).await, 1);
+}
+
+#[tokio::test]
+async fn rollback_before_cleanup() {
+    // Repair finished the rollback before the route saw its refused activation.
+    let (_storage_dir, state, auth, _) = test_state().await;
+    let relationship = claimed_create(&state).await;
+    process_mirror_repairs(&state.get_ctx(), state.get_node_id())
+        .await
+        .unwrap();
+    assert!(repair_record(&state, &relationship).await.is_none());
+
+    let error = activate_sync(&state, &relationship).await.unwrap_err();
+
+    assert!(matches!(error, ServerError::BadGatewayReason(_)));
+    assert!(repair_record(&state, &relationship).await.is_none());
+    assert_eq!(row_count(&state, RELATIONSHIP_OUT_KEYSPACE).await, 0);
+    assert_eq!(row_count(&state, RELATIONSHIP_IN_KEYSPACE).await, 0);
+    retry_create(state, auth).await;
+}
+
+#[tokio::test]
+async fn claim_during_cleanup() {
+    // The rollback claim is still held when the route sees its refused activation.
+    let (_storage_dir, state, auth, _) = test_state().await;
+    let relationship = claimed_create(&state).await;
+
+    let error = activate_sync(&state, &relationship).await.unwrap_err();
+
+    assert!(matches!(error, ServerError::BadGatewayReason(_)));
+    assert_eq!(row_count(&state, RELATIONSHIP_OUT_KEYSPACE).await, 0);
+    assert!(
+        repair_record(&state, &relationship)
+            .await
+            .is_some_and(|record| record.rollback)
+    );
+    process_mirror_repairs(&state.get_ctx(), state.get_node_id())
+        .await
+        .unwrap();
+    assert!(repair_record(&state, &relationship).await.is_none());
+    assert_eq!(row_count(&state, RELATIONSHIP_OUT_KEYSPACE).await, 0);
+    assert_eq!(row_count(&state, RELATIONSHIP_IN_KEYSPACE).await, 0);
+    retry_create(state, auth).await;
 }
