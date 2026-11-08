@@ -377,6 +377,7 @@ pub async fn delete_sync_mirror(
             })),
             relationship.clone(),
             PolicyRequestExtras::operation("s3.DeleteBucketReplication"),
+            false,
         )
         .await
     {

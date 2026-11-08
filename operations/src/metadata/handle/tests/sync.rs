@@ -50,6 +50,53 @@ fn workspace_delete_allowed() {
         true,
     ));
 }
+#[test]
+fn rollback_check_scope() {
+    let (_, realm_id, user_id) = realm_fixture();
+    let (source, target) = (node_id_seed(1), node_id_seed(2));
+    let stored = SyncRelationship {
+        id: Ulid::generate(),
+        source: ArunaArn::s3_bucket(realm_id, source, "source").unwrap(),
+        target: ArunaArn::s3_bucket(realm_id, target, "target").unwrap(),
+        mode: SyncMode::Continuous,
+        reference_handling: Default::default(),
+        reference_serving: false,
+        replicate_deletes: true,
+        created_by: user_id,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        state: SyncState::Enabled,
+        status: SyncStatusSnapshot::default(),
+    };
+    let request = RollbackRequest {
+        peer: source,
+        local_node: target,
+        vouched: true,
+    };
+    assert!(request.allows(&stored, &stored));
+
+    let other_peer = RollbackRequest {
+        peer: node_id_seed(3),
+        ..request
+    };
+    assert!(!other_peer.allows(&stored, &stored));
+    let outgoing = RollbackRequest {
+        peer: target,
+        local_node: source,
+        ..request
+    };
+    assert!(!outgoing.allows(&stored, &stored));
+    let bearer = RollbackRequest {
+        vouched: false,
+        ..request
+    };
+    assert!(!bearer.allows(&stored, &stored));
+    let mut changed = stored.clone();
+    changed.created_at += std::time::Duration::from_millis(1);
+    assert!(!request.allows(&stored, &changed));
+    let mut changed = stored.clone();
+    changed.id = Ulid::generate();
+    assert!(!request.allows(&stored, &changed));
+}
 #[tokio::test]
 async fn sync_creates_bucket() {
     let tempdir = tempdir().unwrap();

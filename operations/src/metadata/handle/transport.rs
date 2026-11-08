@@ -1028,6 +1028,7 @@ impl MetadataHandle {
         auth_token: Option<AuthToken>,
         relationship: SyncRelationship,
         extras: PolicyRequestExtras,
+        rollback: bool,
     ) -> Result<(), MetadataError> {
         match with_sync_timeout(send_remote_request(
             &self.inner,
@@ -1037,6 +1038,7 @@ impl MetadataHandle {
                 auth_token,
                 relationship: Box::new(relationship),
                 extras,
+                rollback,
             },
         ))
         .await?

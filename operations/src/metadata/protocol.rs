@@ -182,6 +182,8 @@ pub enum MetadataTransportMessage {
         auth_token: Option<AuthToken>,
         relationship: Box<SyncRelationship>,
         extras: PolicyRequestExtras,
+        /// The source rolls back the mirror of a create that never activated.
+        rollback: bool,
     },
     SyncMirrorCreated,
     SyncMirrorDeleted,

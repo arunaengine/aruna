@@ -108,6 +108,25 @@ fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> b
         && left.created_at == right.created_at
 }
 
+/// The sender of a mirror rollback, as the transport authenticated it.
+#[derive(Clone, Copy, Debug)]
+struct RollbackRequest {
+    peer: NodeId,
+    local_node: NodeId,
+    /// The token was node-vouched, never a user bearer.
+    vouched: bool,
+}
+
+impl RollbackRequest {
+    /// Only the source peer of this exact incoming mirror may roll it back without WRITE.
+    fn allows(&self, stored: &SyncRelationship, request: &SyncRelationship) -> bool {
+        self.vouched
+            && request.source.node_id == self.peer
+            && request.target.node_id == self.local_node
+            && sync_identity_matches(stored, request)
+    }
+}
+
 fn valid_sync_request(
     relationship: &SyncRelationship,
     source_bucket: &str,
