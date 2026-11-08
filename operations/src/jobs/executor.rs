@@ -110,8 +110,8 @@ pub struct JobContext {
     pub shutdown: CancellationToken,
     pub progress: ProgressReporter,
     pub range_turns: RangeTurns,
-    /// The node's SMTP sender, present only when email notifications are configured.
-    pub mailer: Option<Arc<dyn crate::notifications::email::MailSender>>,
+    /// Senders of the realm email profile, shared by every job of this node.
+    pub mail: Arc<crate::notifications::email::MailProfiles>,
 }
 
 /// One turn per distribution range, shared by every job on this node: page imports into one

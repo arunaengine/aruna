@@ -1,27 +1,53 @@
-//! Tests that email opt-ins need SMTP and a verified address and never show the address.
+//! Tests that email opt-ins need a realm profile and a verified address and never show it.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::USER_KEYSPACE;
+use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
-use aruna_operations::notifications::email::{MailError, MailSender, OutgoingMail};
 use ulid::Ulid;
 
-struct NoSender;
-
-#[async_trait::async_trait]
-impl MailSender for NoSender {
-    async fn send(&self, _mail: OutgoingMail) -> Result<(), MailError> {
-        Err(MailError::Retryable("not used".to_string()))
-    }
+/// Stores the realm config, with an email profile when `email` is set.
+async fn store_config(
+    context: &aruna_operations::driver::DriverContext,
+    actor: &Actor,
+    email: bool,
+) {
+    let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+    config.email = email.then(|| RealmEmailProfile {
+        revision: Ulid::generate(),
+        host: "smtp.example.org".to_string(),
+        port: None,
+        tls: SmtpTls::Starttls,
+        username: None,
+        from: "aruna@example.org".to_string(),
+        password: None,
+        changed_by: actor.user_id,
+        changed_at_ms: 1,
+    });
+    let target = DocumentTarget::RealmConfig {
+        realm_id: actor.realm_id,
+    };
+    let write = StorageEffect::Write {
+        key_space: target.storage_keyspace().to_string(),
+        key: target.storage_key(),
+        value: config.to_bytes(actor).unwrap().into(),
+        txn_id: None,
+    };
+    context
+        .storage_handle
+        .send_effect(Effect::Storage(write))
+        .await;
 }
 
 fn request(address: &str) -> Json<EmailRequest> {
@@ -65,7 +91,7 @@ async fn route_needs_verification() {
         .await;
     let state = Arc::new(
         test_state(
-            context,
+            context.clone(),
             realm_id,
             node_id,
             NodeCapabilities::user_node(realm_id).unwrap(),
@@ -86,9 +112,15 @@ async fn route_needs_verification() {
         )
     };
 
+    let unreadable = set("ada@example.org").await;
+    assert!(matches!(
+        unreadable,
+        Err(ServerError::ServiceUnavailableReason(_))
+    ));
+    store_config(&context, &actor, false).await;
     let unconfigured = set("ada@example.org").await;
     assert!(matches!(unconfigured, Err(ServerError::Conflict(_))));
-    state.jobs_runtime().set_mailer(Arc::new(NoSender));
+    store_config(&context, &actor, true).await;
     let foreign = set("eve@example.org").await;
     assert!(matches!(foreign, Err(ServerError::BadRequestReason(_))));
     let Json(created) = set("ada@example.org").await.unwrap();

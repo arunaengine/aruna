@@ -767,7 +767,7 @@ mod pure_tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
             range_turns: Default::default(),
-            mailer: None,
+            mail: Default::default(),
         };
 
         let pinned = StagingJobSpec {

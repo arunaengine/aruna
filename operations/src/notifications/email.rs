@@ -4,7 +4,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -19,12 +19,13 @@ use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
 pub use aruna_core::structs::execution::email::SmtpTls;
 use aruna_core::structs::execution::email::{
-    EMAIL_CATEGORIES, EmailDeliverySpec, EmailPreference, email_key,
+    EMAIL_CATEGORIES, EmailDeliverySpec, EmailPreference, RealmEmailProfile, email_key,
 };
 use aruna_core::structs::execution::job::{
     JobError, JobPayload, JobResultPayload, WorkspaceMode, user_dedup_key,
 };
 use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Effects;
@@ -35,6 +36,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -42,11 +44,13 @@ use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
 use crate::jobs::submit::SubmitJobSpec;
 use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
+use crate::realm::get_config::GetConfigOperation;
+use crate::realm_vault::{prune_secret_cache, read_realm_secret};
 
 /// Time one SMTP exchange may take; the job runtime retries a timed out attempt.
 const SMTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The one SMTP profile of a node.
+/// The realm email profile with its opened password, as `SmtpMailer::new` takes it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SmtpSettings {
     pub host: String,
@@ -158,6 +162,88 @@ impl MailSender for SmtpMailer {
             Err(error) if error.is_permanent() => Err(MailError::Permanent(status(&error))),
             Err(error) => Err(MailError::Retryable(status(&error))),
         }
+    }
+}
+
+/// Builds the sender of one profile; tests swap in a fake one.
+pub type MailBuilder =
+    Arc<dyn Fn(&SmtpSettings) -> Result<Arc<dyn MailSender>, String> + Send + Sync>;
+
+/// The sender of the current realm email profile, built once per profile revision.
+pub struct MailProfiles {
+    cache: Mutex<Option<(Ulid, Arc<dyn MailSender>)>>,
+    builder: MailBuilder,
+}
+
+impl MailProfiles {
+    pub fn new(builder: MailBuilder) -> Self {
+        Self {
+            cache: Mutex::new(None),
+            builder,
+        }
+    }
+
+    /// The sender built for `revision`, if it is still cached.
+    pub fn cached(&self, revision: Ulid) -> Option<Arc<dyn MailSender>> {
+        let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        (cache.as_ref())
+            .filter(|(cached, _)| *cached == revision)
+            .map(|(_, sender)| sender.clone())
+    }
+
+    /// Builds and caches the sender of `revision`, replacing any other one.
+    pub fn build(
+        &self,
+        revision: Ulid,
+        settings: &SmtpSettings,
+    ) -> Result<Arc<dyn MailSender>, String> {
+        let sender = (self.builder)(settings)?;
+        *self.cache.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((revision, sender.clone()));
+        Ok(sender)
+    }
+
+    /// Drops the cached sender unless it belongs to the `current` profile.
+    pub fn refresh(&self, current: Option<&RealmEmailProfile>) {
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if cache.as_ref().map(|(revision, _)| *revision) != current.map(|profile| profile.revision)
+        {
+            *cache = None;
+        }
+    }
+}
+
+impl std::fmt::Debug for MailProfiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        let revision = cache.as_ref().map(|(revision, _)| *revision);
+        f.debug_struct("MailProfiles")
+            .field("revision", &revision)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for MailProfiles {
+    fn default() -> Self {
+        Self::new(Arc::new(|settings| {
+            Ok(Arc::new(SmtpMailer::new(settings)?) as Arc<dyn MailSender>)
+        }))
+    }
+}
+
+/// Runs when the realm config changes: drops cached senders and passwords it no longer names.
+/// A config read error keeps both.
+pub async fn refresh_mail(context: &DriverContext, realm_id: RealmId, mail: &MailProfiles) {
+    let config = match drive(GetConfigOperation::new(realm_id), context).await {
+        Ok(config) => config,
+        Err(error) => {
+            warn!(error = %error, "Realm config read failed; cached mail settings stay");
+            return;
+        }
+    };
+    mail.refresh(config.email.as_ref());
+    if let Err(error) = prune_secret_cache(context, &config).await {
+        warn!(error = %error, "Pruning cached realm secrets failed");
     }
 }
 
@@ -412,6 +498,13 @@ pub async fn enqueue_emails(
     owner_node_id: NodeId,
     records: &[NotificationRecord],
 ) -> Result<(), String> {
+    // A realm without a profile queues nothing; a read error queues, and the job retries.
+    if let Some(record) = records.first() {
+        let config = drive(GetConfigOperation::new(record.recipient.realm_id), context).await;
+        if config.is_ok_and(|config| config.email.is_none()) {
+            return Ok(());
+        }
+    }
     let mut preferences: HashMap<UserId, Option<EmailPreference>> = HashMap::new();
     for record in records {
         if !EMAIL_CATEGORIES.contains(&record.kind.category()) {
@@ -486,10 +579,12 @@ pub async fn run_email_job(ctx: &JobContext, spec: &EmailDeliverySpec) -> JobRun
 }
 
 async fn send_email(ctx: &JobContext, spec: &EmailDeliverySpec) -> Result<bool, JobError> {
-    let mailer: Arc<dyn MailSender> = ctx.mailer.clone().ok_or_else(|| {
-        JobError::permanent("email notifications are not configured on this node")
-    })?;
     let recipient = spec.notification.recipient;
+    let config = drive(GetConfigOperation::new(recipient.realm_id), &ctx.driver)
+        .await
+        .map_err(|error| JobError::retryable(format!("realm config read: {error}")))?;
+    let profile = (config.email.clone())
+        .ok_or_else(|| JobError::permanent("email is not configured in this realm"))?;
     let preference = drive(
         EmailOperation::new(recipient, EmailAction::Read),
         &ctx.driver,
@@ -512,6 +607,7 @@ async fn send_email(ctx: &JobContext, spec: &EmailDeliverySpec) -> Result<bool, 
     })
     .map_err(|error| JobError::retryable(error.to_string()))?
     .ok_or_else(|| JobError::permanent("the opt-in address is missing"))?;
+    let mailer = mail_sender(ctx, &config, &profile).await?;
     let (subject, body) = spec.text();
     let mail = OutgoingMail {
         to: address,
@@ -524,6 +620,39 @@ async fn send_email(ctx: &JobContext, spec: &EmailDeliverySpec) -> Result<bool, 
         Err(MailError::Permanent(message)) => Err(JobError::permanent(message)),
         Err(MailError::Retryable(message)) => Err(JobError::retryable(message)),
     }
+}
+
+/// The cached sender of this profile revision, or a new one with the password opened or fetched.
+async fn mail_sender(
+    ctx: &JobContext,
+    config: &RealmConfigDocument,
+    profile: &RealmEmailProfile,
+) -> Result<Arc<dyn MailSender>, JobError> {
+    if let Some(sender) = ctx.mail.cached(profile.revision) {
+        return Ok(sender);
+    }
+    let password = match profile.password {
+        None => None,
+        Some(reference) => {
+            let secret = read_realm_secret(&ctx.driver, config, reference)
+                .await
+                .map_err(|error| JobError::retryable(error.to_string()))?;
+            let text = String::from_utf8(secret.expose().to_vec())
+                .map_err(|_| JobError::permanent("the SMTP password is not UTF-8 text"))?;
+            Some(text)
+        }
+    };
+    let settings = SmtpSettings {
+        host: profile.host.clone(),
+        port: profile.port,
+        tls: profile.tls,
+        username: profile.username.clone(),
+        password,
+        from: profile.from.clone(),
+    };
+    (ctx.mail)
+        .build(profile.revision, &settings)
+        .map_err(JobError::permanent)
 }
 
 #[cfg(test)]

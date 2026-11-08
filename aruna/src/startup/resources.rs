@@ -15,7 +15,6 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::startup::RecoveryStatus;
-use aruna_operations::notifications::email::SmtpMailer;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_tasks::TaskHandle;
@@ -346,11 +345,6 @@ async fn fill(
         .open_vault(aruna_core::node_vault::NodeVaultKey::derive(
             &config.node_state.net_secret_key,
         ));
-    if let Some(smtp) = &config.smtp {
-        let mailer = SmtpMailer::new(smtp)?;
-        acquired.jobs_runtime.set_mailer(Arc::new(mailer));
-        info!("email notifications are configured");
-    }
     if matches!(
         config.startup_mode,
         crate::config::StartupMode::JoinRealm {
@@ -508,6 +502,9 @@ async fn fill(
     // Node-managed bucket keys open before content work; vault-locked keys stay locked.
     open_managed_keys(driver_ctx.as_ref(), config).await?;
     record_restart_locks(driver_ctx.as_ref(), config).await?;
+    // Cached realm secrets the config no longer names go before any email job runs.
+    let mail = acquired.jobs_runtime.mail();
+    aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id, &mail).await;
     // Recovery that weakened while the node was down, or later through role changes, is told.
     let origin = (config.realm_id, config.node_id);
     aruna_operations::s3::bucket::key_recovery::spawn_recovery_sweep(

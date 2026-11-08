@@ -44,7 +44,7 @@ use super::{
     JOB_HEARTBEAT_MS,
 };
 use crate::driver::DriverContext;
-use crate::notifications::email::MailSender;
+use crate::notifications::email::MailProfiles;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RETRY_AFTER_MS: u64 = 1_000;
@@ -96,7 +96,7 @@ pub struct JobsRuntime {
     /// means "stop here"; in-process jobs re-queue and external attempts hand off.
     shutdown: CancellationToken,
     range_turns: RangeTurns,
-    mailer: Mutex<Option<Arc<dyn MailSender>>>,
+    mail: Arc<MailProfiles>,
 }
 
 impl std::fmt::Debug for JobsRuntime {
@@ -148,17 +148,13 @@ impl JobsRuntime {
             claim_producer_barrier: RwLock::new(()),
             shutdown: CancellationToken::new(),
             range_turns: RangeTurns::default(),
-            mailer: Mutex::new(None),
+            mail: Arc::default(),
         })
     }
 
-    /// Turns on email delivery jobs; without a sender they fail as not configured.
-    pub fn set_mailer(&self, mailer: Arc<dyn MailSender>) {
-        *self.mailer.lock().expect("mailer mutex poisoned") = Some(mailer);
-    }
-
-    pub fn mailer(&self) -> Option<Arc<dyn MailSender>> {
-        self.mailer.lock().expect("mailer mutex poisoned").clone()
+    /// Senders of the realm email profile; a realm config change refreshes them.
+    pub fn mail(&self) -> Arc<MailProfiles> {
+        self.mail.clone()
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, RuntimeState> {
@@ -318,7 +314,7 @@ impl JobsRuntime {
         let runtime = self.clone();
         let shutdown = self.shutdown.clone();
         let turns = self.range_turns.clone();
-        let mailer = self.mailer();
+        let mail = self.mail();
         tokio::spawn(async move {
             // A panicking payload is turned into a failure inside `supervise`; this guard
             // still runs `finish` on other unwinds, so a panic cannot leak the slot.
@@ -327,7 +323,7 @@ impl JobsRuntime {
                 record,
                 claim_token,
                 (cancel, progress),
-                (shutdown, turns, mailer),
+                (shutdown, turns, mail),
             ))
             .catch_unwind()
             .await;
@@ -664,7 +660,7 @@ async fn run_job(
     record: JobRecord,
     token: ulid::Ulid,
     (cancel, progress): (CancellationToken, Option<ProgressReporter>),
-    (shutdown, range_turns, mailer): (CancellationToken, RangeTurns, Option<Arc<dyn MailSender>>),
+    (shutdown, range_turns, mail): (CancellationToken, RangeTurns, Arc<MailProfiles>),
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
     // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
@@ -734,7 +730,7 @@ async fn run_job(
         shutdown,
         progress: progress.clone(),
         range_turns,
-        mailer,
+        mail,
     };
 
     // Capture the timestamp AFTER the payload runs, so finished_at, backoff, and
@@ -1272,7 +1268,11 @@ mod tests {
             claimed,
             token,
             (CancellationToken::new(), None),
-            (CancellationToken::new(), RangeTurns::default(), None),
+            (
+                CancellationToken::new(),
+                RangeTurns::default(),
+                Default::default(),
+            ),
         )
         .await;
 
@@ -1317,7 +1317,11 @@ mod tests {
             claimed,
             token,
             (CancellationToken::new(), None),
-            (CancellationToken::new(), RangeTurns::default(), None),
+            (
+                CancellationToken::new(),
+                RangeTurns::default(),
+                Default::default(),
+            ),
         )
         .await;
 
@@ -1345,7 +1349,11 @@ mod tests {
             claimed,
             stale_token,
             (cancel.clone(), None),
-            (CancellationToken::new(), RangeTurns::default(), None),
+            (
+                CancellationToken::new(),
+                RangeTurns::default(),
+                Default::default(),
+            ),
         ));
         for _ in 0..100 {
             if marker.exists() {
@@ -1884,7 +1892,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&record.progress),
             range_turns: RangeTurns::default(),
-            mailer: None,
+            mail: Default::default(),
         };
 
         let JobRunOutcome::Failed(error) = handle_panic(&ctx) else {

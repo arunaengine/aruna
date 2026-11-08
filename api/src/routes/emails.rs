@@ -10,6 +10,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::driver::drive;
 use aruna_operations::notifications::email::{EmailAction, EmailError, EmailOperation};
 use aruna_operations::notifications::placement::holds_inbox;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -105,7 +106,8 @@ caller.
 - Setting the opt-in again replaces it; queued emails of the old one are not sent.
 
 **Errors**
-- 409 when this node sends no email, or does not hold the caller's inbox."#,
+- 409 when the realm sends no email, or this node does not hold the caller's inbox.
+- 503 when this node cannot read the realm configuration now."#,
     request_body(content = EmailRequest, example = json!({
         "address": "ada@example.org",
         "categories": ["share.upload", "group.membership"]
@@ -118,7 +120,8 @@ caller.
         (status = 400, description = "No category, an unknown one, or an address that is not the caller's verified address", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
-        (status = 409, description = "Email is not configured here, or this node does not hold the caller's inbox", body = ErrorResponse)
+        (status = 409, description = "The realm sends no email, or this node does not hold the caller's inbox", body = ErrorResponse),
+        (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -128,9 +131,12 @@ pub async fn set_email(
     Json(request): Json<EmailRequest>,
 ) -> ServerResult<Json<EmailResponse>> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    if state.jobs_runtime().mailer().is_none() {
+    let config = drive(GetConfigOperation::new(auth.realm_id), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
+    if config.email.is_none() {
         return Err(ServerError::Conflict(
-            "this node sends no notification emails".to_string(),
+            "email is not configured in this realm".to_string(),
         ));
     }
     if !holds_inbox(&state.get_ctx(), auth.user_id).await {

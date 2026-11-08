@@ -86,7 +86,9 @@ impl OperationsInboundHandler {
         jobs_runtime: Arc<JobsRuntime>,
         shutdown: Shutdown,
     ) -> Self {
-        let document_sync_reconcile = Arc::new(DocumentReconcileCoalescer::new(shutdown.clone()));
+        let mail = jobs_runtime.mail();
+        let document_sync_reconcile =
+            Arc::new(DocumentReconcileCoalescer::new(shutdown.clone(), mail));
         spawn_queue_gauge(Arc::downgrade(&document_sync_reconcile), &shutdown);
         Self {
             context,
@@ -826,6 +828,8 @@ async fn bao_policy(
 struct DocumentReconcileCoalescer {
     state: Mutex<DocumentReconcileQueue>,
     shutdown: Shutdown,
+    /// Senders the job runtime refreshes when the realm config changes.
+    mail: Arc<crate::notifications::email::MailProfiles>,
 }
 
 #[derive(Debug, Default)]
@@ -836,10 +840,11 @@ struct DocumentReconcileQueue {
 }
 
 impl DocumentReconcileCoalescer {
-    fn new(shutdown: Shutdown) -> Self {
+    fn new(shutdown: Shutdown, mail: Arc<crate::notifications::email::MailProfiles>) -> Self {
         Self {
             state: Mutex::default(),
             shutdown,
+            mail,
         }
     }
 
@@ -877,7 +882,7 @@ impl DocumentReconcileCoalescer {
                     state.queued_since = None;
                     std::mem::take(&mut state.queued).into_iter().collect()
                 };
-                if reconcile_inbound_topics(&context, batch.clone()).await {
+                if reconcile_inbound_topics(&context, &coalescer.mail, batch.clone()).await {
                     failures = 0;
                 } else {
                     coalescer.trigger(context.clone(), batch);
@@ -948,6 +953,7 @@ fn spawn_queue_gauge(coalescer: Weak<DocumentReconcileCoalescer>, shutdown: &Shu
 
 async fn reconcile_inbound_topics(
     context: &Arc<DriverContext>,
+    mail: &crate::notifications::email::MailProfiles,
     topics: Vec<irokle::TopicId>,
 ) -> bool {
     let Some(net_handle) = context.net_handle.clone() else {
@@ -980,6 +986,7 @@ async fn reconcile_inbound_topics(
         reconcile_shard_topics(context, *net_handle.realm_id(), net_handle.node_id()).await;
         let (realm_id, node_id) = (*net_handle.realm_id(), net_handle.node_id());
         crate::federation::publish::publish_soon(context, realm_id, node_id).await;
+        crate::notifications::email::refresh_mail(context, realm_id, mail).await;
     }
     refresh_usage_targets(context, net_handle.node_id(), &targets.targets).await;
     // An installed record may name a member this node bootstraps.

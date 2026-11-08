@@ -353,7 +353,7 @@ async fn claimed(context: &TestContext, tag: u8, payload: JobPayload) -> JobCont
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
-        mailer: None,
+        mail: Default::default(),
     }
 }
 

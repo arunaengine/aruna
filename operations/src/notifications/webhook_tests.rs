@@ -64,7 +64,7 @@ fn job_context(context: DriverContext) -> JobContext {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&JobProgress::new("steps")),
         range_turns: Default::default(),
-        mailer: None,
+        mail: Default::default(),
     }
 }
 
