@@ -172,3 +172,35 @@ fn removal_needs_management() {
         ));
     }
 }
+
+#[test]
+fn vault_needs_management() {
+    // A server or user node never writes realm vault records; a management node does.
+    use aruna_core::realm_vault::{RealmVaultEntry, RealmVaultPurpose};
+    let realm_id = RealmId::from_bytes([62u8; 32]);
+    let mut config =
+        aruna_core::structs::identity::realm::RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    config.ensure_node(node(1), RealmNodeKind::Management);
+    config.ensure_node(node(2), RealmNodeKind::Server);
+    let owner = UserId::nil(realm_id);
+    config.ensure_node(node(3), RealmNodeKind::User { owner });
+    let entry = RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, Ulid::from_parts(1, 1));
+    let judge = |seed: u8| {
+        let actor = test_actor(seed, owner, realm_id);
+        let event = test_admin_event(
+            Ulid::from_parts(1_710, seed as u128),
+            AdminDocumentTarget::RealmConfig { realm_id },
+            &actor,
+            1,
+            AdminDocumentOperation::ConfigVaultSet {
+                entry,
+                record: None,
+            },
+        );
+        validate_config_authority(Some(&config), &event, None).expect("validation runs")
+    };
+    assert!(matches!(judge(1), AdminEventValidation::Accepted));
+    assert!(matches!(judge(2), AdminEventValidation::Rejected(_)));
+    assert!(matches!(judge(3), AdminEventValidation::Rejected(_)));
+    assert!(matches!(judge(4), AdminEventValidation::Rejected(_)));
+}

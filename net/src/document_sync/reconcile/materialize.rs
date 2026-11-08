@@ -289,6 +289,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
     {
         config.replica_quota = replicas;
     }
+    config.vault = reducer_state.materialized_realm_vault();
 
     config.revocation_floor = config.revocation_floor.max(reducer_state.revocation_floor);
     // Without an index, the existing set remains fail-closed until each entry's expiry.
@@ -383,6 +384,7 @@ pub(in crate::document_sync) fn materialized_realm_config(
         federation: None,
         portal_features: Default::default(),
         replica_quota: Default::default(),
+        vault: Vec::new(),
     };
     overlay_realm_config(&mut config, reducer_state, now, now_ms, revocation_index);
     Some(config)

@@ -117,6 +117,7 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::MergeCoordinatorSet { .. } => {
             vec![CONFIG_MERGE_PATH.to_string()]
         }
+        AdminDocumentOperation::ConfigVaultSet { entry, .. } => vec![vault_entry_path(entry)],
         AdminDocumentOperation::NodeNameSet { node_id, .. } => vec![node_name_path(node_id)],
         AdminDocumentOperation::NodePlaceSet { node_id, .. } => vec![node_place_path(node_id)],
         AdminDocumentOperation::ConfigPoliciesSet { .. } => {
@@ -280,6 +281,13 @@ pub fn node_name_path(node_id: &NodeId) -> String {
 
 pub fn node_place_path(node_id: &NodeId) -> String {
     format!("realm_config.node_places.{node_id}")
+}
+
+pub const VAULT_ENTRY_PREFIX: &str = "realm_config.vault.";
+
+/// One path per entry, `realm_config.vault.<purpose tag>.<id>`.
+pub fn vault_entry_path(entry: &crate::realm_vault::RealmVaultEntry) -> String {
+    format!("{VAULT_ENTRY_PREFIX}{}.{}", entry.purpose.tag(), entry.id)
 }
 
 pub fn config_oidc_path(provider_id: &str) -> String {

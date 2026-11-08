@@ -58,6 +58,15 @@ impl AdminDocumentState {
             AdminDocumentOperation::MergeCoordinatorSet { node_id } => {
                 self.apply_config_setting(event, CONFIG_MERGE_PATH, node_id.to_string());
             }
+            AdminDocumentOperation::ConfigVaultSet { entry, record } => {
+                if record.as_ref().is_some_and(|record| record.entry != *entry) {
+                    return Err(AdminDocumentError::InvalidVaultRecord);
+                }
+                let value = (record.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidVaultRecord)?;
+                self.apply_node_value(event, vault_entry_path(entry), value);
+            }
             AdminDocumentOperation::ConfigReplicasSet { replicas } => {
                 let value = replicas_value(replicas);
                 self.apply_config_setting(event, CONFIG_REPLICAS_PATH, value);

@@ -325,6 +325,21 @@ impl AdminDocumentState {
             .and_then(|value| serde_json::from_str(value).ok())
     }
 
+    /// Realm vault records sorted by entry key. A never set, deleted or conflicting entry is absent.
+    pub fn materialized_realm_vault(&self) -> Vec<crate::realm_vault::RealmVaultRecord> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return Vec::new();
+        }
+        let mut records: Vec<crate::realm_vault::RealmVaultRecord> = (self.user_subject_ids)
+            .range(VAULT_ENTRY_PREFIX.to_string()..)
+            .take_while(|(path, _)| path.starts_with(VAULT_ENTRY_PREFIX))
+            .filter(|(path, _)| !self.conflicts.contains_key(*path))
+            .filter_map(|(_, version)| serde_json::from_str(version.value.as_deref()?).ok())
+            .collect();
+        records.sort_by_key(|record| record.entry.key());
+        records
+    }
+
     /// Display names of realm nodes, by node id. A cleared or conflicting name is absent.
     pub fn materialized_node_names(&self) -> BTreeMap<NodeId, String> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {

@@ -160,6 +160,7 @@ impl From<LegacyConfig> for RealmConfigDocument {
             federation: old.federation.map(Into::into),
             portal_features: old.portal_features,
             replica_quota: ReplicaQuota::default(),
+            vault: Vec::new(),
         }
     }
 }

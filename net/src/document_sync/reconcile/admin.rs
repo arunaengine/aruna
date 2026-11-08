@@ -849,6 +849,7 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::NodePlaceSet { .. }
             | AdminDocumentOperation::ConfigTokenRevoked { .. }
             | AdminDocumentOperation::MergeCoordinatorSet { .. }
+            | AdminDocumentOperation::ConfigVaultSet { .. }
     )
 }
 

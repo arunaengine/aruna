@@ -420,6 +420,13 @@ pub enum AdminDocumentOperation {
     MergeCoordinatorSet {
         node_id: NodeId,
     },
+    /// Sets or deletes one realm vault record. Each entry is its own path, so writes to
+    /// different entries never conflict; concurrent writes of one entry leave it absent.
+    #[serde(rename = "RealmConfigVaultSet")]
+    ConfigVaultSet {
+        entry: crate::realm_vault::RealmVaultEntry,
+        record: Option<crate::realm_vault::RealmVaultRecord>,
+    },
 }
 
 impl AdminDocumentOperation {

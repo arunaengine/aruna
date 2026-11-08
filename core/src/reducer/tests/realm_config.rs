@@ -891,3 +891,100 @@ fn merge_coordinator_pins() {
     first.apply(&rival).unwrap();
     assert_eq!(first.materialized_merge_coordinator(), None);
 }
+
+fn vault_set(id: u8, revision: Option<u8>) -> AdminDocumentOperation {
+    use crate::realm_vault::{RealmVaultEntry, RealmVaultPurpose, RealmVaultRecord};
+    let entry = RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, Ulid::from_bytes([id; 16]));
+    let record = revision.map(|revision| RealmVaultRecord {
+        entry,
+        revision: Ulid::from_bytes([revision; 16]),
+        sealed: vec![revision; 40],
+        changed_by: UserId::local(Ulid::from_bytes([9; 16]), realm_id()),
+        changed_at_ms: u64::from(revision),
+    });
+    AdminDocumentOperation::ConfigVaultSet { entry, record }
+}
+
+fn vault_revisions(state: &AdminDocumentState) -> Vec<(Ulid, Ulid)> {
+    (state.materialized_realm_vault().iter())
+        .map(|record| (record.entry.id, record.revision))
+        .collect()
+}
+
+#[test]
+fn vault_sets_replaces_deletes() {
+    // Different entries never conflict; a write that saw the record replaces or deletes it.
+    let mut state =
+        AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+            realm_id: realm_id(),
+        });
+    state
+        .apply_operation(&actor(node(1)), vault_set(2, Some(1)))
+        .unwrap();
+    let mut other = state.clone();
+    other
+        .apply_operation(&actor(node(2)), vault_set(1, Some(1)))
+        .unwrap();
+    let rival = state
+        .apply_operation(&actor(node(1)), vault_set(2, Some(2)))
+        .unwrap();
+    other.apply(&rival).unwrap();
+    let ids = |id: u8, revision: u8| (Ulid::from_bytes([id; 16]), Ulid::from_bytes([revision; 16]));
+    assert_eq!(vault_revisions(&other), vec![ids(1, 1), ids(2, 2)]);
+    assert!(other.conflicts.is_empty());
+
+    other
+        .apply_operation(&actor(node(2)), vault_set(2, None))
+        .unwrap();
+    assert_eq!(vault_revisions(&other), vec![ids(1, 1)]);
+    let path = crate::reducer::vault_entry_path(&crate::realm_vault::RealmVaultEntry::new(
+        crate::realm_vault::RealmVaultPurpose::SmtpPassword,
+        Ulid::from_bytes([2; 16]),
+    ));
+    assert_eq!(other.user_subject_ids[&path].value, None);
+
+    let mismatched = match vault_set(3, Some(1)) {
+        AdminDocumentOperation::ConfigVaultSet { record, .. } => {
+            AdminDocumentOperation::ConfigVaultSet {
+                entry: crate::realm_vault::RealmVaultEntry::new(
+                    crate::realm_vault::RealmVaultPurpose::SmtpPassword,
+                    Ulid::from_bytes([4; 16]),
+                ),
+                record,
+            }
+        }
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        other.apply_operation(&actor(node(2)), mismatched),
+        Err(AdminDocumentError::InvalidVaultRecord)
+    );
+}
+
+#[test]
+fn vault_conflict_absent() {
+    // Two unseen writes of one entry leave it absent on every node, whatever the event order.
+    let base = AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+        realm_id: realm_id(),
+    });
+    let mut first = base.clone();
+    let one = first
+        .apply_operation(&actor(node(1)), vault_set(5, Some(1)))
+        .unwrap();
+    let mut second = base.clone();
+    let two = second
+        .apply_operation(&actor(node(2)), vault_set(5, Some(2)))
+        .unwrap();
+    first.apply(&two).unwrap();
+    second.apply(&one).unwrap();
+    for state in [&first, &second] {
+        assert!(state.materialized_realm_vault().is_empty());
+        assert_eq!(state.conflicts.len(), 1);
+    }
+    let mut deleted = base.clone();
+    let tombstone = deleted
+        .apply_operation(&actor(node(3)), vault_set(5, None))
+        .unwrap();
+    first.apply(&tombstone).unwrap();
+    assert!(first.materialized_realm_vault().is_empty());
+}
