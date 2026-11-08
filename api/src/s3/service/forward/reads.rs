@@ -381,6 +381,24 @@ impl ArunaS3Service {
         (self.answer_read(&http::Extensions::new(), user, Some(info), pinned, request)).await
     }
 
+    /// A HEAD of `key` answered as `member_get` answers a GET. A holder's HEAD miss has no
+    /// body to name its code, so it becomes the missing key a local miss is.
+    pub(crate) async fn member_head(
+        &self,
+        user: &UserAccess,
+        (bucket, info): (&str, &BucketInfo),
+        key: &str,
+    ) -> S3Result<ReadAnswer> {
+        let headers = HeaderMap::new();
+        let request = || read_request(Method::HEAD, "HeadObject", bucket, key, None, &headers);
+        let extensions = http::Extensions::new();
+        let answer = self.answer_read(&extensions, user, Some(info), (key, false), request);
+        answer.await.map_err(|error| match error.status_code() {
+            Some(http::StatusCode::NOT_FOUND) => s3s::s3_error!(NoSuchKey),
+            _ => error,
+        })
+    }
+
     /// Sends a GET or HEAD to the chosen holder; a replica's miss goes on to the coordinator.
     pub(in crate::s3::service) async fn read_object(
         &self,

@@ -10,7 +10,9 @@ use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{BucketInfo, CONTENT_TYPE_KEY, object_permission_path};
+use aruna_core::structs::storage::blob::{
+    BucketInfo, CONTENT_TYPE_KEY, UserAccess, object_permission_path,
+};
 use aruna_core::structs::storage::share::{
     SHARE_SCHEME, ShareAction, ShareEvent, ShareLink, ShareTarget, ShareToken, TICKET_SECS,
     TicketBody, client_network,
@@ -41,15 +43,17 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::relay::{ShareRelay, share_access};
+use super::relay::{ShareRelay, member_error, share_access};
 use super::{ShareModeBody, log_event, rfc3339, unix_now};
 use crate::auth::ensure_permission_with;
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::forwarded::client_ip;
 use crate::rate_limit::LocalKey;
+use crate::routes::federation::import::shared_stream;
 use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::objects::page_error;
+use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
 use aruna_operations::s3::object::pages::{self, ListRequest, PageError, PageScope};
 
@@ -584,6 +588,31 @@ pub(crate) async fn current_version(
     }
 }
 
+/// The current version of `key` as the range's coordinator of a distributed bucket names it,
+/// asked as `user`; an ordinary bucket answers here. 404 when there is none.
+pub(crate) async fn head_version(
+    state: &ServerState,
+    (bucket, info): (&str, &BucketInfo),
+    key: &str,
+    user: &UserAccess,
+) -> ServerResult<Option<Ulid>> {
+    if info.distribution.is_none() {
+        return current_version(state, bucket, key).await;
+    }
+    let service = member_service(state).await;
+    match service.member_head(user, (bucket, info), key).await {
+        Ok(ReadAnswer::Local(_)) => current_version(state, bucket, key).await,
+        Ok(ReadAnswer::Forwarded(response, _)) => Ok((response.headers().get("x-amz-version-id"))
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Ulid::from_string(value).ok())),
+        Err(error) => Err(member_error(&error)),
+    }
+}
+
+async fn member_service(state: &ServerState) -> ArunaS3Service {
+    ArunaS3Service::new(state.get_ctx(), state.get_realm_id(), state.get_node_id()).await
+}
+
 #[utoipa::path(
     post,
     path = "/shares/visit/tickets",
@@ -625,7 +654,8 @@ pub async fn create_ticket(
         (Permission::READ, "share.read"),
     )
     .await?;
-    let version = current_version(&state, &bucket, &key).await?;
+    let user = share_access(&state, &link, &auth, visit_end);
+    let version = head_version(&state, (&bucket, &info), &key, &user).await?;
     Ok(Json(sign_ticket(
         (&link, visit_end),
         (&bucket, &key),
@@ -704,34 +734,58 @@ pub async fn download_file(
             "too many downloads at once".to_string(),
         ),
     })?;
-    let result = get_object_routed(
-        &state.get_ctx(),
-        GetObjectInput {
-            bucket: bucket.clone(),
-            key: ticket.key.clone(),
-            version_id: ticket.version_id,
-            range: None,
-            group_id: info.group_id,
-            user_identity: auth.user_id,
-            realm_id: state.get_realm_id(),
-            node_id: state.get_node_id(),
-        },
-        auth.path_restrictions.clone(),
-    )
-    .await
-    .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
-    let size = result.info.size;
+    // A key another member serves streams from there; the holder checks the creator again.
+    let remote = match info.distribution.is_some() {
+        true => {
+            let user = share_access(&state, &link, &auth, ticket.expires_at);
+            let service = member_service(&state).await;
+            let read = service.member_get(&user, (&bucket, &info), &ticket.key, ticket.version_id);
+            match read.await.map_err(|error| member_error(&error))? {
+                ReadAnswer::Forwarded(response, _) => {
+                    let size = (response.headers().get(header::CONTENT_LENGTH))
+                        .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
+                    Some((shared_stream(response.bytes_stream()), size))
+                }
+                ReadAnswer::Local(_) => None,
+            }
+        }
+        false => None,
+    };
+    let (blob, size) = match remote {
+        Some(remote) => remote,
+        None => {
+            let result = get_object_routed(
+                &state.get_ctx(),
+                GetObjectInput {
+                    bucket: bucket.clone(),
+                    key: ticket.key.clone(),
+                    version_id: ticket.version_id,
+                    range: None,
+                    group_id: info.group_id,
+                    user_identity: auth.user_id,
+                    realm_id: state.get_realm_id(),
+                    node_id: state.get_node_id(),
+                },
+                auth.path_restrictions.clone(),
+            )
+            .await
+            .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
+            (result.blob, Some(result.info.size))
+        }
+    };
     let mut logged = event(ShareAction::Download, Some(ticket.key.clone()), ip);
-    logged.bytes = Some(size);
+    logged.bytes = size;
     log_event(&state, link.id, logged).await;
     let name = ticket.key.rsplit('/').next().unwrap_or("download");
     let disposition = format!(
         "attachment; filename*=UTF-8''{}",
         utf8_percent_encode(name, NON_ALPHANUMERIC)
     );
-    let mut response = Response::new(download::body(result.blob, permit));
+    let mut response = Response::new(download::body(blob, permit));
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+    if let Some(size) = size {
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+    }
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),

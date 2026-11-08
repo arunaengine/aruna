@@ -3,11 +3,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::visit::{OpenShareRequest, VisitListQuery, VisitListing, list_files, open_share};
+use super::visit::{
+    DownloadQuery, OpenShareRequest, TicketRequest, VisitListQuery, VisitListing, create_ticket,
+    download_file, list_files, open_share,
+};
 use super::*;
 use crate::tests::members::{BUCKET, Members, members};
 use crate::tests::routes::test_state;
 use aruna_core::structs::identity::auth::NodeCapabilities;
+use axum::body::to_bytes;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, HeaderValue, header};
 use s3s::S3;
@@ -185,6 +189,27 @@ async fn names(
     }
 }
 
+async fn ticket(shared: &Shared, visit: &str, name: &str) -> ServerResult<String> {
+    let request = TicketRequest {
+        name: name.to_string(),
+    };
+    let state = State(shared.state.clone());
+    let Json(ticket) = create_ticket(state, share_headers(visit), Json(request)).await?;
+    Ok(ticket.path.split_once("ticket=").unwrap().1.to_string())
+}
+
+async fn fetch(shared: &Shared, ticket: &str) -> ServerResult<Vec<u8>> {
+    let query = Query(DownloadQuery {
+        ticket: ticket.to_string(),
+    });
+    let state = State(shared.state.clone());
+    let response = download_file(state, peer(), HeaderMap::new(), query).await?;
+    Ok(to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec())
+}
+
 // The member a link was made on lists both ranges in key order, and its pages go on across
 // the range bound without losing or repeating a name.
 #[tokio::test]
@@ -250,4 +275,82 @@ async fn coordinator_down_listing() {
     shared.members.nodes[1].stop().await;
     let error = page(&shared, &visit, ("", None, None)).await.unwrap_err();
     assert_eq!(code(error), "range_unavailable");
+}
+
+// A key another member coordinates downloads through the link's member, and the owner's log
+// records its size there.
+#[tokio::test]
+async fn remote_key_downloads() {
+    let shared = shared().await;
+    put(&shared, 1, "y.txt", "far away").await;
+    let (link, visit) = visit(&shared, ShareModeBody::Read).await;
+    let ticket = ticket(&shared, &visit, "y.txt").await.unwrap();
+    assert_eq!(fetch(&shared, &ticket).await.unwrap(), b"far away");
+    assert_eq!(
+        code(fetch(&shared, &ticket).await.unwrap_err()),
+        "share_unavailable"
+    );
+    assert_eq!(
+        code(ticket_error(&shared, &visit, "gone.txt").await),
+        "not_found"
+    );
+    let state = State(shared.state.clone());
+    let auth = Extension(Some(shared.owner.clone()));
+    let query = Query(ShareLogQuery::default());
+    let Json(log) = share_log(state, auth, Path(link.share.id), query)
+        .await
+        .unwrap();
+    let download = log
+        .entries
+        .iter()
+        .find(|entry| entry.action == "download")
+        .unwrap();
+    assert_eq!(download.bytes, Some(8));
+}
+
+async fn ticket_error(shared: &Shared, visit: &str, name: &str) -> ServerError {
+    ticket(shared, visit, name).await.unwrap_err()
+}
+
+// Revoking or expiring the link on its member ends the next request for another member's key:
+// a ticket already handed out and a listing alike.
+#[tokio::test]
+async fn ended_link_refused() {
+    use aruna_core::effects::Effect;
+    use aruna_operations::shares::store::save_effect;
+    let shared = shared().await;
+    put(&shared, 1, "y.txt", "far").await;
+    let (link, opened) = visit(&shared, ShareModeBody::Read).await;
+    let issued = ticket(&shared, &opened, "y.txt").await.unwrap();
+    let state = State(shared.state.clone());
+    let auth = Extension(Some(shared.owner.clone()));
+    revoke_share(state, auth, Path(link.share.id))
+        .await
+        .unwrap();
+    assert_eq!(
+        code(fetch(&shared, &issued).await.unwrap_err()),
+        "share_unavailable"
+    );
+    let listed = page(&shared, &opened, ("", None, None)).await.unwrap_err();
+    assert_eq!(code(listed), "share_unavailable");
+
+    let (link, opened) = visit(&shared, ShareModeBody::Read).await;
+    let issued = ticket(&shared, &opened, "y.txt").await.unwrap();
+    let id = Ulid::from_string(&link.share.id).unwrap();
+    let context = shared.state.get_ctx();
+    let mut stored = drive(GetShareOperation::new(id), &context)
+        .await
+        .unwrap()
+        .unwrap();
+    stored.expires_at = Some(unix_now() - 1);
+    let Effect::Storage(write) = save_effect(&stored).unwrap() else {
+        panic!("a link record is one storage write");
+    };
+    context.storage_handle.send_storage_effect(write).await;
+    assert_eq!(
+        code(fetch(&shared, &issued).await.unwrap_err()),
+        "share_unavailable"
+    );
+    let listed = page(&shared, &opened, ("", None, None)).await.unwrap_err();
+    assert_eq!(code(listed), "share_unavailable");
 }
