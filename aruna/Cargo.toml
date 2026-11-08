@@ -70,6 +70,7 @@ rustix = { workspace = true }
 
 [dev-dependencies]
 aruna-cli = { workspace = true }
+aruna-operations = { workspace = true, features = ["test-hooks"] }
 keyring-core = { workspace = true }
 aruna-kpabe = { workspace = true }
 axum = { workspace = true }

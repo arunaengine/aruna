@@ -1014,6 +1014,10 @@ impl MetadataHandle {
         ))
         .await?
         {
+            #[cfg(feature = "test-hooks")]
+            MetadataTransportMessage::SyncMirrorCreated if self.take_dropped_ack() => Err(
+                MetadataError::Backend("sync mirror request timed out".to_string()),
+            ),
             MetadataTransportMessage::SyncMirrorCreated => Ok(()),
             MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
             other => Err(MetadataError::Backend(format!(

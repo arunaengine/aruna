@@ -545,6 +545,17 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_mirror_repair(&self) {
+        #[cfg(feature = "test-hooks")]
+        if self
+            .context
+            .metadata_handle
+            .as_ref()
+            .is_some_and(|handle| handle.repair_held())
+        {
+            self.reschedule_timer(TaskKey::DrainMirrorRepair, REPAIR_RETRY_AFTER)
+                .await;
+            return;
+        }
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             self.reschedule_timer(TaskKey::DrainMirrorRepair, REPAIR_RETRY_AFTER)
                 .await;
