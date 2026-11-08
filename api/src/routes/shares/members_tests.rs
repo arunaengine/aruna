@@ -782,27 +782,31 @@ async fn content_skips_unreadable() {
         }
         .set_id()
     };
-    // Sets resolve in id order, so the closed group's set must sort before the open one.
-    let open_set = set_of(test.group_id);
-    let closed = (1..=u8::MAX)
-        .map(|seed| Ulid::from_bytes([seed; 16]))
-        .find(|group| set_of(*group) < open_set)
-        .unwrap();
-    let stranger = aruna_core::UserId::local(Ulid::from_bytes([98; 16]), test.auth.realm_id);
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: stranger,
-        realm_id: test.auth.realm_id,
-    };
+    // Sets resolve in id order: of two fixed groups, the one whose set sorts first is unreadable.
+    let mut groups = [Ulid::from_bytes([41; 16]), Ulid::from_bytes([42; 16])];
+    groups.sort_by_key(|group| set_of(*group));
+    let [unreadable, readable] = groups;
+    assert!(set_of(unreadable) < set_of(readable));
     let (context, realm) = (state.get_ctx(), test.auth.realm_id);
-    crate::tests::routes::seed_group_docs(&context, realm, &actor, closed, "closed", stranger)
-        .await;
+    let stranger = aruna_core::UserId::local(Ulid::from_bytes([98; 16]), realm);
+    // The link's creator owns the readable group only; a stranger owns the other one.
+    for (group, name, owner) in [
+        (unreadable, "closed", stranger),
+        (readable, "spire", test.auth.user_id),
+    ] {
+        let actor = Actor {
+            node_id: state.get_node_id(),
+            user_id: owner,
+            realm_id: realm,
+        };
+        crate::tests::routes::seed_group_docs(&context, realm, &actor, group, name, owner).await;
+    }
     let hash = [9; 32];
-    for (group, bucket) in [(closed, "closed"), (test.group_id, "spire")] {
+    for (group, bucket) in [(unreadable, "closed"), (readable, "spire")] {
         let set_id = distribute(&state, group, bucket).await.set_id();
         index_content(&state, set_id, hash).await;
     }
-    let (url, server) = listing_peer(test.group_id).await;
+    let (url, server) = listing_peer(readable).await;
     publish_urls(&state, node_id(PEER), (&url, Some(&url))).await;
     let content = content_id(hash);
     let parts = [(content.as_str(), "File")];
