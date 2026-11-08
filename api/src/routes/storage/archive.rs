@@ -7,11 +7,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use aruna_core::UserId;
+use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::TokenGrant;
+use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::auth::bearer_token::{grant_valid, token_grant};
-use aruna_operations::s3::object::archive::{SelectionEntry, validate_selection, write_selection};
+use aruna_operations::s3::object::archive::{
+    EntryStatus, MemberCall, MemberRead, MemberReader, SelectionEntry, validate_selection,
+    write_selection,
+};
 use aruna_operations::s3::object::pages::PageScope;
 use axum::extract::{Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
@@ -31,8 +36,10 @@ use crate::auth::{ValidatedBearer, require_realm_auth};
 use crate::download::{self, AdmissionError, DownloadPermit};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
+use crate::routes::federation::import::shared_stream;
 use crate::routes::shares::{rfc3339, unix_now};
 use crate::routes::storage::objects::BearerRelay;
+use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
 
 /// Bytes buffered between the archive writer and the response body.
@@ -188,6 +195,9 @@ READ on its prefix, as the object listing requires.
   archive streams, never all before the first byte.
 - There is no snapshot: a file without `version_id` takes the version that is current when the
   archive reaches it, and that version is then read to its end.
+- A key of a distributed bucket is read where an S3 GET of the caller would be: a current
+  version from its range's coordinator, a pinned one from any member that keeps its records,
+  with the caller's credential, restrictions and expiry.
 - A version is written once, at `{bucket}/{key}`. A key that is unsafe as a ZIP path, or whose
   path equals a written path, lies below a written file, or equals a written path's folder,
   moves to `_renamed/{bucket}/{version_id}`. The same selection over unchanged data yields the
@@ -195,10 +205,10 @@ READ on its prefix, as the object listing requires.
 - The last archive entry, `_report.json`, holds `totals` (entries per status and bytes written)
   and one row in `entries` for each file, folder or key range that is not included at its own
   path: `renamed` with its `path`, `denied`, `missing`, `locked` (bucket key not unlocked) or
-  `unavailable`. A folder the caller may not list is one `denied` row and is never enumerated;
-  entries the listing hides never appear. A key range no holder answered, or one a copy listed
-  because its coordinator could not, is one `unavailable` row with its `range_id`, and the
-  archive is incomplete. Keys of ranges this node keeps no records of are `unavailable`.
+  `unavailable`. A folder the caller may not list is one `denied` row and is never
+  enumerated; entries the listing hides never appear. A key range no holder answered or served,
+  or one a copy listed because its coordinator could not, is one `unavailable` row with its
+  `range_id`, the folder's other ranges still follow, and the archive is incomplete.
 - Entries are stored uncompressed, with ZIP64 records beyond 65,535 entries or 4 GiB.
 - The node keeps per entry its ZIP directory record (the path plus about 100 bytes), the written
   path and its folders, and the report row of an entry that is not included, so memory grows
@@ -343,6 +353,50 @@ pub async fn download_link(
     }
     let caller = (link.auth, Some(link.bearer));
     Ok(archive_response(state, caller, link.entries, permit))
+}
+
+// Distributed keys are read through the S3 forwarding, with the delegation the S3 GET route sends.
+impl MemberReader for BearerRelay<'_> {
+    async fn member_read(&self, call: MemberCall<'_>) -> Result<MemberRead, EntryStatus> {
+        let state = self.state;
+        let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+        let service = ArunaS3Service::new(state.get_ctx(), realm_id, node_id).await;
+        let expiry = self.bearer.map_or(0, ValidatedBearer::expires_at_secs);
+        // An expiry past what `SystemTime` holds becomes the latest one it always holds.
+        let expiry = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(expiry))
+            .unwrap_or(std::time::UNIX_EPOCH + std::time::Duration::from_secs(u32::MAX.into()));
+        // The bearer was verified here; the delegation carries its expiry and restrictions.
+        let user = UserAccess {
+            access_key: String::new(),
+            user_identity: call.auth.user_id,
+            group_id: call.info.group_id,
+            secret: EncryptedS3Secret::empty(),
+            expiry,
+            path_restrictions: call.auth.path_restrictions.clone(),
+            issued_by: *node_id.as_bytes(),
+            revoked_at: None,
+        };
+        let read = service.member_get(&user, (call.bucket, call.info), call.key, call.version);
+        match read.await {
+            Ok(ReadAnswer::Local(_)) => Ok(MemberRead::Local),
+            Ok(ReadAnswer::Forwarded(response, _)) => {
+                let version = (response.headers().get("x-amz-version-id"))
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| ulid::Ulid::from_string(value).ok())
+                    .ok_or(EntryStatus::Unavailable)?;
+                let blob = shared_stream(response.bytes_stream());
+                Ok(MemberRead::Remote { version, blob })
+            }
+            Err(error) => Err(match error.code() {
+                s3s::S3ErrorCode::NoSuchKey
+                | s3s::S3ErrorCode::NoSuchVersion
+                | s3s::S3ErrorCode::MethodNotAllowed => EntryStatus::Missing,
+                s3s::S3ErrorCode::AccessDenied => EntryStatus::Denied,
+                _ => EntryStatus::Unavailable,
+            }),
+        }
+    }
 }
 
 /// What an unredeemed link runs as. The bearer stays in memory for relayed listings and is

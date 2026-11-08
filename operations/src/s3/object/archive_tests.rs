@@ -49,6 +49,12 @@ impl RangeRelay for NoRelay {
     }
 }
 
+impl MemberReader for NoRelay {
+    async fn member_read(&self, _: MemberCall<'_>) -> Result<MemberRead, EntryStatus> {
+        Ok(MemberRead::Local)
+    }
+}
+
 fn file(key: &str, version_id: Option<Ulid>) -> SelectionEntry {
     SelectionEntry::File {
         bucket: BUCKET.to_string(),

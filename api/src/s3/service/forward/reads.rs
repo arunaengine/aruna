@@ -41,7 +41,7 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 pub(in crate::s3::service) const STALE_HEADER: &str = "x-aruna-stale";
 
 /// Where a GET or HEAD is answered; `Some` names the range a copy answered for.
-pub(in crate::s3::service) enum ReadAnswer {
+pub(crate) enum ReadAnswer {
     Forwarded(reqwest::Response, Option<Ulid>),
     Local(Option<Ulid>),
 }
@@ -354,6 +354,31 @@ impl ArunaS3Service {
             }
         }
         Err(error)
+    }
+
+    /// A GET of `key` for a caller another surface verified, answered as an S3 GET would be: a
+    /// current version by the range's coordinator, a pinned one by any holder of its records.
+    pub(crate) async fn member_get(
+        &self,
+        user: &UserAccess,
+        (bucket, info): (&str, &BucketInfo),
+        key: &str,
+        version: Option<Ulid>,
+    ) -> S3Result<ReadAnswer> {
+        let query = version.map(|version| format!("versionId={version}"));
+        let headers = HeaderMap::new();
+        let request = || {
+            read_request(
+                Method::GET,
+                "GetObject",
+                bucket,
+                key,
+                query.as_deref(),
+                &headers,
+            )
+        };
+        let pinned = (key, version.is_some());
+        (self.answer_read(&http::Extensions::new(), user, Some(info), pinned, request)).await
     }
 
     /// Sends a GET or HEAD to the chosen holder; a replica's miss goes on to the coordinator.

@@ -6,9 +6,10 @@
 use super::*;
 use crate::mcp::data::{WriteObjectInput, store_text};
 use crate::routes::storage::deletion::bucket_info;
+use crate::tests::assistant::spawn_mock;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
-    unsigned_token,
+    publish_urls, unsigned_token,
 };
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -52,6 +53,45 @@ async fn store(node: &Node, keys: &[&str]) {
 fn bearer(auth: &AuthContext) -> ValidatedBearer {
     ValidatedBearer::new_for_test(unsigned_token(auth))
 }
+
+/// The archive's files by name in archive order, without the report.
+async fn files(response: Response) -> Vec<(String, Vec<u8>)> {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the archive streams to its end");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("valid archive");
+    let mut files = Vec::new();
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).unwrap();
+        let mut content = Vec::new();
+        file.read_to_end(&mut content).unwrap();
+        files.push((file.name().unwrap().to_string(), content));
+    }
+    files
+}
+
+/// A peer S3 endpoint that serves every GET as `version` with `body`, and stops on drop.
+struct MockS3(String, tokio::task::JoinHandle<()>);
+
+impl Drop for MockS3 {
+    fn drop(&mut self) {
+        self.1.abort();
+    }
+}
+
+async fn mock_s3(version: &'static str, body: &'static str) -> MockS3 {
+    let answer = move || async move {
+        let headers = [
+            ("x-amz-version-id", version),
+            ("content-type", "text/plain"),
+        ];
+        (StatusCode::OK, headers, body)
+    };
+    let (url, task) = spawn_mock(axum::Router::new().fallback(answer)).await;
+    MockS3(url, task)
+}
+
+const REMOTE_VERSION: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 /// The archive's file names, without the report, and the report.
 async fn unzip(response: Response) -> (Vec<String>, Report) {
@@ -193,6 +233,29 @@ async fn distributed_folder_ranges() {
     assert_eq!(report.entries[0].prefix.as_deref(), Some(""));
     assert_eq!(report.entries[0].status, EntryStatus::Unavailable);
     assert_eq!((report.totals.included, report.totals.unavailable), (2, 1));
+}
+
+// A healthy range another member coordinates is read there with the caller's credential.
+#[tokio::test]
+async fn remote_range_read() {
+    let node = node_state().await;
+    store(&node, &["a.md"]).await;
+    distribute(&node.state, node.group_id, BUCKET).await;
+    let answer = r#"{"bucket":"routed","objects":[{"key":"x.md","size":1,"etag":null,
+        "version_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "last_modified":null,"content_type":null,"referenced":false,"content_id":null}],
+        "prefixes":[],"next_cursor":null}"#;
+    let peer = mock_peer(StatusCode::OK, answer).await;
+    let s3 = mock_s3(REMOTE_VERSION, "remote x").await;
+    publish_urls(&node.state, node_id(PEER), (&peer.url, Some(&s3.0))).await;
+    let response = archive(&node, &node.owner, whole_bucket()).await.unwrap();
+    let files = files(response).await;
+    let names: Vec<_> = files.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["routed/a.md", "routed/x.md", REPORT_PATH]);
+    assert_eq!(files[1].1, b"remote x");
+    let report: Report = serde_json::from_slice(&files[2].1).unwrap();
+    assert!(report.entries.is_empty(), "{:?}", report.entries);
+    assert_eq!(report.totals.included, 2);
 }
 
 // A holder that refuses its range costs that range only, never the keys listed before it.

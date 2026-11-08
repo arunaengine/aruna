@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 
 use aruna_core::errors::ConversionError;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -130,6 +131,40 @@ impl Report {
     }
 }
 
+type Blob = BackendStream<Result<Bytes, StreamError>>;
+
+/// Where a member of a distributed bucket reads a key for the caller.
+pub enum MemberRead {
+    /// This node reads its own records.
+    Local,
+    /// The member that serves the key answered with this version and its bytes.
+    Remote { version: Ulid, blob: Blob },
+}
+
+/// One key of a distributed bucket the archive reads for its caller.
+pub struct MemberCall<'a> {
+    pub auth: &'a AuthContext,
+    pub bucket: &'a str,
+    pub info: &'a BucketInfo,
+    pub key: &'a str,
+    pub version: Option<Ulid>,
+}
+
+/// Reads a distributed bucket's key where an S3 GET of the caller would be answered: a current
+/// version at the range's coordinator, a pinned one at any holder of its records.
+pub trait MemberReader: RangeRelay {
+    fn member_read(
+        &self,
+        call: MemberCall<'_>,
+    ) -> impl Future<Output = Result<MemberRead, EntryStatus>> + Send;
+}
+
+/// A version pinned for writing, with its bytes when another member already sent them.
+struct Pinned {
+    version: Ulid,
+    blob: Option<Blob>,
+}
+
 #[derive(Debug, Error)]
 pub enum SelectionError {
     #[error("a selection names at least one file or folder")]
@@ -196,7 +231,7 @@ fn folders(path: &str) -> impl Iterator<Item = &str> {
 /// Writes every selected entry, bucket by bucket in request order and key by key in key order,
 /// then the report. Each key is resolved and its version pinned only when the writer reaches it.
 /// A failure inside an entry ends the archive with an error instead of a silent gap.
-pub async fn write_selection<R: RangeRelay, W: tokio::io::AsyncWrite + Unpin>(
+pub async fn write_selection<R: MemberReader, W: tokio::io::AsyncWrite + Unpin>(
     scope: &PageScope<'_, R>,
     caller: Caller<'_>,
     entries: Vec<SelectionEntry>,
@@ -269,7 +304,7 @@ fn folder_row(bucket: &str, prefix: &str, range_id: Option<String>) -> ReportRow
 
 impl<W: AsyncWrite + Unpin> Archive<W> {
     /// Merges the bucket's explicit files into its folder listings in key order.
-    async fn write_bucket<R: RangeRelay>(
+    async fn write_bucket<R: MemberReader>(
         &mut self,
         scope: &PageScope<'_, R>,
         caller: Caller<'_>,
@@ -354,7 +389,7 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
     }
 
     /// Writes each distinct version the claims on `key` resolve to, once.
-    async fn write_key<R: RangeRelay>(
+    async fn write_key<R: MemberReader>(
         &mut self,
         scope: &PageScope<'_, R>,
         auth: &AuthContext,
@@ -364,18 +399,19 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
     ) -> Result<(), SelectionError> {
         let mut written = Vec::new();
         for requested in claims {
-            let version = match resolve(scope, auth, (bucket, info), key, requested).await {
-                Ok(version) => version,
+            let pinned = match resolve(scope, auth, (bucket, info), key, requested).await {
+                Ok(pinned) => pinned,
                 Err(status) => {
                     self.report.add(file_row(bucket, key, requested, status));
                     continue;
                 }
             };
+            let version = pinned.version;
             if written.contains(&version) {
                 continue;
             }
             match self
-                .write_object(scope, auth, (bucket, info), key, version)
+                .write_object(scope, auth, (bucket, info), key, pinned)
                 .await?
             {
                 Ok(()) => written.push(version),
@@ -389,14 +425,15 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
 
     /// Streams one pinned version into the archive; a version that cannot be opened is
     /// reported by its status and takes no path.
-    async fn write_object<R: RangeRelay>(
+    async fn write_object<R: MemberReader>(
         &mut self,
         scope: &PageScope<'_, R>,
         auth: &AuthContext,
         (bucket, info): (&str, &BucketInfo),
         key: &str,
-        version: Ulid,
+        pinned: Pinned,
     ) -> Result<Result<(), EntryStatus>, SelectionError> {
+        let Pinned { version, blob } = pinned;
         let (path, renamed) = self.paths.place(bucket, key, version);
         let input = GetObjectInput {
             bucket: bucket.to_string(),
@@ -409,19 +446,24 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
             node_id: scope.node_id,
         };
         let restrictions = auth.path_restrictions.clone();
-        let read = match get_object_routed(scope.context, input, restrictions).await {
-            Ok(read) => read,
-            Err(error) => return Ok(Err(read_status(&error))),
+        let blob = match blob {
+            Some(blob) => blob,
+            None => match get_object_routed(scope.context, input, restrictions).await {
+                Ok(read) => read.blob,
+                Err(error) => return Ok(Err(read_status(&error))),
+            },
         };
-        let size = write_entry(&mut self.zip, &path, version.timestamp_ms(), read.blob).await?;
+        let size = write_entry(&mut self.zip, &path, version.timestamp_ms(), blob).await?;
         self.report.totals.bytes += size;
+        if !renamed {
+            self.paths.record(&path);
+        }
         if renamed {
             self.report.add(ReportRow {
                 path: Some(path),
                 ..file_row(bucket, key, Some(version), EntryStatus::Renamed)
             });
         } else {
-            self.paths.record(&path);
             self.report.count(EntryStatus::Included);
         }
         Ok(Ok(()))
@@ -470,7 +512,7 @@ struct FolderListing {
 
 impl FolderWalk {
     /// The next listed key; ranges a page could not list from current records are reported.
-    async fn peek<R: RangeRelay>(
+    async fn peek<R: MemberReader>(
         &mut self,
         scope: &PageScope<'_, R>,
         caller: Caller<'_>,
@@ -526,7 +568,7 @@ impl FolderWalk {
 }
 
 /// Whether the caller may list `prefix`, as the bucket's own listing requires.
-async fn may_list<R: RangeRelay>(
+async fn may_list<R: MemberReader>(
     scope: &PageScope<'_, R>,
     auth: &AuthContext,
     (bucket, info): (&str, &BucketInfo),
@@ -555,21 +597,36 @@ async fn authorization<R>(
     }
 }
 
-/// The exact version `requested` names for the caller, or the one current now.
-async fn resolve<R: RangeRelay>(
+/// The exact version `requested` names for the caller, or the one current now. A distributed
+/// bucket's key is read where its S3 GET would be, so a current version is the coordinator's.
+async fn resolve<R: MemberReader>(
     scope: &PageScope<'_, R>,
     auth: &AuthContext,
     (bucket, info): (&str, &BucketInfo),
     key: &str,
     requested: Option<Ulid>,
-) -> Result<Ulid, EntryStatus> {
+) -> Result<Pinned, EntryStatus> {
     let (realm_id, node_id) = (scope.realm_id, scope.node_id);
     let path = object_permission_path(realm_id, info.group_id, node_id, bucket, key);
     // A denied caller learns nothing about whether the key exists.
     authorization(scope, auth, &path).await?;
-    // Without records of the key's range here, a miss would prove nothing.
     let mut catching_up = false;
     if let Some(binding) = info.distribution.as_ref() {
+        let call = MemberCall {
+            auth,
+            bucket,
+            info,
+            key,
+            version: requested,
+        };
+        match scope.relay.member_read(call).await? {
+            MemberRead::Remote { version, blob } => {
+                let blob = Some(blob);
+                return Ok(Pinned { version, blob });
+            }
+            MemberRead::Local => {}
+        }
+        // Without records of the key's range here, a miss would prove nothing.
         match route_read(scope.context, binding, key, false).await {
             Ok(ReadRoute::Local {
                 catching_up: behind,
@@ -582,7 +639,7 @@ async fn resolve<R: RangeRelay>(
         key: key.to_string(),
         version_id: requested,
     });
-    match drive(head, scope.context).await {
+    let version = match drive(head, scope.context).await {
         Ok(head) => (head.resolved_version_id.or(head.version_id)).ok_or(EntryStatus::Missing),
         Err(
             HeadObjectError::NoSuchKey
@@ -591,7 +648,11 @@ async fn resolve<R: RangeRelay>(
         ) if !catching_up => Err(EntryStatus::Missing),
         Err(HeadObjectError::ConversionError(error)) if locked(&error) => Err(EntryStatus::Locked),
         Err(_) => Err(EntryStatus::Unavailable),
-    }
+    }?;
+    Ok(Pinned {
+        version,
+        blob: None,
+    })
 }
 
 fn locked(error: &ConversionError) -> bool {

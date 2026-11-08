@@ -14,6 +14,7 @@ mod payload;
 mod pinned;
 
 pub(crate) use forward::forwarded_digest;
+pub(crate) use forward::reads::ReadAnswer;
 
 use crate::s3::auth::DelegatedRequest;
 use aruna_core::structs::storage::distribution::delegation::{
