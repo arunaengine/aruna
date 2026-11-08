@@ -43,12 +43,15 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::relay::{ShareRelay, member_error, share_access};
+use super::relay::{
+    ShareRelay, UploadStream, counted_blob, member_error, share_access, upload_error,
+};
 use super::{ShareModeBody, log_event, rfc3339, unix_now};
 use crate::auth::ensure_permission_with;
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::forwarded::client_ip;
+use crate::mcp::data::store_stream;
 use crate::rate_limit::LocalKey;
 use crate::routes::federation::import::shared_stream;
 use crate::routes::storage::deletion::bucket_info;
@@ -56,6 +59,7 @@ use crate::routes::storage::objects::page_error;
 use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
 use aruna_operations::s3::object::pages::{self, ListRequest, PageError, PageScope};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Entries per listing page when the visitor names no limit.
 const PAGE: usize = 100;
@@ -804,6 +808,7 @@ async fn claim_key(
     auth: &AuthContext,
     (bucket, info): (&str, &BucketInfo),
     wanted: &str,
+    user: &UserAccess,
 ) -> ServerResult<String> {
     let now = unix_now();
     let until = now + UPLOAD_SECS.as_secs();
@@ -814,7 +819,7 @@ async fn claim_key(
             number => numbered_key(wanted, number),
         };
         number += 1;
-        match current_version(state, bucket, &candidate).await {
+        match head_version(state, (bucket, info), &candidate, user).await {
             Err(ServerError::NotFound) => {}
             Err(error) => return Err(error),
             Ok(_) => continue,
@@ -863,7 +868,7 @@ pub async fn upload_file(
     body: Body,
 ) -> ServerResult<(StatusCode, Json<UploadResponse>)> {
     let ip = visitor_ip(&state, peer, &headers);
-    let (link, _) = visited_link(&state, &headers).await?;
+    let (link, visit_end) = visited_link(&state, &headers).await?;
     if !link.mode.uploads() {
         return Err(ServerError::Refused(
             StatusCode::FORBIDDEN,
@@ -879,7 +884,8 @@ pub async fn upload_file(
     guard_bucket_write(state.get_ctx().as_ref(), &bucket)
         .await
         .map_err(|_| ServerError::Forbidden)?;
-    let key = claim_key(&state, &auth, (&bucket, &info), &wanted).await?;
+    let user = share_access(&state, &link, &auth, visit_end);
+    let key = claim_key(&state, &auth, (&bucket, &info), &wanted, &user).await?;
     let content_length = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -892,21 +898,13 @@ pub async fn upload_file(
         .to_string();
     let deadline = tokio::time::Instant::now() + UPLOAD_SECS;
     let stream = crate::routes::rocrate_import::upload_body_stream(body, deadline);
-    let stored = crate::mcp::data::store_stream(
-        &state,
-        &auth,
-        &info,
-        (&bucket, &key),
-        (stream, content_length),
-        ([(CONTENT_TYPE_KEY.to_string(), content_type)].into(), true),
-    )
-    .await;
+    let upload = (stream, content_length, content_type);
+    let stored = store_upload(&state, (&auth, &user), (&bucket, &info), &key, upload).await;
     let release = ReleaseNameOperation::new(&bucket, &key);
     if let Err(error) = drive(release, &state.get_ctx()).await {
         tracing::warn!(share_id = %link.id, error = %error, "Share upload name claim not released");
     }
-    let stored = stored?;
-    let size = stored.location.blob_size;
+    let size = stored?;
     let mut logged = event(ShareAction::Upload, Some(key.clone()), ip);
     logged.bytes = Some(size);
     log_event(&state, link.id, logged).await;
@@ -916,6 +914,34 @@ pub async fn upload_file(
         .unwrap_or(&key)
         .to_string();
     Ok((StatusCode::CREATED, Json(UploadResponse { name, size })))
+}
+
+/// Stores an upload create-only at the coordinator of its key and returns its size. Another
+/// member's range takes it as `user`, and its quota is charged there.
+async fn store_upload(
+    state: &Arc<ServerState>,
+    (auth, user): (&AuthContext, &UserAccess),
+    (bucket, info): (&str, &BucketInfo),
+    key: &str,
+    (stream, content_length, content_type): (UploadStream, Option<u64>, String),
+) -> ServerResult<u64> {
+    let service = member_service(state).await;
+    let extensions = axum::http::Extensions::new();
+    let target = service.forward_target(&extensions, Some(info), key).await;
+    let Some(forward) = target.map_err(|error| upload_error(&error))? else {
+        let metadata = [(CONTENT_TYPE_KEY.to_string(), content_type)].into();
+        let upload = (stream, content_length);
+        let stored = store_stream(state, auth, info, (bucket, key), upload, (metadata, true));
+        return Ok(stored.await?.location.blob_size);
+    };
+    let counted = Arc::new(AtomicU64::new(0));
+    let body = counted_blob(stream, counted.clone());
+    let upload = (body, content_length, content_type.as_str());
+    let sent = service
+        .member_put(user, &forward, (bucket, key), upload)
+        .await;
+    sent.map_err(|error| upload_error(&error))?;
+    Ok(counted.load(Ordering::Relaxed))
 }
 
 /// Tells the link's creator about an upload; a failed notice never fails the upload.

@@ -3,15 +3,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, UNIX_EPOCH};
 
 use aruna_core::credential_encryption::EncryptedS3Secret;
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::share::{SHARE_CREDENTIAL_PREFIX, ShareLink};
 use aruna_operations::s3::object::pages::{ObjectPage, RangeCall, RangeRelay};
+use axum::http::StatusCode;
+use bytes::Bytes;
+use s3s::dto::StreamingBlob;
 
-use super::visit::unavailable;
+use super::visit::{range_unavailable, unavailable};
 use crate::error::{ServerError, ServerResult};
 use crate::mcp::data::ObjectOutput;
 use crate::s3::service::ArunaS3Service;
@@ -48,7 +55,43 @@ pub(crate) fn member_error(error: &s3s::S3Error) -> ServerError {
         Some(403) => unavailable(),
         Some(404) => ServerError::NotFound,
         Some(400) => ServerError::BadRequestReason(message),
-        _ => ServerError::ServiceUnavailableReason(message),
+        _ => range_unavailable("cannot be reached"),
+    }
+}
+
+/// The body of a visitor's upload.
+pub(crate) type UploadStream = BackendStream<Result<Bytes, StreamError>>;
+
+/// An upload body to send on, counting into `counted` the bytes it yields.
+pub(crate) fn counted_blob(stream: UploadStream, counted: Arc<AtomicU64>) -> StreamingBlob {
+    // The lock only lends the stream `Sync`; one task polls it.
+    let stream = Mutex::new(stream.0);
+    StreamingBlob::wrap(futures_util::stream::poll_fn(move |cx| {
+        let mut stream = stream.lock().unwrap_or_else(|error| error.into_inner());
+        let item = stream.as_mut().poll_next(cx);
+        if let Poll::Ready(Some(Ok(bytes))) = &item {
+            counted.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        item
+    }))
+}
+
+/// A coordinator's refusal of a visitor's upload as the visitor's answer.
+pub(crate) fn upload_error(error: &s3s::S3Error) -> ServerError {
+    match error.code().as_str() {
+        "PreconditionFailed" => ServerError::Refused(
+            StatusCode::CONFLICT,
+            "name_taken",
+            "another file took this name during the upload; upload again".to_string(),
+        ),
+        "QuotaExceeded" => ServerError::Conflict(error.message().unwrap_or_default().to_string()),
+        _ if error
+            .status_code()
+            .is_none_or(|code| code.is_server_error()) =>
+        {
+            range_unavailable("takes no uploads")
+        }
+        _ => member_error(error),
     }
 }
 

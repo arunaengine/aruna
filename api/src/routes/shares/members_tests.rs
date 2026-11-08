@@ -4,14 +4,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::visit::{
-    DownloadQuery, OpenShareRequest, TicketRequest, VisitListQuery, VisitListing, create_ticket,
-    download_file, list_files, open_share,
+    DownloadQuery, OpenShareRequest, TicketRequest, UploadQuery, VisitListQuery, VisitListing,
+    create_ticket, download_file, list_files, open_share, upload_file,
 };
 use super::*;
 use crate::tests::members::{BUCKET, Members, members};
 use crate::tests::routes::test_state;
 use aruna_core::structs::identity::auth::NodeCapabilities;
-use axum::body::to_bytes;
+use axum::body::{Body, to_bytes};
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, HeaderValue, header};
 use s3s::S3;
@@ -210,6 +210,18 @@ async fn fetch(shared: &Shared, ticket: &str) -> ServerResult<Vec<u8>> {
         .to_vec())
 }
 
+async fn upload(shared: &Shared, visit: &str, name: &str, text: &str) -> ServerResult<String> {
+    let query = Query(UploadQuery {
+        name: name.to_string(),
+    });
+    let mut headers = share_headers(visit);
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(text.len()));
+    let body = Body::from(text.to_string());
+    let state = State(shared.state.clone());
+    let uploaded = upload_file(state, peer(), headers, query, body).await;
+    uploaded.map(|(_, Json(uploaded))| uploaded.name)
+}
+
 // The member a link was made on lists both ranges in key order, and its pages go on across
 // the range bound without losing or repeating a name.
 #[tokio::test]
@@ -266,15 +278,108 @@ async fn holder_policy_hides() {
     assert!(stored(&shared, 1, "private/secret.txt").await.is_some());
 }
 
-// A range whose coordinator is down cannot be listed, and the visitor is told to retry.
+// A range whose coordinator is down cannot be listed or written, and the visitor is told to
+// retry; this member's own range still takes uploads.
 #[tokio::test]
-async fn coordinator_down_listing() {
+async fn coordinator_down_refused() {
     let mut shared = shared().await;
     put(&shared, 0, "a.txt", "alpha").await;
     let (_, visit) = visit(&shared, ShareModeBody::ReadUpload).await;
     shared.members.nodes[1].stop().await;
     let error = page(&shared, &visit, ("", None, None)).await.unwrap_err();
     assert_eq!(code(error), "range_unavailable");
+    let error = upload(&shared, &visit, "x.txt", "far").await.unwrap_err();
+    assert_eq!(code(error), "range_unavailable");
+    assert_eq!(
+        upload(&shared, &visit, "b.txt", "near").await.unwrap(),
+        "b.txt"
+    );
+}
+
+// An upload to another member's range lands at its coordinator and never replaces a live
+// key there; a deleted key takes its name again.
+#[tokio::test]
+async fn uploads_reach_coordinator() {
+    let shared = shared().await;
+    put(&shared, 1, "y.txt", "kept").await;
+    put(&shared, 1, "z.txt", "deleted").await;
+    let input = s3s::dto::DeleteObjectInput {
+        bucket: BUCKET.to_string(),
+        key: "z.txt".to_string(),
+        ..Default::default()
+    };
+    let request = s3_request(&shared, 1, input, http::Method::DELETE).await;
+    shared.members.nodes[1]
+        .service
+        .delete_object(request)
+        .await
+        .unwrap();
+    let (link, visit) = visit(&shared, ShareModeBody::Upload).await;
+    assert_eq!(
+        upload(&shared, &visit, "x.txt", "new").await.unwrap(),
+        "x.txt"
+    );
+    assert_eq!(
+        upload(&shared, &visit, "y.txt", "other").await.unwrap(),
+        "y (1).txt"
+    );
+    assert_eq!(
+        upload(&shared, &visit, "z.txt", "again").await.unwrap(),
+        "z.txt"
+    );
+    assert_eq!(stored(&shared, 1, "x.txt").await.unwrap(), b"new");
+    assert_eq!(stored(&shared, 1, "y.txt").await.unwrap(), b"kept");
+    assert_eq!(stored(&shared, 1, "y (1).txt").await.unwrap(), b"other");
+    assert_eq!(stored(&shared, 1, "z.txt").await.unwrap(), b"again");
+    let state = State(shared.state.clone());
+    let auth = Extension(Some(shared.owner.clone()));
+    let query = Query(ShareLogQuery::default());
+    let Json(log) = share_log(state, auth, Path(link.share.id), query)
+        .await
+        .unwrap();
+    let sizes: Vec<_> = log.entries.iter().filter_map(|entry| entry.bytes).collect();
+    assert_eq!(sizes, [3, 5, 5]);
+}
+
+/// Gives the group a storage quota of `bytes` on member `on` only.
+async fn quota_on(shared: &Shared, on: usize, bytes: u64) {
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+    let members = &shared.members;
+    let mut config = RealmConfigDocument::default_for_realm(members.realm_id, Vec::new());
+    for node in &members.nodes {
+        config.ensure_node(node.node_id(), RealmNodeKind::Server);
+    }
+    config.quota.default_quota_bytes = Some(bytes);
+    config.quota.grace_factor_percent = 100;
+    let node = &members.nodes[on];
+    let actor = Actor {
+        node_id: node.node_id(),
+        user_id: members.user.user_identity,
+        realm_id: members.realm_id,
+    };
+    let value = config.to_bytes(&actor).unwrap();
+    let key = (*members.realm_id.as_bytes()).into();
+    let space = aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    crate::tests::routes::write_doc(&node.context, space, key, value.into()).await;
+}
+
+// The coordinator charges an upload to its own quota: a quota there refuses a file for its
+// range, and this member, without one, still takes its own keys.
+#[tokio::test]
+async fn quota_on_coordinator() {
+    let shared = shared().await;
+    quota_on(&shared, 1, 4).await;
+    let (_, visit) = visit(&shared, ShareModeBody::Upload).await;
+    let error = upload(&shared, &visit, "x.txt", "too large")
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), "conflict");
+    assert!(stored(&shared, 1, "x.txt").await.is_none());
+    assert_eq!(
+        upload(&shared, &visit, "a.txt", "too large").await.unwrap(),
+        "a.txt"
+    );
 }
 
 // A key another member coordinates downloads through the link's member, and the owner's log
