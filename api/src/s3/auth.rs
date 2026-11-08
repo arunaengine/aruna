@@ -12,7 +12,7 @@ use crate::s3::service::InputView;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 use aruna_core::errors::StorageError;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission, SessionKind, SessionRef};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::structs::storage::blob::{
@@ -22,6 +22,7 @@ use aruna_core::structs::storage::distribution::delegation::{
     COPY_READ_HEADER, DELEGATION_HEADER, Payload, SignedDelegation,
 };
 use aruna_core::structs::storage::encryption::TokenCredential;
+use aruna_core::structs::storage::share::SHARE_CREDENTIAL_PREFIX;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::auth::bearer_token::realm_user_cutoff;
 use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
@@ -770,11 +771,20 @@ impl AuthProvider {
             };
             routed.map_err(|error| crate::s3::error::guard_error(&error))?;
         }
+        // The issuer signs the credential id, so a share link's visit stays a share session.
+        let session = (delegation.credential_id)
+            .strip_prefix(SHARE_CREDENTIAL_PREFIX)
+            .map(|sid| SessionRef {
+                sid: sid.to_string(),
+                kind: SessionKind::Share,
+                name: None,
+                via: None,
+            });
         let auth_context = AuthContext {
             user_id: delegation.user_id,
             realm_id: self.realm_id,
             path_restrictions: delegation.restrictions.clone(),
-            session: None,
+            session,
         };
         let path = match listing {
             true => {

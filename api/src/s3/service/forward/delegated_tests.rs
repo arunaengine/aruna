@@ -149,6 +149,25 @@ async fn serves_once() {
     assert!(body.contains("already used"), "{body}");
 }
 
+// A `share:` credential id runs as that link's share session on the holder, so a policy
+// about share sessions decides there as on the link's node.
+#[tokio::test]
+async fn share_session_kept() {
+    let members = members(3, &["h", "p"], 0).await;
+    stored(&members, "k/held").await;
+    members.deny_on(1, "request.session.kind == 'share'").await;
+    let secret = &members.nodes[0].secret;
+    let mut shared = delegation(&members, (0, 1), &get("k/held"), &accept());
+    shared.credential_id = "share:01JSHARE0123456789ABCDEFGH".to_string();
+    let value = shared.sign(secret).encode().unwrap();
+    let (status, body) = send(&members, 1, (Method::GET, "k/held"), &[value], None).await;
+    assert_eq!(status, http::StatusCode::FORBIDDEN, "{body}");
+    let plain = delegation(&members, (0, 1), &get("k/held"), &accept());
+    let value = plain.sign(secret).encode().unwrap();
+    let (status, body) = send(&members, 1, (Method::GET, "k/held"), &[value], None).await;
+    assert_eq!((status, body.as_str()), (http::StatusCode::OK, "held"));
+}
+
 // The delegation binds the request: another key, a missing or doubled header, or a broken
 // value is refused before anything is read.
 #[tokio::test]

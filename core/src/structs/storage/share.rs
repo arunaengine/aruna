@@ -24,6 +24,9 @@ pub const SHARE_SCHEME: &str = "Share";
 pub const VISIT_SECS: u64 = 60 * 60;
 /// The longest a download ticket lasts.
 pub const TICKET_SECS: u64 = 60;
+/// Starts the credential id of a link's delegated requests, followed by the link id. S3
+/// access keys are alphanumeric, so no other credential starts with it.
+pub const SHARE_CREDENTIAL_PREFIX: &str = "share:";
 const VISIT_DOMAIN: &[u8] = b"aruna share visit v1";
 const TICKET_DOMAIN: &[u8] = b"aruna share ticket v1";
 

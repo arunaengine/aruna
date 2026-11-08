@@ -126,6 +126,33 @@ impl Members {
         }
     }
 
+    /// Adds a group policy on node `on` only that denies every request `expression` matches.
+    pub async fn deny_on(&self, on: usize, expression: &str) {
+        use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+        use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+        let owner = self.user.user_identity;
+        let mut document =
+            GroupAuthorizationDocument::default_group_doc(owner, self.realm_id, self.group_id);
+        document.policies = vec![RequestPolicy {
+            policy_id: Ulid::from_bytes([77; 16]),
+            name: "deny-on-member".to_string(),
+            kind: PolicyKind::Deny,
+            when: None,
+            expression: expression.to_string(),
+            enabled: true,
+        }];
+        let node = &self.nodes[on];
+        let actor = Actor {
+            node_id: node.node_id(),
+            user_id: owner,
+            realm_id: self.realm_id,
+        };
+        let value = document.to_bytes(&actor).unwrap();
+        let key = aruna_core::keyspaces::AUTH_KEYSPACE;
+        let group = self.group_id.to_bytes().into();
+        write_doc(&node.context, key, group, value.into()).await;
+    }
+
     /// The caller's credential as the node it is used on issued it.
     pub fn user_on(&self, node: usize) -> UserAccess {
         UserAccess {
