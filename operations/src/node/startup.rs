@@ -1559,6 +1559,7 @@ pub(crate) async fn apply_restored_reconcile(
     let tombstones = result.metadata_graph_tombstones.clone();
     refresh_usage_targets(context, node_id, &result.targets).await;
     refresh_target_interest(context, &result.targets).await;
+    crate::notifications::email::config_applied(context, &result.targets).await;
     project_restored_events(
         context,
         node_id,

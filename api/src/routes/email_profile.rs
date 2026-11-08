@@ -316,7 +316,7 @@ async fn change_profile(
     .await
     .map_err(map_email_error)?;
     let mail = state.jobs_runtime().mail();
-    refresh_mail(&state.get_ctx(), state.get_realm_id(), &mail).await;
+    refresh_mail(&state.get_ctx(), state.get_realm_id(), Some(&mail)).await;
     Ok(stored)
 }
 

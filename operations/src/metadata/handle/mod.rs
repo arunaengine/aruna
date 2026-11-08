@@ -288,6 +288,7 @@ struct MetadataInner {
     deferred_persist_running: AtomicBool,
     profile_validation_disabled: bool,
     realm_vault_key: Option<Arc<aruna_core::realm_vault::RealmVaultKey>>,
+    mail: std::sync::OnceLock<Arc<crate::notifications::email::MailProfiles>>,
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
     peer_contacts: PeerContacts,
     sync_pulls: crate::metadata::device_pull::PullRegistry,
@@ -566,6 +567,7 @@ impl MetadataHandle {
                 deferred_persist_running: AtomicBool::new(false),
                 profile_validation_disabled: metadata_options.profile_validation_disabled,
                 realm_vault_key: metadata_options.realm_vault_key,
+                mail: std::sync::OnceLock::new(),
                 profile_shacl,
                 peer_contacts: PeerContacts::default(),
                 sync_pulls: Default::default(),
@@ -704,6 +706,15 @@ impl MetadataHandle {
     /// The realm vault key; only management nodes hold one.
     pub fn realm_vault_key(&self) -> Option<Arc<aruna_core::realm_vault::RealmVaultKey>> {
         self.inner.realm_vault_key.clone()
+    }
+
+    /// Shares the job runtime's mail senders, so every applied realm config change refreshes them.
+    pub fn share_mail(&self, mail: Arc<crate::notifications::email::MailProfiles>) {
+        let _ = self.inner.mail.set(mail);
+    }
+
+    pub fn mail(&self) -> Option<Arc<crate::notifications::email::MailProfiles>> {
+        self.inner.mail.get().cloned()
     }
 
     pub(crate) fn profile_validation_available(&self) -> bool {

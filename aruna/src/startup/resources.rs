@@ -424,6 +424,7 @@ async fn fill(
         Some(net_handle.document_sync_database()),
         metadata_options,
     )?;
+    metadata_handle.share_mail(acquired.jobs_runtime.mail());
     acquired.metadata_handle = Some(metadata_handle.clone());
     checkpoint(StartupStage::Metadata)?;
     stopped(stop)?;
@@ -504,7 +505,8 @@ async fn fill(
     record_restart_locks(driver_ctx.as_ref(), config).await?;
     // Cached realm secrets the config no longer names go before any email job runs.
     let mail = acquired.jobs_runtime.mail();
-    aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id, &mail).await;
+    aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id, Some(&mail))
+        .await;
     // Recovery that weakened while the node was down, or later through role changes, is told.
     let origin = (config.realm_id, config.node_id);
     aruna_operations::s3::bucket::key_recovery::spawn_recovery_sweep(

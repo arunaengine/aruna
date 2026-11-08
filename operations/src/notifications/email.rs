@@ -10,6 +10,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -231,9 +232,22 @@ impl Default for MailProfiles {
     }
 }
 
+/// The hook every sync result handler runs after applying `targets`: inbound, outbound and
+/// restored. A realm config change refreshes the senders this node's metadata handle shares.
+pub async fn config_applied(context: &DriverContext, targets: &[DocumentTarget]) {
+    let Some(realm_id) = targets.iter().find_map(|target| match target {
+        DocumentTarget::RealmConfig { realm_id } => Some(*realm_id),
+        _ => None,
+    }) else {
+        return;
+    };
+    let mail = (context.metadata_handle.as_ref()).and_then(|metadata| metadata.mail());
+    refresh_mail(context, realm_id, mail.as_deref()).await;
+}
+
 /// Runs when the realm config changes: drops cached senders and passwords it no longer names.
 /// A config read error keeps both.
-pub async fn refresh_mail(context: &DriverContext, realm_id: RealmId, mail: &MailProfiles) {
+pub async fn refresh_mail(context: &DriverContext, realm_id: RealmId, mail: Option<&MailProfiles>) {
     let config = match drive(GetConfigOperation::new(realm_id), context).await {
         Ok(config) => config,
         Err(error) => {
@@ -241,7 +255,9 @@ pub async fn refresh_mail(context: &DriverContext, realm_id: RealmId, mail: &Mai
             return;
         }
     };
-    mail.refresh(config.email.as_ref());
+    if let Some(mail) = mail {
+        mail.refresh(config.email.as_ref());
+    }
     if let Err(error) = prune_secret_cache(context, &config).await {
         warn!(error = %error, "Pruning cached realm secrets failed");
     }

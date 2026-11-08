@@ -366,14 +366,14 @@ async fn refresh_drops_stale() {
         from: current.from.clone(),
     };
     mail.build(current.revision, &settings).unwrap();
-    refresh_mail(&context, user().realm_id, &mail).await;
+    refresh_mail(&context, user().realm_id, Some(&mail)).await;
     assert!(
         mail.cached(current.revision).is_some(),
         "the current profile stays"
     );
 
     seed_profile(&context, None).await;
-    refresh_mail(&context, user().realm_id, &mail).await;
+    refresh_mail(&context, user().realm_id, Some(&mail)).await;
     assert!(mail.cached(current.revision).is_none());
     let row = VaultEntry::new(VaultPurpose::RealmSecret, Ulid::from_parts(3, 3));
     let event = context
@@ -464,4 +464,30 @@ async fn replacement_keeps_job() {
         .expect("a replaced opt-in does not conflict");
     let again = find_dedup_plan(storage, user(), &key, None).await.unwrap();
     assert_eq!(again, first);
+}
+
+#[tokio::test]
+async fn restore_prunes_password() {
+    // A deletion that arrives through restart recovery clears the cached password too.
+    use aruna_core::document::{DocumentNetEvent, DocumentTarget};
+    let staging = setup_driver_context().await;
+    let context = Arc::new(staging.driver_context.clone());
+    seed_profile(&context, Some(profile(1, true))).await;
+    seed_profile(&context, None).await;
+    let applied = DocumentNetEvent::DocumentsReconciled {
+        applied: 1,
+        targets: vec![DocumentTarget::RealmConfig {
+            realm_id: user().realm_id,
+        }],
+        metadata_create_events: Vec::new(),
+        metadata_graph_tombstones: Vec::new(),
+    };
+    assert!(crate::node::startup::apply_restored_reconcile(&context, node(), applied).await);
+    let row = VaultEntry::new(VaultPurpose::RealmSecret, Ulid::from_parts(3, 3));
+    let event = context
+        .storage_handle
+        .send_effect(read_secret(row, None))
+        .await;
+    let cached = parse_secret(event, row, |bytes| Ok(bytes.to_vec())).unwrap();
+    assert!(cached.is_none(), "the deleted password is no longer cached");
 }
