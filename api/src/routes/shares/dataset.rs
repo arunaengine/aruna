@@ -377,7 +377,7 @@ pub async fn list_part(
     headers: HeaderMap,
     Query(query): Query<PartQuery>,
 ) -> ServerResult<Json<VisitListing>> {
-    let (link, _) = visited_link(&state, &headers).await?;
+    let (link, visit_end) = visited_link(&state, &headers).await?;
     let part = named_part(&state, &link, &query.part).await?;
     if !part.folder {
         return Err(ServerError::BadRequestReason(
@@ -396,7 +396,8 @@ pub async fn list_part(
     };
     let covers = |key: &str| key.starts_with(&part.key);
     let scope = (bucket.as_str(), &info, &auth);
-    let listing = list_below(&state, scope, &part.key, list, link.expires_at, covers).await?;
+    let visit = (&link, visit_end);
+    let listing = list_below(&state, scope, &part.key, list, visit, covers).await?;
     Ok(Json(listing))
 }
 

@@ -41,6 +41,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use super::relay::{ShareRelay, share_access};
 use super::{ShareModeBody, log_event, rfc3339, unix_now};
 use crate::auth::ensure_permission_with;
 use crate::download::{self, AdmissionError};
@@ -48,9 +49,9 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::forwarded::client_ip;
 use crate::rate_limit::LocalKey;
 use crate::routes::storage::deletion::bucket_info;
-use crate::routes::storage::objects::object_page;
+use crate::routes::storage::objects::page_error;
 use crate::server::state::ServerState;
-use aruna_operations::s3::object::pages::ListRequest;
+use aruna_operations::s3::object::pages::{self, ListRequest, PageError, PageScope};
 
 /// Entries per listing page when the visitor names no limit.
 const PAGE: usize = 100;
@@ -181,6 +182,15 @@ pub(crate) fn visit_error(error: ShareError) -> ServerError {
         ShareError::Rule(error) => ServerError::BadRequestReason(error.to_string()),
         error => ServerError::InternalError(error.to_string()),
     }
+}
+
+/// The answer while the member holding part of a distributed bucket cannot be reached.
+pub(crate) fn range_unavailable(action: &str) -> ServerError {
+    ServerError::Refused(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "range_unavailable",
+        format!("part of this folder {action} right now; try again later"),
+    )
 }
 
 /// The one answer for unknown, expired, revoked and mistyped links.
@@ -440,24 +450,26 @@ pub async fn list_files(
     headers: HeaderMap,
     Query(query): Query<VisitListQuery>,
 ) -> ServerResult<Json<VisitListing>> {
-    let (link, _) = visited_link(&state, &headers).await?;
+    let (link, visit_end) = visited_link(&state, &headers).await?;
     require_reads(&link)?;
     let (bucket, info, auth) = visit_scope(&state, &link).await?;
     let root = root(&link.target).to_string();
     let covers = |key: &str| link.target.covers(&bucket, key);
     let scope = (bucket.as_str(), &info, &auth);
-    let listing = list_below(&state, scope, &root, query, link.expires_at, covers).await?;
+    let visit = (&link, visit_end);
+    let listing = list_below(&state, scope, &root, query, visit, covers).await?;
     Ok(Json(listing))
 }
 
 /// One folder level below `root` of a bucket as the narrowed creator sees it, names relative
-/// to `root`; only keys `covers` admits show.
+/// to `root`; only keys `covers` admits show. Other members list their ranges of a
+/// distributed bucket for the visit, which ends at `visit_end`.
 pub(crate) async fn list_below(
     state: &ServerState,
     (bucket, info, auth): (&str, &BucketInfo, &AuthContext),
     root: &str,
     query: VisitListQuery,
-    link_expiry: Option<u64>,
+    (link, visit_end): (&ShareLink, u64),
     covers: impl Fn(&str) -> bool,
 ) -> ServerResult<VisitListing> {
     let limit = query.limit.unwrap_or(PAGE);
@@ -475,8 +487,22 @@ pub(crate) async fn list_below(
         limit,
         partial: false,
     };
-    let expiry = link_expiry.unwrap_or(u64::MAX);
-    let page = object_page(state, info, (None, Some((auth, expiry))), request).await?;
+    let relay = ShareRelay {
+        state,
+        user: share_access(state, link, auth, visit_end),
+    };
+    let context = state.get_ctx();
+    let scope = PageScope {
+        context: context.as_ref(),
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        relay: &relay,
+    };
+    let page = pages::object_page(&scope, info, Some((auth, visit_end)), request).await;
+    let page = page.map_err(|error| match error {
+        PageError::Unanswered { .. } => range_unavailable("cannot be listed"),
+        error => page_error(error),
+    })?;
     let relative = |key: &str| key.strip_prefix(root).map(str::to_string);
     Ok(VisitListing {
         files: page

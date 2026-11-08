@@ -39,6 +39,7 @@ use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
 
 mod dataset;
+mod relay;
 mod visit;
 
 /// Bytes of a link password; argon2id hashes any length, this only bounds the request.
@@ -639,6 +640,8 @@ pub(crate) async fn log_event(state: &ServerState, share_id: Ulid, event: ShareE
     }
 }
 
+#[cfg(test)]
+mod members_tests;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
