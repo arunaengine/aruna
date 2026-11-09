@@ -406,14 +406,15 @@ async fn fill(
     let mut metadata_options = MetadataHandleOptions::default()
         .with_search_storage(config.metadata_search_storage)
         .with_sync_policy(config.fjall_persist_policy);
-    // Only holders of the realm signing key derive the realm vault key.
+    // Only holders of the realm signing key derive the realm vault and seal keys.
     if let aruna_core::structs::identity::auth::NodeCapabilities::Management {
         realm_signing_key,
         ..
     } = &config.node_capabilities
     {
         let key = aruna_core::realm_vault::RealmVaultKey::derive(realm_signing_key);
-        metadata_options = metadata_options.with_vault_key(key);
+        let seal_key = aruna_core::realm_vault::RealmSealKey::derive(realm_signing_key);
+        metadata_options = metadata_options.with_vault_key(key).with_seal_key(seal_key);
     }
     let metadata_handle = MetadataHandle::new_with_options(
         &config.metadata_storage_path,

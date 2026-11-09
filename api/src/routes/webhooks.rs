@@ -6,9 +6,7 @@ use std::sync::Arc;
 
 use aruna_core::structs::execution::webhook::{WEBHOOK_EVENT, WebhookSubscription};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::driver::drive;
-use aruna_operations::notifications::placement::holds_inbox;
-use aruna_operations::notifications::webhook::{WebhookAction, WebhookError, WebhookOperation};
+use aruna_operations::notifications::webhook::{self, WebhookError, read_webhook, remove_webhook};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -19,6 +17,7 @@ use utoipa_axum::routes;
 
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::emails::{setting_error, settings_node};
 use crate::server::state::ServerState;
 
 #[derive(OpenApi)]
@@ -56,10 +55,19 @@ pub struct WebhookResponse {
     path = "/system/notifications/webhook",
     tag = "system/notifications",
     summary = "Read the caller's webhook",
-    description = r#"Returns the caller's webhook subscription on this node, without its secret.
+    description = r#"Returns the caller's webhook subscription, without its secret.
 
 **Authentication**: realm bearer token without path restrictions; only the caller's own
-subscription is read."#,
+subscription is read.
+
+**Behavior**
+- The subscription is a replicated realm setting. This node shows the newest confirmed setting
+  it received so far; a node that has not received a recent change yet shows the previous one.
+  Deliveries always decide from most management nodes.
+
+**Errors**
+- 409 on a user device, which keeps no notification settings.
+- 503 when this node cannot read the realm configuration now."#,
     responses(
         (status = 200, description = "The subscription", body = WebhookResponse, example = json!({
             "subscription_id": "01JWEBHK0123456789ABCDEFGH",
@@ -69,7 +77,9 @@ subscription is read."#,
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
-        (status = 404, description = "The caller has no webhook on this node", body = ErrorResponse)
+        (status = 404, description = "The caller has no webhook", body = ErrorResponse),
+        (status = 409, description = "This node is a user device", body = ErrorResponse),
+        (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -78,13 +88,11 @@ pub async fn get_webhook(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<Json<WebhookResponse>> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let outcome = drive(
-        WebhookOperation::new(auth.user_id, WebhookAction::Read),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_error)?;
-    let subscription = outcome.subscription.ok_or(ServerError::NotFound)?;
+    settings_node(&state, &auth).await?;
+    let subscription = read_webhook(&state.get_ctx(), auth.user_id)
+        .await
+        .map_err(map_error)?;
+    let subscription = subscription.ok_or(ServerError::NotFound)?;
     Ok(Json(response(subscription, None)))
 }
 
@@ -108,12 +116,23 @@ the caller.
 - Each delivery is a job of the caller, followed and cancelled with the job routes. A failed
   attempt is retried a bounded number of times; a 4xx answer other than 408 and 429 ends it.
 - The URL is checked against the node's egress rules at delivery, like other outbound requests.
-- Setting a webhook replaces the previous one and its secret; queued deliveries of the old
-  subscription send nothing.
-- The secret is returned only here and is kept in the node vault.
+- The subscription is a replicated realm setting, so it keeps working when the caller's inbox
+  moves to another node. Setting a webhook replaces the previous one and its secret. Each
+  delivery reads the setting from most management nodes when it runs, so queued deliveries
+  use the newest subscription.
+- The secret is returned only here. It is sealed to the realm key, which only management nodes
+  hold.
+- A 200 means most management nodes confirmed the subscription, and it decides every later
+  delivery.
+- A 503 is an unknown outcome: the change may still take effect. A retry or a GET shows the
+  result.
+- The order in which overlapping requests complete does not order them: a DELETE that overlaps
+  a retried PUT can return 204 while that PUT's newer version wins. A DELETE started after the
+  failed PUT completed always wins.
 
 **Errors**
-- 409 when this node does not hold the caller's inbox; set the webhook on the node that does."#,
+- 409 on a user device.
+- 503 when the realm configuration cannot be read now, or too few management nodes answered."#,
     request_body(content = WebhookRequest, example = json!({"url": "https://hooks.example.org/aruna"})),
     responses(
         (status = 200, description = "The new subscription with its secret", body = WebhookResponse, example = json!({
@@ -126,7 +145,8 @@ the caller.
         (status = 400, description = "Not an http or https URL, a URL with credentials, or longer than 2048 bytes", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
-        (status = 409, description = "This node does not hold the caller's inbox", body = ErrorResponse)
+        (status = 409, description = "This node is a user device", body = ErrorResponse),
+        (status = 503, description = "Unknown outcome: the configuration cannot be read or too few management nodes answered; retry or read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -136,21 +156,12 @@ pub async fn set_webhook(
     Json(request): Json<WebhookRequest>,
 ) -> ServerResult<Json<WebhookResponse>> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    if !holds_inbox(&state.get_ctx(), auth.user_id).await {
-        return Err(ServerError::Conflict(
-            "this node does not hold the caller's inbox".to_string(),
-        ));
-    }
-    let outcome = drive(
-        WebhookOperation::new(auth.user_id, WebhookAction::Set { url: request.url }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_error)?;
-    let subscription = outcome
-        .subscription
-        .ok_or_else(|| ServerError::InternalError("webhook was not stored".to_string()))?;
-    Ok(Json(response(subscription, outcome.secret)))
+    settings_node(&state, &auth).await?;
+    let ctx = state.get_ctx();
+    let outcome = webhook::set_webhook(&ctx, state.get_node_id(), auth.user_id, request.url)
+        .await
+        .map_err(map_error)?;
+    Ok(Json(response(outcome.subscription, Some(outcome.secret))))
 }
 
 #[utoipa::path(
@@ -158,16 +169,25 @@ pub async fn set_webhook(
     path = "/system/notifications/webhook",
     tag = "system/notifications",
     summary = "Remove the caller's webhook",
-    description = r#"Removes the caller's webhook subscription and its secret from this node.
+    description = r#"Turns the caller's webhook off.
 
 **Authentication**: realm bearer token without path restrictions.
 
 **Behavior**
-- Queued deliveries send nothing afterwards. Removing a missing webhook succeeds too."#,
+- A 204 means most management nodes confirmed the change; queued deliveries send nothing
+  afterwards. Removing a missing webhook succeeds too.
+- A 503 is an unknown outcome: the change may still take effect. A retry or a GET shows the
+  result.
+
+**Errors**
+- 409 on a user device.
+- 503 when the realm configuration cannot be read now, or too few management nodes answered."#,
     responses(
-        (status = 204, description = "No webhook is left on this node"),
+        (status = 204, description = "Most management nodes confirmed that the webhook is off"),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "A path-restricted token", body = ErrorResponse)
+        (status = 403, description = "A path-restricted token", body = ErrorResponse),
+        (status = 409, description = "This node is a user device", body = ErrorResponse),
+        (status = 503, description = "Unknown outcome: the configuration cannot be read or too few management nodes answered; retry or read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -176,19 +196,17 @@ pub async fn delete_webhook(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    drive(
-        WebhookOperation::new(auth.user_id, WebhookAction::Remove),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_error)?;
+    settings_node(&state, &auth).await?;
+    remove_webhook(&state.get_ctx(), state.get_node_id(), auth.user_id)
+        .await
+        .map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 fn response(subscription: WebhookSubscription, secret: Option<String>) -> WebhookResponse {
     WebhookResponse {
         subscription_id: subscription.subscription_id.to_string(),
-        url: subscription.url,
+        url: subscription.url.unwrap_or_default(),
         event: WEBHOOK_EVENT.to_string(),
         created_at_ms: subscription.created_at_ms,
         secret,
@@ -198,10 +216,8 @@ fn response(subscription: WebhookSubscription, secret: Option<String>) -> Webhoo
 fn map_error(error: WebhookError) -> ServerError {
     match error {
         WebhookError::InvalidUrl => ServerError::BadRequestReason(error.to_string()),
-        WebhookError::Storage(_)
-        | WebhookError::Conversion(_)
-        | WebhookError::NotFinished
-        | WebhookError::UnexpectedEvent { .. } => ServerError::InternalError(error.to_string()),
+        WebhookError::Setting(error) => setting_error(error),
+        WebhookError::Conversion(_) => ServerError::InternalError(error.to_string()),
     }
 }
 

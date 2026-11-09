@@ -6,10 +6,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aruna_core::structs::execution::email::EmailPreference;
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_operations::driver::drive;
-use aruna_operations::notifications::email::{EmailAction, EmailError, EmailOperation};
-use aruna_operations::notifications::placement::holds_inbox;
+use aruna_operations::notifications::email::{self, EmailError, read_email, remove_email};
+use aruna_operations::notifications::settings::SettingError;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -44,7 +44,7 @@ pub struct EmailRequest {
     pub categories: BTreeSet<String>,
 }
 
-/// The opt-in without its address, which stays sealed on the node.
+/// The opt-in without its address, which stays sealed to the realm key.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct EmailResponse {
     pub categories: BTreeSet<String>,
@@ -56,10 +56,19 @@ pub struct EmailResponse {
     path = "/system/notifications/email",
     tag = "system/notifications",
     summary = "Read the caller's email opt-in",
-    description = r#"Returns the notification categories the caller receives by email on this node.
+    description = r#"Returns the notification categories the caller receives by email.
 
 **Authentication**: realm bearer token without path restrictions; only the caller's own opt-in
-is read, and its address is never returned."#,
+is read, and its address is never returned.
+
+**Behavior**
+- The opt-in is a replicated realm setting. This node shows the newest confirmed setting it
+  received so far; a node that has not received a recent change yet shows the previous one.
+  Deliveries always decide from most management nodes.
+
+**Errors**
+- 409 on a user device, which keeps no notification settings.
+- 503 when this node cannot read the realm configuration now."#,
     responses(
         (status = 200, description = "The opt-in", body = EmailResponse, example = json!({
             "categories": ["share.upload"],
@@ -67,7 +76,9 @@ is read, and its address is never returned."#,
         })),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
-        (status = 404, description = "The caller receives no notification emails here", body = ErrorResponse)
+        (status = 404, description = "The caller receives no notification emails", body = ErrorResponse),
+        (status = 409, description = "This node is a user device", body = ErrorResponse),
+        (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -76,12 +87,10 @@ pub async fn get_email(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<Json<EmailResponse>> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let preference = drive(
-        EmailOperation::new(auth.user_id, EmailAction::Read),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_error)?;
+    settings_node(&state, &auth).await?;
+    let preference = read_email(&state.get_ctx(), auth.user_id)
+        .await
+        .map_err(map_error)?;
     Ok(Json(response(preference.ok_or(ServerError::NotFound)?)))
 }
 
@@ -100,14 +109,22 @@ caller.
   notices to someone else's mailbox.
 - Categories are `group.membership`, `share.upload` and `bucket.encryption`. The inbox stays
   authoritative: an email only says that a notice arrived and names no group, path or file.
+- The opt-in is a replicated realm setting, so it keeps working when the caller's inbox moves
+  to another node. The address is sealed to the realm key, which only management nodes hold,
+  and is never returned or logged.
+- A 200 means most management nodes confirmed the opt-in, and it decides every later delivery.
+- A 503 is an unknown outcome: the change may still take effect. A retry or a GET shows the
+  result.
+- The order in which overlapping requests complete does not order them: a DELETE that overlaps
+  a retried PUT can return 204 while that PUT's newer version wins. A DELETE started after the
+  failed PUT completed always wins.
 - Each email is a job of the caller with a bounded number of retries. Its `Message-ID` stays the
-  same across retries, so mail systems can drop repeats.
-- The address is sealed in the node vault and never returned or logged.
-- Setting the opt-in again replaces it; queued emails of the old one are not sent.
+  same across retries, so mail systems can drop repeats. Each job reads the setting from most
+  management nodes when it runs, so a later change applies to queued emails too.
 
 **Errors**
-- 409 when the realm sends no email, or this node does not hold the caller's inbox.
-- 503 when this node cannot read the realm configuration now."#,
+- 409 when the realm sends no email, or on a user device.
+- 503 when the realm configuration cannot be read now, or too few management nodes answered."#,
     request_body(content = EmailRequest, example = json!({
         "address": "ada@example.org",
         "categories": ["share.upload", "group.membership"]
@@ -120,8 +137,8 @@ caller.
         (status = 400, description = "No category, an unknown one, or an address that is not the caller's verified address", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
-        (status = 409, description = "The realm sends no email, or this node does not hold the caller's inbox", body = ErrorResponse),
-        (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
+        (status = 409, description = "The realm sends no email, or this node is a user device", body = ErrorResponse),
+        (status = 503, description = "Unknown outcome: the configuration cannot be read or too few management nodes answered; retry or read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -131,27 +148,18 @@ pub async fn set_email(
     Json(request): Json<EmailRequest>,
 ) -> ServerResult<Json<EmailResponse>> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let config = drive(GetConfigOperation::new(auth.realm_id), &state.get_ctx())
-        .await
-        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
-    if config.email.is_none() {
-        return Err(ServerError::Conflict(
-            "email is not configured in this realm".to_string(),
-        ));
-    }
-    if !holds_inbox(&state.get_ctx(), auth.user_id).await {
-        return Err(ServerError::Conflict(
-            "this node does not hold the caller's inbox".to_string(),
-        ));
-    }
-    let action = EmailAction::OptIn {
-        address: request.address,
-        categories: request.categories,
-    };
-    let preference = drive(EmailOperation::new(auth.user_id, action), &state.get_ctx())
-        .await
-        .map_err(map_error)?
-        .ok_or_else(|| ServerError::InternalError("the opt-in was not stored".to_string()))?;
+    settings_node(&state, &auth).await?;
+    let ctx = state.get_ctx();
+    let local = state.get_node_id();
+    let preference = email::set_email(
+        &ctx,
+        local,
+        auth.user_id,
+        request.address,
+        request.categories,
+    )
+    .await
+    .map_err(map_error)?;
     Ok(Json(response(preference)))
 }
 
@@ -160,16 +168,25 @@ pub async fn set_email(
     path = "/system/notifications/email",
     tag = "system/notifications",
     summary = "Turn off notification emails",
-    description = r#"Removes the caller's email opt-in and its sealed address from this node.
+    description = r#"Turns the caller's notification emails off.
 
 **Authentication**: realm bearer token without path restrictions.
 
 **Behavior**
-- Queued emails are not sent afterwards. Removing a missing opt-in succeeds too."#,
+- A 204 means most management nodes confirmed the change; queued emails are not sent
+  afterwards. Turning off a missing opt-in succeeds too.
+- A 503 is an unknown outcome: the change may still take effect. A retry or a GET shows the
+  result.
+
+**Errors**
+- 409 on a user device.
+- 503 when the realm configuration cannot be read now, or too few management nodes answered."#,
     responses(
-        (status = 204, description = "No opt-in is left on this node"),
+        (status = 204, description = "Most management nodes confirmed that email is off"),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "A path-restricted token", body = ErrorResponse)
+        (status = 403, description = "A path-restricted token", body = ErrorResponse),
+        (status = 409, description = "This node is a user device", body = ErrorResponse),
+        (status = 503, description = "Unknown outcome: the configuration cannot be read or too few management nodes answered; retry or read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -178,13 +195,24 @@ pub async fn delete_email(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    drive(
-        EmailOperation::new(auth.user_id, EmailAction::OptOut),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(map_error)?;
+    settings_node(&state, &auth).await?;
+    remove_email(&state.get_ctx(), state.get_node_id(), auth.user_id)
+        .await
+        .map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// User devices keep no settings; other nodes need a readable realm configuration.
+pub(crate) async fn settings_node(state: &ServerState, auth: &AuthContext) -> ServerResult<()> {
+    if matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
+        return Err(ServerError::Conflict(
+            "user devices keep no notification settings".to_string(),
+        ));
+    }
+    drive(GetConfigOperation::new(auth.realm_id), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
+    Ok(())
 }
 
 fn response(preference: EmailPreference) -> EmailResponse {
@@ -199,10 +227,22 @@ fn map_error(error: EmailError) -> ServerError {
         EmailError::InvalidCategories | EmailError::NotVerified => {
             ServerError::BadRequestReason(error.to_string())
         }
-        EmailError::Storage(_)
-        | EmailError::Conversion(_)
-        | EmailError::NotFinished
-        | EmailError::UnexpectedEvent { .. } => ServerError::InternalError(error.to_string()),
+        EmailError::NotConfigured => ServerError::Conflict(error.to_string()),
+        EmailError::Setting(error) => setting_error(error),
+        EmailError::Storage(_) | EmailError::Conversion(_) => {
+            ServerError::InternalError(error.to_string())
+        }
+    }
+}
+
+pub(crate) fn setting_error(error: SettingError) -> ServerError {
+    match error {
+        SettingError::Config(_) | SettingError::NoQuorum => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
+        SettingError::Build(_) | SettingError::Storage(_) => {
+            ServerError::InternalError(error.to_string())
+        }
     }
 }
 

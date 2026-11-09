@@ -10,8 +10,6 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::{DEFAULT_SHARD_COUNT, PlacementStrategy};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::metadata::api::load_realm_config;
 use crate::placement::{build_view, resolve_holders};
 
 pub const INBOX_TOPIC_DOMAIN: &[u8] = b"aruna-notification-inbox-v1";
@@ -45,17 +43,6 @@ pub fn resolve_inbox_holder(
     Ok(resolve_holders(&view, &inbox_strategy(), &subject, None)
         .into_iter()
         .next())
-}
-
-/// Whether this node holds `user_id`'s inbox, the only node its notifications reach.
-pub async fn holds_inbox(context: &DriverContext, user_id: UserId) -> bool {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return true;
-    };
-    let Some(config) = load_realm_config(context, user_id.realm_id).await else {
-        return false;
-    };
-    resolve_inbox_holder(&user_id, &config).is_ok_and(|holder| holder == Some(net_handle.node_id()))
 }
 
 pub fn filter_local_subscriptions(
