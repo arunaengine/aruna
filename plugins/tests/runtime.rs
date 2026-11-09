@@ -510,3 +510,36 @@ async fn node_admission_bounded() {
     let first = running.await.unwrap();
     assert!(matches!(first, Err(InvokeError::Cancelled)), "{first:?}");
 }
+
+#[tokio::test]
+async fn wasi_calls_bounded() {
+    let random = |len: u64| probe(serde_json::json!({"call": "random", "len": len}));
+    assert_eq!(
+        output(invoke(random(64), Arc::default()).await),
+        serde_json::json!(64)
+    );
+    let large = invoke(random(2 << 20), Arc::default()).await;
+    assert!(
+        matches!(large, Err(InvokeError::Limit(Limit::Bytes))),
+        "per call: {large:?}"
+    );
+    let mut total = random(200);
+    total.limits.bytes = 100;
+    let ended = invoke(total, Arc::default()).await;
+    assert!(
+        matches!(ended, Err(InvokeError::Limit(Limit::Bytes))),
+        "in total: {ended:?}"
+    );
+    let clock = probe(serde_json::json!({"call": "clock"}));
+    assert_eq!(
+        output(invoke(clock.clone(), Arc::default()).await),
+        serde_json::json!(true)
+    );
+    let mut counted = clock;
+    counted.limits.calls = 0;
+    let ended = invoke(counted, Arc::default()).await;
+    assert!(
+        matches!(ended, Err(InvokeError::Limit(Limit::Calls))),
+        "WASI calls count: {ended:?}"
+    );
+}

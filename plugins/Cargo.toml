@@ -12,11 +12,12 @@ rust-version.workspace = true
 
 [features]
 default = ["build", "runtime"]
-# Builds projects with their toolchain and packages the result; the CLI uses it.
-build = ["dep:toml", "dep:wit-component"]
+# Builds projects with their toolchain and packages the result, compiled against the host.
+build = ["runtime", "dep:toml", "dep:wit-component"]
 # The Wasmtime runtime; without it the crate only reads, checks and writes plugin artifacts.
 runtime = [
     "dep:async-trait",
+    "dep:getrandom",
     "dep:lru",
     "dep:tokio",
     "dep:tokio-util",
@@ -27,6 +28,7 @@ runtime = [
 
 [dependencies]
 async-trait = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
 hex = { workspace = true }
 lru = { workspace = true, optional = true }
 serde = { workspace = true }
@@ -48,3 +50,5 @@ wit-component = { workspace = true, optional = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
+wit-component = { workspace = true, features = ["dummy-module"] }
+wit-parser = { workspace = true }

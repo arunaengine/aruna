@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use wasmtime::component::types::ComponentItem;
 use wasmtime::component::{Component, HasSelf, InstancePre, Linker};
-use wasmtime::{Config, Engine, Store, Trap};
+use wasmtime::{CallHook, Config, Engine, Store, Trap};
 
 use crate::artifact::{ArtifactDigest, SectionError, read_manifest};
 use crate::broker::{Broker, CallContext};
@@ -124,6 +124,7 @@ impl Runtime {
         wit::Plugin::add_to_linker::<Session, HasSelf<Session>>(&mut linker, |session| session)
             .map_err(wasm_error)?;
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(wasm_error)?;
+        crate::host::bounded_random(&mut linker).map_err(wasm_error)?;
         let cache = NonZeroUsize::new(config.cache).unwrap_or(NonZeroUsize::MIN);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -285,6 +286,15 @@ impl Runtime {
         let limits = session.limits();
         let mut store = Store::new(&self.inner.engine, session);
         store.limiter(|session| session);
+        let fuel = limits.fuel;
+        store.call_hook(move |mut store, hook| match hook {
+            CallHook::CallingHost => {
+                // A yield happens each time another YIELD_FUEL units are consumed.
+                let yields = fuel.saturating_sub(store.get_fuel()?) / YIELD_FUEL;
+                store.data_mut().count_call(yields)
+            }
+            _ => Ok(()),
+        });
         store.set_hostcall_fuel(limits.call_bytes);
         store.set_max_component_handles(MAX_HANDLES);
         store

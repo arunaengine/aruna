@@ -10,6 +10,10 @@ use std::hint::black_box;
 use aruna_plugin::{Context, Error, Event, Level, Method, Result};
 use serde_json::{Value, json};
 
+mod wasi {
+    wit_bindgen::generate!({ path: "wit", world: "aruna-test:wasi/probe", generate_all });
+}
+
 /// Runs the host call named by the manual input and returns what it answered.
 async fn probe(ctx: Context, event: Event) -> Result<Value> {
     let Event::Manual(input) = event else {
@@ -59,6 +63,11 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
                 .await?;
             json!({ "status": reply.status, "fields": reply.fields })
         }
+        "random" => {
+            let len = input.get("len").and_then(Value::as_u64).unwrap_or_default();
+            json!(wasi::wasi::random::random::get_random_bytes(len).len())
+        }
+        "clock" => json!(wasi::wasi::clocks::monotonic_clock::now() > 0),
         "errors" => {
             let mut failed = 0;
             for _ in 0..1000 {

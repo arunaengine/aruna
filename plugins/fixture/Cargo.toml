@@ -16,4 +16,5 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 aruna-plugin = { workspace = true }
+wit-bindgen = { workspace = true }
 serde_json = { workspace = true }

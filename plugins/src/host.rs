@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use tokio_util::task::TaskTracker;
 use wasmtime::ResourceLimiter;
-use wasmtime::component::ResourceTable;
+use wasmtime::StoreContextMut;
+use wasmtime::component::{Linker, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::broker::{Broker, CallContext, ErrorKind, HostError};
@@ -89,7 +90,8 @@ pub(crate) struct Session {
     writes: TaskTracker,
     limits: Limits,
     ordinal: u32,
-    calls: u32,
+    /// Entries into the host, fuel yields included.
+    calls: u64,
     bytes: u64,
     pending: u32,
     memory: usize,
@@ -141,16 +143,18 @@ impl Session {
         wasmtime::Error::new(Exceeded(limit))
     }
 
-    /// Counts one call moving `size` bytes into the host.
-    pub(crate) fn charge(&mut self, size: usize) -> wasmtime::Result<()> {
+    /// Counts one entry into the host, ours or WASI; the store's call hook runs it. Fuel
+    /// yields enter the host too, so the `yields` so far are not host calls.
+    pub(crate) fn count_call(&mut self, yields: u64) -> wasmtime::Result<()> {
         self.calls += 1;
-        if self.calls > self.limits.calls {
+        if self.calls > u64::from(self.limits.calls).saturating_add(yields) {
             return Err(self.exceed(Limit::Calls));
         }
-        self.receive(size)
+        Ok(())
     }
 
-    fn receive(&mut self, size: usize) -> wasmtime::Result<()> {
+    /// Counts `size` bytes moved through a host call against the per-call and total budgets.
+    pub(crate) fn charge(&mut self, size: usize) -> wasmtime::Result<()> {
         self.bytes += size as u64;
         if size > self.limits.call_bytes || self.bytes > self.limits.bytes {
             return Err(self.exceed(Limit::Bytes));
@@ -184,7 +188,7 @@ impl Session {
                 Needs::Free => String::new(),
             };
             let message = format!("{what} is not granted to this install");
-            self.receive(message.len())?;
+            self.charge(message.len())?;
             return Ok(Err(HostError::new(ErrorKind::NotGranted, message)));
         }
         self.pending += 1;
@@ -210,8 +214,34 @@ impl Session {
 
     pub(crate) fn finish(&mut self, size: usize) -> wasmtime::Result<()> {
         self.pending -= 1;
-        self.receive(size)
+        self.charge(size)
     }
+}
+
+/// WASI random interfaces whose byte calls replace the default ones, so a guest cannot ask the
+/// host for more random bytes than its per-call and total byte budgets allow.
+const RANDOM_BYTES: [(&str, &str); 2] = [
+    ("wasi:random/random@0.2.12", "get-random-bytes"),
+    ("wasi:random/insecure@0.2.12", "get-insecure-random-bytes"),
+];
+
+/// Shadows the WASI random byte calls with versions that charge the run before allocating.
+pub(crate) fn bounded_random(linker: &mut Linker<Session>) -> wasmtime::Result<()> {
+    linker.allow_shadowing(true);
+    for (interface, function) in RANDOM_BYTES {
+        linker.instance(interface)?.func_wrap(
+            function,
+            |mut store: StoreContextMut<'_, Session>, (len,): (u64,)| {
+                let len = usize::try_from(len).unwrap_or(usize::MAX);
+                store.data_mut().charge(len)?;
+                let mut bytes = vec![0u8; len];
+                getrandom::fill(&mut bytes).map_err(|err| wasmtime::Error::msg(err.to_string()))?;
+                Ok((bytes,))
+            },
+        )?;
+    }
+    linker.allow_shadowing(false);
+    Ok(())
 }
 
 /// A WASI context that grants nothing: no preopened directories, no environment or
