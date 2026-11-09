@@ -81,9 +81,7 @@ pub enum SectionError {
     WrongKind(&'static str),
     #[error("the artifact needs exactly one top-level {MANIFEST_SECTION} section")]
     Manifest,
-    #[error(
-        "the module needs exactly one {HANDLERS_SECTION} section; call `aruna_plugin::export!`"
-    )]
+    #[error("the module has more than one {HANDLERS_SECTION} section")]
     Handlers,
     #[error("the module lists a handler name that is not valid UTF-8 or is empty")]
     HandlerName,
@@ -116,8 +114,9 @@ pub fn attach_manifest(component: &[u8], manifest: &Manifest) -> Result<Vec<u8>,
     Ok(out)
 }
 
-/// The handler names the SDK recorded in a core module, before it becomes a component.
-pub fn read_handlers(module: &[u8]) -> Result<BTreeSet<String>, SectionError> {
+/// The handler names a toolchain recorded in a core module, such as the Rust SDK's `export!`;
+/// `None` when the module lists none.
+pub fn read_handlers(module: &[u8]) -> Result<Option<BTreeSet<String>>, SectionError> {
     if !Parser::is_core_wasm(module) {
         return Err(SectionError::WrongKind("module"));
     }
@@ -131,13 +130,26 @@ pub fn read_handlers(module: &[u8]) -> Result<BTreeSet<String>, SectionError> {
             return Err(SectionError::Handlers);
         }
     }
-    let text = std::str::from_utf8(found.ok_or(SectionError::Handlers)?)
-        .map_err(|_| SectionError::HandlerName)?;
+    let Some(data) = found else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(data).map_err(|_| SectionError::HandlerName)?;
     let names: BTreeSet<String> = text.split('\n').map(str::to_string).collect();
     if names.iter().any(String::is_empty) {
         return Err(SectionError::HandlerName);
     }
-    Ok(names)
+    Ok(Some(names))
+}
+
+/// Checks a finished artifact from any toolchain without compiling it: a valid component
+/// with a wired manifest that imports only interfaces the host provides.
+pub fn check_artifact(bytes: &[u8]) -> Result<Manifest, SectionError> {
+    let mut validator = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
+    (validator.validate_all(bytes)).map_err(|err| SectionError::Parse(err.to_string()))?;
+    let manifest = read_manifest(bytes)?;
+    let imports = component_imports(bytes)?;
+    manifest.check_imports(imports.iter().map(String::as_str))?;
+    Ok(manifest)
 }
 
 /// Names of the top-level instance imports of a component, such as `aruna:plugin/log@0.2.0`.
@@ -240,7 +252,7 @@ mod tests {
     #[test]
     fn handler_names() {
         let module = module_with(&[(HANDLERS_SECTION, b"dataset_created\nresync")]).finish();
-        let names = read_handlers(&module).unwrap();
+        let names = read_handlers(&module).unwrap().unwrap();
         assert_eq!(
             names.into_iter().collect::<Vec<_>>(),
             ["dataset_created", "resync"]
@@ -252,10 +264,15 @@ mod tests {
         ));
         let twice = module_with(&[(HANDLERS_SECTION, b"a"), (HANDLERS_SECTION, b"b")]).finish();
         assert!(matches!(read_handlers(&twice), Err(SectionError::Handlers)));
-        assert!(matches!(
-            read_handlers(&module_with(&[]).finish()),
-            Err(SectionError::Handlers)
-        ));
+        assert_eq!(read_handlers(&module_with(&[]).finish()).unwrap(), None);
+    }
+
+    #[test]
+    fn checks_artifacts() {
+        let fixture = include_bytes!("../tests/fixture.wasm");
+        assert_eq!(check_artifact(fixture).unwrap().name, "fixture");
+        assert!(check_artifact(&fixture[..fixture.len() / 2]).is_err());
+        assert!(check_artifact(b"not wasm").is_err());
     }
 
     #[test]

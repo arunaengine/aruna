@@ -101,9 +101,22 @@ pub struct Manifest {
     pub triggers: BTreeMap<TriggerKind, Trigger>,
     #[serde(default)]
     pub permissions: Requests,
-    /// Handler functions the code exports; set by `build`.
+    /// Handler names the triggers call through the `handle` export; set by `build`.
     #[serde(default)]
     pub handlers: BTreeSet<String>,
+    /// How the project's own toolchain builds it; never part of a published artifact.
+    #[serde(default, skip_serializing)]
+    pub build: Option<BuildStep>,
+}
+
+/// A language toolchain step that writes a core module or a component.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildStep {
+    /// The program and its arguments, run in the project folder without a shell.
+    pub command: Vec<String>,
+    /// The module or component the command writes, relative to the project folder.
+    pub output: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -140,8 +153,6 @@ pub enum ManifestError {
     UnknownHandler(String),
     #[error("handler `{0}` is exported but no trigger calls it")]
     UnusedHandler(String),
-    #[error("the code imports `{0}`, which the manifest does not request")]
-    UndeclaredImport(String),
     #[error("the code imports `{0}`, which the plugin host does not provide")]
     UnknownImport(String),
 }
@@ -207,19 +218,24 @@ impl Manifest {
         self.check_permissions()
     }
 
-    /// Resolves every trigger's handler against the exported `handlers` and marks the result
-    /// as built for this host. Fails on a missing, unknown or unused handler.
-    pub fn wire(&mut self, handlers: BTreeSet<String>) -> Result<(), ManifestError> {
-        self.handlers = handlers;
-        let only = match self.handlers.len() {
-            1 => self.handlers.first().cloned(),
-            _ => None,
-        };
+    /// Resolves each trigger's handler (default: the trigger's own name), records the handler
+    /// names and marks the manifest as built for this host. Toolchains that list their handlers
+    /// pass them as `declared`, which must then match exactly.
+    pub fn wire(&mut self, declared: Option<BTreeSet<String>>) -> Result<(), ManifestError> {
         for (kind, trigger) in &mut self.triggers {
-            if trigger.handler.is_none() {
-                let named = self.handlers.contains(kind.as_str());
-                let handler = named.then(|| kind.as_str().to_string()).or(only.clone());
-                trigger.handler = Some(handler.ok_or(ManifestError::NoHandler(*kind))?);
+            trigger
+                .handler
+                .get_or_insert_with(|| kind.as_str().to_string());
+        }
+        self.handlers = (self.triggers.values())
+            .filter_map(|t| t.handler.clone())
+            .collect();
+        if let Some(declared) = declared {
+            if let Some(unknown) = self.handlers.difference(&declared).next() {
+                return Err(ManifestError::UnknownHandler(unknown.clone()));
+            }
+            if let Some(unused) = declared.difference(&self.handlers).next() {
+                return Err(ManifestError::UnusedHandler(unused.clone()));
             }
         }
         self.abi = Some(PLUGIN_ABI.to_string());
@@ -227,7 +243,8 @@ impl Manifest {
         self.check_wiring()
     }
 
-    /// Checks that the code imports only host interfaces this manifest requests.
+    /// Checks that the code imports only interfaces the host provides. Grants are checked per
+    /// call, because some toolchains import every interface of the world whether used or not.
     pub fn check_imports<'a>(
         &self,
         imports: impl IntoIterator<Item = &'a str>,
@@ -239,15 +256,8 @@ impl Manifest {
                 .and_then(|rest| rest.strip_prefix('/'))
                 .and_then(|rest| rest.strip_suffix(version))
                 .and_then(|rest| rest.strip_suffix('@'));
-            let needed = interface.and_then(Import::of);
-            let allowed = match needed {
-                None => return Err(ManifestError::UnknownImport(import.to_string())),
-                Some(Import::Free) => true,
-                Some(Import::Needs(permission)) => self.requested().contains(&permission),
-                Some(Import::Connections) => !self.connections.is_empty(),
-            };
-            if !allowed {
-                return Err(ManifestError::UndeclaredImport(import.to_string()));
+            if interface.and_then(Import::of).is_none() && !closed_wasi(import) {
+                return Err(ManifestError::UnknownImport(import.to_string()));
             }
         }
         Ok(())
@@ -381,6 +391,26 @@ fn check_setting(setting: &Setting) -> Result<(), &'static str> {
         return Err("the default does not fit the type");
     }
     Ok(())
+}
+
+/// WASI 0.2 interfaces the host links with nothing granted: no files, environment, arguments
+/// or network. HTTP is not among them; plugins reach outside services through connections.
+fn closed_wasi(import: &str) -> bool {
+    let packages = [
+        "wasi:io",
+        "wasi:clocks",
+        "wasi:random",
+        "wasi:cli",
+        "wasi:filesystem",
+        "wasi:sockets",
+    ];
+    let Some((package, rest)) = import.split_once('/') else {
+        return false;
+    };
+    packages.contains(&package)
+        && rest
+            .split_once('@')
+            .is_some_and(|(_, v)| v.starts_with("0.2."))
 }
 
 /// Whether `value` is an https origin with an optional path, as a url setting must be.

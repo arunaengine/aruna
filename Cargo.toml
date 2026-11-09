@@ -269,7 +269,13 @@ utoipa-swagger-ui = { version = "10.0.1", features = ["axum"] }
 wasm-bindgen = "=0.2.127"
 # Plugin runtime: wit-bindgen 0.61 and wasm-tools 0.258 match the component async ABI of wasmtime 49.
 wasm-encoder = "0.258.3"
-wasmparser = { version = "0.258.3", default-features = false, features = ["component-model", "std"] }
+wasmparser = { version = "0.258.3", default-features = false, features = [
+    "component-model",
+    "features",
+    "simd",
+    "std",
+    "validate",
+] }
 wasmtime = { version = "49.0.5", default-features = false, features = [
     "async",
     "component-model",

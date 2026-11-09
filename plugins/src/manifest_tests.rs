@@ -42,7 +42,7 @@ fn handlers(names: &[&str]) -> BTreeSet<String> {
 fn example_wires() {
     let mut manifest = example();
     assert_eq!(manifest.check(), Ok(()));
-    manifest.wire(handlers(&["dataset_created"])).unwrap();
+    manifest.wire(Some(handlers(&["dataset_created"]))).unwrap();
     assert_eq!(manifest.abi.as_deref(), Some(PLUGIN_ABI));
     let created = &manifest.triggers[&TriggerKind::DatasetCreated];
     assert_eq!(created.handler.as_deref(), Some("dataset_created"));
@@ -52,21 +52,25 @@ fn example_wires() {
 
 #[test]
 fn wiring_defaults() {
-    let mut only = example();
-    only.triggers.get_mut(&TriggerKind::Manual).unwrap().handler = None;
-    only.wire(handlers(&["announce"])).unwrap();
-    let manual = &only.triggers[&TriggerKind::Manual];
-    assert_eq!(manual.handler.as_deref(), Some("announce"));
+    let mut named = example();
+    named.wire(None).unwrap();
+    let created = &named.triggers[&TriggerKind::DatasetCreated];
+    assert_eq!(
+        created.handler.as_deref(),
+        Some("dataset_created"),
+        "the trigger's own name"
+    );
+    assert_eq!(named.handlers, handlers(&["dataset_created"]));
 
     let mut missing = example();
-    let result = missing.wire(handlers(&["announce", "resync"]));
+    let result = missing.wire(Some(handlers(&["announce"])));
     assert_eq!(
         result,
-        Err(ManifestError::NoHandler(TriggerKind::DatasetCreated))
+        Err(ManifestError::UnknownHandler("dataset_created".into()))
     );
 
     let mut unused = example();
-    let result = unused.wire(handlers(&["dataset_created", "resync"]));
+    let result = unused.wire(Some(handlers(&["dataset_created", "resync"])));
     assert_eq!(result, Err(ManifestError::UnusedHandler("resync".into())));
 
     let mut unknown = example();
@@ -75,7 +79,7 @@ fn wiring_defaults() {
         .get_mut(&TriggerKind::Manual)
         .unwrap()
         .handler = Some("resync".into());
-    let result = unknown.wire(handlers(&["dataset_created"]));
+    let result = unknown.wire(Some(handlers(&["dataset_created"])));
     assert_eq!(result, Err(ManifestError::UnknownHandler("resync".into())));
 }
 
@@ -239,40 +243,39 @@ fn checks_settings() {
 fn import_rule() {
     let manifest = example();
     let import = |name: &str| format!("aruna:plugin/{name}@0.2.0");
-    let allowed = [
+    let mut allowed = [
         "types",
         "log",
         "metadata-read",
-        "metadata-write",
+        "objects-read",
         "connections",
     ]
-    .map(import);
+    .map(import)
+    .to_vec();
+    allowed.extend(
+        [
+            "wasi:cli/environment@0.2.9",
+            "wasi:sockets/tcp@0.2.0",
+            "wasi:io/streams@0.2.3",
+        ]
+        .map(String::from),
+    );
     assert_eq!(
         manifest.check_imports(allowed.iter().map(String::as_str)),
         Ok(())
     );
-    let objects = import("objects-read");
-    assert_eq!(
-        manifest.check_imports([objects.as_str()]),
-        Err(ManifestError::UndeclaredImport(objects.clone()))
-    );
     for name in [
-        "wasi:cli/environment@0.2.0",
+        "wasi:http/outgoing-handler@0.2.9",
+        "wasi:cli/environment@0.3.0",
         "aruna:plugin/log@0.1.0",
         "aruna:plugin/files@0.2.0",
+        "invocation",
     ] {
         assert_eq!(
             manifest.check_imports([name]),
             Err(ManifestError::UnknownImport(name.into()))
         );
     }
-    let mut offline = example();
-    offline.connections.clear();
-    let connections = import("connections");
-    assert_eq!(
-        offline.check_imports([connections.as_str()]),
-        Err(ManifestError::UndeclaredImport(connections.clone()))
-    );
 }
 
 #[test]
