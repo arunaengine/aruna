@@ -1,5 +1,5 @@
-//! Tests the verified-address opt-in, email jobs that decide from a quorum read, the realm
-//! profile and the deduplication of queued emails.
+//! Tests the verified-address opt-in as a register write, email jobs that decide from this
+//! node's setting, the realm profile and the deduplication of queued emails.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,8 +8,7 @@ use crate::jobs::executor::ProgressReporter;
 use crate::jobs::store::find_dedup_plan;
 use crate::jobs::submit::mint_job_id;
 use crate::node_vault::{parse_secret, read_secret, write_secret};
-use crate::notifications::settings::SettingAnswer;
-use crate::tests::notifications::{CannedPeers, managers};
+use crate::tests::notifications::{CannedPeers, managers, opening, store_setting};
 use crate::tests::staging::setup_driver_context;
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::structs::execution::job::{JobErrorKind, JobProgress};
@@ -18,13 +17,19 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use ed25519_dalek::SigningKey;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 
 const ADDRESS: &str = "ada@example.org";
 
+/// A user of a realm whose id is a realm key, so addresses can be sealed to it.
 fn user() -> UserId {
-    UserId::local(Ulid::from_parts(1, 1), RealmId::from_bytes([1; 32]))
+    let realm_key = SigningKey::from_bytes(&[5; 32]).verifying_key();
+    UserId::local(
+        Ulid::from_parts(1, 1),
+        RealmId::from_bytes(realm_key.to_bytes()),
+    )
 }
 
 fn node() -> NodeId {
@@ -198,37 +203,33 @@ fn job_context(context: DriverContext, mail: Arc<MailProfiles>) -> JobContext {
     }
 }
 
-/// Answers from every manager with an opt-in for `categories`; no category turns email off.
-fn answering(categories: &[&str]) -> CannedPeers {
-    let (sealed, secret) = match categories.is_empty() {
-        false => (
-            Some(vec![1]),
-            Some(SecretBytes::new(ADDRESS.as_bytes().to_vec())),
-        ),
-        true => (None, None),
-    };
+/// Stores an email setting of `user()` with `counter`, as a local write or sync would; no
+/// category turns email off.
+async fn seed_setting(context: &DriverContext, counter: u64, categories: &[&str]) {
+    let id = Ulid::generate();
+    let on = !categories.is_empty();
     let preference = EmailPreference {
-        preference_id: Ulid::from_parts(2, 2),
+        preference_id: id,
         user_id: user(),
-        version: 1,
-        categories: (categories.iter())
+        stamp: RegisterStamp {
+            counter,
+            node_id: node(),
+            write_id: id,
+        },
+        categories: categories
+            .iter()
             .map(|category| category.to_string())
             .collect(),
-        sealed,
+        sealed: on.then(|| vec![1]),
         created_at_ms: 1,
     };
-    let answer = SettingAnswer {
-        max_version: 1,
-        winner: Some(SettingWinner {
-            bytes: preference.to_bytes().unwrap(),
-            secret,
-        }),
-    };
-    let answers = managers().map(|manager| (manager, answer.clone())).into();
-    CannedPeers {
-        answers,
-        ..Default::default()
-    }
+    let target = SettingChannel::Email.target(user(), id);
+    store_setting(
+        &context.storage_handle,
+        &target,
+        preference.to_bytes().unwrap(),
+    )
+    .await;
 }
 
 fn spec() -> EmailDeliverySpec {
@@ -271,23 +272,31 @@ async fn requires_verified_address() {
     assert_eq!(unknown, Err(EmailError::InvalidCategories));
     let empty = set(&[], ADDRESS).await;
     assert_eq!(empty, Err(EmailError::InvalidCategories));
-    // Without reachable managers a valid opt-in has an unknown outcome.
-    let unreachable = set(&["share.upload"], ADDRESS).await;
-    assert_eq!(
-        unreachable,
-        Err(EmailError::Setting(SettingError::NoQuorum))
+
+    // A valid opt-in is one local register write, without any management node.
+    let stored = set(&["share.upload"], ADDRESS).await.unwrap();
+    assert_eq!((stored.stamp.counter, stored.stamp.node_id), (1, node()));
+    let sealed = stored.sealed.clone().unwrap();
+    assert!(
+        !sealed
+            .windows(ADDRESS.len())
+            .any(|part| part == ADDRESS.as_bytes())
     );
+    assert_eq!(read_email(context, user()).await.unwrap(), Some(stored));
+    remove_email(context, node(), user()).await.unwrap();
+    assert_eq!(read_email(context, user()).await.unwrap(), None);
 }
 
 #[tokio::test]
-async fn on_answer_sends() {
+async fn on_setting_sends() {
     let staging = setup_driver_context().await;
     let context = staging.driver_context.clone();
     let sender = Arc::new(FakeSender::default());
     let (mail, built) = fake_mail(sender.clone());
     let ctx = job_context(context.clone(), mail);
     seed_profile(&context, Some(profile(1, true))).await;
-    let peers = answering(&["share.upload"]);
+    seed_setting(&context, 1, &["share.upload"]).await;
+    let peers = opening(ADDRESS.as_bytes());
     let backoffs = Backoffs::default();
     let spec = spec();
     let run = || deliver_email(&ctx, &spec, &peers, &backoffs, NOW_MS);
@@ -298,9 +307,9 @@ async fn on_answer_sends() {
         JobRunOutcome::Succeeded(JobResultPayload::Email { sent: true })
     ));
     assert_eq!(
-        peers.reads.load(Ordering::SeqCst),
-        2,
-        "a quorum of three is two"
+        peers.opens.load(Ordering::SeqCst),
+        1,
+        "one manager opens the address"
     );
     let mail = sender.sent.lock().unwrap()[0].clone();
     assert_eq!(
@@ -339,36 +348,27 @@ async fn on_answer_sends() {
 }
 
 #[tokio::test]
-async fn off_answer_skips() {
+async fn off_setting_skips() {
     let staging = setup_driver_context().await;
     let context = staging.driver_context.clone();
     let sender = Arc::new(FakeSender::default());
     let (mail, _) = fake_mail(sender.clone());
     let ctx = job_context(context.clone(), mail);
     seed_profile(&context, Some(profile(1, false))).await;
-    for peers in [
-        answering(&[]),
-        CannedPeers {
-            answers: managers()
-                .map(|manager| {
-                    (
-                        manager,
-                        SettingAnswer {
-                            max_version: 0,
-                            winner: None,
-                        },
-                    )
-                })
-                .into(),
-            ..Default::default()
-        },
-    ] {
-        let result = deliver_email(&ctx, &spec(), &peers, &Backoffs::default(), NOW_MS).await;
-        assert!(matches!(
-            result,
+    let peers = opening(ADDRESS.as_bytes());
+    let unsent = |outcome| {
+        matches!(
+            outcome,
             JobRunOutcome::Succeeded(JobResultPayload::Email { sent: false })
-        ));
-    }
+        )
+    };
+    let none = deliver_email(&ctx, &spec(), &peers, &Backoffs::default(), NOW_MS).await;
+    assert!(unsent(none), "no setting means off");
+    seed_setting(&context, 1, &["share.upload"]).await;
+    seed_setting(&context, 2, &[]).await;
+    let off = deliver_email(&ctx, &spec(), &peers, &Backoffs::default(), NOW_MS).await;
+    assert!(unsent(off), "the newer opt-out decides");
+    assert_eq!(peers.opens.load(Ordering::SeqCst), 0);
     assert!(sender.sent.lock().unwrap().is_empty());
 }
 
@@ -380,7 +380,8 @@ async fn category_excluded_skips() {
     let (mail, _) = fake_mail(sender.clone());
     let ctx = job_context(context.clone(), mail);
     seed_profile(&context, Some(profile(1, false))).await;
-    let peers = answering(&["group.membership"]);
+    seed_setting(&context, 1, &["group.membership"]).await;
+    let peers = opening(ADDRESS.as_bytes());
     let result = deliver_email(&ctx, &spec(), &peers, &Backoffs::default(), NOW_MS).await;
     assert!(matches!(
         result,
@@ -396,7 +397,8 @@ async fn expired_notice_finishes() {
     let (mail, _) = fake_mail(Arc::new(FakeSender::default()));
     let ctx = job_context(context.clone(), mail);
     seed_profile(&context, Some(profile(1, false))).await;
-    let peers = answering(&["share.upload"]);
+    seed_setting(&context, 1, &["share.upload"]).await;
+    let peers = opening(ADDRESS.as_bytes());
     let expired = spec().notification.expires_at_ms();
     let result = deliver_email(&ctx, &spec(), &peers, &Backoffs::default(), expired).await;
     assert!(matches!(
@@ -404,21 +406,24 @@ async fn expired_notice_finishes() {
         JobRunOutcome::Succeeded(JobResultPayload::Email { sent: false })
     ));
     assert_eq!(
-        peers.reads.load(Ordering::SeqCst),
+        peers.opens.load(Ordering::SeqCst),
         0,
-        "an expired notice reads nothing"
+        "an expired notice opens nothing"
     );
 }
 
 #[tokio::test]
-async fn short_quorum_defers() {
-    // One answer of three, or no readable realm config, waits without spending an attempt.
+async fn no_manager_defers() {
+    // No readable realm config, or no management node that opens the address, waits without
+    // spending an attempt.
     let staging = setup_driver_context().await;
     let context = staging.driver_context.clone();
     let (mail, built) = fake_mail(Arc::new(FakeSender::default()));
     let ctx = job_context(context.clone(), mail);
+    seed_setting(&context, 1, &["share.upload"]).await;
     let backoffs = Backoffs::default();
-    let unreadable = deliver_email(&ctx, &spec(), &CannedPeers::default(), &backoffs, NOW_MS).await;
+    let peers = CannedPeers::default();
+    let unreadable = deliver_email(&ctx, &spec(), &peers, &backoffs, NOW_MS).await;
     let JobRunOutcome::DeferredFor(error, delay) = unreadable else {
         panic!("an unreadable config defers");
     };
@@ -428,8 +433,6 @@ async fn short_quorum_defers() {
     );
 
     seed_profile(&context, Some(profile(1, false))).await;
-    let mut peers = answering(&["share.upload"]);
-    peers.answers.retain(|node, _| *node == managers()[0]);
     let waiting = deliver_email(&ctx, &spec(), &peers, &backoffs, NOW_MS + 10_000).await;
     let JobRunOutcome::DeferredFor(_, delay) = waiting else {
         panic!("a running backoff defers");
@@ -440,15 +443,20 @@ async fn short_quorum_defers() {
         "the backoff runs to its end"
     );
     assert_eq!(
-        peers.reads.load(Ordering::SeqCst),
+        peers.opens.load(Ordering::SeqCst),
         0,
-        "a running backoff reads nothing"
+        "a running backoff asks nobody"
     );
     let short = deliver_email(&ctx, &spec(), &peers, &backoffs, NOW_MS + 30_000).await;
     let JobRunOutcome::DeferredFor(_, delay) = short else {
-        panic!("one answer of three defers");
+        panic!("no manager opens the address");
     };
     assert_eq!(delay, Duration::from_secs(60), "the next delay doubles");
+    assert_eq!(
+        peers.opens.load(Ordering::SeqCst),
+        3,
+        "every manager was asked once"
+    );
     assert!(built.lock().unwrap().is_empty());
 }
 
