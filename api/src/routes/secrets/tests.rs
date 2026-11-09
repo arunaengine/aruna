@@ -9,6 +9,7 @@ use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::driver::drive;
+use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use axum::extract::{Path, Query, State};
@@ -17,7 +18,7 @@ use axum::{Extension, Json};
 use tempfile::TempDir;
 use ulid::Ulid;
 
-use super::{node, realm, *};
+use super::{group, node, realm, user, *};
 use crate::server::state::ServerState;
 use crate::tests::routes::{test_context, test_state, test_storage};
 
@@ -113,9 +114,8 @@ async fn node_secret_flow() {
     let again =
         node::create_node_secret(State(state.clone()), auth(&state, admin), create("a")).await;
     assert!(matches!(again, Err(ServerError::Conflict(_))));
-    node::create_node_secret(State(state.clone()), auth(&state, admin), create("b"))
-        .await
-        .unwrap();
+    let second = node::create_node_secret(State(state.clone()), auth(&state, admin), create("b"));
+    assert_eq!(second.await.unwrap().0, StatusCode::CREATED);
 
     let query = Query(SecretListQuery {
         cursor: None,
@@ -220,4 +220,103 @@ fn requests_hide_values() {
     assert!(shown.contains("token") && !shown.contains("canary"));
     let error = parse_name("Bad Name").unwrap_err();
     assert!(matches!(error, ServerError::BadRequestReason(_)));
+}
+
+#[tokio::test]
+async fn user_secret_readback() {
+    let (_dir, state, admin) = setup_state().await;
+    let mut readable = create("orcid");
+    readable.0.readable = true;
+    let created = user::create_user_secret(State(state.clone()), auth(&state, admin), readable);
+    let (_, Json(created)) = created.await.unwrap();
+    assert!(created.readable && !created.incomplete);
+    let read = user::read_user_secret(State(state.clone()), auth(&state, admin), path("orcid"));
+    let Json(value) = read.await.unwrap();
+    assert_eq!(value.fields["token"], CANARY);
+    assert!(!format!("{value:?}").contains(CANARY));
+
+    // An unreadable secret never reads back; another user never sees the caller's secrets.
+    user::create_user_secret(State(state.clone()), auth(&state, admin), create("hidden"))
+        .await
+        .map(|(status, _)| assert_eq!(status, StatusCode::CREATED))
+        .unwrap();
+    let refused = user::read_user_secret(State(state.clone()), auth(&state, admin), path("hidden"));
+    assert!(matches!(refused.await, Err(ServerError::Forbidden)));
+    let other = UserId::local(Ulid::generate(), state.get_realm_id());
+    let query = Query(SecretListQuery::default());
+    let Json(listed) = user::list_user_secrets(State(state.clone()), auth(&state, other), query)
+        .await
+        .unwrap();
+    assert!(listed.secrets.is_empty());
+    let query = Query(SecretListQuery::default());
+    let Json(own) = user::list_user_secrets(State(state.clone()), auth(&state, admin), query)
+        .await
+        .unwrap();
+    assert_eq!(own.secrets.len(), 2);
+    assert!(!serde_json::to_string(&own).unwrap().contains(CANARY));
+}
+
+#[tokio::test]
+async fn group_secret_managers() {
+    let (_dir, state, admin) = setup_state().await;
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: admin,
+        realm_id: state.get_realm_id(),
+    };
+    let config = CreateGroupConfig {
+        actor,
+        display_name: "secret group".to_string(),
+        owner_cap: None,
+    };
+    let (created, _) = drive(CreateGroupOperation::new(config), &state.get_ctx())
+        .await
+        .unwrap();
+    let group_id = created.group_id.to_string();
+    let member = UserId::local(Ulid::generate(), state.get_realm_id());
+    let refused = group::create_group_secret(
+        State(state.clone()),
+        auth(&state, member),
+        Path(group_id.clone()),
+        create("a"),
+    );
+    assert!(matches!(refused.await, Err(ServerError::Forbidden)));
+    let mut readable = create("a");
+    readable.0.readable = true;
+    let refused = group::create_group_secret(
+        State(state.clone()),
+        auth(&state, admin),
+        Path(group_id.clone()),
+        readable,
+    );
+    assert!(matches!(
+        refused.await,
+        Err(ServerError::BadRequestReason(_))
+    ));
+    let created = group::create_group_secret(
+        State(state.clone()),
+        auth(&state, admin),
+        Path(group_id.clone()),
+        create("a"),
+    );
+    let (_, Json(created)) = created.await.unwrap();
+    let rotated = group::rotate_group_secret(
+        State(state.clone()),
+        auth(&state, admin),
+        Path((group_id.clone(), "a".to_string())),
+        matching(&created.revision),
+        rotate(),
+    );
+    let Json(rotated) = rotated.await.unwrap();
+    assert_ne!(rotated.revision, created.revision);
+    let stale = group::delete_group_secret(
+        State(state.clone()),
+        auth(&state, admin),
+        Path((group_id.clone(), "a".to_string())),
+        matching(&created.revision),
+    );
+    assert!(matches!(
+        stale.await,
+        Err(ServerError::PreconditionFailed(_))
+    ));
 }
