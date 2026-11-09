@@ -31,8 +31,8 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::AuthToken;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::sync::sync_relationship::{
-    DeleteRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
-    SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
+    DeleteRelationshipOperation, StoreRelationshipOperation, SyncRelationshipDirection,
+    SyncRelationshipError, remove_outgoing_relationship,
 };
 use crate::tasks::queue_backoff::retry_delay_ms;
 
@@ -54,6 +54,8 @@ pub struct SyncMirrorRecord {
     pub due_at_ms: u64,
     pub attempts: u32,
     pub last_error: Option<String>,
+    /// A claimed rollback: the create never activated, so only the target mirror goes.
+    pub rollback: bool,
 }
 
 impl SyncMirrorRecord {
@@ -70,6 +72,7 @@ impl SyncMirrorRecord {
             due_at_ms,
             attempts: 0,
             last_error: None,
+            rollback: false,
         }
     }
 
@@ -111,6 +114,17 @@ pub enum SyncMirrorError {
     Mirror(String),
     #[error("unexpected storage event: {0:?}")]
     Unexpected(Event),
+}
+
+/// What a reconcile pass finds when it tries to claim a rollback.
+#[derive(Debug, PartialEq)]
+enum RollbackClaim {
+    /// The scanned record changed, so this pass has nothing to do.
+    Stale,
+    /// The relationship was activated and is reconciled as usual.
+    Active(SyncRelationship),
+    /// The create never activated; the record now asks for a rollback.
+    Claimed,
 }
 
 struct RepairScan {
@@ -347,15 +361,100 @@ pub async fn delete_sync_mirror(
     local_node: NodeId,
     relationship: &SyncRelationship,
 ) -> Result<(), SyncMirrorError> {
+    send_mirror_delete(context, local_node, relationship, false).await
+}
+
+/// Removes the target mirror of a create that never activated, without the creator's WRITE.
+async fn rollback_sync_mirror(
+    context: &DriverContext,
+    local_node: NodeId,
+    relationship: &SyncRelationship,
+) -> Result<(), SyncMirrorError> {
+    send_mirror_delete(context, local_node, relationship, true).await
+}
+
+/// Claims the staged reconcile record of a new relationship inside `txn_id`. Rewriting the
+/// record makes a concurrent rollback claim on the same key fail at commit.
+pub(crate) async fn claim_activation(
+    storage: &StorageHandle,
+    relationship: &SyncRelationship,
+    txn_id: TxnId,
+) -> Result<(), SyncRelationshipError> {
+    let key = relationship.id.to_bytes().to_vec();
+    let value = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+            key: ByteView::from(key.clone()),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => value,
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            return Err(SyncRelationshipError::RolledBack);
+        }
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        received => {
+            return Err(SyncRelationshipError::UnexpectedEvent {
+                state: "ClaimingActivation",
+                expected: "storage read result",
+                received,
+            });
+        }
+    };
+    let record = SyncMirrorRecord::from_bytes(&key, &value)?;
+    if record.intent != SyncMirrorIntent::Reconcile
+        || !same_relationship(&record.relationship, relationship)
+    {
+        return Err(SyncRelationshipError::RolledBack);
+    }
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+            key: ByteView::from(key),
+            value,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        received => Err(SyncRelationshipError::UnexpectedEvent {
+            state: "ClaimingActivation",
+            expected: "storage write result",
+            received,
+        }),
+    }
+}
+
+async fn send_mirror_delete(
+    context: &DriverContext,
+    local_node: NodeId,
+    relationship: &SyncRelationship,
+    rollback: bool,
+) -> Result<(), SyncMirrorError> {
     relationship.validate()?;
     if relationship.source.node_id == local_node && relationship.target.node_id == local_node {
-        delete_local_relationships(context, local_node, relationship).await?;
+        if rollback {
+            drive(
+                DeleteRelationshipOperation::new(
+                    relationship.clone(),
+                    SyncRelationshipDirection::Incoming,
+                ),
+                context,
+            )
+            .await?;
+        } else {
+            delete_local_relationships(context, local_node, relationship).await?;
+        }
         return Ok(());
     }
 
     let remote_node = if relationship.source.node_id == local_node {
         relationship.target.node_id
-    } else if relationship.target.node_id == local_node {
+    } else if relationship.target.node_id == local_node && !rollback {
         relationship.source.node_id
     } else {
         return Err(SyncMirrorError::Mirror(
@@ -377,6 +476,7 @@ pub async fn delete_sync_mirror(
             })),
             relationship.clone(),
             PolicyRequestExtras::operation("s3.DeleteBucketReplication"),
+            rollback,
         )
         .await
     {
@@ -394,10 +494,12 @@ pub async fn process_mirror_repairs(
     let scan = scan_repair_records(&context.storage_handle, now_ms).await?;
     let mut succeeded = 0usize;
     let mut failed = 0usize;
+    let mut claimed = false;
 
     for (key, record) in &scan.records {
         match process_repair_record(context, local_node, record).await {
-            Ok(()) => {
+            Ok(rollback) => {
+                claimed |= rollback;
                 clear_scanned_record(&context.storage_handle, key.clone(), record).await?;
                 succeeded = succeeded.saturating_add(1);
             }
@@ -414,12 +516,14 @@ pub async fn process_mirror_repairs(
         }
     }
 
+    // A claimed rollback is due now, so the next pass runs at once.
+    let has_more_due = scan.has_more_due || claimed;
     Ok(SyncMirrorResult {
         processed: scan.records.len(),
         succeeded,
         failed,
-        has_more_due: scan.has_more_due,
-        next_due_after: if scan.has_more_due {
+        has_more_due,
+        next_due_after: if has_more_due {
             None
         } else {
             scan.next_due_ms
@@ -535,36 +639,99 @@ async fn authorize_repair(
     }
 }
 
+/// Returns true when the pass claimed a rollback that is due now.
 async fn process_repair_record(
     context: &DriverContext,
     local_node: NodeId,
     record: &SyncMirrorRecord,
-) -> Result<(), SyncMirrorError> {
+) -> Result<bool, SyncMirrorError> {
     match record.intent {
-        SyncMirrorIntent::Reconcile => match drive(
-            GetRelationshipOperation::new(
-                record.relationship.id,
-                SyncRelationshipDirection::Outgoing,
-            ),
-            context,
-        )
-        .await
+        SyncMirrorIntent::Reconcile => match settle_reconcile(&context.storage_handle, record)
+            .await?
         {
+            RollbackClaim::Stale => Ok(false),
+            RollbackClaim::Claimed => Ok(true),
             // Detached stubs only serve retained reference reads; never
             // resurrect the target mirror for them.
-            Ok(relationship) if relationship.state == SyncState::Detached => {
-                delete_sync_mirror(context, local_node, &record.relationship).await
+            RollbackClaim::Active(relationship) if relationship.state == SyncState::Detached => {
+                delete_sync_mirror(context, local_node, &record.relationship).await?;
+                Ok(false)
             }
-            Ok(relationship) => ensure_sync_mirror(context, local_node, &relationship).await,
-            Err(SyncRelationshipError::NotFound) => {
-                delete_sync_mirror(context, local_node, &record.relationship).await
+            RollbackClaim::Active(relationship) => {
+                ensure_sync_mirror(context, local_node, &relationship).await?;
+                Ok(false)
             }
-            Err(error) => Err(error.into()),
         },
+        // The claim found no outgoing record, so no local cleanup may leave a stub.
+        SyncMirrorIntent::Delete if record.rollback => {
+            rollback_sync_mirror(context, local_node, &record.relationship).await?;
+            Ok(false)
+        }
         SyncMirrorIntent::Delete => {
             delete_local_relationships(context, local_node, &record.relationship).await?;
-            delete_sync_mirror(context, local_node, &record.relationship).await
+            delete_sync_mirror(context, local_node, &record.relationship).await?;
+            Ok(false)
         }
+    }
+}
+
+async fn settle_reconcile(
+    storage: &StorageHandle,
+    record: &SyncMirrorRecord,
+) -> Result<RollbackClaim, SyncMirrorError> {
+    let txn_id = start_repair_transaction(storage).await?;
+    let result = async {
+        let claim = claim_rollback(storage, record, txn_id).await?;
+        commit_repair_transaction(storage, txn_id).await?;
+        Ok(claim)
+    }
+    .await;
+    if result.is_err() {
+        abort_repair_transaction(storage, txn_id).await;
+    }
+    result
+}
+
+/// Inside `txn_id`, turns a scanned reconcile record whose outgoing record is absent into a
+/// rollback. Activation rewrites the same record, so only one of the two commits.
+async fn claim_rollback(
+    storage: &StorageHandle,
+    record: &SyncMirrorRecord,
+    txn_id: TxnId,
+) -> Result<RollbackClaim, SyncMirrorError> {
+    let key = record.relationship.id.to_bytes().to_vec();
+    if read_repair_record(storage, &key, Some(txn_id))
+        .await?
+        .as_ref()
+        != Some(record)
+    {
+        return Ok(RollbackClaim::Stale);
+    }
+    let source_bucket = record
+        .relationship
+        .source
+        .bucket()
+        .ok_or_else(|| SyncMirrorError::Mirror("invalid source ARN".to_string()))?;
+    let relationship_key = sync_relationship_key(source_bucket, record.relationship.id);
+    if let Some(existing) = read_out_relationship(storage, &relationship_key, Some(txn_id)).await? {
+        return Ok(RollbackClaim::Active(existing));
+    }
+    let claimed = SyncMirrorRecord {
+        rollback: true,
+        ..SyncMirrorRecord::new(record.relationship.clone(), SyncMirrorIntent::Delete)
+    };
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+            key: ByteView::from(key),
+            value: ByteView::from(claimed.to_bytes()?),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(RollbackClaim::Claimed),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(SyncMirrorError::Unexpected(other)),
     }
 }
 
@@ -673,6 +840,7 @@ async fn reschedule_repair_record(
         due_at_ms: unix_timestamp_millis().saturating_add(retry_delay_ms(attempts)),
         attempts,
         last_error: Some(error),
+        rollback: record.rollback,
     };
     let txn_id = start_repair_transaction(storage).await?;
     let result = async {
@@ -708,16 +876,24 @@ async fn reschedule_repair_record(
 
 async fn store_repair_record(
     storage: &StorageHandle,
-    record: SyncMirrorRecord,
+    mut record: SyncMirrorRecord,
 ) -> Result<(), SyncMirrorError> {
     let key = record.relationship.id.to_bytes().to_vec();
     let txn_id = start_repair_transaction(storage).await?;
     let result = async {
         let existing = read_repair_record(storage, &key, Some(txn_id)).await?;
         if record.intent == SyncMirrorIntent::Reconcile
-            && existing.is_some_and(|existing| existing.intent == SyncMirrorIntent::Delete)
+            && existing
+                .as_ref()
+                .is_some_and(|existing| existing.intent == SyncMirrorIntent::Delete)
         {
             return commit_repair_transaction(storage, txn_id).await;
+        }
+        // A delete staged after a refused activation keeps the claimed rollback.
+        if existing.is_some_and(|existing| {
+            existing.rollback && same_relationship(&existing.relationship, &record.relationship)
+        }) {
+            record.rollback = true;
         }
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -928,6 +1104,9 @@ async fn delete_repair_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::sync_relationship::{
+        GetRelationshipOperation, activate_relationship, create_sync_relationship,
+    };
     use aruna_core::UserId;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -1069,6 +1248,191 @@ mod tests {
             Event::Storage(StorageEvent::BatchWriteResult { .. })
         ));
         (tempdir, context)
+    }
+
+    fn storage_context() -> (tempfile::TempDir, DriverContext) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        (tempdir, context)
+    }
+
+    async fn staged_record(
+        context: &DriverContext,
+        relationship: &SyncRelationship,
+    ) -> SyncMirrorRecord {
+        stage_mirror_reconcile(context, relationship).await.unwrap();
+        read_repair_record(&context.storage_handle, &relationship.id.to_bytes(), None)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn stored_record(
+        context: &DriverContext,
+        relationship: &SyncRelationship,
+    ) -> SyncMirrorRecord {
+        read_repair_record(&context.storage_handle, &relationship.id.to_bytes(), None)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn outgoing(
+        context: &DriverContext,
+        relationship: &SyncRelationship,
+    ) -> Option<SyncRelationship> {
+        let key = sync_relationship_key(relationship.source.bucket().unwrap(), relationship.id);
+        read_out_relationship(&context.storage_handle, &key, None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rollback_blocks_activation() {
+        let (_tempdir, context) = storage_context();
+        let relationship = relationship();
+        let record = staged_record(&context, &relationship).await;
+
+        assert_eq!(
+            settle_reconcile(&context.storage_handle, &record)
+                .await
+                .unwrap(),
+            RollbackClaim::Claimed
+        );
+        assert_eq!(
+            create_sync_relationship(&context, relationship.clone()).await,
+            Err(SyncRelationshipError::RolledBack)
+        );
+        assert_eq!(
+            activate_relationship(&context, relationship.clone()).await,
+            Err(SyncRelationshipError::RolledBack)
+        );
+
+        assert_eq!(outgoing(&context, &relationship).await, None);
+        let claimed = stored_record(&context, &relationship).await;
+        assert_eq!(claimed.intent, SyncMirrorIntent::Delete);
+        assert!(claimed.rollback);
+    }
+
+    #[tokio::test]
+    async fn activation_blocks_rollback() {
+        let (_tempdir, context) = storage_context();
+        let relationship = relationship();
+        let record = staged_record(&context, &relationship).await;
+
+        create_sync_relationship(&context, relationship.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            settle_reconcile(&context.storage_handle, &record)
+                .await
+                .unwrap(),
+            RollbackClaim::Active(relationship.clone())
+        );
+        assert_eq!(stored_record(&context, &relationship).await, record);
+        assert_eq!(outgoing(&context, &relationship).await, Some(relationship));
+    }
+
+    #[tokio::test]
+    async fn claims_conflict() {
+        // Both orders: the claim that commits second must fail and change nothing.
+        for activation_first in [true, false] {
+            let (_tempdir, context) = storage_context();
+            let storage = &context.storage_handle;
+            let relationship = relationship();
+            let record = staged_record(&context, &relationship).await;
+            let activation = start_repair_transaction(storage).await.unwrap();
+            let rollback = start_repair_transaction(storage).await.unwrap();
+
+            claim_activation(storage, &relationship, activation)
+                .await
+                .unwrap();
+            let key = sync_relationship_key(relationship.source.bucket().unwrap(), relationship.id);
+            assert!(matches!(
+                storage
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                        key: key.into(),
+                        value: relationship.to_bytes().unwrap().into(),
+                        txn_id: Some(activation),
+                    })
+                    .await,
+                Event::Storage(StorageEvent::WriteResult { .. })
+            ));
+            assert_eq!(
+                claim_rollback(storage, &record, rollback).await.unwrap(),
+                RollbackClaim::Claimed
+            );
+            let (first, second) = match activation_first {
+                true => (activation, rollback),
+                false => (rollback, activation),
+            };
+            commit_repair_transaction(storage, first).await.unwrap();
+
+            assert!(matches!(
+                commit_repair_transaction(storage, second).await,
+                Err(SyncMirrorError::Storage(StorageError::TransactionConflict))
+            ));
+            let stored = stored_record(&context, &relationship).await;
+            if activation_first {
+                assert_eq!(stored, record);
+                assert_eq!(outgoing(&context, &relationship).await, Some(relationship));
+            } else {
+                assert!(stored.rollback);
+                assert_eq!(outgoing(&context, &relationship).await, None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_rollback() {
+        let (_tempdir, context) = storage_context();
+        let relationship = relationship();
+        let record = staged_record(&context, &relationship).await;
+        settle_reconcile(&context.storage_handle, &record)
+            .await
+            .unwrap();
+
+        stage_mirror_delete(&context, &relationship).await.unwrap();
+
+        let stored = stored_record(&context, &relationship).await;
+        assert_eq!(stored.intent, SyncMirrorIntent::Delete);
+        assert!(stored.rollback);
+    }
+
+    #[tokio::test]
+    async fn rollback_skips_stub() {
+        // A reference-serving create that never activated must not leave a detached stub.
+        for mode in [SyncMode::Reference, SyncMode::Continuous] {
+            let (_tempdir, context) = storage_context();
+            let mut relationship = relationship();
+            relationship.mode = mode;
+            relationship.set_reference_handling(ReferenceHandling::Preserve);
+            let record = staged_record(&context, &relationship).await;
+            settle_reconcile(&context.storage_handle, &record)
+                .await
+                .unwrap();
+
+            let result = process_mirror_repairs(&context, relationship.source.node_id)
+                .await
+                .unwrap();
+
+            assert_eq!(result.failed, 1);
+            assert_eq!(outgoing(&context, &relationship).await, None);
+            assert_eq!(
+                stored_record(&context, &relationship).await.last_error,
+                Some("target unreachable".to_string())
+            );
+        }
     }
 
     #[test]

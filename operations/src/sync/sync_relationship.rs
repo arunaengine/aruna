@@ -17,6 +17,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::sync::mirror_repair::claim_activation;
+
 const RELATIONSHIP_PAGE_SIZE: usize = 128;
 const CREATE_RELATIONSHIP_ATTEMPTS: usize = 3;
 
@@ -52,6 +54,8 @@ pub enum SyncRelationshipError {
     NotFound,
     #[error("sync relationship already exists")]
     Duplicate,
+    #[error("sync relationship creation was rolled back")]
+    RolledBack,
     #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
     UnexpectedEvent {
         state: &'static str,
@@ -62,15 +66,34 @@ pub enum SyncRelationshipError {
     NotFinished,
 }
 
+/// Activates a new relationship: claims its staged repair record and stores the outgoing
+/// record unless an enabled relationship with the same endpoints and mode exists.
 pub async fn create_sync_relationship(
     context: &crate::driver::DriverContext,
     relationship: SyncRelationship,
 ) -> Result<SyncRelationship, SyncRelationshipError> {
-    let storage = &context.storage_handle;
     let bucket = relationship.source.bucket().ok_or_else(|| {
         ConversionError::FromStrError("sync relationship endpoint is not an S3 ARN".to_string())
     })?;
     let prefix = ByteView::from(sync_relationship_prefix(bucket));
+    store_outgoing(context, relationship, Some(prefix)).await
+}
+
+/// Activates a relationship that replaces older ones of the same endpoints, so it skips the
+/// duplicate check. It fails with `RolledBack` once repair claimed the create for a rollback.
+pub async fn activate_relationship(
+    context: &crate::driver::DriverContext,
+    relationship: SyncRelationship,
+) -> Result<SyncRelationship, SyncRelationshipError> {
+    store_outgoing(context, relationship, None).await
+}
+
+async fn store_outgoing(
+    context: &crate::driver::DriverContext,
+    relationship: SyncRelationship,
+    prefix: Option<Key>,
+) -> Result<SyncRelationship, SyncRelationshipError> {
+    let storage = &context.storage_handle;
     let key = storage_key(SyncRelationshipDirection::Outgoing, &relationship)?;
     let value = ByteView::from(relationship.to_bytes()?);
 
@@ -83,8 +106,15 @@ pub async fn create_sync_relationship(
             }
             result => result?,
         };
-        if let Err(error) =
-            create_relationship_once(storage, &relationship, &prefix, &key, &value, txn_id).await
+        if let Err(error) = create_relationship_once(
+            storage,
+            &relationship,
+            prefix.as_ref(),
+            &key,
+            &value,
+            txn_id,
+        )
+        .await
         {
             abort_create_txn(storage, txn_id).await;
             return Err(error);
@@ -143,13 +173,13 @@ pub async fn remove_outgoing_relationship(
 async fn create_relationship_once(
     storage: &StorageHandle,
     relationship: &SyncRelationship,
-    prefix: &Key,
+    prefix: Option<&Key>,
     key: &Key,
     value: &Value,
     txn_id: TxnId,
 ) -> Result<(), SyncRelationshipError> {
     let mut start = None;
-    loop {
+    while let Some(prefix) = prefix {
         match storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
@@ -189,6 +219,7 @@ async fn create_relationship_once(
             }
         }
     }
+    claim_activation(storage, relationship, txn_id).await?;
 
     match storage
         .send_storage_effect(StorageEffect::Write {
@@ -702,6 +733,7 @@ impl Operation for DeleteRelationshipOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::sync::mirror_repair::stage_mirror_reconcile;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
@@ -881,6 +913,8 @@ mod tests {
             let target = format!("target-{attempt}");
             let first = relationship(attempt * 2 + 1, &source, &target);
             let second = relationship(attempt * 2 + 2, &source, &target);
+            stage_mirror_reconcile(&context, &first).await.unwrap();
+            stage_mirror_reconcile(&context, &second).await.unwrap();
 
             let (first_result, second_result) = tokio::join!(
                 create_sync_relationship(&context, first),

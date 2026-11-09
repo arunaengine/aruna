@@ -108,6 +108,25 @@ fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> b
         && left.created_at == right.created_at
 }
 
+/// The sender of a mirror rollback, as the transport authenticated it.
+#[derive(Clone, Copy, Debug)]
+struct RollbackRequest {
+    peer: NodeId,
+    local_node: NodeId,
+    /// The token was node-vouched, never a user bearer.
+    vouched: bool,
+}
+
+impl RollbackRequest {
+    /// Only the source peer of this exact incoming mirror may roll it back without WRITE.
+    fn allows(&self, stored: &SyncRelationship, request: &SyncRelationship) -> bool {
+        self.vouched
+            && request.source.node_id == self.peer
+            && request.target.node_id == self.local_node
+            && sync_identity_matches(stored, request)
+    }
+}
+
 fn valid_sync_request(
     relationship: &SyncRelationship,
     source_bucket: &str,
@@ -293,6 +312,10 @@ struct MetadataInner {
     peer_contacts: PeerContacts,
     sync_pulls: crate::metadata::device_pull::PullRegistry,
     range_indexes: Arc<RangeIndexes>,
+    #[cfg(feature = "test-hooks")]
+    drop_ack: AtomicBool,
+    #[cfg(feature = "test-hooks")]
+    repair_hold: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -572,6 +595,10 @@ impl MetadataHandle {
                 peer_contacts: PeerContacts::default(),
                 sync_pulls: Default::default(),
                 range_indexes: Arc::new(RangeIndexes::new(path.join(RANGE_INDEX_DIR))),
+                #[cfg(feature = "test-hooks")]
+                drop_ack: AtomicBool::new(false),
+                #[cfg(feature = "test-hooks")]
+                repair_hold: AtomicBool::new(false),
             }),
             storage_priority: StoragePriority::Foreground,
         })
@@ -580,6 +607,43 @@ impl MetadataHandle {
     /// The search indexes of the distributed bucket ranges this node holds.
     pub fn range_indexes(&self) -> Arc<RangeIndexes> {
         self.inner.range_indexes.clone()
+    }
+
+    /// Test hook: the next sync mirror create reports a timeout after the target stored it.
+    #[cfg(feature = "test-hooks")]
+    pub fn drop_create_ack(&self) {
+        self.inner
+            .drop_ack
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test hook: sync mirror repair on this node waits until `release_repair`.
+    #[cfg(feature = "test-hooks")]
+    pub fn hold_repair(&self) {
+        self.inner
+            .repair_hold
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn release_repair(&self) {
+        self.inner
+            .repair_hold
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn repair_held(&self) -> bool {
+        self.inner
+            .repair_hold
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn take_dropped_ack(&self) -> bool {
+        self.inner
+            .drop_ack
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The device pulls this node is running.

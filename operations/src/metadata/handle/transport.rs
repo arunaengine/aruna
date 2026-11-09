@@ -1014,6 +1014,10 @@ impl MetadataHandle {
         ))
         .await?
         {
+            #[cfg(feature = "test-hooks")]
+            MetadataTransportMessage::SyncMirrorCreated if self.take_dropped_ack() => Err(
+                MetadataError::Backend("sync mirror request timed out".to_string()),
+            ),
             MetadataTransportMessage::SyncMirrorCreated => Ok(()),
             MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
             other => Err(MetadataError::Backend(format!(
@@ -1028,6 +1032,7 @@ impl MetadataHandle {
         auth_token: Option<AuthToken>,
         relationship: SyncRelationship,
         extras: PolicyRequestExtras,
+        rollback: bool,
     ) -> Result<(), MetadataError> {
         match with_sync_timeout(send_remote_request(
             &self.inner,
@@ -1037,6 +1042,7 @@ impl MetadataHandle {
                 auth_token,
                 relationship: Box::new(relationship),
                 extras,
+                rollback,
             },
         ))
         .await?

@@ -295,7 +295,9 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
 **Limits**
 - Source and target must differ.
 - Bucket names must be non-empty and free of `/`, and workspace buckets are refused.
-- A prefix, when given, must be a confined relative path."#,
+- A prefix, when given, must be a confined relative path.
+- A create that reaches the target more than 10 s after this node gave up on it can store the
+  target's mirror again after the rollback removed it. That mirror receives no data."#,
     request_body(
         content = CreateSyncRequest,
         description = "Source endpoint on this node, target endpoint on the receiving node, and the sync mode. `reference_handling` defaults to `materialize` and `replicate_deletes` to false.",
@@ -477,19 +479,7 @@ pub async fn create_sync(
             .await
             .map_err(ServerError::InternalError)?;
     }
-    if let Err(error) = create_sync_relationship(&context, relationship.clone())
-        .await
-        .map_err(map_create_error)
-    {
-        if let Err(stage_error) = stage_mirror_delete(&context, &relationship).await {
-            warn!(%stage_error, relationship_id = %relationship.id, "Failed to stage sync mirror rollback");
-        }
-        kick_mirror_repair(&context).await;
-        if remove_mirror(&state, &relationship).await {
-            clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
-        }
-        return Err(error);
-    }
+    activate_sync(&state, &relationship).await?;
 
     if matches!(relationship.mode, SyncMode::Once | SyncMode::Reference)
         && let Err(error) = queue_relationship(&state, &auth, &relationship).await
@@ -1182,6 +1172,28 @@ async fn create_mirror(
     .map_err(map_mirror_error)
 }
 
+/// Stores the outgoing record, or removes the mirror again when that fails. A create that repair
+/// already rolled back stays with repair: an ordinary delete could leave a detached stub.
+async fn activate_sync(state: &ServerState, relationship: &SyncRelationship) -> ServerResult<()> {
+    let context = state.get_ctx();
+    let error = match create_sync_relationship(&context, relationship.clone()).await {
+        Ok(_) => return Ok(()),
+        Err(SyncRelationshipError::RolledBack) => {
+            kick_mirror_repair(&context).await;
+            return Err(map_create_error(SyncRelationshipError::RolledBack));
+        }
+        Err(error) => map_create_error(error),
+    };
+    if let Err(stage_error) = stage_mirror_delete(&context, relationship).await {
+        warn!(%stage_error, relationship_id = %relationship.id, "Failed to stage sync mirror rollback");
+    }
+    kick_mirror_repair(&context).await;
+    if remove_mirror(state, relationship).await {
+        clear_repair(state, relationship, SyncMirrorIntent::Delete).await;
+    }
+    Err(error)
+}
+
 async fn remove_mirror(state: &ServerState, relationship: &SyncRelationship) -> bool {
     if let Err(error) =
         delete_sync_mirror(&state.get_ctx(), state.get_node_id(), relationship).await
@@ -1223,6 +1235,10 @@ fn map_create_error(error: SyncRelationshipError) -> ServerError {
         SyncRelationshipError::Duplicate => {
             ServerError::Conflict("sync relationship already exists".to_string())
         }
+        // The target's answer was lost and repair rolls the mirror back; the caller may retry.
+        SyncRelationshipError::RolledBack => ServerError::BadGatewayReason(
+            "the target did not confirm the mirror and it was rolled back".to_string(),
+        ),
         other => ServerError::InternalError(other.to_string()),
     }
 }

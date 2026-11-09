@@ -130,7 +130,7 @@ use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed, open_cursor
 use aruna_operations::sync::mirror_repair::{
     SyncMirrorIntent, kick_mirror_repair, stage_mirror_delete, stage_mirror_reconcile,
 };
-use aruna_operations::sync::sync_relationship::SyncRelationshipDirection;
+use aruna_operations::sync::sync_relationship::{SyncRelationshipDirection, activate_relationship};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
@@ -3084,9 +3084,9 @@ impl S3 for ArunaS3Service {
                 }
                 return Err(error);
             }
-            if let Err(error) = self
-                .store_sync_relationship(relationship.clone(), SyncRelationshipDirection::Outgoing)
+            if let Err(error) = activate_relationship(&self.state, relationship.clone())
                 .await
+                .map_err(|error| s3_error!(InternalError, "{}", error.to_string()))
             {
                 let mut rollback = stored.clone();
                 rollback.push(relationship.clone());

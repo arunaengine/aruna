@@ -17,9 +17,9 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::key_seal::{SealedSecret, open_sealed};
 use aruna_core::keyspaces::{
-    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
-    RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
-    USAGE_STATS_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MIRROR_REPAIR_KEYSPACE,
+    RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE,
+    REPLICATION_OBLIGATION_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::StagingStrategy;
@@ -27,15 +27,19 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permissi
 use aruna_core::structs::storage::abe::GRANT_PURPOSE;
 use aruna_core::structs::storage::abe_access::KeyGrant;
 use aruna_core::structs::storage::blob::{
-    BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, VersionKey, group_permission_path,
+    BackendRef, BlobLocationKey, BlobVersion, BlobVersionState, VersionKey, bucket_permission_path,
+    group_permission_path,
 };
 use aruna_core::structs::storage::encryption::public_key_of;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_kpabe::{Envelope, UserKey};
+use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
+use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
+use aruna_operations::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -224,20 +228,43 @@ impl ReplicationHarness {
         Ok(())
     }
 
+    /// A 502 means the target did not store its mirror and nothing was created; the route
+    /// documents it as retryable, so a slow or briefly unreachable target is asked again.
     async fn post_sync(
         &self,
         base_url: &str,
         bearer_token: &str,
         request: CreateSyncRequest,
     ) -> TestResult<SyncRelationshipResponse> {
-        let response = reqwest::Client::new()
-            .post(format!("{}/api/v1/data/sync/relationships", base_url))
-            .bearer_auth(bearer_token)
-            .json(&request)
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response.text().await?;
+        let answer = std::sync::Mutex::new(None);
+        let waited = wait_until(
+            "sync relationship creation",
+            shared::WAIT_CAP,
+            Duration::from_millis(200),
+            || async {
+                let response = reqwest::Client::new()
+                    .post(format!("{base_url}/api/v1/data/sync/relationships"))
+                    .bearer_auth(bearer_token)
+                    .json(&request)
+                    .send()
+                    .await;
+                let Ok(response) = response else {
+                    return false;
+                };
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let retry = status == StatusCode::BAD_GATEWAY;
+                *answer.lock().expect("sync answer lock") = Some((status, body));
+                !retry
+            },
+        )
+        .await;
+        // A lasting 502 is reported with its reason rather than as a bare timeout.
+        let Some((status, body)) = answer.into_inner().expect("sync answer lock") else {
+            let missing =
+                || std::io::Error::other("sync relationship creation had no answer").into();
+            return Err(waited.err().unwrap_or_else(missing));
+        };
         if status != StatusCode::CREATED {
             return Err(std::io::Error::other(format!(
                 "sync relationship creation returned {status}: {body}"
@@ -1274,6 +1301,188 @@ async fn permission_rechecks_creator() -> TestResult<()> {
             .send()
             .await;
         assert!(target_head.is_err());
+        Ok(())
+    }
+    .await;
+
+    harness.shutdown().await;
+    result
+}
+
+async fn row_exists(context: &DriverContext, keyspace: &str, key: Vec<u8>) -> TestResult<bool> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: keyspace.to_string(),
+            key: key.into(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+        event => Err(std::io::Error::other(format!("unexpected read event: {event:?}")).into()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_mirror_rollback() -> TestResult<()> {
+    let harness = ReplicationHarness::new("orphan-rollback-group").await?;
+
+    let result = async {
+        let source_bucket = "orphan-rollback-source";
+        let target_bucket = "orphan-rollback-target";
+        let realm_id = harness.seed.realm_id;
+        let creator_id = UserId::local(Ulid::generate(), realm_id);
+        let seed_metadata = harness
+            .seed
+            .context
+            .metadata_handle
+            .clone()
+            .ok_or_else(|| std::io::Error::other("seed node has no metadata handle"))?;
+
+        harness
+            .create_bucket_pair(source_bucket, target_bucket)
+            .await?;
+        let creator_token = harness.add_member(creator_id).await?;
+        // Repair waits until the creator lost WRITE, so only a rollback can remove the mirror.
+        seed_metadata.hold_repair();
+        seed_metadata.drop_create_ack();
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/api/v1/data/sync/relationships",
+                harness.seed.base_url
+            ))
+            .bearer_auth(&creator_token)
+            .json(&CreateSyncRequest {
+                source: SyncSourceRequest {
+                    bucket: source_bucket.to_string(),
+                    prefix: None,
+                },
+                target: SyncTargetRequest {
+                    node_id: harness.joiner.config.node_id.to_string(),
+                    bucket: target_bucket.to_string(),
+                    prefix: None,
+                },
+                mode: ApiSyncMode::Continuous,
+                reference_handling: ApiReferenceHandling::Materialize,
+                replicate_deletes: false,
+                plaintext: false,
+            })
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        assert!(keyspace_empty(&harness.seed.context, RELATIONSHIP_OUT_KEYSPACE).await);
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = harness
+            .seed
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 2,
+                txn_id: None,
+            })
+            .await
+        else {
+            return Err(std::io::Error::other("repair keyspace scan failed").into());
+        };
+        assert_eq!(values.len(), 1);
+        let record: SyncMirrorRecord = postcard::from_bytes(&values[0].1)?;
+        assert_eq!(record.intent, SyncMirrorIntent::Reconcile);
+        assert!(!record.rollback);
+        assert_eq!(record.relationship.created_by, creator_id);
+        assert_eq!(record.relationship.source.bucket(), Some(source_bucket));
+        assert_eq!(record.relationship.target.bucket(), Some(target_bucket));
+        assert_eq!(
+            record.relationship.target.node_id,
+            harness.joiner.config.node_id
+        );
+        let mirror_key = sync_relationship_key(target_bucket, record.relationship.id);
+        let repair_key = record.relationship.id.to_bytes().to_vec();
+        assert!(
+            row_exists(
+                &harness.joiner.context,
+                RELATIONSHIP_IN_KEYSPACE,
+                mirror_key.clone()
+            )
+            .await?
+        );
+
+        harness.remove_member(creator_id).await?;
+        let write_path = bucket_permission_path(
+            realm_id,
+            Ulid::from_string(&harness.group_id)?,
+            harness.joiner.config.node_id,
+            target_bucket,
+        );
+        let creator = AuthContext {
+            user_id: creator_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        wait_until(
+            "joiner refuses the creator WRITE",
+            shared::WAIT_CAP,
+            Duration::from_millis(200),
+            || async {
+                matches!(
+                    authorize(
+                        &harness.joiner.context,
+                        realm_id,
+                        &creator,
+                        &write_path,
+                        &Permission::WRITE,
+                        PolicyRequestExtras::operation("s3.DeleteBucketReplication"),
+                    )
+                    .await,
+                    Err(AuthorizeError::PermissionDenied)
+                )
+            },
+        )
+        .await?;
+        assert!(
+            row_exists(
+                &harness.joiner.context,
+                RELATIONSHIP_IN_KEYSPACE,
+                mirror_key.clone()
+            )
+            .await?
+        );
+        assert!(
+            row_exists(
+                &harness.seed.context,
+                MIRROR_REPAIR_KEYSPACE,
+                repair_key.clone()
+            )
+            .await?
+        );
+
+        seed_metadata.release_repair();
+        wait_until(
+            "orphan sync mirror rollback",
+            shared::WAIT_CAP,
+            Duration::from_millis(200),
+            || async {
+                let mirror = row_exists(
+                    &harness.joiner.context,
+                    RELATIONSHIP_IN_KEYSPACE,
+                    mirror_key.clone(),
+                )
+                .await;
+                let repair = row_exists(
+                    &harness.seed.context,
+                    MIRROR_REPAIR_KEYSPACE,
+                    repair_key.clone(),
+                )
+                .await;
+                matches!((mirror, repair), (Ok(false), Ok(false)))
+            },
+        )
+        .await?;
+        assert!(keyspace_empty(&harness.seed.context, RELATIONSHIP_OUT_KEYSPACE).await);
         Ok(())
     }
     .await;
