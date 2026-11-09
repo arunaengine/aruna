@@ -4,6 +4,9 @@
 
 pub mod certificate;
 
+#[cfg(test)]
+mod tests;
+
 use axum::http::{HeaderMap, Uri, header};
 
 /// The service a TLS connection reaches, chosen by its SNI name.

@@ -22,6 +22,7 @@ STRUCT_NAMES = frozenset({"bin", "benches", "examples"})
 GENERIC_PREFIXES = frozenset({("get",), ("set",), ("test",), ("tests",)})
 EXTERNAL_NAMES = {}
 SMALL_DOMAINS = {
+    "api/src/https": "grouped shared-prefix domain",
     "api/src/metadata": "grouped shared-prefix domain",
     "api/src/routes/access/credentials": "grouped shared-prefix domain",
     "api/src/routes/access/users": "grouped shared-prefix domain",
