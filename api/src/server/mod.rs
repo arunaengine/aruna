@@ -7,17 +7,23 @@ use crate::csp::baseline_security_headers;
 use crate::error::ServerSetupError;
 use crate::routes::rest_router;
 pub mod state;
+use crate::https::check_host;
+use crate::https::listener::CombinedListener;
 pub(crate) use crate::server::state::{ServerState, swagger_ui};
-use axum::Router;
-use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Redirect, Response};
+use axum::serve::{IncomingStream, Listener};
+use axum::{Extension, Router};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
+use tower::{Layer, service_fn};
 
 pub const MAX_BODY_SIZE: usize = 1024 * 1024;
 
@@ -113,10 +119,11 @@ impl Server {
     /// requests already in flight run to completion before this returns.
     pub async fn run_with_listener(
         self,
-        listener: TcpListener,
+        listener: impl Into<CombinedListener>,
         shutdown: CancellationToken,
     ) -> Result<(), ServerSetupError> {
-        let bound_addr = listener.local_addr()?;
+        let listener = listener.into();
+        let bound_addr = Listener::local_addr(&listener)?;
         self.state
             .register_rest_public(bound_addr, self.api_public_url.as_deref())
             .await;
@@ -141,13 +148,22 @@ impl Server {
                 }
             }));
 
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await
-        .map_err(|e| ServerSetupError::Runtime(e.to_string()))?;
+        // TLS connections get the route's host check; plain ones keep today's router.
+        let tls_router = listener
+            .host_check()
+            .map(|check| router.clone().layer(from_fn_with_state(check, check_host)));
+        let connections = service_fn(move |incoming: IncomingStream<'_, CombinedListener>| {
+            let selected = match (incoming.io(), &tls_router) {
+                (Either::Right(_), Some(tls)) => tls.clone(),
+                _ => router.clone(),
+            };
+            let peer = ConnectInfo(*incoming.remote_addr());
+            std::future::ready(Ok::<_, Infallible>(Extension(peer).layer(selected)))
+        });
+        axum::serve(listener, connections)
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+            .await
+            .map_err(|e| ServerSetupError::Runtime(e.to_string()))?;
 
         Ok(())
     }

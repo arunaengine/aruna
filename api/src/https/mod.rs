@@ -3,11 +3,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod certificate;
+pub mod listener;
 
 #[cfg(test)]
 mod tests;
 
-use axum::http::{HeaderMap, Uri, header};
+use std::sync::Arc;
+
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 
 /// The service a TLS connection reaches, chosen by its SNI name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -118,4 +124,41 @@ pub fn request_host(uri: &Uri, headers: &HeaderMap) -> Option<String> {
     };
     let host = authority.host().trim_end_matches('.');
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// The route a TLS connection was accepted for. Requests on it must name a host
+/// of the same route; others get `421` so a client retries on a new connection.
+#[derive(Clone, Debug)]
+pub struct HostCheck {
+    routes: Arc<HostRoutes>,
+    route: HostRoute,
+}
+
+impl HostCheck {
+    pub fn new(routes: Arc<HostRoutes>, route: HostRoute) -> Self {
+        Self { routes, route }
+    }
+
+    pub fn route(&self) -> HostRoute {
+        self.route
+    }
+
+    pub fn routes(&self) -> &Arc<HostRoutes> {
+        &self.routes
+    }
+
+    /// Whether a request with this URI and headers belongs to the connection's route.
+    pub fn allows(&self, uri: &Uri, headers: &HeaderMap) -> bool {
+        request_host(uri, headers)
+            .and_then(|host| self.routes.route_for(&host))
+            .is_some_and(|route| route == self.route)
+    }
+}
+
+/// Answers `421 Misdirected Request` for a request whose host belongs to another route.
+pub async fn check_host(State(check): State<HostCheck>, request: Request, next: Next) -> Response {
+    if !check.allows(request.uri(), request.headers()) {
+        return StatusCode::MISDIRECTED_REQUEST.into_response();
+    }
+    next.run(request).await
 }

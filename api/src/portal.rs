@@ -4,6 +4,8 @@
 
 use crate::csp::{PortalCspConfig, PortalSecurity, portal_security_headers};
 use crate::error::{ServerError, ServerSetupError};
+use crate::https::check_host;
+use crate::https::listener::CombinedListener;
 use crate::server::state::{PortalRuntimeState, ServerState};
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
@@ -13,12 +15,13 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::serve::IncomingStream;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use tower_http::compression::CompressionLayer;
@@ -130,12 +133,24 @@ pub fn router(state: Arc<ServerState>, config: PortalConfig) -> Router {
 /// Serves until `shutdown` is cancelled: the listener stops accepting and
 /// requests already in flight run to completion before this returns.
 pub async fn serve(
-    listener: TcpListener,
+    listener: impl Into<CombinedListener>,
     state: Arc<ServerState>,
     config: PortalConfig,
     shutdown: CancellationToken,
 ) -> Result<(), ServerSetupError> {
-    axum::serve(listener, router(state, config).into_make_service())
+    let listener = listener.into();
+    let plain = router(state, config);
+    let tls = listener
+        .host_check()
+        .map(|check| plain.clone().layer(from_fn_with_state(check, check_host)));
+    let connections = tower::service_fn(move |incoming: IncomingStream<'_, CombinedListener>| {
+        let selected = match (incoming.io(), &tls) {
+            (Either::Right(_), Some(tls)) => tls.clone(),
+            _ => plain.clone(),
+        };
+        std::future::ready(Ok::<_, std::convert::Infallible>(selected))
+    });
+    axum::serve(listener, connections)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         .map_err(|error| ServerSetupError::Runtime(error.to_string()))
