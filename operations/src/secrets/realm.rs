@@ -368,3 +368,7 @@ impl Operation for RealmSecretOperation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "realm_tests.rs"]
+mod tests;
