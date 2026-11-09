@@ -16,7 +16,7 @@ name = "aruna-cli"
 path = "src/main.rs"
 
 [dependencies]
-aruna-plugins = { workspace = true }
+aruna-plugins = { workspace = true, features = ["build"] }
 aws-sdk-s3 = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
@@ -34,10 +34,8 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-toml = { workspace = true }
 unicode-normalization = { workspace = true }
 url = { workspace = true }
-wit-component = { workspace = true }
 zip = { workspace = true, features = ["deflate-flate2"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

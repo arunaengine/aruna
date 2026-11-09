@@ -5,6 +5,8 @@
 pub mod artifact;
 pub mod connection;
 pub mod manifest;
+#[cfg(feature = "build")]
+pub mod package;
 pub mod permission;
 pub mod trigger;
 
