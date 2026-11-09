@@ -186,6 +186,7 @@ pub fn document_class(target: &DocumentTarget) -> DocumentClass {
         | DocumentTarget::WatchSubscription { .. }
         | DocumentTarget::EmailPreference { .. }
         | DocumentTarget::WebhookSubscription { .. }
+        | DocumentTarget::OwnerSecret { .. }
         | DocumentTarget::NodeInfo { .. } => DocumentClass::Admin,
     }
 }

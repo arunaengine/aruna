@@ -261,6 +261,9 @@ impl AnnounceTopicOperation {
                         .to_string(),
                 ))
             }
+            DocumentTarget::OwnerSecret { .. } => Err(AnnounceTopicError::DocumentSync(
+                "owner secrets sync only through their register outbox records".to_string(),
+            )),
             DocumentTarget::MetadataRegistry {
                 group_id,
                 document_id,

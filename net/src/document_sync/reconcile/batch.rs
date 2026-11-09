@@ -122,6 +122,7 @@ pub(super) async fn apply_batch_event(
         DocumentTarget::WatchSubscription { .. }
             | DocumentTarget::EmailPreference { .. }
             | DocumentTarget::WebhookSubscription { .. }
+            | DocumentTarget::OwnerSecret { .. }
     ) && matches!(
         event,
         DocumentEvent::Upsert { .. } | DocumentEvent::Delete { .. }

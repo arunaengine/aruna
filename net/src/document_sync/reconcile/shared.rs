@@ -15,7 +15,7 @@ use crate::document_sync::{DocumentSyncService, SyncRejection, node_to_peer};
 use crate::error::{NetError, Result};
 
 use super::validate::{
-    validate_node_upsert, validate_setting_upsert, validate_usage_upsert, validate_watch_delete,
+    validate_node_upsert, validate_register_upsert, validate_usage_upsert, validate_watch_delete,
     validate_watch_interest, validate_watch_upsert,
 };
 
@@ -131,11 +131,11 @@ pub(super) async fn apply_watch_event(
             target,
             bytes,
             change,
-        } if SettingChannel::of_target(&target).is_some() => {
+        } if register_target(&target) => {
             let expected_actor =
                 ::irokle::actor_id_for(topic_id, node_to_peer(&change.current.actor));
             let mut reason = match actor_id == expected_actor {
-                true => validate_setting_upsert(&target, &bytes, &change)
+                true => validate_register_upsert(&target, &bytes, &change)
                     .err()
                     .map(|reason| format!("invalid notification setting: {reason}")),
                 false => {
@@ -177,9 +177,7 @@ pub(super) async fn apply_watch_event(
             }
         }
         // Settings are immutable register writes; a newer write turns a setting off.
-        event @ DocumentEvent::Delete { .. }
-            if SettingChannel::of_target(event.target()).is_some() =>
-        {
+        event @ DocumentEvent::Delete { .. } if register_target(event.target()) => {
             warn!(%topic_id, "Rejecting a notification setting delete");
             Ok(SharedOutcome::Rejected(SyncRejection::new(
                 identity,
@@ -411,6 +409,12 @@ async fn apply_node_event(
             )))
         }
     }
+}
+
+/// Notification settings and owner secrets: immutable register writes.
+fn register_target(target: &DocumentTarget) -> bool {
+    SettingChannel::of_target(target).is_some()
+        || matches!(target, DocumentTarget::OwnerSecret { .. })
 }
 
 /// The stored bytes of a register write, if this node holds the target.

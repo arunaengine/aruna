@@ -295,6 +295,8 @@ pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
 pub const EMAIL_SETTINGS_KEYSPACE: &str = "notification_email_settings";
 /// Webhook setting register writes, replicated per user and all kept.
 pub const WEBHOOK_SETTINGS_KEYSPACE: &str = "notification_webhook_settings";
+/// User and group secret register writes by owner, name, part and write id; all kept.
+pub const OWNER_SECRETS_KEYSPACE: &str = "owner_secrets";
 pub const WATCH_SUBSCRIPTIONS_KEYSPACE: &str = "notification_watch_subscriptions";
 pub const WATCH_INTEREST_KEYSPACE: &str = "notification_watch_interest";
 /// The newest deletion time of a bucket per recipient, which drops older notices about it.
@@ -713,6 +715,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NOTIFICATION_OUTBOX_KEYSPACE,
     EMAIL_SETTINGS_KEYSPACE,
     WEBHOOK_SETTINGS_KEYSPACE,
+    OWNER_SECRETS_KEYSPACE,
     WATCH_SUBSCRIPTIONS_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,
     NOTIFICATION_CUTOFF_KEYSPACE,
