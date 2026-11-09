@@ -13,6 +13,9 @@ impl AdminDocumentState {
         match &event.op {
             AdminDocumentOperation::ConfigNodeEnsured { node_id, kind } => {
                 self.apply_config_node(event, node_id, Some(node_kind_value(kind)));
+                if matches!(kind, RealmNodeKind::Server | RealmNodeKind::Management) {
+                    self.record_membership(event, node_id, false);
+                }
             }
             AdminDocumentOperation::ConfigNodeRemoved { node_id, cutoffs } => {
                 let mut sorted = cutoffs.clone();
@@ -22,6 +25,7 @@ impl AdminDocumentState {
                     return Err(AdminDocumentError::InvalidCutoffs);
                 }
                 self.apply_config_node(event, node_id, None);
+                self.record_membership(event, node_id, true);
                 let value = serde_json::to_string(&sorted)
                     .map_err(|_| AdminDocumentError::InvalidCutoffs)?;
                 self.apply_config_setting(event, &publisher_cutoffs_path(node_id), value);

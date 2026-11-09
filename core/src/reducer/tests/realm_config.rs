@@ -1043,3 +1043,58 @@ fn email_conflict_off() {
         Err(AdminDocumentError::InvalidEmailProfile)
     );
 }
+
+#[test]
+fn node_history_kept() {
+    // Removal and re-addition keep both intervals; a clock in the gap is inside neither.
+    use crate::structs::identity::realm::RealmNodeKind;
+    let mut state =
+        AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+            realm_id: realm_id(),
+        });
+    let before = state.clock.clone();
+    let ensure = || AdminDocumentOperation::ConfigNodeEnsured {
+        node_id: node(5),
+        kind: RealmNodeKind::Server,
+    };
+    let remove = || AdminDocumentOperation::ConfigNodeRemoved {
+        node_id: node(5),
+        cutoffs: Vec::new(),
+    };
+    state.apply_operation(&actor(node(1)), ensure()).unwrap();
+    let member = state.clock.clone();
+    state.apply_operation(&actor(node(1)), remove()).unwrap();
+    let gap = state.clock.clone();
+    state.apply_operation(&actor(node(2)), ensure()).unwrap();
+    let again = state.clock.clone();
+    let device = AdminDocumentOperation::ConfigNodeEnsured {
+        node_id: node(6),
+        kind: RealmNodeKind::User {
+            owner: UserId::local(Ulid::from_bytes([9; 16]), realm_id()),
+        },
+    };
+    state.apply_operation(&actor(node(1)), device).unwrap();
+
+    let intervals = state.node_intervals();
+    assert_eq!(
+        intervals.len(),
+        2,
+        "a user device has no infrastructure interval"
+    );
+    let open = |clock| intervals.iter().any(|interval| interval.open_at(clock));
+    assert!(!open(&before), "a clock before the addition");
+    assert!(open(&member) && !open(&gap) && open(&again));
+    assert!(again.covers(&member) && !member.covers(&again));
+}
+
+#[test]
+fn clocks_compare_componentwise() {
+    use crate::admin_documents::AdminDocumentClock;
+    let one = AdminDocumentClock::default().with_observed(node(1), 2);
+    let two = AdminDocumentClock::default().with_observed(node(2), 1);
+    let both = one.clone().with_observed(node(2), 1);
+    assert!(both.covers(&one) && both.covers(&two));
+    // Concurrent clocks: neither covers the other.
+    assert!(!one.covers(&two) && !two.covers(&one));
+    assert!(one.covers(&AdminDocumentClock::default()));
+}

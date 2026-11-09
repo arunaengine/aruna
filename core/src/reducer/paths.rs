@@ -292,6 +292,13 @@ pub fn vault_entry_path(entry: &crate::realm_vault::RealmVaultEntry) -> String {
     format!("{VAULT_ENTRY_PREFIX}{}.{}", entry.purpose.tag(), entry.id)
 }
 
+pub const NODE_HISTORY_PREFIX: &str = "realm_config.node_history.";
+
+/// One retained path per infrastructure add or removal event of a node; never overwritten.
+pub fn node_history_path(node_id: &NodeId, event_id: Ulid) -> String {
+    format!("{NODE_HISTORY_PREFIX}{node_id}.{event_id}")
+}
+
 pub fn config_oidc_path(provider_id: &str) -> String {
     format!("realm_config.oidc_providers.{provider_id}")
 }
