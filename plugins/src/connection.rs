@@ -94,7 +94,9 @@ impl Connection {
         if !plain {
             return Err("only https addresses without credentials, query or fragment");
         }
-        let rest = &self.url["https://".len()..];
+        // The parser also accepts forms like `https:host`; only the plain form is kept.
+        let rest =
+            (self.url.strip_prefix("https://")).ok_or("the address must start with https://")?;
         let path = rest.find('/').map_or("", |start| &rest[start..]);
         if self.url.contains('{') || !valid_prefix(path) {
             return Err("the path is not a plain path prefix");
@@ -160,6 +162,11 @@ mod tests {
             })
         );
         assert!(connection("https://catalog.example.org").address().is_ok());
+        let international = connection("https://ä.example/api");
+        let international = international.address();
+        assert!(
+            matches!(international, Ok(Address::Fixed(url)) if url.host_str() == Some("xn--4ca.example"))
+        );
     }
 
     #[test]
@@ -176,6 +183,12 @@ mod tests {
             "{catalog_url}/api/%2e%2e",
             "{catalog_url",
             "/api/records",
+            "https:x",
+            "https:/x",
+            "https:",
+            "h",
+            "https://catalog.example.org/äpi",
+            "{catalog_url}/äpi",
         ] {
             assert!(connection(url).address().is_err(), "{url}");
         }
