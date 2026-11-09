@@ -7,8 +7,12 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use ulid::Ulid;
+use url::Url;
 
+use crate::UserId;
 use crate::compute::{Secret, SecretBytes};
+use crate::types::GroupId;
 
 /// Encoded bytes a secret value may take.
 pub const MAX_VALUE_BYTES: usize = 16 * 1024;
@@ -276,6 +280,211 @@ impl fmt::Debug for SecretFields {
     }
 }
 
+/// Where a secret lives and who manages it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SecretScope {
+    /// Local to one node, managed by realm admins on that node.
+    Node,
+    /// The realm vault, managed by realm admins.
+    Realm,
+    Group(GroupId),
+    User(UserId),
+}
+
+/// Who may use a secret. Group plugin installs are the only consumers for now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretConsumer {
+    Plugin { plugin_id: String, install_id: Ulid },
+}
+
+/// How a consumer gets a secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    /// The host adds it to an approved outgoing request.
+    Inject,
+    /// The host checks an incoming request with it; no origin.
+    Verify,
+    /// The consumer gets the bytes, an explicit owner choice.
+    Value,
+}
+
+/// What a consumer sees of the answer to an injected request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseExposure {
+    /// The status code only.
+    #[default]
+    Status,
+    /// The listed JSON pointers of a JSON body and the listed headers.
+    Fields {
+        pointers: Vec<String>,
+        headers: Vec<String>,
+    },
+    /// Headers and body; the owner trusts the destination not to echo credentials.
+    Full,
+}
+
+/// One rule of a secret: which consumer may use it, how, and toward where.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UseRule {
+    pub consumer: SecretConsumer,
+    pub delivery: Delivery,
+    /// HTTPS origins for `inject`, such as `https://api.example.org`.
+    #[serde(default)]
+    pub origins: Vec<String>,
+    /// Path prefixes for `inject`; empty allows every path.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Methods for `inject`; empty allows every method.
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub response: ResponseExposure,
+    /// Realm and node secrets: the groups whose installs may use it.
+    #[serde(default)]
+    pub groups: Vec<GroupId>,
+}
+
+/// Checks the rules a manager sets; a rule that could never match or would widen use is refused.
+pub fn check_rules(
+    scope: SecretScope,
+    kind: &SecretKind,
+    rules: &[UseRule],
+) -> Result<(), SecretError> {
+    let spec = kind.spec()?;
+    for rule in rules {
+        let SecretConsumer::Plugin { plugin_id, .. } = &rule.consumer;
+        let consumer = !plugin_id.is_empty()
+            && plugin_id.len() <= MAX_NAME * 2
+            && plugin_id.bytes().all(|byte| byte.is_ascii_graphic());
+        let groups = match scope {
+            SecretScope::Node | SecretScope::Realm => !rule.groups.is_empty(),
+            SecretScope::Group(_) => rule.groups.is_empty(),
+            // A plugin acts as its install's service account, never as a user.
+            SecretScope::User(_) => false,
+        };
+        let request = match rule.delivery {
+            Delivery::Inject => {
+                spec.inject.is_some()
+                    && !rule.origins.is_empty()
+                    && rule.origins.iter().all(|origin| https_origin(origin))
+                    && rule.paths.iter().all(|path| path.starts_with('/'))
+                    && rule.methods.iter().all(|method| http_method(method))
+                    && exposure_valid(&rule.response)
+            }
+            Delivery::Verify | Delivery::Value => {
+                (rule.delivery == Delivery::Value || spec.verify.is_some())
+                    && rule.origins.is_empty()
+                    && rule.paths.is_empty()
+                    && rule.methods.is_empty()
+                    && rule.response == ResponseExposure::Status
+            }
+        };
+        if !consumer || !groups || !request {
+            return Err(SecretError::Rule);
+        }
+    }
+    Ok(())
+}
+
+fn https_origin(origin: &str) -> bool {
+    Url::parse(origin)
+        .is_ok_and(|url| url.scheme() == "https" && url.origin().ascii_serialization() == origin)
+}
+
+fn http_method(method: &str) -> bool {
+    ["DELETE", "GET", "HEAD", "PATCH", "POST", "PUT"].contains(&method)
+}
+
+fn exposure_valid(response: &ResponseExposure) -> bool {
+    match response {
+        ResponseExposure::Fields { pointers, headers } => {
+            pointers.iter().all(|pointer| pointer.starts_with('/'))
+                && headers.iter().all(|header| header_name(header))
+        }
+        ResponseExposure::Status | ResponseExposure::Full => true,
+    }
+}
+
+/// One intended use, as the host states it from the consumer's stored binding.
+#[derive(Clone, Debug)]
+pub struct UseRequest<'a> {
+    pub consumer: &'a SecretConsumer,
+    pub delivery: Delivery,
+    /// The consuming group; `None` is a realm install.
+    pub group: Option<GroupId>,
+    /// Method and URL of the outgoing request, for `inject`.
+    pub target: Option<(&'a str, &'a Url)>,
+}
+
+/// Why a use does not match the rules of a secret.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum UseRefusal {
+    #[error("realm plugin installs cannot use secrets yet")]
+    RealmInstall,
+    #[error("the consumer belongs to another group than the secret")]
+    OtherGroup,
+    #[error("secrets are injected only into HTTPS requests")]
+    PlainHttp,
+    #[error("no use rule of the secret matches this use")]
+    NoRule,
+}
+
+/// The rule that allows `request`; the first refusal otherwise. Pure: authority and policies
+/// are checked by the caller before and after.
+pub fn check_use<'a>(
+    scope: SecretScope,
+    rules: &'a [UseRule],
+    request: &UseRequest<'_>,
+) -> Result<&'a UseRule, UseRefusal> {
+    let group = request.group.ok_or(UseRefusal::RealmInstall)?;
+    match scope {
+        SecretScope::Group(owner) if owner != group => return Err(UseRefusal::OtherGroup),
+        SecretScope::User(_) => return Err(UseRefusal::NoRule),
+        _ => {}
+    }
+    if request.delivery == Delivery::Inject {
+        let (_, url) = request.target.ok_or(UseRefusal::NoRule)?;
+        if url.scheme() != "https" {
+            return Err(UseRefusal::PlainHttp);
+        }
+    }
+    (rules.iter())
+        .find(|rule| rule_matches(scope, rule, request, group))
+        .ok_or(UseRefusal::NoRule)
+}
+
+fn rule_matches(
+    scope: SecretScope,
+    rule: &UseRule,
+    request: &UseRequest<'_>,
+    group: GroupId,
+) -> bool {
+    let shared = matches!(scope, SecretScope::Node | SecretScope::Realm);
+    if rule.consumer != *request.consumer
+        || rule.delivery != request.delivery
+        || (shared && !rule.groups.contains(&group))
+    {
+        return false;
+    }
+    let Some((method, url)) = request.target.filter(|_| rule.delivery == Delivery::Inject) else {
+        return rule.delivery != Delivery::Inject;
+    };
+    let origin = url.origin().ascii_serialization();
+    let path = url.path();
+    rule.origins.contains(&origin)
+        && (rule.methods.is_empty() || rule.methods.iter().any(|allowed| allowed == method))
+        && (rule.paths.is_empty() || rule.paths.iter().any(|prefix| path_within(path, prefix)))
+}
+
+/// `path` equals `prefix` or continues it at a segment boundary.
+fn path_within(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || prefix.ends_with('/') || rest.starts_with('/'))
+}
+
 /// Why a secret, its value or a rule is not valid. Never carries a value.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum SecretError {
@@ -295,6 +504,8 @@ pub enum SecretError {
     Encoding,
     #[error("the description is longer than 1024 characters")]
     Description,
+    #[error("a use rule is invalid for this scope and kind")]
+    Rule,
 }
 
 #[cfg(test)]
