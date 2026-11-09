@@ -100,6 +100,9 @@ HEADER_EXCEPTIONS = {
     "blob/tests/fixtures/autoindex_nginx.html": "copied index page; the parser test needs its bytes",
     "blob/tests/fixtures/non_index.html": "copied page; the rejection test needs its bytes",
     "operations/tests/fixtures/ELN_README.md": "copied fixture; its bytes must stay unchanged",
+    "plugins/templates/rust/Cargo.toml": "template copied into a user's own plugin project",
+    "plugins/templates/rust/plugin.toml": "template copied into a user's own plugin project",
+    "plugins/templates/rust/src/lib.rs": "template copied into a user's own plugin project",
 }
 
 WORD_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
