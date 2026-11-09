@@ -1,4 +1,4 @@
-//! Writes a user's webhook subscription through the management quorum and delivers share
+//! Writes a user's webhook subscription as a register write and delivers share
 //! upload notifications to it as jobs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
@@ -10,6 +10,7 @@ use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
 use aruna_core::errors::ConversionError;
 use aruna_core::realm_vault::seal_setting;
+use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::job::{
     JobError, JobPayload, JobResultPayload, WorkspaceMode, user_dedup_key,
 };
@@ -19,7 +20,6 @@ use aruna_core::structs::execution::webhook::{
     DELIVERY_HEADER, SIGNATURE_HEADER, URL_BYTES, WebhookDeliverySpec, WebhookSubscription,
     sign_delivery, valid_url,
 };
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
 use thiserror::Error;
 use ulid::Ulid;
@@ -79,10 +79,10 @@ pub async fn set_webhook(
     if !valid_url(&url) {
         return Err(WebhookError::InvalidUrl);
     }
-    let config = realm_config(ctx, owner).await?;
     let secret: [u8; 32] = rand::random();
     let sealed_secret = SecretBytes::new(secret.to_vec());
-    let build = |version: u64, id: Ulid| {
+    let build = |stamp: RegisterStamp| {
+        let id = stamp.write_id;
         let sealed = seal_setting(
             &owner.realm_id,
             SettingChannel::Webhook,
@@ -91,53 +91,45 @@ pub async fn set_webhook(
             &sealed_secret,
         )
         .map_err(|error| SettingError::Build(error.to_string()))?;
-        webhook_bytes(owner, id, version, Some(url.clone()), Some(sealed))
+        webhook_bytes(owner, stamp, Some(url.clone()), Some(sealed))
     };
-    let subscription = write_webhook(ctx, local, &config, owner, &build).await?;
+    let subscription = write_webhook(ctx, local, owner, &build).await?;
     Ok(WebhookOutcome {
         subscription,
         secret: hex::encode(secret),
     })
 }
 
-/// Turns the webhook off with a newer setting; queued deliveries then send nothing.
+/// Turns the webhook off with a newer register write; queued deliveries then send nothing.
 pub async fn remove_webhook(
     ctx: &DriverContext,
     local: NodeId,
     owner: UserId,
 ) -> Result<(), WebhookError> {
-    let config = realm_config(ctx, owner).await?;
-    let build = |version: u64, id: Ulid| webhook_bytes(owner, id, version, None, None);
-    write_webhook(ctx, local, &config, owner, &build)
-        .await
-        .map(|_| ())
+    let build = |stamp: RegisterStamp| webhook_bytes(owner, stamp, None, None);
+    write_webhook(ctx, local, owner, &build).await.map(|_| ())
 }
 
 async fn write_webhook(
     ctx: &DriverContext,
     local: NodeId,
-    config: &RealmConfigDocument,
     owner: UserId,
-    build: &(dyn Fn(u64, Ulid) -> Result<Vec<u8>, SettingError> + Sync),
+    build: &(dyn Fn(RegisterStamp) -> Result<Vec<u8>, SettingError> + Sync),
 ) -> Result<WebhookSubscription, WebhookError> {
-    let peers = MetadataPeers { ctx, local };
-    let managers = managers(config);
-    let channel = SettingChannel::Webhook;
-    let bytes = write_setting(ctx, &peers, local, &managers, channel, owner, build).await?;
+    let bytes = write_setting(ctx, local, SettingChannel::Webhook, owner, build).await?;
     Ok(WebhookSubscription::from_bytes(&bytes)?)
 }
 
 fn webhook_bytes(
     owner: UserId,
-    id: Ulid,
-    version: u64,
+    stamp: RegisterStamp,
     url: Option<String>,
     sealed: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, SettingError> {
     let subscription = WebhookSubscription {
-        subscription_id: id,
+        subscription_id: stamp.write_id,
         user_id: owner,
-        version,
+        stamp,
         url,
         sealed,
         created_at_ms: unix_timestamp_millis(),
@@ -147,17 +139,8 @@ fn webhook_bytes(
         .map_err(|error| SettingError::Build(error.to_string()))
 }
 
-async fn realm_config(
-    ctx: &DriverContext,
-    owner: UserId,
-) -> Result<RealmConfigDocument, SettingError> {
-    drive(GetConfigOperation::new(owner.realm_id), ctx)
-        .await
-        .map_err(|error| SettingError::Config(error.to_string()))
-}
-
 /// Queues one delivery job per held share upload notification, whatever the settings say now;
-/// the job decides from a quorum read. The notification id deduplicates; a failure is returned
+/// the job decides from the setting when it runs. The notification id deduplicates; a failure is returned
 /// so the sender delivers again.
 pub async fn enqueue_webhooks(
     context: &DriverContext,
@@ -205,8 +188,9 @@ pub async fn enqueue_webhooks(
     Ok(())
 }
 
-/// Sends one signed delivery when a quorum of management nodes says the webhook is on. A 4xx
-/// answer other than 408 and 429 is permanent; a short quorum waits without an attempt.
+/// Sends one signed delivery when this node's current setting has the webhook on. A 4xx answer
+/// other than 408 and 429 is permanent; while no management node opens the secret, the job
+/// waits without an attempt.
 pub async fn run_webhook_job(ctx: &JobContext, spec: &WebhookDeliverySpec) -> JobRunOutcome {
     let Some(metadata) = ctx.driver.metadata_handle.as_ref() else {
         return no_transport();
@@ -233,6 +217,7 @@ pub(crate) async fn deliver_webhook(
     let record = &spec.notification;
     let channel = SettingChannel::Webhook;
     let delivery = delivery_setting(
+        &ctx.driver,
         peers,
         backoffs,
         record,

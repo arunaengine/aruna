@@ -1,4 +1,4 @@
-//! Writes a user's email opt-in through the management quorum and mails the chosen notices
+//! Writes a user's email opt-in as a register write and mails the chosen notices
 //! through one SMTP server.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
@@ -16,6 +16,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::realm_vault::seal_setting;
+use aruna_core::register::RegisterStamp;
 pub use aruna_core::structs::execution::email::SmtpTls;
 use aruna_core::structs::execution::email::{
     EMAIL_CATEGORIES, EmailDeliverySpec, EmailPreference, RealmEmailProfile,
@@ -322,52 +323,45 @@ pub async fn set_email(
         return Err(EmailError::NotVerified);
     }
     let secret = SecretBytes::new(address.into_bytes());
-    let build = |version: u64, id: Ulid| {
+    let build = |stamp: RegisterStamp| {
+        let id = stamp.write_id;
         let sealed = seal_setting(&owner.realm_id, SettingChannel::Email, &owner, id, &secret)
             .map_err(|error| SettingError::Build(error.to_string()))?;
-        email_bytes(owner, id, version, categories.clone(), Some(sealed))
+        email_bytes(owner, stamp, categories.clone(), Some(sealed))
     };
-    write_email(ctx, local, &config, owner, &build).await
+    write_email(ctx, local, owner, &build).await
 }
 
-/// Turns email off with a newer setting; queued emails then send nothing.
+/// Turns email off with a newer register write; queued emails then send nothing.
 pub async fn remove_email(
     ctx: &DriverContext,
     local: NodeId,
     owner: UserId,
 ) -> Result<(), EmailError> {
-    let config = realm_config(ctx, owner).await?;
-    let build = |version: u64, id: Ulid| email_bytes(owner, id, version, BTreeSet::new(), None);
-    write_email(ctx, local, &config, owner, &build)
-        .await
-        .map(|_| ())
+    let build = |stamp: RegisterStamp| email_bytes(owner, stamp, BTreeSet::new(), None);
+    write_email(ctx, local, owner, &build).await.map(|_| ())
 }
 
 async fn write_email(
     ctx: &DriverContext,
     local: NodeId,
-    config: &RealmConfigDocument,
     owner: UserId,
-    build: &(dyn Fn(u64, Ulid) -> Result<Vec<u8>, SettingError> + Sync),
+    build: &(dyn Fn(RegisterStamp) -> Result<Vec<u8>, SettingError> + Sync),
 ) -> Result<EmailPreference, EmailError> {
-    let peers = MetadataPeers { ctx, local };
-    let managers = managers(config);
-    let channel = SettingChannel::Email;
-    let bytes = write_setting(ctx, &peers, local, &managers, channel, owner, build).await?;
+    let bytes = write_setting(ctx, local, SettingChannel::Email, owner, build).await?;
     Ok(EmailPreference::from_bytes(&bytes)?)
 }
 
 fn email_bytes(
     owner: UserId,
-    id: Ulid,
-    version: u64,
+    stamp: RegisterStamp,
     categories: BTreeSet<String>,
     sealed: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, SettingError> {
     let preference = EmailPreference {
-        preference_id: id,
+        preference_id: stamp.write_id,
         user_id: owner,
-        version,
+        stamp,
         categories,
         sealed,
         created_at_ms: unix_timestamp_millis(),
@@ -404,8 +398,8 @@ async fn verified(ctx: &DriverContext, owner: UserId, address: &str) -> Result<b
 }
 
 /// Queues one email job per held notice of an email category, whatever the settings say now;
-/// the job decides from a quorum read. The notification id deduplicates; a failure is returned
-/// so the sender delivers again.
+/// the job decides from the setting when it runs. The notification id deduplicates; a failure
+/// is returned so the sender delivers again.
 pub async fn enqueue_emails(
     context: &DriverContext,
     owner_node_id: NodeId,
@@ -459,8 +453,9 @@ pub async fn enqueue_emails(
     Ok(())
 }
 
-/// Sends one notification email when a quorum of management nodes says email is on for its
-/// category. A permanent SMTP refusal ends the job; a short quorum waits without an attempt.
+/// Sends one notification email when this node's current setting has email on for its
+/// category. A permanent SMTP refusal ends the job; while no management node opens the address,
+/// the job waits without an attempt.
 pub async fn run_email_job(ctx: &JobContext, spec: &EmailDeliverySpec) -> JobRunOutcome {
     let Some(metadata) = ctx.driver.metadata_handle.as_ref() else {
         return no_transport();
@@ -479,7 +474,7 @@ pub async fn run_email_job(ctx: &JobContext, spec: &EmailDeliverySpec) -> JobRun
     }
 }
 
-/// The waiting time of a job on a node without a metadata transport, which never reads a quorum.
+/// The waiting time of a job on a node without a metadata transport, which cannot open secrets.
 pub(crate) fn no_transport() -> JobRunOutcome {
     JobRunOutcome::DeferredFor(
         JobError::retryable("the metadata transport is unavailable"),
@@ -513,6 +508,7 @@ pub(crate) async fn deliver_email(
     let record = &spec.notification;
     let channel = SettingChannel::Email;
     let delivery = delivery_setting(
+        &ctx.driver,
         peers,
         backoffs,
         record,
