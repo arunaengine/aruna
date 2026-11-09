@@ -22,6 +22,8 @@ pub enum VaultPurpose {
     BucketKey,
     /// A fetched realm vault secret, under its realm vault entry id.
     RealmSecret,
+    /// The value of a named node secret, under its value id.
+    NamedSecret,
 }
 
 impl VaultPurpose {
@@ -32,6 +34,7 @@ impl VaultPurpose {
             Self::BucketKey => 3,
             // Tags 4 and 5 held node-local webhook secrets and email addresses; never reuse them.
             Self::RealmSecret => 6,
+            Self::NamedSecret => 7,
         }
     }
 }
@@ -158,5 +161,21 @@ mod tests {
         );
         assert_eq!(key.open(entry, &sealed[..20]), Err(VaultError::Open));
         assert_eq!(format!("{key:?}"), "NodeVaultKey(***)");
+    }
+
+    #[test]
+    fn tags_stay_unique() {
+        let purposes = [
+            VaultPurpose::SourceConnector,
+            VaultPurpose::GroupBackend,
+            VaultPurpose::BucketKey,
+            VaultPurpose::Webhook,
+            VaultPurpose::EmailAddress,
+            VaultPurpose::RealmSecret,
+            VaultPurpose::NamedSecret,
+        ];
+        let tags: std::collections::BTreeSet<u8> = purposes.iter().map(|p| p.tag()).collect();
+        assert_eq!(tags.len(), purposes.len());
+        assert_eq!(VaultPurpose::NamedSecret.tag(), 7);
     }
 }

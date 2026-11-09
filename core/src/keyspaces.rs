@@ -505,6 +505,8 @@ pub const NODE_STATE_KEYSPACE: &str = "node_state";
 pub const FEDERATION_KEYSPACE: &str = "federation_publication";
 /// Secrets this node opens by itself, sealed with its node vault key. Never replicated.
 pub const NODE_VAULT_KEYSPACE: &str = "node_vault";
+/// Named node secrets by name: kind, rules and field names. Their values live in the node vault.
+pub const NODE_SECRETS_KEYSPACE: &str = "node_secrets";
 /// The one row of `NODE_STATE_KEYSPACE` that holds the node's identity.
 pub const NODE_STATE_KEY: &[u8] = b"node_state";
 /// Realm signing key a promotion handed to this node; its next start moves it into the identity.
@@ -796,6 +798,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NODE_STATE_KEYSPACE,
     FEDERATION_KEYSPACE,
     NODE_VAULT_KEYSPACE,
+    NODE_SECRETS_KEYSPACE,
     ONBOARDING_KEYSPACE,
     DHT_KEYSPACE,
     CRAQLE_TERMS_KEYSPACE,

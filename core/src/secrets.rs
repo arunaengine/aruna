@@ -485,6 +485,42 @@ fn path_within(path: &str, prefix: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || prefix.ends_with('/') || rest.starts_with('/'))
 }
 
+/// The stored record of a node or realm secret. The value stays sealed in the vault.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretRecord {
+    pub name: SecretName,
+    pub kind: SecretKind,
+    pub description: String,
+    pub settings: SecretSettings,
+    pub uses: Vec<UseRule>,
+    /// Field names of the current value; the field values stay sealed.
+    pub fields: Vec<String>,
+    /// Write id of this record.
+    pub revision: Ulid,
+    /// Write id of the current value, which is also its vault entry id.
+    pub value_id: Ulid,
+    pub created_by: UserId,
+    pub created_at_ms: u64,
+    pub updated_by: UserId,
+    pub updated_at_ms: u64,
+}
+
+impl SecretRecord {
+    /// Checks everything a manager set, for the scope the secret lives in.
+    pub fn check(&self, scope: SecretScope) -> Result<(), SecretError> {
+        if self.description.chars().count() > MAX_DESCRIPTION {
+            return Err(SecretError::Description);
+        }
+        check_settings(&self.kind, &self.settings)?;
+        check_rules(scope, &self.kind, &self.uses)
+    }
+
+    /// The opaque token `If-Match` compares: any change of the record or the value changes it.
+    pub fn revision_token(&self) -> String {
+        format!("{}.{}", self.revision, self.value_id)
+    }
+}
+
 /// Why a secret, its value or a rule is not valid. Never carries a value.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum SecretError {

@@ -165,7 +165,7 @@ fn request<'a>(consumer: &'a SecretConsumer, target: (&'a str, &'a Url)) -> UseR
 }
 
 #[test]
-fn rules_checked_per_scope() {
+fn rules_per_scope() {
     let bearer = kind("bearer");
     let group = SecretScope::Group(GROUP);
     assert_eq!(check_rules(group, &bearer, &[inject_rule(vec![])]), Ok(()));
@@ -275,7 +275,7 @@ fn use_needs_group() {
 }
 
 #[test]
-fn verify_needs_no_target() {
+fn verify_without_target() {
     let consumer = plugin(1);
     let rule = UseRule {
         delivery: Delivery::Verify,
