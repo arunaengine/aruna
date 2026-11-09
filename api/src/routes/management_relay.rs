@@ -73,6 +73,7 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/access/onboarding/secrets"),
     ("POST", "/access/sessions"),
     ("POST", "/access/users/register"),
+    ("POST", "/plugins"),
     ("POST", "/system/realm/nodes/{node_id}/promote"),
     ("POST", "/system/realm/secrets"),
     ("POST", "/system/realm/secrets/{name}/rotate"),
