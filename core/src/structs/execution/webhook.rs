@@ -10,6 +10,7 @@ use ulid::Ulid;
 
 use crate::UserId;
 use crate::errors::ConversionError;
+use crate::register::RegisterStamp;
 use crate::structs::execution::notification::{NotificationKind, NotificationRecord};
 
 /// The one event a webhook delivers: an upload through one of the subscriber's share links.
@@ -22,13 +23,13 @@ pub const DELIVERY_HEADER: &str = "x-aruna-delivery";
 /// The most bytes a webhook URL may take.
 pub const URL_BYTES: usize = 2048;
 
-/// One immutable version of a user's webhook setting, replicated in the realm topic.
+/// One immutable write of a user's webhook setting register, replicated in the realm topic.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookSubscription {
     pub subscription_id: Ulid,
     pub user_id: UserId,
-    /// A write takes one above every version a quorum of management nodes holds.
-    pub version: u64,
+    /// The register order; its write id is `subscription_id`.
+    pub stamp: RegisterStamp,
     /// `None` when the webhook is off.
     pub url: Option<String>,
     /// The signing secret sealed to the realm key; `None` turns the webhook off.

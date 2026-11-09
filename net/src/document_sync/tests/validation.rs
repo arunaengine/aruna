@@ -921,14 +921,22 @@ fn setting_change(actor: NodeId, generation: u64, kind: DocumentChangeKind) -> D
     }
 }
 
-fn email_setting(owner: UserId, seed: u8, on: bool) -> (DocumentTarget, Vec<u8>) {
+fn setting_stamp(writer: NodeId, id: Ulid) -> aruna_core::register::RegisterStamp {
+    aruna_core::register::RegisterStamp {
+        counter: 1,
+        node_id: writer,
+        write_id: id,
+    }
+}
+
+fn email_setting(owner: UserId, seed: u8, on: bool, writer: NodeId) -> (DocumentTarget, Vec<u8>) {
     use aruna_core::structs::execution::email::EmailPreference;
     use aruna_core::structs::execution::setting::SettingChannel;
     let id = Ulid::from_parts(seed as u64, 1);
     let preference = EmailPreference {
         preference_id: id,
         user_id: owner,
-        version: 1,
+        stamp: setting_stamp(writer, id),
         categories: match on {
             true => ["share.upload".to_string()].into(),
             false => Default::default(),
@@ -946,19 +954,22 @@ fn email_upsert_validated() {
     let owner = UserId::local(Ulid::from_parts(1, 1), RealmId::from_bytes([2u8; 32]));
     let upsert = setting_change(node(7), 1, DocumentChangeKind::Upsert);
     for on in [true, false] {
-        let (target, bytes) = email_setting(owner, 1, on);
+        let (target, bytes) = email_setting(owner, 1, on, node(7));
         assert!(validate_setting_upsert(&target, &bytes, &upsert).is_ok());
         let later = setting_change(node(7), 2, DocumentChangeKind::Upsert);
         assert!(validate_setting_upsert(&target, &bytes, &later).is_err());
     }
-    let (target, bytes) = email_setting(owner, 1, true);
+    let (target, bytes) = email_setting(owner, 1, true, node(7));
     let mut preference = EmailPreference::from_bytes(&bytes).expect("setting decodes");
     let other = UserId::local(Ulid::from_parts(9, 9), owner.realm_id);
     let mut broken = Vec::new();
-    let changes: [fn(&mut EmailPreference); 5] = [
+    let changes: [fn(&mut EmailPreference); 7] = [
         |setting: &mut EmailPreference| setting.categories.clear(),
         |setting: &mut EmailPreference| setting.sealed = None,
-        |setting: &mut EmailPreference| setting.version = 0,
+        |setting: &mut EmailPreference| setting.stamp.counter = 0,
+        |setting: &mut EmailPreference| setting.stamp.write_id = Ulid::from_parts(8, 8),
+        // The stamp must name the node that published the write.
+        |setting: &mut EmailPreference| setting.stamp.node_id = node(8),
         |setting: &mut EmailPreference| setting.categories = ["resource.watch".to_string()].into(),
         |setting: &mut EmailPreference| setting.sealed = Some(vec![0; 4096]),
     ];
@@ -990,7 +1001,7 @@ fn webhook_upsert_validated() {
         let subscription = WebhookSubscription {
             subscription_id: id,
             user_id: owner,
-            version: 1,
+            stamp: setting_stamp(node(7), id),
             url: url.map(str::to_string),
             sealed,
             created_at_ms: 1,
@@ -1008,15 +1019,15 @@ fn webhook_upsert_validated() {
     ] {
         assert!(validate_setting_upsert(&target, &bytes, &upsert).is_err());
     }
-    let (email_target, _) = email_setting(owner, 3, true);
+    let (email_target, _) = email_setting(owner, 3, true, node(7));
     let mismatched = setting(url, Some(vec![1; 80]));
     assert!(validate_setting_upsert(&email_target, &mismatched, &upsert).is_err());
 }
 
 #[tokio::test]
 async fn foreign_actor_rejected() {
-    // A setting whose revision actor is not its publisher, an invalid one and any delete are
-    // quarantined; the valid setting applies.
+    // A setting whose revision actor is not its publisher, an invalid one, other bytes under a
+    // known target and any delete are quarantined; the valid setting applies and replays skip.
     let (_storage_dir, storage) = test_storage();
     let doc_dir = tempfile::tempdir().expect("doc dir");
     let realm_id = RealmId::from_bytes([72u8; 32]);
@@ -1033,17 +1044,13 @@ async fn foreign_actor_rejected() {
     .expect("document sync service opens");
     let local = service.local_node_id().expect("local node id");
     let owner = UserId::local(Ulid::from_bytes([3; 16]), realm_id);
-    let (forged, forged_bytes) = email_setting(owner, 1, true);
-    let (valid, valid_bytes) = email_setting(owner, 2, false);
-    let (removed, _) = email_setting(owner, 3, true);
-    let (invalid, _) = email_setting(owner, 4, true);
+    let (forged, forged_bytes) = email_setting(owner, 1, true, node(71));
+    let (valid, valid_bytes) = email_setting(owner, 2, false, local);
+    let (_, conflicting) = email_setting(owner, 2, true, local);
+    let (removed, _) = email_setting(owner, 3, true, local);
+    let (invalid, _) = email_setting(owner, 4, true, local);
     let topic = valid.sync_topic_id(realm_id, &PlacementRef::NIL);
-    let events = [
-        Ulid::generate(),
-        Ulid::generate(),
-        Ulid::generate(),
-        Ulid::generate(),
-    ];
+    let events: [Ulid; 6] = std::array::from_fn(|_| Ulid::generate());
     let upsert =
         |event_id, target: &DocumentTarget, bytes: &[u8], actor| DocumentSyncPublish::Upsert {
             event_id,
@@ -1064,6 +1071,8 @@ async fn foreign_actor_rejected() {
                     allow_genesis: true,
                 },
                 upsert(events[3], &valid, &valid_bytes, local),
+                upsert(events[4], &valid, &conflicting, local),
+                upsert(events[5], &valid, &valid_bytes, local),
             ],
             Vec::new(),
         )
@@ -1079,7 +1088,7 @@ async fn foreign_actor_rejected() {
         .expect("rejected settings are quarantined");
 
     let records = quarantine_rows(&storage).await;
-    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(records.len(), 4, "{records:?}");
     assert_eq!(
         quarantined_reason(&records, events[0]),
         "notification setting revision actor is not its publisher"
@@ -1088,6 +1097,10 @@ async fn foreign_actor_rejected() {
     assert_eq!(
         quarantined_reason(&records, events[2]),
         "notification settings are never deleted"
+    );
+    assert_eq!(
+        quarantined_reason(&records, events[4]),
+        "notification setting conflicts with a stored write"
     );
     let applied = read_storage_value(&storage, valid.storage_keyspace(), valid.storage_key()).await;
     assert_eq!(applied.as_deref(), Some(valid_bytes.as_slice()));

@@ -121,12 +121,12 @@ pub enum DocumentTarget {
         record_id: Ulid,
     },
     // Appended, because stored rows and sync ops carry the variant index.
-    /// One immutable version of a user's email setting; the newest confirmed one decides.
+    /// One immutable version of a user's email setting; the highest stamp decides.
     EmailPreference {
         owner: UserId,
         preference_id: Ulid,
     },
-    /// One immutable version of a user's webhook setting; the newest confirmed one decides.
+    /// One immutable version of a user's webhook setting; the highest stamp decides.
     WebhookSubscription {
         owner: UserId,
         subscription_id: Ulid,

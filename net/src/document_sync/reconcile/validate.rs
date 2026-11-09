@@ -1120,7 +1120,11 @@ pub(in crate::document_sync) fn validate_setting_upsert(
     if change.kind != DocumentChangeKind::Upsert || change.current.generation != 1 {
         return Err("a setting upsert must carry a generation 1 upsert revision".to_string());
     }
-    validate_setting(target, bytes).map(|_| ())
+    let head = validate_setting(target, bytes)?;
+    match head.stamp.written_by(change.current.actor) {
+        true => Ok(()),
+        false => Err("the setting stamp names another node than its actor".to_string()),
+    }
 }
 
 pub(in crate::document_sync) fn validate_watch_delete(

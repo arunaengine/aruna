@@ -10,18 +10,19 @@ use ulid::Ulid;
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::realm_vault::{RealmSecretRef, RealmVaultPurpose};
+use crate::register::RegisterStamp;
 use crate::structs::execution::notification::NotificationRecord;
 
 /// The notification categories a user may receive by email.
 pub const EMAIL_CATEGORIES: &[&str] = &["group.membership", "share.upload", "bucket.encryption"];
 
-/// One immutable version of a user's email setting, replicated in the realm topic.
+/// One immutable write of a user's email setting register, replicated in the realm topic.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailPreference {
     pub preference_id: Ulid,
     pub user_id: UserId,
-    /// A write takes one above every version a quorum of management nodes holds.
-    pub version: u64,
+    /// The register order; its write id is `preference_id`.
+    pub stamp: RegisterStamp,
     /// Empty when email is off.
     pub categories: BTreeSet<String>,
     /// The address sealed to the realm key; `None` turns email off.
@@ -146,7 +147,11 @@ mod tests {
         let preference = EmailPreference {
             preference_id: Ulid::from_parts(2, 2),
             user_id: record.recipient,
-            version: 1,
+            stamp: RegisterStamp {
+                counter: 1,
+                node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+                write_id: Ulid::from_parts(2, 2),
+            },
             categories: BTreeSet::from(["group.membership".to_string()]),
             sealed: Some(vec![1]),
             created_at_ms: 1,

@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::{DocumentEvent, DocumentTarget};
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::register::{Admission, admit_write};
 use aruna_core::structs::SyncQuarantineIdentity;
 use aruna_core::structs::execution::setting::SettingChannel;
 use tracing::warn;
@@ -131,7 +134,7 @@ pub(super) async fn apply_watch_event(
         } if SettingChannel::of_target(&target).is_some() => {
             let expected_actor =
                 ::irokle::actor_id_for(topic_id, node_to_peer(&change.current.actor));
-            let reason = match actor_id == expected_actor {
+            let mut reason = match actor_id == expected_actor {
                 true => validate_setting_upsert(&target, &bytes, &change)
                     .err()
                     .map(|reason| format!("invalid notification setting: {reason}")),
@@ -139,6 +142,18 @@ pub(super) async fn apply_watch_event(
                     Some("notification setting revision actor is not its publisher".to_string())
                 }
             };
+            // Register writes are immutable: a replay changes nothing, other bytes are refused.
+            let mut replay = false;
+            if reason.is_none() {
+                let stored = stored_row(service, &target).await?;
+                match admit_write(stored.as_deref(), &bytes) {
+                    Admission::Store => {}
+                    Admission::Replay => replay = true,
+                    Admission::Conflict => {
+                        reason = Some("notification setting conflicts with a stored write".into())
+                    }
+                }
+            }
             if let Some(reason) = reason {
                 warn!(%topic_id, %reason, "Rejecting a notification setting");
                 let event = DocumentEvent::Upsert {
@@ -151,16 +166,17 @@ pub(super) async fn apply_watch_event(
                     identity, event, reason,
                 )));
             }
-            if service
-                .apply_watch_change(target.clone(), Some(bytes), change)
-                .await?
+            if !replay
+                && service
+                    .apply_watch_change(target.clone(), Some(bytes), change)
+                    .await?
             {
                 Ok(SharedOutcome::Applied(target))
             } else {
                 Ok(SharedOutcome::Skipped)
             }
         }
-        // Settings are immutable versions; a newer version turns a setting off.
+        // Settings are immutable register writes; a newer write turns a setting off.
         event @ DocumentEvent::Delete { .. }
             if SettingChannel::of_target(event.target()).is_some() =>
         {
@@ -394,6 +410,23 @@ async fn apply_node_event(
                 "unsupported non-upsert node info document event",
             )))
         }
+    }
+}
+
+/// The stored bytes of a register write, if this node holds the target.
+async fn stored_row(
+    service: &DocumentSyncService,
+    target: &DocumentTarget,
+) -> Result<Option<Vec<u8>>> {
+    let read = StorageEffect::Read {
+        key_space: target.storage_keyspace().to_string(),
+        key: target.storage_key(),
+        txn_id: None,
+    };
+    match service.storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.map(|row| row.to_vec())),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(NetError::Dht(format!("unexpected setting read: {other:?}"))),
     }
 }
 
