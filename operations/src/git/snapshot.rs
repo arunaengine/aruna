@@ -12,7 +12,7 @@ use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::distribution::resolve::version_holders;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::metadata::materialization_queue::document_job_queued;
+use crate::metadata::materialization_queue::capture_pending;
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::get::GetBucketOperation;
@@ -79,11 +79,11 @@ pub(super) async fn current(
     revision: Option<&MetadataRawRevision>,
     materializing: bool,
 ) -> Result<Option<(Ulid, String)>, GitError> {
-    // A queued job, a late merge too, snapshots its own graph and stores it only when it
-    // finishes, so until then the raw view can be older than that snapshot.
+    // A job that published its graph, a late merge too, stores it only when it finishes, so
+    // until then the raw view can be older. A job still waiting for dependencies holds nothing.
     if !materializing {
-        let queued = document_job_queued(&context.storage_handle, document.document_id).await;
-        if queued.map_err(|_| GitError::Unavailable)? {
+        let captured = capture_pending(&context.storage_handle, document.document_id).await;
+        if captured.map_err(|_| GitError::Unavailable)? {
             return Ok(None);
         }
     }

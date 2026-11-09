@@ -12,7 +12,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+    DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE,
+    MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
     MATERIALIZATION_STATUS_KEYSPACE,
 };
 use aruna_core::metadata::{
@@ -602,6 +603,10 @@ async fn plan_finish_chunk(
                 ));
                 if let Some(document_job_key) = job.document_job_key {
                     plan.deletes.push((
+                        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+                        ByteView::from(document_job_key.clone()),
+                    ));
+                    plan.deletes.push((
                         DOCUMENT_JOB_KEYSPACE.to_string(),
                         ByteView::from(document_job_key),
                     ));
@@ -671,6 +676,11 @@ async fn plan_finish_chunk(
                     ),
                     (
                         DOCUMENT_JOB_KEYSPACE.to_string(),
+                        document_job_key(job.document_id, job.event_id),
+                    ),
+                    // A parked job no longer holds refreshes to its graph.
+                    (
+                        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
                         document_job_key(job.document_id, job.event_id),
                     ),
                 ];
@@ -1540,6 +1550,13 @@ async fn process_materialization_job(
     match apply_result {
         Ok(materialized) => {
             let raw_revision = materialized.raw_revision;
+            // Refreshes keep off the raw view from here until the finish batch stores this graph.
+            if let Err(error) = mark_capture(&context.storage_handle, &job).await {
+                return Ok(ProcessedMaterializationJob::deferred(
+                    defer_materialization_job(&job_key, &job, &event, &error),
+                    craqle_elapsed,
+                ));
+            }
             // Boxed so callers' futures stay shallow enough to prove `Send`.
             let capture: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> = Box::pin(
                 crate::git::snapshot::capture(context, &event.record, raw_revision.as_ref()),
@@ -1847,15 +1864,37 @@ fn should_write_retry(
     })
 }
 
-/// Whether a materialization job of the document is queued or running. Its finish batch
-/// removes the row together with the graph state the job stores.
-pub async fn document_job_queued(
+/// Records that the job is about to publish a Git snapshot of a graph it has not stored yet.
+async fn mark_capture(
+    storage: &StorageHandle,
+    job: &MetadataMaterializationRecord,
+) -> Result<(), MetadataMaterializationError> {
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+            key: document_job_key(job.document_id, job.event_id),
+            value: ByteView::from(Vec::new()),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
+/// Whether a job of the document published a Git snapshot whose graph is not stored yet. The
+/// job's finish batch stores the graph and removes the row together; a dependency wait has none.
+pub async fn capture_pending(
     storage: &StorageHandle,
     document_id: Ulid,
 ) -> Result<bool, MetadataMaterializationError> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
-            key_space: DOCUMENT_JOB_KEYSPACE.to_string(),
+            key_space: MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
             prefix: Some(document_job_prefix(document_id)),
             start: None,
             limit: 1,
@@ -1933,6 +1972,10 @@ async fn delete_materialization_job(
     if let Some((document_id, event_id)) = job_key_target(&key) {
         deletes.push((
             DOCUMENT_JOB_KEYSPACE.to_string(),
+            document_job_key(document_id, event_id),
+        ));
+        deletes.push((
+            MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
             document_job_key(document_id, event_id),
         ));
     }

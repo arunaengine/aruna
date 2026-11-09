@@ -4,7 +4,10 @@
 
 use super::*;
 use aruna_core::NodeId;
-use aruna_core::keyspaces::{DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, RAW_REVISION_KEYSPACE};
+use aruna_core::keyspaces::{
+    DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, MATERIALIZATION_CAPTURE_KEYSPACE,
+    RAW_REVISION_KEYSPACE,
+};
 use aruna_core::storage_entries::{create_event_entry, raw_revision_key};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -85,6 +88,16 @@ fn create_event(document_id: Ulid, event_id: Ulid, name: &str) -> MetadataEventR
         },
         occurred_at_ms: 1,
     }
+}
+
+// The row a job writes before it publishes its graph to Git.
+fn capture_mark(document_id: Ulid, event_id: Ulid) -> (String, ByteView, ByteView) {
+    let key = document_job_key(document_id, event_id);
+    (
+        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+        key,
+        ByteView::from(Vec::new()),
+    )
 }
 
 fn with_payload(
@@ -622,6 +635,7 @@ async fn failure_cap_parks() {
             create_event_entry(&event).unwrap(),
             materialization_job_entry(&job).unwrap(),
             document_job_entry(&job).unwrap(),
+            capture_mark(document_id, event_id),
         ],
     )
     .await;
@@ -633,6 +647,7 @@ async fn failure_cap_parks() {
 
     assert!(!storage_key_exists(&storage, MATERIALIZATION_JOB_KEYSPACE, index_key.to_vec()).await);
     assert!(!storage_key_exists(&storage, DOCUMENT_JOB_KEYSPACE, sidecar_key.to_vec()).await);
+    assert!(!capture_pending(&storage, document_id).await.unwrap());
     let status = read_materialization_status(&storage, document_id, None)
         .await
         .unwrap()
@@ -1589,6 +1604,7 @@ async fn finish_stores_merge() {
             materialization_status_entry(&newer_status).unwrap(),
             materialization_job_entry(&late_job).unwrap(),
             document_job_entry(&late_job).unwrap(),
+            capture_mark(document_id, late_job.event_id),
         ],
     )
     .await;
@@ -1623,7 +1639,100 @@ async fn finish_stores_merge() {
         "the newer status stays"
     );
     assert!(storage_key_exists(&storage, RAW_REVISION_KEYSPACE, raw_state_key.to_vec()).await);
-    assert!(!document_job_queued(&storage, document_id).await.unwrap());
+    assert!(!capture_pending(&storage, document_id).await.unwrap());
+}
+
+fn crate_render(names: &[&str]) -> String {
+    let graph: Vec<_> = (names.iter().enumerate())
+        .map(|(index, name)| serde_json::json!({"@id": format!("#e{index}"), "name": name}))
+        .collect();
+    serde_json::json!({"@context": "https://w3id.org/ro/crate/1.2/context", "@graph": graph})
+        .to_string()
+}
+
+// Two late merges of one drain chain through the shared raw cache and keep the newer content.
+#[tokio::test]
+async fn late_merges_chain() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let document_id = Ulid::from_bytes([6u8; 16]);
+    let newer = create_event(document_id, Ulid::from_parts(9, 1), "newer");
+    let renders = [
+        crate_render(&["newer"]),
+        crate_render(&["newer", "first"]),
+        crate_render(&["newer", "first", "second"]),
+    ];
+    let prepare = crate::metadata::raw_revision::prepare_merged_event;
+    let mut fresh = RawStateCache::default();
+    let stored = prepare(&context, &newer, renders[0].clone(), 0, &mut fresh)
+        .await
+        .unwrap();
+    let newer_status = materialized_status(document_id, &newer);
+    write_entries(
+        &storage,
+        vec![
+            stored.state_write,
+            materialization_status_entry(&newer_status).unwrap(),
+        ],
+    )
+    .await;
+
+    let mut cache = RawStateCache::default();
+    let mut finished = Vec::new();
+    for (index, render) in renders[1..].iter().enumerate() {
+        let late = create_event(document_id, Ulid::from_parts(index as u64 + 1, 1), "late");
+        let plan = prepare(&context, &late, render.clone(), 0, &mut cache)
+            .await
+            .unwrap();
+        plan.cache(&mut cache);
+        let job = MetadataMaterializationRecord {
+            document_id,
+            event_id: late.event_id,
+            due_at_ms: 1,
+            attempts: 0,
+            failures: 0,
+            parks: 0,
+        };
+        let (_, job_key, _) = materialization_job_entry(&job).unwrap();
+        finished.push(FinishedMaterializationJob::Completed(
+            CompletedMaterializationJob {
+                job_key: job_key.to_vec(),
+                document_job_key: Some(document_job_key(document_id, late.event_id).to_vec()),
+                status: Some(materialization_success_status(&job, &late, None)),
+                iri_index_writes: Vec::new(),
+                link_deletes: Vec::new(),
+                raw_state_write: Some(plan.state_write),
+                validation_write: None,
+                sync: None,
+                merge: true,
+            },
+        ));
+    }
+    finish_completed_jobs(&storage, finished).await.unwrap();
+
+    let raw = crate::metadata::raw_revision::load_raw_revision(&context, document_id, None)
+        .await
+        .unwrap()
+        .expect("the merged graph is stored");
+    assert_eq!(
+        raw.jsonld, renders[2],
+        "the second merge builds on the first"
+    );
+    assert_eq!(raw.winning_event_id, newer.event_id);
+    assert_eq!(
+        read_materialization_status(&storage, document_id, None)
+            .await
+            .unwrap(),
+        Some(newer_status)
+    );
 }
 
 #[tokio::test]

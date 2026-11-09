@@ -1,4 +1,4 @@
-//! Tests which graph a refresh may snapshot while a materialization job is queued.
+//! Tests which graph a refresh may snapshot while a materialization job waits or captures.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -6,7 +6,7 @@ use super::current;
 use crate::driver::DriverContext;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::DOCUMENT_JOB_KEYSPACE;
+use aruna_core::keyspaces::MATERIALIZATION_CAPTURE_KEYSPACE;
 use aruna_core::metadata::{
     MaterializationState, MaterializationStatusRecord, MetadataEventPayload, MetadataEventRecord,
     MetadataMaterializationRecord, MetadataRawRevision,
@@ -80,11 +80,13 @@ fn status(
     status
 }
 
-/// Stores the older event, the status and the job row of `queued`, if any.
+/// Stores the older event, the status and the job row of `queued`, if any, which `captured`
+/// marks as a job that published its graph.
 async fn stored(
     event: &MetadataEventRecord,
     status: &MaterializationStatusRecord,
     queued: Option<Ulid>,
+    captured: bool,
 ) -> (tempfile::TempDir, DriverContext) {
     let directory = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
@@ -102,6 +104,15 @@ async fn stored(
             parks: 0,
         };
         writes.push(document_job_entry(&job).unwrap());
+        if captured {
+            let key = document_job_key(job.document_id, event_id);
+            let mark = (
+                MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+                key,
+                Vec::new().into(),
+            );
+            writes.push(mark);
+        }
     }
     let written = storage
         .send_storage_effect(StorageEffect::BatchWrite {
@@ -130,7 +141,7 @@ async fn waits_for_materialization() {
     let pending = Ulid::from_parts(2, 10);
     let (event, document) = events(pending);
     let status = status(&event, pending, MaterializationState::Pending);
-    let (_directory, context) = stored(&event, &status, Some(pending)).await;
+    let (_directory, context) = stored(&event, &status, Some(pending), true).await;
 
     let refreshed = current(&context, &document, None, false).await.unwrap();
     assert_eq!(refreshed, None, "a refresh snapshots the older graph");
@@ -149,6 +160,25 @@ async fn waits_for_materialization() {
         Some((pending, supplied.jsonld.clone())),
         "a capture snapshots the graph its job made"
     );
+    let refreshed = current(&context, &document, Some(&supplied), false).await;
+    assert_eq!(
+        refreshed.unwrap(),
+        None,
+        "a refresh passes the captured job"
+    );
+}
+
+// A batch waiting for a predecessor on an offline node holds back no completed revision, which
+// this holder must still publish, for example after holder failover.
+#[tokio::test]
+async fn waiting_job_publishes() {
+    let waiting = Ulid::from_parts(2, 10);
+    let (event, document) = events(OLDER);
+    let status = status(&event, OLDER, MaterializationState::Materialized);
+    let (_directory, context) = stored(&event, &status, Some(waiting), false).await;
+
+    let refreshed = current(&context, &document, None, false).await.unwrap();
+    assert_eq!(refreshed.map(|(id, _)| id), Some(OLDER));
 }
 
 // A late merge leaves the newer status materialized; its job still holds refreshes back.
@@ -158,7 +188,7 @@ async fn waits_for_merge() {
     let late = Ulid::from_parts(2, 10);
     let (event, document) = events(newer);
     let status = status(&event, newer, MaterializationState::Materialized);
-    let (_directory, context) = stored(&event, &status, Some(late)).await;
+    let (_directory, context) = stored(&event, &status, Some(late), true).await;
 
     let refreshed = current(&context, &document, None, false).await.unwrap();
     assert_eq!(
@@ -166,11 +196,11 @@ async fn waits_for_merge() {
         "a refresh snapshots the graph before the merge"
     );
 
-    // Completion removes the job row in the batch that stores the merged graph.
+    // Completion removes the mark in the batch that stores the merged graph.
     let removed = context
         .storage_handle
         .send_storage_effect(StorageEffect::Delete {
-            key_space: DOCUMENT_JOB_KEYSPACE.to_string(),
+            key_space: MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
             key: document_job_key(document.document_id, late),
             txn_id: None,
         })
@@ -187,7 +217,7 @@ async fn waits_for_merge() {
 async fn snapshots_materialized_graph() {
     let (event, document) = events(OLDER);
     let status = status(&event, OLDER, MaterializationState::Materialized);
-    let (_directory, context) = stored(&event, &status, None).await;
+    let (_directory, context) = stored(&event, &status, None, false).await;
 
     let refreshed = current(&context, &document, None, false).await.unwrap();
     let (id, jsonld) = refreshed.expect("a materialized graph is ready");
