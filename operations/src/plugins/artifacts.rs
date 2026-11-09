@@ -257,3 +257,6 @@ pub fn spawn_repair(context: Arc<DriverContext>, shutdown: &Shutdown) {
     });
 }
 
+#[cfg(test)]
+#[path = "artifacts_tests.rs"]
+mod tests;
