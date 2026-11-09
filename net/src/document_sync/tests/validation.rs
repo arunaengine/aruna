@@ -1108,3 +1108,70 @@ async fn foreign_actor_rejected() {
     assert!(skipped.await.is_none());
     service.shutdown().await;
 }
+
+#[test]
+fn secret_upsert_validated() {
+    // Owner secret writes admit by structure and origin only; membership is decided later.
+    use aruna_core::admin_documents::AdminDocumentClock;
+    use aruna_core::registers::{
+        SecretBody, SecretDocument, SecretLifecycle, SecretOwner, SecretValue,
+    };
+    use aruna_core::secrets::{SecretKind, SecretName};
+    let realm_id = RealmId::from_bytes([2u8; 32]);
+    let owner = SecretOwner::Group(Ulid::from_parts(5, 5));
+    let name = SecretName::try_from("catalog-key".to_string()).expect("valid name");
+    let id = Ulid::from_parts(3, 1);
+    let document = SecretDocument {
+        owner,
+        name: name.clone(),
+        stamp: setting_stamp(node(7), id),
+        incarnation: id,
+        config_clock: AdminDocumentClock::default(),
+        author: UserId::local(Ulid::from_parts(1, 1), realm_id),
+        written_at_ms: 1,
+        body: SecretBody::Lifecycle(SecretLifecycle::Created {
+            kind: SecretKind::parse("bearer").expect("built-in kind"),
+            readable: false,
+        }),
+    };
+    let target = |part| DocumentTarget::OwnerSecret {
+        realm_id,
+        owner,
+        name: name.clone(),
+        part,
+        write_id: id,
+    };
+    let lifecycle = target(aruna_core::registers::SecretPart::Lifecycle);
+    let upsert = setting_change(node(7), 1, DocumentChangeKind::Upsert);
+    let bytes = document.to_bytes().expect("document serializes");
+    assert!(validate_register_upsert(&lifecycle, &bytes, &upsert).is_ok());
+    let later = setting_change(node(7), 2, DocumentChangeKind::Upsert);
+    assert!(validate_register_upsert(&lifecycle, &bytes, &later).is_err());
+    let wrong_part = target(aruna_core::registers::SecretPart::Value);
+    assert!(validate_register_upsert(&wrong_part, &bytes, &upsert).is_err());
+    let mut broken = Vec::new();
+    let changes: [fn(&mut SecretDocument); 4] = [
+        |document: &mut SecretDocument| document.stamp.counter = 0,
+        // The stamp must name the node that published the write.
+        |document: &mut SecretDocument| document.stamp.node_id = node(8),
+        |document: &mut SecretDocument| document.incarnation = Ulid::from_parts(9, 9),
+        |document: &mut SecretDocument| {
+            document.body = SecretBody::Value(SecretValue {
+                fields: vec!["token".to_string()],
+                sealed: vec![0; 20_000],
+            })
+        },
+    ];
+    for change in changes {
+        let mut changed = document.clone();
+        change(&mut changed);
+        broken.push(changed);
+    }
+    for document in broken {
+        let bytes = document.to_bytes().expect("document serializes");
+        assert!(
+            validate_register_upsert(&lifecycle, &bytes, &upsert).is_err(),
+            "{document:?}"
+        );
+    }
+}
