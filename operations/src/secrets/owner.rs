@@ -834,3 +834,7 @@ pub fn open_value(
         &sealed.sealed,
     )?)
 }
+
+#[cfg(test)]
+#[path = "owner_tests.rs"]
+mod tests;
