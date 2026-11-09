@@ -283,6 +283,14 @@ impl fmt::Debug for RealmSealKey {
     }
 }
 
+impl PartialEq for RealmSealKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ct_eq(&other.0).into()
+    }
+}
+
+impl Eq for RealmSealKey {}
+
 impl Drop for RealmSealKey {
     fn drop(&mut self) {
         self.0.zeroize();

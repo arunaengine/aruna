@@ -1,4 +1,4 @@
-//! Defines a user's webhook subscription, the delivery job of one notification and its signature.
+//! Defines a user's webhook setting, the delivery job of one notification and its signature.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -19,12 +19,20 @@ pub const SIGNATURE_HEADER: &str = "x-aruna-signature";
 /// Header carrying the delivery id, stable across retries, for receiver deduplication.
 pub const DELIVERY_HEADER: &str = "x-aruna-delivery";
 
+/// The most bytes a webhook URL may take.
+pub const URL_BYTES: usize = 2048;
+
+/// One immutable version of a user's webhook setting, replicated in the realm topic.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookSubscription {
-    /// Also the node vault id of the signing secret, so a replaced secret never signs again.
     pub subscription_id: Ulid,
     pub user_id: UserId,
-    pub url: String,
+    /// A write takes one above every version a quorum of management nodes holds.
+    pub version: u64,
+    /// `None` when the webhook is off.
+    pub url: Option<String>,
+    /// The signing secret sealed to the realm key; `None` turns the webhook off.
+    pub sealed: Option<Vec<u8>>,
     pub created_at_ms: u64,
 }
 
@@ -38,11 +46,19 @@ impl WebhookSubscription {
     }
 }
 
-pub fn webhook_key(user_id: &UserId) -> Vec<u8> {
-    user_id.to_bytes()
+/// An http or https URL with a host and without credentials, at most [`URL_BYTES`] long.
+pub fn valid_url(url: &str) -> bool {
+    url.len() <= URL_BYTES
+        && url::Url::parse(url).is_ok_and(|parsed| {
+            matches!(parsed.scheme(), "http" | "https")
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.host().is_some()
+        })
 }
 
-/// One delivery of one notification to its recipient's subscription.
+/// One delivery of one notification; the job reads the current setting when it runs, so
+/// `subscription_id` is nil.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookDeliverySpec {
     pub subscription_id: Ulid,
