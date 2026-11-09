@@ -1,13 +1,18 @@
-//! Builds temporary storage, users and seeded records for the notification tests.
+//! Builds temporary storage, users, seeded records and canned management answers for the
+//! notification tests.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
+use crate::metadata::protocol::MetadataReadError;
 use crate::notifications::inbox::upsert_inbox_records;
+use crate::notifications::settings::{SettingAnswer, SettingPeers, StoreAnswer};
 use aruna_core::UserId;
+use aruna_core::document::{DocumentChange, DocumentTarget};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
+use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_storage::storage::{FjallStorage, StorageHandle};
 use tempfile::{TempDir, tempdir};
@@ -60,4 +65,51 @@ pub(crate) async fn seed(storage: &StorageHandle, records: &[NotificationRecord]
         upsert_inbox_records(storage, records).await,
         Ok(records.len())
     );
+}
+
+/// Management nodes that answer setting reads with fixed answers and count them. A node
+/// without an answer is unreachable, and writes always fail.
+#[derive(Default)]
+pub(crate) struct CannedPeers {
+    pub answers: std::collections::HashMap<aruna_core::NodeId, SettingAnswer>,
+    pub reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SettingPeers for CannedPeers {
+    async fn read(
+        &self,
+        node: aruna_core::NodeId,
+        _owner: UserId,
+        _channel: SettingChannel,
+    ) -> Result<SettingAnswer, MetadataReadError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.answers
+            .get(&node)
+            .cloned()
+            .ok_or(MetadataReadError::Unavailable)
+    }
+
+    async fn store(
+        &self,
+        _node: aruna_core::NodeId,
+        _target: DocumentTarget,
+        _bytes: Vec<u8>,
+        _change: DocumentChange,
+    ) -> Result<StoreAnswer, MetadataReadError> {
+        Err(MetadataReadError::Unavailable)
+    }
+
+    async fn confirm(
+        &self,
+        _node: aruna_core::NodeId,
+        _target: DocumentTarget,
+    ) -> Result<(), MetadataReadError> {
+        Err(MetadataReadError::Unavailable)
+    }
+}
+
+/// Three management nodes, in config order.
+pub(crate) fn managers() -> [aruna_core::NodeId; 3] {
+    [61u8, 62, 63].map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
 }
