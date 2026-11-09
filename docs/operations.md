@@ -33,6 +33,20 @@ the [README](../README.md) to get a node running.
   A node can also download a portal release archive with `PORTAL_MODE=artifact` and
   `PORTAL_ARTIFACT_URL`. An enabled portal needs `PORTAL_SOCKET_ADDRESS`, `API_PUBLIC_URL` and the
   portal origin in `CORS_ALLOWED_ORIGINS`.
+- **Portal landing page.** `PORTAL_LANDING=disabled` opens the app at `/` instead of the landing
+  page. The default is `enabled`.
+- **Legal pages.** `PORTAL_LEGAL` lists the imprint, privacy and terms pages of the deployment as
+  one JSON list, in display order. Each entry has a `label` and exactly one of `url` (an `https://`
+  page) or `file` (a Markdown file on the node). The node reads each file at startup and sends its
+  text with every portal start, so keep files to a few KiB and restart the node after a change.
+  Without `PORTAL_LEGAL` the portal shows no legal links. Invalid JSON, an empty label, a missing
+  or unreadable file, a plain `http` URL or an entry with both or neither source stops the start
+  with an error that names `PORTAL_LEGAL`.
+
+  ```
+  PORTAL_LEGAL='[{"label":"Imprint","url":"https://example.org/imprint"},
+    {"label":"Privacy","file":"/srv/aruna/legal/privacy.md"}]'
+  ```
 - **Compute.** `ARUNA_COMPUTE_EXECUTOR` is `none` by default. The `docker` executor needs the host's
   Docker socket and an S3 address that job containers can reach.
 
