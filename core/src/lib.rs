@@ -44,6 +44,7 @@ pub mod repo_layout;
 pub mod repository;
 pub mod request_policy;
 pub mod scheduling;
+pub mod secrets;
 pub mod shutdown;
 pub mod storage_entries;
 pub mod stream;
