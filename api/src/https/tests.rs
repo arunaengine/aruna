@@ -766,7 +766,7 @@ struct RestStack {
     _shutdown: tokio_util::sync::DropGuard,
 }
 
-async fn rest_stack() -> RestStack {
+async fn rest_stack(cors: crate::cors::CorsConfig) -> RestStack {
     use crate::server::state::ServerState;
     use crate::server::{Server, ServerConfig};
     use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -812,7 +812,7 @@ async fn rest_stack() -> RestStack {
         ServerConfig {
             http_addr: plain.local_addr().expect("plain address"),
             max_body_size: crate::server::MAX_BODY_SIZE,
-            cors: crate::cors::CorsConfig::default(),
+            cors,
         },
     );
     tokio::spawn(
@@ -849,7 +849,7 @@ fn organization_url(body: &[u8]) -> String {
 async fn tls_origin_urls() {
     // DRS builds absolute URLs from the request; over TLS they carry the
     // configured HTTPS origin on HTTP/1.1 and on HTTP/2, which sends no `Host`.
-    let stack = rest_stack().await;
+    let stack = rest_stack(crate::cors::CorsConfig::default()).await;
     let path = "/api/v1/ga4gh/drs/v1/service-info";
 
     let stream = connect(
@@ -1201,4 +1201,50 @@ async fn try_hold(
         .await
         .ok()?;
     Some(sender)
+}
+
+#[tokio::test]
+async fn tls_cors_preflight() {
+    // The portal origin calls the API over TLS: the preflight must allow it.
+    let cors = crate::cors::CorsConfig::new(vec!["https://portal.test".to_string()]);
+    let stack = rest_stack(cors).await;
+    let stream = connect(
+        stack.address,
+        dns("api.test"),
+        client_config(&stack.ca, &[b"http/1.1"]),
+    )
+    .await
+    .expect("TLS connection");
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("HTTP/1.1 handshake");
+    tokio::spawn(connection);
+    let request = http::Request::builder()
+        .method(http::Method::OPTIONS)
+        .uri("/api/v1/access/groups")
+        .header(http::header::HOST, "api.test")
+        .header(http::header::ORIGIN, "https://portal.test")
+        .header(http::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+        .body(Body::empty())
+        .expect("preflight");
+    let response = sender.send_request(request).await.expect("response");
+    assert!(response.status().is_success(), "{}", response.status());
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some("https://portal.test")
+    );
+}
+
+#[test]
+fn portal_api_base() {
+    // A native HTTPS origin has no path, so the portal calls `/api/v1` on it.
+    let routes = routes();
+    let origin = routes.origin(HostRoute::Rest).expect("REST origin");
+    assert_eq!(
+        crate::portal::api_base_url(origin),
+        "https://api.test/api/v1"
+    );
 }

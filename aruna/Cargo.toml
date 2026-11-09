@@ -76,6 +76,8 @@ keyring-core = { workspace = true }
 aruna-kpabe = { workspace = true }
 axum = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+aws-smithy-http-client = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
 rcgen = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",

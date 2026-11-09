@@ -14,6 +14,7 @@ mod credentials;
 mod drs;
 mod git_native;
 mod groups;
+mod https;
 mod job_api;
 mod mcp_artifacts;
 mod network_recovery;
