@@ -1143,7 +1143,7 @@ pub(in crate::document_sync) fn validate_secret_upsert(
     else {
         return Err("the target is not an owner secret".to_string());
     };
-    let document = aruna_core::registers::SecretDocument::from_bytes(bytes)
+    let document = aruna_core::secret_registers::SecretDocument::from_bytes(bytes)
         .map_err(|error| format!("undecodable secret write: {error}"))?;
     document.check()?;
     let matches = document.owner == *owner

@@ -134,9 +134,9 @@ pub enum DocumentTarget {
     /// One immutable register write of a user or group secret.
     OwnerSecret {
         realm_id: RealmId,
-        owner: crate::registers::SecretOwner,
+        owner: crate::secret_registers::SecretOwner,
         name: crate::secrets::SecretName,
-        part: crate::registers::SecretPart,
+        part: crate::secret_registers::SecretPart,
         write_id: Ulid,
     },
 }
@@ -539,7 +539,7 @@ impl DocumentTarget {
                 part,
                 write_id,
                 ..
-            } => ByteView::from(crate::registers::document_key(
+            } => ByteView::from(crate::secret_registers::document_key(
                 owner, name, *part, *write_id,
             )),
             Self::NodeInfo { node_id, .. } => ByteView::from(node_info_key(*node_id)),

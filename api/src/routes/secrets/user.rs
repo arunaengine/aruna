@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::realm_vault::RealmSealKey;
-use aruna_core::registers::SecretOwner;
+use aruna_core::secret_registers::SecretOwner;
 use aruna_core::secrets::SecretFields;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_operations::driver::drive;

@@ -12,7 +12,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use aruna_core::compute::Secret;
-use aruna_core::registers::{SecretBody, SecretEntry, SecretOwner};
+use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
 use aruna_core::secrets::{SecretFields, SecretKind, SecretName, SecretRecord, UseRule};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::time::unix_timestamp_millis;

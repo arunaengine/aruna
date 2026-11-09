@@ -5,7 +5,7 @@
 use crate::UserId;
 use crate::compute::SecretBytes;
 use crate::key_seal::{SealedSecret, open_sealed, seal_to};
-use crate::registers::SecretOwner;
+use crate::secret_registers::SecretOwner;
 use crate::secrets::SecretName;
 use crate::structs::execution::setting::SettingChannel;
 use crate::structs::identity::realm::{RealmId, RealmNodeKind};
@@ -335,7 +335,7 @@ fn named_associated(
 ) -> Vec<u8> {
     [
         realm_id.as_bytes().as_slice(),
-        &crate::registers::entry_prefix(owner, name),
+        &crate::secret_registers::entry_prefix(owner, name),
         &incarnation.to_bytes(),
         &value_id.to_bytes(),
     ]

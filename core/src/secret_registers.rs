@@ -291,5 +291,5 @@ pub fn current_entry<'a>(
 }
 
 #[cfg(test)]
-#[path = "registers_tests.rs"]
+#[path = "secret_registers_tests.rs"]
 mod tests;

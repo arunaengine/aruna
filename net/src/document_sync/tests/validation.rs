@@ -1113,7 +1113,7 @@ async fn foreign_actor_rejected() {
 fn secret_upsert_validated() {
     // Owner secret writes admit by structure and origin only; membership is decided later.
     use aruna_core::admin_documents::AdminDocumentClock;
-    use aruna_core::registers::{
+    use aruna_core::secret_registers::{
         SecretBody, SecretDocument, SecretLifecycle, SecretOwner, SecretValue,
     };
     use aruna_core::secrets::{SecretKind, SecretName};
@@ -1141,13 +1141,13 @@ fn secret_upsert_validated() {
         part,
         write_id: id,
     };
-    let lifecycle = target(aruna_core::registers::SecretPart::Lifecycle);
+    let lifecycle = target(aruna_core::secret_registers::SecretPart::Lifecycle);
     let upsert = setting_change(node(7), 1, DocumentChangeKind::Upsert);
     let bytes = document.to_bytes().expect("document serializes");
     assert!(validate_register_upsert(&lifecycle, &bytes, &upsert).is_ok());
     let later = setting_change(node(7), 2, DocumentChangeKind::Upsert);
     assert!(validate_register_upsert(&lifecycle, &bytes, &later).is_err());
-    let wrong_part = target(aruna_core::registers::SecretPart::Value);
+    let wrong_part = target(aruna_core::secret_registers::SecretPart::Value);
     assert!(validate_register_upsert(&wrong_part, &bytes, &upsert).is_err());
     let mut broken = Vec::new();
     let changes: [fn(&mut SecretDocument); 4] = [

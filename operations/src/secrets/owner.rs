@@ -16,7 +16,7 @@ use aruna_core::operation::Operation;
 use aruna_core::realm_vault::{RealmVaultError, seal_named};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::register::{RegisterError, RegisterStamp};
-use aruna_core::registers::{
+use aruna_core::secret_registers::{
     Eligibility, SecretBody, SecretDocument, SecretEntry, SecretInfo, SecretLifecycle, SecretOwner,
     SecretPart, SecretValue, current_entry, entry_prefix, owner_prefix, writer_eligibility,
 };
