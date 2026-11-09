@@ -41,6 +41,7 @@ pub mod realm_vault;
 pub mod recovery_code;
 pub mod reducer;
 pub mod register;
+pub mod registers;
 pub mod repo_layout;
 pub mod repository;
 pub mod request_policy;
