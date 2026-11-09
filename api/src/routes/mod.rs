@@ -41,6 +41,7 @@ pub mod repository;
 pub mod rocrate_import;
 pub mod running_jobs;
 pub mod search;
+pub mod secrets;
 pub mod shares;
 pub mod staging;
 pub mod storage;
