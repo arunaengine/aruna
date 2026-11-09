@@ -147,6 +147,8 @@ pub enum JobRunOutcome {
     /// A dependency such as metadata projection is not readable yet. The
     /// runtime requeues without incrementing the bounded execution attempts.
     Deferred(JobError),
+    /// Like `Deferred`, but runs again only after the given delay.
+    DeferredFor(JobError, Duration),
     Cancelled,
     Interrupted,
     /// Needs these locked bucket keys; the runtime parks the job without spending an attempt.
