@@ -289,3 +289,7 @@ pub fn current_entry<'a>(
         lifecycle,
     })
 }
+
+#[cfg(test)]
+#[path = "registers_tests.rs"]
+mod tests;
