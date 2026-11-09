@@ -540,3 +540,297 @@ impl Operation for OwnerSecretOperation {
         }
     }
 }
+
+/// Lists the current entries of one owner by name, or reads one name, from this node's view.
+#[derive(Debug, PartialEq)]
+pub struct OwnerSecretsOperation {
+    realm_id: RealmId,
+    prefix: Vec<u8>,
+    start: Option<IterStart>,
+    limit: usize,
+    view: Option<WriterView>,
+    documents: Vec<SecretDocument>,
+    output: Option<Result<(Vec<SecretEntry>, bool), OwnerSecretError>>,
+}
+
+impl OwnerSecretsOperation {
+    /// The entries after `after`; `limit` is clamped to 1..=200.
+    pub fn new(
+        realm_id: RealmId,
+        owner: SecretOwner,
+        after: Option<&SecretName>,
+        limit: usize,
+    ) -> Self {
+        // Part tags are 1 to 3, so 0xff sorts after every document of the cursor name.
+        let start = after
+            .map(|name| IterStart::After([entry_prefix(&owner, name), vec![0xff]].concat().into()));
+        Self {
+            realm_id,
+            prefix: owner_prefix(&owner),
+            start,
+            limit: limit.clamp(1, 200),
+            view: None,
+            documents: Vec::new(),
+            output: None,
+        }
+    }
+
+    pub fn named(realm_id: RealmId, owner: SecretOwner, name: &SecretName) -> Self {
+        Self {
+            prefix: entry_prefix(&owner, name),
+            ..Self::new(realm_id, owner, None, 1)
+        }
+    }
+
+    fn page(&self, start: Option<IterStart>) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: OWNER_SECRETS_KEYSPACE.to_string(),
+            prefix: Some(self.prefix.clone().into()),
+            start,
+            limit: PAGE,
+            txn_id: None,
+        })]
+    }
+
+    fn names(&self) -> Vec<&SecretName> {
+        let mut names: Vec<&SecretName> = self
+            .documents
+            .iter()
+            .map(|document| &document.name)
+            .collect();
+        names.dedup();
+        names
+    }
+
+    /// The selected entries of every name whose documents are all read: all names on the last
+    /// page, all but the newest one before. Deleted names and ignored writers select nothing.
+    fn entries(&self, last_page: bool) -> Vec<SecretEntry> {
+        let view = self.view.clone().unwrap_or_default();
+        let mut names = self.names();
+        if !last_page {
+            names.pop();
+        }
+        (names.into_iter())
+            .filter_map(|name| {
+                let documents = (self.documents.iter()).filter(|document| document.name == *name);
+                current_entry(documents, |document| view.counts(document))
+            })
+            .collect()
+    }
+
+    /// Ends once more than `limit` entries are selected or nothing is left, so a page of
+    /// deleted names never ends a listing early.
+    fn finish(&mut self, mut entries: Vec<SecretEntry>) {
+        let more = entries.len() > self.limit;
+        entries.truncate(self.limit);
+        self.output = Some(Ok((entries, more)));
+    }
+}
+
+impl Operation for OwnerSecretsOperation {
+    /// The entries and whether more names follow.
+    type Output = (Vec<SecretEntry>, bool);
+    type Error = OwnerSecretError;
+
+    fn start(&mut self) -> Effects {
+        let reader = EntryReader {
+            realm_id: self.realm_id,
+            prefix: Vec::new(),
+            view: WriterView::default(),
+            documents: Vec::new(),
+            reading_view: true,
+            done: false,
+        };
+        smallvec![reader.start(None)]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if self.output.is_some() {
+            return smallvec![];
+        }
+        let result: Result<(), OwnerSecretError> = match (self.view.is_none(), event) {
+            (true, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                let state = value.map(|value| decode_reducer_state(&value)).transpose();
+                match state.map_err(ConversionError::from) {
+                    Ok(state) => {
+                        self.view =
+                            Some(state.map_or_else(WriterView::default, |state| WriterView {
+                                intervals: state.node_intervals(),
+                                clock: state.clock,
+                            }));
+                        return self.page(self.start.clone());
+                    }
+                    Err(error) => Err(OwnerSecretError::from(error)),
+                }
+            }
+            (
+                false,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                let decoded: Result<Vec<_>, _> = values
+                    .iter()
+                    .map(|(_, value)| SecretDocument::from_bytes(value))
+                    .collect();
+                match decoded {
+                    Ok(documents) => {
+                        self.documents.extend(documents);
+                        match next_start_after {
+                            Some(after) => {
+                                let entries = self.entries(false);
+                                if entries.len() > self.limit {
+                                    self.finish(entries);
+                                    return smallvec![];
+                                }
+                                return self.page(Some(IterStart::After(after)));
+                            }
+                            None => {
+                                let entries = self.entries(true);
+                                self.finish(entries);
+                                return smallvec![];
+                            }
+                        }
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (_, other) => Err(OwnerSecretError::UnexpectedEvent {
+                state: "OwnerSecrets",
+                got: format!("{other:?}"),
+            }),
+        };
+        if let Err(error) = result {
+            self.output = Some(Err(error));
+        }
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(OwnerSecretError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// Selects a readable user secret on a management node and writes the `SecretRead` audit row
+/// before anyone opens the value; a failed audit write ends it without a value.
+#[derive(Debug, PartialEq)]
+pub struct ReadbackOperation {
+    reader: EntryReader,
+    owner: SecretOwner,
+    actor: UserId,
+    entry: Option<SecretEntry>,
+    output: Option<Result<SecretEntry, OwnerSecretError>>,
+}
+
+impl ReadbackOperation {
+    pub fn new(realm_id: RealmId, owner: SecretOwner, name: SecretName, actor: UserId) -> Self {
+        Self {
+            reader: EntryReader::new(realm_id, &owner, &name),
+            owner,
+            actor,
+            entry: None,
+            output: None,
+        }
+    }
+
+    fn audit(&mut self) -> Result<Effects, OwnerSecretError> {
+        let entry = self.reader.entry().filter(SecretEntry::complete);
+        let entry = entry.ok_or(ChangeError::NotFound)?;
+        let readable = entry.readable() && self.owner == SecretOwner::User(self.actor);
+        if !readable {
+            return Err(OwnerSecretError::NotReadable);
+        }
+        let audit = AdminAuditRecord::for_secret(
+            AdminAuditAction::SecretRead,
+            self.actor,
+            SecretAudit {
+                scope: self.owner.scope(),
+                name: entry.lifecycle.name.clone(),
+                incarnation: Some(entry.lifecycle.stamp.write_id),
+                write_id: entry.value.as_ref().map(|value| value.stamp.write_id),
+            },
+        );
+        self.entry = Some(entry);
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes: audit.entries()?,
+            txn_id: None,
+        })])
+    }
+}
+
+impl Operation for ReadbackOperation {
+    type Output = SecretEntry;
+    type Error = OwnerSecretError;
+
+    fn start(&mut self) -> Effects {
+        smallvec![self.reader.start(None)]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if self.output.is_some() {
+            return smallvec![];
+        }
+        let result = match (&self.entry, event) {
+            (None, event) => match self.reader.step(event, None) {
+                Ok(Some(effect)) => return smallvec![effect],
+                Ok(None) => match self.audit() {
+                    Ok(effects) => return effects,
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            },
+            (Some(entry), Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                Ok(entry.clone())
+            }
+            (Some(_), Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (Some(_), other) => Err(OwnerSecretError::UnexpectedEvent {
+                state: "Readback",
+                got: format!("{other:?}"),
+            }),
+        };
+        self.output = Some(result);
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(OwnerSecretError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// Opens the value of a readable user secret for its owner on a management node.
+pub fn open_value(
+    key: &aruna_core::realm_vault::RealmSealKey,
+    realm_id: &RealmId,
+    entry: &SecretEntry,
+) -> Result<SecretBytes, OwnerSecretError> {
+    let value = entry.value.as_ref().ok_or(ChangeError::NotFound)?;
+    let SecretBody::Value(sealed) = &value.body else {
+        return Err(ChangeError::NotFound.into());
+    };
+    Ok(key.open_named(
+        realm_id,
+        &value.owner,
+        &value.name,
+        value.incarnation,
+        value.stamp.write_id,
+        &sealed.sealed,
+    )?)
+}
