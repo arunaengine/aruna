@@ -728,12 +728,11 @@ fn legal_document(entry: LegalEntry) -> Result<LegalDocument, String> {
         return Err("every document needs a label".to_string());
     }
     let source = match (entry.url, entry.file) {
-        (Some(url), None) => {
-            if !reqwest::Url::parse(&url).is_ok_and(|parsed| parsed.scheme() == "https") {
-                return Err(format!("url {url} must be an HTTPS URL"));
-            }
-            LegalSource::Url(url)
-        }
+        // The parser repairs input such as `https:/host`; serve its canonical form, not the input.
+        (Some(url), None) => match reqwest::Url::parse(&url) {
+            Ok(parsed) if parsed.scheme() == "https" => LegalSource::Url(parsed.into()),
+            _ => return Err(format!("url {url} must be an HTTPS URL")),
+        },
         (None, Some(file)) => match std::fs::read_to_string(&file) {
             Ok(text) => LegalSource::Markdown(text),
             Err(error) => return Err(format!("cannot read {}: {error}", file.display())),
@@ -1456,6 +1455,8 @@ mod tests {
         let privacy = dir.path().join("privacy.md");
         std::fs::write(&privacy, "# Privacy\n").unwrap();
         let missing = dir.path().join("missing.md");
+        let binary = dir.path().join("binary.md");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
         let valid = format!(
             r#"[{{"label":"Imprint","url":"https://example.org/imprint"}},
                 {{"label":"Privacy","file":{}}}]"#,
@@ -1484,6 +1485,10 @@ mod tests {
             r#"[{{"label":"Terms","file":{}}}]"#,
             serde_json::to_string(&missing).unwrap()
         );
+        let not_text = format!(
+            r#"[{{"label":"Terms","file":{}}}]"#,
+            serde_json::to_string(&binary).unwrap()
+        );
         let invalid = [
             "not json",
             r#"{"label":"Terms","url":"https://example.org/terms"}"#,
@@ -1494,11 +1499,28 @@ mod tests {
             r#"[{"label":"Terms","link":"https://example.org/terms"}]"#,
             &both,
             &unread,
+            &not_text,
         ];
         for value in invalid {
             let error = portal_site(&[("PORTAL_LEGAL", value)]).unwrap_err();
             assert_eq!(invalid_key(error), "PORTAL_LEGAL", "{value}");
         }
+        let repaired = r#"[{"label":"Privacy","url":"https:/example.org/privacy"}]"#;
+        assert_eq!(
+            portal_site(&[("PORTAL_LEGAL", repaired)]).unwrap().1[0].source,
+            LegalSource::Url("https://example.org/privacy".to_string())
+        );
+    }
+
+    #[test]
+    fn portal_site_ignored() {
+        let settings = parse(&[
+            ("PORTAL_MODE", "disabled"),
+            ("PORTAL_LANDING", "off"),
+            ("PORTAL_LEGAL", "not json"),
+        ])
+        .unwrap();
+        assert!(matches!(settings.portal, PortalConfig::Disabled));
     }
 
     #[test]
