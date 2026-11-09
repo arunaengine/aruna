@@ -133,6 +133,17 @@ pub enum PluginCommand {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Publish a built artifact to the realm; needs realm admin rights.
+    Publish {
+        /// The .wasm file `plugin build` wrote.
+        artifact: PathBuf,
+    },
+    /// List the plugin versions published to the realm.
+    List {
+        /// Only versions of this plugin.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
