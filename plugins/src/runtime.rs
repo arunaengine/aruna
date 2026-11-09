@@ -114,16 +114,16 @@ struct Inner {
 }
 
 impl Runtime {
-    /// Builds the engine and host linker. The linker provides only Aruna plugin
-    /// imports: no WASI, file system, network, clock or environment.
+    /// Builds the engine and host linker: the plugin imports, and WASI for toolchains that need
+    /// it, with no files, environment, arguments or network.
     pub fn new(config: RuntimeConfig) -> Result<Self, CompileError> {
         let mut engine_config = Config::new();
         engine_config.consume_fuel(true);
-        engine_config.wasm_component_model_async(true);
         let engine = Engine::new(&engine_config).map_err(wasm_error)?;
         let mut linker = Linker::new(&engine);
         wit::Plugin::add_to_linker::<Session, HasSelf<Session>>(&mut linker, |session| session)
             .map_err(wasm_error)?;
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(wasm_error)?;
         let cache = NonZeroUsize::new(config.cache).unwrap_or(NonZeroUsize::MIN);
         Ok(Self {
             inner: Arc::new(Inner {

@@ -80,7 +80,7 @@ interface types {
 
 /// Checks a grant before trying an optional call; needs no permission.
 interface grants {
-  granted: async func(permission: string, %resource: string) -> bool;
+  granted: func(permission: string, %resource: string) -> bool;
 }
 
 /// Reads dataset metadata of the group (`metadata.read`).
@@ -98,15 +98,15 @@ interface metadata-read {
     cursor: option<string>,
   }
 
-  get: async func(%resource: string) -> result<document, host-error>;
-  %list: async func(cursor: option<string>) -> result<listing, host-error>;
+  get: func(%resource: string) -> result<document, host-error>;
+  %list: func(cursor: option<string>) -> result<listing, host-error>;
 }
 
 /// Changes dataset metadata if its revision is still `expected` (`metadata.write`).
 interface metadata-write {
   use types.{host-error};
 
-  patch: async func(
+  patch: func(
     %resource: string,
     patch: string,
     expected: string,
@@ -129,8 +129,8 @@ interface objects-read {
     cursor: option<string>,
   }
 
-  info: async func(path: string) -> result<object-info, host-error>;
-  %list: async func(prefix: string, cursor: option<string>) -> result<object-page, host-error>;
+  info: func(path: string) -> result<object-info, host-error>;
+  %list: func(prefix: string, cursor: option<string>) -> result<object-page, host-error>;
 }
 
 /// Sends requests through the connections the manifest declares (`connections.send`).
@@ -163,7 +163,7 @@ interface connections {
     json: option<string>,
   }
 
-  send: async func(request: request) -> result<response, host-error>;
+  send: func(request: request) -> result<response, host-error>;
 }
 
 /// Small private values of the install, changed by compare and swap.
@@ -175,8 +175,8 @@ interface state {
     value: list<u8>,
   }
 
-  get: async func(key: string) -> result<option<entry>, host-error>;
-  put: async func(key: string, value: list<u8>, expected: option<u64>) -> result<u64, host-error>;
+  get: func(key: string) -> result<option<entry>, host-error>;
+  put: func(key: string, value: list<u8>, expected: option<u64>) -> result<u64, host-error>;
 }
 
 interface log {
@@ -202,5 +202,5 @@ world plugin {
   import state;
   import log;
 
-  export handle: async func(handler: string, invocation: invocation) -> result<option<string>, failure>;
+  export handle: func(handler: string, invocation: invocation) -> result<option<string>, failure>;
 }

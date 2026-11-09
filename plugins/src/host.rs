@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use tokio_util::task::TaskTracker;
 use wasmtime::ResourceLimiter;
+use wasmtime::component::ResourceTable;
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::broker::{Broker, CallContext, ErrorKind, HostError};
 use crate::limits::Limits;
@@ -17,7 +19,7 @@ pub mod wit {
     wasmtime::component::bindgen!({
         world: "plugin",
         path: "wit",
-        imports: { default: trappable },
+        imports: { default: async | trappable },
         additional_derives: [PartialEq, Eq],
     });
 }
@@ -92,6 +94,9 @@ pub(crate) struct Session {
     pending: u32,
     memory: usize,
     pub(crate) exceeded: Option<Limit>,
+    /// WASI for guests whose toolchain imports it: no files, environment, arguments or network.
+    wasi: WasiCtx,
+    table: ResourceTable,
 }
 
 pub(crate) struct Grants {
@@ -122,6 +127,8 @@ impl Session {
             pending: 0,
             memory: 0,
             exceeded: None,
+            wasi: closed_wasi(),
+            table: ResourceTable::new(),
         }
     }
 
@@ -204,6 +211,26 @@ impl Session {
     pub(crate) fn finish(&mut self, size: usize) -> wasmtime::Result<()> {
         self.pending -= 1;
         self.receive(size)
+    }
+}
+
+/// A WASI context that grants nothing: no preopened directories, no environment or
+/// arguments, no network, and stdio that reads nothing and discards output.
+fn closed_wasi() -> WasiCtx {
+    let mut builder = WasiCtxBuilder::new();
+    builder
+        .allow_tcp(false)
+        .allow_udp(false)
+        .allow_ip_name_lookup(false);
+    builder.build()
+}
+
+impl WasiView for Session {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
     }
 }
 

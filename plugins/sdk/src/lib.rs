@@ -1,4 +1,5 @@
-//! Rust SDK for Aruna plugins: handlers are async functions, listed once with [`export!`].
+//! Rust SDK for Aruna plugins: handlers are async functions over synchronous host calls,
+//! listed once with [`export!`].
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -118,7 +119,7 @@ macro_rules! export {
             struct Exported;
 
             impl $crate::bindings::Guest for Exported {
-                async fn handle(
+                fn handle(
                     handler: String,
                     invocation: $crate::bindings::aruna::plugin::types::Invocation,
                 ) -> ::std::result::Result<
@@ -126,7 +127,7 @@ macro_rules! export {
                     $crate::bindings::aruna::plugin::types::Failure,
                 > {
                     match handler.as_str() {
-                        $(stringify!($handler) => $crate::dispatch(invocation, $handler).await,)+
+                        $(stringify!($handler) => $crate::dispatch(invocation, $handler),)+
                         other => Err($crate::unknown(other)),
                     }
                 }
@@ -144,10 +145,7 @@ macro_rules! export {
 }
 
 #[doc(hidden)]
-pub async fn dispatch<I, O, F, Fut>(
-    invocation: Invocation,
-    handler: F,
-) -> Result<Option<String>, Failure>
+pub fn dispatch<I, O, F, Fut>(invocation: Invocation, handler: F) -> Result<Option<String>, Failure>
 where
     I: Input,
     O: Output,
@@ -166,7 +164,16 @@ where
         let input = I::from_event(event(invocation.trigger)?)?;
         handler(context, input).await?.into_output()
     };
-    outcome.await.map_err(Error::failure)
+    // Every SDK call is synchronous underneath, so one poll runs the handler to its end.
+    let mut outcome = std::pin::pin!(outcome);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match outcome.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(result) => result.map_err(Error::failure),
+        std::task::Poll::Pending => Err(Failure {
+            kind: FailureKind::Permanent,
+            message: "a handler may only await SDK calls".into(),
+        }),
+    }
 }
 
 #[doc(hidden)]

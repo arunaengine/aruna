@@ -49,7 +49,7 @@ impl Context {
 
     /// Whether an optional permission is granted for `resource`, before trying the call.
     pub async fn granted(&self, permission: &str, resource: &str) -> bool {
-        grants::granted(permission.to_string(), resource.to_string()).await
+        grants::granted(permission, resource)
     }
 
     pub fn metadata(&self) -> Metadata {
@@ -97,8 +97,7 @@ pub struct Metadata;
 
 impl Metadata {
     pub async fn get(&self, resource: &str) -> Result<Document> {
-        let doc = metadata_read::get(resource.to_string())
-            .await
+        let doc = metadata_read::get(resource)
             .map_err(|err| Error::host(err, "metadata.read", resource))?;
         Ok(Document {
             resource: doc.resource,
@@ -108,9 +107,8 @@ impl Metadata {
     }
 
     pub async fn list(&self, cursor: Option<&str>) -> Result<Listing> {
-        let page = metadata_read::list(cursor.map(str::to_string))
-            .await
-            .map_err(|err| Error::host(err, "metadata.read", ""))?;
+        let page =
+            metadata_read::list(cursor).map_err(|err| Error::host(err, "metadata.read", ""))?;
         Ok(Listing {
             resources: page.resources,
             cursor: page.cursor,
@@ -131,15 +129,8 @@ impl Metadata {
         key: Option<&str>,
     ) -> Result<String> {
         let text = serde_json::to_string(patch)?;
-        let reply = metadata_write::patch(
-            resource.to_string(),
-            text,
-            expected.to_string(),
-            key.map(str::to_string),
-        );
-        reply
-            .await
-            .map_err(|err| Error::host(err, "metadata.write", resource))
+        let reply = metadata_write::patch(resource, &text, expected, key);
+        reply.map_err(|err| Error::host(err, "metadata.write", resource))
     }
 }
 
@@ -149,12 +140,12 @@ pub struct Objects;
 
 impl Objects {
     pub async fn info(&self, path: &str) -> Result<ObjectInfo> {
-        let reply = objects_read::info(path.to_string()).await;
+        let reply = objects_read::info(path);
         reply.map_err(|err| Error::host(err, "objects.read", path))
     }
 
     pub async fn list(&self, prefix: &str, cursor: Option<&str>) -> Result<ObjectPage> {
-        let reply = objects_read::list(prefix.to_string(), cursor.map(str::to_string)).await;
+        let reply = objects_read::list(prefix, cursor);
         reply.map_err(|err| Error::host(err, "objects.read", prefix))
     }
 }
@@ -225,7 +216,7 @@ impl Http {
             body,
             key: key.map(str::to_string),
         };
-        let reply = connections::send(request).await;
+        let reply = connections::send(&request);
         let reply = reply.map_err(|err| Error::host(err, "connections.send", &self.name))?;
         let fields = match reply.json {
             Some(text) => serde_json::from_str(&text)?,
@@ -244,13 +235,13 @@ pub struct State;
 
 impl State {
     pub async fn get(&self, key: &str) -> Result<Option<Entry>> {
-        let reply = state::get(key.to_string()).await;
+        let reply = state::get(key);
         reply.map_err(|err| Error::host(err, "state", key))
     }
 
     /// Writes `value` if the stored version is still `expected` (`None`: absent).
     pub async fn put(&self, key: &str, value: Vec<u8>, expected: Option<u64>) -> Result<u64> {
-        let reply = state::put(key.to_string(), value, expected).await;
+        let reply = state::put(key, &value, expected);
         reply.map_err(|err| Error::host(err, "state", key))
     }
 }

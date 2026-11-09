@@ -5,8 +5,6 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use wasmtime::component::{Accessor, HasSelf};
-
 use crate::broker::{
     Broker, CallContext, Document, Entry, ErrorKind, Field, HostError, Intent, Listing,
     MetadataPatch, Method, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
@@ -25,55 +23,57 @@ enum Effect {
     Write(Intent),
 }
 
-/// Runs one broker call between the checks of `begin` and `finish`. Writes run as tasks
-/// tracked by the node and the run, so no guest end interrupts recording their outcome,
-/// and each has a deadline after which the broker records the outcome as unknown.
-async fn brokered<T: Send, R, F, Fut>(
-    accessor: &Accessor<T, HasSelf<Session>>,
-    size: usize,
-    effect: Effect,
-    needs: Needs<'_>,
-    call: F,
-    reply_size: impl FnOnce(&R) -> usize,
-) -> wasmtime::Result<Result<R, HostError>>
-where
-    F: FnOnce(Arc<dyn Broker>, CallContext) -> Fut,
-    Fut: Future<Output = Result<R, HostError>> + Send + 'static,
-    R: Send + 'static,
-{
-    let started = match accessor.with(|mut access| access.get().begin(size, needs))? {
-        Ok(started) => started,
-        Err(error) => return Ok(Err(error)),
-    };
-    let (broker, cx, deadline) = (started.broker.clone(), started.cx.clone(), started.deadline);
-    let future = call(started.broker, started.cx);
-    let reply = match effect {
-        Effect::Read => future.await,
-        Effect::Write(intent) => {
-            let bounded = async move {
-                match tokio::time::timeout(deadline, future).await {
-                    Ok(reply) => reply,
-                    Err(_) => {
-                        // The effect may have happened; the begun intent stays unknown if this fails too.
-                        let _ =
-                            tokio::time::timeout(deadline, broker.abandoned(&cx, &intent)).await;
-                        Err(unknown("the host call did not finish in time"))
+impl Session {
+    /// Runs one broker call between the checks of `begin` and `finish`. Writes run as tasks
+    /// tracked by the node and the run, so no guest end interrupts recording their outcome,
+    /// and each has a deadline after which the broker records the outcome as unknown.
+    async fn brokered<R, F, Fut>(
+        &mut self,
+        size: usize,
+        effect: Effect,
+        needs: Needs<'_>,
+        call: F,
+        reply_size: impl FnOnce(&R) -> usize,
+    ) -> wasmtime::Result<Result<R, HostError>>
+    where
+        F: FnOnce(Arc<dyn Broker>, CallContext) -> Fut,
+        Fut: Future<Output = Result<R, HostError>> + Send + 'static,
+        R: Send + 'static,
+    {
+        let started = match self.begin(size, needs)? {
+            Ok(started) => started,
+            Err(error) => return Ok(Err(error)),
+        };
+        let (broker, cx, deadline) = (started.broker.clone(), started.cx.clone(), started.deadline);
+        let future = call(started.broker, started.cx);
+        let reply = match effect {
+            Effect::Read => future.await,
+            Effect::Write(intent) => {
+                let bounded = async move {
+                    match tokio::time::timeout(deadline, future).await {
+                        Ok(reply) => reply,
+                        Err(_) => {
+                            // The effect may have happened; the begun intent stays unknown if this fails too.
+                            let _ = tokio::time::timeout(deadline, broker.abandoned(&cx, &intent))
+                                .await;
+                            Err(unknown("the host call did not finish in time"))
+                        }
                     }
-                }
-            };
-            (started
-                .tracker
-                .spawn(started.writes.track_future(bounded))
-                .await)
-                .unwrap_or_else(|_| Err(unknown("the host call ended without a result")))
-        }
-    };
-    let size = match &reply {
-        Ok(reply) => reply_size(reply),
-        Err(error) => error.message.len(),
-    };
-    accessor.with(|mut access| access.get().finish(size))?;
-    Ok(reply)
+                };
+                (started
+                    .tracker
+                    .spawn(started.writes.track_future(bounded))
+                    .await)
+                    .unwrap_or_else(|_| Err(unknown("the host call ended without a result")))
+            }
+        };
+        let size = match &reply {
+            Ok(reply) => reply_size(reply),
+            Err(error) => error.message.len(),
+        };
+        self.finish(size)?;
+        Ok(reply)
+    }
 }
 
 fn unknown(message: &str) -> HostError {
@@ -91,10 +91,6 @@ pub(crate) fn project(json: Option<String>, pointers: &[String]) -> Option<Strin
         .filter_map(|pointer| Some((pointer.clone(), value.pointer(pointer)?.clone())))
         .collect();
     serde_json::to_string(&fields).ok()
-}
-
-fn ordinal<T: Send>(accessor: &Accessor<T, HasSelf<Session>>) -> u32 {
-    accessor.with(|mut access| access.get().next_ordinal())
 }
 
 fn fields_len(fields: &[Field]) -> usize {
@@ -123,37 +119,29 @@ fn method_name(method: Method) -> &'static str {
     }
 }
 
-impl<T: Send> grants::HostWithStore<T> for HasSelf<Session> {
-    async fn granted(
-        accessor: &Accessor<T, Self>,
-        permission: String,
-        resource: String,
-    ) -> wasmtime::Result<bool> {
+impl grants::Host for Session {
+    async fn granted(&mut self, permission: String, resource: String) -> wasmtime::Result<bool> {
         let size = permission.len() + resource.len();
         let Ok(permission) = permission.parse::<Permission>() else {
-            accessor.with(|mut access| access.get().charge(size))?;
+            self.charge(size)?;
             return Ok(false);
         };
-        let reply = brokered(
-            accessor,
-            size,
-            Effect::Read,
-            Needs::Free,
-            |broker, cx| async move { Ok(broker.granted(&cx, permission, &resource).await) },
-            |_| 0,
-        )
-        .await?;
+        let reply = self
+            .brokered(
+                size,
+                Effect::Read,
+                Needs::Free,
+                |broker, cx| async move { Ok(broker.granted(&cx, permission, &resource).await) },
+                |_| 0,
+            )
+            .await?;
         Ok(reply.unwrap_or(false))
     }
 }
 
-impl<T: Send> metadata_read::HostWithStore<T> for HasSelf<Session> {
-    async fn get(
-        accessor: &Accessor<T, Self>,
-        resource: String,
-    ) -> wasmtime::Result<Result<Document, HostError>> {
-        brokered(
-            accessor,
+impl metadata_read::Host for Session {
+    async fn get(&mut self, resource: String) -> wasmtime::Result<Result<Document, HostError>> {
+        self.brokered(
             resource.len(),
             Effect::Read,
             Needs::Permission(Permission::MetadataRead),
@@ -164,11 +152,10 @@ impl<T: Send> metadata_read::HostWithStore<T> for HasSelf<Session> {
     }
 
     async fn list(
-        accessor: &Accessor<T, Self>,
+        &mut self,
         cursor: Option<String>,
     ) -> wasmtime::Result<Result<Listing, HostError>> {
-        brokered(
-            accessor,
+        self.brokered(
             cursor.as_ref().map_or(0, String::len),
             Effect::Read,
             Needs::Permission(Permission::MetadataRead),
@@ -182,9 +169,9 @@ impl<T: Send> metadata_read::HostWithStore<T> for HasSelf<Session> {
     }
 }
 
-impl<T: Send> metadata_write::HostWithStore<T> for HasSelf<Session> {
+impl metadata_write::Host for Session {
     async fn patch(
-        accessor: &Accessor<T, Self>,
+        &mut self,
         resource: String,
         patch: String,
         expected: String,
@@ -193,7 +180,7 @@ impl<T: Send> metadata_write::HostWithStore<T> for HasSelf<Session> {
         let size =
             resource.len() + patch.len() + expected.len() + key.as_ref().map_or(0, String::len);
         let parts: [&[u8]; 3] = [resource.as_bytes(), patch.as_bytes(), expected.as_bytes()];
-        let intent = Intent::new(ordinal(accessor), key, &parts);
+        let intent = Intent::new(self.next_ordinal(), key, &parts);
         let effect = Effect::Write(intent.clone());
         let patch = MetadataPatch {
             resource,
@@ -201,8 +188,7 @@ impl<T: Send> metadata_write::HostWithStore<T> for HasSelf<Session> {
             expected,
             intent,
         };
-        brokered(
-            accessor,
+        self.brokered(
             size,
             effect,
             Needs::Permission(Permission::MetadataWrite),
@@ -213,13 +199,9 @@ impl<T: Send> metadata_write::HostWithStore<T> for HasSelf<Session> {
     }
 }
 
-impl<T: Send> objects_read::HostWithStore<T> for HasSelf<Session> {
-    async fn info(
-        accessor: &Accessor<T, Self>,
-        path: String,
-    ) -> wasmtime::Result<Result<ObjectInfo, HostError>> {
-        brokered(
-            accessor,
+impl objects_read::Host for Session {
+    async fn info(&mut self, path: String) -> wasmtime::Result<Result<ObjectInfo, HostError>> {
+        self.brokered(
             path.len(),
             Effect::Read,
             Needs::Permission(Permission::ObjectsRead),
@@ -230,13 +212,12 @@ impl<T: Send> objects_read::HostWithStore<T> for HasSelf<Session> {
     }
 
     async fn list(
-        accessor: &Accessor<T, Self>,
+        &mut self,
         prefix: String,
         cursor: Option<String>,
     ) -> wasmtime::Result<Result<ObjectPage, HostError>> {
         let size = prefix.len() + cursor.as_ref().map_or(0, String::len);
-        brokered(
-            accessor,
+        self.brokered(
             size,
             Effect::Read,
             Needs::Permission(Permission::ObjectsRead),
@@ -254,9 +235,9 @@ impl<T: Send> objects_read::HostWithStore<T> for HasSelf<Session> {
     }
 }
 
-impl<T: Send> connections::HostWithStore<T> for HasSelf<Session> {
+impl connections::Host for Session {
     async fn send(
-        accessor: &Accessor<T, Self>,
+        &mut self,
         request: connections::Request,
     ) -> wasmtime::Result<Result<Response, HostError>> {
         let size = request.connection.len()
@@ -275,10 +256,10 @@ impl<T: Send> connections::HostWithStore<T> for HasSelf<Session> {
                 &field_bytes(&request.headers),
                 &request.body,
             ];
-            Intent::new(ordinal(accessor), request.key.clone(), &parts)
+            Intent::new(self.next_ordinal(), request.key.clone(), &parts)
         });
         let connection = request.connection.clone();
-        let pointers = accessor.with(|mut access| access.get().response_fields(&connection));
+        let pointers = self.response_fields(&connection);
         let effect = match &intent {
             Some(intent) => Effect::Write(intent.clone()),
             None => Effect::Read,
@@ -292,8 +273,7 @@ impl<T: Send> connections::HostWithStore<T> for HasSelf<Session> {
             body: request.body,
             intent,
         };
-        brokered(
-            accessor,
+        self.brokered(
             size,
             effect,
             Needs::Connection(&connection),
@@ -308,13 +288,9 @@ impl<T: Send> connections::HostWithStore<T> for HasSelf<Session> {
     }
 }
 
-impl<T: Send> state::HostWithStore<T> for HasSelf<Session> {
-    async fn get(
-        accessor: &Accessor<T, Self>,
-        key: String,
-    ) -> wasmtime::Result<Result<Option<Entry>, HostError>> {
-        brokered(
-            accessor,
+impl state::Host for Session {
+    async fn get(&mut self, key: String) -> wasmtime::Result<Result<Option<Entry>, HostError>> {
+        self.brokered(
             key.len(),
             Effect::Read,
             Needs::Free,
@@ -325,7 +301,7 @@ impl<T: Send> state::HostWithStore<T> for HasSelf<Session> {
     }
 
     async fn put(
-        accessor: &Accessor<T, Self>,
+        &mut self,
         key: String,
         value: Vec<u8>,
         expected: Option<u64>,
@@ -337,7 +313,7 @@ impl<T: Send> state::HostWithStore<T> for HasSelf<Session> {
             &value,
             version.as_ref().map_or(&[][..], |v| &v[..]),
         ];
-        let intent = Intent::new(ordinal(accessor), None, &parts);
+        let intent = Intent::new(self.next_ordinal(), None, &parts);
         let effect = Effect::Write(intent.clone());
         let put = StatePut {
             key,
@@ -345,8 +321,7 @@ impl<T: Send> state::HostWithStore<T> for HasSelf<Session> {
             expected,
             intent,
         };
-        brokered(
-            accessor,
+        self.brokered(
             size,
             effect,
             Needs::Free,
@@ -358,7 +333,7 @@ impl<T: Send> state::HostWithStore<T> for HasSelf<Session> {
 }
 
 impl log::Host for Session {
-    fn log(&mut self, level: log::Level, message: String) -> wasmtime::Result<()> {
+    async fn log(&mut self, level: log::Level, message: String) -> wasmtime::Result<()> {
         self.charge(message.len())?;
         let mut end = message.len().min(MAX_LOG);
         while !message.is_char_boundary(end) {
@@ -376,9 +351,3 @@ impl log::Host for Session {
 }
 
 impl types::Host for Session {}
-impl grants::Host for Session {}
-impl metadata_read::Host for Session {}
-impl metadata_write::Host for Session {}
-impl objects_read::Host for Session {}
-impl connections::Host for Session {}
-impl state::Host for Session {}

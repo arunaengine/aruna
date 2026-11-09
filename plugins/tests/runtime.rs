@@ -17,8 +17,7 @@ use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::manifest::Manifest;
 use aruna_plugins::permission::Permission;
 use aruna_plugins::{
-    CancellationToken, CompileError, FailureKind, Invocation, InvokeError, Limit, Runtime, Trigger,
-    WatchEvent,
+    CancellationToken, FailureKind, Invocation, InvokeError, Limit, Runtime, Trigger, WatchEvent,
 };
 use wasm_encoder::{ComponentSection, CustomSection};
 
@@ -379,7 +378,8 @@ async fn budgets_end_runs() {
 }
 
 #[tokio::test]
-async fn compile_checks_imports() {
+async fn narrow_requests_compile() {
+    // Toolchains import every interface of the world, so grants, not imports, bound calls.
     let manifest = read_manifest(FIXTURE).unwrap();
     let json = serde_json::to_vec(&manifest).unwrap();
     let mut section = Vec::new();
@@ -397,14 +397,7 @@ async fn compile_checks_imports() {
         .optional
         .remove(&Permission::MetadataWrite);
     let artifact = aruna_plugins::artifact::attach_manifest(component, &narrow).unwrap();
-    match runtime().compile(&artifact) {
-        Err(CompileError::Manifest(error)) => assert_eq!(
-            error.to_string(),
-            "the code imports `aruna:plugin/metadata-write@0.2.0`, which the manifest does not request"
-        ),
-        Err(other) => panic!("{other}"),
-        Ok(_) => panic!("an undeclared import must not compile"),
-    }
+    assert!(runtime().compile(&artifact).is_ok());
     let compiled = runtime().compile(FIXTURE).unwrap();
     let handlers: Vec<&str> = compiled
         .manifest
