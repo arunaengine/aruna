@@ -101,6 +101,7 @@ pub struct Config {
     pub node_labels: BTreeMap<String, String>,
     pub node_location: Option<String>,
     pub node_weight: Option<u32>,
+    pub https: Option<crate::settings::HttpsSettings>,
 }
 
 /// Operator-configurable request admission limits for the REST and S3 planes.
@@ -303,6 +304,7 @@ pub async fn resolve_config(
         node_labels,
         node_location,
         node_weight,
+        https,
         fjall_cache_bytes: _,
     } = settings;
     let bootstrap_timeout = Duration::from_secs(bootstrap_timeout_secs);
@@ -467,6 +469,7 @@ pub async fn resolve_config(
         node_labels,
         node_location,
         node_weight,
+        https,
     }))
 }
 
