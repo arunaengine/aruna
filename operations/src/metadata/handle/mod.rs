@@ -788,7 +788,7 @@ impl MetadataHandle {
         self.inner.realm_seal_key.clone()
     }
 
-    /// The delays every delivery job of this node shares after a short setting read.
+    /// The delays every delivery job of this node shares while no management node opens a secret.
     pub fn setting_backoffs(&self) -> &crate::notifications::settings::Backoffs {
         &self.inner.setting_backoffs
     }

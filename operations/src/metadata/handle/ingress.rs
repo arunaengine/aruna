@@ -1190,40 +1190,12 @@ impl MetadataHandle {
                 let result = Box::pin(served).await;
                 (MetadataTransportMessage::RealmSecretResult { result }, None)
             }
-            MetadataTransportMessage::NotificationSetting { owner, channel } => {
+            MetadataTransportMessage::OpenSetting { target, bytes } => {
                 let key = self.realm_seal_key();
-                let served = crate::realm_vault::serve_setting(
-                    context,
-                    key.as_deref(),
-                    peer,
-                    owner,
-                    channel,
-                );
+                let served =
+                    crate::realm_vault::serve_open(context, key.as_deref(), peer, target, bytes);
                 let result = Box::pin(served).await;
-                (
-                    MetadataTransportMessage::NotificationSettingResult { result },
-                    None,
-                )
-            }
-            MetadataTransportMessage::StoreSetting {
-                target,
-                bytes,
-                change,
-            } => {
-                let served = crate::realm_vault::serve_store(context, peer, target, bytes, change);
-                let result = Box::pin(served).await;
-                (
-                    MetadataTransportMessage::StoreSettingResult { result },
-                    None,
-                )
-            }
-            MetadataTransportMessage::ConfirmSetting { target } => {
-                let served = crate::realm_vault::serve_confirm(context, peer, target);
-                let result = Box::pin(served).await;
-                (
-                    MetadataTransportMessage::ConfirmSettingResult { result },
-                    None,
-                )
+                (MetadataTransportMessage::OpenSettingResult { result }, None)
             }
             MetadataTransportMessage::PromotionCheck => {
                 let ready = crate::realm::promote_node::serve_promotion_check(context, peer);

@@ -672,29 +672,13 @@ pub enum MetadataTransportMessage {
     RealmSecretResult {
         result: Result<aruna_core::compute::SecretBytes, MetadataReadError>,
     },
-    /// One user's notification setting of one channel, asked of a management node.
-    NotificationSetting {
-        owner: UserId,
-        channel: aruna_core::structs::execution::setting::SettingChannel,
-    },
-    NotificationSettingResult {
-        result: Result<crate::notifications::settings::SettingAnswer, MetadataReadError>,
-    },
-    /// Phase one of a setting write: the management node keeps the document tentative.
-    StoreSetting {
+    /// The sealed secret of a setting document, asked of a management node; Debug hides it.
+    OpenSetting {
         target: DocumentTarget,
         bytes: Vec<u8>,
-        change: aruna_core::document::DocumentChange,
     },
-    StoreSettingResult {
-        result: Result<crate::notifications::settings::StoreAnswer, MetadataReadError>,
-    },
-    /// Phase two of a setting write: the management node confirms the stored document.
-    ConfirmSetting {
-        target: DocumentTarget,
-    },
-    ConfirmSettingResult {
-        result: Result<(), MetadataReadError>,
+    OpenSettingResult {
+        result: Result<aruna_core::compute::SecretBytes, MetadataReadError>,
     },
 }
 
