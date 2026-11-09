@@ -178,14 +178,14 @@ async fn portal_config(State(state): State<PortalState>) -> Response {
         Err(GetConfigError::DocumentNotFound) => state.registry_url.clone(),
         Err(error) => return ServerError::InternalError(error.to_string()).into_response(),
     };
-    Json(PortalRuntimeConfig {
+    let config = Json(PortalRuntimeConfig {
         api_base_url: &state.api_base_url,
         registry_url,
         login: state.login.as_ref(),
         landing: (!state.landing).then_some(false),
         legal: &state.legal,
-    })
-    .into_response()
+    });
+    ([(header::CACHE_CONTROL, NO_CACHE)], config).into_response()
 }
 
 async fn realm_descriptor(State(state): State<PortalState>) -> Response {
@@ -693,6 +693,7 @@ mod tests {
             .oneshot(request(Method::GET, "/portal-config.json"))
             .await
             .unwrap();
+        assert_eq!(response.headers()[header::CACHE_CONTROL], NO_CACHE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(config["landing"], serde_json::json!(false));
