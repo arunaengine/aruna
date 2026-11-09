@@ -534,6 +534,12 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ResolvedJobInputs { .. } => "resolved_job_inputs",
         MetadataTransportMessage::RealmSecret { .. } => "realm_secret",
         MetadataTransportMessage::RealmSecretResult { .. } => "realm_secret_result",
+        MetadataTransportMessage::NotificationSetting { .. } => "notification_setting",
+        MetadataTransportMessage::NotificationSettingResult { .. } => "notification_setting_result",
+        MetadataTransportMessage::StoreSetting { .. } => "store_setting",
+        MetadataTransportMessage::StoreSettingResult { .. } => "store_setting_result",
+        MetadataTransportMessage::ConfirmSetting { .. } => "confirm_setting",
+        MetadataTransportMessage::ConfirmSettingResult { .. } => "confirm_setting_result",
     }
 }
 
@@ -764,6 +770,61 @@ impl MetadataHandle {
             .map_err(|_| MetadataReadError::Unavailable)?
         {
             MetadataTransportMessage::RealmSecretResult { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// The management node `node_id`'s answer to a setting read.
+    pub async fn request_setting(
+        &self,
+        node_id: NodeId,
+        owner: aruna_core::UserId,
+        channel: aruna_core::structs::execution::setting::SettingChannel,
+    ) -> Result<crate::notifications::settings::SettingAnswer, MetadataReadError> {
+        let request = MetadataTransportMessage::NotificationSetting { owner, channel };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::NotificationSettingResult { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// Phase one of a setting write on the management node `node_id`.
+    pub async fn request_store(
+        &self,
+        node_id: NodeId,
+        target: aruna_core::document::DocumentTarget,
+        bytes: Vec<u8>,
+        change: aruna_core::document::DocumentChange,
+    ) -> Result<crate::notifications::settings::StoreAnswer, MetadataReadError> {
+        let request = MetadataTransportMessage::StoreSetting {
+            target,
+            bytes,
+            change,
+        };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::StoreSettingResult { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// Phase two of a setting write on the management node `node_id`.
+    pub async fn request_confirm(
+        &self,
+        node_id: NodeId,
+        target: aruna_core::document::DocumentTarget,
+    ) -> Result<(), MetadataReadError> {
+        let request = MetadataTransportMessage::ConfirmSetting { target };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::ConfirmSettingResult { result } => result,
             _ => Err(MetadataReadError::Unavailable),
         }
     }
