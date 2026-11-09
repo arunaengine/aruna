@@ -345,3 +345,7 @@ impl Operation for NodeSecretsOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+#[path = "node_tests.rs"]
+mod tests;

@@ -1,0 +1,185 @@
+//! Tests the node secret operation's transitions and effects without I/O.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use crate::secrets::tests::{actor, create, name, token};
+use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
+use byteview::ByteView;
+
+const TXN: Ulid = Ulid::from_bytes([9; 16]);
+
+fn change(change: SecretChange, write: u8) -> NodeSecretOperation {
+    NodeSecretOperation::new(NodeChange {
+        actor: actor(),
+        change,
+        now_ms: u64::from(write),
+        write_id: Ulid::from_bytes([write; 16]),
+    })
+}
+
+fn storage(event: StorageEvent) -> Event {
+    Event::Storage(event)
+}
+
+/// Starts the operation and answers the record read with `stored`.
+fn read(operation: &mut NodeSecretOperation, stored: Option<&SecretRecord>) -> Effects {
+    let effects = operation.start();
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    ));
+    let effects = operation.step(storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { key_space, txn_id: Some(TXN), .. })]
+            if key_space == NODE_SECRETS_KEYSPACE
+    ));
+    let value = stored.map(|info| ByteView::from(postcard::to_allocvec(info).unwrap()));
+    let key = ByteView::from(record_key(&name()));
+    operation.step(storage(StorageEvent::ReadResult { key, value }))
+}
+
+fn commit(operation: &mut NodeSecretOperation, effects: &Effects) {
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::CommitTransaction {
+            txn_id: TXN
+        })]
+    ));
+    let effects = operation.step(storage(StorageEvent::TransactionCommitted { txn_id: TXN }));
+    assert!(effects.is_empty() && operation.is_complete());
+}
+
+fn stored_info() -> SecretRecord {
+    let mut operation = change(create(), 10);
+    let effects = read(&mut operation, None);
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the record and audit write, got {effects:?}");
+    };
+    let row = writes
+        .iter()
+        .find(|(space, ..)| space == NODE_SECRETS_KEYSPACE)
+        .unwrap();
+    postcard::from_bytes(&row.2).unwrap()
+}
+
+#[test]
+fn create_writes_record() {
+    let mut operation = change(create(), 10);
+    let effects = read(&mut operation, None);
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice() else {
+        panic!("expected the record and audit write, got {effects:?}");
+    };
+    assert_eq!(*txn_id, Some(TXN));
+    let spaces: Vec<_> = writes.iter().map(|(space, ..)| space.as_str()).collect();
+    assert_eq!(spaces, [ADMIN_AUDIT_KEYSPACE, NODE_SECRETS_KEYSPACE]);
+    let effects = operation.step(storage(StorageEvent::BatchWriteResult { entries: vec![] }));
+    let [Effect::Storage(StorageEffect::VaultWrite { entry, txn_id, .. })] = effects.as_slice()
+    else {
+        panic!("expected the vault write, got {effects:?}");
+    };
+    assert_eq!(
+        (*entry, *txn_id),
+        (value_entry(Ulid::from_bytes([10; 16])), Some(TXN))
+    );
+    assert!(!format!("{effects:?}").contains("canary"));
+    let key = ByteView::from(entry.key());
+    let effects = operation.step(storage(StorageEvent::WriteResult { key }));
+    commit(&mut operation, &effects);
+    let info = operation.finalize().unwrap().unwrap();
+    assert_eq!(info.value_id, Ulid::from_bytes([10; 16]));
+}
+
+#[test]
+fn rotate_replaces_value() {
+    let current = stored_info();
+    let rotate = SecretChange::Rotate {
+        name: name(),
+        fields: token("canary-77aa"),
+        expected: Some(current.revision_token()),
+    };
+    let mut operation = change(rotate, 11);
+    let effects = read(&mut operation, Some(&current));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchWrite { .. })]
+    ));
+    let effects = operation.step(storage(StorageEvent::BatchWriteResult { entries: vec![] }));
+    let [Effect::Storage(StorageEffect::VaultWrite { entry, .. })] = effects.as_slice() else {
+        panic!("expected the new value, got {effects:?}");
+    };
+    assert_eq!(*entry, value_entry(Ulid::from_bytes([11; 16])));
+    let key = ByteView::from(entry.key());
+    let effects = operation.step(storage(StorageEvent::WriteResult { key }));
+    let [Effect::Storage(StorageEffect::VaultDelete { entry, .. })] = effects.as_slice() else {
+        panic!("expected the old value removal, got {effects:?}");
+    };
+    assert_eq!(*entry, value_entry(current.value_id));
+    let key = ByteView::from(entry.key());
+    let effects = operation.step(storage(StorageEvent::DeleteResult { key }));
+    commit(&mut operation, &effects);
+    assert!(operation.finalize().unwrap().is_some());
+}
+
+#[test]
+fn delete_removes_both() {
+    let current = stored_info();
+    let delete = SecretChange::Delete {
+        name: name(),
+        expected: None,
+    };
+    let mut operation = change(delete, 12);
+    let effects = read(&mut operation, Some(&current));
+    let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice() else {
+        panic!("expected the record removal, got {effects:?}");
+    };
+    assert_eq!(deletes[0].0, NODE_SECRETS_KEYSPACE);
+    let effects = operation.step(storage(StorageEvent::BatchDeleteResult { entries: vec![] }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::BatchWrite { .. })]
+    ));
+    let effects = operation.step(storage(StorageEvent::BatchWriteResult { entries: vec![] }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::VaultDelete { .. })]
+    ));
+    let key = ByteView::from(value_entry(current.value_id).key());
+    let effects = operation.step(storage(StorageEvent::DeleteResult { key }));
+    commit(&mut operation, &effects);
+    assert_eq!(operation.finalize(), Ok(None));
+}
+
+#[test]
+fn refusal_aborts() {
+    let current = stored_info();
+    let mut operation = change(create(), 13);
+    let effects = read(&mut operation, Some(&current));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction {
+            txn_id: TXN
+        })]
+    ));
+    assert!(operation.is_complete());
+    let error = operation.finalize().unwrap_err();
+    assert_eq!(error, NodeSecretError::Change(ChangeError::Exists));
+}
+
+#[test]
+fn wrong_event_fails() {
+    let mut operation = change(create(), 14);
+    let _ = read(&mut operation, None);
+    let effects = operation.step(storage(StorageEvent::SyncAllFinished));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::AbortTransaction {
+            txn_id: TXN
+        })]
+    ));
+    let error = operation.finalize().unwrap_err();
+    assert!(matches!(error, NodeSecretError::UnexpectedEvent { .. }));
+}
