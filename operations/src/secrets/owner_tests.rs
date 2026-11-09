@@ -238,6 +238,15 @@ fn parent_transaction_kept() {
     let effects = operation.step(Event::Storage(page));
     assert!(matches!(
         effects.as_slice(),
+        [Effect::Storage(StorageEffect::Read { txn_id: Some(id), .. })] if *id == parent
+    ));
+    let key = aruna_core::types::Key::from(Vec::new());
+    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+        key,
+        value: None,
+    }));
+    assert!(matches!(
+        effects.as_slice(),
         [Effect::Storage(StorageEffect::BatchWrite { txn_id: Some(id), .. })] if *id == parent
     ));
     assert!(

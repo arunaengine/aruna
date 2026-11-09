@@ -5,25 +5,31 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::NODE_SECRETS_KEYSPACE;
+use aruna_core::keyspaces::{AUTH_KEYSPACE, NODE_SECRETS_KEYSPACE};
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
 use aruna_core::secrets::{SecretName, SecretRecord, SecretScope};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, TxnId};
+use aruna_core::{NodeId, UserId};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::{ChangeError, SecretChange, apply_change};
+use super::{ChangeError, Managers, SecretChange, apply_change, widening_notices};
 use crate::node_vault::{delete_secret, write_secret};
+use crate::notifications::outbox::schedule_drain_effect;
 
 /// One node secret change, with the time and write id it uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeChange {
+    pub realm_id: RealmId,
+    /// The node the secret lives on, named in the notice a widening change sends.
+    pub node_id: NodeId,
     pub actor: UserId,
     pub change: SecretChange,
     pub now_ms: u64,
@@ -60,6 +66,7 @@ enum State {
     ReadRecord,
     Writing(Pending),
     Commit,
+    ScheduleNotices,
     Done,
 }
 
@@ -70,6 +77,7 @@ pub struct NodeSecretOperation {
     state: State,
     txn_id: Option<TxnId>,
     queue: VecDeque<(Effect, Pending)>,
+    notices: bool,
     result: Option<Option<SecretRecord>>,
     output: Option<Result<Option<SecretRecord>, NodeSecretError>>,
 }
@@ -93,6 +101,7 @@ impl NodeSecretOperation {
             state: State::Init,
             txn_id: None,
             queue: VecDeque::new(),
+            notices: false,
             result: None,
             output: None,
         }
@@ -113,10 +122,15 @@ impl NodeSecretOperation {
     }
 
     /// Decides the change from the stored record, then queues every write of the transaction.
-    fn plan(&mut self, stored: Option<Vec<u8>>) -> Result<Effects, NodeSecretError> {
-        let current = stored.as_deref().map(decode).transpose()?;
+    fn plan(
+        &mut self,
+        stored: Option<&[u8]>,
+        auth: Option<&[u8]>,
+    ) -> Result<Effects, NodeSecretError> {
+        let current = stored.map(decode).transpose()?;
         let input = self.input.take().ok_or(NodeSecretError::NotFinished)?;
         let key = record_key(input.change.name());
+        let name = input.change.name().clone();
         let applied = apply_change(
             SecretScope::Node,
             current.as_ref(),
@@ -126,6 +140,20 @@ impl NodeSecretOperation {
             input.write_id,
         )?;
         let mut audit = applied.audit.entries()?;
+        if let (Some(info), Some(auth)) = (&applied.info, auth) {
+            let old = current.as_ref().map_or(&[][..], |current| &current.uses);
+            let notices = widening_notices(
+                input.realm_id,
+                &name,
+                (old, &info.uses),
+                Managers::Realm(auth),
+                Some(input.node_id),
+                input.actor,
+                input.now_ms,
+            )?;
+            self.notices = !notices.is_empty();
+            audit.extend(notices);
+        }
         let keyspace = NODE_SECRETS_KEYSPACE.to_string();
         match &applied.info {
             Some(info) => {
@@ -207,14 +235,27 @@ impl Operation for NodeSecretOperation {
                     return self.fail(NodeSecretError::NotFinished);
                 };
                 self.state = State::ReadRecord;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: NODE_SECRETS_KEYSPACE.to_string(),
-                    key: record_key(input.change.name()).into(),
+                let auth_key = input.realm_id.as_bytes().to_vec();
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads: vec![
+                        (
+                            NODE_SECRETS_KEYSPACE.to_string(),
+                            record_key(input.change.name()).into()
+                        ),
+                        (AUTH_KEYSPACE.to_string(), auth_key.into()),
+                    ],
                     txn_id: Some(txn_id),
                 })]
             }
-            (State::ReadRecord, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                match self.plan(value.map(|value| value.to_vec())) {
+            (State::ReadRecord, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                let [(_, stored), (_, auth)] = values.as_slice() else {
+                    let got = format!("{} values", values.len());
+                    return self.fail(NodeSecretError::UnexpectedEvent {
+                        state: "ReadRecord",
+                        got,
+                    });
+                };
+                match self.plan(stored.as_deref(), auth.as_deref()) {
                     Ok(effects) => effects,
                     Err(error) => self.fail(error),
                 }
@@ -243,6 +284,19 @@ impl Operation for NodeSecretOperation {
             }
             (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
                 self.txn_id = None;
+                if self.notices {
+                    self.state = State::ScheduleNotices;
+                    return smallvec![schedule_drain_effect()];
+                }
+                self.state = State::Done;
+                self.output = Some(Ok(self.result.take().flatten()));
+                smallvec![]
+            }
+            (
+                State::ScheduleNotices,
+                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
+            ) => {
+                // The notice rows are committed; a missed timer leaves them to the next drain.
                 self.state = State::Done;
                 self.output = Some(Ok(self.result.take().flatten()));
                 smallvec![]

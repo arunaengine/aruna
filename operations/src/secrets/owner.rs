@@ -11,7 +11,7 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, OWNER_SECRETS_KEYSPACE};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, OWNER_SECRETS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::realm_vault::{RealmVaultError, seal_named};
 use aruna_core::reducer::decode_reducer_state;
@@ -35,7 +35,8 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::{ChangeError, SecretChange};
+use super::{ChangeError, Managers, SecretChange, widening_notices};
+use crate::notifications::outbox::schedule_drain_effect as notice_drain_effect;
 use crate::sync::document_outbox::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -56,8 +57,8 @@ pub struct OwnerChange {
     pub now_ms: u64,
     /// Ids for the lifecycle, info and value writes this change may make.
     pub write_ids: [Ulid; 3],
-    /// A parent operation's transaction to write in; the parent commits it. `None` opens and
-    /// commits its own.
+    /// A parent operation's transaction to write in. The parent commits or aborts it and, after
+    /// a commit, schedules the document and notification drains. `None` opens and commits its own.
     pub txn_id: Option<TxnId>,
 }
 
@@ -198,9 +199,11 @@ enum State {
     Init,
     StartTransaction,
     Reading,
+    ReadManagers,
     Write,
     Commit,
     ScheduleDrain,
+    ScheduleNotices,
     Done,
 }
 
@@ -211,6 +214,7 @@ pub struct OwnerSecretOperation {
     reader: EntryReader,
     state: State,
     txn_id: Option<TxnId>,
+    notices: bool,
     result: Option<Option<SecretEntry>>,
     output: Option<Result<Option<SecretEntry>, OwnerSecretError>>,
 }
@@ -223,9 +227,20 @@ impl OwnerSecretOperation {
             reader,
             state: State::Init,
             txn_id: None,
+            notices: false,
             result: None,
             output: None,
         }
+    }
+
+    fn notices_or_done(&mut self) -> Effects {
+        if self.notices {
+            self.state = State::ScheduleNotices;
+            return smallvec![notice_drain_effect()];
+        }
+        self.state = State::Done;
+        self.output = Some(Ok(self.result.take().flatten()));
+        smallvec![]
     }
 
     fn fail(&mut self, error: OwnerSecretError) -> Effects {
@@ -368,9 +383,47 @@ impl OwnerSecretOperation {
         })
     }
 
-    fn write(&mut self) -> Result<Effects, OwnerSecretError> {
+    /// A group secret reads its group's roles, which name the managers a widening notice goes to.
+    fn read_managers(&mut self) -> Result<Effects, OwnerSecretError> {
+        let SecretOwner::Group(group_id) = self.input.owner else {
+            return self.write(None);
+        };
+        self.state = State::ReadManagers;
+        Ok(smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: AUTH_KEYSPACE.to_string(),
+            key: group_id.to_bytes().to_vec().into(),
+            txn_id: self.txn_id,
+        })])
+    }
+
+    fn write(&mut self, auth: Option<&[u8]>) -> Result<Effects, OwnerSecretError> {
+        let old = (self.reader.entry())
+            .and_then(|entry| entry.info)
+            .map(|info| match info.body {
+                SecretBody::Info(info) => info.uses,
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
         let (documents, action) = self.plan()?;
         let mut writes = Vec::new();
+        let new = (documents.iter()).find_map(|document| match &document.body {
+            SecretBody::Info(info) => Some(info.uses.as_slice()),
+            _ => None,
+        });
+        if let (SecretOwner::Group(group_id), Some(auth), Some(new)) = (self.input.owner, auth, new)
+        {
+            let notices = widening_notices(
+                self.input.realm_id,
+                self.input.change.name(),
+                (&old, new),
+                Managers::Group(group_id, auth),
+                None,
+                self.input.actor,
+                self.input.now_ms,
+            )?;
+            self.notices = !notices.is_empty();
+            writes.extend(notices);
+        }
         for document in &documents {
             let target = DocumentTarget::OwnerSecret {
                 realm_id: self.input.realm_id,
@@ -476,13 +529,18 @@ impl Operation for OwnerSecretOperation {
             }
             (State::Reading, event) => match self.reader.step(event, self.txn_id) {
                 Ok(Some(effect)) => smallvec![effect],
-                Ok(None) => self.write().unwrap_or_else(|error| self.fail(error)),
+                Ok(None) => self
+                    .read_managers()
+                    .unwrap_or_else(|error| self.fail(error)),
                 Err(error) => self.fail(error),
             },
+            (State::ReadManagers, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                (self.write(value.as_deref())).unwrap_or_else(|error| self.fail(error))
+            }
             (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
                 if self.input.txn_id.is_some() =>
             {
-                // The parent commits its transaction and schedules the outbox drain.
+                // The parent commits and schedules the document and notification drains.
                 self.txn_id = None;
                 self.state = State::Done;
                 self.output = Some(Ok(self.result.take().flatten()));
@@ -501,12 +559,17 @@ impl Operation for OwnerSecretOperation {
                 smallvec![schedule_drain_effect()]
             }
             (State::ScheduleDrain, Event::Task(TaskEvent::TimerScheduled { .. })) => {
-                self.state = State::Done;
-                self.output = Some(Ok(self.result.take().flatten()));
-                smallvec![]
+                self.notices_or_done()
             }
             (State::ScheduleDrain, Event::Task(TaskEvent::Error { message, .. })) => {
                 warn!(error = %message, "Outbox drain not scheduled; the durable outbox retries");
+                self.notices_or_done()
+            }
+            (
+                State::ScheduleNotices,
+                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
+            ) => {
+                // The notice rows are committed; a missed timer leaves them to the next drain.
                 self.state = State::Done;
                 self.output = Some(Ok(self.result.take().flatten()));
                 smallvec![]

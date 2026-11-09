@@ -59,6 +59,8 @@ async fn change(
     change: SecretChange,
 ) -> ServerResult<Option<SecretRecord>> {
     let input = NodeChange {
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
         actor: auth.user_id,
         change,
         now_ms: unix_timestamp_millis(),

@@ -11,6 +11,8 @@ const TXN: Ulid = Ulid::from_bytes([9; 16]);
 
 fn change(change: SecretChange, write: u8) -> NodeSecretOperation {
     NodeSecretOperation::new(NodeChange {
+        realm_id: actor().realm_id,
+        node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
         actor: actor(),
         change,
         now_ms: u64::from(write),
@@ -22,8 +24,16 @@ fn storage(event: StorageEvent) -> Event {
     Event::Storage(event)
 }
 
-/// Starts the operation and answers the record read with `stored`.
+/// Starts the operation and answers the record read with `stored` and no realm roles.
 fn read(operation: &mut NodeSecretOperation, stored: Option<&SecretRecord>) -> Effects {
+    read_with(operation, stored, None)
+}
+
+fn read_with(
+    operation: &mut NodeSecretOperation,
+    stored: Option<&SecretRecord>,
+    auth: Option<Vec<u8>>,
+) -> Effects {
     let effects = operation.start();
     assert!(matches!(
         effects.as_slice(),
@@ -34,12 +44,15 @@ fn read(operation: &mut NodeSecretOperation, stored: Option<&SecretRecord>) -> E
     let effects = operation.step(storage(StorageEvent::TransactionStarted { txn_id: TXN }));
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, txn_id: Some(TXN), .. })]
-            if key_space == NODE_SECRETS_KEYSPACE
+        [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: Some(TXN) })]
+            if reads[0].0 == NODE_SECRETS_KEYSPACE && reads[1].0 == AUTH_KEYSPACE
     ));
     let value = stored.map(|info| ByteView::from(postcard::to_allocvec(info).unwrap()));
-    let key = ByteView::from(record_key(&name()));
-    operation.step(storage(StorageEvent::ReadResult { key, value }))
+    let values = vec![
+        (ByteView::from(record_key(&name())), value),
+        (ByteView::from(Vec::new()), auth.map(ByteView::from)),
+    ];
+    operation.step(storage(StorageEvent::BatchReadResult { values }))
 }
 
 fn commit(operation: &mut NodeSecretOperation, effects: &Effects) {

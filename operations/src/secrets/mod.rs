@@ -6,14 +6,23 @@ pub mod node;
 pub mod owner;
 pub mod realm;
 
-use aruna_core::UserId;
+use aruna_core::errors::ConversionError;
+use aruna_core::secrets::widens_use;
 use aruna_core::secrets::{
     SecretError, SecretFields, SecretKind, SecretName, SecretRecord, SecretScope, SecretSettings,
     UseRule,
 };
+use aruna_core::storage_entries::outbox_write_entry;
+use aruna_core::structs::execution::notification::{NotificationOutboxRecord, ResourceEvent};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord, SecretAudit};
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
+use aruna_core::{NodeId, UserId};
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::notifications::routing::{RoutingContext, route_resource_event};
 
 /// One change a manager asks for. `expected` is an `If-Match` revision token.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +217,58 @@ fn touched(current: &SecretRecord, actor: UserId, now_ms: u64, write_id: Ulid) -
         updated_at_ms: now_ms,
         ..current.clone()
     }
+}
+
+/// Who manages a secret, for the notice that widened use triggers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Managers<'a> {
+    Realm(&'a [u8]),
+    Group(GroupId, &'a [u8]),
+}
+
+/// One notice row per manager when the new rules widen use over the old ones, the acting
+/// manager included, in the change's own transaction. Unreadable authorization writes none.
+pub(crate) fn widening_notices(
+    realm_id: RealmId,
+    name: &SecretName,
+    (old, new): (&[UseRule], &[UseRule]),
+    managers: Managers<'_>,
+    node_id: Option<NodeId>,
+    actor: UserId,
+    now_ms: u64,
+) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
+    if !widens_use(old, new) {
+        return Ok(Vec::new());
+    }
+    let (group_id, group_auth, realm_auth) = match managers {
+        Managers::Realm(bytes) => (
+            None,
+            None,
+            RealmAuthorizationDocument::from_bytes(bytes).ok(),
+        ),
+        Managers::Group(group_id, bytes) => (
+            Some(group_id),
+            GroupAuthorizationDocument::from_bytes(bytes).ok(),
+            None,
+        ),
+    };
+    let event = ResourceEvent::SecretUseWidened {
+        name: name.to_string(),
+        group_id,
+        node_id,
+        actor_user_id: actor,
+    };
+    let context = RoutingContext {
+        group_auth: group_auth.as_ref(),
+        realm_auth: realm_auth.as_ref(),
+        realm_id,
+    };
+    (route_resource_event(&event, context, now_ms).into_iter())
+        .map(|record| {
+            let outbox_id = record.notification_id;
+            outbox_write_entry(&NotificationOutboxRecord { outbox_id, record })
+        })
+        .collect()
 }
 
 #[cfg(test)]
