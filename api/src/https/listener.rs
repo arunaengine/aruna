@@ -239,10 +239,11 @@ impl HttpsHandle {
 
     /// Waits for every task and open handshake while the handle stays owned.
     pub async fn wait_until_released(&mut self) {
-        for task in &mut self.tasks {
+        // Drops each handle once joined, so a call cancelled by a deadline can run again.
+        while let Some(task) = self.tasks.first_mut() {
             let _ = task.await;
+            self.tasks.remove(0);
         }
-        self.tasks.clear();
         self.handshakes.close();
         self.handshakes.wait().await;
     }
@@ -333,5 +334,31 @@ async fn handshake(
             Ok(Err(reason)) => debug!(peer = %peer, reason = %reason, "HTTPS handshake refused"),
             Err(_) => debug!(peer = %peer, "HTTPS handshake timed out"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A drain cut short by its deadline is aborted and joined again without polling a done task.
+    #[tokio::test]
+    async fn rejoin_after_deadline() {
+        let done = tokio::spawn(async {});
+        while !done.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut handle = HttpsHandle {
+            tasks: vec![done, tokio::spawn(std::future::pending())],
+            handshakes: TaskTracker::new(),
+            abort_handshakes: CancellationToken::new(),
+        };
+        let cut = tokio::time::timeout(Duration::from_millis(50), handle.wait_until_released());
+        assert!(cut.await.is_err(), "the pending task holds the drain");
+        handle.abort();
+        tokio::time::timeout(Duration::from_secs(10), handle.wait_until_released())
+            .await
+            .expect("the aborted task releases the drain");
+        assert!(handle.tasks.is_empty());
     }
 }
