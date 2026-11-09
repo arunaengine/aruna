@@ -117,12 +117,15 @@ pub(super) async fn apply_batch_event(
     event: DocumentEvent,
     state: &mut BatchState,
 ) -> Result<()> {
-    if matches!(event.target(), DocumentTarget::WatchSubscription { .. })
-        && matches!(
-            event,
-            DocumentEvent::Upsert { .. } | DocumentEvent::Delete { .. }
-        )
-    {
+    if matches!(
+        event.target(),
+        DocumentTarget::WatchSubscription { .. }
+            | DocumentTarget::EmailPreference { .. }
+            | DocumentTarget::WebhookSubscription { .. }
+    ) && matches!(
+        event,
+        DocumentEvent::Upsert { .. } | DocumentEvent::Delete { .. }
+    ) {
         let outcome = apply_watch_event(service, topic_id, actor_id, identity, event).await?;
         record_shared(outcome, state);
         return Ok(());

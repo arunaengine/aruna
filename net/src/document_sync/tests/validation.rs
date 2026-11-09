@@ -906,3 +906,192 @@ fn node_owner_validation() {
         .is_err()
     );
 }
+
+fn setting_change(actor: NodeId, generation: u64, kind: DocumentChangeKind) -> DocumentChange {
+    DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation,
+            event_id: Ulid::generate(),
+            actor,
+            updated_at_ms: 1,
+        },
+        kind,
+        placement: PlacementRef::NIL,
+    }
+}
+
+fn email_setting(owner: UserId, seed: u8, on: bool) -> (DocumentTarget, Vec<u8>) {
+    use aruna_core::structs::execution::email::EmailPreference;
+    use aruna_core::structs::execution::setting::SettingChannel;
+    let id = Ulid::from_parts(seed as u64, 1);
+    let preference = EmailPreference {
+        preference_id: id,
+        user_id: owner,
+        version: 1,
+        categories: match on {
+            true => ["share.upload".to_string()].into(),
+            false => Default::default(),
+        },
+        sealed: on.then(|| vec![7; 48]),
+        created_at_ms: 1,
+    };
+    let target = SettingChannel::Email.target(owner, id);
+    (target, preference.to_bytes().expect("setting serializes"))
+}
+
+#[test]
+fn email_upsert_validated() {
+    use aruna_core::structs::execution::email::EmailPreference;
+    let owner = UserId::local(Ulid::from_parts(1, 1), RealmId::from_bytes([2u8; 32]));
+    let upsert = setting_change(node(7), 1, DocumentChangeKind::Upsert);
+    for on in [true, false] {
+        let (target, bytes) = email_setting(owner, 1, on);
+        assert!(validate_setting_upsert(&target, &bytes, &upsert).is_ok());
+        let later = setting_change(node(7), 2, DocumentChangeKind::Upsert);
+        assert!(validate_setting_upsert(&target, &bytes, &later).is_err());
+    }
+    let (target, bytes) = email_setting(owner, 1, true);
+    let mut preference = EmailPreference::from_bytes(&bytes).expect("setting decodes");
+    let other = UserId::local(Ulid::from_parts(9, 9), owner.realm_id);
+    let mut broken = Vec::new();
+    let changes: [fn(&mut EmailPreference); 5] = [
+        |setting: &mut EmailPreference| setting.categories.clear(),
+        |setting: &mut EmailPreference| setting.sealed = None,
+        |setting: &mut EmailPreference| setting.version = 0,
+        |setting: &mut EmailPreference| setting.categories = ["resource.watch".to_string()].into(),
+        |setting: &mut EmailPreference| setting.sealed = Some(vec![0; 4096]),
+    ];
+    for change in changes {
+        let mut changed = preference.clone();
+        change(&mut changed);
+        broken.push(changed);
+    }
+    preference.user_id = other;
+    broken.push(preference);
+    for setting in broken {
+        let bytes = setting.to_bytes().expect("setting serializes");
+        assert!(
+            validate_setting_upsert(&target, &bytes, &upsert).is_err(),
+            "{setting:?}"
+        );
+    }
+}
+
+#[test]
+fn webhook_upsert_validated() {
+    use aruna_core::structs::execution::setting::SettingChannel;
+    use aruna_core::structs::execution::webhook::WebhookSubscription;
+    let owner = UserId::local(Ulid::from_parts(1, 1), RealmId::from_bytes([2u8; 32]));
+    let id = Ulid::from_parts(3, 1);
+    let target = SettingChannel::Webhook.target(owner, id);
+    let upsert = setting_change(node(7), 1, DocumentChangeKind::Upsert);
+    let setting = |url: Option<&str>, sealed: Option<Vec<u8>>| {
+        let subscription = WebhookSubscription {
+            subscription_id: id,
+            user_id: owner,
+            version: 1,
+            url: url.map(str::to_string),
+            sealed,
+            created_at_ms: 1,
+        };
+        subscription.to_bytes().expect("setting serializes")
+    };
+    let url = Some("https://hooks.example.org/aruna");
+    assert!(validate_setting_upsert(&target, &setting(url, Some(vec![1; 80])), &upsert).is_ok());
+    assert!(validate_setting_upsert(&target, &setting(None, None), &upsert).is_ok());
+    for bytes in [
+        setting(url, None),
+        setting(None, Some(vec![1; 80])),
+        setting(Some("ftp://example.org/x"), Some(vec![1; 80])),
+        setting(Some("https://user:pw@example.org/x"), Some(vec![1; 80])),
+    ] {
+        assert!(validate_setting_upsert(&target, &bytes, &upsert).is_err());
+    }
+    let (email_target, _) = email_setting(owner, 3, true);
+    let mismatched = setting(url, Some(vec![1; 80]));
+    assert!(validate_setting_upsert(&email_target, &mismatched, &upsert).is_err());
+}
+
+#[tokio::test]
+async fn foreign_actor_rejected() {
+    // A setting whose revision actor is not its publisher, an invalid one and any delete are
+    // quarantined; the valid setting applies.
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([72u8; 32]);
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(72).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+    let local = service.local_node_id().expect("local node id");
+    let owner = UserId::local(Ulid::from_bytes([3; 16]), realm_id);
+    let (forged, forged_bytes) = email_setting(owner, 1, true);
+    let (valid, valid_bytes) = email_setting(owner, 2, false);
+    let (removed, _) = email_setting(owner, 3, true);
+    let (invalid, _) = email_setting(owner, 4, true);
+    let topic = valid.sync_topic_id(realm_id, &PlacementRef::NIL);
+    let events = [
+        Ulid::generate(),
+        Ulid::generate(),
+        Ulid::generate(),
+        Ulid::generate(),
+    ];
+    let upsert =
+        |event_id, target: &DocumentTarget, bytes: &[u8], actor| DocumentSyncPublish::Upsert {
+            event_id,
+            target: target.clone(),
+            bytes: bytes.to_vec(),
+            change: setting_change(actor, 1, DocumentChangeKind::Upsert),
+            allow_genesis: true,
+        };
+    let published = service
+        .publish_documents(
+            vec![
+                upsert(events[0], &forged, &forged_bytes, node(71)),
+                upsert(events[1], &invalid, &valid_bytes, local),
+                DocumentSyncPublish::Delete {
+                    event_id: events[2],
+                    target: removed,
+                    change: setting_change(local, 2, DocumentChangeKind::Delete),
+                    allow_genesis: true,
+                },
+                upsert(events[3], &valid, &valid_bytes, local),
+            ],
+            Vec::new(),
+        )
+        .await;
+    assert!(matches!(
+        published,
+        DocumentNetEvent::DocumentsPublished { .. }
+    ));
+    reset_test_cursor(&service, topic).await;
+    service
+        .reconcile_document_topics([topic])
+        .await
+        .expect("rejected settings are quarantined");
+
+    let records = quarantine_rows(&storage).await;
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(
+        quarantined_reason(&records, events[0]),
+        "notification setting revision actor is not its publisher"
+    );
+    assert!(quarantined_reason(&records, events[1]).starts_with("invalid notification setting:"));
+    assert_eq!(
+        quarantined_reason(&records, events[2]),
+        "notification settings are never deleted"
+    );
+    let applied = read_storage_value(&storage, valid.storage_keyspace(), valid.storage_key()).await;
+    assert_eq!(applied.as_deref(), Some(valid_bytes.as_slice()));
+    let skipped = read_storage_value(&storage, forged.storage_keyspace(), forged.storage_key());
+    assert!(skipped.await.is_none());
+    service.shutdown().await;
+}

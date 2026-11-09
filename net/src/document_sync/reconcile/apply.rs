@@ -512,10 +512,6 @@ pub(in crate::document_sync) async fn store_watch_change(
             return Ok(false);
         }
 
-        let realm_id = match &target {
-            DocumentTarget::WatchSubscription { owner, .. } => owner.realm_id,
-            _ => unreachable!("watch subscription apply requires a subscription target"),
-        };
         let revision_entry = match sync_revision_entry(&target, &change) {
             Ok(entry) => entry,
             Err(error) => {
@@ -525,14 +521,15 @@ pub(in crate::document_sync) async fn store_watch_change(
                 return Err(NetError::Bootstrap(error.to_string()));
             }
         };
-        let mut writes = vec![
-            revision_entry,
-            (
+        let mut writes = vec![revision_entry];
+        // Only watch subscriptions feed the interest digest; notification settings share the path.
+        if let DocumentTarget::WatchSubscription { owner, .. } = &target {
+            writes.push((
                 WATCH_INTEREST_KEYSPACE.to_string(),
-                ByteView::from(interest_dirty_key(realm_id)),
+                ByteView::from(interest_dirty_key(owner.realm_id)),
                 ByteView::from(Ulid::generate().to_bytes().to_vec()),
-            ),
-        ];
+            ));
+        }
         let deletes = if let Some(bytes) = bytes.as_ref() {
             writes.push((
                 target.storage_keyspace().to_string(),

@@ -255,6 +255,11 @@ impl AnnounceTopicOperation {
                 "watch subscriptions must sync through atomic watch CRUD outbox records"
                     .to_string(),
             )),
+            DocumentTarget::EmailPreference { .. } | DocumentTarget::WebhookSubscription { .. } => {
+                Err(AnnounceTopicError::DocumentSync(
+                    "notification settings sync only through their quorum write".to_string(),
+                ))
+            }
             DocumentTarget::MetadataRegistry {
                 group_id,
                 document_id,

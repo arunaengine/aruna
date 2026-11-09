@@ -184,6 +184,8 @@ pub fn document_class(target: &DocumentTarget) -> DocumentClass {
         | DocumentTarget::NodeUsage { .. }
         | DocumentTarget::WatchInterest { .. }
         | DocumentTarget::WatchSubscription { .. }
+        | DocumentTarget::EmailPreference { .. }
+        | DocumentTarget::WebhookSubscription { .. }
         | DocumentTarget::NodeInfo { .. } => DocumentClass::Admin,
     }
 }
@@ -1263,6 +1265,20 @@ mod pure_tests {
                 DocumentTarget::WatchSubscription {
                     owner: user_id,
                     watch_id: sid(4),
+                },
+                DocumentClass::Admin,
+            ),
+            (
+                DocumentTarget::EmailPreference {
+                    owner: user_id,
+                    preference_id: sid(4),
+                },
+                DocumentClass::Admin,
+            ),
+            (
+                DocumentTarget::WebhookSubscription {
+                    owner: user_id,
+                    subscription_id: sid(4),
                 },
                 DocumentClass::Admin,
             ),
