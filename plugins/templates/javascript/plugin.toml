@@ -1,0 +1,13 @@
+# Plugin manifest: what the plugin asks for. Build with `aruna-cli plugin build`.
+name = "{{name}}"
+version = "0.1.0"
+
+[triggers]
+manual = { handler = "run" }
+
+[permissions]
+required = []
+
+[build]
+command = ["npx", "--yes", "@bytecodealliance/jco@1.17.0", "componentize", "plugin.js", "--wit", "wit", "--world-name", "plugin", "--disable", "all", "-o", "plugin.wasm"]
+output = "plugin.wasm"
