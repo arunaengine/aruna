@@ -257,7 +257,8 @@ impl AnnounceTopicOperation {
             )),
             DocumentTarget::EmailPreference { .. } | DocumentTarget::WebhookSubscription { .. } => {
                 Err(AnnounceTopicError::DocumentSync(
-                    "notification settings sync only through their quorum write".to_string(),
+                    "notification settings sync only through their settings outbox records"
+                        .to_string(),
                 ))
             }
             DocumentTarget::MetadataRegistry {
