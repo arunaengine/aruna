@@ -486,6 +486,85 @@ fn rule_matches(
         && (rule.paths.is_empty() || rule.paths.iter().any(|prefix| path_within(path, prefix)))
 }
 
+/// Whether `new` lets some consumer use the secret where `old` did not: a new consumer or
+/// delivery, or a wider origin, path, method, group or response exposure. Managers get a notice.
+pub fn widens_use(old: &[UseRule], new: &[UseRule]) -> bool {
+    new.iter().enumerate().any(|(index, rule)| {
+        let covering: Vec<usize> = (old.iter().enumerate())
+            .filter(|(_, held)| rule_within(rule, held))
+            .map(|(position, _)| position)
+            .collect();
+        covering.is_empty() || unshadowed(old, &new[..index], rule, &covering)
+    })
+}
+
+/// `check_use` takes the first matching rule, so an earlier narrower rule hides a later wider
+/// exposure. True when such a hiding rule of the old list no longer comes before `rule`.
+fn unshadowed(old: &[UseRule], before: &[UseRule], rule: &UseRule, covering: &[usize]) -> bool {
+    covering.iter().any(|&position| {
+        old[..position].iter().any(|hiding| {
+            overlaps(hiding, rule)
+                && !exposure_within(&rule.response, &hiding.response)
+                && !before.contains(hiding)
+        })
+    })
+}
+
+/// Rules that may match one request: the same consumer and delivery and, for `inject`, a
+/// shared origin. Paths and methods are not compared, so this errs toward a notice.
+fn overlaps(left: &UseRule, right: &UseRule) -> bool {
+    left.consumer == right.consumer
+        && left.delivery == right.delivery
+        && (left.delivery != Delivery::Inject
+            || left
+                .origins
+                .iter()
+                .any(|origin| right.origins.contains(origin)))
+}
+
+fn rule_within(rule: &UseRule, held: &UseRule) -> bool {
+    let subset = |narrow: &[String], wide: &[String]| {
+        wide.is_empty() || (!narrow.is_empty() && narrow.iter().all(|item| wide.contains(item)))
+    };
+    let paths = held.paths.is_empty()
+        || (!rule.paths.is_empty()
+            && (rule.paths.iter())
+                .all(|path| held.paths.iter().any(|prefix| path_within(path, prefix))));
+    rule.consumer == held.consumer
+        && rule.delivery == held.delivery
+        && rule
+            .origins
+            .iter()
+            .all(|origin| held.origins.contains(origin))
+        && paths
+        && subset(&rule.methods, &held.methods)
+        && rule.groups.iter().all(|group| held.groups.contains(group))
+        && exposure_within(&rule.response, &held.response)
+}
+
+fn exposure_within(narrow: &ResponseExposure, wide: &ResponseExposure) -> bool {
+    match (narrow, wide) {
+        (_, ResponseExposure::Full) | (ResponseExposure::Status, _) => true,
+        (
+            ResponseExposure::Fields { pointers, headers },
+            ResponseExposure::Fields {
+                pointers: held_pointers,
+                headers: held_headers,
+            },
+        ) => {
+            pointers
+                .iter()
+                .all(|pointer| held_pointers.contains(pointer))
+                && (headers.iter()).all(|header| {
+                    held_headers
+                        .iter()
+                        .any(|held| held.eq_ignore_ascii_case(header))
+                })
+        }
+        _ => false,
+    }
+}
+
 /// `path` equals `prefix` or continues it at a segment boundary.
 fn path_within(path: &str, prefix: &str) -> bool {
     path.strip_prefix(prefix)

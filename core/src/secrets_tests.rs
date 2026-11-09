@@ -292,3 +292,64 @@ fn verify_without_target() {
     };
     assert!(check_use(SecretScope::Group(GROUP), &[rule], &use_request).is_ok());
 }
+
+#[test]
+fn widening_detected() {
+    let base = [inject_rule(vec![])];
+    assert!(widens_use(&[], &base), "a first rule widens use");
+    assert!(!widens_use(&base, &base));
+    assert!(!widens_use(&base, &[]), "removing rules narrows");
+    let mut narrower = base.clone();
+    narrower[0].paths = vec!["/records/drafts".to_string()];
+    assert!(!widens_use(&base, &narrower));
+    let wider: [fn(&mut UseRule); 6] = [
+        |rule: &mut UseRule| rule.origins.push("https://evil.example.org".to_string()),
+        |rule: &mut UseRule| rule.paths.clear(),
+        |rule: &mut UseRule| rule.methods.push("DELETE".to_string()),
+        |rule: &mut UseRule| rule.response = ResponseExposure::Full,
+        |rule: &mut UseRule| rule.consumer = plugin(2),
+        |rule: &mut UseRule| rule.delivery = Delivery::Value,
+    ];
+    for change in wider {
+        let mut rule = base.clone();
+        change(&mut rule[0]);
+        assert!(widens_use(&base, &rule), "{rule:?}");
+    }
+    let held = [inject_rule(vec![GROUP])];
+    assert!(!widens_use(&held, &held));
+    let mut grouped = held.clone();
+    grouped[0].groups.push(Ulid::from_bytes([8; 16]));
+    assert!(widens_use(&held, &grouped));
+}
+
+#[test]
+fn shadowing_counts() {
+    // The first matching rule decides, so dropping or moving a narrower earlier rule exposes the
+    // wider later one.
+    let status = inject_rule(vec![]);
+    let full = UseRule {
+        response: ResponseExposure::Full,
+        ..inject_rule(vec![])
+    };
+    let held = [status.clone(), full.clone()];
+    assert!(
+        widens_use(&held, std::slice::from_ref(&full)),
+        "status removed"
+    );
+    assert!(
+        widens_use(&held, &[full.clone(), status.clone()]),
+        "rules reordered"
+    );
+    assert!(!widens_use(&held, &held));
+    assert!(
+        !widens_use(&held, std::slice::from_ref(&status)),
+        "removing full narrows"
+    );
+    let mut elsewhere = full.clone();
+    elsewhere.origins = vec!["https://other.example.org".to_string()];
+    let apart = [status.clone(), elsewhere.clone()];
+    assert!(
+        !widens_use(&apart, std::slice::from_ref(&elsewhere)),
+        "no shared origin"
+    );
+}
