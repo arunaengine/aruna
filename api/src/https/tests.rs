@@ -1,19 +1,37 @@
-//! Tests native HTTPS: certificate checks and reload with generated test certificates.
+//! Tests native HTTPS: certificate checks and reload, routing, handshake limits and shutdown.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
+use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::middleware::from_fn_with_state;
+use axum::routing::get;
+use http::StatusCode;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     date_time_ymd,
 };
-use rustls::pki_types::UnixTime;
+use rustls::client::Resumption;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, RootCertStore};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream as ClientStream;
+use tokio_util::sync::CancellationToken;
 
-use super::HostRoutes;
 use super::certificate::{CertificateError, CertificateStore, ReloadOutcome, check_pair};
+use super::listener::{CombinedListener, HttpsHandle, RoutedListener, serve_routers};
+use super::{HostCheck, HostRoute, HostRoutes, check_host};
 
 /// 2026-01-01T00:00:00Z, inside every default validity window below.
 const NOW: u64 = 1_767_225_600;
@@ -418,4 +436,318 @@ fn startup_refuses_expired() {
         at(NOW),
     );
     assert!(matches!(missing, Err(CertificateError::Read { .. })));
+}
+
+/// A front on a loopback port with one small router per route behind it.
+struct Stack {
+    address: SocketAddr,
+    ca: String,
+    root: Authority,
+    files: Files,
+    store: Arc<CertificateStore>,
+    handle: HttpsHandle,
+    shutdown: CancellationToken,
+    /// The REST route's listener when the test keeps it from accepting.
+    parked: Option<RoutedListener>,
+}
+
+/// Answers its route name on `/route` and the client address on `/peer`.
+fn route_router(name: &'static str) -> Router {
+    Router::new()
+        .route("/route", get(move || async move { name }))
+        .route(
+            "/peer",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+        )
+}
+
+async fn stack(permits: usize, deadline: Duration, queue: usize, serve_rest: bool) -> Stack {
+    let root = Authority::root();
+    let (certificate, key) = pair(&root);
+    let files = Files::new(&certificate, &key, &root.pem);
+    let store = Arc::new(files.store(UnixTime::now()).expect("store loads"));
+    let shutdown = CancellationToken::new();
+    let mut senders = HashMap::new();
+    let mut parked = None;
+    for (route, name) in [
+        (HostRoute::Rest, "rest"),
+        (HostRoute::S3, "s3"),
+        (HostRoute::Portal, "portal"),
+    ] {
+        let check = HostCheck::new(store.routes().clone(), route);
+        let (sender, routed) = RoutedListener::bounded(check.clone(), queue);
+        senders.insert(route, sender);
+        if route == HostRoute::Rest && !serve_rest {
+            parked = Some(routed);
+            continue;
+        }
+        let plain = TcpListener::bind("127.0.0.1:0").await.expect("plain port");
+        let router = route_router(name);
+        let tls = router.clone().layer(from_fn_with_state(check, check_host));
+        tokio::spawn(serve_routers(
+            CombinedListener::new(plain, Some(routed)),
+            router,
+            Some(tls),
+            shutdown.clone(),
+        ));
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("HTTPS port");
+    let address = listener.local_addr().expect("HTTPS address");
+    let handle = HttpsHandle::spawn_with(
+        listener,
+        store.clone(),
+        senders,
+        shutdown.clone(),
+        permits,
+        deadline,
+    )
+    .expect("front starts");
+    Stack {
+        address,
+        ca: root.pem.clone(),
+        root,
+        files,
+        store,
+        handle,
+        shutdown,
+        parked,
+    }
+}
+
+async fn default_stack() -> Stack {
+    stack(16, Duration::from_secs(10), 8, true).await
+}
+
+/// A client that trusts `ca`, offers `alpn` and never resumes a session, so
+/// every connection shows the certificate the server serves now.
+fn client_config(ca: &str, alpn: &[&[u8]]) -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    for certificate in CertificateDer::pem_slice_iter(ca.as_bytes()) {
+        roots.add(certificate.expect("CA PEM")).expect("CA root");
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+    config.resumption = Resumption::disabled();
+    Arc::new(config)
+}
+
+async fn connect(
+    address: SocketAddr,
+    name: ServerName<'static>,
+    config: Arc<ClientConfig>,
+) -> std::io::Result<ClientStream<TcpStream>> {
+    let tcp = TcpStream::connect(address).await?;
+    TlsConnector::from(config).connect(name, tcp).await
+}
+
+fn dns(name: &str) -> ServerName<'static> {
+    ServerName::try_from(name.to_string()).expect("DNS name")
+}
+
+async fn connect_h1(stack: &Stack, name: &str) -> ClientStream<TcpStream> {
+    connect(
+        stack.address,
+        dns(name),
+        client_config(&stack.ca, &[b"http/1.1"]),
+    )
+    .await
+    .expect("TLS connection")
+}
+
+/// One HTTP/1.1 GET with an explicit `Host`, answering the status and body.
+async fn get_h1(stream: ClientStream<TcpStream>, host: &str, path: &str) -> (StatusCode, String) {
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("HTTP/1.1 handshake");
+    tokio::spawn(connection);
+    let request = http::Request::get(path)
+        .header(http::header::HOST, host)
+        .body(Body::empty())
+        .expect("request");
+    let response = sender.send_request(request).await.expect("response");
+    let status = response.status();
+    let body = axum::body::to_bytes(Body::new(response.into_body()), 1 << 20)
+        .await
+        .expect("body");
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Waits until the server closes `stream`, so a test observes the close itself.
+async fn closed(mut stream: impl AsyncRead + Unpin) {
+    let mut buffer = [0u8; 64];
+    let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buffer))
+        .await
+        .expect("the server must close the connection");
+    assert!(matches!(read, Ok(0) | Err(_)), "unexpected data: {read:?}");
+}
+
+#[tokio::test]
+async fn routes_by_sni() {
+    let stack = default_stack().await;
+    for (name, expected) in [
+        ("api.test", "rest"),
+        ("portal.test", "portal"),
+        ("s3.test", "s3"),
+        ("bucket.s3.test", "s3"),
+    ] {
+        let stream = connect_h1(&stack, name).await;
+        assert_eq!(
+            get_h1(stream, name, "/route").await,
+            (StatusCode::OK, expected.to_string()),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refuses_unknown_names() {
+    // HTTPS serves domain names only: no SNI (an IP address) and unknown names fail.
+    let stack = default_stack().await;
+    let config = client_config(&stack.ca, &[b"http/1.1"]);
+    let ip = ServerName::IpAddress(std::net::Ipv4Addr::LOCALHOST.into());
+    assert!(connect(stack.address, ip, config.clone()).await.is_err());
+    assert!(
+        connect(stack.address, dns("other.test"), config)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn negotiates_alpn() {
+    let stack = default_stack().await;
+    let config = client_config(&stack.ca, &[b"h2", b"http/1.1"]);
+    let rest = connect(stack.address, dns("api.test"), config.clone())
+        .await
+        .expect("REST connection");
+    assert_eq!(rest.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+    let s3 = connect(stack.address, dns("s3.test"), config)
+        .await
+        .expect("S3 connection");
+    assert_eq!(s3.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+}
+
+#[tokio::test]
+async fn http2_misdirected() {
+    // One HTTP/2 connection reused for another route's name gets 421, so a
+    // browser that coalesced connections retries on a new one.
+    let stack = default_stack().await;
+    let stream = connect(
+        stack.address,
+        dns("api.test"),
+        client_config(&stack.ca, &[b"h2"]),
+    )
+    .await
+    .expect("HTTP/2 connection");
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .expect("HTTP/2 handshake");
+    tokio::spawn(connection);
+    for (uri, expected) in [
+        ("https://api.test/route", StatusCode::OK),
+        ("https://portal.test/route", StatusCode::MISDIRECTED_REQUEST),
+    ] {
+        let request = http::Request::get(uri)
+            .body(Body::empty())
+            .expect("request");
+        let response = sender.send_request(request).await.expect("response");
+        assert_eq!(response.status(), expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn host_mismatch_misdirected() {
+    let stack = default_stack().await;
+    let stream = connect_h1(&stack, "api.test").await;
+    let (status, _) = get_h1(stream, "portal.test", "/route").await;
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+}
+
+#[tokio::test]
+async fn handler_sees_peer() {
+    let stack = default_stack().await;
+    let stream = connect_h1(&stack, "api.test").await;
+    let local = stream.get_ref().0.local_addr().expect("client address");
+    let (status, body) = get_h1(stream, "api.test", "/peer").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, local.to_string());
+}
+
+#[tokio::test]
+async fn reload_serves_new() {
+    let stack = default_stack().await;
+    let leaf = |stream: &ClientStream<TcpStream>| {
+        stream.get_ref().1.peer_certificates().expect("peer chain")[0].to_vec()
+    };
+    let before = leaf(&connect_h1(&stack, "api.test").await);
+
+    let key = KeyPair::generate().expect("leaf key");
+    let renewed = stack.root.leaf(&NAMES, VALID, &key);
+    stack.files.write(&stack.files.key, &key.serialize_pem());
+    stack.files.write(&stack.files.certificate, &renewed);
+    assert!(matches!(
+        stack.store.reload(UnixTime::now()),
+        ReloadOutcome::Replaced
+    ));
+    let after = leaf(&connect_h1(&stack, "api.test").await);
+    assert_ne!(before, after, "a new connection sees the reloaded leaf");
+}
+
+#[tokio::test]
+async fn handshake_deadline_frees() {
+    let stack = stack(1, Duration::from_millis(300), 8, true).await;
+    let idle = TcpStream::connect(stack.address)
+        .await
+        .expect("idle client");
+    let config = client_config(&stack.ca, &[b"http/1.1"]);
+    assert!(
+        connect(stack.address, dns("api.test"), config.clone())
+            .await
+            .is_err(),
+        "the only permit is held by the idle client"
+    );
+    closed(idle).await;
+    // The permit is released right after the idle socket closes.
+    let mut connected = false;
+    for _ in 0..50 {
+        if connect(stack.address, dns("api.test"), config.clone())
+            .await
+            .is_ok()
+        {
+            connected = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(connected, "the freed permit admits a new handshake");
+}
+
+#[tokio::test]
+async fn full_queue_drops() {
+    // REST never accepts: one stream fills its queue of one, and the next
+    // handshake gives up at the deadline instead of waiting without bound.
+    let stack = stack(16, Duration::from_millis(300), 1, false).await;
+    let _queued = connect_h1(&stack, "api.test").await;
+    let waiting = connect_h1(&stack, "api.test").await;
+    closed(waiting).await;
+    assert!(stack.parked.is_some());
+}
+
+#[tokio::test]
+async fn shutdown_ends_handshakes() {
+    let mut stack = stack(16, Duration::from_secs(60), 8, true).await;
+    let idle = TcpStream::connect(stack.address)
+        .await
+        .expect("idle client");
+    stack.shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), stack.handle.wait_until_released())
+        .await
+        .expect("shutdown releases the front and its handshakes");
+    closed(idle).await;
 }
