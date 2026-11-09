@@ -110,6 +110,8 @@ pub struct NodeShutdown {
     pub portal: Option<JoinHandle<()>>,
     /// Optional session bridge listener; joined with the other ingress tasks.
     pub session_s3: Option<aruna_api::s3::server::S3ServerHandle>,
+    /// Native HTTPS front, redirect and reload; handed-over connections drain with their service.
+    pub https: Option<aruna_api::https::listener::HttpsHandle>,
     /// The monitoring refresher owner. Its sampler is cancelled and awaited
     /// before storage closes; the ops HTTP task above stays separate.
     pub monitoring: Option<Arc<MonitoringState>>,
@@ -192,6 +194,7 @@ impl NodeShutdown {
         let mut s3 = self.s3;
         let mut portal = self.portal;
         let mut session_s3 = self.session_s3;
+        let mut https = self.https;
         let mut ingress_complete = false;
         phase("ingress", ingress, async {
             if let Some(rest) = rest.as_mut() {
@@ -207,6 +210,9 @@ impl NodeShutdown {
             portal = None;
             if let Some(session_s3) = session_s3.as_mut() {
                 session_s3.wait_until_released().await;
+            }
+            if let Some(https) = https.as_mut() {
+                https.wait_until_released().await;
             }
             ingress_complete = true;
         })
@@ -224,6 +230,9 @@ impl NodeShutdown {
             if let Some(session_s3) = session_s3.as_ref() {
                 session_s3.abort();
             }
+            if let Some(https) = https.as_ref() {
+                https.abort();
+            }
             if let Some(rest) = rest {
                 let _ = rest.await;
             }
@@ -237,6 +246,9 @@ impl NodeShutdown {
             }
             if let Some(session_s3) = session_s3.as_mut() {
                 session_s3.wait_until_released().await;
+            }
+            if let Some(https) = https.as_mut() {
+                https.wait_until_released().await;
             }
         }
 
@@ -593,6 +605,7 @@ mod tests {
             s3: None,
             portal: None,
             session_s3: None,
+            https: None,
             monitoring: None,
             task_handle: TaskHandle::new(),
             jobs_runtime: JobsRuntime::new(),

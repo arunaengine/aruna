@@ -104,6 +104,7 @@ impl Acquired {
             s3: None,
             portal: None,
             session_s3: None,
+            https: None,
             monitoring: self.monitoring,
             task_handle: self.task_handle,
             jobs_runtime: self.jobs_runtime,

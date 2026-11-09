@@ -205,6 +205,11 @@ impl HttpsHandle {
         })
     }
 
+    /// Whether any task has ended, for the readiness check before the supervision loop.
+    pub fn is_finished(&self) -> bool {
+        self.tasks.iter().any(JoinHandle::is_finished)
+    }
+
     /// Adds a task, such as the redirect or the reload, to this handle's supervision and drain.
     pub fn attach(&mut self, task: JoinHandle<()>) {
         self.tasks.push(task);

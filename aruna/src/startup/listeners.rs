@@ -7,6 +7,8 @@ use std::sync::Arc;
 use aruna_api::auth::OidcValidator;
 use aruna_api::cors::CorsConfig;
 use aruna_api::csp::PortalCspConfig;
+use aruna_api::https::HostRoute;
+use aruna_api::https::listener::{CombinedListener, HttpsHandle};
 use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
@@ -32,6 +34,8 @@ pub(crate) struct ServerBindings {
     /// The optional session bridge listener, joined with the other ingress
     /// listeners instead of being left to its cancellation token.
     pub(crate) session_s3_handle: Option<S3ServerHandle>,
+    /// Native HTTPS: the front, redirect and reload tasks.
+    pub(crate) https_handle: Option<HttpsHandle>,
     pub(crate) realm_id: aruna_core::structs::identity::realm::RealmId,
     pub(crate) node_id: iroh::PublicKey,
     pub(crate) is_initial_boot: bool,
@@ -47,6 +51,7 @@ struct StartedListeners {
     portal: Option<tokio::task::JoinHandle<()>>,
     s3: Option<S3ServerHandle>,
     session_s3: Option<S3ServerHandle>,
+    https: Option<HttpsHandle>,
 }
 
 impl StartedListeners {
@@ -54,6 +59,10 @@ impl StartedListeners {
     /// handles await their connection children after the abort, so a partial
     /// bind releases every accepted connection, not just the accept loop.
     async fn abort_all(&mut self) {
+        if let Some(mut handle) = self.https.take() {
+            handle.abort();
+            handle.wait_until_released().await;
+        }
         if let Some(handle) = self.session_s3.take() {
             handle.abort();
             handle.wait().await;
@@ -239,6 +248,8 @@ async fn bind_all(
 ) -> Result<ServerBindings, Box<dyn std::error::Error>> {
     let is_initial_node = config.is_initial_node();
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
+    // Certificates and HTTPS sockets first: a failure here starts nothing.
+    let mut https = crate::startup::https::prepare(config.https.as_ref()).await?;
     #[cfg(unix)]
     crate::backup::serve(
         std::path::Path::new(&config.storage_path),
@@ -320,6 +331,9 @@ async fn bind_all(
         .with_mcp_enabled(config.mcp_enabled);
 
     started.portal = bind_portal(
+        https
+            .as_mut()
+            .and_then(|https| https.take(HostRoute::Portal)),
         &config.portal,
         config.api_public_url.as_deref(),
         PortalCspConfig::new(config.portal_csp_origins.clone()),
@@ -372,6 +386,10 @@ async fn bind_all(
                 config.s3_public_url.as_deref().unwrap_or(s3_host),
             )
             .await;
+        let s3_listener = CombinedListener::new(
+            s3_listener,
+            https.as_mut().and_then(|https| https.take(HostRoute::S3)),
+        );
         let (_s3_addr, s3_handle) = s3_server.run_with_listener(s3_listener, shutdown.token())?;
         started.s3 = Some(s3_handle);
         started.session_s3 = bind_session_s3(
@@ -386,7 +404,10 @@ async fn bind_all(
         .await;
     }
 
+    let rest_routed = https.as_mut().and_then(|https| https.take(HostRoute::Rest));
+    started.https = https.map(|https| https.start(shutdown)).transpose()?;
     let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
+    let rest_listener = CombinedListener::new(rest_listener, rest_routed);
     let rest_handle = tokio::spawn(server.run_with_listener(rest_listener, shutdown.token()));
 
     Ok(ServerBindings {
@@ -394,6 +415,7 @@ async fn bind_all(
         s3_handle: started.s3.take(),
         portal_handle: started.portal.take(),
         session_s3_handle: started.session_s3.take(),
+        https_handle: started.https.take(),
         realm_id: config.realm_id,
         node_id: config.node_id,
         is_initial_boot,
@@ -405,6 +427,7 @@ async fn bind_all(
 /// is required alongside it, so the served config always carries an absolute
 /// API base.
 async fn bind_portal(
+    routed: Option<aruna_api::https::listener::RoutedListener>,
     portal: &PortalConfig,
     api_public_url: Option<&str>,
     csp: PortalCspConfig,
@@ -428,6 +451,7 @@ async fn bind_portal(
 
     let listener = TcpListener::bind(socket_addr).await?;
     let bound = listener.local_addr()?;
+    let listener = CombinedListener::new(listener, routed);
     let portal_config = aruna_api::portal::PortalConfig {
         api_public_url: api_public_url.to_string(),
         csp,
@@ -462,6 +486,14 @@ pub(crate) async fn portal_exit(handle: Option<&mut tokio::task::JoinHandle<()>>
 pub(crate) async fn s3_exit(handle: Option<&mut S3ServerHandle>) -> String {
     match handle {
         Some(handle) => handle.exit("S3").await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves when a native HTTPS task exits, and never without HTTPS.
+pub(crate) async fn https_exit(handle: Option<&mut HttpsHandle>) -> String {
+    match handle {
+        Some(handle) => handle.exit().await,
         None => std::future::pending().await,
     }
 }
@@ -671,6 +703,124 @@ mod tests {
         let rebound =
             std::net::TcpListener::bind(s3_addr).expect("the failed bind must release the port");
         drop(rebound);
+        drop(occupied);
+    }
+
+    /// A self-signed certificate for `api.test` and `s3.test`, listed as its own CA.
+    fn https_files(dir: &std::path::Path) -> [String; 2] {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["api.test".to_string(), "s3.test".to_string()])
+                .expect("params");
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2100, 1, 1);
+        let certificate = params.self_signed(&key).expect("certificate").pem();
+        let paths = [dir.join("fullchain.pem"), dir.join("privkey.pem")];
+        std::fs::write(&paths[0], certificate).expect("certificate file");
+        std::fs::write(&paths[1], key.serialize_pem()).expect("key file");
+        paths.map(|path| path.to_str().expect("utf8 path").to_string())
+    }
+
+    /// Resolves a native HTTPS node config with the REST and S3 routes.
+    async fn https_config(
+        temp: &std::path::Path,
+        rest: std::net::SocketAddr,
+        https: std::net::SocketAddr,
+        redirect: std::net::SocketAddr,
+        files: &[String; 2],
+    ) -> (crate::config::Config, aruna_storage::StorageHandle) {
+        let map: std::collections::BTreeMap<String, String> = [
+            ("STORAGE_PATH", temp.join("store").to_str().expect("utf8")),
+            ("SOCKET_ADDRESS", &rest.to_string()),
+            ("P2P_SOCKET_ADDRESS", "127.0.0.1:0"),
+            ("PORTAL_MODE", "disabled"),
+            ("ARUNA_FJALL_PERSIST_MODE", "buffer"),
+            ("API_PUBLIC_URL", "https://api.test"),
+            ("S3_HOST", "s3.test"),
+            ("S3_ADDRESS", &free_port().to_string()),
+            ("S3_PUBLIC_URL", "https://s3.test"),
+            ("HTTPS_SOCKET_ADDRESS", &https.to_string()),
+            ("HTTPS_CERTIFICATE_PATH", &files[0]),
+            ("HTTPS_KEY_PATH", &files[1]),
+            ("HTTPS_CA_PATH", &files[0]),
+            ("REDIRECT_SOCKET_ADDRESS", &redirect.to_string()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        crate::config::resolve_settings(
+            crate::settings::read_settings_from(&map).expect("settings parse"),
+        )
+        .await
+        .expect("settings resolve")
+    }
+
+    fn free_port() -> std::net::SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        probe.local_addr().expect("probe address")
+    }
+
+    async fn bind_error(
+        config: &crate::config::Config,
+        storage: aruna_storage::StorageHandle,
+    ) -> String {
+        let driver_ctx = std::sync::Arc::new(aruna_operations::driver::DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        });
+        match bind(
+            config,
+            None,
+            driver_ctx,
+            aruna_operations::jobs::runtime::JobsRuntime::new_paused(),
+            std::sync::Arc::new(aruna_core::metrics::NodeMetrics::new()),
+            &aruna_core::shutdown::Shutdown::new(),
+        )
+        .await
+        {
+            Ok(_) => panic!("the bind must fail"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    // TLS errors fail startup before any listener starts, never falling back to plaintext.
+    #[tokio::test]
+    async fn https_bind_refused() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let rest = free_port();
+        let missing = [
+            temp.path().join("missing.pem").display().to_string(),
+            temp.path().join("missing.key").display().to_string(),
+        ];
+        let (config, storage) =
+            https_config(temp.path(), rest, free_port(), free_port(), &missing).await;
+        let error = bind_error(&config, storage).await;
+        assert!(error.contains("cannot read"), "{error}");
+        std::net::TcpListener::bind(rest).expect("no REST listener was started");
+    }
+
+    // A failure after the HTTPS and redirect sockets were bound and the front
+    // started releases both ports with the other started listeners.
+    #[tokio::test]
+    async fn https_failure_releases() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let files = https_files(temp.path());
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupied port");
+        let rest = occupied.local_addr().expect("occupied address");
+        let (https, redirect) = (free_port(), free_port());
+        let (config, storage) = https_config(temp.path(), rest, https, redirect, &files).await;
+        let error = bind_error(&config, storage).await;
+        assert!(
+            error.to_lowercase().contains("address already in use"),
+            "expected the REST bind failure, got {error}"
+        );
+        std::net::TcpListener::bind(https).expect("the HTTPS port is released");
+        std::net::TcpListener::bind(redirect).expect("the redirect port is released");
         drop(occupied);
     }
 

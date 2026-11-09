@@ -51,6 +51,7 @@ opentelemetry_sdk = { workspace = true }
 postcard = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -75,6 +76,7 @@ keyring-core = { workspace = true }
 aruna-kpabe = { workspace = true }
 axum = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+rcgen = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",
