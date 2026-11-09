@@ -152,6 +152,14 @@ async fn short_quorum_unavailable() {
     assert!(matches!(read, Err(ServerError::NotFound)));
 }
 
+#[test]
+fn storage_error_unavailable() {
+    let stored = setting_error(SettingError::Storage("journal".into()));
+    assert!(matches!(stored, ServerError::ServiceUnavailableReason(_)));
+    let built = setting_error(SettingError::Build("encode".into()));
+    assert!(matches!(built, ServerError::InternalError(_)));
+}
+
 #[tokio::test]
 async fn config_error_unavailable() {
     let (_dir, state, _actor, auth) = management_state().await;

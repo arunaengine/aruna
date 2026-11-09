@@ -237,12 +237,11 @@ fn map_error(error: EmailError) -> ServerError {
 
 pub(crate) fn setting_error(error: SettingError) -> ServerError {
     match error {
-        SettingError::Config(_) | SettingError::NoQuorum => {
+        // A failed publish after the store quorum may still take effect, so the outcome is unknown.
+        SettingError::Config(_) | SettingError::NoQuorum | SettingError::Storage(_) => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        SettingError::Build(_) | SettingError::Storage(_) => {
-            ServerError::InternalError(error.to_string())
-        }
+        SettingError::Build(_) => ServerError::InternalError(error.to_string()),
     }
 }
 
