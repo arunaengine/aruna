@@ -238,3 +238,64 @@ async fn early_value_kept() {
     );
     assert_eq!(state.materialized_realm_secrets().len(), 2);
 }
+
+#[tokio::test]
+async fn widening_notifies_admins() {
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
+    use aruna_core::secrets::{Delivery, ResponseExposure, SecretConsumer, UseRule};
+    use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+    let dir = tempdir().unwrap();
+    let ctx = context(dir.path().to_str().unwrap());
+    seed(&ctx, RealmNodeKind::Management).await;
+    let mut auth = RealmAuthorizationDocument::default_realm_doc(actor().realm_id);
+    for role in auth
+        .roles
+        .values_mut()
+        .filter(|role| role.name == "realm_admin")
+    {
+        role.assigned_users.insert(actor().user_id);
+    }
+    let write = StorageEffect::Write {
+        key_space: AUTH_KEYSPACE.to_string(),
+        key: actor().realm_id.as_bytes().to_vec().into(),
+        value: postcard::to_allocvec(&auth).unwrap().into(),
+        txn_id: None,
+    };
+    ctx.storage_handle.send_storage_effect(write).await;
+    let notices = || async {
+        let iter = StorageEffect::Iter {
+            key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 10,
+            txn_id: None,
+        };
+        match ctx.storage_handle.send_storage_effect(iter).await {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values.len(),
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    run(&ctx, create(), 10).await.unwrap();
+    assert_eq!(notices().await, 0, "a secret without rules widens nothing");
+    let rule = UseRule {
+        consumer: SecretConsumer::Plugin {
+            plugin_id: "announcer".to_string(),
+            install_id: Ulid::from_bytes([3; 16]),
+        },
+        delivery: Delivery::Inject,
+        origins: vec!["https://api.example.org".to_string()],
+        paths: Vec::new(),
+        methods: Vec::new(),
+        response: ResponseExposure::Status,
+        groups: vec![Ulid::from_bytes([7; 16])],
+    };
+    let widen = SecretChange::Replace {
+        name: name(),
+        description: String::new(),
+        settings: Default::default(),
+        uses: vec![rule],
+        expected: None,
+    };
+    run(&ctx, widen, 11).await.unwrap();
+    assert_eq!(notices().await, 1, "the one realm admin is told");
+}

@@ -196,3 +196,94 @@ fn wrong_event_fails() {
     let error = operation.finalize().unwrap_err();
     assert!(matches!(error, NodeSecretError::UnexpectedEvent { .. }));
 }
+
+#[test]
+fn widening_notifies_admins() {
+    use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
+    use aruna_core::secrets::{Delivery, ResponseExposure, SecretConsumer, UseRule};
+    use aruna_core::structs::execution::notification::NotificationKind;
+    use aruna_core::structs::execution::notification::NotificationOutboxRecord;
+    use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+    use aruna_core::task::TaskEvent;
+    let current = stored_info();
+    let mut auth = RealmAuthorizationDocument::default_realm_doc(actor().realm_id);
+    let other = UserId::local(Ulid::from_bytes([6; 16]), actor().realm_id);
+    for role in auth
+        .roles
+        .values_mut()
+        .filter(|role| role.name == "realm_admin")
+    {
+        role.assigned_users.extend([actor(), other]);
+    }
+    let rule = UseRule {
+        consumer: SecretConsumer::Plugin {
+            plugin_id: "announcer".to_string(),
+            install_id: Ulid::from_bytes([3; 16]),
+        },
+        delivery: Delivery::Inject,
+        origins: vec!["https://api.example.org".to_string()],
+        paths: Vec::new(),
+        methods: Vec::new(),
+        response: ResponseExposure::Status,
+        groups: vec![Ulid::from_bytes([7; 16])],
+    };
+    let widen = SecretChange::Replace {
+        name: name(),
+        description: String::new(),
+        settings: Default::default(),
+        uses: vec![rule],
+        expected: None,
+    };
+    let mut operation = change(widen.clone(), 11);
+    let bytes = postcard::to_allocvec(&auth).unwrap();
+    let effects = read_with(&mut operation, Some(&current), Some(bytes.clone()));
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the record, audit and notice writes, got {effects:?}");
+    };
+    let notices: Vec<NotificationOutboxRecord> = (writes.iter())
+        .filter(|(space, ..)| space == NOTIFICATION_OUTBOX_KEYSPACE)
+        .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
+        .collect();
+    let mut recipients: Vec<_> = notices
+        .iter()
+        .map(|notice| notice.record.recipient)
+        .collect();
+    recipients.sort();
+    assert_eq!(recipients, [actor(), other], "the acting admin is told too");
+    assert!(matches!(
+        &notices[0].record.kind,
+        NotificationKind::SecretUseWidened { name: notified, group_id: None, node_id: Some(_), .. }
+            if notified == "catalog-key"
+    ));
+    let effects = operation.step(storage(StorageEvent::BatchWriteResult { entries: vec![] }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+    ));
+    let effects = operation.step(storage(StorageEvent::TransactionCommitted { txn_id: TXN }));
+    assert!(
+        matches!(effects.as_slice(), [Effect::Task(_)]),
+        "the notice drain is scheduled"
+    );
+    let key = aruna_core::task::TaskKey::DrainNotificationOutbox;
+    let after = std::time::Duration::ZERO;
+    operation.step(Event::Task(TaskEvent::TimerScheduled { key, after }));
+    assert!(operation.finalize().unwrap().is_some());
+
+    // The same rules again widen nothing and send no notice.
+    let mut stored = current.clone();
+    stored.uses = match &widen {
+        SecretChange::Replace { uses, .. } => uses.clone(),
+        _ => Vec::new(),
+    };
+    let mut again = change(widen, 12);
+    let effects = read_with(&mut again, Some(&stored), Some(bytes));
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the record and audit write, got {effects:?}");
+    };
+    assert!(
+        !writes
+            .iter()
+            .any(|(space, ..)| space == NOTIFICATION_OUTBOX_KEYSPACE)
+    );
+}
