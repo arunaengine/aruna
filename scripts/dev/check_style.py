@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Style checks for folders, shared prefixes, names, comments and file headers.
-EXTERNAL_NAMES, SMALL_DOMAINS and HEADER_EXCEPTIONS hold the reviewed exceptions."""
+EXTERNAL_NAMES, SMALL_DOMAINS, HEADER_EXCEPTIONS and HEADER_FOLDERS hold the reviewed exceptions."""
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 import argparse
@@ -100,9 +100,11 @@ HEADER_EXCEPTIONS = {
     "blob/tests/fixtures/autoindex_nginx.html": "copied index page; the parser test needs its bytes",
     "blob/tests/fixtures/non_index.html": "copied page; the rejection test needs its bytes",
     "operations/tests/fixtures/ELN_README.md": "copied fixture; its bytes must stay unchanged",
-    "plugins/templates/rust/Cargo.toml": "template copied into a user's own plugin project",
-    "plugins/templates/rust/plugin.toml": "template copied into a user's own plugin project",
-    "plugins/templates/rust/src/lib.rs": "template copied into a user's own plugin project",
+}
+
+# Folders whose files carry no repository header, each with its reason.
+HEADER_FOLDERS = {
+    "plugins/templates": "scaffold copied into plugin authors' own projects; no Aruna copyright",
 }
 
 WORD_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
@@ -998,6 +1000,10 @@ def check_headers(root):
         if rel in HEADER_EXCEPTIONS:
             excused.add(rel)
             continue
+        folder = next((f for f in HEADER_FOLDERS if rel.startswith(f + "/")), None)
+        if folder is not None:
+            excused.add(folder)
+            continue
         kind = header_kind(rel, path)
         if kind is None:
             continue
@@ -1014,6 +1020,8 @@ def check_headers(root):
             yield from comment_header(rel, kind, lines, start)
     for rel in sorted(set(HEADER_EXCEPTIONS) - excused):
         yield ("header", rel, 0, "HEADER_EXCEPTIONS entry does not exist; remove it")
+    for rel in sorted(set(HEADER_FOLDERS) - excused):
+        yield ("header", rel, 0, "HEADER_FOLDERS entry has no files; remove it")
 
 
 def iter_python_files(root):
@@ -1430,6 +1438,10 @@ def main(argv):
     missing = without_reason(HEADER_EXCEPTIONS)
     if missing:
         print(f"HEADER_EXCEPTIONS needs a reason for: {', '.join(sorted(missing))}", file=sys.stderr)
+        return 2
+    missing = without_reason(HEADER_FOLDERS)
+    if missing:
+        print(f"HEADER_FOLDERS needs a reason for: {', '.join(sorted(missing))}", file=sys.stderr)
         return 2
     findings = []
     findings.extend(check_folders(root))

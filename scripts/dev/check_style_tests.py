@@ -837,11 +837,24 @@ class PythonToolTest(TreeTest):
 class HeaderTest(TreeTest):
     def setUp(self):
         self.saved = dict(check_style.HEADER_EXCEPTIONS)
+        self.folders = dict(check_style.HEADER_FOLDERS)
         check_style.HEADER_EXCEPTIONS.clear()
+        check_style.HEADER_FOLDERS.clear()
 
     def tearDown(self):
         check_style.HEADER_EXCEPTIONS.clear()
         check_style.HEADER_EXCEPTIONS.update(self.saved)
+        check_style.HEADER_FOLDERS.clear()
+        check_style.HEADER_FOLDERS.update(self.folders)
+
+    def test_folder_exempt(self):
+        check_style.HEADER_FOLDERS["kit/templates"] = "copied into user projects"
+        tree = [("kit/templates/rust/src/lib.rs", "fn tiny() {}\n"), ("kit/templates/py/app.py", "x = 1\n")]
+        self.assertEqual(self.headers(tree), [])
+        findings = self.headers([("kit/other/app.py", "x = 1\n")])
+        stale = ("header", "kit/templates", 0, "HEADER_FOLDERS entry has no files; remove it")
+        self.assertIn(stale, findings)
+        self.assertTrue(any(rel == "kit/other/app.py" for _, rel, _, _ in findings))
 
     def headers(self, tree):
         with tempfile.TemporaryDirectory() as tmp:
