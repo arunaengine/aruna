@@ -237,3 +237,5 @@ pub(crate) fn change_error(error: ChangeError) -> ServerError {
     }
 }
 
+#[cfg(test)]
+mod tests;
