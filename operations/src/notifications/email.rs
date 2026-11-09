@@ -1,9 +1,9 @@
-//! Keeps a user's email notification opt-in and mails the chosen notices through one SMTP server.
+//! Writes a user's email opt-in through the management quorum and mails the chosen notices
+//! through one SMTP server.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -13,29 +13,26 @@ use aruna_core::compute::SecretBytes;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{EMAIL_KEYSPACE, USER_KEYSPACE};
-use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::Operation;
+use aruna_core::keyspaces::USER_KEYSPACE;
+use aruna_core::realm_vault::seal_setting;
 pub use aruna_core::structs::execution::email::SmtpTls;
 use aruna_core::structs::execution::email::{
-    EMAIL_CATEGORIES, EmailDeliverySpec, EmailPreference, RealmEmailProfile, email_key,
+    EMAIL_CATEGORIES, EmailDeliverySpec, EmailPreference, RealmEmailProfile,
 };
 use aruna_core::structs::execution::job::{
     JobError, JobPayload, JobResultPayload, WorkspaceMode, user_dedup_key,
 };
 use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::Effects;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
 use lettre::message::Mailbox;
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -44,9 +41,13 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
 use crate::jobs::submit::SubmitJobSpec;
-use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
+use crate::notifications::settings::{
+    BACKOFF_START_MS, Backoffs, Delivery, MetadataPeers, SettingError, SettingPeers, SettingWinner,
+    delivery_setting, local_setting, managers, write_setting,
+};
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm_vault::{prune_secret_cache, read_realm_secret};
+use crate::storage_read::{StorageReadError, parse_storage_read};
 
 /// Time one SMTP exchange may take; the job runtime retries a timed out attempt.
 const SMTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -271,19 +272,10 @@ fn status(error: &lettre::transport::smtp::Error) -> String {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EmailAction {
-    Read,
-    /// Replaces any opt-in with one for `address` and `categories`.
-    OptIn {
-        address: String,
-        categories: BTreeSet<String>,
-    },
-    OptOut,
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum EmailError {
+    #[error(transparent)]
+    Setting(#[from] SettingError),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -292,223 +284,128 @@ pub enum EmailError {
     InvalidCategories,
     #[error("the address is not the verified email address of this account")]
     NotVerified,
-    #[error("email operation did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: {event}")]
-    UnexpectedEvent { state: String, event: String },
+    #[error("email is not configured in this realm")]
+    NotConfigured,
 }
 
-#[derive(Debug, PartialEq)]
-enum State {
-    Init,
-    Read,
-    WriteAddress { previous: Option<Ulid> },
-    WriteRecord { previous: Option<Ulid> },
-    DeleteRecord { previous: Ulid },
-    DeleteAddress,
-    Done,
+/// The caller's current opt-in as this node received it; `None` when email is off.
+pub async fn read_email(
+    ctx: &DriverContext,
+    owner: UserId,
+) -> Result<Option<EmailPreference>, EmailError> {
+    let bytes = local_setting(ctx, SettingChannel::Email, owner).await?;
+    Ok(bytes
+        .as_deref()
+        .map(EmailPreference::from_bytes)
+        .transpose()?)
 }
 
-/// Reads, sets or removes the caller's own opt-in on this node. An opt-in names only the
-/// account's verified address, which is sealed in the node vault.
-#[derive(Debug, PartialEq)]
-pub struct EmailOperation {
-    user_id: UserId,
-    action: EmailAction,
-    state: State,
-    preference: Option<EmailPreference>,
-    output: Option<Result<Option<EmailPreference>, EmailError>>,
+/// Turns on email for `categories` to the account's verified `address`. The address is
+/// sealed to the realm key, so only management nodes open it.
+pub async fn set_email(
+    ctx: &DriverContext,
+    local: NodeId,
+    owner: UserId,
+    address: String,
+    categories: BTreeSet<String>,
+) -> Result<EmailPreference, EmailError> {
+    let config = realm_config(ctx, owner).await?;
+    if config.email.is_none() {
+        return Err(EmailError::NotConfigured);
+    }
+    let known = (categories.iter()).all(|category| EMAIL_CATEGORIES.contains(&category.as_str()));
+    if categories.is_empty() || !known {
+        return Err(EmailError::InvalidCategories);
+    }
+    let address = address.trim().to_string();
+    if !verified(ctx, owner, &address).await? || address.parse::<Address>().is_err() {
+        return Err(EmailError::NotVerified);
+    }
+    let secret = SecretBytes::new(address.into_bytes());
+    let build = |version: u64, id: Ulid| {
+        let sealed = seal_setting(&owner.realm_id, SettingChannel::Email, &owner, id, &secret)
+            .map_err(|error| SettingError::Build(error.to_string()))?;
+        email_bytes(owner, id, version, categories.clone(), Some(sealed))
+    };
+    write_email(ctx, local, &config, owner, &build).await
 }
 
-impl EmailOperation {
-    pub fn new(user_id: UserId, action: EmailAction) -> Self {
-        Self {
-            user_id,
-            action,
-            state: State::Init,
-            preference: None,
-            output: None,
-        }
-    }
-
-    fn fail(&mut self, error: EmailError) -> Effects {
-        self.state = State::Done;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn done(&mut self) -> Effects {
-        self.state = State::Done;
-        self.output = Some(Ok(self.preference.take()));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, event: Event) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(EmailError::UnexpectedEvent {
-            state,
-            event: format!("{event:?}"),
-        })
-    }
-
-    fn handle_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(event);
-        };
-        let [(_, stored), (_, user)] = values.as_slice() else {
-            return self.fail(EmailError::NotFinished);
-        };
-        let existing = match stored
-            .as_deref()
-            .map(EmailPreference::from_bytes)
-            .transpose()
-        {
-            Ok(existing) => existing,
-            Err(error) => return self.fail(error.into()),
-        };
-        match self.action.clone() {
-            EmailAction::Read => {
-                self.preference = existing;
-                self.done()
-            }
-            EmailAction::OptOut => match existing {
-                None => self.done(),
-                Some(existing) => {
-                    self.state = State::DeleteRecord {
-                        previous: existing.preference_id,
-                    };
-                    smallvec![Effect::Storage(StorageEffect::Delete {
-                        key_space: EMAIL_KEYSPACE.to_string(),
-                        key: email_key(&self.user_id).into(),
-                        txn_id: None,
-                    })]
-                }
-            },
-            EmailAction::OptIn {
-                address,
-                categories,
-            } => {
-                let known = categories
-                    .iter()
-                    .all(|category| EMAIL_CATEGORIES.contains(&category.as_str()));
-                if categories.is_empty() || !known {
-                    return self.fail(EmailError::InvalidCategories);
-                }
-                let verified = match user.as_deref().map(User::from_bytes).transpose() {
-                    Ok(user) => {
-                        user.and_then(|user| user.attributes.get(EMAIL_HASH_ATTRIBUTE).cloned())
-                    }
-                    Err(error) => return self.fail(error.into()),
-                };
-                let matches = verified.is_some_and(|hash| hash == email_hash(&address));
-                if !matches || address.trim().parse::<Address>().is_err() {
-                    return self.fail(EmailError::NotVerified);
-                }
-                let preference = EmailPreference {
-                    preference_id: Ulid::generate(),
-                    user_id: self.user_id,
-                    categories,
-                    created_at_ms: unix_timestamp_millis(),
-                };
-                let entry = address_entry(preference.preference_id);
-                self.preference = Some(preference);
-                self.state = State::WriteAddress {
-                    previous: existing.map(|existing| existing.preference_id),
-                };
-                let address = SecretBytes::new(address.trim().as_bytes().to_vec());
-                smallvec![write_secret(entry, address, None)]
-            }
-        }
-    }
-
-    fn write_record(&mut self, previous: Option<Ulid>) -> Effects {
-        let value = match self.preference.as_ref().map(EmailPreference::to_bytes) {
-            Some(Ok(value)) => value,
-            Some(Err(error)) => return self.fail(error.into()),
-            None => return self.fail(EmailError::NotFinished),
-        };
-        self.state = State::WriteRecord { previous };
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: EMAIL_KEYSPACE.to_string(),
-            key: email_key(&self.user_id).into(),
-            value: value.into(),
-            txn_id: None,
-        })]
-    }
-
-    fn drop_address(&mut self, previous: Option<Ulid>) -> Effects {
-        match previous {
-            None => self.done(),
-            Some(previous) => {
-                self.state = State::DeleteAddress;
-                smallvec![delete_secret(address_entry(previous), None)]
-            }
-        }
-    }
+/// Turns email off with a newer setting; queued emails then send nothing.
+pub async fn remove_email(
+    ctx: &DriverContext,
+    local: NodeId,
+    owner: UserId,
+) -> Result<(), EmailError> {
+    let config = realm_config(ctx, owner).await?;
+    let build = |version: u64, id: Ulid| email_bytes(owner, id, version, BTreeSet::new(), None);
+    write_email(ctx, local, &config, owner, &build)
+        .await
+        .map(|_| ())
 }
 
-impl Operation for EmailOperation {
-    type Output = Option<EmailPreference>;
-    type Error = EmailError;
-
-    fn start(&mut self) -> Effects {
-        self.state = State::Read;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (EMAIL_KEYSPACE.to_string(), email_key(&self.user_id).into()),
-                (USER_KEYSPACE.to_string(), self.user_id.to_bytes().into()),
-            ],
-            txn_id: None,
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match std::mem::replace(&mut self.state, State::Done) {
-            State::Read => self.handle_read(event),
-            State::WriteAddress { previous } => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.write_record(previous),
-                other => self.unexpected(other),
-            },
-            State::WriteRecord { previous } => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.drop_address(previous),
-                other => self.unexpected(other),
-            },
-            State::DeleteRecord { previous } => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                    self.drop_address(Some(previous))
-                }
-                other => self.unexpected(other),
-            },
-            State::DeleteAddress => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => self.done(),
-                other => self.unexpected(other),
-            },
-            State::Init | State::Done => self.unexpected(event),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(EmailError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
+async fn write_email(
+    ctx: &DriverContext,
+    local: NodeId,
+    config: &RealmConfigDocument,
+    owner: UserId,
+    build: &(dyn Fn(u64, Ulid) -> Result<Vec<u8>, SettingError> + Sync),
+) -> Result<EmailPreference, EmailError> {
+    let peers = MetadataPeers { ctx, local };
+    let managers = managers(config);
+    let channel = SettingChannel::Email;
+    let bytes = write_setting(ctx, &peers, local, &managers, channel, owner, build).await?;
+    Ok(EmailPreference::from_bytes(&bytes)?)
 }
 
-fn address_entry(preference_id: Ulid) -> VaultEntry {
-    VaultEntry::new(VaultPurpose::EmailAddress, preference_id)
+fn email_bytes(
+    owner: UserId,
+    id: Ulid,
+    version: u64,
+    categories: BTreeSet<String>,
+    sealed: Option<Vec<u8>>,
+) -> Result<Vec<u8>, SettingError> {
+    let preference = EmailPreference {
+        preference_id: id,
+        user_id: owner,
+        version,
+        categories,
+        sealed,
+        created_at_ms: unix_timestamp_millis(),
+    };
+    preference
+        .to_bytes()
+        .map_err(|error| SettingError::Build(error.to_string()))
 }
 
-/// Queues one email job per held notice of an opted-in category. The notification id
-/// deduplicates; a failure is returned so the sender delivers again.
+async fn realm_config(
+    ctx: &DriverContext,
+    owner: UserId,
+) -> Result<RealmConfigDocument, SettingError> {
+    drive(GetConfigOperation::new(owner.realm_id), ctx)
+        .await
+        .map_err(|error| SettingError::Config(error.to_string()))
+}
+
+/// Whether `address` is the address the account's sign-in provider verified.
+async fn verified(ctx: &DriverContext, owner: UserId, address: &str) -> Result<bool, EmailError> {
+    let read = StorageEffect::Read {
+        key_space: USER_KEYSPACE.to_string(),
+        key: owner.to_bytes().into(),
+        txn_id: None,
+    };
+    let event = ctx.storage_handle.send_effect(Effect::Storage(read)).await;
+    let user = match parse_storage_read(event, User::from_bytes) {
+        Ok(user) => user,
+        Err(StorageReadError::Storage(error)) => return Err(error.into()),
+        Err(StorageReadError::Conversion(error)) => return Err(error.into()),
+    };
+    let hash = user.and_then(|user| user.attributes.get(EMAIL_HASH_ATTRIBUTE).cloned());
+    Ok(hash.is_some_and(|hash| hash == email_hash(address)))
+}
+
+/// Queues one email job per held notice of an email category, whatever the settings say now;
+/// the job decides from a quorum read. The notification id deduplicates; a failure is returned
+/// so the sender delivers again.
 pub async fn enqueue_emails(
     context: &DriverContext,
     owner_node_id: NodeId,
@@ -521,31 +418,14 @@ pub async fn enqueue_emails(
             return Ok(());
         }
     }
-    let mut preferences: HashMap<UserId, Option<EmailPreference>> = HashMap::new();
     for record in records {
         if !EMAIL_CATEGORIES.contains(&record.kind.category()) {
             continue;
         }
-        if let Entry::Vacant(slot) = preferences.entry(record.recipient) {
-            let preference = drive(
-                EmailOperation::new(record.recipient, EmailAction::Read),
-                context,
-            )
-            .await
-            .map_err(|error| format!("email opt-in read: {error}"))?;
-            slot.insert(preference);
-        }
-        let Some(preference) = preferences[&record.recipient]
-            .as_ref()
-            .filter(|preference| preference.wants(record))
-        else {
-            continue;
-        };
         let dedup_key = user_dedup_key(
             record.recipient,
             &format!("email/{}", record.notification_id),
         );
-        // A queued job keeps the settings it was queued with, so changed settings never conflict.
         let queued = find_dedup_job(context, record.recipient, &dedup_key).await;
         if queued
             .map_err(|error| format!("email delivery lookup: {error}"))?
@@ -558,7 +438,7 @@ pub async fn enqueue_emails(
             let job_id = mint_local_job(context, realm_id, owner_node_id, Some(&dedup_key)).await?;
             let spec = SubmitJobSpec {
                 payload: JobPayload::EmailDelivery(EmailDeliverySpec {
-                    preference_id: preference.preference_id,
+                    preference_id: Ulid::nil(),
                     notification: record.clone(),
                 }),
                 created_by: record.recipient,
@@ -579,51 +459,99 @@ pub async fn enqueue_emails(
     Ok(())
 }
 
-/// Sends one notification email. A removed or replaced opt-in sends nothing; a permanent
-/// SMTP refusal ends the job, and every other failure is retried by the job runtime.
+/// Sends one notification email when a quorum of management nodes says email is on for its
+/// category. A permanent SMTP refusal ends the job; a short quorum waits without an attempt.
 pub async fn run_email_job(ctx: &JobContext, spec: &EmailDeliverySpec) -> JobRunOutcome {
-    let result = tokio::select! {
-        biased;
-        () = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,
-        () = ctx.shutdown.cancelled() => return JobRunOutcome::Interrupted,
-        result = send_email(ctx, spec) => result,
+    let Some(metadata) = ctx.driver.metadata_handle.as_ref() else {
+        return no_transport();
     };
-    match result {
-        Ok(sent) => JobRunOutcome::Succeeded(JobResultPayload::Email { sent }),
+    let local = (ctx.driver.net_handle.as_ref()).map_or(ctx.owner_node_id, |net| net.node_id());
+    let peers = MetadataPeers {
+        ctx: &ctx.driver,
+        local,
+    };
+    let backoffs = metadata.setting_backoffs();
+    tokio::select! {
+        biased;
+        () = ctx.cancel.cancelled() => JobRunOutcome::Cancelled,
+        () = ctx.shutdown.cancelled() => JobRunOutcome::Interrupted,
+        outcome = deliver_email(ctx, spec, &peers, backoffs, unix_timestamp_millis()) => outcome,
+    }
+}
+
+/// The waiting time of a job on a node without a metadata transport, which never reads a quorum.
+pub(crate) fn no_transport() -> JobRunOutcome {
+    JobRunOutcome::DeferredFor(
+        JobError::retryable("the metadata transport is unavailable"),
+        Duration::from_millis(BACKOFF_START_MS),
+    )
+}
+
+pub(crate) async fn deliver_email(
+    ctx: &JobContext,
+    spec: &EmailDeliverySpec,
+    peers: &dyn SettingPeers,
+    backoffs: &Backoffs,
+    now_ms: u64,
+) -> JobRunOutcome {
+    let unsent = JobRunOutcome::Succeeded(JobResultPayload::Email { sent: false });
+    if now_ms >= spec.notification.expires_at_ms() {
+        return unsent;
+    }
+    let recipient = spec.notification.recipient;
+    let config = drive(GetConfigOperation::new(recipient.realm_id), &ctx.driver).await;
+    let config = match config {
+        Ok(config) if config.email.is_none() => {
+            return JobRunOutcome::Failed(JobError::permanent(
+                "email is not configured in this realm",
+            ));
+        }
+        Ok(config) => Some(config),
+        Err(_) => None,
+    };
+    let managers = config.as_ref().map(managers);
+    let record = &spec.notification;
+    let channel = SettingChannel::Email;
+    let delivery = delivery_setting(
+        peers,
+        backoffs,
+        record,
+        channel,
+        managers.as_deref(),
+        now_ms,
+    );
+    let winner = match delivery.await {
+        Delivery::Skip => return unsent,
+        Delivery::Wait(error, delay) => return JobRunOutcome::DeferredFor(error, delay),
+        Delivery::Send(winner) => winner,
+    };
+    let (Some(config), Ok(preference)) = (config, EmailPreference::from_bytes(&winner.bytes))
+    else {
+        return unsent;
+    };
+    if !preference.wants(record) {
+        return unsent;
+    }
+    match send_email(ctx, spec, &config, winner).await {
+        Ok(()) => JobRunOutcome::Succeeded(JobResultPayload::Email { sent: true }),
         Err(error) => JobRunOutcome::Failed(error),
     }
 }
 
-async fn send_email(ctx: &JobContext, spec: &EmailDeliverySpec) -> Result<bool, JobError> {
-    let recipient = spec.notification.recipient;
-    let config = drive(GetConfigOperation::new(recipient.realm_id), &ctx.driver)
-        .await
-        .map_err(|error| JobError::retryable(format!("realm config read: {error}")))?;
+async fn send_email(
+    ctx: &JobContext,
+    spec: &EmailDeliverySpec,
+    config: &RealmConfigDocument,
+    winner: SettingWinner,
+) -> Result<(), JobError> {
     let profile = (config.email.clone())
         .ok_or_else(|| JobError::permanent("email is not configured in this realm"))?;
-    let preference = drive(
-        EmailOperation::new(recipient, EmailAction::Read),
-        &ctx.driver,
-    )
-    .await
-    .map_err(|error| JobError::retryable(error.to_string()))?;
-    let Some(preference) = preference.filter(|found| {
-        found.preference_id == spec.preference_id && found.wants(&spec.notification)
-    }) else {
-        return Ok(false);
-    };
-    let entry = address_entry(preference.preference_id);
-    let event = ctx
-        .driver
-        .storage_handle
-        .send_effect(read_secret(entry, None))
-        .await;
-    let address = parse_secret(event, entry, |bytes| {
-        String::from_utf8(bytes.to_vec()).map_err(ConversionError::from)
-    })
-    .map_err(|error| JobError::retryable(error.to_string()))?
-    .ok_or_else(|| JobError::permanent("the opt-in address is missing"))?;
-    let mailer = mail_sender(ctx, &config, &profile).await?;
+    let secret = winner
+        .secret
+        .ok_or_else(|| JobError::permanent("the opt-in address is missing"))?;
+    let address = String::from_utf8(secret.expose().to_vec())
+        .map_err(|_| JobError::permanent("the opt-in address is not UTF-8 text"))?;
+    let mailer = mail_sender(ctx, config, &profile).await?;
     let (subject, body) = spec.text();
     let mail = OutgoingMail {
         to: address,
@@ -632,7 +560,7 @@ async fn send_email(ctx: &JobContext, spec: &EmailDeliverySpec) -> Result<bool, 
         id: spec.notification.notification_id,
     };
     match mailer.send(mail).await {
-        Ok(()) => Ok(true),
+        Ok(()) => Ok(()),
         Err(MailError::Permanent(message)) => Err(JobError::permanent(message)),
         Err(MailError::Retryable(message)) => Err(JobError::retryable(message)),
     }
