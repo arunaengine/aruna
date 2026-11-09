@@ -18,6 +18,7 @@ members = [
     "aruna-doctor",
     "cli",
     "plugins",
+    "plugins/sdk",
     "registry",
     "scripts/compute-helper",
 ]
