@@ -43,10 +43,22 @@ the [README](../README.md) to get a node running.
   or unreadable file, a plain `http` URL or an entry with both or neither source stops the start
   with an error that names `PORTAL_LEGAL`.
 
+  Link to the legal pages your institution already publishes:
+
   ```
   PORTAL_LEGAL='[{"label":"Imprint","url":"https://example.org/imprint"},
-    {"label":"Privacy","file":"/srv/aruna/legal/privacy.md"}]'
+    {"label":"Privacy","url":"https://example.org/privacy"}]'
   ```
+
+  Or provide your own texts, shown inside the portal:
+
+  ```
+  PORTAL_LEGAL='[{"label":"Imprint","file":"/srv/aruna/legal/imprint.md"},
+    {"label":"Privacy","file":"/srv/aruna/legal/privacy.md"},
+    {"label":"Terms of service","file":"/srv/aruna/legal/terms.md"}]'
+  ```
+
+  Both kinds can also be mixed in one list.
 - **Compute.** `ARUNA_COMPUTE_EXECUTOR` is `none` by default. The `docker` executor needs the host's
   Docker socket and an S3 address that job containers can reach.
 
