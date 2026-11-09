@@ -37,11 +37,12 @@ the [README](../README.md) to get a node running.
   page. The default is `enabled`.
 - **Legal pages.** `PORTAL_LEGAL` lists the imprint, privacy and terms pages of the deployment as
   one JSON list, in display order. Each entry has a `label` and exactly one of `url` (an `https://`
-  page) or `file` (a Markdown file on the node). The node reads each file at startup and sends its
-  text with every portal start, so keep files to a few KiB and restart the node after a change.
-  Without `PORTAL_LEGAL` the portal shows no legal links. Invalid JSON, an empty label, a missing
-  or unreadable file, a plain `http` URL or an entry with both or neither source stops the start
-  with an error that names `PORTAL_LEGAL`.
+  page) or `file` (a UTF-8 Markdown file on the node). The node reads each file at startup and
+  sends its text with every portal start, so keep files to a few KiB and restart the node after a
+  change. Without `PORTAL_LEGAL` the portal shows no legal links. Invalid JSON, an empty label, a
+  missing, unreadable or non-UTF-8 file, a plain `http` URL or an entry with both or neither source
+  stops the start with an error that names `PORTAL_LEGAL`. The node reads `PORTAL_LANDING` and
+  `PORTAL_LEGAL` only with `PORTAL_MODE=artifact` and ignores them otherwise.
 
   Link to the legal pages your institution already publishes:
 
