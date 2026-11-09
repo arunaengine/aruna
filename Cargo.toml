@@ -18,7 +18,7 @@ members = [
     "aruna-doctor",
     "cli",
     "plugins",
-    "plugins/example",
+    "plugins/examples/rust",
     "plugins/fixture",
     "plugins/sdk",
     "registry",
