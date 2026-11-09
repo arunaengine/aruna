@@ -45,7 +45,7 @@ use utoipa_axum::routes;
 use crate::auth::require_owner;
 use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::error::ServerError;
-use crate::forwarded::external_base_url;
+use crate::forwarded::{DirectOrigin, external_base_url};
 use crate::routes::execution::jobs::{ExecutionTarget, map_local_error};
 use crate::server::state::ServerState;
 
@@ -499,9 +499,15 @@ fn parse_tag_filters(raw_query: Option<&str>) -> Vec<(String, String)> {
 pub async fn service_info(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    direct: Option<Extension<DirectOrigin>>,
     headers: HeaderMap,
 ) -> Response {
-    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
+    let base_url = external_base_url(
+        state.trusted_proxies(),
+        peer.ip(),
+        &headers,
+        direct.as_deref(),
+    );
     let info = TesServiceInfo {
         id: format!("org.aruna.{}", state.get_realm_id()),
         name: format!("Aruna Realm {}", state.get_realm_id()),
@@ -877,6 +883,7 @@ pub async fn get_task(
     Extension(auth): Extension<Option<AuthContext>>,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    direct: Option<Extension<DirectOrigin>>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(query): Query<ViewQuery>,
@@ -921,7 +928,12 @@ pub async fn get_task(
         return TesError::not_found("TES task not found").into_response();
     }
 
-    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
+    let base_url = external_base_url(
+        state.trusted_proxies(),
+        peer.ip(),
+        &headers,
+        direct.as_deref(),
+    );
     tes_json_response(
         StatusCode::OK,
         project_task(&record, &details, view, (&base_url, state.get_realm_id())),
@@ -1041,6 +1053,7 @@ pub async fn list_tasks(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    direct: Option<Extension<DirectOrigin>>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Query(query): Query<ListTasksQuery>,
@@ -1067,7 +1080,12 @@ pub async fn list_tasks(
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .min(MAX_PAGE_SIZE);
 
-    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
+    let base_url = external_base_url(
+        state.trusted_proxies(),
+        peer.ip(),
+        &headers,
+        direct.as_deref(),
+    );
     let page = if filters.has_derived() {
         list_derived(&state, &caller, &filters, cursor, limit).await
     } else {

@@ -751,3 +751,133 @@ async fn shutdown_ends_handshakes() {
         .expect("shutdown releases the front and its handshakes");
     closed(idle).await;
 }
+
+/// A front whose REST route reaches the real REST server.
+struct RestStack {
+    address: SocketAddr,
+    ca: String,
+    _files: Files,
+    _storage: tempfile::TempDir,
+    _handle: HttpsHandle,
+    _shutdown: tokio_util::sync::DropGuard,
+}
+
+async fn rest_stack() -> RestStack {
+    use crate::server::state::ServerState;
+    use crate::server::{Server, ServerConfig};
+    use aruna_core::structs::identity::auth::NodeCapabilities;
+    use aruna_core::structs::identity::realm::RealmId;
+
+    let storage = tempfile::tempdir().expect("temp dir");
+    let store_path = storage.path().to_str().expect("utf8 path");
+    let driver_ctx = Arc::new(aruna_operations::driver::DriverContext {
+        storage_handle: aruna_storage::FjallStorage::open(store_path).expect("storage"),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    });
+    let realm_id = RealmId::from_bytes(
+        ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    let state = Arc::new(
+        ServerState::new(
+            driver_ctx,
+            realm_id,
+            iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            NodeCapabilities::user_node(realm_id).expect("capabilities"),
+            false,
+            None,
+            aruna_operations::jobs::runtime::JobsRuntime::new(),
+        )
+        .await,
+    );
+    let root = Authority::root();
+    let (certificate, key) = pair(&root);
+    let files = Files::new(&certificate, &key, &root.pem);
+    let store = Arc::new(files.store(UnixTime::now()).expect("store loads"));
+    let shutdown = CancellationToken::new();
+    let (sender, routed) =
+        RoutedListener::channel(HostCheck::new(store.routes().clone(), HostRoute::Rest));
+    let plain = TcpListener::bind("127.0.0.1:0").await.expect("plain port");
+    let server = Server::new(
+        state,
+        ServerConfig {
+            http_addr: plain.local_addr().expect("plain address"),
+            max_body_size: crate::server::MAX_BODY_SIZE,
+            cors: crate::cors::CorsConfig::default(),
+        },
+    );
+    tokio::spawn(
+        server.run_with_listener(CombinedListener::new(plain, Some(routed)), shutdown.clone()),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("HTTPS port");
+    let address = listener.local_addr().expect("HTTPS address");
+    let handle = HttpsHandle::spawn(
+        listener,
+        store,
+        HashMap::from([(HostRoute::Rest, sender)]),
+        shutdown.clone(),
+    )
+    .expect("front starts");
+    RestStack {
+        address,
+        ca: root.pem,
+        _files: files,
+        _storage: storage,
+        _handle: handle,
+        _shutdown: shutdown.drop_guard(),
+    }
+}
+
+fn organization_url(body: &[u8]) -> String {
+    let info: serde_json::Value = serde_json::from_slice(body).expect("service info JSON");
+    info["organization"]["url"]
+        .as_str()
+        .expect("organization URL")
+        .to_string()
+}
+
+#[tokio::test]
+async fn tls_urls_use_origin() {
+    // DRS builds absolute URLs from the request; over TLS they carry the
+    // configured HTTPS origin on HTTP/1.1 and on HTTP/2, which sends no `Host`.
+    let stack = rest_stack().await;
+    let path = "/api/v1/ga4gh/drs/v1/service-info";
+
+    let stream = connect(
+        stack.address,
+        dns("api.test"),
+        client_config(&stack.ca, &[b"http/1.1"]),
+    )
+    .await
+    .expect("HTTP/1.1 connection");
+    let (status, body) = get_h1(stream, "api.test", path).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(organization_url(body.as_bytes()), "https://api.test");
+
+    let stream = connect(
+        stack.address,
+        dns("api.test"),
+        client_config(&stack.ca, &[b"h2"]),
+    )
+    .await
+    .expect("HTTP/2 connection");
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .expect("HTTP/2 handshake");
+    tokio::spawn(connection);
+    let request = http::Request::get(format!("https://api.test{path}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = sender.send_request(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(Body::new(response.into_body()), 1 << 20)
+        .await
+        .expect("body");
+    assert_eq!(organization_url(&body), "https://api.test");
+}
