@@ -1,4 +1,6 @@
 """Calls plugin handlers by name: builds the context and event, and turns errors into failures."""
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
 
 import json
 from dataclasses import dataclass
