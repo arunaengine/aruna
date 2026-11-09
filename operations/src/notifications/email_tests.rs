@@ -1,5 +1,5 @@
-//! Tests the verified-address opt-in, sealed addresses, email jobs with the realm profile and
-//! their deduplication.
+//! Tests the verified-address opt-in, email jobs that decide from a quorum read, the realm
+//! profile and the deduplication of queued emails.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,14 +7,18 @@ use super::*;
 use crate::jobs::executor::ProgressReporter;
 use crate::jobs::store::find_dedup_plan;
 use crate::jobs::submit::mint_job_id;
+use crate::node_vault::{parse_secret, read_secret, write_secret};
+use crate::notifications::settings::SettingAnswer;
+use crate::tests::notifications::{CannedPeers, managers};
 use crate::tests::staging::setup_driver_context;
+use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::structs::execution::job::{JobErrorKind, JobProgress};
 use aruna_core::structs::execution::notification::{NotificationClass, NotificationKind};
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 
 const ADDRESS: &str = "ada@example.org";
@@ -50,35 +54,6 @@ async fn seed_user(context: &DriverContext) {
         .storage_handle
         .send_effect(Effect::Storage(write))
         .await;
-}
-
-fn opt_in(address: &str, categories: &[&str]) -> EmailAction {
-    EmailAction::OptIn {
-        address: address.to_string(),
-        categories: categories
-            .iter()
-            .map(|category| category.to_string())
-            .collect(),
-    }
-}
-
-async fn act(
-    context: &DriverContext,
-    action: EmailAction,
-) -> Result<Option<EmailPreference>, EmailError> {
-    drive(EmailOperation::new(user(), action), context).await
-}
-
-async fn sealed(context: &DriverContext, preference_id: Ulid) -> Option<String> {
-    let entry = address_entry(preference_id);
-    let event = context
-        .storage_handle
-        .send_effect(read_secret(entry, None))
-        .await;
-    parse_secret(event, entry, |bytes| {
-        String::from_utf8(bytes.to_vec()).map_err(ConversionError::from)
-    })
-    .unwrap()
 }
 
 fn notice(kind: NotificationKind) -> NotificationRecord {
@@ -134,12 +109,16 @@ fn fake_mail(sender: Arc<FakeSender>) -> (Arc<MailProfiles>, Arc<Mutex<Vec<SmtpS
 
 const PASSWORD: &str = "canary-smtp-31";
 
-/// Stores a realm config with `profile`; a password is sealed and already cached on this node.
+/// Stores a realm config with three managers and `profile`; a password is sealed and already
+/// cached on this node.
 async fn seed_profile(context: &DriverContext, profile: Option<RealmEmailProfile>) {
     use aruna_core::document::DocumentTarget;
     use aruna_core::realm_vault::{RealmVaultKey, RealmVaultRecord};
     let realm_id = user().realm_id;
     let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    for manager in managers() {
+        config.ensure_node(manager, RealmNodeKind::Management);
+    }
     if let Some(reference) = profile.as_ref().and_then(|profile| profile.password) {
         let key = RealmVaultKey::derive(&ed25519_dalek::SigningKey::from_bytes(&[5; 32]));
         let secret = SecretBytes::new(PASSWORD.as_bytes().to_vec());
@@ -219,66 +198,110 @@ fn job_context(context: DriverContext, mail: Arc<MailProfiles>) -> JobContext {
     }
 }
 
+/// Answers from every manager with an opt-in for `categories`; no category turns email off.
+fn answering(categories: &[&str]) -> CannedPeers {
+    let (sealed, secret) = match categories.is_empty() {
+        false => (
+            Some(vec![1]),
+            Some(SecretBytes::new(ADDRESS.as_bytes().to_vec())),
+        ),
+        true => (None, None),
+    };
+    let preference = EmailPreference {
+        preference_id: Ulid::from_parts(2, 2),
+        user_id: user(),
+        version: 1,
+        categories: (categories.iter())
+            .map(|category| category.to_string())
+            .collect(),
+        sealed,
+        created_at_ms: 1,
+    };
+    let answer = SettingAnswer {
+        max_version: 1,
+        winner: Some(SettingWinner {
+            bytes: preference.to_bytes().unwrap(),
+            secret,
+        }),
+    };
+    let answers = managers().map(|manager| (manager, answer.clone())).into();
+    CannedPeers {
+        answers,
+        ..Default::default()
+    }
+}
+
+fn spec() -> EmailDeliverySpec {
+    EmailDeliverySpec {
+        preference_id: Ulid::nil(),
+        notification: share_upload(),
+    }
+}
+
+/// A time before the notice expires.
+const NOW_MS: u64 = 1_000;
+
 #[tokio::test]
 async fn requires_verified_address() {
     let staging = setup_driver_context().await;
     let context = &staging.driver_context;
+    let set = |categories: &[&str], address: &str| {
+        let categories = categories.iter().map(|category| category.to_string());
+        set_email(
+            context,
+            node(),
+            user(),
+            address.to_string(),
+            categories.collect(),
+        )
+    };
+    let unreadable = set(&["share.upload"], ADDRESS).await;
+    assert!(matches!(
+        unreadable,
+        Err(EmailError::Setting(SettingError::Config(_)))
+    ));
+    seed_profile(context, None).await;
+    let unconfigured = set(&["share.upload"], ADDRESS).await;
+    assert_eq!(unconfigured, Err(EmailError::NotConfigured));
+    seed_profile(context, Some(profile(1, false))).await;
     seed_user(context).await;
-    let other = act(context, opt_in("eve@example.org", &["share.upload"])).await;
+    let other = set(&["share.upload"], "eve@example.org").await;
     assert_eq!(other, Err(EmailError::NotVerified));
-    let unknown = act(context, opt_in(ADDRESS, &["resource.watch"])).await;
+    let unknown = set(&["resource.watch"], ADDRESS).await;
     assert_eq!(unknown, Err(EmailError::InvalidCategories));
-    let empty = act(context, opt_in(ADDRESS, &[])).await;
+    let empty = set(&[], ADDRESS).await;
     assert_eq!(empty, Err(EmailError::InvalidCategories));
-
-    let first = act(context, opt_in(ADDRESS, &["share.upload"]))
-        .await
-        .unwrap()
-        .unwrap();
+    // Without reachable managers a valid opt-in has an unknown outcome.
+    let unreachable = set(&["share.upload"], ADDRESS).await;
     assert_eq!(
-        sealed(context, first.preference_id).await.as_deref(),
-        Some(ADDRESS)
+        unreachable,
+        Err(EmailError::Setting(SettingError::NoQuorum))
     );
-    let second = act(context, opt_in(ADDRESS, &["group.membership"]))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        sealed(context, first.preference_id).await,
-        None,
-        "the old address is gone"
-    );
-    let read = act(context, EmailAction::Read).await.unwrap();
-    assert_eq!(read, Some(second.clone()));
-
-    act(context, EmailAction::OptOut).await.unwrap();
-    assert_eq!(act(context, EmailAction::Read).await.unwrap(), None);
-    assert_eq!(sealed(context, second.preference_id).await, None);
 }
 
 #[tokio::test]
-async fn sends_opted_notices() {
+async fn on_answer_sends() {
     let staging = setup_driver_context().await;
     let context = staging.driver_context.clone();
-    seed_user(&context).await;
-    let preference = act(&context, opt_in(ADDRESS, &["share.upload"]))
-        .await
-        .unwrap()
-        .unwrap();
     let sender = Arc::new(FakeSender::default());
     let (mail, built) = fake_mail(sender.clone());
     let ctx = job_context(context.clone(), mail);
     seed_profile(&context, Some(profile(1, true))).await;
-    let spec = EmailDeliverySpec {
-        preference_id: preference.preference_id,
-        notification: share_upload(),
-    };
+    let peers = answering(&["share.upload"]);
+    let backoffs = Backoffs::default();
+    let spec = spec();
+    let run = || deliver_email(&ctx, &spec, &peers, &backoffs, NOW_MS);
 
-    let result = run_email_job(&ctx, &spec).await;
+    let result = run().await;
     assert!(matches!(
         result,
         JobRunOutcome::Succeeded(JobResultPayload::Email { sent: true })
     ));
+    assert_eq!(
+        peers.reads.load(Ordering::SeqCst),
+        2,
+        "a quorum of three is two"
+    );
     let mail = sender.sent.lock().unwrap()[0].clone();
     assert_eq!(
         (mail.to.as_str(), mail.id),
@@ -293,16 +316,15 @@ async fn sends_opted_notices() {
     assert!(!format!("{settings:?}").contains(PASSWORD));
 
     *sender.answer.lock().unwrap() = Some(MailError::Retryable("SMTP status 451".to_string()));
-    let JobRunOutcome::Failed(error) = run_email_job(&ctx, &spec).await else {
+    let JobRunOutcome::Failed(error) = run().await else {
         panic!("a transient refusal fails the attempt");
     };
     assert_eq!(error.kind, JobErrorKind::Retryable);
     *sender.answer.lock().unwrap() = Some(MailError::Permanent("SMTP status 550".to_string()));
-    let JobRunOutcome::Failed(error) = run_email_job(&ctx, &spec).await else {
+    let JobRunOutcome::Failed(error) = run().await else {
         panic!("a permanent refusal ends the job");
     };
     assert_eq!(error.kind, JobErrorKind::Permanent);
-
     assert_eq!(
         built.lock().unwrap().len(),
         1,
@@ -310,42 +332,123 @@ async fn sends_opted_notices() {
     );
 
     seed_profile(&context, None).await;
-    let JobRunOutcome::Failed(error) = run_email_job(&ctx, &spec).await else {
+    let JobRunOutcome::Failed(error) = run().await else {
         panic!("a realm without a profile sends nothing");
     };
     assert_eq!(error.kind, JobErrorKind::Permanent);
-    seed_profile(&context, Some(profile(2, false))).await;
+}
 
-    act(&context, EmailAction::OptOut).await.unwrap();
-    *sender.answer.lock().unwrap() = None;
-    let result = run_email_job(&ctx, &spec).await;
+#[tokio::test]
+async fn off_answer_skips() {
+    let staging = setup_driver_context().await;
+    let context = staging.driver_context.clone();
+    let sender = Arc::new(FakeSender::default());
+    let (mail, _) = fake_mail(sender.clone());
+    let ctx = job_context(context.clone(), mail);
+    seed_profile(&context, Some(profile(1, false))).await;
+    for peers in [
+        answering(&[]),
+        CannedPeers {
+            answers: managers()
+                .map(|manager| {
+                    (
+                        manager,
+                        SettingAnswer {
+                            max_version: 0,
+                            winner: None,
+                        },
+                    )
+                })
+                .into(),
+            ..Default::default()
+        },
+    ] {
+        let result = deliver_email(&ctx, &spec(), &peers, &Backoffs::default(), NOW_MS).await;
+        assert!(matches!(
+            result,
+            JobRunOutcome::Succeeded(JobResultPayload::Email { sent: false })
+        ));
+    }
+    assert!(sender.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn category_excluded_skips() {
+    let staging = setup_driver_context().await;
+    let context = staging.driver_context.clone();
+    let sender = Arc::new(FakeSender::default());
+    let (mail, _) = fake_mail(sender.clone());
+    let ctx = job_context(context.clone(), mail);
+    seed_profile(&context, Some(profile(1, false))).await;
+    let peers = answering(&["group.membership"]);
+    let result = deliver_email(&ctx, &spec(), &peers, &Backoffs::default(), NOW_MS).await;
     assert!(matches!(
         result,
         JobRunOutcome::Succeeded(JobResultPayload::Email { sent: false })
     ));
-    assert_eq!(sender.sent.lock().unwrap().len(), 1);
+    assert!(sender.sent.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn config_error_retries() {
-    // Without a readable realm config the job waits for replication instead of failing.
+async fn expired_notice_finishes() {
     let staging = setup_driver_context().await;
     let context = staging.driver_context.clone();
-    seed_user(&context).await;
-    let preference = act(&context, opt_in(ADDRESS, &["share.upload"]))
-        .await
-        .unwrap()
-        .unwrap();
+    let (mail, _) = fake_mail(Arc::new(FakeSender::default()));
+    let ctx = job_context(context.clone(), mail);
+    seed_profile(&context, Some(profile(1, false))).await;
+    let peers = answering(&["share.upload"]);
+    let expired = spec().notification.expires_at_ms();
+    let result = deliver_email(&ctx, &spec(), &peers, &Backoffs::default(), expired).await;
+    assert!(matches!(
+        result,
+        JobRunOutcome::Succeeded(JobResultPayload::Email { sent: false })
+    ));
+    assert_eq!(
+        peers.reads.load(Ordering::SeqCst),
+        0,
+        "an expired notice reads nothing"
+    );
+}
+
+#[tokio::test]
+async fn short_quorum_defers() {
+    // One answer of three, or no readable realm config, waits without spending an attempt.
+    let staging = setup_driver_context().await;
+    let context = staging.driver_context.clone();
     let (mail, built) = fake_mail(Arc::new(FakeSender::default()));
-    let ctx = job_context(context, mail);
-    let spec = EmailDeliverySpec {
-        preference_id: preference.preference_id,
-        notification: share_upload(),
+    let ctx = job_context(context.clone(), mail);
+    let backoffs = Backoffs::default();
+    let unreadable = deliver_email(&ctx, &spec(), &CannedPeers::default(), &backoffs, NOW_MS).await;
+    let JobRunOutcome::DeferredFor(error, delay) = unreadable else {
+        panic!("an unreadable config defers");
     };
-    let JobRunOutcome::Failed(error) = run_email_job(&ctx, &spec).await else {
-        panic!("a config read error fails the attempt");
+    assert_eq!(
+        (error.kind, delay),
+        (JobErrorKind::Retryable, Duration::from_secs(30))
+    );
+
+    seed_profile(&context, Some(profile(1, false))).await;
+    let mut peers = answering(&["share.upload"]);
+    peers.answers.retain(|node, _| *node == managers()[0]);
+    let waiting = deliver_email(&ctx, &spec(), &peers, &backoffs, NOW_MS + 10_000).await;
+    let JobRunOutcome::DeferredFor(_, delay) = waiting else {
+        panic!("a running backoff defers");
     };
-    assert_eq!(error.kind, JobErrorKind::Retryable);
+    assert_eq!(
+        delay,
+        Duration::from_secs(20),
+        "the backoff runs to its end"
+    );
+    assert_eq!(
+        peers.reads.load(Ordering::SeqCst),
+        0,
+        "a running backoff reads nothing"
+    );
+    let short = deliver_email(&ctx, &spec(), &peers, &backoffs, NOW_MS + 30_000).await;
+    let JobRunOutcome::DeferredFor(_, delay) = short else {
+        panic!("one answer of three defers");
+    };
+    assert_eq!(delay, Duration::from_secs(60), "the next delay doubles");
     assert!(built.lock().unwrap().is_empty());
 }
 
@@ -388,11 +491,7 @@ async fn refresh_drops_stale() {
 async fn skips_without_profile() {
     let staging = setup_driver_context().await;
     let context = &staging.driver_context;
-    seed_user(context).await;
     seed_profile(context, None).await;
-    act(context, opt_in(ADDRESS, &["share.upload"]))
-        .await
-        .unwrap();
     let records = [share_upload()];
     enqueue_emails(context, node(), &records).await.unwrap();
     let key = user_dedup_key(user(), &format!("email/{}", records[0].notification_id));
@@ -405,13 +504,11 @@ async fn skips_without_profile() {
 }
 
 #[tokio::test]
-async fn queues_each_once() {
+async fn enqueue_always_queues() {
+    // No opt-in is read at enqueue: each email-category notice gets one job, once.
     let staging = setup_driver_context().await;
     let context = &staging.driver_context;
-    seed_user(context).await;
-    act(context, opt_in(ADDRESS, &["share.upload"]))
-        .await
-        .unwrap();
+    seed_profile(context, Some(profile(1, false))).await;
     let mut watched = notice(NotificationKind::BucketDeleted {
         bucket: "inbox".to_string(),
         node_id: node(),
@@ -425,7 +522,7 @@ async fn queues_each_once() {
     let first = find_dedup_plan(storage, user(), &key(records[0].notification_id), None)
         .await
         .unwrap()
-        .expect("the opted notice is queued");
+        .expect("the notice is queued without an opt-in");
     enqueue_emails(context, node(), &records).await.unwrap();
     let again = find_dedup_plan(storage, user(), &key(records[0].notification_id), None)
         .await
@@ -436,34 +533,8 @@ async fn queues_each_once() {
         .unwrap();
     assert_eq!(
         skipped, None,
-        "a category outside the opt-in queues nothing"
+        "a notice outside every email category queues nothing"
     );
-}
-
-#[tokio::test]
-async fn replacement_keeps_job() {
-    // A retry after the opt-in was replaced finds the queued job instead of a conflict.
-    let staging = setup_driver_context().await;
-    let context = &staging.driver_context;
-    seed_user(context).await;
-    act(context, opt_in(ADDRESS, &["share.upload"]))
-        .await
-        .unwrap();
-    let records = [share_upload()];
-    enqueue_emails(context, node(), &records).await.unwrap();
-    let key = user_dedup_key(user(), &format!("email/{}", records[0].notification_id));
-    let storage = &context.storage_handle;
-    let first = find_dedup_plan(storage, user(), &key, None).await.unwrap();
-    assert!(first.is_some(), "the opted notice is queued");
-
-    act(context, opt_in(ADDRESS, &["share.upload"]))
-        .await
-        .unwrap();
-    enqueue_emails(context, node(), &records)
-        .await
-        .expect("a replaced opt-in does not conflict");
-    let again = find_dedup_plan(storage, user(), &key, None).await.unwrap();
-    assert_eq!(again, first);
 }
 
 #[tokio::test]
