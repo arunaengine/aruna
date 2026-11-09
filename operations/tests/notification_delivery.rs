@@ -5,17 +5,12 @@
 
 use std::sync::Arc;
 
-use aruna_core::compute::SecretBytes;
-use aruna_core::document::{
-    DocumentChange, DocumentChangeKind, DocumentEffect, DocumentOutboxEvent, DocumentSyncRevision,
-    DocumentTarget,
-};
+use aruna_core::document::DocumentEffect;
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::realm_vault::{RealmSealKey, seal_setting};
-use aruna_core::storage_entries::sync_revision_entry;
+use aruna_core::realm_vault::RealmSealKey;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
 };
@@ -36,16 +31,11 @@ use aruna_operations::notifications::dispatch::{
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
-use aruna_operations::notifications::settings::{
-    Delivery, MetadataPeers, SettingError, SettingPeers, StoreAnswer, delivery_setting, read_quorum,
-};
+use aruna_operations::notifications::settings::{Delivery, MetadataPeers, delivery_setting};
 use aruna_operations::notifications::webhook::{
-    WebhookError, read_webhook, remove_webhook, set_webhook,
+    WebhookOutcome, read_webhook, remove_webhook, set_webhook,
 };
 use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::sync::document_outbox::{
-    new_identified_record, outbox_write_entry, schedule_drain_effect,
-};
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{drain_notification_outbox, start_task_queues};
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -659,13 +649,11 @@ const HOOK_URL: &str = "https://hooks.example.org/aruna";
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// Management nodes A, B and C and the server S of a realm whose id is the realm key. Each node
-/// keeps its storage across a restart.
+/// Management nodes A, B and C and the server S of a realm whose id is the realm key.
 struct SettingRealm {
     seed: u8,
     realm_id: RealmId,
     realm_key: SigningKey,
-    stores: Vec<(TempDir, StorageHandle)>,
     nodes: Vec<TestNode>,
 }
 
@@ -673,17 +661,10 @@ impl SettingRealm {
     async fn spawn(seed: u8) -> TestResult<Self> {
         let realm_key = SigningKey::from_bytes(&[seed; 32]);
         let realm_id = RealmId::from_bytes(realm_key.verifying_key().to_bytes());
-        let mut stores = Vec::new();
-        for _ in 0..4 {
-            let dir = tempfile::tempdir()?;
-            let storage = FjallStorage::open(dir.path().to_str().ok_or("invalid temp path")?)?;
-            stores.push((dir, storage));
-        }
         let mut realm = Self {
             seed,
             realm_id,
             realm_key,
-            stores,
             nodes: Vec::new(),
         };
         for index in 0..4 {
@@ -700,6 +681,9 @@ impl SettingRealm {
             .ensure_sync_topics(&[realm.topic()], peers.clone())
             .await?;
         writer.allow_topic_peers(&[realm.topic()], peers).await?;
+        for index in 0..3 {
+            realm.pull(index, 3).await;
+        }
         Ok(realm)
     }
 
@@ -709,25 +693,11 @@ impl SettingRealm {
         if index < 3 {
             options = options.with_seal_key(RealmSealKey::derive(&self.realm_key));
         }
-        let storage = self.stores[index].1.clone();
-        build_node(self.realm_id, Some(secret), Some(storage), Some(options)).await
-    }
-
-    /// Restarts a node that was shut down, on its kept storage.
-    async fn restart(&mut self, index: usize) -> TestResult<()> {
-        self.nodes[index] = self.start(index).await?;
-        mesh_nodes(&self.nodes).await;
-        install_config(&self.nodes, &self.config()).await
+        build_node(self.realm_id, Some(secret), None, Some(options)).await
     }
 
     fn id(&self, index: usize) -> NodeId {
-        self.nodes
-            .get(index)
-            .map(|node| node.net.node_id())
-            .unwrap_or_else(|| {
-                let secret = [self.seed.wrapping_mul(4).wrapping_add(index as u8 + 1); 32];
-                iroh::SecretKey::from_bytes(&secret).public()
-            })
+        self.nodes[index].net.node_id()
     }
 
     fn managers(&self) -> Vec<NodeId> {
@@ -744,11 +714,8 @@ impl SettingRealm {
         config
     }
 
-    fn peers(&self, index: usize) -> MetadataPeers<'_> {
-        MetadataPeers {
-            ctx: self.nodes[index].context.as_ref(),
-            local: self.id(index),
-        }
+    fn context(&self, index: usize) -> &DriverContext {
+        self.nodes[index].context.as_ref()
     }
 
     fn topic(&self) -> ::irokle::TopicId {
@@ -756,40 +723,6 @@ impl SettingRealm {
         SettingChannel::Webhook
             .target(owner, Ulid::nil())
             .sync_topic_id(self.realm_id, &PlacementRef::NIL)
-    }
-
-    /// One webhook setting of `owner` written by S, sealed to the realm key when on.
-    fn webhook(&self, owner: UserId, version: u64, on: bool) -> (DocumentTarget, Vec<u8>) {
-        let id = Ulid::generate();
-        let secret = SecretBytes::new(vec![version as u8; 32]);
-        let sealed = on.then(|| {
-            seal_setting(&self.realm_id, SettingChannel::Webhook, &owner, id, &secret)
-                .expect("the realm id is a realm key")
-        });
-        let subscription = WebhookSubscription {
-            subscription_id: id,
-            user_id: owner,
-            version,
-            url: on.then(|| HOOK_URL.to_string()),
-            sealed,
-            created_at_ms: unix_timestamp_millis(),
-        };
-        let target = SettingChannel::Webhook.target(owner, id);
-        (target, subscription.to_bytes().expect("setting encodes"))
-    }
-
-    fn change(&self) -> DocumentChange {
-        DocumentChange {
-            base: None,
-            current: DocumentSyncRevision {
-                generation: 1,
-                event_id: Ulid::generate(),
-                actor: self.id(3),
-                updated_at_ms: unix_timestamp_millis(),
-            },
-            kind: DocumentChangeKind::Upsert,
-            placement: PlacementRef::NIL,
-        }
     }
 
     /// Pulls the realm settings topic on node `index` from node `from`.
@@ -803,12 +736,56 @@ impl SettingRealm {
             .await;
     }
 
-    /// The version and on state of the winner of a quorum read by S over `managers`.
-    async fn decision(&self, owner: UserId, managers: &[NodeId]) -> Option<(u64, bool)> {
-        let read = read_quorum(&self.peers(3), managers, owner, SettingChannel::Webhook).await?;
-        let winner = read.winner?;
-        let head = SettingChannel::Webhook.head(&winner.bytes).ok()?;
-        Some((head.version, winner.secret.is_some()))
+    /// Pulls on node `index` from every node in `from` until its setting satisfies `done`.
+    async fn sync_until<F>(
+        &self,
+        index: usize,
+        from: &[usize],
+        owner: UserId,
+        done: F,
+    ) -> TestResult<()>
+    where
+        F: Fn(Option<WebhookSubscription>) -> bool,
+    {
+        wait_for(|| async {
+            for source in from {
+                self.pull(index, *source).await;
+            }
+            read_webhook(self.context(index), owner)
+                .await
+                .is_ok_and(&done)
+        })
+        .await
+    }
+
+    /// The delivery decision of node `index` for a notice of `owner`.
+    async fn decide(&self, index: usize, owner: UserId) -> Delivery {
+        let record = NotificationRecord::new(
+            owner,
+            NotificationClass::Direct,
+            NotificationKind::AddedToGroup {
+                group_id: Ulid::generate(),
+                actor_user_id: owner,
+            },
+            unix_timestamp_millis(),
+        );
+        let context = self.context(index);
+        let metadata = context.metadata_handle.as_ref().expect("metadata handle");
+        let peers = MetadataPeers {
+            ctx: context,
+            local: self.id(index),
+        };
+        let managers = self.managers();
+        let channel = SettingChannel::Webhook;
+        let backoffs = metadata.setting_backoffs();
+        let now = unix_timestamp_millis();
+        let managers = Some(managers.as_slice());
+        delivery_setting(context, &peers, backoffs, &record, channel, managers, now).await
+    }
+
+    async fn set(&self, index: usize, owner: UserId, url: &str) -> TestResult<WebhookOutcome> {
+        let set = set_webhook(self.context(index), self.id(index), owner, url.to_string());
+        Ok(set.await?)
     }
 
     async fn shutdown(self) {
@@ -817,82 +794,20 @@ impl SettingRealm {
 }
 
 #[tokio::test]
-async fn puts_then_delete() -> TestResult<()> {
-    // Two failed opt-ins left on settings v1 and v2 on C only; an opt-out written while C is
-    // down wins every later decision, and the next write goes above C's versions.
-    let mut realm = SettingRealm::spawn(81).await?;
-    let owner = UserId::local(Ulid::generate(), realm.realm_id);
-    let writer = realm.peers(3);
-    for version in [1, 2] {
-        let (target, bytes) = realm.webhook(owner, version, true);
-        let stored = writer.store(realm.id(2), target, bytes, realm.change());
-        assert_eq!(stored.await, Ok(StoreAnswer::Stored));
-    }
-    realm.nodes[2].net.shutdown().await;
-    remove_webhook(&realm.nodes[3].context, realm.id(3), owner).await?;
-    realm.restart(2).await?;
-    wait_for(|| async {
-        realm.pull(2, 3).await;
-        realm.decision(owner, &[realm.id(2)]).await == Some((1, false))
-    })
-    .await?;
-    realm.nodes[1].net.shutdown().await;
-    let managers = realm.managers();
-    assert_eq!(
-        realm.decision(owner, &managers).await,
-        Some((1, false)),
-        "A and C send nothing"
-    );
-    assert_eq!(read_webhook(&realm.nodes[2].context, owner).await?, None);
-    let next = set_webhook(
-        &realm.nodes[3].context,
-        realm.id(3),
-        owner,
-        HOOK_URL.to_string(),
-    );
-    assert_eq!(next.await?.subscription.version, 3);
-    realm.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test]
 async fn settings_follow_inbox() -> TestResult<()> {
-    // The holder of the inbox decides from the managers, so a moved inbox delivers the same.
+    // A setting written on S reaches every node, and each node decides from its own view and
+    // opens the secret on a management node, so a moved inbox delivers the same.
     let realm = SettingRealm::spawn(82).await?;
     let owner = UserId::local(Ulid::generate(), realm.realm_id);
-    let set = set_webhook(
-        &realm.nodes[3].context,
-        realm.id(3),
-        owner,
-        HOOK_URL.to_string(),
-    );
-    let outcome = set.await?;
-    let managers = realm.managers();
-    let record = NotificationRecord::new(
-        owner,
-        NotificationClass::Direct,
-        NotificationKind::AddedToGroup {
-            group_id: Ulid::generate(),
-            actor_user_id: owner,
-        },
-        unix_timestamp_millis(),
-    );
+    let outcome = realm.set(3, owner, HOOK_URL).await?;
+    let written = Some(outcome.subscription.clone());
+    for index in 0..3 {
+        realm
+            .sync_until(index, &[3], owner, |current| current == written)
+            .await?;
+    }
     for index in 0..4 {
-        let node = &realm.nodes[index];
-        let backoffs = node.context.metadata_handle.as_ref().ok_or("metadata")?;
-        let backoffs = backoffs.setting_backoffs();
-        let now = unix_timestamp_millis();
-        let channel = SettingChannel::Webhook;
-        let peers = realm.peers(index);
-        let delivery = delivery_setting(
-            &peers,
-            backoffs,
-            &record,
-            channel,
-            Some(managers.as_slice()),
-            now,
-        );
-        let Delivery::Send(winner) = delivery.await else {
+        let Delivery::Send(winner) = realm.decide(index, owner).await else {
             panic!("node {index} decides to send");
         };
         let secret = hex::encode(winner.secret.ok_or("secret")?.expose());
@@ -903,148 +818,82 @@ async fn settings_follow_inbox() -> TestResult<()> {
 }
 
 #[tokio::test]
-async fn lagging_writer_effective() -> TestResult<()> {
-    // A writer that stopped after its store quorum and publish still turns the setting on.
+async fn racing_writes_converge() -> TestResult<()> {
+    // A and S write without seeing each other; once both writes arrive, every node keeps the one
+    // with the higher stamp.
     let realm = SettingRealm::spawn(83).await?;
     let owner = UserId::local(Ulid::generate(), realm.realm_id);
-    let (target, bytes) = realm.webhook(owner, 1, true);
-    let change = realm.change();
-    let writer = realm.peers(3);
-    for manager in realm.managers() {
-        let stored = writer.store(manager, target.clone(), bytes.clone(), change);
-        assert_eq!(stored.await, Ok(StoreAnswer::Stored));
+    let first = realm.set(0, owner, HOOK_URL).await?.subscription;
+    let second = realm
+        .set(3, owner, "https://hooks.example.org/other")
+        .await?
+        .subscription;
+    assert_eq!((first.stamp.counter, second.stamp.counter), (1, 1));
+    let kept = [first, second].into_iter().max_by_key(|write| write.stamp);
+    for index in 0..4 {
+        realm
+            .sync_until(index, &[0, 3], owner, |current| current == kept)
+            .await?;
     }
-    let outbox = new_identified_record(
-        change.current.event_id,
-        realm.id(3),
-        target.clone(),
-        Vec::new(),
-        DocumentOutboxEvent::Upsert {
-            bytes: bytes.clone(),
-            change,
-        },
-        PlacementRef::NIL,
-        false,
-    );
-    let writes = vec![
-        (
-            target.storage_keyspace().to_string(),
-            target.storage_key(),
-            bytes.into(),
-        ),
-        sync_revision_entry(&target, &change)?,
-        outbox_write_entry(&outbox)?,
-    ];
-    let storage = &realm.nodes[3].context.storage_handle;
-    storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await;
-    let tasks = realm.nodes[3].context.task_handle.as_ref().ok_or("tasks")?;
-    tasks.send_effect(schedule_drain_effect()).await;
-    let managers = realm.managers();
-    wait_for(|| async {
-        realm.pull(0, 3).await;
-        realm.pull(1, 3).await;
-        realm.decision(owner, &managers).await == Some((1, true))
-    })
-    .await?;
     realm.shutdown().await;
     Ok(())
 }
 
 #[tokio::test]
-async fn retry_supersedes_partial() -> TestResult<()> {
-    // A write stored on C only never decides; the retry above it does.
+async fn opt_out_wins() -> TestResult<()> {
+    // B turns the webhook off after it saw S turn it on, so the opt-out has the higher stamp.
     let realm = SettingRealm::spawn(84).await?;
     let owner = UserId::local(Ulid::generate(), realm.realm_id);
-    let (target, bytes) = realm.webhook(owner, 1, true);
-    let writer = realm.peers(3);
-    let stored = writer.store(realm.id(2), target, bytes, realm.change());
-    assert_eq!(stored.await, Ok(StoreAnswer::Stored));
-    remove_webhook(&realm.nodes[3].context, realm.id(3), owner).await?;
-    let [a, _, c] = realm.managers()[..] else {
-        panic!("three managers");
-    };
-    assert_eq!(realm.decision(owner, &[c, a]).await, Some((1, false)));
-    assert_eq!(read_webhook(&realm.nodes[3].context, owner).await?, None);
+    let on = Some(realm.set(3, owner, HOOK_URL).await?.subscription);
+    realm
+        .sync_until(1, &[3], owner, |current| current == on)
+        .await?;
+    remove_webhook(realm.context(1), realm.id(1), owner).await?;
+    for index in [0, 2, 3] {
+        realm
+            .sync_until(index, &[1, 3], owner, |current| current.is_none())
+            .await?;
+    }
+    for index in 0..4 {
+        let decision = realm.decide(index, owner).await;
+        assert!(
+            matches!(decision, Delivery::Skip),
+            "node {index} sends nothing"
+        );
+    }
     realm.shutdown().await;
     Ok(())
 }
 
 #[tokio::test]
-async fn lagging_manager_ignored() -> TestResult<()> {
-    // C missed a write; every quorum that includes it still meets a manager that has it.
-    let mut realm = SettingRealm::spawn(85).await?;
+async fn one_manager_opens() -> TestResult<()> {
+    // One reachable management node is enough to open the secret.
+    let realm = SettingRealm::spawn(85).await?;
     let owner = UserId::local(Ulid::generate(), realm.realm_id);
-    realm.nodes[2].net.shutdown().await;
-    let set = set_webhook(
-        &realm.nodes[3].context,
-        realm.id(3),
-        owner,
-        HOOK_URL.to_string(),
-    );
-    assert_eq!(set.await?.subscription.version, 1);
-    realm.restart(2).await?;
-    let [a, b, c] = realm.managers()[..] else {
-        panic!("three managers");
+    let outcome = realm.set(3, owner, HOOK_URL).await?;
+    realm.nodes[0].net.shutdown().await;
+    realm.nodes[1].net.shutdown().await;
+    let Delivery::Send(winner) = realm.decide(3, owner).await else {
+        panic!("C opens the secret");
     };
-    assert_eq!(realm.decision(owner, &[c, a]).await, Some((1, true)));
-    assert_eq!(realm.decision(owner, &[c, b]).await, Some((1, true)));
-    remove_webhook(&realm.nodes[3].context, realm.id(3), owner).await?;
-    assert_eq!(realm.decision(owner, &[c, b]).await, Some((2, false)));
+    let secret = hex::encode(winner.secret.ok_or("secret")?.expose());
+    assert_eq!(secret, outcome.secret);
     realm.shutdown().await;
     Ok(())
 }
 
 #[tokio::test]
 async fn management_outage_waits() -> TestResult<()> {
-    // Without a quorum a write has an unknown outcome and a delivery waits.
+    // Writes need no management node; a delivery waits while none opens the secret.
     let realm = SettingRealm::spawn(86).await?;
     let owner = UserId::local(Ulid::generate(), realm.realm_id);
-    realm.nodes[0].net.shutdown().await;
-    realm.nodes[1].net.shutdown().await;
-    let set = set_webhook(
-        &realm.nodes[3].context,
-        realm.id(3),
-        owner,
-        HOOK_URL.to_string(),
-    );
-    assert_eq!(
-        set.await,
-        Err(WebhookError::Setting(SettingError::NoQuorum))
-    );
-    let record = NotificationRecord::new(
-        owner,
-        NotificationClass::Direct,
-        NotificationKind::AddedToGroup {
-            group_id: Ulid::generate(),
-            actor_user_id: owner,
-        },
-        unix_timestamp_millis(),
-    );
-    let metadata = realm.nodes[3]
-        .context
-        .metadata_handle
-        .as_ref()
-        .ok_or("metadata")?;
-    let managers = realm.managers();
-    let now = unix_timestamp_millis();
-    let peers = realm.peers(3);
-    let backoffs = metadata.setting_backoffs();
-    let channel = SettingChannel::Webhook;
-    let delivery = delivery_setting(
-        &peers,
-        backoffs,
-        &record,
-        channel,
-        Some(managers.as_slice()),
-        now,
-    );
-    let Delivery::Wait(_, delay) = delivery.await else {
-        panic!("a delivery without a quorum waits");
+    for node in &realm.nodes[..3] {
+        node.net.shutdown().await;
+    }
+    let outcome = realm.set(3, owner, HOOK_URL).await?;
+    assert_eq!(outcome.subscription.stamp.counter, 1);
+    let Delivery::Wait(_, delay) = realm.decide(3, owner).await else {
+        panic!("a delivery without a management node waits");
     };
     assert_eq!(delay, std::time::Duration::from_secs(30));
     realm.shutdown().await;
