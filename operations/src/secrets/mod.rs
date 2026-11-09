@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod node;
+
 use aruna_core::UserId;
 use aruna_core::secrets::{
     SecretError, SecretFields, SecretKind, SecretName, SecretRecord, SecretScope, SecretSettings,

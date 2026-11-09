@@ -169,8 +169,6 @@ mod tests {
             VaultPurpose::SourceConnector,
             VaultPurpose::GroupBackend,
             VaultPurpose::BucketKey,
-            VaultPurpose::Webhook,
-            VaultPurpose::EmailAddress,
             VaultPurpose::RealmSecret,
             VaultPurpose::NamedSecret,
         ];
