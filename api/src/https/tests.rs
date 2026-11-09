@@ -23,7 +23,7 @@ use rustls::client::Resumption;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream as ClientStream;
@@ -560,7 +560,11 @@ async fn connect_h1(stack: &Stack, name: &str) -> ClientStream<TcpStream> {
 }
 
 /// One HTTP/1.1 GET with an explicit `Host`, answering the status and body.
-async fn get_h1(stream: ClientStream<TcpStream>, host: &str, path: &str) -> (StatusCode, String) {
+async fn get_h1(
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    host: &str,
+    path: &str,
+) -> (StatusCode, String) {
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .expect("HTTP/1.1 handshake");
@@ -842,7 +846,7 @@ fn organization_url(body: &[u8]) -> String {
 }
 
 #[tokio::test]
-async fn tls_urls_use_origin() {
+async fn tls_origin_urls() {
     // DRS builds absolute URLs from the request; over TLS they carry the
     // configured HTTPS origin on HTTP/1.1 and on HTTP/2, which sends no `Host`.
     let stack = rest_stack().await;
@@ -880,4 +884,109 @@ async fn tls_urls_use_origin() {
         .await
         .expect("body");
     assert_eq!(organization_url(&body), "https://api.test");
+}
+
+/// Sends one request to the redirect router, answering the status and `Location`.
+async fn redirect_once(
+    routes: HostRoutes,
+    method: http::Method,
+    uri: &str,
+    host: Option<&str>,
+) -> (StatusCode, Option<String>) {
+    use tower::ServiceExt;
+
+    let mut request = http::Request::builder().method(method).uri(uri);
+    if let Some(host) = host {
+        request = request.header(http::header::HOST, host);
+    }
+    let response = super::redirect::router(Arc::new(routes))
+        .oneshot(request.body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    let location = response
+        .headers()
+        .get(http::header::LOCATION)
+        .map(|value| value.to_str().expect("ASCII location").to_string());
+    (response.status(), location)
+}
+
+#[tokio::test]
+async fn redirect_keeps_target() {
+    // Encoded segments and repeated query keys pass through byte for byte.
+    let target = "/a%2Fb/c%20d/?x=1&x=2&empty";
+    for method in [http::Method::GET, http::Method::POST, http::Method::PUT] {
+        assert_eq!(
+            redirect_once(routes(), method.clone(), target, Some("api.test")).await,
+            (
+                StatusCode::PERMANENT_REDIRECT,
+                Some(format!("https://api.test{target}"))
+            ),
+            "{method}"
+        );
+    }
+    assert_eq!(
+        redirect_once(routes(), http::Method::GET, "/", Some("Portal.Test:80")).await,
+        (
+            StatusCode::PERMANENT_REDIRECT,
+            Some("https://portal.test/".to_string())
+        )
+    );
+}
+
+#[tokio::test]
+async fn redirect_uses_port() {
+    let url = |value: &str| url::Url::parse(value).expect("test origin");
+    let routes = HostRoutes::new(&url("https://api.test:8443"), None, None);
+    assert_eq!(
+        redirect_once(routes, http::Method::GET, "/x?y=1", Some("api.test")).await,
+        (
+            StatusCode::PERMANENT_REDIRECT,
+            Some("https://api.test:8443/x?y=1".to_string())
+        )
+    );
+}
+
+#[tokio::test]
+async fn redirect_refuses_hosts() {
+    let refused = [
+        ("/x", None),
+        ("/x", Some("other.test")),
+        ("/x", Some("bucket.s3.test")),
+        ("http://evil.test/x", Some("api.test")),
+        ("*", Some("api.test")),
+    ];
+    for (uri, host) in refused {
+        let method = match uri {
+            "*" => http::Method::OPTIONS,
+            _ => http::Method::GET,
+        };
+        assert_eq!(
+            redirect_once(routes(), method, uri, host).await,
+            (StatusCode::BAD_REQUEST, None),
+            "{uri} {host:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn redirect_listener_stops() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("redirect port");
+    let address = listener.local_addr().expect("redirect address");
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(super::redirect::serve(
+        listener,
+        Arc::new(routes()),
+        shutdown.clone(),
+    ));
+    let stream = TcpStream::connect(address).await.expect("plain client");
+    let (status, _) = get_h1(stream, "api.test", "/x").await;
+    assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the redirect listener stops on its token")
+        .expect("no panic")
+        .expect("no I/O error");
 }

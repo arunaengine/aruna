@@ -4,6 +4,7 @@
 
 pub mod certificate;
 pub mod listener;
+pub mod redirect;
 
 #[cfg(test)]
 mod tests;
