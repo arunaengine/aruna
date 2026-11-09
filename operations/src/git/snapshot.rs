@@ -80,10 +80,19 @@ pub(super) async fn current(
 ) -> Result<Option<(Ulid, String)>, GitError> {
     let raw = match revision {
         Some(revision) => Some(revision.clone()),
-        None => crate::metadata::raw_revision::load_raw_view(context, document.document_id, None)
-            .await
-            .map_err(|_| GitError::Unavailable)?
-            .map(|view| view.revision),
+        None => {
+            let view =
+                crate::metadata::raw_revision::load_raw_view(context, document.document_id, None)
+                    .await
+                    .map_err(|_| GitError::Unavailable)?;
+            // A pending materialization snapshots its own graph and stores it only afterwards,
+            // so until it finishes the raw view is older than that snapshot.
+            let pending = view.as_ref().map(|view| view.projection_state);
+            if !materializing && pending == Some(MaterializationState::Pending) {
+                return Ok(None);
+            }
+            view.map(|view| view.revision)
+        }
     };
     if let Some(raw) = raw {
         return Ok(Some((raw.winning_event_id, raw.jsonld)));
@@ -962,3 +971,7 @@ fn erased<'a, T>(
 ) -> std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>> {
     Box::pin(future)
 }
+
+#[cfg(test)]
+#[path = "snapshot_tests.rs"]
+mod tests;
