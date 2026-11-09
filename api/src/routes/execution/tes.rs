@@ -878,6 +878,7 @@ answer 404, so the existence of a task is never disclosed.
     ),
     security(("bearer_auth" = []), ("basic_auth" = []))
 )]
+#[allow(clippy::too_many_arguments)]
 pub async fn get_task(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,

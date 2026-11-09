@@ -165,19 +165,29 @@ fn stable_cause(error: &webpki::Error) -> String {
     }
 }
 
-/// The three files as read at one check, kept only as a digest.
+/// The bytes of the three files at one check; only their digest is kept.
+struct PairFiles {
+    certificate: Vec<u8>,
+    key: Vec<u8>,
+    ca: Option<Vec<u8>>,
+}
+
 fn read_files(
     certificate: &Path,
     key: &Path,
     ca: Option<&Path>,
-) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>), CertificateError> {
+) -> Result<PairFiles, CertificateError> {
     let read = |path: &Path| {
         std::fs::read(path).map_err(|source| CertificateError::Read {
             path: path.to_path_buf(),
             source,
         })
     };
-    Ok((read(certificate)?, read(key)?, ca.map(read).transpose()?))
+    Ok(PairFiles {
+        certificate: read(certificate)?,
+        key: read(key)?,
+        ca: ca.map(read).transpose()?,
+    })
 }
 
 fn digest(certificate: &[u8], key: &[u8], ca: Option<&[u8]>) -> blake3::Hash {
@@ -225,8 +235,14 @@ impl CertificateStore {
         routes: Arc<HostRoutes>,
         now: UnixTime,
     ) -> Result<Self, CertificateError> {
-        let (certificate_pem, key_pem, ca_pem) = read_files(&certificate, &key, ca.as_deref())?;
-        let pair = check_pair(&certificate_pem, &key_pem, ca_pem.as_deref(), &routes, now)?;
+        let files = read_files(&certificate, &key, ca.as_deref())?;
+        let pair = check_pair(
+            &files.certificate,
+            &files.key,
+            files.ca.as_deref(),
+            &routes,
+            now,
+        )?;
         if !covers_buckets(&pair, &routes) {
             info!(
                 certificate = %certificate.display(),
@@ -236,7 +252,7 @@ impl CertificateStore {
         Ok(Self {
             active: RwLock::new(Arc::new(pair)),
             state: Mutex::new(ReloadState {
-                active: digest(&certificate_pem, &key_pem, ca_pem.as_deref()),
+                active: digest(&files.certificate, &files.key, files.ca.as_deref()),
                 logged: None,
             }),
             certificate,
@@ -256,14 +272,20 @@ impl CertificateStore {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let checked = match read_files(&self.certificate, &self.key, self.ca.as_deref()) {
             Err(error) => Err((None, error)),
-            Ok((certificate, key, ca)) => {
-                let files = digest(&certificate, &key, ca.as_deref());
+            Ok(read) => {
+                let files = digest(&read.certificate, &read.key, read.ca.as_deref());
                 if files == state.active {
                     return ReloadOutcome::Unchanged;
                 }
-                check_pair(&certificate, &key, ca.as_deref(), &self.routes, now)
-                    .map(|pair| (files, pair))
-                    .map_err(|error| (Some(files), error))
+                check_pair(
+                    &read.certificate,
+                    &read.key,
+                    read.ca.as_deref(),
+                    &self.routes,
+                    now,
+                )
+                .map(|pair| (files, pair))
+                .map_err(|error| (Some(files), error))
             }
         };
         match checked {
