@@ -169,6 +169,13 @@ impl SecretKind {
     }
 }
 
+pub fn check_description(description: &str) -> Result<(), SecretError> {
+    match description.chars().count() <= MAX_DESCRIPTION {
+        true => Ok(()),
+        false => Err(SecretError::Description),
+    }
+}
+
 /// Settings of a secret that are not secret, such as the header a `header` secret goes into.
 pub type SecretSettings = BTreeMap<String, String>;
 
@@ -508,9 +515,7 @@ pub struct SecretRecord {
 impl SecretRecord {
     /// Checks everything a manager set, for the scope the secret lives in.
     pub fn check(&self, scope: SecretScope) -> Result<(), SecretError> {
-        if self.description.chars().count() > MAX_DESCRIPTION {
-            return Err(SecretError::Description);
-        }
+        check_description(&self.description)?;
         check_settings(&self.kind, &self.settings)?;
         check_rules(scope, &self.kind, &self.uses)
     }

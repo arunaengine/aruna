@@ -20,7 +20,9 @@ use aruna_core::registers::{
     Eligibility, SecretBody, SecretDocument, SecretEntry, SecretInfo, SecretLifecycle, SecretOwner,
     SecretPart, SecretValue, current_entry, entry_prefix, owner_prefix, writer_eligibility,
 };
-use aruna_core::secrets::{SecretError, SecretName, check_rules, check_settings};
+use aruna_core::secrets::{
+    SecretError, SecretName, check_description, check_rules, check_settings,
+};
 use aruna_core::storage_entries::{reducer_state_key, sync_revision_entry};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord, SecretAudit};
 use aruna_core::structs::identity::realm::RealmId;
@@ -188,5 +190,353 @@ impl EntryReader {
 
     pub(crate) fn entry(&self) -> Option<SecretEntry> {
         current_entry(&self.documents, |document| self.view.counts(document))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum State {
+    Init,
+    StartTransaction,
+    Reading,
+    Write,
+    Commit,
+    ScheduleDrain,
+    Done,
+}
+
+/// Creates, replaces, rotates or deletes one user or group secret on this node.
+#[derive(Debug, PartialEq)]
+pub struct OwnerSecretOperation {
+    input: OwnerChange,
+    reader: EntryReader,
+    state: State,
+    txn_id: Option<TxnId>,
+    result: Option<Option<SecretEntry>>,
+    output: Option<Result<Option<SecretEntry>, OwnerSecretError>>,
+}
+
+impl OwnerSecretOperation {
+    pub fn new(input: OwnerChange) -> Self {
+        let reader = EntryReader::new(input.realm_id, &input.owner, input.change.name());
+        Self {
+            input,
+            reader,
+            state: State::Init,
+            txn_id: None,
+            result: None,
+            output: None,
+        }
+    }
+
+    fn fail(&mut self, error: OwnerSecretError) -> Effects {
+        self.output = Some(Err(error));
+        self.state = State::Done;
+        self.abort()
+    }
+
+    /// One document of this change with the next stamp of its register on this node.
+    fn document(
+        &self,
+        part: SecretPart,
+        id: Ulid,
+        incarnation: Option<Ulid>,
+        body: SecretBody,
+    ) -> Result<SecretDocument, OwnerSecretError> {
+        let held = (self.reader.documents.iter())
+            .filter(|document| document.part() == part)
+            .map(|document| document.stamp.counter)
+            .max();
+        Ok(SecretDocument {
+            owner: self.input.owner,
+            name: self.input.change.name().clone(),
+            stamp: RegisterStamp::next(held, self.input.node_id, id)?,
+            incarnation: incarnation.unwrap_or(id),
+            config_clock: self.reader.view.clock.clone(),
+            author: self.input.actor,
+            written_at_ms: self.input.now_ms,
+            body,
+        })
+    }
+
+    fn value(
+        &self,
+        incarnation: Ulid,
+        id: Ulid,
+        fields: &aruna_core::secrets::SecretFields,
+    ) -> Result<SecretDocument, OwnerSecretError> {
+        let name = self.input.change.name();
+        let sealed = seal_named(
+            &self.input.realm_id,
+            &self.input.owner,
+            name,
+            incarnation,
+            id,
+            &fields.encode()?,
+        )?;
+        let body = SecretBody::Value(SecretValue {
+            fields: fields.names().map(str::to_string).collect(),
+            sealed,
+        });
+        self.document(SecretPart::Value, id, Some(incarnation), body)
+    }
+
+    /// Decides the change against the current entry and builds its documents.
+    fn plan(&self) -> Result<(Vec<SecretDocument>, AdminAuditAction), OwnerSecretError> {
+        let current = self.reader.entry();
+        let scope = self.input.owner.scope();
+        let [first, second, third] = self.input.write_ids;
+        if let (Some(entry), Some(expected)) = (&current, expected(&self.input.change))
+            && entry.revision() != expected
+        {
+            return Err(ChangeError::Stale.into());
+        }
+        let info_body = |description: &str, settings, uses| {
+            SecretBody::Info(SecretInfo {
+                description: description.to_string(),
+                settings,
+                uses,
+            })
+        };
+        Ok(match (&self.input.change, &current) {
+            (SecretChange::Create { .. }, Some(_)) => return Err(ChangeError::Exists.into()),
+            (
+                SecretChange::Create {
+                    kind,
+                    description,
+                    settings,
+                    uses,
+                    fields,
+                    ..
+                },
+                None,
+            ) => {
+                if self.input.readable && !matches!(self.input.owner, SecretOwner::User(_)) {
+                    return Err(SecretError::Rule.into());
+                }
+                check_description(description)?;
+                check_settings(kind, settings)?;
+                check_rules(scope, kind, uses)?;
+                fields.check(kind)?;
+                let created = SecretLifecycle::Created {
+                    kind: kind.clone(),
+                    readable: self.input.readable,
+                };
+                let lifecycle = self.document(
+                    SecretPart::Lifecycle,
+                    first,
+                    None,
+                    SecretBody::Lifecycle(created),
+                )?;
+                let info_doc = info_body(description, settings.clone(), uses.clone());
+                let info = self.document(SecretPart::Info, second, Some(first), info_doc)?;
+                let value = self.value(first, third, fields)?;
+                (
+                    vec![lifecycle, info, value],
+                    AdminAuditAction::SecretCreated,
+                )
+            }
+            (_, None) => return Err(ChangeError::NotFound.into()),
+            (
+                SecretChange::Replace {
+                    description,
+                    settings,
+                    uses,
+                    ..
+                },
+                Some(entry),
+            ) => {
+                let kind = entry.kind().ok_or(ChangeError::NotFound)?;
+                check_description(description)?;
+                check_settings(kind, settings)?;
+                check_rules(scope, kind, uses)?;
+                let incarnation = Some(entry.lifecycle.stamp.write_id);
+                let body = info_body(description, settings.clone(), uses.clone());
+                let info = self.document(SecretPart::Info, first, incarnation, body)?;
+                (vec![info], AdminAuditAction::SecretReplaced)
+            }
+            (SecretChange::Rotate { fields, .. }, Some(entry)) => {
+                fields.check(entry.kind().ok_or(ChangeError::NotFound)?)?;
+                let value = self.value(entry.lifecycle.stamp.write_id, first, fields)?;
+                (vec![value], AdminAuditAction::SecretRotated)
+            }
+            (SecretChange::Delete { .. }, Some(entry)) => {
+                let incarnation = Some(entry.lifecycle.stamp.write_id);
+                let body = SecretBody::Lifecycle(SecretLifecycle::Deleted);
+                let delete = self.document(SecretPart::Lifecycle, first, incarnation, body)?;
+                (vec![delete], AdminAuditAction::SecretDeleted)
+            }
+        })
+    }
+
+    fn write(&mut self) -> Result<Effects, OwnerSecretError> {
+        let (documents, action) = self.plan()?;
+        let mut writes = Vec::new();
+        for document in &documents {
+            let target = DocumentTarget::OwnerSecret {
+                realm_id: self.input.realm_id,
+                owner: document.owner,
+                name: document.name.clone(),
+                part: document.part(),
+                write_id: document.stamp.write_id,
+            };
+            let bytes = document.to_bytes()?;
+            let change = DocumentChange {
+                base: None,
+                current: DocumentSyncRevision {
+                    generation: 1,
+                    event_id: document.stamp.write_id,
+                    actor: self.input.node_id,
+                    updated_at_ms: self.input.now_ms,
+                },
+                kind: DocumentChangeKind::Upsert,
+                placement: PlacementRef::NIL,
+            };
+            let outbox = new_identified_record(
+                change.current.event_id,
+                self.input.node_id,
+                target.clone(),
+                Vec::new(),
+                DocumentOutboxEvent::Upsert {
+                    bytes: bytes.clone(),
+                    change,
+                },
+                PlacementRef::NIL,
+                false,
+            );
+            writes.push((
+                target.storage_keyspace().to_string(),
+                target.storage_key(),
+                bytes.into(),
+            ));
+            writes.push(sync_revision_entry(&target, &change)?);
+            writes.push(outbox_write_entry(&outbox).map_err(ConversionError::from)?);
+        }
+        let incarnation = documents.first().map(|document| document.incarnation);
+        let audit = AdminAuditRecord::for_secret(
+            action,
+            self.input.actor,
+            SecretAudit {
+                scope: self.input.owner.scope(),
+                name: self.input.change.name().clone(),
+                incarnation,
+                write_id: documents.last().map(|document| document.stamp.write_id),
+            },
+        );
+        writes.extend(audit.entries()?);
+        self.reader.documents.extend(documents);
+        self.result = Some(self.reader.entry());
+        self.state = State::Write;
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: self.txn_id,
+        })])
+    }
+}
+
+fn expected(change: &SecretChange) -> Option<&str> {
+    match change {
+        SecretChange::Create { .. } => None,
+        SecretChange::Replace { expected, .. }
+        | SecretChange::Rotate { expected, .. }
+        | SecretChange::Delete { expected, .. } => expected.as_deref(),
+    }
+}
+
+impl Operation for OwnerSecretOperation {
+    type Output = Option<SecretEntry>;
+    type Error = OwnerSecretError;
+
+    fn start(&mut self) -> Effects {
+        if let Some(txn_id) = self.input.txn_id {
+            self.txn_id = Some(txn_id);
+            self.state = State::Reading;
+            return smallvec![self.reader.start(self.txn_id)];
+        }
+        self.state = State::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::Error { error }) = event {
+            if self.state == State::Commit {
+                self.txn_id = None;
+            }
+            return self.fail(error.into());
+        }
+        match (&self.state, event) {
+            (
+                State::StartTransaction,
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
+            ) => {
+                self.txn_id = Some(txn_id);
+                self.state = State::Reading;
+                smallvec![self.reader.start(self.txn_id)]
+            }
+            (State::Reading, event) => match self.reader.step(event, self.txn_id) {
+                Ok(Some(effect)) => smallvec![effect],
+                Ok(None) => self.write().unwrap_or_else(|error| self.fail(error)),
+                Err(error) => self.fail(error),
+            },
+            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
+                if self.input.txn_id.is_some() =>
+            {
+                // The parent commits its transaction and schedules the outbox drain.
+                self.txn_id = None;
+                self.state = State::Done;
+                self.output = Some(Ok(self.result.take().flatten()));
+                smallvec![]
+            }
+            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(OwnerSecretError::NotFinished);
+                };
+                self.state = State::Commit;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
+                self.txn_id = None;
+                self.state = State::ScheduleDrain;
+                smallvec![schedule_drain_effect()]
+            }
+            (State::ScheduleDrain, Event::Task(TaskEvent::TimerScheduled { .. })) => {
+                self.state = State::Done;
+                self.output = Some(Ok(self.result.take().flatten()));
+                smallvec![]
+            }
+            (State::ScheduleDrain, Event::Task(TaskEvent::Error { message, .. })) => {
+                warn!(error = %message, "Outbox drain not scheduled; the durable outbox retries");
+                self.state = State::Done;
+                self.output = Some(Ok(self.result.take().flatten()));
+                smallvec![]
+            }
+            (State::Init | State::Done, _) => smallvec![],
+            (_, event) => {
+                let got = format!("{event:?}");
+                self.fail(OwnerSecretError::UnexpectedEvent {
+                    state: "OwnerSecret",
+                    got,
+                })
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state == State::Done
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(OwnerSecretError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        let own = self.input.txn_id.is_none();
+        match self.txn_id.take() {
+            Some(txn_id) if own => {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            _ => smallvec![],
+        }
     }
 }
