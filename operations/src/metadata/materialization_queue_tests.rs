@@ -1735,6 +1735,113 @@ async fn late_merges_chain() {
     );
 }
 
+// The scanner read attempt 0, then the captured job rescheduled; its stale verdict must spare
+// the retry's sidecar and capture mark.
+#[tokio::test]
+async fn prune_keeps_retry() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let document_id = Ulid::from_bytes([7u8; 16]);
+    let event = create_event(document_id, Ulid::from_parts(7, 1), "retried");
+    let first = MetadataMaterializationRecord {
+        document_id,
+        event_id: event.event_id,
+        due_at_ms: 1,
+        attempts: 0,
+        failures: 0,
+        parks: 0,
+    };
+    let first_key = materialization_job_key(&first).to_vec();
+    write_entries(
+        &storage,
+        vec![
+            create_event_entry(&event).unwrap(),
+            materialization_status_entry(&new_pending_status(&event, 1)).unwrap(),
+            materialization_job_entry(&first).unwrap(),
+            document_job_entry(&first).unwrap(),
+            capture_mark(document_id, event.event_id),
+        ],
+    )
+    .await;
+
+    let target = [(document_id, event.event_id)];
+    let seen = read_document_jobs(&storage, &target).await.unwrap();
+    assert_eq!(seen, vec![Some(first.clone())]);
+    let transient = MetadataMaterializationError::Storage(StorageError::Timeout);
+    let retry = defer_materialization_job(&first_key, &first, &event, &transient);
+    finish_completed_jobs(&storage, vec![retry]).await.unwrap();
+    let (_, dead) = filter_live_jobs(&storage, vec![(first_key.clone(), first.clone())])
+        .await
+        .unwrap();
+    assert_eq!(
+        dead.len(),
+        1,
+        "the newer status marks the scanned copy dead"
+    );
+    let stale = StaleJob {
+        index_key: first_key.clone(),
+        seen: Some(first),
+        drop_sidecar: true,
+    };
+    prune_jobs(&storage, vec![stale]).await.unwrap();
+
+    let sidecar = read_document_job(&storage, document_id, event.event_id)
+        .await
+        .unwrap()
+        .expect("the retry keeps its sidecar");
+    assert_eq!(sidecar.attempts, 1);
+    assert!(capture_pending(&storage, document_id).await.unwrap());
+    let (jobs, _, _) = scan_due_jobs(&storage, u64::MAX, MATERIALIZATION_BATCH_SIZE)
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs.iter().map(|(_, job)| job).collect::<Vec<_>>(),
+        vec![&sidecar]
+    );
+}
+
+// A captured job whose event is gone is an orphan; the scan removes its capture mark with it.
+#[tokio::test]
+async fn prune_drops_orphan() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let document_id = Ulid::from_bytes([8u8; 16]);
+    let event_id = Ulid::from_parts(8, 1);
+    let job = MetadataMaterializationRecord {
+        document_id,
+        event_id,
+        due_at_ms: 1,
+        attempts: 0,
+        failures: 0,
+        parks: 0,
+    };
+    write_entries(
+        &storage,
+        vec![
+            materialization_job_entry(&job).unwrap(),
+            document_job_entry(&job).unwrap(),
+            capture_mark(document_id, event_id),
+        ],
+    )
+    .await;
+
+    let (jobs, _, _) = scan_due_jobs(&storage, u64::MAX, MATERIALIZATION_BATCH_SIZE)
+        .await
+        .unwrap();
+
+    assert!(jobs.is_empty());
+    assert!(!capture_pending(&storage, document_id).await.unwrap());
+    assert!(
+        !storage_key_exists(
+            &storage,
+            DOCUMENT_JOB_KEYSPACE,
+            document_job_key(document_id, event_id).to_vec()
+        )
+        .await
+    );
+    assert!(!materialization_jobs_exist(&storage).await.unwrap());
+}
+
 #[tokio::test]
 async fn supersedes_prior_rows() {
     // A second revision replaces the document's postings: rows it does not write are deleted

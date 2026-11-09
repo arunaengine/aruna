@@ -1216,10 +1216,11 @@ async fn scan_due_jobs(
             let key = key.to_vec();
             let Some((due_at_ms, document_id, event_id)) = job_key_parts(&key) else {
                 warn!(key = ?key, "Deleting malformed metadata materialization index row");
-                stale.push((
-                    MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                    ByteView::from(key),
-                ));
+                stale.push(StaleJob {
+                    index_key: key,
+                    seen: None,
+                    drop_sidecar: false,
+                });
                 continue;
             };
             if due_at_ms > now_ms {
@@ -1241,12 +1242,12 @@ async fn scan_due_jobs(
             for (_, job) in live {
                 jobs.push((materialization_job_key(&job).to_vec(), job));
                 if jobs.len() >= limit {
-                    delete_materialization_entries(storage, stale).await?;
+                    prune_jobs(storage, stale).await?;
                     return Ok((jobs, true, None));
                 }
             }
         }
-        delete_materialization_entries(storage, stale).await?;
+        prune_jobs(storage, stale).await?;
 
         if let Some(due_at_ms) = next_due_ms {
             return Ok((jobs, false, Some(due_at_ms)));
@@ -1268,7 +1269,7 @@ type DueCandidate = (Vec<u8>, u64, Ulid, Ulid);
 async fn resolve_due_jobs(
     storage: &StorageHandle,
     candidates: &[DueCandidate],
-) -> Result<(ScannedJobs, Vec<(String, ByteView)>), MetadataMaterializationError> {
+) -> Result<(ScannedJobs, Vec<StaleJob>), MetadataMaterializationError> {
     let targets: Vec<(Ulid, Ulid)> = candidates
         .iter()
         .map(|(_, _, document_id, event_id)| (*document_id, *event_id))
@@ -1276,36 +1277,26 @@ async fn resolve_due_jobs(
     let sidecars = read_document_jobs(storage, &targets).await?;
     let mut due = Vec::with_capacity(candidates.len());
     let mut stale = Vec::new();
-    for ((key, due_at_ms, document_id, event_id), sidecar) in candidates.iter().zip(sidecars) {
+    for ((key, due_at_ms, _, _), sidecar) in candidates.iter().zip(sidecars) {
         match sidecar {
             Some(job) if job.due_at_ms == *due_at_ms => due.push((key.clone(), job)),
             // The sidecar is authoritative: an index row it does not match is
             // stale. A missing or malformed sidecar is dropped with it.
-            sidecar => {
-                stale.push((
-                    MATERIALIZATION_JOB_KEYSPACE.to_string(),
-                    ByteView::from(key.clone()),
-                ));
-                if sidecar.is_none() {
-                    stale.push((
-                        DOCUMENT_JOB_KEYSPACE.to_string(),
-                        document_job_key(*document_id, *event_id),
-                    ));
-                }
-            }
+            sidecar => stale.push(StaleJob {
+                index_key: key.clone(),
+                drop_sidecar: sidecar.is_none(),
+                seen: sidecar,
+            }),
         }
     }
 
     let (live, dead) = filter_live_jobs(storage, due).await?;
     for (key, job) in dead {
-        stale.push((
-            MATERIALIZATION_JOB_KEYSPACE.to_string(),
-            ByteView::from(key),
-        ));
-        stale.push((
-            DOCUMENT_JOB_KEYSPACE.to_string(),
-            document_job_key(job.document_id, job.event_id),
-        ));
+        stale.push(StaleJob {
+            index_key: key,
+            seen: Some(job),
+            drop_sidecar: true,
+        });
     }
     Ok((live, stale))
 }
@@ -1726,8 +1717,8 @@ async fn older_job_exists(
             Ok(_) => return Ok(true),
             Err(MetadataMaterializationError::CreateEventMissing { .. }) => {
                 warn!(document_id = %pending.document_id, event_id = %pending.event_id, "Deleting orphan metadata materialization job");
-                delete_materialization_job(storage, materialization_job_key(pending).to_vec())
-                    .await?;
+                let key = materialization_job_key(pending).to_vec();
+                delete_materialization_job(storage, key, pending.clone()).await?;
             }
             Err(error) => return Err(error),
         }
@@ -1947,7 +1938,7 @@ pub async fn materialization_jobs_exist(
                         if job_is_live(storage, &job).await? {
                             return Ok(true);
                         }
-                        delete_materialization_job(storage, key).await?;
+                        delete_materialization_job(storage, key, job).await?;
                     }
                     _ => delete_global_job(storage, key).await?,
                 }
@@ -1961,25 +1952,101 @@ pub async fn materialization_jobs_exist(
     }
 }
 
+/// Deletes a dead job whose sidecar read as `seen`, unless a newer retry rewrote it since.
 async fn delete_materialization_job(
     storage: &StorageHandle,
     key: Vec<u8>,
+    seen: MetadataMaterializationRecord,
 ) -> Result<(), MetadataMaterializationError> {
-    let mut deletes = vec![(
-        MATERIALIZATION_JOB_KEYSPACE.to_string(),
-        ByteView::from(key.clone()),
-    )];
-    if let Some((document_id, event_id)) = job_key_target(&key) {
-        deletes.push((
-            DOCUMENT_JOB_KEYSPACE.to_string(),
-            document_job_key(document_id, event_id),
-        ));
-        deletes.push((
-            MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
-            document_job_key(document_id, event_id),
-        ));
+    let stale = StaleJob {
+        index_key: key,
+        seen: Some(seen),
+        drop_sidecar: true,
+    };
+    prune_jobs(storage, vec![stale]).await
+}
+
+/// An index row a scan found stale or dead, the sidecar it read for it and whether that
+/// sidecar, with its capture mark, goes too.
+struct StaleJob {
+    index_key: Vec<u8>,
+    seen: Option<MetadataMaterializationRecord>,
+    drop_sidecar: bool,
+}
+
+/// Deletes stale job rows after reading their sidecars again in one transaction. A sidecar a
+/// newer retry rewrote keeps its rows and capture mark; a conflict leaves all to the next scan.
+async fn prune_jobs(
+    storage: &StorageHandle,
+    stale: Vec<StaleJob>,
+) -> Result<(), MetadataMaterializationError> {
+    if stale.is_empty() {
+        return Ok(());
     }
-    delete_materialization_entries(storage, deletes).await
+    let txn_id = start_write_transaction(storage).await?;
+    let pruned = async {
+        let targets: Vec<_> = (stale.iter())
+            .map(|row| job_key_parts(&row.index_key))
+            .collect();
+        let reads = (targets.iter().flatten())
+            .map(|(_, document_id, event_id)| {
+                let key = document_job_key(*document_id, *event_id);
+                (DOCUMENT_JOB_KEYSPACE.to_string(), key)
+            })
+            .collect();
+        let mut sidecars = match storage
+            .send_storage_effect(StorageEffect::BatchRead {
+                reads,
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => values.into_iter(),
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            other => {
+                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
+                    "{other:?}"
+                )));
+            }
+        };
+        let mut deletes = Vec::new();
+        for (row, target) in stale.into_iter().zip(targets) {
+            let index = (MATERIALIZATION_JOB_KEYSPACE.to_string(), row.index_key);
+            let Some((due_at_ms, document_id, event_id)) = target else {
+                deletes.push((index.0, ByteView::from(index.1)));
+                continue;
+            };
+            let current = (sidecars.next().and_then(|(_, value)| value)).and_then(|value| {
+                postcard::from_bytes::<MetadataMaterializationRecord>(&value).ok()
+            });
+            let changed = current != row.seen;
+            // A retry that rewrote the sidecar onto this very index row keeps it.
+            if !(changed && current.is_some_and(|job| job.due_at_ms == due_at_ms)) {
+                deletes.push((index.0, ByteView::from(index.1)));
+            }
+            if row.drop_sidecar && !changed {
+                let key = document_job_key(document_id, event_id);
+                deletes.push((DOCUMENT_JOB_KEYSPACE.to_string(), key.clone()));
+                deletes.push((MATERIALIZATION_CAPTURE_KEYSPACE.to_string(), key));
+            }
+        }
+        transactional_batch_delete(storage, txn_id, deletes).await
+    }
+    .await;
+    if let Err(error) = pruned {
+        abort_storage_transaction(
+            storage,
+            txn_id,
+            "Failed to abort materialization prune transaction",
+            "Unexpected materialization prune transaction abort result",
+        )
+        .await;
+        return Err(error);
+    }
+    match commit_storage_transaction(storage, txn_id).await {
+        Err(MetadataQueueError::Storage(StorageError::TransactionConflict)) => Ok(()),
+        committed => committed.map_err(Into::into),
+    }
 }
 
 async fn delete_global_job(
