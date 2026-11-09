@@ -672,6 +672,14 @@ pub enum MetadataTransportMessage {
     RealmSecretResult {
         result: Result<aruna_core::compute::SecretBytes, MetadataReadError>,
     },
+    /// The sealed secret of a setting document, asked of a management node; Debug hides it.
+    OpenSetting {
+        target: DocumentTarget,
+        bytes: Vec<u8>,
+    },
+    OpenSettingResult {
+        result: Result<aruna_core::compute::SecretBytes, MetadataReadError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.

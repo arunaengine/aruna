@@ -1,16 +1,20 @@
 //! Reads realm vault secrets: management nodes open them, other nodes fetch them once and cache
-//! the current revision in their node vault.
+//! the current revision in their node vault. Management nodes also open notification secrets.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::compute::SecretBytes;
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NODE_VAULT_KEYSPACE;
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::realm_vault::{RealmSecretRef, RealmVaultError, RealmVaultKey, RealmVaultRecord};
+use aruna_core::realm_vault::{
+    FetchScope, RealmSealKey, RealmSecretRef, RealmVaultError, RealmVaultKey, RealmVaultRecord,
+};
+use aruna_core::structs::execution::setting::{SettingChannel, validate_setting};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use std::future::Future;
 use thiserror::Error;
@@ -177,6 +181,68 @@ fn check_fetch(
         // An older revision is never handed out; a newer one has not reached this node yet.
         Some(record) if record.revision > request.revision => Err(MetadataReadError::Forbidden),
         _ => Err(MetadataReadError::Unavailable),
+    }
+}
+
+/// The management side of opening a setting secret for a delivery. Only a key holder answers,
+/// only infrastructure peers get an answer, and only for a well-formed setting document.
+pub(crate) async fn serve_open(
+    ctx: &DriverContext,
+    key: Option<&RealmSealKey>,
+    peer: NodeId,
+    target: DocumentTarget,
+    bytes: Vec<u8>,
+) -> Result<SecretBytes, MetadataReadError> {
+    let key = key.ok_or(MetadataReadError::Unavailable)?;
+    let config = management_config(ctx).await?;
+    open_setting(key, &config, peer, &target, &bytes)
+}
+
+/// Opens the sealed secret of a valid setting document; an off setting has none.
+pub(crate) fn open_setting(
+    key: &RealmSealKey,
+    config: &RealmConfigDocument,
+    peer: NodeId,
+    target: &DocumentTarget,
+    bytes: &[u8],
+) -> Result<SecretBytes, MetadataReadError> {
+    infrastructure_peer(config, peer)?;
+    let head = validate_setting(target, bytes).map_err(|_| MetadataReadError::Forbidden)?;
+    let (channel, owner, id) =
+        SettingChannel::of_target(target).ok_or(MetadataReadError::Forbidden)?;
+    let sealed = channel
+        .sealed(bytes)
+        .map_err(|_| MetadataReadError::Forbidden)?;
+    let sealed = sealed
+        .filter(|_| head.on)
+        .ok_or(MetadataReadError::NotFound)?;
+    key.open(&config.realm_id, channel, &owner, id, &sealed)
+        .map_err(|_| MetadataReadError::Forbidden)
+}
+
+/// The realm config of a node that holds the realm key; other nodes keep no settings.
+async fn management_config(ctx: &DriverContext) -> Result<RealmConfigDocument, MetadataReadError> {
+    let net_handle = ctx
+        .net_handle
+        .as_ref()
+        .ok_or(MetadataReadError::Unavailable)?;
+    let config = drive(GetConfigOperation::new(*net_handle.realm_id()), ctx)
+        .await
+        .map_err(|_| MetadataReadError::Unavailable)?;
+    match is_management(&config, net_handle.node_id()) {
+        true => Ok(config),
+        false => Err(MetadataReadError::Unavailable),
+    }
+}
+
+/// Server and management nodes may open settings; user devices never.
+fn infrastructure_peer(
+    config: &RealmConfigDocument,
+    peer: NodeId,
+) -> Result<(), MetadataReadError> {
+    match node_kind(config, peer) {
+        Some(kind) if FetchScope::Infrastructure.allows(&kind) => Ok(()),
+        _ => Err(MetadataReadError::Forbidden),
     }
 }
 

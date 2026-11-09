@@ -244,11 +244,18 @@ pub struct MetadataHandleOptions {
     pub profile_validation_disabled: bool,
     /// Present on management nodes only: opens realm vault records and serves fetches.
     pub realm_vault_key: Option<Arc<aruna_core::realm_vault::RealmVaultKey>>,
+    /// Present on management nodes only: opens the secrets of notification settings.
+    pub realm_seal_key: Option<Arc<aruna_core::realm_vault::RealmSealKey>>,
 }
 
 impl MetadataHandleOptions {
     pub fn with_vault_key(mut self, key: aruna_core::realm_vault::RealmVaultKey) -> Self {
         self.realm_vault_key = Some(Arc::new(key));
+        self
+    }
+
+    pub fn with_seal_key(mut self, key: aruna_core::realm_vault::RealmSealKey) -> Self {
+        self.realm_seal_key = Some(Arc::new(key));
         self
     }
 
@@ -307,6 +314,8 @@ struct MetadataInner {
     deferred_persist_running: AtomicBool,
     profile_validation_disabled: bool,
     realm_vault_key: Option<Arc<aruna_core::realm_vault::RealmVaultKey>>,
+    realm_seal_key: Option<Arc<aruna_core::realm_vault::RealmSealKey>>,
+    setting_backoffs: crate::notifications::settings::Backoffs,
     mail: std::sync::OnceLock<Arc<crate::notifications::email::MailProfiles>>,
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
     peer_contacts: PeerContacts,
@@ -590,6 +599,8 @@ impl MetadataHandle {
                 deferred_persist_running: AtomicBool::new(false),
                 profile_validation_disabled: metadata_options.profile_validation_disabled,
                 realm_vault_key: metadata_options.realm_vault_key,
+                realm_seal_key: metadata_options.realm_seal_key,
+                setting_backoffs: Default::default(),
                 mail: std::sync::OnceLock::new(),
                 profile_shacl,
                 peer_contacts: PeerContacts::default(),
@@ -770,6 +781,16 @@ impl MetadataHandle {
     /// The realm vault key; only management nodes hold one.
     pub fn realm_vault_key(&self) -> Option<Arc<aruna_core::realm_vault::RealmVaultKey>> {
         self.inner.realm_vault_key.clone()
+    }
+
+    /// The realm seal key; only management nodes hold one.
+    pub fn realm_seal_key(&self) -> Option<Arc<aruna_core::realm_vault::RealmSealKey>> {
+        self.inner.realm_seal_key.clone()
+    }
+
+    /// The delays every delivery job of this node shares while no management node opens a secret.
+    pub fn setting_backoffs(&self) -> &crate::notifications::settings::Backoffs {
+        &self.inner.setting_backoffs
     }
 
     /// Shares the job runtime's mail senders, so every applied realm config change refreshes them.

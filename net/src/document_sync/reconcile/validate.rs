@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::structs::execution::setting::validate_setting;
 use aruna_core::user::validation::{
     DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, SERVICE_GROUP_ATTRIBUTE,
 };
@@ -1108,6 +1109,22 @@ pub(in crate::document_sync) fn validate_watch_upsert(
         return Err("watch subscription event mask is invalid".to_string());
     }
     Ok(())
+}
+
+/// A notification setting syncs as one generation 1 upsert per immutable version.
+pub(in crate::document_sync) fn validate_setting_upsert(
+    target: &DocumentTarget,
+    bytes: &[u8],
+    change: &DocumentChange,
+) -> std::result::Result<(), String> {
+    if change.kind != DocumentChangeKind::Upsert || change.current.generation != 1 {
+        return Err("a setting upsert must carry a generation 1 upsert revision".to_string());
+    }
+    let head = validate_setting(target, bytes)?;
+    match head.stamp.written_by(change.current.actor) {
+        true => Ok(()),
+        false => Err("the setting stamp names another node than its actor".to_string()),
+    }
 }
 
 pub(in crate::document_sync) fn validate_watch_delete(

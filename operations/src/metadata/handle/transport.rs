@@ -534,6 +534,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ResolvedJobInputs { .. } => "resolved_job_inputs",
         MetadataTransportMessage::RealmSecret { .. } => "realm_secret",
         MetadataTransportMessage::RealmSecretResult { .. } => "realm_secret_result",
+        MetadataTransportMessage::OpenSetting { .. } => "open_setting",
+        MetadataTransportMessage::OpenSettingResult { .. } => "open_setting_result",
     }
 }
 
@@ -764,6 +766,23 @@ impl MetadataHandle {
             .map_err(|_| MetadataReadError::Unavailable)?
         {
             MetadataTransportMessage::RealmSecretResult { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// The sealed secret of a setting document, opened by the management node `node_id`.
+    pub async fn request_open(
+        &self,
+        node_id: NodeId,
+        target: aruna_core::document::DocumentTarget,
+        bytes: Vec<u8>,
+    ) -> Result<aruna_core::compute::SecretBytes, MetadataReadError> {
+        let request = MetadataTransportMessage::OpenSetting { target, bytes };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::OpenSettingResult { result } => result,
             _ => Err(MetadataReadError::Unavailable),
         }
     }

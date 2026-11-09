@@ -1,10 +1,15 @@
-//! Builds temporary storage, users and seeded records for the notification tests.
+//! Builds temporary storage, users, seeded records, stored settings and canned management
+//! answers for the notification tests.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
+use crate::metadata::protocol::MetadataReadError;
 use crate::notifications::inbox::upsert_inbox_records;
+use crate::notifications::settings::SettingPeers;
 use aruna_core::UserId;
+use aruna_core::compute::SecretBytes;
+use aruna_core::document::DocumentTarget;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
@@ -60,4 +65,57 @@ pub(crate) async fn seed(storage: &StorageHandle, records: &[NotificationRecord]
         upsert_inbox_records(storage, records).await,
         Ok(records.len())
     );
+}
+
+/// Management nodes that open every setting with a fixed secret and count the requests. A node
+/// without a secret is unreachable.
+#[derive(Default)]
+pub(crate) struct CannedPeers {
+    pub secrets: std::collections::HashMap<aruna_core::NodeId, SecretBytes>,
+    pub opens: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SettingPeers for CannedPeers {
+    async fn open(
+        &self,
+        node: aruna_core::NodeId,
+        _target: DocumentTarget,
+        _bytes: Vec<u8>,
+    ) -> Result<SecretBytes, MetadataReadError> {
+        self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.secrets
+            .get(&node)
+            .cloned()
+            .ok_or(MetadataReadError::Unavailable)
+    }
+}
+
+/// Peers where every manager opens settings with `secret`.
+pub(crate) fn opening(secret: &[u8]) -> CannedPeers {
+    let secret = SecretBytes::new(secret.to_vec());
+    CannedPeers {
+        secrets: managers().map(|node| (node, secret.clone())).into(),
+        ..Default::default()
+    }
+}
+
+/// Stores one register write of a setting on this node, as a local write or sync would.
+pub(crate) async fn store_setting(
+    storage: &StorageHandle,
+    target: &DocumentTarget,
+    bytes: Vec<u8>,
+) {
+    let write = aruna_core::effects::StorageEffect::Write {
+        key_space: target.storage_keyspace().to_string(),
+        key: target.storage_key(),
+        value: bytes.into(),
+        txn_id: None,
+    };
+    storage.send_storage_effect(write).await;
+}
+
+/// Three management nodes, in config order.
+pub(crate) fn managers() -> [aruna_core::NodeId; 3] {
+    [61u8, 62, 63].map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
 }

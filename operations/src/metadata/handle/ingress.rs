@@ -1190,6 +1190,13 @@ impl MetadataHandle {
                 let result = Box::pin(served).await;
                 (MetadataTransportMessage::RealmSecretResult { result }, None)
             }
+            MetadataTransportMessage::OpenSetting { target, bytes } => {
+                let key = self.realm_seal_key();
+                let served =
+                    crate::realm_vault::serve_open(context, key.as_deref(), peer, target, bytes);
+                let result = Box::pin(served).await;
+                (MetadataTransportMessage::OpenSettingResult { result }, None)
+            }
             MetadataTransportMessage::PromotionCheck => {
                 let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
                 let result = Box::pin(ready).await;

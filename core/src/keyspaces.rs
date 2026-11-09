@@ -288,10 +288,11 @@ pub const NODE_SUBJECT_KEYSPACE: &str = "node_subject";
 pub const NOTIFICATION_INBOX_KEYSPACE: &str = "notification_inbox";
 pub const PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_prune_index";
 pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
-/// Each user's webhook subscription on its inbox holder, by user id.
-pub const WEBHOOK_KEYSPACE: &str = "webhook_subscriptions";
-/// Each user's email notification opt-in on its inbox holder, by user id.
-pub const EMAIL_KEYSPACE: &str = "email_preferences";
+/// Email setting register writes, replicated per user and all kept. The keyspaces of the
+/// node-local opt-ins before them stay unread.
+pub const EMAIL_SETTINGS_KEYSPACE: &str = "notification_email_settings";
+/// Webhook setting register writes, replicated per user and all kept.
+pub const WEBHOOK_SETTINGS_KEYSPACE: &str = "notification_webhook_settings";
 pub const WATCH_SUBSCRIPTIONS_KEYSPACE: &str = "notification_watch_subscriptions";
 pub const WATCH_INTEREST_KEYSPACE: &str = "notification_watch_interest";
 /// The newest deletion time of a bucket per recipient, which drops older notices about it.
@@ -705,8 +706,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NOTIFICATION_INBOX_KEYSPACE,
     PRUNE_INDEX_KEYSPACE,
     NOTIFICATION_OUTBOX_KEYSPACE,
-    WEBHOOK_KEYSPACE,
-    EMAIL_KEYSPACE,
+    EMAIL_SETTINGS_KEYSPACE,
+    WEBHOOK_SETTINGS_KEYSPACE,
     WATCH_SUBSCRIPTIONS_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,
     NOTIFICATION_CUTOFF_KEYSPACE,

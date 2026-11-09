@@ -11,16 +11,18 @@ use ulid::Ulid;
 use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
 use crate::keyspaces::{
-    AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GIT_PACK_KEYSPACE,
-    GIT_RECORD_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE, ID_MAPPING_KEYSPACE,
-    METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, REPOSITORY_LINK_KEYSPACE, USER_KEY_KEYSPACE, USER_KEYSPACE,
-    VAULT_REVISION_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
+    AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EMAIL_SETTINGS_KEYSPACE, EVENT_LOG_KEYSPACE,
+    GIT_PACK_KEYSPACE, GIT_RECORD_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE,
+    ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATS_KEYSPACE,
+    PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE, REPOSITORY_LINK_KEYSPACE, USER_KEY_KEYSPACE,
+    USER_KEYSPACE, VAULT_REVISION_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
+    WEBHOOK_SETTINGS_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use crate::repository::link_key;
 use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
 use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
+use crate::structs::execution::setting::setting_key;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::vault::user_record_key;
 use crate::structs::persistent_id_key;
@@ -117,6 +119,17 @@ pub enum DocumentTarget {
         realm_id: RealmId,
         user_id: UserId,
         record_id: Ulid,
+    },
+    // Appended, because stored rows and sync ops carry the variant index.
+    /// One immutable version of a user's email setting; the highest stamp decides.
+    EmailPreference {
+        owner: UserId,
+        preference_id: Ulid,
+    },
+    /// One immutable version of a user's webhook setting; the highest stamp decides.
+    WebhookSubscription {
+        owner: UserId,
+        subscription_id: Ulid,
     },
 }
 
@@ -421,7 +434,9 @@ impl DocumentTarget {
             }
             Self::NodeUsage { realm_id, .. } => TopicId::realm(*realm_id),
             Self::WatchInterest { realm_id, .. } => TopicId::realm(*realm_id),
-            Self::WatchSubscription { owner, .. } => TopicId::realm(owner.realm_id),
+            Self::WatchSubscription { owner, .. }
+            | Self::EmailPreference { owner, .. }
+            | Self::WebhookSubscription { owner, .. } => TopicId::realm(owner.realm_id),
             Self::NodeInfo { realm_id, .. } => TopicId::realm(*realm_id),
             Self::PlacementPolicy { policy_id } => TopicId::metadata(*policy_id),
         }
@@ -443,6 +458,8 @@ impl DocumentTarget {
             Self::NodeUsage { .. } => NODE_STATS_KEYSPACE,
             Self::WatchInterest { .. } => WATCH_INTEREST_KEYSPACE,
             Self::WatchSubscription { .. } => WATCH_SUBSCRIPTIONS_KEYSPACE,
+            Self::EmailPreference { .. } => EMAIL_SETTINGS_KEYSPACE,
+            Self::WebhookSubscription { .. } => WEBHOOK_SETTINGS_KEYSPACE,
             Self::NodeInfo { .. } => NODE_INFO_KEYSPACE,
             Self::PlacementPolicy { .. } => PLACEMENT_POLICY_KEYSPACE,
             Self::RepositoryLink { .. } => REPOSITORY_LINK_KEYSPACE,
@@ -498,6 +515,14 @@ impl DocumentTarget {
             Self::WatchSubscription { owner, watch_id } => {
                 watch_subscription_key(*owner, *watch_id)
             }
+            Self::EmailPreference {
+                owner,
+                preference_id: id,
+            }
+            | Self::WebhookSubscription {
+                owner,
+                subscription_id: id,
+            } => ByteView::from(setting_key(owner, *id)),
             Self::NodeInfo { node_id, .. } => ByteView::from(node_info_key(*node_id)),
             Self::PlacementPolicy { policy_id } => ByteView::from(placement_policy_key(*policy_id)),
             Self::RepositoryLink {
@@ -569,9 +594,11 @@ impl DocumentTarget {
             Self::NodeUsage { .. } => bytes.extend_from_slice(b"/node-usage"),
             // Likewise realm-shared: every node's watch-interest digest rides one
             // topic so origin nodes receive all holders' interest.
-            Self::WatchInterest { .. } | Self::WatchSubscription { .. } => {
-                bytes.extend_from_slice(b"/watch-interest")
-            }
+            // Notification settings share it: every infrastructure node joins, devices never.
+            Self::WatchInterest { .. }
+            | Self::WatchSubscription { .. }
+            | Self::EmailPreference { .. }
+            | Self::WebhookSubscription { .. } => bytes.extend_from_slice(b"/watch-interest"),
             // Realm-shared: every node's info document rides one topic
             // (no node id in the suffix) so all realm nodes receive every peer's.
             Self::NodeInfo { .. } => bytes.extend_from_slice(b"/node-info"),

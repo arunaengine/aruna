@@ -1,4 +1,5 @@
-//! Tests webhook subscriptions, signed delivery, status handling and replaced subscriptions.
+//! Tests webhook subscriptions as register writes, signed delivery, status handling and
+//! deliveries that decide from this node's setting.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -6,21 +7,35 @@ use super::*;
 use crate::jobs::executor::ProgressReporter;
 use crate::jobs::store::find_dedup_plan;
 use crate::jobs::submit::mint_job_id;
+use crate::tests::notifications::{CannedPeers, managers, opening, store_setting};
 use crate::tests::staging::setup_driver_context;
 
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::{JobErrorKind, JobProgress};
 use aruna_core::structs::execution::notification::NotificationClass;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use axum::http::{HeaderMap, StatusCode};
+use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// A time before the notice expires.
+const NOW_MS: u64 = 1_000;
+const SECRET: [u8; 32] = [9; 32];
+
+/// A user of a realm whose id is a realm key, so secrets can be sealed to it.
 fn user() -> UserId {
-    UserId::local(Ulid::from_parts(1, 1), RealmId::from_bytes([1; 32]))
+    let realm_key = SigningKey::from_bytes(&[5; 32]).verifying_key();
+    UserId::local(
+        Ulid::from_parts(1, 1),
+        RealmId::from_bytes(realm_key.to_bytes()),
+    )
 }
 
 fn upload(recipient: UserId) -> NotificationRecord {
@@ -40,13 +55,6 @@ fn upload(recipient: UserId) -> NotificationRecord {
         read_at_ms: None,
         watch_authorization: None,
     }
-}
-
-async fn act(
-    context: &DriverContext,
-    action: WebhookAction,
-) -> Result<WebhookOutcome, WebhookError> {
-    drive(WebhookOperation::new(user(), action), context).await
 }
 
 fn job_context(context: DriverContext) -> JobContext {
@@ -89,71 +97,113 @@ async fn receiver(answer: Arc<AtomicU16>) -> (String, Received) {
     (format!("http://{address}/hook"), received)
 }
 
-#[tokio::test]
-async fn subscription_replaces_secret() {
-    let staging = setup_driver_context().await;
-    let context = &staging.driver_context;
-    let url = "https://hooks.example.org/aruna".to_string();
-    let first = act(context, WebhookAction::Set { url: url.clone() })
-        .await
-        .unwrap();
-    assert_eq!(first.secret.as_ref().map(String::len), Some(64));
-    let stored = act(context, WebhookAction::Read).await.unwrap();
-    assert_eq!(stored.subscription, first.subscription);
-    assert_eq!(stored.secret, None, "a read never shows the secret");
-
-    let second = act(context, WebhookAction::Set { url }).await.unwrap();
-    let old = first.subscription.unwrap().subscription_id;
-    assert_ne!(second.subscription.as_ref().unwrap().subscription_id, old);
-    let event = context
+/// Stores a realm config whose three managers are the canned peers.
+async fn seed_config(context: &DriverContext) {
+    let realm_id = user().realm_id;
+    let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    for manager in managers() {
+        config.ensure_node(manager, RealmNodeKind::Management);
+    }
+    let actor = Actor {
+        node_id: managers()[0],
+        user_id: user(),
+        realm_id,
+    };
+    let target = aruna_core::document::DocumentTarget::RealmConfig { realm_id };
+    let write = StorageEffect::Write {
+        key_space: target.storage_keyspace().to_string(),
+        key: target.storage_key(),
+        value: config.to_bytes(&actor).unwrap().into(),
+        txn_id: None,
+    };
+    context
         .storage_handle
-        .send_effect(read_secret(secret_entry(old), None))
+        .send_effect(Effect::Storage(write))
         .await;
-    let gone = parse_secret(event, secret_entry(old), |bytes| {
-        Ok::<_, ConversionError>(bytes.to_vec())
-    });
-    assert_eq!(gone.unwrap(), None, "the replaced secret is deleted");
-
-    act(context, WebhookAction::Remove).await.unwrap();
-    let removed = act(context, WebhookAction::Read).await.unwrap();
-    assert_eq!(removed.subscription, None);
 }
+
+/// Stores a webhook setting of `user()` with `counter`, as a local write or sync would;
+/// `None` turns the webhook off.
+async fn seed_setting(context: &DriverContext, counter: u64, url: Option<String>) {
+    let id = Ulid::generate();
+    let on = url.is_some();
+    let subscription = WebhookSubscription {
+        subscription_id: id,
+        user_id: user(),
+        stamp: RegisterStamp {
+            counter,
+            node_id: managers()[0],
+            write_id: id,
+        },
+        url,
+        sealed: on.then(|| vec![1]),
+        created_at_ms: 1,
+    };
+    let target = SettingChannel::Webhook.target(user(), id);
+    store_setting(
+        &context.storage_handle,
+        &target,
+        subscription.to_bytes().unwrap(),
+    )
+    .await;
+}
+
+fn spec() -> WebhookDeliverySpec {
+    WebhookDeliverySpec {
+        subscription_id: Ulid::nil(),
+        notification: upload(user()),
+    }
+}
+
+const HOOK: &str = "https://hooks.example.org/aruna";
 
 #[tokio::test]
 async fn refuses_unusable_urls() {
     let staging = setup_driver_context().await;
+    let context = &staging.driver_context;
+    let node = iroh::SecretKey::from_bytes(&[8; 32]).public();
     for url in [
         "ftp://example.org/x",
         "https://user:pw@example.org/x",
         "not a url",
     ] {
-        let result = act(
-            &staging.driver_context,
-            WebhookAction::Set {
-                url: url.to_string(),
-            },
-        )
-        .await;
+        let result = set_webhook(context, node, user(), url.to_string()).await;
         assert_eq!(result, Err(WebhookError::InvalidUrl), "{url}");
     }
+    // A valid subscription is one local register write, without any management node.
+    let outcome = set_webhook(context, node, user(), HOOK.to_string())
+        .await
+        .unwrap();
+    assert_eq!(outcome.secret.len(), 64);
+    assert_eq!(outcome.subscription.stamp.counter, 1);
+    let read = read_webhook(context, user()).await.unwrap();
+    assert_eq!(read, Some(outcome.subscription.clone()));
+    let replaced = set_webhook(context, node, user(), HOOK.to_string())
+        .await
+        .unwrap();
+    assert_eq!(replaced.subscription.stamp.counter, 2);
+    assert_ne!(
+        replaced.secret, outcome.secret,
+        "a new subscription gets a new secret"
+    );
+    remove_webhook(context, node, user()).await.unwrap();
+    assert_eq!(read_webhook(context, user()).await.unwrap(), None);
 }
 
 #[tokio::test]
-async fn delivers_signed_upload() {
+async fn on_setting_sends() {
     let staging = setup_driver_context().await;
+    seed_config(&staging.driver_context).await;
     let answer = Arc::new(AtomicU16::new(204));
     let (url, mut received) = receiver(answer.clone()).await;
-    let outcome = act(&staging.driver_context, WebhookAction::Set { url })
-        .await
-        .unwrap();
-    let secret = hex::decode(outcome.secret.unwrap()).unwrap();
-    let spec = WebhookDeliverySpec {
-        subscription_id: outcome.subscription.unwrap().subscription_id,
-        notification: upload(user()),
-    };
+    seed_setting(&staging.driver_context, 1, Some(url)).await;
+    let peers = opening(&SECRET);
+    let backoffs = Backoffs::default();
     let ctx = job_context(staging.driver_context.clone());
+    let spec = spec();
+    let run = || deliver_webhook(&ctx, &spec, &peers, &backoffs, NOW_MS);
 
-    let result = run_webhook_job(&ctx, &spec).await;
+    let result = run().await;
     assert!(matches!(
         result,
         JobRunOutcome::Succeeded(JobResultPayload::Webhook { status: Some(204) })
@@ -170,52 +220,90 @@ async fn delivers_signed_upload() {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(signature, sign_delivery(&secret, timestamp, &body));
+    assert_eq!(signature, sign_delivery(&SECRET, timestamp, &body));
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body, spec.body().unwrap());
 
     answer.store(500, Ordering::SeqCst);
-    let JobRunOutcome::Failed(error) = run_webhook_job(&ctx, &spec).await else {
+    let JobRunOutcome::Failed(error) = run().await else {
         panic!("a server error fails the attempt");
     };
     assert_eq!(error.kind, JobErrorKind::Retryable);
     answer.store(400, Ordering::SeqCst);
-    let JobRunOutcome::Failed(error) = run_webhook_job(&ctx, &spec).await else {
+    let JobRunOutcome::Failed(error) = run().await else {
         panic!("a client error fails the delivery");
     };
     assert_eq!(error.kind, JobErrorKind::Permanent);
 }
 
 #[tokio::test]
-async fn replaced_subscription_skips() {
-    // A delivery queued for a replaced or removed subscription sends nothing.
+async fn off_setting_skips() {
     let staging = setup_driver_context().await;
-    let (url, mut received) = receiver(Arc::new(AtomicU16::new(200))).await;
-    act(&staging.driver_context, WebhookAction::Set { url })
-        .await
-        .unwrap();
-    let spec = WebhookDeliverySpec {
-        subscription_id: Ulid::generate(),
-        notification: upload(user()),
-    };
+    seed_config(&staging.driver_context).await;
+    seed_setting(&staging.driver_context, 1, Some(HOOK.to_string())).await;
+    seed_setting(&staging.driver_context, 2, None).await;
     let ctx = job_context(staging.driver_context.clone());
-    let result = run_webhook_job(&ctx, &spec).await;
+    let (spec, peers, backoffs) = (spec(), opening(&SECRET), Backoffs::default());
+    let result = deliver_webhook(&ctx, &spec, &peers, &backoffs, NOW_MS);
+    assert!(matches!(
+        result.await,
+        JobRunOutcome::Succeeded(JobResultPayload::Webhook { status: None })
+    ));
+    assert_eq!(peers.opens.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn expired_notice_finishes() {
+    let staging = setup_driver_context().await;
+    seed_config(&staging.driver_context).await;
+    seed_setting(&staging.driver_context, 1, Some(HOOK.to_string())).await;
+    let ctx = job_context(staging.driver_context.clone());
+    let peers = opening(&SECRET);
+    let expired = spec().notification.expires_at_ms();
+    let result = deliver_webhook(&ctx, &spec(), &peers, &Backoffs::default(), expired).await;
     assert!(matches!(
         result,
         JobRunOutcome::Succeeded(JobResultPayload::Webhook { status: None })
     ));
-    assert!(received.try_recv().is_err());
+    assert_eq!(
+        peers.opens.load(Ordering::SeqCst),
+        0,
+        "an expired notice opens nothing"
+    );
 }
 
 #[tokio::test]
-async fn replacement_keeps_job() {
-    // A retry after the subscription was replaced finds the queued job instead of a conflict.
+async fn no_manager_defers() {
+    let staging = setup_driver_context().await;
+    seed_config(&staging.driver_context).await;
+    seed_setting(&staging.driver_context, 1, Some(HOOK.to_string())).await;
+    let ctx = job_context(staging.driver_context.clone());
+    let peers = CannedPeers::default();
+    let backoffs = Backoffs::default();
+    let JobRunOutcome::DeferredFor(error, delay) =
+        deliver_webhook(&ctx, &spec(), &peers, &backoffs, NOW_MS).await
+    else {
+        panic!("no manager opens the secret");
+    };
+    assert_eq!(
+        (error.kind, delay),
+        (JobErrorKind::Retryable, Duration::from_secs(30))
+    );
+    // The notice expires during the backoff, so the wait ends at the expiry.
+    let late = spec().notification.expires_at_ms() - 5_000;
+    let JobRunOutcome::DeferredFor(_, delay) =
+        deliver_webhook(&ctx, &spec(), &peers, &backoffs, late).await
+    else {
+        panic!("a failed open near the expiry defers");
+    };
+    assert_eq!(delay, Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn enqueue_always_queues() {
+    // No subscription is read at enqueue: each upload gets one job, once.
     let staging = setup_driver_context().await;
     let context = &staging.driver_context;
-    let url = "https://hooks.example.org/aruna".to_string();
-    act(context, WebhookAction::Set { url: url.clone() })
-        .await
-        .unwrap();
     let records = [upload(user())];
     let owner = iroh::SecretKey::from_bytes(&[8; 32]).public();
     enqueue_webhooks(context, owner, &records).await.unwrap();
@@ -223,12 +311,11 @@ async fn replacement_keeps_job() {
     let key = user_dedup_key(user(), &key);
     let storage = &context.storage_handle;
     let first = find_dedup_plan(storage, user(), &key, None).await.unwrap();
-    assert!(first.is_some(), "the upload is queued");
-
-    act(context, WebhookAction::Set { url }).await.unwrap();
-    enqueue_webhooks(context, owner, &records)
-        .await
-        .expect("a replaced subscription does not conflict");
+    assert!(
+        first.is_some(),
+        "the upload is queued without a subscription"
+    );
+    enqueue_webhooks(context, owner, &records).await.unwrap();
     let again = find_dedup_plan(storage, user(), &key, None).await.unwrap();
     assert_eq!(again, first);
 }

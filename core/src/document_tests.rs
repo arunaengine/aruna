@@ -673,4 +673,52 @@ fn stored_target_tags() {
         }),
         17
     );
+    let owner = UserId::new(document_id, test_realm(2));
+    assert_eq!(
+        tag(&DocumentTarget::EmailPreference {
+            owner,
+            preference_id: document_id
+        }),
+        20
+    );
+    assert_eq!(
+        tag(&DocumentTarget::WebhookSubscription {
+            owner,
+            subscription_id: document_id
+        }),
+        21
+    );
+}
+
+#[test]
+fn setting_targets_shared() {
+    // Settings ride the shared watch topic, which every infrastructure node joins.
+    let realm_id = test_realm(2);
+    let owner = UserId::new(test_ulid(10), realm_id);
+    let watch = DocumentTarget::WatchSubscription {
+        owner,
+        watch_id: test_ulid(11),
+    };
+    let email = DocumentTarget::EmailPreference {
+        owner,
+        preference_id: test_ulid(12),
+    };
+    let webhook = DocumentTarget::WebhookSubscription {
+        owner,
+        subscription_id: test_ulid(12),
+    };
+    let nil = PlacementRef::NIL;
+    for target in [&email, &webhook] {
+        assert_eq!(target.topic_id(), TopicId::realm(realm_id));
+        assert_eq!(
+            target.sync_topic_id(realm_id, &nil),
+            watch.sync_topic_id(realm_id, &nil)
+        );
+        assert!(!target.uses_shard_topic() && !target.is_admin_document());
+    }
+    assert_ne!(email.storage_keyspace(), webhook.storage_keyspace());
+    assert_ne!(
+        crate::storage_entries::sync_revision_key(&email),
+        crate::storage_entries::sync_revision_key(&webhook)
+    );
 }

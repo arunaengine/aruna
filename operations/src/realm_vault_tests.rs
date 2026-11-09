@@ -1,4 +1,5 @@
-//! Tests realm secret fetch checks, local opens, the node vault cache and its pruning.
+//! Tests realm secret fetch checks, local opens, the node vault cache and its pruning, and how
+//! management nodes store, confirm and answer notification settings.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -154,4 +155,124 @@ async fn prunes_stale_rows() {
         .await;
     let row = parse_secret(event, cache_entry(reference), |bytes| Ok(bytes.to_vec())).unwrap();
     assert_eq!(row, None);
+}
+
+mod settings {
+    use super::*;
+    use aruna_core::realm_vault::seal_setting;
+    use aruna_core::register::RegisterStamp;
+    use aruna_core::structs::execution::email::EmailPreference;
+    use std::collections::BTreeSet;
+
+    const ADDRESS: &[u8] = b"ada@example.org";
+
+    fn realm_key() -> SigningKey {
+        SigningKey::from_bytes(&[5u8; 32])
+    }
+
+    /// Node 1 manages, nodes 2 and 4 serve, node 3 is a device; the realm id is the realm key.
+    fn config() -> RealmConfigDocument {
+        let realm_id = RealmId::from_bytes(realm_key().verifying_key().to_bytes());
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        config.ensure_node(node(1), RealmNodeKind::Management);
+        config.ensure_node(node(2), RealmNodeKind::Server);
+        let owner = UserId::nil(realm_id);
+        config.ensure_node(node(3), RealmNodeKind::User { owner });
+        config.ensure_node(node(4), RealmNodeKind::Server);
+        config
+    }
+
+    fn owner() -> UserId {
+        UserId::local(Ulid::from_bytes([6u8; 16]), config().realm_id)
+    }
+
+    /// An email setting of `owner()` written by node 2; on settings seal the address.
+    fn email(id: u8, on: bool) -> (DocumentTarget, Vec<u8>) {
+        let id = Ulid::from_bytes([id; 16]);
+        let secret = SecretBytes::new(ADDRESS.to_vec());
+        let sealed = on.then(|| {
+            seal_setting(
+                &config().realm_id,
+                SettingChannel::Email,
+                &owner(),
+                id,
+                &secret,
+            )
+            .unwrap()
+        });
+        let categories = match on {
+            true => BTreeSet::from(["share.upload".to_string()]),
+            false => BTreeSet::new(),
+        };
+        let preference = EmailPreference {
+            preference_id: id,
+            user_id: owner(),
+            stamp: RegisterStamp {
+                counter: 1,
+                node_id: node(2),
+                write_id: id,
+            },
+            categories,
+            sealed,
+            created_at_ms: 1,
+        };
+        let target = SettingChannel::Email.target(owner(), id);
+        (target, preference.to_bytes().unwrap())
+    }
+
+    fn open(
+        peer: NodeId,
+        setting: &(DocumentTarget, Vec<u8>),
+    ) -> Result<SecretBytes, MetadataReadError> {
+        let key = RealmSealKey::derive(&realm_key());
+        open_setting(&key, &config(), peer, &setting.0, &setting.1)
+    }
+
+    #[test]
+    fn open_returns_secret() {
+        let setting = email(1, true);
+        for peer in [node(1), node(2), node(4)] {
+            assert_eq!(open(peer, &setting).unwrap().expose(), ADDRESS);
+        }
+    }
+
+    #[test]
+    fn open_refuses_device() {
+        let setting = email(1, true);
+        for peer in [node(3), node(9)] {
+            assert_eq!(
+                open(peer, &setting).err(),
+                Some(MetadataReadError::Forbidden)
+            );
+        }
+    }
+
+    #[test]
+    fn open_checks_document() {
+        // The sealed secret is bound to its target, so it opens only under the original one.
+        let (_, bytes) = email(1, true);
+        let moved = (
+            SettingChannel::Email.target(owner(), Ulid::from_bytes([2; 16])),
+            bytes,
+        );
+        assert_eq!(
+            open(node(2), &moved).err(),
+            Some(MetadataReadError::Forbidden)
+        );
+        let broken = (email(1, true).0, vec![1, 2]);
+        assert_eq!(
+            open(node(2), &broken).err(),
+            Some(MetadataReadError::Forbidden)
+        );
+        let off = email(1, false);
+        assert_eq!(open(node(2), &off).err(), Some(MetadataReadError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn open_needs_key() {
+        let (_dir, context) = context();
+        let (target, bytes) = email(1, true);
+        let served = serve_open(&context, None, node(2), target, bytes);
+        assert_eq!(served.await.err(), Some(MetadataReadError::Unavailable));
+    }
 }

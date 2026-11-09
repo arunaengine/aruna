@@ -4,10 +4,12 @@
 
 use crate::UserId;
 use crate::compute::SecretBytes;
+use crate::key_seal::{SealedSecret, open_sealed, seal_to};
+use crate::structs::execution::setting::SettingChannel;
 use crate::structs::identity::realm::{RealmId, RealmNodeKind};
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Nonce, Payload};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use subtle::ConstantTimeEq;
@@ -16,6 +18,7 @@ use ulid::Ulid;
 use zeroize::Zeroize;
 
 const KEY_CONTEXT: &str = "aruna realm vault v1";
+const SEAL_INFO: &[u8] = b"aruna notification setting v1";
 const NONCE_LEN: usize = 12;
 
 /// What a realm vault record is for. Its tag is part of the record key; new purposes append tags.
@@ -207,6 +210,93 @@ impl Drop for RealmVaultKey {
     }
 }
 
+/// X25519 private key of the realm, the scalar of the realm signing key. Only management nodes
+/// hold it; it opens the sealed parts of notification settings.
+#[derive(Clone)]
+pub struct RealmSealKey([u8; 32]);
+
+impl RealmSealKey {
+    pub fn derive(realm_key: &SigningKey) -> Self {
+        Self(realm_key.to_scalar_bytes())
+    }
+
+    /// Opens what [`seal_setting`] sealed for the same realm, channel, owner and document id.
+    pub fn open(
+        &self,
+        realm_id: &RealmId,
+        channel: SettingChannel,
+        owner: &UserId,
+        id: Ulid,
+        sealed: &[u8],
+    ) -> Result<SecretBytes, RealmVaultError> {
+        let (enc, ciphertext) = sealed
+            .split_first_chunk::<32>()
+            .ok_or(RealmVaultError::Open)?;
+        let sealed = SealedSecret {
+            enc: *enc,
+            ciphertext: ciphertext.to_vec(),
+        };
+        let aad = setting_associated(realm_id, channel, owner, id);
+        open_sealed(&self.0, &sealed, SEAL_INFO, &aad)
+            .map(|plain| SecretBytes::new(plain.to_vec()))
+            .map_err(|_| RealmVaultError::Open)
+    }
+}
+
+/// Seals `secret` as `enc || ciphertext` to the Montgomery form of the realm id, so any node
+/// seals and only holders of the realm signing key open.
+pub fn seal_setting(
+    realm_id: &RealmId,
+    channel: SettingChannel,
+    owner: &UserId,
+    id: Ulid,
+    secret: &SecretBytes,
+) -> Result<Vec<u8>, RealmVaultError> {
+    let public = VerifyingKey::from_bytes(realm_id.as_bytes())
+        .map_err(|_| RealmVaultError::Seal)?
+        .to_montgomery()
+        .to_bytes();
+    let aad = setting_associated(realm_id, channel, owner, id);
+    let sealed =
+        seal_to(&public, SEAL_INFO, &aad, secret.expose()).map_err(|_| RealmVaultError::Seal)?;
+    Ok([sealed.enc.as_slice(), &sealed.ciphertext].concat())
+}
+
+fn setting_associated(
+    realm_id: &RealmId,
+    channel: SettingChannel,
+    owner: &UserId,
+    id: Ulid,
+) -> Vec<u8> {
+    [
+        realm_id.as_bytes().as_slice(),
+        &[channel.tag()],
+        &owner.to_bytes(),
+        &id.to_bytes(),
+    ]
+    .concat()
+}
+
+impl fmt::Debug for RealmSealKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RealmSealKey(***)")
+    }
+}
+
+impl PartialEq for RealmSealKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ct_eq(&other.0).into()
+    }
+}
+
+impl Eq for RealmSealKey {}
+
+impl Drop for RealmSealKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RealmVaultError {
     #[error("realm vault record could not be sealed")]
@@ -290,6 +380,53 @@ mod tests {
         let shown = format!("{sealed:?}");
         assert!(shown.contains(&format!("sealed_len: {}", sealed.sealed.len())));
         assert!(!shown.contains(&format!("{:?}", sealed.sealed)));
+    }
+
+    fn sealed_setting(owner: &UserId, id: Ulid) -> (SigningKey, RealmId, Vec<u8>) {
+        let realm_key = SigningKey::from_bytes(&[7u8; 32]);
+        let realm_id = RealmId::from_bytes(realm_key.verifying_key().to_bytes());
+        let secret = SecretBytes::new(CANARY.to_vec());
+        let sealed = seal_setting(&realm_id, SettingChannel::Email, owner, id, &secret).unwrap();
+        (realm_key, realm_id, sealed)
+    }
+
+    #[test]
+    fn seal_key_matches() {
+        let owner = UserId::local(Ulid::from_bytes([4u8; 16]), RealmId::from_bytes([1u8; 32]));
+        let id = Ulid::from_bytes([2u8; 16]);
+        let (realm_key, realm_id, sealed) = sealed_setting(&owner, id);
+        assert!(!sealed.windows(CANARY.len()).any(|window| window == CANARY));
+        let key = RealmSealKey::derive(&realm_key);
+        let opened = key.open(&realm_id, SettingChannel::Email, &owner, id, &sealed);
+        assert_eq!(opened.unwrap().expose(), CANARY);
+        let other = RealmSealKey::derive(&SigningKey::from_bytes(&[8u8; 32]));
+        let refused = other.open(&realm_id, SettingChannel::Email, &owner, id, &sealed);
+        assert_eq!(refused.err(), Some(RealmVaultError::Open));
+        assert_eq!(format!("{key:?}"), "RealmSealKey(***)");
+    }
+
+    #[test]
+    fn seal_binds_owner() {
+        let owner = UserId::local(Ulid::from_bytes([4u8; 16]), RealmId::from_bytes([1u8; 32]));
+        let id = Ulid::from_bytes([2u8; 16]);
+        let (realm_key, realm_id, sealed) = sealed_setting(&owner, id);
+        let key = RealmSealKey::derive(&realm_key);
+        let stranger = UserId::local(Ulid::from_bytes([5u8; 16]), owner.realm_id);
+        let other_realm = RealmId::from_bytes([9u8; 32]);
+        let refused = [
+            key.open(&realm_id, SettingChannel::Email, &stranger, id, &sealed),
+            key.open(
+                &realm_id,
+                SettingChannel::Email,
+                &owner,
+                Ulid::nil(),
+                &sealed,
+            ),
+            key.open(&realm_id, SettingChannel::Webhook, &owner, id, &sealed),
+            key.open(&other_realm, SettingChannel::Email, &owner, id, &sealed),
+            key.open(&realm_id, SettingChannel::Email, &owner, id, &sealed[..20]),
+        ];
+        assert!(refused.iter().all(|opened| opened.is_err()));
     }
 
     #[test]

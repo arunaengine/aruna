@@ -1,4 +1,4 @@
-//! Defines a user's email notification opt-in, the delivery job of one notice and its text.
+//! Defines a user's email notification setting, the delivery job of one notice and its text.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,17 +10,23 @@ use ulid::Ulid;
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::realm_vault::{RealmSecretRef, RealmVaultPurpose};
+use crate::register::RegisterStamp;
 use crate::structs::execution::notification::NotificationRecord;
 
 /// The notification categories a user may receive by email.
 pub const EMAIL_CATEGORIES: &[&str] = &["group.membership", "share.upload", "bucket.encryption"];
 
-/// One opt-in. The address itself is sealed in the node vault under `preference_id`.
+/// One immutable write of a user's email setting register, replicated in the realm topic.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailPreference {
     pub preference_id: Ulid,
     pub user_id: UserId,
+    /// The register order; its write id is `preference_id`.
+    pub stamp: RegisterStamp,
+    /// Empty when email is off.
     pub categories: BTreeSet<String>,
+    /// The address sealed to the realm key; `None` turns email off.
+    pub sealed: Option<Vec<u8>>,
     pub created_at_ms: u64,
 }
 
@@ -36,10 +42,6 @@ impl EmailPreference {
     pub fn wants(&self, record: &NotificationRecord) -> bool {
         self.categories.contains(record.kind.category())
     }
-}
-
-pub fn email_key(user_id: &UserId) -> Vec<u8> {
-    user_id.to_bytes()
 }
 
 /// How a connection to the mail server is secured.
@@ -83,7 +85,8 @@ impl RealmEmailProfile {
     }
 }
 
-/// One email for one notification to the address of `preference_id`.
+/// One email for one notification; the job reads the current setting when it runs, so
+/// `preference_id` is nil.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmailDeliverySpec {
     pub preference_id: Ulid,
@@ -144,7 +147,13 @@ mod tests {
         let preference = EmailPreference {
             preference_id: Ulid::from_parts(2, 2),
             user_id: record.recipient,
+            stamp: RegisterStamp {
+                counter: 1,
+                node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+                write_id: Ulid::from_parts(2, 2),
+            },
             categories: BTreeSet::from(["group.membership".to_string()]),
+            sealed: Some(vec![1]),
             created_at_ms: 1,
         };
         assert!(!preference.wants(&record));

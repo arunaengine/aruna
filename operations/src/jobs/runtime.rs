@@ -792,6 +792,15 @@ async fn run_job(
                 warn!(job_id = %job_id, error = %error, "Failed to defer job");
             }
         }
+        SuperviseResult::Outcome(JobRunOutcome::DeferredFor(error, delay)) => {
+            let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+            let now = unix_timestamp_millis();
+            if let Err(error) = defer_job(storage, job_id, token, now, delay_ms, error).await
+                && !matches!(error, JobMutationError::TokenMismatch)
+            {
+                warn!(job_id = %job_id, error = %error, "Failed to defer job");
+            }
+        }
         SuperviseResult::Outcome(JobRunOutcome::Cancelled) => {
             let terminal = retry_terminal(|| {
                 cancel_running_job(storage, job_id, token, unix_timestamp_millis())
@@ -1958,6 +1967,57 @@ mod tests {
 
         runtime.finish(&ctx, job_id, survivor).await;
         assert_eq!(runtime.running_count(), 0);
+    }
+
+    // A delivery that cannot read a quorum waits for its delay without spending an attempt.
+    #[tokio::test]
+    async fn deferred_for_delay() {
+        use aruna_core::structs::execution::notification::{
+            NotificationClass, NotificationKind, NotificationRecord,
+        };
+        use aruna_core::structs::execution::webhook::WebhookDeliverySpec;
+        let (_dir, storage) = temp_storage();
+        let runtime = JobsRuntime::new();
+        let job_id = JobId::from_bytes([0x6D; 16]);
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let kind = NotificationKind::ShareUpload {
+            share_id: Ulid::from_bytes([3u8; 16]),
+            node_id: node_id(7),
+            group_id: Ulid::from_bytes([4u8; 16]),
+            bucket: "inbox".to_string(),
+            key: "a.csv".to_string(),
+            size_bytes: 1,
+        };
+        let now = unix_timestamp_millis();
+        let notification = NotificationRecord::new(owner, NotificationClass::Direct, kind, now);
+        let payload = JobPayload::WebhookDelivery(WebhookDeliverySpec {
+            subscription_id: Ulid::nil(),
+            notification,
+        });
+        let record = JobRecord::new(job_id, payload, owner, node_id(7), 1, 1, None);
+        let claimed = claim(&storage, record).await;
+        let attempts = claimed.attempts;
+
+        runtime.spawn(context(storage.clone()), claimed);
+        let mut finished = runtime.state().running[&job_id].completion.subscribe();
+        tokio::time::timeout(Duration::from_secs(60), finished.wait_for(|done| *done))
+            .await
+            .expect("delivery finishes its attempt")
+            .unwrap();
+        let stored = read_job_record(&storage, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (stored.state, stored.attempts),
+            (JobState::Queued, attempts)
+        );
+        assert!(stored.claim.is_none());
+        assert!(
+            stored.due_at_ms >= now + 30_000,
+            "the job waits for its delay"
+        );
+        assert!(stored.last_error.is_some());
     }
 
     // The node telemetry counts a job from its spawn until its finish, imports apart.

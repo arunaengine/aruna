@@ -2286,7 +2286,7 @@ fn run_name(result: Result<JobRunOutcome, tokio::task::JoinError>) -> &'static s
     match result {
         Ok(JobRunOutcome::Succeeded(_)) => "succeeded",
         Ok(JobRunOutcome::Failed(_)) => "failed",
-        Ok(JobRunOutcome::Deferred(_)) => "deferred",
+        Ok(JobRunOutcome::Deferred(_) | JobRunOutcome::DeferredFor(..)) => "deferred",
         Ok(JobRunOutcome::Cancelled) => "cancelled",
         Ok(JobRunOutcome::Interrupted) => "interrupted",
         Ok(JobRunOutcome::AwaitingKey(_)) => "awaiting key",

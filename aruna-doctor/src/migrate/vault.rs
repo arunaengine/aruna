@@ -40,10 +40,7 @@ pub(super) fn vault_rows(
         VaultPurpose::SourceConnector => SourceConnectorSecret::from_bytes(value).is_ok(),
         VaultPurpose::GroupBackend => GroupStorageSecret::from_bytes(value).is_ok(),
         // These secrets were never stored outside the node vault.
-        VaultPurpose::BucketKey
-        | VaultPurpose::Webhook
-        | VaultPurpose::EmailAddress
-        | VaultPurpose::RealmSecret => false,
+        VaultPurpose::BucketKey | VaultPurpose::RealmSecret => false,
     };
     let mut moves = Moves {
         scanned: 0,
