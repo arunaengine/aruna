@@ -1197,6 +1197,16 @@ impl MetadataHandle {
                 let result = Box::pin(served).await;
                 (MetadataTransportMessage::OpenSettingResult { result }, None)
             }
+            MetadataTransportMessage::StoreArtifact { artifact } => {
+                let stored = crate::plugins::artifacts::serve_store(context, peer, artifact);
+                let result = Box::pin(stored).await;
+                (MetadataTransportMessage::ArtifactStored { result }, None)
+            }
+            MetadataTransportMessage::FetchArtifact { digest } => {
+                let fetched = crate::plugins::artifacts::serve_fetch(context, peer, digest);
+                let result = Box::pin(fetched).await;
+                (MetadataTransportMessage::FetchedArtifact { result }, None)
+            }
             MetadataTransportMessage::PromotionCheck => {
                 let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
                 let result = Box::pin(ready).await;

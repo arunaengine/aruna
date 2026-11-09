@@ -536,6 +536,10 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::RealmSecretResult { .. } => "realm_secret_result",
         MetadataTransportMessage::OpenSetting { .. } => "open_setting",
         MetadataTransportMessage::OpenSettingResult { .. } => "open_setting_result",
+        MetadataTransportMessage::StoreArtifact { .. } => "store_artifact",
+        MetadataTransportMessage::ArtifactStored { .. } => "artifact_stored",
+        MetadataTransportMessage::FetchArtifact { .. } => "fetch_artifact",
+        MetadataTransportMessage::FetchedArtifact { .. } => "fetched_artifact",
     }
 }
 
@@ -766,6 +770,38 @@ impl MetadataHandle {
             .map_err(|_| MetadataReadError::Unavailable)?
         {
             MetadataTransportMessage::RealmSecretResult { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// Asks the management node `node_id` to keep a plugin artifact durably before publishing.
+    pub async fn request_store_artifact(
+        &self,
+        node_id: NodeId,
+        artifact: crate::plugins::ArtifactBytes,
+    ) -> Result<(), MetadataReadError> {
+        let request = MetadataTransportMessage::StoreArtifact { artifact };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::ArtifactStored { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// A published plugin artifact by digest from the management node `node_id`, unchecked.
+    pub async fn request_artifact(
+        &self,
+        node_id: NodeId,
+        digest: String,
+    ) -> Result<crate::plugins::ArtifactBytes, MetadataReadError> {
+        let request = MetadataTransportMessage::FetchArtifact { digest };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::FetchedArtifact { result } => result,
             _ => Err(MetadataReadError::Unavailable),
         }
     }
