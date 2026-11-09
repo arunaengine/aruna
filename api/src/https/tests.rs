@@ -990,3 +990,215 @@ async fn redirect_listener_stops() {
         .expect("no panic")
         .expect("no I/O error");
 }
+
+/// One S3 server serving plain and TLS connections from the same accept loop.
+struct S3Stack {
+    https: SocketAddr,
+    plain: SocketAddr,
+    ca: String,
+    _files: Files,
+    _storage: tempfile::TempDir,
+    _front: HttpsHandle,
+    _shutdown: tokio_util::sync::DropGuard,
+}
+
+async fn s3_stack(
+    configure: impl FnOnce(crate::s3::server::S3Server) -> crate::s3::server::S3Server,
+) -> S3Stack {
+    use aruna_core::credential_encryption::CredentialEncryptionKey;
+    use aruna_core::structs::identity::realm::RealmId;
+
+    let storage = tempfile::tempdir().expect("temp dir");
+    let store_path = storage.path().to_str().expect("utf8 path");
+    let driver_ctx = Arc::new(aruna_operations::driver::DriverContext {
+        storage_handle: aruna_storage::FjallStorage::open(store_path).expect("storage"),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    });
+    let server = crate::s3::server::S3Server::new(
+        "127.0.0.1:0",
+        "s3.test",
+        driver_ctx,
+        RealmId([6u8; 32]),
+        iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+        CredentialEncryptionKey::random(),
+        Default::default(),
+        crate::cors::CorsConfig::default(),
+        Arc::new(aruna_core::metrics::NodeMetrics::new()),
+    )
+    .await
+    .expect("S3 server builds");
+    let root = Authority::root();
+    let (certificate, key) = pair(&root);
+    let files = Files::new(&certificate, &key, &root.pem);
+    let store = Arc::new(files.store(UnixTime::now()).expect("store loads"));
+    let shutdown = CancellationToken::new();
+    let (sender, routed) =
+        RoutedListener::channel(HostCheck::new(store.routes().clone(), HostRoute::S3));
+    let plain = TcpListener::bind("127.0.0.1:0").await.expect("plain port");
+    let plain_address = plain.local_addr().expect("plain address");
+    let (_, s3_handle) = configure(server)
+        .run_with_listener(CombinedListener::new(plain, Some(routed)), shutdown.clone())
+        .expect("S3 runs");
+    // The S3 handle owns the connection children; dropping it detaches them for the test.
+    drop(s3_handle);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("HTTPS port");
+    let https = listener.local_addr().expect("HTTPS address");
+    let front = HttpsHandle::spawn(
+        listener,
+        store,
+        HashMap::from([(HostRoute::S3, sender)]),
+        shutdown.clone(),
+    )
+    .expect("front starts");
+    S3Stack {
+        https,
+        plain: plain_address,
+        ca: root.pem,
+        _files: files,
+        _storage: storage,
+        _front: front,
+        _shutdown: shutdown.drop_guard(),
+    }
+}
+
+async fn s3_tls(stack: &S3Stack, name: &str) -> ClientStream<TcpStream> {
+    connect(
+        stack.https,
+        dns(name),
+        client_config(&stack.ca, &[b"http/1.1"]),
+    )
+    .await
+    .expect("S3 TLS connection")
+}
+
+#[tokio::test]
+async fn s3_checks_host() {
+    let stack = s3_stack(|server| server).await;
+    let stream = s3_tls(&stack, "s3.test").await;
+    let (status, _) = get_h1(stream, "api.test", "/bucket/key").await;
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+    for host in ["s3.test", "bucket.s3.test"] {
+        let stream = s3_tls(&stack, "s3.test").await;
+        let (status, _) = get_h1(stream, host, "/bucket/key").await;
+        assert_ne!(status, StatusCode::MISDIRECTED_REQUEST, "{host}");
+    }
+}
+
+#[tokio::test]
+async fn s3_shares_connections() {
+    // One connection permit: a held TLS connection makes a plain one be
+    // dropped, and closing the TLS connection releases the permit again.
+    let stack = s3_stack(|server| server.with_concurrency_limits(1, 64)).await;
+    let held = hold_h1(s3_tls(&stack, "s3.test").await).await;
+    let refused = TcpStream::connect(stack.plain).await.expect("plain client");
+    closed(refused).await;
+    drop(held);
+    let mut served = false;
+    for _ in 0..50 {
+        let stream = TcpStream::connect(stack.plain).await.expect("plain client");
+        if let Some(held) = try_hold(stream).await {
+            served = true;
+            // Held again, now over plain: a TLS connection is dropped.
+            let refused = s3_tls(&stack, "s3.test").await;
+            closed(refused).await;
+            drop(held);
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(served, "the released permit admits a plain connection");
+}
+
+#[tokio::test]
+async fn s3_shares_quota() {
+    // The per-IP quota is one bucket for both transports: a burst of one spent
+    // over TLS refuses the next plain request.
+    let stack = s3_stack(|server| {
+        server
+            .with_rate_limits(crate::rate_limit::ApiRateLimits::new(1, 1, 60, 60))
+            .expect("rate limits")
+    })
+    .await;
+    let (first, _) = get_h1(s3_tls(&stack, "s3.test").await, "s3.test", "/bucket/key").await;
+    assert_ne!(first, StatusCode::SERVICE_UNAVAILABLE);
+    let plain = TcpStream::connect(stack.plain).await.expect("plain client");
+    let (second, body) = get_h1(plain, "s3.test", "/bucket/key").await;
+    assert_eq!(second, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.contains("SlowDown"));
+}
+
+#[tokio::test]
+async fn s3_tls_deadlines() {
+    use tokio::io::AsyncWriteExt;
+
+    // A header that never ends is closed at the initial-request deadline.
+    let stack = s3_stack(|server| {
+        server.with_timeouts(crate::s3::server::S3ServerTimeouts {
+            initial_request: Duration::from_millis(300),
+            connection_idle: Duration::from_secs(300),
+            stream_lifetime: Duration::from_secs(300),
+        })
+    })
+    .await;
+    let mut partial = s3_tls(&stack, "s3.test").await;
+    partial
+        .write_all(b"GET /bucket/key HTTP/1.1\r\nHost: s3.test\r\n")
+        .await
+        .expect("partial header");
+    closed(partial).await;
+
+    // A kept-alive connection without a next request is closed when idle.
+    let stack = s3_stack(|server| {
+        server.with_timeouts(crate::s3::server::S3ServerTimeouts {
+            initial_request: Duration::from_secs(300),
+            connection_idle: Duration::from_millis(300),
+            stream_lifetime: Duration::from_secs(300),
+        })
+    })
+    .await;
+    let mut idle = s3_tls(&stack, "s3.test").await;
+    idle.write_all(b"GET /bucket/key HTTP/1.1\r\nHost: s3.test\r\n\r\n")
+        .await
+        .expect("request");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), idle.read_to_end(&mut response))
+        .await
+        .expect("the idle connection must close")
+        .ok();
+    assert!(
+        response.starts_with(b"HTTP/1.1 "),
+        "the request was answered before the idle close"
+    );
+}
+
+/// A connection that answered one request, so the server has accepted it and
+/// holds its permit until the returned sender is dropped.
+async fn hold_h1(
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+) -> hyper::client::conn::http1::SendRequest<Body> {
+    try_hold(stream)
+        .await
+        .expect("the server answers the held connection")
+}
+
+async fn try_hold(
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+) -> Option<hyper::client::conn::http1::SendRequest<Body>> {
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .ok()?;
+    tokio::spawn(connection);
+    let request = http::Request::get("/bucket/key")
+        .header(http::header::HOST, "s3.test")
+        .body(Body::empty())
+        .ok()?;
+    let response = sender.send_request(request).await.ok()?;
+    axum::body::to_bytes(Body::new(response.into_body()), 1 << 20)
+        .await
+        .ok()?;
+    Some(sender)
+}
