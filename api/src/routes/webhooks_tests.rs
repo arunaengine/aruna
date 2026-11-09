@@ -1,5 +1,5 @@
-//! Tests that webhook routes show only the caller's confirmed subscription, never its secret,
-//! and refuse writes without a management quorum.
+//! Tests that webhook routes show only the caller's current subscription, never its secret,
+//! and store changes on the answering node.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -57,7 +57,11 @@ async fn get_hides_secret() {
     let subscription = WebhookSubscription {
         subscription_id: Ulid::from_parts(1, 1),
         user_id: owner.user_id,
-        version: 1,
+        stamp: aruna_core::register::RegisterStamp {
+            counter: 1,
+            node_id,
+            write_id: Ulid::from_parts(1, 1),
+        },
         url: Some("https://hooks.example.org/aruna".to_string()),
         sealed: Some(b"sealed-canary".to_vec()),
         created_at_ms: 1,
@@ -106,12 +110,11 @@ async fn get_hides_secret() {
     )
     .await;
     assert!(matches!(invalid, Err(ServerError::BadRequestReason(_))));
-    // This node is the only manager but holds no realm key in the test, so no quorum answers.
+    // Removing is a newer local register write.
     let removed = delete_webhook(State(state.clone()), Extension(Some(owner.clone()))).await;
-    assert!(matches!(
-        removed,
-        Err(ServerError::ServiceUnavailableReason(_))
-    ));
+    assert_eq!(removed.unwrap(), StatusCode::NO_CONTENT);
+    let gone = get_webhook(State(state.clone()), Extension(Some(owner.clone()))).await;
+    assert!(matches!(gone, Err(ServerError::NotFound)));
 }
 
 #[tokio::test]

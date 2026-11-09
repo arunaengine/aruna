@@ -61,9 +61,8 @@ pub struct WebhookResponse {
 subscription is read.
 
 **Behavior**
-- The subscription is a replicated realm setting. This node shows the newest confirmed setting
-  it received so far; a node that has not received a recent change yet shows the previous one.
-  Deliveries always decide from most management nodes.
+- The subscription is a replicated realm setting. This node shows the current setting it
+  received so far; a node that has not received a recent change yet shows the previous one.
 
 **Errors**
 - 409 on a user device, which keeps no notification settings.
@@ -118,21 +117,18 @@ the caller.
 - The URL is checked against the node's egress rules at delivery, like other outbound requests.
 - The subscription is a replicated realm setting, so it keeps working when the caller's inbox
   moves to another node. Setting a webhook replaces the previous one and its secret. Each
-  delivery reads the setting from most management nodes when it runs, so queued deliveries
-  use the newest subscription.
+  delivery reads the setting when it runs, so queued deliveries use the current subscription.
 - The secret is returned only here. It is sealed to the realm key, which only management nodes
   hold.
-- A 200 means most management nodes confirmed the subscription, and it decides every later
-  delivery.
-- A 503 is an unknown outcome: the change may still take effect. A retry or a GET shows the
-  result.
-- The order in which overlapping requests complete does not order them: a DELETE that overlaps
-  a retried PUT can return 204 while that PUT's newer version wins. A DELETE started after the
-  failed PUT completed always wins.
+- A 200 means this node stored the subscription. It reaches the other nodes through
+  replication, so a node that has not received it yet still decides from the previous setting.
+- The last write wins: a change made on this node after it saw another change replaces it.
+  Two changes made on different nodes at about the same time both answer 200, and one of them
+  is kept on every node.
 
 **Errors**
 - 409 on a user device.
-- 503 when the realm configuration cannot be read now, or too few management nodes answered."#,
+- 503 when the realm configuration cannot be read now."#,
     request_body(content = WebhookRequest, example = json!({"url": "https://hooks.example.org/aruna"})),
     responses(
         (status = 200, description = "The new subscription with its secret", body = WebhookResponse, example = json!({
@@ -146,7 +142,7 @@ the caller.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
-        (status = 503, description = "Unknown outcome: the configuration cannot be read or too few management nodes answered; retry or read", body = ErrorResponse)
+        (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -174,20 +170,20 @@ pub async fn set_webhook(
 **Authentication**: realm bearer token without path restrictions.
 
 **Behavior**
-- A 204 means most management nodes confirmed the change; queued deliveries send nothing
-  afterwards. Removing a missing webhook succeeds too.
-- A 503 is an unknown outcome: the change may still take effect. A retry or a GET shows the
-  result.
+- A 204 means this node stored the change. Queued deliveries send nothing once a node has
+  received it; a node that has not received it yet still decides from the previous setting.
+  Removing a missing webhook succeeds too.
+- The last write wins, as for setting a webhook.
 
 **Errors**
 - 409 on a user device.
-- 503 when the realm configuration cannot be read now, or too few management nodes answered."#,
+- 503 when the realm configuration cannot be read now."#,
     responses(
-        (status = 204, description = "Most management nodes confirmed that the webhook is off"),
+        (status = 204, description = "This node stored that the webhook is off"),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
-        (status = 503, description = "Unknown outcome: the configuration cannot be read or too few management nodes answered; retry or read", body = ErrorResponse)
+        (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

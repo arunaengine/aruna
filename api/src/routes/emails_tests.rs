@@ -1,5 +1,5 @@
-//! Tests that email opt-ins need a realm profile, a verified address and a management quorum,
-//! and never show the address.
+//! Tests that email opt-ins need a realm profile and a verified address, are stored on the
+//! answering node, and never show the address.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,6 +10,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::USER_KEYSPACE;
+use aruna_core::register::{RegisterError, RegisterStamp};
 use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
@@ -130,8 +131,8 @@ async fn route_needs_verification() {
 }
 
 #[tokio::test]
-async fn short_quorum_unavailable() {
-    // The only manager is this node without its realm key, so no write reaches a quorum.
+async fn write_stores_locally() {
+    // A write is one local register write; no management node takes part.
     let (_dir, state, actor, auth) = management_state().await;
     store_config(&state.get_ctx(), &actor, true).await;
     let set = set_email(
@@ -139,25 +140,27 @@ async fn short_quorum_unavailable() {
         Extension(auth.clone()),
         request("ada@example.org"),
     );
-    assert!(matches!(
-        set.await,
-        Err(ServerError::ServiceUnavailableReason(_))
-    ));
+    let Json(created) = set.await.unwrap();
+    let Json(read) = get_email(State(state.clone()), Extension(auth.clone()))
+        .await
+        .unwrap();
+    assert_eq!(read, created);
+    assert!(!serde_json::to_string(&read).unwrap().contains("ada@"));
     let removed = delete_email(State(state.clone()), Extension(auth.clone())).await;
-    assert!(matches!(
-        removed,
-        Err(ServerError::ServiceUnavailableReason(_))
-    ));
+    assert_eq!(removed.unwrap(), StatusCode::NO_CONTENT);
     let read = get_email(State(state), Extension(auth)).await;
     assert!(matches!(read, Err(ServerError::NotFound)));
 }
 
 #[test]
-fn storage_error_unavailable() {
+fn storage_error_internal() {
+    // A failed local batch stored nothing, so the outcome is known.
     let stored = setting_error(SettingError::Storage("journal".into()));
-    assert!(matches!(stored, ServerError::ServiceUnavailableReason(_)));
+    assert!(matches!(stored, ServerError::InternalError(_)));
     let built = setting_error(SettingError::Build("encode".into()));
     assert!(matches!(built, ServerError::InternalError(_)));
+    let full = setting_error(SettingError::Register(RegisterError::CounterLimit));
+    assert!(matches!(full, ServerError::Conflict(_)));
 }
 
 #[tokio::test]
@@ -211,23 +214,27 @@ async fn device_node_refuses() {
 }
 
 #[tokio::test]
-async fn get_shows_confirmed() {
-    // GET shows the newest confirmed setting this node holds, never its sealed address.
+async fn get_shows_current() {
+    // GET shows the write with the highest stamp this node holds, never its sealed address.
     let (_dir, state, actor, auth) = management_state().await;
     let context = state.get_ctx();
     store_config(&context, &actor, true).await;
-    for (version, on) in [(1, true), (2, false), (3, true)] {
-        let id = Ulid::from_parts(version, 1);
+    for (counter, on) in [(1, true), (2, false), (3, true)] {
+        let id = Ulid::from_parts(counter, 1);
         let preference = EmailPreference {
             preference_id: id,
             user_id: actor.user_id,
-            version,
+            stamp: RegisterStamp {
+                counter,
+                node_id: actor.node_id,
+                write_id: id,
+            },
             categories: match on {
                 true => BTreeSet::from(["share.upload".to_string()]),
                 false => BTreeSet::new(),
             },
             sealed: on.then(|| b"sealed-canary".to_vec()),
-            created_at_ms: version,
+            created_at_ms: counter,
         };
         let target = SettingChannel::Email.target(actor.user_id, id);
         let write = StorageEffect::Write {

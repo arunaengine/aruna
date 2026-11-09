@@ -62,9 +62,8 @@ pub struct EmailResponse {
 is read, and its address is never returned.
 
 **Behavior**
-- The opt-in is a replicated realm setting. This node shows the newest confirmed setting it
-  received so far; a node that has not received a recent change yet shows the previous one.
-  Deliveries always decide from most management nodes.
+- The opt-in is a replicated realm setting. This node shows the current setting it received so
+  far; a node that has not received a recent change yet shows the previous one.
 
 **Errors**
 - 409 on a user device, which keeps no notification settings.
@@ -112,19 +111,18 @@ caller.
 - The opt-in is a replicated realm setting, so it keeps working when the caller's inbox moves
   to another node. The address is sealed to the realm key, which only management nodes hold,
   and is never returned or logged.
-- A 200 means most management nodes confirmed the opt-in, and it decides every later delivery.
-- A 503 is an unknown outcome: the change may still take effect. A retry or a GET shows the
-  result.
-- The order in which overlapping requests complete does not order them: a DELETE that overlaps
-  a retried PUT can return 204 while that PUT's newer version wins. A DELETE started after the
-  failed PUT completed always wins.
+- A 200 means this node stored the opt-in. It reaches the other nodes through replication, so
+  a node that has not received it yet still decides from the previous setting.
+- The last write wins: a change made on this node after it saw another change replaces it.
+  Two changes made on different nodes at about the same time both answer 200, and one of them
+  is kept on every node.
 - Each email is a job of the caller with a bounded number of retries. Its `Message-ID` stays the
-  same across retries, so mail systems can drop repeats. Each job reads the setting from most
-  management nodes when it runs, so a later change applies to queued emails too.
+  same across retries, so mail systems can drop repeats. Each job reads the setting when it
+  runs, so a later change applies to queued emails too.
 
 **Errors**
 - 409 when the realm sends no email, or on a user device.
-- 503 when the realm configuration cannot be read now, or too few management nodes answered."#,
+- 503 when the realm configuration cannot be read now."#,
     request_body(content = EmailRequest, example = json!({
         "address": "ada@example.org",
         "categories": ["share.upload", "group.membership"]
@@ -138,7 +136,7 @@ caller.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "The realm sends no email, or this node is a user device", body = ErrorResponse),
-        (status = 503, description = "Unknown outcome: the configuration cannot be read or too few management nodes answered; retry or read", body = ErrorResponse)
+        (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -173,20 +171,20 @@ pub async fn set_email(
 **Authentication**: realm bearer token without path restrictions.
 
 **Behavior**
-- A 204 means most management nodes confirmed the change; queued emails are not sent
-  afterwards. Turning off a missing opt-in succeeds too.
-- A 503 is an unknown outcome: the change may still take effect. A retry or a GET shows the
-  result.
+- A 204 means this node stored the change. Queued emails are not sent once a node has received
+  it; a node that has not received it yet still decides from the previous setting. Turning off a
+  missing opt-in succeeds too.
+- The last write wins, as for turning email on.
 
 **Errors**
 - 409 on a user device.
-- 503 when the realm configuration cannot be read now, or too few management nodes answered."#,
+- 503 when the realm configuration cannot be read now."#,
     responses(
-        (status = 204, description = "Most management nodes confirmed that email is off"),
+        (status = 204, description = "This node stored that email is off"),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
-        (status = 503, description = "Unknown outcome: the configuration cannot be read or too few management nodes answered; retry or read", body = ErrorResponse)
+        (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -237,11 +235,12 @@ fn map_error(error: EmailError) -> ServerError {
 
 pub(crate) fn setting_error(error: SettingError) -> ServerError {
     match error {
-        // A failed publish after the store quorum may still take effect, so the outcome is unknown.
-        SettingError::Config(_) | SettingError::NoQuorum | SettingError::Storage(_) => {
-            ServerError::ServiceUnavailableReason(error.to_string())
+        SettingError::Config(_) => ServerError::ServiceUnavailableReason(error.to_string()),
+        SettingError::Register(_) => ServerError::Conflict(error.to_string()),
+        // The write is one local batch, so a failed one stored nothing.
+        SettingError::Build(_) | SettingError::Storage(_) => {
+            ServerError::InternalError(error.to_string())
         }
-        SettingError::Build(_) => ServerError::InternalError(error.to_string()),
     }
 }
 
