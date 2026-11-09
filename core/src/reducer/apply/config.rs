@@ -71,6 +71,15 @@ impl AdminDocumentState {
                     .map_err(|_| AdminDocumentError::InvalidVaultRecord)?;
                 self.apply_node_value(event, vault_entry_path(entry), value);
             }
+            AdminDocumentOperation::ConfigSecretSet { name, info } => {
+                if info.as_ref().is_some_and(|info| info.name != *name) {
+                    return Err(AdminDocumentError::InvalidVaultRecord);
+                }
+                let value = (info.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidVaultRecord)?;
+                self.apply_node_value(event, secret_info_path(name), value);
+            }
             AdminDocumentOperation::ConfigEmailSet { profile } => {
                 if profile.as_ref().is_some_and(|profile| !profile.valid()) {
                     return Err(AdminDocumentError::InvalidEmailProfile);

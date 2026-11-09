@@ -1622,6 +1622,15 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("realm email profile is malformed".to_string());
             }
         }
+        AdminDocumentOperation::ConfigSecretSet {
+            name,
+            info: Some(info),
+        } => {
+            let scope = aruna_core::secrets::SecretScope::Realm;
+            if info.name != *name || info.check(scope).is_err() {
+                return Err("realm secret record is malformed".to_string());
+            }
+        }
         AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
@@ -1845,6 +1854,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::MergeCoordinatorSet { .. }
         | AdminDocumentOperation::ConfigVaultSet { .. }
         | AdminDocumentOperation::ConfigEmailSet { .. }
+        | AdminDocumentOperation::ConfigSecretSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
         AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
     };

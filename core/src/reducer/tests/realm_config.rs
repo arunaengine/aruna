@@ -1044,6 +1044,78 @@ fn email_conflict_off() {
     );
 }
 
+fn named_secret(value: u8) -> Vec<AdminDocumentOperation> {
+    use crate::realm_vault::{RealmSecretRef, RealmVaultRecord};
+    use crate::secrets::{SecretKind, SecretName, SecretRecord};
+    let user = UserId::local(Ulid::from_bytes([9; 16]), realm_id());
+    let name = SecretName::try_from("catalog-key".to_string()).unwrap();
+    let reference = RealmSecretRef::named(Ulid::from_bytes([value; 16]));
+    let info = SecretRecord {
+        name: name.clone(),
+        kind: SecretKind::parse("bearer").unwrap(),
+        description: String::new(),
+        settings: Default::default(),
+        uses: Vec::new(),
+        fields: vec!["token".to_string()],
+        revision: reference.revision,
+        value_id: reference.revision,
+        created_by: user,
+        created_at_ms: 1,
+        updated_by: user,
+        updated_at_ms: 1,
+    };
+    let record = RealmVaultRecord {
+        entry: reference.entry,
+        revision: reference.revision,
+        sealed: vec![value; 40],
+        changed_by: user,
+        changed_at_ms: 1,
+    };
+    vec![
+        AdminDocumentOperation::ConfigVaultSet {
+            entry: reference.entry,
+            record: Some(record),
+        },
+        AdminDocumentOperation::ConfigSecretSet {
+            name,
+            info: Some(info),
+        },
+    ]
+}
+
+#[test]
+fn secret_conflict_absent() {
+    // Two unseen writes of one name leave it absent everywhere, and neither value is served.
+    let base = AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+        realm_id: realm_id(),
+    });
+    let mut first = base.clone();
+    let mut second = base.clone();
+    let mut one = Vec::new();
+    for operation in named_secret(1) {
+        one.push(first.apply_operation(&actor(node(1)), operation).unwrap());
+    }
+    assert_eq!(first.materialized_realm_secrets().len(), 1);
+    assert_eq!(first.materialized_realm_vault().len(), 1);
+    let mut two = Vec::new();
+    for operation in named_secret(2) {
+        two.push(second.apply_operation(&actor(node(2)), operation).unwrap());
+    }
+    for event in &two {
+        first.apply(event).unwrap();
+    }
+    for event in &one {
+        second.apply(event).unwrap();
+    }
+    for state in [&first, &second] {
+        assert!(state.materialized_realm_secrets().is_empty());
+        // Both values stay held but hidden; the next write of the name supersedes both.
+        assert!(state.materialized_realm_vault().is_empty());
+        let name = crate::secrets::SecretName::try_from("catalog-key".to_string()).unwrap();
+        assert_eq!(state.realm_secret_candidates(&name).len(), 2);
+    }
+}
+
 #[test]
 fn node_history_kept() {
     // Removal and re-addition keep both intervals; a clock in the gap is inside neither.

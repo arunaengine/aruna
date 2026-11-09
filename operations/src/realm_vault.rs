@@ -171,7 +171,7 @@ fn check_fetch(
     if !is_management(config, local) {
         return Err(MetadataReadError::Unavailable);
     }
-    let scope = request.entry.purpose.fetch_scope();
+    let scope = (request.entry.purpose.fetch_scope()).ok_or(MetadataReadError::Forbidden)?;
     if !node_kind(config, peer).is_some_and(|kind| scope.allows(&kind)) {
         return Err(MetadataReadError::Forbidden);
     }
@@ -300,7 +300,9 @@ pub async fn prune_secret_cache(
 }
 
 fn cached_current(config: &RealmConfigDocument, id: [u8; 16], bytes: &[u8]) -> bool {
-    (config.vault.iter()).any(|record| {
+    let mut fetchable =
+        (config.vault.iter()).filter(|record| record.entry.purpose.fetch_scope().is_some());
+    fetchable.any(|record| {
         let reference = RealmSecretRef {
             entry: record.entry,
             revision: record.revision,

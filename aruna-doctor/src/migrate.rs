@@ -28,6 +28,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::realm_vault::RealmVaultRecord;
+use aruna_core::secrets::SecretRecord;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
 use aruna_core::structs::execution::email::RealmEmailProfile;
 use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
@@ -693,9 +694,9 @@ fn rewrite_rows(
     Ok(Rewrites { scanned, rows })
 }
 
-/// Realm configuration documents gained the catch-up wait, the session idle timeout, federation
-/// settings, portal features, the replica quota, the email profile and the realm vault last.
-/// Postcard is positional, so appending the defaults an older row lacks re-encodes it.
+/// Realm configs gained the catch-up wait, idle timeout, federation, portal features, replica
+/// quota, email profile, realm vault and named secrets, in that order. Postcard is positional,
+/// so appending the defaults an older row lacks re-encodes it.
 fn realm_configs(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
@@ -719,7 +720,12 @@ fn realm_configs(
 /// Appends the trailing defaults an older row lacks, shortest suffix first, so
 /// a row missing only the newest value keeps the one it already has.
 fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
-    let vault = postcard::to_allocvec(&Vec::<RealmVaultRecord>::new()).ok()?;
+    let secrets = postcard::to_allocvec(&Vec::<SecretRecord>::new()).ok()?;
+    let vault = [
+        postcard::to_allocvec(&Vec::<RealmVaultRecord>::new()).ok()?,
+        secrets.clone(),
+    ]
+    .concat();
     let email = [
         postcard::to_allocvec(&None::<RealmEmailProfile>).ok()?,
         vault.clone(),
@@ -739,6 +745,7 @@ fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
     let idle_on = [idle.as_slice(), &federation_on].concat();
     let both = [catch_up.as_slice(), &idle_on].concat();
     for suffix in [
+        secrets,
         vault,
         email,
         replicas,
@@ -1152,7 +1159,8 @@ mod tests {
     #[test]
     fn rewrites_realm_configs() {
         // Legacy documents decode with default timeouts, no federation settings, no portal
-        // features, no replica quota, no email and an empty vault. Current rows stay byte-identical.
+        // features, no replica quota, no email, an empty vault and no named secrets. Current
+        // rows stay byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
@@ -1165,7 +1173,9 @@ mod tests {
         let replicas = postcard::to_allocvec(&super::ReplicaQuota::default()).unwrap();
         let vault = postcard::to_allocvec(&Vec::<super::RealmVaultRecord>::new()).unwrap();
         let email = postcard::to_allocvec(&None::<super::RealmEmailProfile>).unwrap();
-        let vaultless = current[..current.len() - vault.len()].to_vec();
+        let secrets = postcard::to_allocvec(&Vec::<super::SecretRecord>::new()).unwrap();
+        let secretless = current[..current.len() - secrets.len()].to_vec();
+        let vaultless = secretless[..secretless.len() - vault.len()].to_vec();
         let emailless = vaultless[..vaultless.len() - email.len()].to_vec();
         let replicaless = emailless[..emailless.len() - replicas.len()].to_vec();
         let featureless = replicaless[..replicaless.len() - features.len()].to_vec();
@@ -1181,6 +1191,7 @@ mod tests {
                 (b"main", unfederated),
                 (b"prior", featureless),
                 (b"replicaless", replicaless),
+                (b"secretless", secretless),
                 (b"vaultless", vaultless),
                 (b"emailless", emailless),
                 (b"new", current.clone()),
@@ -1191,11 +1202,12 @@ mod tests {
 
         assert_eq!(
             (output.realm_configs_scanned, output.realm_configs_rewritten),
-            (8, 7)
+            (9, 8)
         );
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
         assert_eq!(rows[b"replicaless".as_slice()], current);
+        assert_eq!(rows[b"secretless".as_slice()], current);
         assert_eq!(rows[b"vaultless".as_slice()], current);
         assert_eq!(rows[b"emailless".as_slice()], current);
         assert_eq!(rows[b"main".as_slice()], current);

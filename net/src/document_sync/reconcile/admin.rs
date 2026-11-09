@@ -851,6 +851,7 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::MergeCoordinatorSet { .. }
             | AdminDocumentOperation::ConfigVaultSet { .. }
             | AdminDocumentOperation::ConfigEmailSet { .. }
+            | AdminDocumentOperation::ConfigSecretSet { .. }
     )
 }
 

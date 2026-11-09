@@ -455,6 +455,13 @@ pub enum AdminDocumentOperation {
     ConfigEmailSet {
         profile: Option<crate::structs::execution::email::RealmEmailProfile>,
     },
+    /// Sets or deletes the record of one named realm secret. Each name is its own path;
+    /// concurrent writes of one name leave it absent until a realm admin writes it again.
+    #[serde(rename = "RealmConfigSecretSet")]
+    ConfigSecretSet {
+        name: crate::secrets::SecretName,
+        info: Option<crate::secrets::SecretRecord>,
+    },
 }
 
 impl AdminDocumentOperation {

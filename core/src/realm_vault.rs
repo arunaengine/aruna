@@ -27,19 +27,24 @@ const NONCE_LEN: usize = 12;
 pub enum RealmVaultPurpose {
     /// The password of the realm email profile.
     SmtpPassword,
+    /// The value of a named realm secret, under its value id.
+    NamedSecret,
 }
 
 impl RealmVaultPurpose {
     pub const fn tag(self) -> u8 {
         match self {
             Self::SmtpPassword => 1,
+            Self::NamedSecret => 2,
         }
     }
 
-    /// Which node kinds may fetch records of this purpose from a management node.
-    pub const fn fetch_scope(self) -> FetchScope {
+    /// Which node kinds may fetch records of this purpose from a management node. Named
+    /// secrets are never fetched; they leave a management node only through a checked use.
+    pub const fn fetch_scope(self) -> Option<FetchScope> {
         match self {
-            Self::SmtpPassword => FetchScope::Infrastructure,
+            Self::SmtpPassword => Some(FetchScope::Infrastructure),
+            Self::NamedSecret => None,
         }
     }
 }
@@ -50,6 +55,7 @@ impl TryFrom<u8> for RealmVaultPurpose {
     fn try_from(tag: u8) -> Result<Self, Self::Error> {
         match tag {
             1 => Ok(Self::SmtpPassword),
+            2 => Ok(Self::NamedSecret),
             _ => Err(RealmVaultError::UnknownPurpose(tag)),
         }
     }
@@ -119,10 +125,20 @@ impl fmt::Debug for RealmVaultRecord {
 }
 
 /// How other realm state points at one revision of a realm vault record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RealmSecretRef {
     pub entry: RealmVaultEntry,
     pub revision: Ulid,
+}
+
+impl RealmSecretRef {
+    /// The value of a named realm secret: its entry id and revision are both its value id.
+    pub fn named(value_id: Ulid) -> Self {
+        Self {
+            entry: RealmVaultEntry::new(RealmVaultPurpose::NamedSecret, value_id),
+            revision: value_id,
+        }
+    }
 }
 
 /// AES-256-GCM key of the realm vault, derived from the realm signing key with its own label.
@@ -439,7 +455,7 @@ mod tests {
             RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, Ulid::from_bytes([2u8; 16]));
         let mut bytes = postcard::to_allocvec(&entry).unwrap();
         assert_eq!(bytes[0], 1);
-        bytes[0] = 2;
+        bytes[0] = 3;
         assert!(postcard::from_bytes::<RealmVaultEntry>(&bytes).is_err());
         let json = serde_json::to_string(&entry)
             .unwrap()

@@ -353,19 +353,64 @@ impl AdminDocumentState {
             .collect()
     }
 
-    /// Realm vault records sorted by entry key. A never set, deleted or conflicting entry is absent.
+    /// Realm vault records sorted by entry key. A never set, deleted or conflicting entry is absent,
+    /// and so is a named secret value no present secret record points at.
     pub fn materialized_realm_vault(&self) -> Vec<crate::realm_vault::RealmVaultRecord> {
+        use crate::realm_vault::{RealmSecretRef, RealmVaultPurpose, RealmVaultRecord};
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return Vec::new();
         }
-        let mut records: Vec<crate::realm_vault::RealmVaultRecord> = (self.user_subject_ids)
+        let referenced: BTreeSet<RealmSecretRef> = (self.materialized_realm_secrets().iter())
+            .map(|info| RealmSecretRef::named(info.value_id))
+            .collect();
+        let mut records: Vec<RealmVaultRecord> = (self.user_subject_ids)
             .range(VAULT_ENTRY_PREFIX.to_string()..)
             .take_while(|(path, _)| path.starts_with(VAULT_ENTRY_PREFIX))
             .filter(|(path, _)| !self.conflicts.contains_key(*path))
             .filter_map(|(_, version)| serde_json::from_str(version.value.as_deref()?).ok())
+            .filter(|record: &RealmVaultRecord| {
+                let reference = RealmSecretRef {
+                    entry: record.entry,
+                    revision: record.revision,
+                };
+                record.entry.purpose != RealmVaultPurpose::NamedSecret
+                    || referenced.contains(&reference)
+            })
             .collect();
         records.sort_by_key(|record| record.entry.key());
         records
+    }
+
+    /// Named realm secret records sorted by name. A never set, deleted or conflicting name is absent.
+    pub fn materialized_realm_secrets(&self) -> Vec<crate::secrets::SecretRecord> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return Vec::new();
+        }
+        (self
+            .user_subject_ids
+            .range(SECRET_INFO_PREFIX.to_string()..))
+        .take_while(|(path, _)| path.starts_with(SECRET_INFO_PREFIX))
+        .filter(|(path, _)| !self.conflicts.contains_key(*path))
+        .filter_map(|(_, version)| serde_json::from_str(version.value.as_deref()?).ok())
+        .collect()
+    }
+
+    /// The current record of one realm secret name and every record competing with it. A write
+    /// of that name supersedes them all, so their values may retire; nothing else may.
+    pub fn realm_secret_candidates(
+        &self,
+        name: &crate::secrets::SecretName,
+    ) -> Vec<crate::secrets::SecretRecord> {
+        let path = secret_info_path(name);
+        let conflicting = (self.conflicts.get(&path).into_iter())
+            .flat_map(|conflict| &conflict.values)
+            .filter_map(|candidate| candidate.value.as_deref());
+        (self.user_subject_ids.get(&path))
+            .and_then(|version| version.value.as_deref())
+            .into_iter()
+            .chain(conflicting)
+            .filter_map(|value| serde_json::from_str(value).ok())
+            .collect()
     }
 
     /// Display names of realm nodes, by node id. A cleared or conflicting name is absent.

@@ -120,6 +120,7 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         }
         AdminDocumentOperation::ConfigVaultSet { entry, .. } => vec![vault_entry_path(entry)],
         AdminDocumentOperation::ConfigEmailSet { .. } => vec![CONFIG_EMAIL_PATH.to_string()],
+        AdminDocumentOperation::ConfigSecretSet { name, .. } => vec![secret_info_path(name)],
         AdminDocumentOperation::NodeNameSet { node_id, .. } => vec![node_name_path(node_id)],
         AdminDocumentOperation::NodePlaceSet { node_id, .. } => vec![node_place_path(node_id)],
         AdminDocumentOperation::ConfigPoliciesSet { .. } => {
@@ -297,6 +298,13 @@ pub const NODE_HISTORY_PREFIX: &str = "realm_config.node_history.";
 /// One retained path per infrastructure add or removal event of a node; never overwritten.
 pub fn node_history_path(node_id: &NodeId, event_id: Ulid) -> String {
     format!("{NODE_HISTORY_PREFIX}{node_id}.{event_id}")
+}
+
+pub const SECRET_INFO_PREFIX: &str = "realm_config.secrets.";
+
+/// One path per named realm secret, `realm_config.secrets.<name>`.
+pub fn secret_info_path(name: &crate::secrets::SecretName) -> String {
+    format!("{SECRET_INFO_PREFIX}{name}")
 }
 
 pub fn config_oidc_path(provider_id: &str) -> String {
