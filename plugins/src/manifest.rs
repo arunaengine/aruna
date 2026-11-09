@@ -452,3 +452,6 @@ fn bounded(what: &'static str, count: usize) -> Result<(), ManifestError> {
     }
 }
 
+#[cfg(test)]
+#[path = "manifest_tests.rs"]
+mod tests;
