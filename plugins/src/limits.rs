@@ -32,7 +32,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            memory: 64 << 20,
+            memory: 256 << 20,
             fuel: 2_000_000_000,
             wall: Duration::from_secs(60),
             write: Duration::from_secs(30),
@@ -82,7 +82,7 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            max_artifact: 32 << 20,
+            max_artifact: 64 << 20,
             cache: 32,
             invocations: 16,
             compiles: 1,
