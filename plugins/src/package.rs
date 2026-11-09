@@ -11,7 +11,9 @@ use wasmparser::Parser;
 use crate::artifact::{
     SectionError, attach_manifest, check_artifact, component_imports, read_handlers,
 };
+use crate::limits::RuntimeConfig;
 use crate::manifest::{BuildStep, Manifest, ManifestError};
+use crate::runtime::Runtime;
 
 /// The target Rust projects without a build step compile to; the host adds no WASI there.
 pub const RUST_TARGET: &str = "wasm32-unknown-unknown";
@@ -24,6 +26,8 @@ pub enum BuildError {
     Toolchain(String),
     #[error("the build output is neither a module nor a component: {0}")]
     Output(String),
+    #[error("the host cannot run the artifact: {0}")]
+    Host(String),
     #[error(transparent)]
     Section(#[from] SectionError),
     #[error(transparent)]
@@ -79,22 +83,25 @@ pub fn build_project(project: &Path) -> Result<Built, BuildError> {
 /// Turns a core module with embedded WIT, or a finished component from any toolchain, into
 /// an artifact: handlers wired, imports checked, manifest embedded, whole artifact checked.
 pub fn package(manifest: &mut Manifest, bytes: &[u8]) -> Result<Vec<u8>, BuildError> {
-    let (component, declared) = if Parser::is_core_wasm(bytes) {
-        let encoded = wit_component::ComponentEncoder::default()
+    let component = if Parser::is_core_wasm(bytes) {
+        wit_component::ComponentEncoder::default()
             .module(bytes)
             .and_then(|encoder| encoder.validate(true).encode())
-            .map_err(|err| BuildError::Output(format!("{err:#}")))?;
-        (encoded, read_handlers(bytes)?)
+            .map_err(|err| BuildError::Output(format!("{err:#}")))?
     } else if Parser::is_component(bytes) {
-        (bytes.to_vec(), None)
+        bytes.to_vec()
     } else {
         return Err(BuildError::Output("unknown file format".into()));
     };
-    manifest.wire(declared)?;
+    manifest.wire(read_handlers(&component)?)?;
     let imports = component_imports(&component)?;
     manifest.check_imports(imports.iter().map(String::as_str))?;
     let artifact = attach_manifest(&component, manifest)?;
     check_artifact(&artifact)?;
+    // Compiling against the host linker type-checks every import and the `handle` export.
+    let config = RuntimeConfig::default();
+    let runtime = Runtime::new(config).map_err(|err| BuildError::Host(err.to_string()))?;
+    (runtime.compile(&artifact)).map_err(|err| BuildError::Host(err.to_string()))?;
     Ok(artifact)
 }
 

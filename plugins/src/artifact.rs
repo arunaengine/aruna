@@ -114,11 +114,11 @@ pub fn attach_manifest(component: &[u8], manifest: &Manifest) -> Result<Vec<u8>,
     Ok(out)
 }
 
-/// The handler names a toolchain recorded in a core module, such as the Rust SDK's `export!`;
-/// `None` when the module lists none.
+/// The handler names a toolchain recorded, such as the Rust SDK's `export!`, in a core module
+/// or in a module nested in a finished component; `None` when nothing lists them.
 pub fn read_handlers(module: &[u8]) -> Result<Option<BTreeSet<String>>, SectionError> {
-    if !Parser::is_core_wasm(module) {
-        return Err(SectionError::WrongKind("module"));
+    if !Parser::is_core_wasm(module) && !Parser::is_component(module) {
+        return Err(SectionError::WrongKind("module or component"));
     }
     let mut found = None;
     for payload in Parser::new(0).parse_all(module) {
@@ -152,8 +152,8 @@ pub fn check_artifact(bytes: &[u8]) -> Result<Manifest, SectionError> {
     Ok(manifest)
 }
 
-/// Names of the top-level instance imports of a component, such as `aruna:plugin/log@0.2.0`.
-/// Type imports carry no host calls and are left out.
+/// Names of the top-level instance and function imports of a component, such as
+/// `aruna:plugin/log@0.2.0`. Type imports carry no host calls and are left out.
 pub fn component_imports(component: &[u8]) -> Result<Vec<String>, SectionError> {
     let mut depth = 0usize;
     let mut names = Vec::new();
@@ -164,7 +164,10 @@ pub fn component_imports(component: &[u8]) -> Result<Vec<String>, SectionError> 
             Payload::ComponentImportSection(reader) if depth == 0 => {
                 for import in reader {
                     let import = import.map_err(|err| SectionError::Parse(err.to_string()))?;
-                    if matches!(import.ty, ComponentTypeRef::Instance(_)) {
+                    if matches!(
+                        import.ty,
+                        ComponentTypeRef::Instance(_) | ComponentTypeRef::Func(_)
+                    ) {
                         names.push(import.name.name.to_string());
                     }
                 }
