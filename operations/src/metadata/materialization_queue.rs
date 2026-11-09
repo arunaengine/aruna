@@ -106,6 +106,8 @@ struct CompletedMaterializationJob {
     raw_state_write: Option<(String, ByteView, ByteView)>,
     validation_write: Option<(String, ByteView, ByteView)>,
     sync: Option<CompletedMaterializationSync>,
+    /// A merge renders the whole merged graph, so its raw state stays valid under a newer status.
+    merge: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -586,6 +588,12 @@ async fn plan_finish_chunk(
                         }
                         plan.writes.push(materialization_status_entry(&status)?);
                         planned.insert(status.document_id, status);
+                    } else if job.merge
+                        && current.is_some_and(|current| current.event_id > status.event_id)
+                        && let Some(raw_state_write) = job.raw_state_write
+                    {
+                        // A late merge keeps the newer status but stores the graph it published.
+                        plan.writes.push(raw_state_write);
                     }
                 }
                 plan.deletes.push((
@@ -1472,6 +1480,7 @@ async fn process_materialization_job(
                     raw_state_write: None,
                     validation_write: None,
                     sync: None,
+                    merge: false,
                 },
                 Duration::ZERO,
             ));
@@ -1495,6 +1504,7 @@ async fn process_materialization_job(
                     raw_state_write: None,
                     validation_write: None,
                     sync: None,
+                    merge: false,
                 },
                 Duration::ZERO,
             ));
@@ -1518,6 +1528,7 @@ async fn process_materialization_job(
                 raw_state_write: None,
                 validation_write: None,
                 sync: None,
+                merge: false,
             },
             Duration::ZERO,
         ));
@@ -1578,6 +1589,7 @@ async fn process_materialization_job(
                         graph_iri: event.record.graph_iri.clone(),
                         peers: event.record.holder_node_ids.clone(),
                     }),
+                    merge: merges(&event),
                 },
                 craqle_elapsed,
             ))
@@ -1598,6 +1610,7 @@ async fn process_materialization_job(
                 raw_state_write: None,
                 validation_write: None,
                 sync: None,
+                merge: false,
             },
             craqle_elapsed,
         )),
@@ -1832,6 +1845,30 @@ fn should_write_retry(
                 },
             )
     })
+}
+
+/// Whether a materialization job of the document is queued or running. Its finish batch
+/// removes the row together with the graph state the job stores.
+pub async fn document_job_queued(
+    storage: &StorageHandle,
+    document_id: Ulid,
+) -> Result<bool, MetadataMaterializationError> {
+    match storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: DOCUMENT_JOB_KEYSPACE.to_string(),
+            prefix: Some(document_job_prefix(document_id)),
+            start: None,
+            limit: 1,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
 }
 
 pub async fn materialization_jobs_exist(

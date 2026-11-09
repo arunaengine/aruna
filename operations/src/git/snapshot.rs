@@ -12,6 +12,7 @@ use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::distribution::resolve::version_holders;
 use crate::driver::DriverContext;
 use crate::driver::drive;
+use crate::metadata::materialization_queue::document_job_queued;
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::get::GetBucketOperation;
@@ -78,21 +79,20 @@ pub(super) async fn current(
     revision: Option<&MetadataRawRevision>,
     materializing: bool,
 ) -> Result<Option<(Ulid, String)>, GitError> {
+    // A queued job, a late merge too, snapshots its own graph and stores it only when it
+    // finishes, so until then the raw view can be older than that snapshot.
+    if !materializing {
+        let queued = document_job_queued(&context.storage_handle, document.document_id).await;
+        if queued.map_err(|_| GitError::Unavailable)? {
+            return Ok(None);
+        }
+    }
     let raw = match revision {
         Some(revision) => Some(revision.clone()),
-        None => {
-            let view =
-                crate::metadata::raw_revision::load_raw_view(context, document.document_id, None)
-                    .await
-                    .map_err(|_| GitError::Unavailable)?;
-            // A pending materialization snapshots its own graph and stores it only afterwards,
-            // so until it finishes the raw view is older than that snapshot.
-            let pending = view.as_ref().map(|view| view.projection_state);
-            if !materializing && pending == Some(MaterializationState::Pending) {
-                return Ok(None);
-            }
-            view.map(|view| view.revision)
-        }
+        None => crate::metadata::raw_revision::load_raw_view(context, document.document_id, None)
+            .await
+            .map_err(|_| GitError::Unavailable)?
+            .map(|view| view.revision),
     };
     if let Some(raw) = raw {
         return Ok(Some((raw.winning_event_id, raw.jsonld)));

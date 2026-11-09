@@ -1414,6 +1414,7 @@ async fn finish_keeps_newer() {
             raw_state_write: None,
             validation_write: None,
             sync: None,
+            merge: false,
         },
     )];
     let plan = plan_finish_chunk(&storage, finished).await.unwrap();
@@ -1524,6 +1525,7 @@ async fn finish_not_regress() {
                 )),
                 validation_write: None,
                 sync: None,
+                merge: false,
             },
         )],
     )
@@ -1560,6 +1562,68 @@ async fn finish_not_regress() {
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {}
         other => panic!("unexpected storage event: {other:?}"),
     }
+}
+
+// A late merge published its merged graph; the raw view must show it without lowering the status.
+#[tokio::test]
+async fn finish_stores_merge() {
+    let dir = tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let document_id = Ulid::from_bytes([5u8; 16]);
+    let late_event = create_event(document_id, Ulid::from_parts(5, 1), "late");
+    let newer_event = create_event(document_id, Ulid::from_parts(6, 1), "newer");
+    let late_job = MetadataMaterializationRecord {
+        document_id,
+        event_id: late_event.event_id,
+        due_at_ms: 1,
+        attempts: 0,
+        failures: 0,
+        parks: 0,
+    };
+    let newer_status = materialized_status(document_id, &newer_event);
+    let (_, late_job_key, _) = materialization_job_entry(&late_job).unwrap();
+    let raw_state_key = raw_revision_key(document_id);
+    write_entries(
+        &storage,
+        vec![
+            materialization_status_entry(&newer_status).unwrap(),
+            materialization_job_entry(&late_job).unwrap(),
+            document_job_entry(&late_job).unwrap(),
+        ],
+    )
+    .await;
+
+    let completed = CompletedMaterializationJob {
+        job_key: late_job_key.to_vec(),
+        document_job_key: Some(document_job_key(document_id, late_job.event_id).to_vec()),
+        status: Some(materialization_success_status(&late_job, &late_event, None)),
+        iri_index_writes: Vec::new(),
+        link_deletes: Vec::new(),
+        raw_state_write: Some((
+            RAW_REVISION_KEYSPACE.to_string(),
+            raw_state_key.clone(),
+            ByteView::from(vec![1]),
+        )),
+        validation_write: None,
+        sync: None,
+        merge: true,
+    };
+    finish_completed_jobs(
+        &storage,
+        vec![FinishedMaterializationJob::Completed(completed)],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        read_materialization_status(&storage, document_id, None)
+            .await
+            .unwrap(),
+        Some(newer_status),
+        "the newer status stays"
+    );
+    assert!(storage_key_exists(&storage, RAW_REVISION_KEYSPACE, raw_state_key.to_vec()).await);
+    assert!(!document_job_queued(&storage, document_id).await.unwrap());
 }
 
 #[tokio::test]
@@ -1599,6 +1663,7 @@ async fn supersedes_prior_rows() {
             )),
             validation_write: None,
             sync: None,
+            merge: false,
         }
     };
 
@@ -1924,6 +1989,7 @@ fn sync_dedupes_graphs() {
                 graph_iri: graph_iri.clone(),
                 peers,
             }),
+            merge: false,
         })
     };
     let finished = vec![completed(vec![node(1)]), completed(vec![node(2)])];
