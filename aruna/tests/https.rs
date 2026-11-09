@@ -435,3 +435,175 @@ async fn rest_bearer_tls() -> TestResult<()> {
     seed.shutdown().await;
     result
 }
+
+/// A TLS client for `s3.test` that trusts the test CA.
+async fn connect_s3(stack: &TlsS3) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in CertificateDer::pem_slice_iter(stack.files.ca.as_bytes()) {
+        roots.add(certificate.expect("CA PEM")).expect("CA root");
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let tcp = TcpStream::connect(stack.https).await.expect("TCP connect");
+    let name = ServerName::try_from("s3.test").expect("DNS name");
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, tcp)
+        .await
+        .expect("TLS connection")
+}
+
+/// Sends one request and reads its answer, which proves the server accepted
+/// the connection; the connection stays open for the drain under test.
+async fn answered(stream: &mut tokio_rustls::client::TlsStream<TcpStream>) {
+    stream
+        .write_all(b"GET /bucket/key HTTP/1.1\r\nHost: s3.test\r\nContent-Length: 0\r\n\r\n")
+        .await
+        .expect("request");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.expect("response head");
+        head.push(byte[0]);
+    }
+    let text = String::from_utf8_lossy(&head);
+    let length = text
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|value| value.trim().parse::<usize>().expect("length"))
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).await.expect("response body");
+}
+
+async fn released(mut stream: tokio_rustls::client::TlsStream<TcpStream>) {
+    let mut buffer = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+        .await
+        .expect("the drain must release the TLS connection");
+    assert!(matches!(read, Ok(0) | Err(_)), "unexpected data: {read:?}");
+}
+
+fn shutdown_sequence(
+    shutdown: Shutdown,
+    storage_handle: aruna_storage::StorageHandle,
+    grace: Duration,
+) -> NodeShutdown {
+    NodeShutdown {
+        shutdown,
+        readiness: aruna_api::monitoring::Readiness::new(),
+        rest: None,
+        s3: None,
+        portal: None,
+        session_s3: None,
+        https: None,
+        monitoring: None,
+        task_handle: aruna_tasks::TaskHandle::new(),
+        jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),
+        net_handle: None,
+        metadata_handle: None,
+        blob_handle: None,
+        storage_handle,
+        ops: None,
+        grace,
+    }
+}
+
+/// A TLS S3 stack on fresh storage with one connection permit, stopped by `shutdown`.
+async fn drained_stack(
+    shutdown: &Shutdown,
+) -> (TlsS3, aruna_storage::StorageHandle, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
+        .expect("storage opens");
+    let context = Arc::new(aruna_operations::driver::DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    });
+    let secret = iroh::SecretKey::from_bytes(&[0x61; 32]);
+    let stack = tls_s3(
+        context,
+        aruna_core::structs::identity::realm::RealmId::from_bytes([0x61; 32]),
+        secret.public(),
+        "s3.test",
+        shutdown.token(),
+        |server| server.with_concurrency_limits(1, 64),
+    )
+    .await
+    .expect("TLS S3 stack");
+    (stack, storage, dir)
+}
+
+#[tokio::test]
+async fn tls_drain_graceful() {
+    // An established, answered TLS connection drains within the ingress slice.
+    let shutdown = Shutdown::new();
+    let (mut stack, storage, _dir) = drained_stack(&shutdown).await;
+    let mut client = connect_s3(&stack).await;
+    answered(&mut client).await;
+    let mut sequence = shutdown_sequence(shutdown.clone(), storage, Duration::from_secs(20));
+    sequence.s3 = stack.s3.take();
+    sequence.https = stack.front.take();
+    let outcome = sequence.run().await;
+    assert!(
+        !outcome.ingress_forced,
+        "an idle TLS connection drains gracefully"
+    );
+    released(client).await;
+}
+
+/// A TLS connection stuck in its first request head that the S3 loop has
+/// accepted. With one permit the server drops whichever connection came
+/// second, so a dropped plain probe proves the TLS connection holds it.
+async fn stuck_tls(stack: &TlsS3) -> tokio_rustls::client::TlsStream<TcpStream> {
+    for _ in 0..20 {
+        let mut client = connect_s3(stack).await;
+        client
+            .write_all(b"PUT /bucket/key HTTP/1.1\r\nHost: s3.test\r\n")
+            .await
+            .expect("partial head");
+        client.flush().await.expect("flush");
+        let mut probe = TcpStream::connect(stack.plain).await.expect("plain probe");
+        let (mut tls_byte, mut probe_byte) = ([0u8; 1], [0u8; 1]);
+        let tls_dropped = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = probe.read(&mut probe_byte) => false,
+                _ = client.read(&mut tls_byte) => true,
+            }
+        })
+        .await
+        .expect("the server drops one of the two connections");
+        if !tls_dropped {
+            return client;
+        }
+    }
+    panic!("the TLS connection never reached the S3 loop first");
+}
+
+#[tokio::test]
+async fn tls_drain_forced() {
+    // A TLS connection stuck in a request head outlives the ingress slice; the
+    // forced cleanup still releases it before the sequence continues.
+    let shutdown = Shutdown::new();
+    let (mut stack, storage, _dir) = drained_stack(&shutdown).await;
+    let client = stuck_tls(&stack).await;
+    let mut sequence = shutdown_sequence(shutdown.clone(), storage, Duration::from_millis(200));
+    sequence.s3 = stack.s3.take();
+    sequence.https = stack.front.take();
+    let outcome = sequence.run().await;
+    assert!(
+        outcome.ingress_forced,
+        "the stuck connection outlives the slice"
+    );
+    released(client).await;
+}
