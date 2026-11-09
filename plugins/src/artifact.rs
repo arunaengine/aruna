@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wasm_encoder::{ComponentSection, CustomSection};
-use wasmparser::{Parser, Payload};
+use wasmparser::{ComponentTypeRef, Parser, Payload};
 
 use crate::manifest::{Manifest, ManifestError};
 
@@ -140,7 +140,8 @@ pub fn read_handlers(module: &[u8]) -> Result<BTreeSet<String>, SectionError> {
     Ok(names)
 }
 
-/// Names of the top-level imports of a component, such as `aruna:plugin/log@0.2.0`.
+/// Names of the top-level instance imports of a component, such as `aruna:plugin/log@0.2.0`.
+/// Type imports carry no host calls and are left out.
 pub fn component_imports(component: &[u8]) -> Result<Vec<String>, SectionError> {
     let mut depth = 0usize;
     let mut names = Vec::new();
@@ -151,7 +152,9 @@ pub fn component_imports(component: &[u8]) -> Result<Vec<String>, SectionError> 
             Payload::ComponentImportSection(reader) if depth == 0 => {
                 for import in reader {
                     let import = import.map_err(|err| SectionError::Parse(err.to_string()))?;
-                    names.push(import.name.name.to_string());
+                    if matches!(import.ty, ComponentTypeRef::Instance(_)) {
+                        names.push(import.name.name.to_string());
+                    }
                 }
             }
             _ => {}
@@ -177,7 +180,8 @@ fn top_section<'a>(component: &'a [u8], name: &str) -> Result<Option<&'a [u8]>, 
             Payload::ModuleSection { .. } | Payload::ComponentSection { .. } => depth += 1,
             Payload::End(_) => depth = depth.saturating_sub(1),
             Payload::CustomSection(section) if depth == 0 && section.name() == name => {
-                if found.replace(section.data()).is_some() {
+                let earlier = found.replace(section.data());
+                if earlier.is_some() {
                     return Err(SectionError::Manifest);
                 }
             }
