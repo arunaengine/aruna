@@ -1,4 +1,5 @@
-//! Keeps a user's webhook subscription and delivers share upload notifications to it as jobs.
+//! Writes a user's webhook subscription through the management quorum and delivers share
+//! upload notifications to it as jobs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,24 +8,19 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::WEBHOOK_KEYSPACE;
-use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::Operation;
+use aruna_core::errors::ConversionError;
+use aruna_core::realm_vault::seal_setting;
 use aruna_core::structs::execution::job::{
     JobError, JobPayload, JobResultPayload, WorkspaceMode, user_dedup_key,
 };
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
+use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::{
-    DELIVERY_HEADER, SIGNATURE_HEADER, WebhookDeliverySpec, WebhookSubscription, sign_delivery,
-    webhook_key,
+    DELIVERY_HEADER, SIGNATURE_HEADER, URL_BYTES, WebhookDeliverySpec, WebhookSubscription,
+    sign_delivery, valid_url,
 };
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -32,249 +28,137 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
 use crate::jobs::submit::SubmitJobSpec;
-use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
-use crate::storage_read::{StorageReadError, parse_storage_read};
+use crate::notifications::email::no_transport;
+use crate::notifications::settings::{
+    Backoffs, Delivery, MetadataPeers, SettingError, SettingPeers, delivery_setting, local_setting,
+    managers, write_setting,
+};
+use crate::realm::get_config::GetConfigOperation;
 
-const URL_BYTES: usize = 2048;
 /// Total time one delivery attempt may take; the job runtime retries a timed out attempt.
 const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WebhookAction {
-    Read,
-    /// Replaces any subscription and its secret with a new one for `url`.
-    Set {
-        url: String,
-    },
-    Remove,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct WebhookOutcome {
-    pub subscription: Option<WebhookSubscription>,
-    /// The new signing secret, hex encoded; present only right after `Set`.
-    pub secret: Option<String>,
-}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum WebhookError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Setting(#[from] SettingError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error(
         "the webhook URL must be an http or https URL without credentials, at most {URL_BYTES} bytes"
     )]
     InvalidUrl,
-    #[error("webhook operation did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: {event}")]
-    UnexpectedEvent { state: String, event: String },
 }
 
-#[derive(Debug, PartialEq)]
-enum State {
-    Init,
-    Read,
-    WriteSecret { previous: Option<Ulid> },
-    WriteRecord { previous: Option<Ulid> },
-    DeleteRecord { previous: Ulid },
-    DeleteSecret,
-    Done,
+/// A new subscription with its signing secret, hex encoded and shown only once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebhookOutcome {
+    pub subscription: WebhookSubscription,
+    pub secret: String,
 }
 
-/// Reads, sets or removes the caller's own subscription on this node.
-#[derive(Debug, PartialEq)]
-pub struct WebhookOperation {
-    user_id: UserId,
-    action: WebhookAction,
-    state: State,
-    outcome: WebhookOutcome,
-    secret: Option<SecretBytes>,
-    output: Option<Result<WebhookOutcome, WebhookError>>,
+/// The caller's current subscription as this node received it; `None` when it is off.
+pub async fn read_webhook(
+    ctx: &DriverContext,
+    owner: UserId,
+) -> Result<Option<WebhookSubscription>, WebhookError> {
+    let bytes = local_setting(ctx, SettingChannel::Webhook, owner).await?;
+    Ok(bytes
+        .as_deref()
+        .map(WebhookSubscription::from_bytes)
+        .transpose()?)
 }
 
-impl WebhookOperation {
-    pub fn new(user_id: UserId, action: WebhookAction) -> Self {
-        Self {
-            user_id,
-            action,
-            state: State::Init,
-            outcome: WebhookOutcome::default(),
-            secret: None,
-            output: None,
-        }
+/// Turns the webhook on for `url` with a new signing secret, sealed to the realm key.
+pub async fn set_webhook(
+    ctx: &DriverContext,
+    local: NodeId,
+    owner: UserId,
+    url: String,
+) -> Result<WebhookOutcome, WebhookError> {
+    if !valid_url(&url) {
+        return Err(WebhookError::InvalidUrl);
     }
-
-    fn fail(&mut self, error: WebhookError) -> Effects {
-        self.state = State::Done;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn done(&mut self) -> Effects {
-        self.state = State::Done;
-        self.output = Some(Ok(std::mem::take(&mut self.outcome)));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, event: Event) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(WebhookError::UnexpectedEvent {
-            state,
-            event: format!("{event:?}"),
-        })
-    }
-
-    fn record_effect(&self, record: &WebhookSubscription) -> Result<Effect, ConversionError> {
-        Ok(Effect::Storage(StorageEffect::Write {
-            key_space: WEBHOOK_KEYSPACE.to_string(),
-            key: webhook_key(&self.user_id).into(),
-            value: record.to_bytes()?.into(),
-            txn_id: None,
-        }))
-    }
-
-    fn handle_read(&mut self, event: Event) -> Effects {
-        let existing = match parse_storage_read(event, WebhookSubscription::from_bytes) {
-            Ok(existing) => existing,
-            Err(StorageReadError::Storage(error)) => return self.fail(error.into()),
-            Err(StorageReadError::Conversion(error)) => return self.fail(error.into()),
-        };
-        match self.action.clone() {
-            WebhookAction::Read => {
-                self.outcome.subscription = existing;
-                self.done()
-            }
-            WebhookAction::Remove => match existing {
-                None => self.done(),
-                Some(existing) => {
-                    self.state = State::DeleteRecord {
-                        previous: existing.subscription_id,
-                    };
-                    smallvec![Effect::Storage(StorageEffect::Delete {
-                        key_space: WEBHOOK_KEYSPACE.to_string(),
-                        key: webhook_key(&self.user_id).into(),
-                        txn_id: None,
-                    })]
-                }
-            },
-            WebhookAction::Set { url } => {
-                if !valid_url(&url) {
-                    return self.fail(WebhookError::InvalidUrl);
-                }
-                let subscription = WebhookSubscription {
-                    subscription_id: Ulid::generate(),
-                    user_id: self.user_id,
-                    url,
-                    created_at_ms: unix_timestamp_millis(),
-                };
-                let secret: [u8; 32] = rand::random();
-                self.outcome.secret = Some(hex::encode(secret));
-                let entry = secret_entry(subscription.subscription_id);
-                self.outcome.subscription = Some(subscription);
-                self.state = State::WriteSecret {
-                    previous: existing.map(|existing| existing.subscription_id),
-                };
-                smallvec![write_secret(entry, SecretBytes::new(secret.to_vec()), None)]
-            }
-        }
-    }
-
-    fn after_secret(&mut self, previous: Option<Ulid>) -> Effects {
-        let Some(subscription) = self.outcome.subscription.clone() else {
-            return self.fail(WebhookError::NotFinished);
-        };
-        match self.record_effect(&subscription) {
-            Ok(effect) => {
-                self.state = State::WriteRecord { previous };
-                smallvec![effect]
-            }
-            Err(error) => self.fail(error.into()),
-        }
-    }
-
-    fn drop_secret(&mut self, previous: Option<Ulid>) -> Effects {
-        match previous {
-            None => self.done(),
-            Some(previous) => {
-                self.state = State::DeleteSecret;
-                smallvec![delete_secret(secret_entry(previous), None)]
-            }
-        }
-    }
+    let config = realm_config(ctx, owner).await?;
+    let secret: [u8; 32] = rand::random();
+    let sealed_secret = SecretBytes::new(secret.to_vec());
+    let build = |version: u64, id: Ulid| {
+        let sealed = seal_setting(
+            &owner.realm_id,
+            SettingChannel::Webhook,
+            &owner,
+            id,
+            &sealed_secret,
+        )
+        .map_err(|error| SettingError::Build(error.to_string()))?;
+        webhook_bytes(owner, id, version, Some(url.clone()), Some(sealed))
+    };
+    let subscription = write_webhook(ctx, local, &config, owner, &build).await?;
+    Ok(WebhookOutcome {
+        subscription,
+        secret: hex::encode(secret),
+    })
 }
 
-impl Operation for WebhookOperation {
-    type Output = WebhookOutcome;
-    type Error = WebhookError;
-
-    fn start(&mut self) -> Effects {
-        self.state = State::Read;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: WEBHOOK_KEYSPACE.to_string(),
-            key: webhook_key(&self.user_id).into(),
-            txn_id: None,
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match std::mem::replace(&mut self.state, State::Done) {
-            State::Read => self.handle_read(event),
-            State::WriteSecret { previous } => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.after_secret(previous),
-                other => self.unexpected(other),
-            },
-            State::WriteRecord { previous } => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.drop_secret(previous),
-                other => self.unexpected(other),
-            },
-            State::DeleteRecord { previous } => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                    self.drop_secret(Some(previous))
-                }
-                other => self.unexpected(other),
-            },
-            State::DeleteSecret => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => self.done(),
-                other => self.unexpected(other),
-            },
-            State::Init | State::Done => self.unexpected(event),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(WebhookError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
+/// Turns the webhook off with a newer setting; queued deliveries then send nothing.
+pub async fn remove_webhook(
+    ctx: &DriverContext,
+    local: NodeId,
+    owner: UserId,
+) -> Result<(), WebhookError> {
+    let config = realm_config(ctx, owner).await?;
+    let build = |version: u64, id: Ulid| webhook_bytes(owner, id, version, None, None);
+    write_webhook(ctx, local, &config, owner, &build)
+        .await
+        .map(|_| ())
 }
 
-fn secret_entry(subscription_id: Ulid) -> VaultEntry {
-    VaultEntry::new(VaultPurpose::Webhook, subscription_id)
+async fn write_webhook(
+    ctx: &DriverContext,
+    local: NodeId,
+    config: &RealmConfigDocument,
+    owner: UserId,
+    build: &(dyn Fn(u64, Ulid) -> Result<Vec<u8>, SettingError> + Sync),
+) -> Result<WebhookSubscription, WebhookError> {
+    let peers = MetadataPeers { ctx, local };
+    let managers = managers(config);
+    let channel = SettingChannel::Webhook;
+    let bytes = write_setting(ctx, &peers, local, &managers, channel, owner, build).await?;
+    Ok(WebhookSubscription::from_bytes(&bytes)?)
 }
 
-fn valid_url(url: &str) -> bool {
-    url.len() <= URL_BYTES
-        && url::Url::parse(url).is_ok_and(|parsed| {
-            matches!(parsed.scheme(), "http" | "https")
-                && parsed.username().is_empty()
-                && parsed.password().is_none()
-                && parsed.host().is_some()
-        })
+fn webhook_bytes(
+    owner: UserId,
+    id: Ulid,
+    version: u64,
+    url: Option<String>,
+    sealed: Option<Vec<u8>>,
+) -> Result<Vec<u8>, SettingError> {
+    let subscription = WebhookSubscription {
+        subscription_id: id,
+        user_id: owner,
+        version,
+        url,
+        sealed,
+        created_at_ms: unix_timestamp_millis(),
+    };
+    subscription
+        .to_bytes()
+        .map_err(|error| SettingError::Build(error.to_string()))
 }
 
-/// Queues one delivery job per held share upload notification whose recipient subscribed here.
-/// The notification id deduplicates; a failure is returned so the sender delivers again.
+async fn realm_config(
+    ctx: &DriverContext,
+    owner: UserId,
+) -> Result<RealmConfigDocument, SettingError> {
+    drive(GetConfigOperation::new(owner.realm_id), ctx)
+        .await
+        .map_err(|error| SettingError::Config(error.to_string()))
+}
+
+/// Queues one delivery job per held share upload notification, whatever the settings say now;
+/// the job decides from a quorum read. The notification id deduplicates; a failure is returned
+/// so the sender delivers again.
 pub async fn enqueue_webhooks(
     context: &DriverContext,
     owner_node_id: NodeId,
@@ -284,24 +168,10 @@ pub async fn enqueue_webhooks(
         if !matches!(record.kind, NotificationKind::ShareUpload { .. }) {
             continue;
         }
-        let read = drive(
-            WebhookOperation::new(record.recipient, WebhookAction::Read),
-            context,
-        )
-        .await;
-        let subscription = match read {
-            Ok(WebhookOutcome {
-                subscription: Some(subscription),
-                ..
-            }) => subscription,
-            Ok(_) => continue,
-            Err(error) => return Err(format!("webhook subscription read: {error}")),
-        };
         let dedup_key = user_dedup_key(
             record.recipient,
             &format!("webhook/{}", record.notification_id),
         );
-        // A queued job keeps the settings it was queued with, so changed settings never conflict.
         let queued = find_dedup_job(context, record.recipient, &dedup_key).await;
         if queued
             .map_err(|error| format!("webhook delivery lookup: {error}"))?
@@ -314,7 +184,7 @@ pub async fn enqueue_webhooks(
             let job_id = mint_local_job(context, realm_id, owner_node_id, Some(&dedup_key)).await?;
             let spec = SubmitJobSpec {
                 payload: JobPayload::WebhookDelivery(WebhookDeliverySpec {
-                    subscription_id: subscription.subscription_id,
+                    subscription_id: Ulid::nil(),
                     notification: record.clone(),
                 }),
                 created_by: record.recipient,
@@ -335,10 +205,60 @@ pub async fn enqueue_webhooks(
     Ok(())
 }
 
-/// Sends one signed delivery. A missing or replaced subscription sends nothing; a 4xx answer
-/// other than 408 and 429 is permanent, and everything else is retried by the job runtime.
+/// Sends one signed delivery when a quorum of management nodes says the webhook is on. A 4xx
+/// answer other than 408 and 429 is permanent; a short quorum waits without an attempt.
 pub async fn run_webhook_job(ctx: &JobContext, spec: &WebhookDeliverySpec) -> JobRunOutcome {
-    match deliver(ctx, spec).await {
+    let Some(metadata) = ctx.driver.metadata_handle.as_ref() else {
+        return no_transport();
+    };
+    let local = (ctx.driver.net_handle.as_ref()).map_or(ctx.owner_node_id, |net| net.node_id());
+    let peers = MetadataPeers {
+        ctx: &ctx.driver,
+        local,
+    };
+    let now_ms = unix_timestamp_millis();
+    deliver_webhook(ctx, spec, &peers, metadata.setting_backoffs(), now_ms).await
+}
+
+pub(crate) async fn deliver_webhook(
+    ctx: &JobContext,
+    spec: &WebhookDeliverySpec,
+    peers: &dyn SettingPeers,
+    backoffs: &Backoffs,
+    now_ms: u64,
+) -> JobRunOutcome {
+    let recipient = spec.notification.recipient;
+    let config = drive(GetConfigOperation::new(recipient.realm_id), &ctx.driver).await;
+    let managers = config.ok().map(|config| managers(&config));
+    let record = &spec.notification;
+    let channel = SettingChannel::Webhook;
+    let delivery = delivery_setting(
+        peers,
+        backoffs,
+        record,
+        channel,
+        managers.as_deref(),
+        now_ms,
+    );
+    let delivery = tokio::select! {
+        biased;
+        () = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,
+        () = ctx.shutdown.cancelled() => return JobRunOutcome::Interrupted,
+        delivery = delivery => delivery,
+    };
+    let winner = match delivery {
+        Delivery::Skip => {
+            return JobRunOutcome::Succeeded(JobResultPayload::Webhook { status: None });
+        }
+        Delivery::Wait(error, delay) => return JobRunOutcome::DeferredFor(error, delay),
+        Delivery::Send(winner) => winner,
+    };
+    let subscription = WebhookSubscription::from_bytes(&winner.bytes).ok();
+    let (Some(url), Some(secret)) = (subscription.and_then(|found| found.url), winner.secret)
+    else {
+        return JobRunOutcome::Succeeded(JobResultPayload::Webhook { status: None });
+    };
+    match deliver(ctx, spec, &url, secret.expose()).await {
         Ok(status) => JobRunOutcome::Succeeded(JobResultPayload::Webhook { status }),
         Err(Failure::Cancelled) => JobRunOutcome::Cancelled,
         Err(Failure::Interrupted) => JobRunOutcome::Interrupted,
@@ -352,38 +272,17 @@ enum Failure {
     Job(JobError),
 }
 
-async fn deliver(ctx: &JobContext, spec: &WebhookDeliverySpec) -> Result<Option<u16>, Failure> {
-    let recipient = spec.notification.recipient;
-    let read = drive(
-        WebhookOperation::new(recipient, WebhookAction::Read),
-        &ctx.driver,
-    )
-    .await;
-    let subscription = match read {
-        Ok(outcome) => outcome.subscription,
-        Err(error) => return Err(retryable(error.to_string())),
-    };
-    let Some(subscription) =
-        subscription.filter(|found| found.subscription_id == spec.subscription_id)
-    else {
-        return Ok(None);
-    };
+async fn deliver(
+    ctx: &JobContext,
+    spec: &WebhookDeliverySpec,
+    url: &str,
+    secret: &[u8],
+) -> Result<Option<u16>, Failure> {
     let body = spec
         .body()
         .ok_or_else(|| permanent("only share upload notifications are delivered"))?;
     let body = serde_json::to_vec(&body).map_err(|error| permanent(error.to_string()))?;
-    let entry = secret_entry(subscription.subscription_id);
-    let event = ctx
-        .driver
-        .storage_handle
-        .send_effect(read_secret(entry, None))
-        .await;
-    let secret = parse_secret(event, entry, |bytes| {
-        Ok::<_, ConversionError>(bytes.to_vec())
-    })
-    .map_err(|error| retryable(error.to_string()))?
-    .ok_or_else(|| permanent("the webhook signing secret is missing"))?;
-    let url = url::Url::parse(&subscription.url).map_err(|error| permanent(error.to_string()))?;
+    let url = url::Url::parse(url).map_err(|error| permanent(error.to_string()))?;
     let blob = ctx
         .driver
         .blob_handle
@@ -398,7 +297,7 @@ async fn deliver(ctx: &JobContext, spec: &WebhookDeliverySpec) -> Result<Option<
             DELIVERY_HEADER,
             spec.notification.notification_id.to_string(),
         )
-        .header(SIGNATURE_HEADER, sign_delivery(&secret, timestamp, &body))
+        .header(SIGNATURE_HEADER, sign_delivery(secret, timestamp, &body))
         .body(body);
     let response = tokio::select! {
         biased;

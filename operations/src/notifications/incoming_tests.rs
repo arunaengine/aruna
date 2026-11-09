@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::drive;
 use crate::jobs::store::find_dedup_plan;
 use crate::metadata::api::load_realm_config;
 use crate::notifications::client::{
@@ -14,13 +13,11 @@ use crate::notifications::inbox::upsert_inbox_records;
 use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, create_local_watch, list_watch_subscriptions,
 };
-use crate::notifications::webhook::{WebhookAction, WebhookOperation};
 use crate::sync::incoming::initialize_incoming_fixture;
 use aruna_core::UserId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, WATCH_INTEREST_KEYSPACE,
 };
-use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::execution::job::user_dedup_key;
 use aruna_core::structs::execution::notification::{
@@ -309,21 +306,13 @@ async fn delivery_pair(realm_seed: u8) -> (Node, Node, UserId) {
     (a, b, recipient)
 }
 
-/// Two nodes whose holder `b` keeps a webhook subscription for the returned recipient. The
-/// stored realm config gives `b` no job control yet.
+/// Two nodes whose holder `b` queues a webhook job for every upload of the returned recipient.
+/// The stored realm config gives `b` no job control yet.
 async fn webhook_pair(realm_seed: u8) -> (Node, Node, UserId, RealmConfigDocument) {
     let (a, b, recipient) = delivery_pair(realm_seed).await;
     let config = load_realm_config(&b.context, recipient.realm_id)
         .await
         .expect("realm config");
-    b.context.storage_handle.open_vault(NodeVaultKey::random());
-    let url = "https://hooks.example.org/aruna".to_string();
-    drive(
-        WebhookOperation::new(recipient, WebhookAction::Set { url }),
-        &b.context,
-    )
-    .await
-    .expect("webhook subscription");
     (a, b, recipient, config)
 }
 

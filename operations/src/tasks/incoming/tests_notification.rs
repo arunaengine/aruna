@@ -233,14 +233,6 @@ async fn drain_retries_queueing() {
         task_handle: None,
         compute_handle: None,
     });
-    let url = "https://hooks.example.org/aruna".to_string();
-    let subscribe = crate::notifications::webhook::WebhookOperation::new(
-        recipient,
-        crate::notifications::webhook::WebhookAction::Set { url },
-    );
-    crate::driver::drive(subscribe, &context)
-        .await
-        .expect("webhook subscription");
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     handler.drain_notification_outbox().await;
 
