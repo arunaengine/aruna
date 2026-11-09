@@ -137,6 +137,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(search::router())
         .merge(secrets::node::router())
         .merge(secrets::realm::router())
+        .merge(secrets::group::router())
         .merge(shares::router())
         .merge(access::service_accounts::router())
         .merge(access::sessions::router())
@@ -467,6 +468,12 @@ pub(crate) mod tests {
         ("PUT", "/system/realm/secrets/{name}"),
         ("DELETE", "/system/realm/secrets/{name}"),
         ("POST", "/system/realm/secrets/{name}/rotate"),
+        ("GET", "/data/groups/{group_id}/secrets"),
+        ("POST", "/data/groups/{group_id}/secrets"),
+        ("GET", "/data/groups/{group_id}/secrets/{name}"),
+        ("PUT", "/data/groups/{group_id}/secrets/{name}"),
+        ("DELETE", "/data/groups/{group_id}/secrets/{name}"),
+        ("POST", "/data/groups/{group_id}/secrets/{name}/rotate"),
         ("GET", "/system/realm/federation"),
         ("GET", "/system/realm/placement"),
         ("GET", "/system/realm/portal-features"),
