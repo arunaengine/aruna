@@ -137,6 +137,8 @@ pub enum PortalConfig {
         artifact: PortalArtifactConfig,
         socket_addr: SocketAddr,
         login: Option<aruna_api::portal::PortalLogin>,
+        landing: bool,
+        legal: Vec<aruna_api::portal::LegalDocument>,
     },
 }
 

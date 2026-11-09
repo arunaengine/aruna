@@ -413,7 +413,11 @@ async fn bind_portal(
     shutdown: &Shutdown,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, Box<dyn std::error::Error>> {
     let PortalConfig::Artifact {
-        socket_addr, login, ..
+        socket_addr,
+        login,
+        landing,
+        legal,
+        ..
     } = portal
     else {
         return Ok(None);
@@ -429,6 +433,8 @@ async fn bind_portal(
         csp,
         registry_url,
         login: login.clone(),
+        landing: *landing,
+        legal: legal.clone(),
     };
     let token = shutdown.token();
     let handle = tokio::spawn(async move {
