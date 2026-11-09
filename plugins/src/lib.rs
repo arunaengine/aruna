@@ -17,4 +17,15 @@ mod imports;
 #[cfg(feature = "runtime")]
 pub mod limits;
 #[cfg(feature = "runtime")]
+mod runtime;
+
+#[cfg(feature = "runtime")]
 pub use host::Limit;
+#[cfg(feature = "runtime")]
+pub use host::wit::aruna::plugin::types::{
+    Failure, FailureKind, Trigger, WatchEvent, WebhookDelivery, WebhookRequest,
+};
+#[cfg(feature = "runtime")]
+pub use runtime::{CompileError, Compiled, Invocation, InvokeError, Runtime};
+#[cfg(feature = "runtime")]
+pub use tokio_util::sync::CancellationToken;
