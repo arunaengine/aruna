@@ -1,5 +1,5 @@
 //! Tests that notifications cross nodes, survive an outage and stay idempotent on retry, and
-//! that notification settings decide from a quorum of management nodes.
+//! that replicated notification settings converge and decide on every node.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -819,8 +819,8 @@ async fn settings_follow_inbox() -> TestResult<()> {
 
 #[tokio::test]
 async fn racing_writes_converge() -> TestResult<()> {
-    // A and S write without seeing each other; once both writes arrive, every node keeps the one
-    // with the higher stamp.
+    // A and S write close together; whether or not S saw A's write, every node keeps the one
+    // with the higher stamp. Equal-counter tie-breaks are covered in core/src/register.rs.
     let realm = SettingRealm::spawn(83).await?;
     let owner = UserId::local(Ulid::generate(), realm.realm_id);
     let first = realm.set(0, owner, HOOK_URL).await?.subscription;
@@ -828,7 +828,6 @@ async fn racing_writes_converge() -> TestResult<()> {
         .set(3, owner, "https://hooks.example.org/other")
         .await?
         .subscription;
-    assert_eq!((first.stamp.counter, second.stamp.counter), (1, 1));
     let kept = [first, second].into_iter().max_by_key(|write| write.stamp);
     for index in 0..4 {
         realm
