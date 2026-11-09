@@ -23,6 +23,7 @@ pub mod handle;
 pub mod handoff;
 pub mod heartbeat;
 pub mod id;
+pub mod injection;
 pub mod jobs;
 pub mod join_request;
 pub mod key_seal;
