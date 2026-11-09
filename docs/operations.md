@@ -15,7 +15,8 @@ the [README](../README.md) to get a node running.
   with its default.
 - **Ports.** `3000` serves REST and the Swagger UI, `1337` S3, `3001` UDP for connections between
   nodes, `3002` health and metrics, and `3003` the portal. Inside a container, bind `0.0.0.0` for
-  every port you publish. Port `3002` has no authentication, so publish it on loopback only.
+  every port you publish. Port `3002` has no authentication, so publish it on loopback only. With
+  [native HTTPS](#native-https), one more port serves all three over TLS.
 - **Data folder.** Everything below `STORAGE_PATH` is node state: the database, metadata, document
   sync, Git repositories, the node identity and, by default, the stored files (`blobstore`). One
   volume at `STORAGE_PATH` holds all of it unless you point `BLOB_ROOT` or `BLOB_BACKENDS_PATH`
@@ -62,6 +63,69 @@ the [README](../README.md) to get a node running.
   Both kinds can also be mixed in one list.
 - **Compute.** `ARUNA_COMPUTE_EXECUTOR` is `none` by default. The `docker` executor needs the host's
   Docker socket and an S3 address that job containers can reach.
+
+## Native HTTPS
+
+A node can serve HTTPS itself, so a Docker or Compose installation needs no separate proxy. Plain
+HTTP behind an existing ingress stays the default.
+
+- **Turn it on.** Set `HTTPS_SOCKET_ADDRESS`, `HTTPS_CERTIFICATE_PATH` and `HTTPS_KEY_PATH`. The
+  certificate file holds the leaf first, then its intermediates. The key file holds one private
+  key. Without `HTTPS_SOCKET_ADDRESS`, every other HTTPS setting must stay unset.
+- **Hostnames.** One HTTPS port serves REST and MCP on the host of `API_PUBLIC_URL`, S3 on the host
+  of `S3_PUBLIC_URL` and its subdomains, and the portal on the host of `PORTAL_PUBLIC_URL`. These
+  URLs must be `https` origins with a domain name and no path, query or user; a port is allowed.
+  `S3_HOST` must name the same host as `S3_PUBLIC_URL`. With a portal, `CORS_ALLOWED_ORIGINS` must
+  allow the portal origin.
+- **Domain names only.** Clients must connect by name. A client that connects by IP address sends
+  no server name and is refused. Health checks keep using the private port `3002`.
+- **Certificate checks.** The node checks the pair at start and refuses to start on any problem:
+  the key must fit, the chain must be complete and valid now, and the certificate must cover every
+  hostname. Chains are trusted up to the public root certificates built into Aruna. For a private
+  CA or a self-signed certificate, list it in `HTTPS_CA_PATH`.
+- **Renewal.** The node checks the files every 60 seconds and on `SIGHUP`. A new pair replaces the
+  active one only when it passes every check; otherwise the active pair stays and the node logs
+  the reason. Replace each file atomically: write it under a temporary name in the same folder and
+  rename it, as certbot does. Mount the folder, not single files, so renames are seen.
+- **Redirect.** `REDIRECT_SOCKET_ADDRESS` adds a plain listener that answers `308` with the same
+  path and query on the configured HTTPS origin. Unknown hosts get `400`. Configure S3 clients with
+  the HTTPS endpoint; do not rely on the redirect.
+- **S3 buckets as hostnames.** Requests like `bucket.s3.example.org` need a wildcard certificate for
+  `*.s3.example.org`. It covers bucket names with one label only; buckets with dots in their names
+  need path-style requests.
+- **Sign-in.** Add the HTTPS portal origin to the redirect URIs and web origins of the OIDC client
+  at your identity provider.
+- **Other ports.** `SOCKET_ADDRESS`, `S3_ADDRESS` and `PORTAL_SOCKET_ADDRESS` keep serving plain
+  HTTP. Do not publish them on the host; job containers still reach S3 on the container network.
+
+The container can listen on unprivileged ports and Docker maps host ports `80` and `443` to them:
+
+```yaml
+services:
+  aruna:
+    image: harbor.computational.bio.uni-giessen.de/aruna/aruna:<tag>
+    ports:
+      - "443:8443"
+      - "80:8080"
+      - "3001:3001/udp"
+    volumes:
+      - aruna-data:/data
+      - ./tls:/tls:ro
+    environment:
+      HTTPS_SOCKET_ADDRESS: 0.0.0.0:8443
+      HTTPS_CERTIFICATE_PATH: /tls/fullchain.pem
+      HTTPS_KEY_PATH: /tls/privkey.pem
+      REDIRECT_SOCKET_ADDRESS: 0.0.0.0:8080
+      API_PUBLIC_URL: https://api.example.org
+      S3_PUBLIC_URL: https://s3.example.org
+      S3_HOST: s3.example.org
+      PORTAL_PUBLIC_URL: https://portal.example.org
+      CORS_ALLOWED_ORIGINS: https://portal.example.org
+      SOCKET_ADDRESS: 0.0.0.0:3000
+      S3_ADDRESS: 0.0.0.0:1337
+      PORTAL_SOCKET_ADDRESS: 127.0.0.1:3003
+      P2P_SOCKET_ADDRESS: 0.0.0.0:3001
+```
 
 ## Settings to check
 
