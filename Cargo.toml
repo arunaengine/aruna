@@ -17,6 +17,7 @@ members = [
     "operations",
     "aruna-doctor",
     "cli",
+    "plugins",
     "registry",
     "scripts/compute-helper",
 ]
@@ -43,6 +44,8 @@ aruna-compute = { path = "compute", default-features = false }
 aruna-core = { path = "core" }
 aruna-net = { path = "net" }
 aruna-operations = { path = "operations" }
+aruna-plugin = { path = "plugins/sdk" }
+aruna-plugins = { path = "plugins", default-features = false }
 aruna-storage = { path = "storage" }
 aruna-tasks = { path = "tasks" }
 
@@ -261,6 +264,19 @@ utoipa-axum = "0.3.0"
 utoipa-swagger-ui = { version = "10.0.1", features = ["axum"] }
 # Exact: the portal's wasm-bindgen-cli must match this version.
 wasm-bindgen = "=0.2.127"
+# Plugin runtime: wit-bindgen 0.61 and wasm-tools 0.258 match the component async ABI of wasmtime 49.
+wasm-encoder = "0.258.3"
+wasmparser = { version = "0.258.3", default-features = false, features = ["component-model", "std"] }
+wasmtime = { version = "49.0.5", default-features = false, features = [
+    "async",
+    "component-model",
+    "component-model-async",
+    "cranelift",
+    "runtime",
+    "std",
+] }
+wit-bindgen = "0.61.1"
+wit-component = "0.258.3"
 windows-native-keyring-store = "1.1.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }

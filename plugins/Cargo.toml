@@ -1,0 +1,36 @@
+# Manifest of aruna-plugins: plugin manifests, artifact sections and the WASM component runtime.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["runtime"]
+# The Wasmtime runtime; without it the crate only reads, checks and writes plugin artifacts.
+runtime = ["dep:async-trait", "dep:lru", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:wasmtime"]
+
+[dependencies]
+async-trait = { workspace = true, optional = true }
+hex = { workspace = true }
+lru = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+url = { workspace = true }
+wasm-encoder = { workspace = true }
+wasmparser = { workspace = true }
+wasmtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+toml = { workspace = true }
