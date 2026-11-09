@@ -633,6 +633,21 @@ fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> R
                 return Err("share upload notification has empty bucket, group or key".to_string());
             }
         }
+        NotificationKind::SecretUseWidened {
+            name,
+            group_id,
+            node_id,
+            actor_user_id,
+        } => {
+            let named = aruna_core::secrets::SecretName::try_from(name.clone()).is_ok();
+            if !named
+                || group_id.is_some_and(|id| id.is_nil())
+                || (group_id.is_some() && node_id.is_some())
+            {
+                return Err("secret notice has an invalid name or scope".to_string());
+            }
+            validate_kind_user("actor_user_id", actor_user_id, recipient_realm)?;
+        }
     }
     Ok(())
 }

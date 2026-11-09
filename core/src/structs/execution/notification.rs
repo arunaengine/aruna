@@ -127,6 +127,14 @@ pub enum NotificationKind {
         node_id: NodeId,
         group_id: GroupId,
     },
+    /// A manager widened who may use a named secret, or how. The group names a group secret,
+    /// the node a node secret; neither names a realm secret.
+    SecretUseWidened {
+        name: String,
+        group_id: Option<GroupId>,
+        node_id: Option<NodeId>,
+        actor_user_id: UserId,
+    },
 }
 
 impl NotificationKind {
@@ -148,6 +156,7 @@ impl NotificationKind {
             | NotificationKind::BucketKeyPending { .. } => "bucket.encryption",
             NotificationKind::ShareUpload { .. } => "share.upload",
             NotificationKind::BucketDeleted { .. } => "bucket.deleted",
+            NotificationKind::SecretUseWidened { .. } => "secret.use",
         }
     }
 
@@ -168,6 +177,7 @@ impl NotificationKind {
             NotificationKind::BucketKeyPending { .. } => "bucket_key_pending",
             NotificationKind::ShareUpload { .. } => "share_upload",
             NotificationKind::BucketDeleted { .. } => "bucket_deleted",
+            NotificationKind::SecretUseWidened { .. } => "secret_use_widened",
         }
     }
 
@@ -308,6 +318,14 @@ pub enum ResourceEvent {
     GroupJoinRequested {
         group_id: GroupId,
         request_id: Ulid,
+        actor_user_id: UserId,
+    },
+    /// Goes to the managers of the secret, the acting one included, since a stolen session
+    /// could widen use.
+    SecretUseWidened {
+        name: String,
+        group_id: Option<GroupId>,
+        node_id: Option<NodeId>,
         actor_user_id: UserId,
     },
 }
