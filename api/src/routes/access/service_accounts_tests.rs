@@ -234,6 +234,7 @@ async fn audit_rows_scoped() {
                 group_id,
                 cursor,
                 limit: Some(1),
+                me: None,
             }),
         )
     };

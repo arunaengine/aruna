@@ -1,10 +1,14 @@
-//! Route that reads this node's retained administrative audit rows for the realm or a group.
+//! Route that reads this node's retained administrative audit rows for the realm, a group or the
+//! caller's own secrets.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
+use aruna_core::secrets::SecretScope;
+use aruna_core::structs::identity::admin_audit::{
+    AdminAuditAction, AdminAuditRecord, AuditIndex, SecretAudit,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::policy_authority_path;
 use aruna_operations::driver::drive;
@@ -36,6 +40,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 pub struct AdminAuditQuery {
     /// Reads only the rows of this group; without it the realm rows are read.
     pub group_id: Option<String>,
+    /// Reads only the rows about the caller's own user secrets; needs no admin grant.
+    pub me: Option<bool>,
     /// The `next_cursor` of the previous page.
     pub cursor: Option<String>,
     /// Rows per page, 1 to 200, default 50.
@@ -54,8 +60,25 @@ pub struct AdminAuditRow {
     pub group_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The secret a secret row is about; never its value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<AuditSecret>,
     pub result: String,
     pub recorded_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct AuditSecret {
+    /// `node`, `realm`, `group` or `user`.
+    pub scope: String,
+    /// The owning group or user for `group` and `user` secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -75,17 +98,22 @@ pub struct AdminAuditPage {
     description = r#"Lists the administrative changes this node made, oldest first, one page at a time.
 
 **Authentication**: realm bearer token without path restrictions. The realm rows need WRITE on
-`/{realm}/admin/config`; the rows of one group need WRITE on `/{realm}/g/{group}/admin`.
+`/{realm}/admin/config`; the rows of one group need WRITE on `/{realm}/g/{group}/admin`. With
+`me=true` the caller reads the rows about their own user secrets and needs no grant.
 
 **Behavior**
-- Recorded changes are account deactivation and reactivation, service account creation and the
-  issuance of a token with path restrictions. Each row names the actor, the target account, the
-  owning group when there is one, the session of an issued token and the result `succeeded`.
+- Recorded changes are account deactivation and reactivation, service account creation, the
+  issuance of a token with path restrictions, and the creation, replacement, rotation, deletion
+  and owner read-back of named secrets. Each row names the actor, the target account, the owning
+  group when there is one, the session of an issued token, the secret (scope, owner, name, never
+  its value) and the result `succeeded`.
 - A row is written only after its change succeeded on this node; denied or failed attempts and
   changes made on other nodes are absent, so every page reports `partial` as true.
 - The realm rows hold every recorded change. The rows of a group hold the changes to its service
-  accounts and their tokens, never other targets.
-- Tokens and path restrictions are never recorded.
+  accounts, their tokens and its secrets, never other targets. The `me` rows hold the changes to
+  and read-backs of the caller's user secrets. A secret row records what this node did, also
+  when a concurrent write on another node later replaced it.
+- Tokens, path restrictions and secret values are never recorded.
 
 **Limits**
 - At most 200 rows per page, 50 by default; follow `next_cursor` for more.
@@ -103,11 +131,26 @@ pub struct AdminAuditPage {
                 "group_id": "01JABCDEF0123456789ABCDEFG",
                 "result": "succeeded",
                 "recorded_at_ms": 1762160400000u64
+            }, {
+                "audit_id": "01JAUDT00123456789ABCDEFGJ",
+                "action": "secret_rotated",
+                "actor": "01JUSER00123456789ABCDEFGH@01JREALM0123456789ABCDEFG",
+                "target": "01JUSER00123456789ABCDEFGH@01JREALM0123456789ABCDEFG",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "secret": {
+                    "scope": "group",
+                    "owner": "01JABCDEF0123456789ABCDEFG",
+                    "name": "catalog-key",
+                    "incarnation": "01JINCR00123456789ABCDEFGH",
+                    "write_id": "01JWRIT00123456789ABCDEFGH"
+                },
+                "result": "succeeded",
+                "recorded_at_ms": 1762160460000u64
             }],
             "next_cursor": "01JAUDT00123456789ABCDEFGH",
             "partial": true
         })),
-        (status = 400, description = "Invalid group id or cursor", body = ErrorResponse),
+        (status = 400, description = "Invalid group id or cursor, or `me` together with a group id", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or no administration grant for the scope", body = ErrorResponse)
     ),
@@ -120,17 +163,30 @@ pub async fn list_admin_audit(
 ) -> ServerResult<Json<AdminAuditPage>> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = query.group_id.as_deref().map(parse_group_id).transpose()?;
+    let own = query.me.unwrap_or(false);
+    if own && group_id.is_some() {
+        return Err(ServerError::BadRequestReason(
+            "me and group_id cannot be combined".to_string(),
+        ));
+    }
     let start_after = query
         .cursor
         .as_deref()
         .map(Ulid::from_string)
         .transpose()
         .map_err(|_| ServerError::BadRequestReason("cursor is not a ULID".to_string()))?;
-    let path = policy_authority_path(state.get_realm_id(), group_id);
-    ensure_permission(&state, &auth, path, Permission::WRITE).await?;
+    let index = match (own, group_id) {
+        (true, _) => AuditIndex::User(auth.user_id),
+        (false, Some(group_id)) => AuditIndex::Group(group_id),
+        (false, None) => AuditIndex::Realm,
+    };
+    if !own {
+        let path = policy_authority_path(state.get_realm_id(), group_id);
+        ensure_permission(&state, &auth, path, Permission::WRITE).await?;
+    }
     let page = drive(
         AuditPageOperation::new(AuditPageInput {
-            group_id,
+            index,
             start_after,
             limit: query.limit.unwrap_or(DEFAULT_LIMIT),
         }),
@@ -151,6 +207,11 @@ fn row(record: AdminAuditRecord) -> AdminAuditRow {
         AdminAuditAction::AccountReactivated => "account_reactivated",
         AdminAuditAction::ServiceAccountCreated => "service_account_created",
         AdminAuditAction::RestrictedTokenIssued => "restricted_token_issued",
+        AdminAuditAction::SecretCreated => "secret_created",
+        AdminAuditAction::SecretReplaced => "secret_replaced",
+        AdminAuditAction::SecretRotated => "secret_rotated",
+        AdminAuditAction::SecretDeleted => "secret_deleted",
+        AdminAuditAction::SecretRead => "secret_read",
     };
     AdminAuditRow {
         audit_id: record.audit_id.to_string(),
@@ -159,7 +220,24 @@ fn row(record: AdminAuditRecord) -> AdminAuditRow {
         target: record.target.to_string(),
         group_id: record.group_id.map(|id| id.to_string()),
         session_id: record.session_id,
+        secret: record.secret.map(audit_secret),
         result: "succeeded".to_string(),
         recorded_at_ms: record.audit_id.timestamp_ms(),
+    }
+}
+
+fn audit_secret(secret: SecretAudit) -> AuditSecret {
+    let (scope, owner) = match secret.scope {
+        SecretScope::Node => ("node", None),
+        SecretScope::Realm => ("realm", None),
+        SecretScope::Group(group_id) => ("group", Some(group_id.to_string())),
+        SecretScope::User(owner) => ("user", Some(owner.to_string())),
+    };
+    AuditSecret {
+        scope: scope.to_string(),
+        owner,
+        name: secret.name.to_string(),
+        incarnation: secret.incarnation.map(|id| id.to_string()),
+        write_id: secret.write_id.map(|id| id.to_string()),
     }
 }
