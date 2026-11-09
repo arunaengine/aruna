@@ -32,5 +32,6 @@ wasmparser = { workspace = true }
 wasmtime = { workspace = true, optional = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
