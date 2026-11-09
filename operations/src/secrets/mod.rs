@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod node;
+pub mod owner;
 pub mod realm;
 
 use aruna_core::UserId;
