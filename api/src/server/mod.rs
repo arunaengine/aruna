@@ -10,20 +10,17 @@ pub mod state;
 use crate::https::check_host;
 use crate::https::listener::CombinedListener;
 pub(crate) use crate::server::state::{ServerState, swagger_ui};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, Request};
+use axum::Router;
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::serve::{IncomingStream, Listener};
-use axum::{Extension, Router};
-use std::convert::Infallible;
+use axum::serve::Listener;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
-use tower::{Layer, service_fn};
 
 pub const MAX_BODY_SIZE: usize = 1024 * 1024;
 
@@ -152,16 +149,7 @@ impl Server {
         let tls_router = listener
             .host_check()
             .map(|check| router.clone().layer(from_fn_with_state(check, check_host)));
-        let connections = service_fn(move |incoming: IncomingStream<'_, CombinedListener>| {
-            let selected = match (incoming.io(), &tls_router) {
-                (Either::Right(_), Some(tls)) => tls.clone(),
-                _ => router.clone(),
-            };
-            let peer = ConnectInfo(*incoming.remote_addr());
-            std::future::ready(Ok::<_, Infallible>(Extension(peer).layer(selected)))
-        });
-        axum::serve(listener, connections)
-            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        crate::https::listener::serve_routers(listener, router, tls_router, shutdown)
             .await
             .map_err(|e| ServerSetupError::Runtime(e.to_string()))?;
 
