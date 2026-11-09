@@ -5,6 +5,7 @@
 pub mod group;
 pub mod node;
 pub mod realm;
+pub mod user;
 
 use std::collections::BTreeMap;
 use std::fmt;
