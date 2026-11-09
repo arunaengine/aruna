@@ -117,6 +117,8 @@ pub enum AdminDocumentError {
     InvalidVaultRecord,
     #[error("realm email profile needs a host, a sender and a username with its password")]
     InvalidEmailProfile,
+    #[error("published plugin entry is malformed or written to another version's path")]
+    InvalidPlugin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

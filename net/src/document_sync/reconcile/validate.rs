@@ -1679,6 +1679,19 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("realm secret record is malformed".to_string());
             }
         }
+        // The artifact was checked on the publishing management node; origin is in the authority.
+        AdminDocumentOperation::ConfigPluginSet {
+            name,
+            version,
+            plugin,
+        } => {
+            let matching = plugin.as_ref().is_none_or(|plugin| {
+                plugin.valid() && plugin.name == *name && plugin.version == *version
+            });
+            if !matching || !aruna_core::plugins::valid_name(name) {
+                return Err("published plugin entry is malformed".to_string());
+            }
+        }
         AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
@@ -1903,6 +1916,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::ConfigVaultSet { .. }
         | AdminDocumentOperation::ConfigEmailSet { .. }
         | AdminDocumentOperation::ConfigSecretSet { .. }
+        | AdminDocumentOperation::ConfigPluginSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
         AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
     };

@@ -121,6 +121,9 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::ConfigVaultSet { entry, .. } => vec![vault_entry_path(entry)],
         AdminDocumentOperation::ConfigEmailSet { .. } => vec![CONFIG_EMAIL_PATH.to_string()],
         AdminDocumentOperation::ConfigSecretSet { name, .. } => vec![secret_info_path(name)],
+        AdminDocumentOperation::ConfigPluginSet { name, version, .. } => {
+            vec![plugin_entry_path(name, version)]
+        }
         AdminDocumentOperation::NodeNameSet { node_id, .. } => vec![node_name_path(node_id)],
         AdminDocumentOperation::NodePlaceSet { node_id, .. } => vec![node_place_path(node_id)],
         AdminDocumentOperation::ConfigPoliciesSet { .. } => {
@@ -305,6 +308,13 @@ pub const SECRET_INFO_PREFIX: &str = "realm_config.secrets.";
 /// One path per named realm secret, `realm_config.secrets.<name>`.
 pub fn secret_info_path(name: &crate::secrets::SecretName) -> String {
     format!("{SECRET_INFO_PREFIX}{name}")
+}
+
+pub const PLUGIN_ENTRY_PREFIX: &str = "realm_config.plugins.";
+
+/// One path per published version, `realm_config.plugins.<name>@<version>`.
+pub fn plugin_entry_path(name: &str, version: &str) -> String {
+    format!("{PLUGIN_ENTRY_PREFIX}{name}@{version}")
 }
 
 pub fn config_oidc_path(provider_id: &str) -> String {

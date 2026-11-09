@@ -225,6 +225,8 @@ pub struct RealmConfigDocument {
     pub vault: Vec<crate::realm_vault::RealmVaultRecord>,
     /// Named realm secret records, sorted by name. A conflicting or deleted name is absent.
     pub secrets: Vec<crate::secrets::SecretRecord>,
+    /// Published plugin versions, sorted by name and version. A conflicting version is absent.
+    pub plugins: Vec<crate::plugins::PublishedPlugin>,
 }
 
 pub const MAX_PORTAL_FEATURES: usize = 64;
@@ -633,6 +635,7 @@ impl RealmConfigDocument {
             email: None,
             vault: Vec::new(),
             secrets: Vec::new(),
+            plugins: Vec::new(),
         }
     }
 
@@ -1346,6 +1349,7 @@ mod test {
             email: None,
             vault: Vec::new(),
             secrets: Vec::new(),
+            plugins: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -1960,6 +1964,7 @@ mod test {
             email: None,
             vault: Vec::new(),
             secrets: Vec::new(),
+            plugins: Vec::new(),
         };
 
         assert_eq!(document.replication_factor_for(other_group_id, None), 3);

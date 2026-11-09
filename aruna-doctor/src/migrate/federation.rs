@@ -163,6 +163,7 @@ impl From<LegacyConfig> for RealmConfigDocument {
             email: None,
             vault: Vec::new(),
             secrets: Vec::new(),
+            plugins: Vec::new(),
         }
     }
 }
