@@ -490,3 +490,6 @@ impl Operation for PublishEntryOperation {
     }
 }
 
+#[cfg(test)]
+#[path = "publish_tests.rs"]
+mod tests;
