@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -65,6 +65,8 @@ pub(crate) struct Started {
     pub tracker: TaskTracker,
     /// This run's writes, which settle before the run reports an outcome.
     pub writes: TaskTracker,
+    /// How long a write may take before its outcome counts as unknown.
+    pub deadline: std::time::Duration,
 }
 
 /// What one host call must be granted before it reaches the broker.
@@ -80,7 +82,7 @@ pub(crate) struct Session {
     broker: Arc<dyn Broker>,
     cx: CallContext,
     permissions: BTreeSet<Permission>,
-    connections: BTreeSet<String>,
+    connections: BTreeMap<String, Vec<String>>,
     tracker: TaskTracker,
     writes: TaskTracker,
     limits: Limits,
@@ -94,7 +96,8 @@ pub(crate) struct Session {
 
 pub(crate) struct Grants {
     pub permissions: BTreeSet<Permission>,
-    pub connections: BTreeSet<String>,
+    /// Granted connections and the response fields the manifest lets the code read.
+    pub connections: BTreeMap<String, Vec<String>>,
 }
 
 impl Session {
@@ -165,7 +168,7 @@ impl Session {
         let granted = match needs {
             Needs::Free => true,
             Needs::Permission(permission) => self.permissions.contains(&permission),
-            Needs::Connection(name) => self.connections.contains(name),
+            Needs::Connection(name) => self.connections.contains_key(name),
         };
         if !granted {
             let what = match needs {
@@ -174,6 +177,7 @@ impl Session {
                 Needs::Free => String::new(),
             };
             let message = format!("{what} is not granted to this install");
+            self.receive(message.len())?;
             return Ok(Err(HostError::new(ErrorKind::NotGranted, message)));
         }
         self.pending += 1;
@@ -185,7 +189,16 @@ impl Session {
             cx: self.cx.clone(),
             tracker: self.tracker.clone(),
             writes: self.writes.clone(),
+            deadline: self.limits.write,
         }))
+    }
+
+    /// The response fields a granted connection lets the code read; empty means status only.
+    pub(crate) fn response_fields(&self, connection: &str) -> Vec<String> {
+        self.connections
+            .get(connection)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn finish(&mut self, size: usize) -> wasmtime::Result<()> {

@@ -20,14 +20,14 @@ use crate::permission::Permission;
 const MAX_LOG: usize = 1024;
 
 /// Whether a broker call may be dropped with its guest or must finish recording.
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum Effect {
     Read,
-    Write,
+    Write(Intent),
 }
 
 /// Runs one broker call between the checks of `begin` and `finish`. Writes run as tasks
-/// tracked by the node and the run, so no guest end interrupts recording their outcome.
+/// tracked by the node and the run, so no guest end interrupts recording their outcome,
+/// and each has a deadline after which the broker records the outcome as unknown.
 async fn brokered<T: Send, R, F, Fut>(
     accessor: &Accessor<T, HasSelf<Session>>,
     size: usize,
@@ -45,23 +45,52 @@ where
         Ok(started) => started,
         Err(error) => return Ok(Err(error)),
     };
+    let (broker, cx, deadline) = (started.broker.clone(), started.cx.clone(), started.deadline);
     let future = call(started.broker, started.cx);
     let reply = match effect {
         Effect::Read => future.await,
-        Effect::Write => started
-            .tracker
-            .spawn(started.writes.track_future(future))
-            .await
-            .unwrap_or_else(|_| {
-                Err(HostError::new(
-                    ErrorKind::UnknownOutcome,
-                    "the host call ended without a result",
-                ))
-            }),
+        Effect::Write(intent) => {
+            let bounded = async move {
+                match tokio::time::timeout(deadline, future).await {
+                    Ok(reply) => reply,
+                    Err(_) => {
+                        // The effect may have happened; the begun intent stays unknown if this fails too.
+                        let _ =
+                            tokio::time::timeout(deadline, broker.abandoned(&cx, &intent)).await;
+                        Err(unknown("the host call did not finish in time"))
+                    }
+                }
+            };
+            (started
+                .tracker
+                .spawn(started.writes.track_future(bounded))
+                .await)
+                .unwrap_or_else(|_| Err(unknown("the host call ended without a result")))
+        }
     };
-    let size = reply.as_ref().map_or(0, reply_size);
+    let size = match &reply {
+        Ok(reply) => reply_size(reply),
+        Err(error) => error.message.len(),
+    };
     accessor.with(|mut access| access.get().finish(size))?;
     Ok(reply)
+}
+
+fn unknown(message: &str) -> HostError {
+    HostError::new(ErrorKind::UnknownOutcome, message)
+}
+
+/// Keeps only the allowed response fields, as an object keyed by JSON pointer; none means
+/// status only. An answer that is not JSON gives no fields.
+pub(crate) fn project(json: Option<String>, pointers: &[String]) -> Option<String> {
+    if pointers.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(json.as_deref()?).ok()?;
+    let fields: serde_json::Map<String, serde_json::Value> = (pointers.iter())
+        .filter_map(|pointer| Some((pointer.clone(), value.pointer(pointer)?.clone())))
+        .collect();
+    serde_json::to_string(&fields).ok()
 }
 
 fn ordinal<T: Send>(accessor: &Accessor<T, HasSelf<Session>>) -> u32 {
@@ -165,6 +194,7 @@ impl<T: Send> metadata_write::HostWithStore<T> for HasSelf<Session> {
             resource.len() + patch.len() + expected.len() + key.as_ref().map_or(0, String::len);
         let parts: [&[u8]; 3] = [resource.as_bytes(), patch.as_bytes(), expected.as_bytes()];
         let intent = Intent::new(ordinal(accessor), key, &parts);
+        let effect = Effect::Write(intent.clone());
         let patch = MetadataPatch {
             resource,
             patch,
@@ -174,7 +204,7 @@ impl<T: Send> metadata_write::HostWithStore<T> for HasSelf<Session> {
         brokered(
             accessor,
             size,
-            Effect::Write,
+            effect,
             Needs::Permission(Permission::MetadataWrite),
             |broker, cx| async move { broker.metadata_patch(&cx, patch).await },
             String::len,
@@ -248,6 +278,11 @@ impl<T: Send> connections::HostWithStore<T> for HasSelf<Session> {
             Intent::new(ordinal(accessor), request.key.clone(), &parts)
         });
         let connection = request.connection.clone();
+        let pointers = accessor.with(|mut access| access.get().response_fields(&connection));
+        let effect = match &intent {
+            Some(intent) => Effect::Write(intent.clone()),
+            None => Effect::Read,
+        };
         let outbound = SendRequest {
             connection: request.connection,
             method: request.method,
@@ -257,17 +292,16 @@ impl<T: Send> connections::HostWithStore<T> for HasSelf<Session> {
             body: request.body,
             intent,
         };
-        let effect = if mutating {
-            Effect::Write
-        } else {
-            Effect::Read
-        };
         brokered(
             accessor,
             size,
             effect,
             Needs::Connection(&connection),
-            |broker, cx| async move { broker.connection_send(&cx, outbound).await },
+            |broker, cx| async move {
+                let reply = broker.connection_send(&cx, outbound).await?;
+                let json = project(reply.json, &pointers);
+                Ok(Response { json, ..reply })
+            },
             |reply: &Response| reply.json.as_ref().map_or(0, String::len) + 2,
         )
         .await
@@ -297,15 +331,24 @@ impl<T: Send> state::HostWithStore<T> for HasSelf<Session> {
         expected: Option<u64>,
     ) -> wasmtime::Result<Result<u64, HostError>> {
         let size = key.len() + value.len();
+        let version = expected.map(u64::to_le_bytes);
+        let parts: [&[u8]; 3] = [
+            key.as_bytes(),
+            &value,
+            version.as_ref().map_or(&[][..], |v| &v[..]),
+        ];
+        let intent = Intent::new(ordinal(accessor), None, &parts);
+        let effect = Effect::Write(intent.clone());
         let put = StatePut {
             key,
             value,
             expected,
+            intent,
         };
         brokered(
             accessor,
             size,
-            Effect::Write,
+            effect,
             Needs::Free,
             |broker, cx| async move { broker.state_put(&cx, put).await },
             |_| 8,

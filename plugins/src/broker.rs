@@ -74,6 +74,7 @@ pub struct StatePut {
     pub key: String,
     pub value: Vec<u8>,
     pub expected: Option<u64>,
+    pub intent: Intent,
 }
 
 /// Runs host calls under the install's current grants and authority. The runtime has
@@ -107,6 +108,9 @@ pub trait Broker: Send + Sync {
     ) -> Result<Response, HostError>;
     async fn state_get(&self, cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError>;
     async fn state_put(&self, cx: &CallContext, put: StatePut) -> Result<u64, HostError>;
+    /// Records that a write did not finish within its deadline, so its outcome is unknown.
+    /// The run's slot is held until this returns or its own deadline passes.
+    async fn abandoned(&self, cx: &CallContext, intent: &Intent);
 }
 
 impl HostError {

@@ -13,6 +13,8 @@ pub struct Limits {
     pub fuel: u64,
     /// Wall-clock time, including awaited host calls.
     pub wall: Duration,
+    /// Longest a started write may take, even after the run ended; then its outcome is unknown.
+    pub write: Duration,
     /// Host calls, including log lines.
     pub calls: u32,
     /// Bytes moved through host calls in both directions, all calls together.
@@ -33,6 +35,7 @@ impl Default for Limits {
             memory: 64 << 20,
             fuel: 2_000_000_000,
             wall: Duration::from_secs(60),
+            write: Duration::from_secs(30),
             calls: 1_000,
             bytes: 16 << 20,
             call_bytes: 1 << 20,
@@ -50,6 +53,7 @@ impl Limits {
             memory: self.memory.min(ceiling.memory),
             fuel: self.fuel.min(ceiling.fuel),
             wall: self.wall.min(ceiling.wall),
+            write: self.write.min(ceiling.write),
             calls: self.calls.min(ceiling.calls),
             bytes: self.bytes.min(ceiling.bytes),
             call_bytes: self.call_bytes.min(ceiling.call_bytes),

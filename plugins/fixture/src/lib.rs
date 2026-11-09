@@ -1,7 +1,9 @@
 //! Test guest for the plugin runtime tests: probes host calls and exhausts each budget.
-//! Rebuild with `aruna-cli plugin build plugins/fixture` and copy it to plugins/tests/fixture.wasm.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// Rebuild: RUSTFLAGS="--remap-path-prefix=$HOME=~" aruna-cli plugin build plugins/fixture, then
+// copy target/wasm32-unknown-unknown/release/fixture-0.2.0.wasm to plugins/tests/fixture.wasm.
 
 use std::hint::black_box;
 
@@ -55,7 +57,14 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
                 .http(&text("connection"))
                 .send(method, &text("path"), body, None)
                 .await?;
-            json!({ "status": reply.status, "json": reply.json })
+            json!({ "status": reply.status, "fields": reply.fields })
+        }
+        "errors" => {
+            let mut failed = 0;
+            for _ in 0..1000 {
+                failed += u32::from(ctx.metadata().get("missing").await.is_err());
+            }
+            json!(failed)
         }
         "state" => {
             let state = ctx.state();

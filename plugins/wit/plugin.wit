@@ -157,7 +157,7 @@ interface connections {
     key: option<string>,
   }
 
-  /// The status, and the response fields the manifest lets the code read as a JSON object.
+  /// The status, and the response fields the manifest allows as a JSON object keyed by pointer.
   record response {
     status: u16,
     json: option<string>,

@@ -163,17 +163,15 @@ impl Objects {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Response {
     pub status: u16,
-    pub json: Option<Value>,
+    /// Allowed fields by JSON pointer, such as `/id`; the host drops everything else.
+    pub fields: serde_json::Map<String, Value>,
 }
 
 impl Response {
-    /// One allowed response field by JSON pointer, such as `/id`.
+    /// One allowed response field by its JSON pointer from the manifest, such as `/id`.
     pub fn field(&self, pointer: &str) -> Result<&Value> {
         let missing = || Error::failed(format!("the response has no field `{pointer}`"));
-        self.json
-            .as_ref()
-            .and_then(|json| json.pointer(pointer))
-            .ok_or_else(missing)
+        self.fields.get(pointer).ok_or_else(missing)
     }
 }
 
@@ -229,13 +227,13 @@ impl Http {
         };
         let reply = connections::send(request).await;
         let reply = reply.map_err(|err| Error::host(err, "connections.send", &self.name))?;
-        let json = reply
-            .json
-            .map(|text| serde_json::from_str(&text))
-            .transpose()?;
+        let fields = match reply.json {
+            Some(text) => serde_json::from_str(&text)?,
+            None => serde_json::Map::new(),
+        };
         Ok(Response {
             status: reply.status,
-            json,
+            fields,
         })
     }
 }

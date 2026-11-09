@@ -227,9 +227,13 @@ impl Runtime {
             max_bytes: limits.call_bytes,
         };
         let writes = TaskTracker::new();
+        let declared = &compiled.manifest.connections;
+        let connections = (call.connections.into_iter())
+            .filter_map(|name| Some((name.clone(), declared.get(&name)?.response.clone())))
+            .collect();
         let grants = Grants {
             permissions: call.permissions,
-            connections: call.connections,
+            connections,
         };
         let trackers = (self.inner.tracker.clone(), writes.clone());
         let session = Session::new(broker, cx, grants, trackers, limits);

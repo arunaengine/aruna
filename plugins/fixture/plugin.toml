@@ -16,7 +16,7 @@ api_key = { title = "API key" }
 url = "{api_url}/v1"
 methods = ["GET", "POST"]
 auth = "api_key"
-response = ["/id"]
+response = ["/id", "/meta/name", "/items/1"]
 
 [triggers]
 manual = { handler = "probe" }

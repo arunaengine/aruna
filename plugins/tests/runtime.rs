@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+#![cfg(feature = "runtime")]
+
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,6 +31,10 @@ const HANG_CAP: Duration = Duration::from_secs(120);
 struct Recorder {
     calls: Mutex<Vec<String>>,
     intents: Mutex<Vec<Intent>>,
+    /// Ordinals of writes whose outcome the runtime gave up on.
+    abandoned: Mutex<Vec<u32>>,
+    /// Signals that a call to the `block` resource is waiting.
+    blocked: tokio::sync::Notify,
 }
 
 impl Recorder {
@@ -43,6 +49,10 @@ impl Recorder {
     fn intents(&self) -> Vec<Intent> {
         self.intents.lock().unwrap().clone()
     }
+
+    fn abandoned(&self) -> Vec<u32> {
+        self.abandoned.lock().unwrap().clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -54,6 +64,14 @@ impl Broker for Recorder {
 
     async fn metadata_get(&self, _: &CallContext, resource: &str) -> Result<Document, HostError> {
         self.note("metadata_get");
+        match resource {
+            "missing" => return Err(HostError::new(ErrorKind::NotFound, "x".repeat(200))),
+            "block" => {
+                self.blocked.notify_one();
+                std::future::pending::<()>().await;
+            }
+            _ => {}
+        }
         Ok(Document {
             resource: resource.to_string(),
             revision: "r1".into(),
@@ -80,6 +98,12 @@ impl Broker for Recorder {
     ) -> Result<String, HostError> {
         self.note("metadata_patch");
         self.intents.lock().unwrap().push(patch.intent);
+        match patch.resource.as_str() {
+            "stall" => std::future::pending::<()>().await,
+            "slow" => tokio::time::sleep(Duration::from_millis(1500)).await,
+            _ => {}
+        }
+        self.note("metadata_patch_done");
         Ok(format!("{}+", patch.expected))
     }
 
@@ -111,9 +135,10 @@ impl Broker for Recorder {
         if let Some(intent) = request.intent {
             self.intents.lock().unwrap().push(intent);
         }
+        let answer = r#"{"id":"c-1","secret":"s","meta":{"name":"n","token":"t"},"items":[{"a":1},{"b":2}],"other":[1]}"#;
         Ok(Response {
             status: 201,
-            json: Some(r#"{"id":"c-1"}"#.into()),
+            json: Some(answer.into()),
         })
     }
 
@@ -125,9 +150,14 @@ impl Broker for Recorder {
         }))
     }
 
-    async fn state_put(&self, _: &CallContext, _: StatePut) -> Result<u64, HostError> {
+    async fn state_put(&self, _: &CallContext, put: StatePut) -> Result<u64, HostError> {
         self.note("state_put");
+        self.intents.lock().unwrap().push(put.intent);
         Ok(1)
+    }
+
+    async fn abandoned(&self, _: &CallContext, intent: &Intent) {
+        self.abandoned.lock().unwrap().push(intent.ordinal);
     }
 }
 
@@ -158,7 +188,14 @@ fn probe(input: serde_json::Value) -> Invocation {
 }
 
 async fn invoke(call: Invocation, broker: Arc<Recorder>) -> Result<Option<String>, InvokeError> {
-    let runtime = runtime();
+    invoke_on(&runtime(), call, broker).await
+}
+
+async fn invoke_on(
+    runtime: &Runtime,
+    call: Invocation,
+    broker: Arc<Recorder>,
+) -> Result<Option<String>, InvokeError> {
     let compiled = runtime.prepare(FIXTURE.to_vec()).await.unwrap();
     tokio::time::timeout(HANG_CAP, runtime.invoke(&compiled, call, broker))
         .await
@@ -201,7 +238,7 @@ async fn calls_reach_broker() {
     let sent = invoke(probe(serde_json::json!({"call": "send", "connection": "api", "method": "POST", "path": "/x", "body": {"a": 1}})), broker.clone()).await;
     assert_eq!(
         output(sent),
-        serde_json::json!({"status": 201, "json": {"id": "c-1"}})
+        serde_json::json!({"status": 201, "fields": {"/id": "c-1", "/meta/name": "n", "/items/1": {"b": 2}}})
     );
     let state = invoke(probe(serde_json::json!({"call": "state"})), broker.clone()).await;
     assert_eq!(
@@ -376,4 +413,107 @@ async fn compile_checks_imports() {
         .map(String::as_str)
         .collect();
     assert_eq!(handlers, ["chatty", "echo", "hoard", "probe", "spin"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_write_abandoned() {
+    let broker = Arc::new(Recorder::default());
+    let mut patch = probe(
+        serde_json::json!({"call": "metadata_patch", "resource": "stall", "patch": {}, "expected": "r1"}),
+    );
+    patch.limits.wall = Duration::from_secs(1);
+    patch.limits.write = Duration::from_secs(2);
+    let ended = invoke(patch, broker.clone()).await;
+    assert!(matches!(ended, Err(InvokeError::Timeout)), "{ended:?}");
+    assert_eq!(
+        broker.abandoned(),
+        [1],
+        "the stalled write is recorded as unknown"
+    );
+    assert!(!broker.calls().contains(&"metadata_patch_done".to_string()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn write_outlives_timeout() {
+    let broker = Arc::new(Recorder::default());
+    let mut patch = probe(
+        serde_json::json!({"call": "metadata_patch", "resource": "slow", "patch": {}, "expected": "r1"}),
+    );
+    patch.limits.wall = Duration::from_secs(1);
+    patch.limits.write = Duration::from_secs(5);
+    let ended = invoke(patch, broker.clone()).await;
+    assert!(matches!(ended, Err(InvokeError::Timeout)), "{ended:?}");
+    assert_eq!(
+        broker.calls(),
+        ["metadata_patch", "metadata_patch_done"],
+        "the write finished first"
+    );
+    assert!(broker.abandoned().is_empty());
+}
+
+#[tokio::test]
+async fn state_put_ordinal() {
+    let broker = Arc::new(Recorder::default());
+    invoke(probe(serde_json::json!({"call": "state"})), broker.clone())
+        .await
+        .unwrap();
+    let rerun = Arc::new(Recorder::default());
+    invoke(probe(serde_json::json!({"call": "state"})), rerun.clone())
+        .await
+        .unwrap();
+    let intents = broker.intents();
+    assert_eq!(intents.iter().map(|i| i.ordinal).collect::<Vec<_>>(), [1]);
+    assert_eq!(rerun.intents(), intents, "a rerun asks for the same write");
+}
+
+#[tokio::test]
+async fn error_bytes_bounded() {
+    let mut errors = probe(serde_json::json!({"call": "errors"}));
+    errors.limits.bytes = 4096;
+    let ended = invoke(errors, Arc::default()).await;
+    assert!(
+        matches!(ended, Err(InvokeError::Limit(Limit::Bytes))),
+        "{ended:?}"
+    );
+    let mut refused = probe(serde_json::json!({"call": "errors"}));
+    refused.limits.bytes = 4096;
+    refused.permissions.clear();
+    let ended = invoke(refused, Arc::default()).await;
+    assert!(
+        matches!(ended, Err(InvokeError::Limit(Limit::Bytes))),
+        "missing grants count: {ended:?}"
+    );
+}
+
+#[tokio::test]
+async fn pending_calls_bounded() {
+    let mut get = probe(serde_json::json!({"call": "metadata_get", "resource": "D1"}));
+    get.limits.pending = 0;
+    let ended = invoke(get, Arc::default()).await;
+    assert!(
+        matches!(ended, Err(InvokeError::Limit(Limit::Pending))),
+        "{ended:?}"
+    );
+}
+
+#[tokio::test]
+async fn node_admission_bounded() {
+    let config = RuntimeConfig {
+        invocations: 1,
+        ..RuntimeConfig::default()
+    };
+    let runtime = Runtime::new(config).unwrap();
+    let broker = Arc::new(Recorder::default());
+    let first = probe(serde_json::json!({"call": "metadata_get", "resource": "block"}));
+    let cancel = first.cancel.clone();
+    let running = {
+        let (runtime, broker) = (runtime.clone(), broker.clone());
+        tokio::spawn(async move { invoke_on(&runtime, first, broker).await })
+    };
+    broker.blocked.notified().await;
+    let second = invoke_on(&runtime, call("echo", Trigger::Timer(0)), broker.clone()).await;
+    assert!(matches!(second, Err(InvokeError::Overloaded)), "{second:?}");
+    cancel.cancel();
+    let first = running.await.unwrap();
+    assert!(matches!(first, Err(InvokeError::Cancelled)), "{first:?}");
 }
