@@ -19,8 +19,8 @@ use tracing::{error, info};
 
 use crate::settings::HttpsSettings;
 
-/// How often the certificate files are checked for a renewal.
-const RELOAD_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the certificate files are checked for a renewal; `SIGHUP` checks at once.
+const RELOAD_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Native HTTPS after its fallible steps: a checked certificate pair, the
 /// signal handler, both bound sockets and the route channels.

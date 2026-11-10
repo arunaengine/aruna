@@ -83,7 +83,8 @@ HTTP behind an existing ingress stays the default.
   the key must fit, the chain must be complete and valid now, and the certificate must cover every
   hostname. Chains are trusted up to the public root certificates built into Aruna. For a private
   CA or a self-signed certificate, list it in `HTTPS_CA_PATH`.
-- **Renewal.** The node checks the files every 60 seconds and on `SIGHUP`. A new pair replaces the
+- **Renewal.** The node checks the files once per hour and at once on `SIGHUP`, so send `SIGHUP`
+  from your renewal hook (for example certbot's `--deploy-hook`). A new pair replaces the
   active one only when it passes every check; otherwise the active pair stays and the node logs
   the reason. Replace each file atomically: write it under a temporary name in the same folder and
   rename it, as certbot does. Mount the folder, not single files, so renames are seen.
