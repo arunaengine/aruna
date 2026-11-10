@@ -820,6 +820,8 @@ pub(crate) mod tests {
             "DELETE",
             "/data/groups/{group_id}/distributed-buckets/{set_id}",
         ),
+        ("POST", "/plugins"),
+        ("GET", "/plugins"),
     ];
 
     /// Documented path to the runtime template that serves it. Catch-all ids
