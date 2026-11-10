@@ -27,6 +27,7 @@ use aruna_core::keyspaces::{
     UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE, USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::plugins::PublishedPlugin;
 use aruna_core::realm_vault::RealmVaultRecord;
 use aruna_core::secrets::SecretRecord;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
@@ -768,7 +769,12 @@ fn realm_configs(
 /// Appends the trailing defaults an older row lacks, shortest suffix first, so
 /// a row missing only the newest value keeps the one it already has.
 fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
-    let secrets = postcard::to_allocvec(&Vec::<SecretRecord>::new()).ok()?;
+    let plugins = postcard::to_allocvec(&Vec::<PublishedPlugin>::new()).ok()?;
+    let secrets = [
+        postcard::to_allocvec(&Vec::<SecretRecord>::new()).ok()?,
+        plugins.clone(),
+    ]
+    .concat();
     let vault = [
         postcard::to_allocvec(&Vec::<RealmVaultRecord>::new()).ok()?,
         secrets.clone(),
@@ -793,6 +799,7 @@ fn realm_config_suffix(value: &[u8]) -> Option<Vec<u8>> {
     let idle_on = [idle.as_slice(), &federation_on].concat();
     let both = [catch_up.as_slice(), &idle_on].concat();
     for suffix in [
+        plugins,
         secrets,
         vault,
         email,
@@ -1207,8 +1214,8 @@ mod tests {
     #[test]
     fn rewrites_realm_configs() {
         // Legacy documents decode with default timeouts, no federation settings, no portal
-        // features, no replica quota, no email, an empty vault and no named secrets. Current
-        // rows stay byte-identical.
+        // features, no replica quota, no email, an empty vault, no named secrets and no published
+        // plugins. Current rows stay byte-identical.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let document = RealmConfigDocument::new(REALM, Vec::new(), 3);
@@ -1222,7 +1229,9 @@ mod tests {
         let vault = postcard::to_allocvec(&Vec::<super::RealmVaultRecord>::new()).unwrap();
         let email = postcard::to_allocvec(&None::<super::RealmEmailProfile>).unwrap();
         let secrets = postcard::to_allocvec(&Vec::<super::SecretRecord>::new()).unwrap();
-        let secretless = current[..current.len() - secrets.len()].to_vec();
+        let plugins = postcard::to_allocvec(&Vec::<super::PublishedPlugin>::new()).unwrap();
+        let pluginless = current[..current.len() - plugins.len()].to_vec();
+        let secretless = pluginless[..pluginless.len() - secrets.len()].to_vec();
         let vaultless = secretless[..secretless.len() - vault.len()].to_vec();
         let emailless = vaultless[..vaultless.len() - email.len()].to_vec();
         let replicaless = emailless[..emailless.len() - replicas.len()].to_vec();
@@ -1240,6 +1249,7 @@ mod tests {
                 (b"prior", featureless),
                 (b"replicaless", replicaless),
                 (b"secretless", secretless),
+                (b"pluginless", pluginless),
                 (b"vaultless", vaultless),
                 (b"emailless", emailless),
                 (b"new", current.clone()),
@@ -1250,10 +1260,11 @@ mod tests {
 
         assert_eq!(
             (output.realm_configs_scanned, output.realm_configs_rewritten),
-            (9, 8)
+            (10, 9)
         );
         let rows = read(&path, REALM_CONFIG_KEYSPACE);
         assert_eq!(rows[b"new".as_slice()], current);
+        assert_eq!(rows[b"pluginless".as_slice()], current);
         assert_eq!(rows[b"replicaless".as_slice()], current);
         assert_eq!(rows[b"secretless".as_slice()], current);
         assert_eq!(rows[b"vaultless".as_slice()], current);

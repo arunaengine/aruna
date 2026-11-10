@@ -259,9 +259,11 @@ mod tests {
             None::<RealmEmailProfile>,
             Vec::<RealmVaultRecord>::new(),
             Vec::<aruna_core::secrets::SecretRecord>::new(),
+            Vec::<aruna_core::plugins::PublishedPlugin>::new(),
         );
         let secrets = postcard::to_allocvec(&secrets).unwrap();
-        // The config ends with federation, portal features, replica quota, email, vault and secrets.
+        // The config ends with federation, portal features, replica quota, email, vault, secrets
+        // and plugins.
         let tail = 1 + features.len() + replicas.len() + secrets.len();
         let head = &unfederated[..unfederated.len() - tail];
         let federation = postcard::to_allocvec(&Some(old_federation(&key, realm_id))).unwrap();
