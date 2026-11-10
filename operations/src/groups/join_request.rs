@@ -114,6 +114,7 @@ pub struct GroupJoinOperation {
     changed: bool,
     notifications: bool,
     deny: bool,
+    conflicts: u8,
     output: Option<Result<JoinRequestState, GroupJoinError>>,
 }
 
@@ -128,8 +129,19 @@ impl GroupJoinOperation {
             changed: false,
             notifications: false,
             deny: false,
+            conflicts: 0,
             output: None,
         }
+    }
+
+    /// A conflicted commit already discarded its transaction, so the retry starts
+    /// from the input alone and rereads every row, including the realm config.
+    fn restart_after_conflict(&mut self) -> Effects {
+        *self = Self {
+            conflicts: self.conflicts + 1,
+            ..Self::new(self.input.clone())
+        };
+        self.start()
     }
 
     fn fail(&mut self, error: GroupJoinError) -> Effects {
@@ -464,6 +476,12 @@ impl Operation for GroupJoinOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::Error { error }) = event {
+            if error == StorageError::TransactionConflict
+                && self.state == State::Commit
+                && self.conflicts < super::CONFLICT_RETRIES
+            {
+                return self.restart_after_conflict();
+            }
             return self.fail(error.into());
         }
         match (self.state, event) {
@@ -573,6 +591,70 @@ mod pure_tests {
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::realm::RealmId;
+
+    #[test]
+    fn retries_commit_conflict() {
+        let realm_id = RealmId::from_bytes([8; 32]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+            realm_id,
+        };
+        let input = GroupJoinInput {
+            auth: AuthContext {
+                user_id: actor.user_id,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            actor,
+            group_id: Ulid::from_bytes([5; 16]),
+            action: JoinAction::Request { message: None },
+            now_ms: 3,
+        };
+        let conflict = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            })
+        };
+        let mut operation = GroupJoinOperation::new(input.clone());
+        let commit = |operation: &mut GroupJoinOperation| {
+            operation.state = State::Commit;
+            operation.txn_id = Some(TxnId::generate());
+            operation.changed = true;
+            operation.deny = true;
+            operation.step(conflict())
+        };
+
+        for _ in 0..crate::groups::CONFLICT_RETRIES {
+            let effects = commit(&mut operation);
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::StartTransaction {
+                    read: false
+                })]
+            ));
+            assert_eq!(operation.state, State::Begin);
+            assert!(operation.txn_id.is_none() && !operation.changed && !operation.deny);
+        }
+        commit(&mut operation);
+        assert_eq!(
+            operation.finalize(),
+            Err(GroupJoinError::Storage(StorageError::TransactionConflict))
+        );
+
+        // Before the commit the transaction is still open, so a conflict aborts it.
+        let mut operation = GroupJoinOperation::new(input);
+        let txn_id = TxnId::generate();
+        operation.state = State::Write;
+        operation.txn_id = Some(txn_id);
+        let effects = operation.step(conflict());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })] if *id == txn_id
+        ));
+        assert_eq!(operation.state, State::Failed);
+    }
 
     #[test]
     fn membership_is_atomic() {
