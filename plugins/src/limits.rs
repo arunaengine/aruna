@@ -15,9 +15,10 @@ pub struct Limits {
     pub wall: Duration,
     /// Longest a started write may take, even after the run ended; then its outcome is unknown.
     pub write: Duration,
-    /// Host calls, including log lines.
+    /// Counted host calls: Aruna imports and log lines, WASI random and poll, and stdout or
+    /// stderr writes. Other WASI calls do constant work and are bounded by fuel and `wall`.
     pub calls: u32,
-    /// Bytes moved through host calls in both directions, all calls together.
+    /// Bytes moved through counted host calls in both directions, all calls together.
     pub bytes: u64,
     /// Bytes of one host request or reply.
     pub call_bytes: usize,
