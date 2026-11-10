@@ -227,7 +227,8 @@ pub(crate) enum Managers<'a> {
 }
 
 /// One notice row per manager when the new rules widen use over the old ones, the acting
-/// manager included, in the change's own transaction. Unreadable authorization writes none.
+/// manager included, in the change's own transaction. Unreadable authorization still notifies
+/// the acting manager.
 pub(crate) fn widening_notices(
     realm_id: RealmId,
     name: &SecretName,
