@@ -443,3 +443,7 @@ async fn delete_rows(ctx: &DriverContext, keys: Vec<Vec<u8>>) -> Result<(), Arti
         other => Err(ArtifactError::Storage(format!("{other:?}"))),
     }
 }
+
+#[cfg(test)]
+#[path = "copies_tests.rs"]
+mod tests;
