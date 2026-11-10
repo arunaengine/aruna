@@ -235,17 +235,22 @@ fn audit_rows(path: &Path) -> (OptimisticTxDatabase, OptimisticTxKeyspace) {
     (db, keyspace)
 }
 
-#[test]
-fn resumes_partial_run() {
-    let temp = tempfile::tempdir().expect("temporary directory");
-    let path = temp.path().join("db");
+/// Writes five admin audit rows in the shape before `secret`.
+fn old_rows(path: &Path) {
     let keys: Vec<[u8; 1]> = (0..5).map(|key| [key]).collect();
     let rows = keys
         .iter()
         .zip(1..)
         .map(|(key, seed)| (key.as_slice(), old_audit(seed)))
         .collect();
-    write(&path, ADMIN_AUDIT_KEYSPACE, rows);
+    write(path, ADMIN_AUDIT_KEYSPACE, rows);
+}
+
+#[test]
+fn resumes_partial_run() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let path = temp.path().join("db");
+    old_rows(&path);
     let mut unknown = Vec::new();
     {
         // One committed batch stands for a run stopped after its first commit.
@@ -261,28 +266,44 @@ fn resumes_partial_run() {
         )
         .expect("batch runs");
         assert_eq!((after, first.rewritten), (Some(vec![1]), 2));
-        let rest = batched::<AdminAuditRecord>(&db, &keyspace, AUDIT, 2, &mut unknown)
-            .expect("rerun runs");
-        assert_eq!(
-            rest,
-            Counts {
-                scanned: 5,
-                rewritten: 3
-            }
-        );
     }
     assert!(unknown.is_empty());
+    let database = path.to_str().expect("path");
+    let output = migrate_output(database).expect("migration resumes");
+    assert_eq!(
+        (output.audit_rows_scanned, output.audit_rows_rewritten),
+        (5, 3)
+    );
     let stored = read(&path, ADMIN_AUDIT_KEYSPACE);
     assert!(
         stored
             .values()
             .all(|value| AdminAuditRecord::from_bytes(value).is_ok())
     );
-    let output = migrate_output(path.to_str().expect("path")).expect("migration repeats");
+    let again = migrate_output(database).expect("migration repeats");
     assert_eq!(
-        (output.audit_rows_scanned, output.audit_rows_rewritten),
+        (again.audit_rows_scanned, again.audit_rows_rewritten),
         (5, 0)
     );
+}
+
+#[test]
+fn spans_several_batches() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let path = temp.path().join("db");
+    old_rows(&path);
+    let mut unknown = Vec::new();
+    let (db, keyspace) = audit_rows(&path);
+    let counts =
+        batched::<AdminAuditRecord>(&db, &keyspace, AUDIT, 2, &mut unknown).expect("batches run");
+    assert_eq!(
+        counts,
+        Counts {
+            scanned: 5,
+            rewritten: 5
+        }
+    );
+    assert!(unknown.is_empty());
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
