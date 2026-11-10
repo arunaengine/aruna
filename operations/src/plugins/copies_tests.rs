@@ -389,6 +389,7 @@ async fn keeps_pinned_copies() {
         grants: Default::default(),
         account: UserId::nil(realm_id),
         role_id: ulid::Ulid::from_parts(1, 8),
+        receiver: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
         granted_by: UserId::nil(realm_id),
         request: digest(FIXTURE),
         revision: 2,

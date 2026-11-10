@@ -7,10 +7,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentTarget};
 use crate::plugins::{valid_digest, valid_name, valid_version};
 use crate::types::{GroupId, RoleId};
+use crate::{NodeId, UserId};
 
 /// Bytes of the setting values, as JSON.
 pub const MAX_SETTINGS: usize = 64 * 1024;
@@ -88,6 +88,8 @@ pub struct PluginInstall {
     pub grants: BTreeMap<String, Vec<String>>,
     pub account: UserId,
     pub role_id: RoleId,
+    /// The node that admits, queues and runs this install's runs, chosen once and never changed.
+    pub receiver: NodeId,
     /// The group admin who approved the current grants.
     pub granted_by: UserId,
     /// `sha256:<hex>` of the install request, so a retry with another body is refused.
@@ -163,6 +165,7 @@ mod tests {
             grants: BTreeMap::from([("metadata.read".to_string(), vec![pattern])]),
             account: UserId::local(install_id, realm_id),
             role_id: install_id,
+            receiver: node,
             granted_by: UserId::local(Ulid::from_parts(1, 3), realm_id),
             request: format!("sha256:{}", "cd".repeat(32)),
             revision: 1,

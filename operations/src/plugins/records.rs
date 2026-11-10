@@ -66,6 +66,8 @@ pub enum RecordError {
     Stale(Option<u64>),
     #[error("the record does not belong to this install and group")]
     Mismatch,
+    #[error("the node that runs an install cannot change")]
+    ReceiverChanged,
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("operation did not finish")]
@@ -186,6 +188,11 @@ impl InstallEntryOperation {
         let revision = current.as_ref().map(|current| current.revision);
         if revision != self.config.expected {
             return Err(RecordError::Stale(revision));
+        }
+        let moved = (current.as_ref().zip(self.config.install.as_ref()))
+            .is_some_and(|(current, next)| current.receiver != next.receiver);
+        if moved {
+            return Err(RecordError::ReceiverChanged);
         }
         let operation = AdminDocumentOperation::ConfigInstallSet {
             install_id: self.config.install_id,

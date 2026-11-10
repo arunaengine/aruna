@@ -6,7 +6,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
-use aruna_core::UserId;
 use aruna_core::plugin_installs::{InstallState, PluginInstall, Prerequisite};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
@@ -14,6 +13,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_core::{NodeId, UserId};
 use aruna_plugins::artifact::ArtifactDigest;
 use aruna_plugins::manifest::Manifest;
 use serde_json::{Map, Value};
@@ -30,6 +30,7 @@ use super::grants::{
     GrantError, Grants, InstallScope, accesses, carry_grants, check_supported, narrow_grants,
     parse_grants, role_paths, stored_grants,
 };
+use super::receiver::pick_receiver;
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
 use super::settings::{SettingError, check_settings};
 use crate::auth::permission_rules::permission_rules;
@@ -167,7 +168,16 @@ pub async fn install_plugin(
             return Ok(existing.clone());
         }
         Some(existing) => existing.clone(),
-        None => write_record(ctx, actor, auth, None, new_record(actor, &prepared), None).await?,
+        None => {
+            let group_id = prepared.scope.group_id;
+            let receiver = pick_receiver(&config, actor.realm_id, group_id).ok_or_else(|| {
+                InstallError::Unavailable(
+                    "no eligible server or management node holds the group's metadata".into(),
+                )
+            })?;
+            let record = new_record(actor, &prepared, receiver);
+            write_record(ctx, actor, auth, None, record, None).await?
+        }
     };
     let audit = Some(AdminAuditAction::PluginInstalled);
     let settled = settle(ctx, actor, auth, record, audit).await?;
@@ -177,7 +187,7 @@ pub async fn install_plugin(
 
 /// The record of a new install. The account and role ids are fresh, never taken from the
 /// caller, so no existing user or role can be adopted or replaced.
-fn new_record(actor: &Actor, prepared: &Prepared) -> PluginInstall {
+fn new_record(actor: &Actor, prepared: &Prepared, receiver: NodeId) -> PluginInstall {
     let scope = &prepared.scope;
     PluginInstall {
         install_id: scope.install_id,
@@ -191,6 +201,7 @@ fn new_record(actor: &Actor, prepared: &Prepared) -> PluginInstall {
         grants: stored_grants(&prepared.grants),
         account: UserId::local(Ulid::generate(), scope.realm_id),
         role_id: Ulid::generate(),
+        receiver,
         granted_by: actor.user_id,
         request: prepared.request.clone(),
         revision: 1,

@@ -290,7 +290,7 @@ impl Fixture {
         let auth = self.auth();
         let request = self.request(Some(install_id));
         let prepared = prepare_install(&self.ctx, &auth, self.actor.realm_id, &request).await;
-        let record = new_record(&self.actor, &prepared.unwrap());
+        let record = new_record(&self.actor, &prepared.unwrap(), self.actor.node_id);
         write_record(&self.ctx, &self.actor, &auth, None, record, None)
             .await
             .unwrap()
@@ -671,4 +671,39 @@ async fn copy_needs_both() {
         request.grants.insert("objects.copy".into(), Vec::new());
         assert!(fixture.install(&request).await.is_ok(), "{denied}");
     }
+}
+
+#[tokio::test]
+async fn keeps_receiver() {
+    // The install records an eligible holder of the group's metadata; no write may move it.
+    use crate::plugins::receiver::{eligible, pick_receiver};
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    assert_eq!(installed.receiver, actor.node_id);
+    let mut moved = installed.clone();
+    moved.receiver = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+    moved.revision += 1;
+    let refused = write_record(ctx, actor, &auth, Some(installed.revision), moved, None).await;
+    let changed = matches!(
+        refused,
+        Err(InstallError::Record(RecordError::ReceiverChanged))
+    );
+    assert!(changed, "{refused:?}");
+
+    let mut config = read_config(ctx, actor.realm_id).await.unwrap();
+    assert!(!eligible(
+        &config,
+        iroh::SecretKey::from_bytes(&[9u8; 32]).public()
+    ));
+    let entry = config
+        .placement_map
+        .iter_mut()
+        .find(|e| e.node_id == actor.node_id);
+    entry.unwrap().draining = true;
+    assert!(!eligible(&config, actor.node_id));
+    assert_eq!(
+        pick_receiver(&config, actor.realm_id, fixture.group_id),
+        None
+    );
 }

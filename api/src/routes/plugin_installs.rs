@@ -116,6 +116,8 @@ pub struct InstallView {
     pub group: String,
     /// The service account the plugin acts as.
     pub account: String,
+    /// The node that runs this install's runs.
+    pub receiver: String,
     /// `preparing`, `active`, `paused`, `blocked` or `removing`.
     pub status: String,
     /// An admin paused it; it stays paused through updates and grant changes until resumed.
@@ -147,7 +149,7 @@ pub struct InstallListQuery {
     pub limit: Option<usize>,
 }
 
-const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "status": "active", "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"]}}"#;
+const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"]}}"#;
 
 pub(crate) fn view_example() -> Value {
     serde_json::from_str(VIEW_EXAMPLE).unwrap_or(Value::Null)
@@ -433,6 +435,7 @@ fn view_in(config: &RealmConfigDocument, install: PluginInstall) -> InstallView 
         digest: install.digest,
         group: install.group_id.to_string(),
         account: install.account.to_string(),
+        receiver: install.receiver.to_string(),
         status: install.state.as_str().to_string(),
         paused: install.paused,
         settings: serde_json::from_str(&install.settings).unwrap_or(Value::Null),

@@ -9,6 +9,7 @@ pub mod grants;
 pub mod install;
 pub mod lifecycle;
 pub mod publish;
+pub mod receiver;
 pub mod records;
 pub mod settings;
 
