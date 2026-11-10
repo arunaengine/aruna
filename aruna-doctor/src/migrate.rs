@@ -38,6 +38,7 @@ use aruna_core::structs::execution::job::{
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::structs::execution::source_connector::SourceConnector;
+use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, ReplicaQuota};
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
@@ -75,6 +76,7 @@ mod sizes;
 mod staging;
 mod sync_ops;
 mod topic_purge;
+mod trailing;
 mod uploads;
 mod user_sessions;
 mod vault;
@@ -178,6 +180,12 @@ pub struct MigrateOutput {
     /// replication jobs moved to their new key with their key waits and plaintext requests,
     /// and unfinished staging checkpoints.
     pub stale_rows_deleted: BTreeMap<&'static str, usize>,
+    /// Admin audit rows from before their newest optional fields, which gain them as empty.
+    pub audit_rows_scanned: usize,
+    pub audit_rows_rewritten: usize,
+    /// Rows of those keyspaces that match no known shape, left unchanged, as
+    /// `keyspace/key: reason`.
+    pub unknown_rows: Vec<String>,
 }
 
 /// Non-zero counts by keyspace; a keyspace listed twice adds up.
@@ -263,6 +271,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         db.keyspace(CONNECTOR_REFERENCE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let root_rows = db.keyspace(ROOT_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
     let snapshot_rows = db.keyspace(NODE_STATS_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let audit_rows = db.keyspace(trailing::AUDIT.0, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
     let mut evidence = families::Evidence::default();
@@ -449,6 +458,13 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         let sealed = seal_rows(&db, &rows, name, secret_key, &mut secrets_skipped)?;
         secrets.push((rows, sealed));
     }
+    let mut unknown_rows = Vec::new();
+    let audits = trailing::missing_options::<AdminAuditRecord>(
+        &db,
+        &audit_rows,
+        trailing::AUDIT,
+        &mut unknown_rows,
+    )?;
     let vault_rows = db.keyspace(NODE_VAULT_KEYSPACE, KeyspaceCreateOptions::default)?;
     let mut moves = Vec::new();
     for moved in vault::MOVED_KEYSPACES {
@@ -481,6 +497,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&staging_rows, &staged.rewrites.rows),
         (&owner_rows, &stale.owner_writes),
         (&cleanup_rows, &old_uploads.blob_deletes),
+        (&audit_rows, &audits.rows),
     ]
     .into_iter()
     .chain(
@@ -604,6 +621,9 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
                 .map(|(_, name, rows)| (*name, rows.len())),
         ),
         stale_rows_deleted: counts(stale_rows.iter().map(|(_, name, keys)| (*name, keys.len()))),
+        audit_rows_scanned: audits.scanned,
+        audit_rows_rewritten: audits.rows.len(),
+        unknown_rows,
     })
 }
 
