@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use wasmtime::component::types::ComponentItem;
 use wasmtime::component::{Component, HasSelf, InstancePre, Linker};
-use wasmtime::{CallHook, Config, Engine, Store, Trap};
+use wasmtime::{Config, Engine, Store, Trap, UpdateDeadline};
 
 use crate::artifact::{ArtifactDigest, SectionError, read_manifest};
 use crate::broker::{Broker, CallContext};
@@ -22,9 +22,8 @@ use crate::limits::{Limits, RuntimeConfig};
 use crate::manifest::{Manifest, ManifestError};
 use crate::permission::Permission;
 
-/// Guest computation between two cooperative yields, so deadlines and
-/// cancellation are observed while a guest spins.
-const YIELD_FUEL: u64 = 1_000_000;
+/// Time between two epoch ticks; a running guest yields to the executor on each tick.
+const TICK: std::time::Duration = std::time::Duration::from_millis(10);
 /// Live component handles per store, including async subtasks and waitables.
 const MAX_HANDLES: usize = 1_024;
 const MAX_TRAP_TEXT: usize = 512;
@@ -119,12 +118,14 @@ impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Self, CompileError> {
         let mut engine_config = Config::new();
         engine_config.consume_fuel(true);
+        engine_config.epoch_interruption(true);
         let engine = Engine::new(&engine_config).map_err(wasm_error)?;
+        spawn_ticker(&engine);
         let mut linker = Linker::new(&engine);
         wit::Plugin::add_to_linker::<Session, HasSelf<Session>>(&mut linker, |session| session)
             .map_err(wasm_error)?;
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(wasm_error)?;
-        crate::host::bounded_random(&mut linker).map_err(wasm_error)?;
+        crate::host::bounded_wasi(&mut linker).map_err(wasm_error)?;
         let cache = NonZeroUsize::new(config.cache).unwrap_or(NonZeroUsize::MIN);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -286,22 +287,13 @@ impl Runtime {
         let limits = session.limits();
         let mut store = Store::new(&self.inner.engine, session);
         store.limiter(|session| session);
-        let fuel = limits.fuel;
-        store.call_hook(move |mut store, hook| match hook {
-            CallHook::CallingHost => {
-                // A yield happens each time another YIELD_FUEL units are consumed.
-                let yields = fuel.saturating_sub(store.get_fuel()?) / YIELD_FUEL;
-                store.data_mut().count_call(yields)
-            }
-            _ => Ok(()),
-        });
+        // Each epoch tick yields to the executor, so deadlines and cancellation are observed.
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(|_| Ok(UpdateDeadline::Yield(1)));
         store.set_hostcall_fuel(limits.call_bytes);
         store.set_max_component_handles(MAX_HANDLES);
         store
             .set_fuel(limits.fuel)
-            .map_err(|err| InvokeError::Trap(err.to_string()))?;
-        store
-            .fuel_async_yield_interval(Some(YIELD_FUEL))
             .map_err(|err| InvokeError::Trap(err.to_string()))?;
         let work = async {
             let instance = compiled.pre.instantiate_async(&mut store).await?;
@@ -341,8 +333,23 @@ fn acquire(slots: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, InvokeError> 
     })
 }
 
+/// Advances the engine's epoch every [`TICK`] on its own thread until the engine is dropped.
+fn spawn_ticker(engine: &Engine) {
+    let weak = engine.weak();
+    std::thread::spawn(move || {
+        while let Some(engine) = weak.upgrade() {
+            engine.increment_epoch();
+            drop(engine);
+            std::thread::sleep(TICK);
+        }
+    });
+}
+
 fn classify(err: &wasmtime::Error, session: &Session) -> InvokeError {
     if let Some(limit) = session.exceeded {
+        return InvokeError::Limit(limit);
+    }
+    if let Some(limit) = session.stream_limit() {
         return InvokeError::Limit(limit);
     }
     if let Some(Exceeded(limit)) = err.downcast_ref::<Exceeded>() {

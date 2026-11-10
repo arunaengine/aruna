@@ -5,12 +5,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use tokio_util::task::TaskTracker;
-use wasmtime::ResourceLimiter;
-use wasmtime::StoreContextMut;
-use wasmtime::component::{Linker, ResourceTable};
+use wasmtime::component::{Linker, Resource, ResourceTable};
+use wasmtime::{ResourceLimiter, StoreContextMut};
+use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
+use wasmtime_wasi::p2::{DynPollable, OutputStream, Pollable, StreamError, StreamResult};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_io::bindings::wasi::io::poll::Host as _;
 
 use crate::broker::{Broker, CallContext, ErrorKind, HostError};
 use crate::limits::Limits;
@@ -90,9 +93,8 @@ pub(crate) struct Session {
     writes: TaskTracker,
     limits: Limits,
     ordinal: u32,
-    /// Entries into the host, fuel yields included.
-    calls: u64,
-    bytes: u64,
+    /// Host calls and bytes so far, shared with the WASI output streams.
+    meter: Arc<Meter>,
     pending: u32,
     memory: usize,
     pub(crate) exceeded: Option<Limit>,
@@ -115,6 +117,7 @@ impl Session {
         trackers: (TaskTracker, TaskTracker),
         limits: Limits,
     ) -> Self {
+        let meter = Arc::new(Meter::new(&limits));
         Self {
             broker,
             cx,
@@ -124,12 +127,11 @@ impl Session {
             writes: trackers.1,
             limits,
             ordinal: 0,
-            calls: 0,
-            bytes: 0,
+            meter: meter.clone(),
             pending: 0,
             memory: 0,
             exceeded: None,
-            wasi: closed_wasi(),
+            wasi: closed_wasi(meter),
             table: ResourceTable::new(),
         }
     }
@@ -143,23 +145,25 @@ impl Session {
         wasmtime::Error::new(Exceeded(limit))
     }
 
-    /// Counts one entry into the host, ours or WASI; the store's call hook runs it. Fuel
-    /// yields enter the host too, so the `yields` so far are not host calls.
-    pub(crate) fn count_call(&mut self, yields: u64) -> wasmtime::Result<()> {
-        self.calls += 1;
-        if self.calls > u64::from(self.limits.calls).saturating_add(yields) {
-            return Err(self.exceed(Limit::Calls));
+    /// Counts one host call we implement or wrap and refuses it once the budget is spent.
+    pub(crate) fn count_call(&mut self) -> wasmtime::Result<()> {
+        match self.meter.call() {
+            true => Ok(()),
+            false => Err(self.exceed(Limit::Calls)),
         }
-        Ok(())
     }
 
     /// Counts `size` bytes moved through a host call against the per-call and total budgets.
     pub(crate) fn charge(&mut self, size: usize) -> wasmtime::Result<()> {
-        self.bytes += size as u64;
-        if size > self.limits.call_bytes || self.bytes > self.limits.bytes {
-            return Err(self.exceed(Limit::Bytes));
+        match self.meter.bytes(size) {
+            true => Ok(()),
+            false => Err(self.exceed(Limit::Bytes)),
         }
-        Ok(())
+    }
+
+    /// The budget a WASI output stream exhausted, if any.
+    pub(crate) fn stream_limit(&self) -> Option<Limit> {
+        self.meter.exhausted()
     }
 
     /// The next outside effect's ordinal; reruns reach the same ordinals in the same order.
@@ -175,6 +179,7 @@ impl Session {
         size: usize,
         needs: Needs<'_>,
     ) -> wasmtime::Result<Result<Started, HostError>> {
+        self.count_call()?;
         self.charge(size)?;
         let granted = match needs {
             Needs::Free => true,
@@ -219,20 +224,21 @@ impl Session {
 }
 
 /// WASI random interfaces whose byte calls replace the default ones, so a guest cannot ask the
-/// host for more random bytes than its per-call and total byte budgets allow.
+/// host for more random bytes than its per-call and total byte budgets allow. `poll` is charged too.
 const RANDOM_BYTES: [(&str, &str); 2] = [
     ("wasi:random/random@0.2.12", "get-random-bytes"),
     ("wasi:random/insecure@0.2.12", "get-insecure-random-bytes"),
 ];
 
-/// Shadows the WASI random byte calls with versions that charge the run before allocating.
-pub(crate) fn bounded_random(linker: &mut Linker<Session>) -> wasmtime::Result<()> {
+/// Shadows the WASI random byte calls and `poll` with versions that charge the run first.
+pub(crate) fn bounded_wasi(linker: &mut Linker<Session>) -> wasmtime::Result<()> {
     linker.allow_shadowing(true);
     for (interface, function) in RANDOM_BYTES {
         linker.instance(interface)?.func_wrap(
             function,
             |mut store: StoreContextMut<'_, Session>, (len,): (u64,)| {
                 let len = usize::try_from(len).unwrap_or(usize::MAX);
+                store.data_mut().count_call()?;
                 store.data_mut().charge(len)?;
                 let mut bytes = vec![0u8; len];
                 getrandom::fill(&mut bytes).map_err(|err| wasmtime::Error::msg(err.to_string()))?;
@@ -240,15 +246,31 @@ pub(crate) fn bounded_random(linker: &mut Linker<Session>) -> wasmtime::Result<(
             },
         )?;
     }
+    // Poll lists and replies are charged like any other host call bytes.
+    linker.instance("wasi:io/poll@0.2.12")?.func_wrap_async(
+        "poll",
+        |mut store: StoreContextMut<'_, Session>, (list,): (Vec<Resource<DynPollable>>,)| {
+            Box::new(async move {
+                let session = store.data_mut();
+                session.count_call()?;
+                session.charge(list.len() * 4)?;
+                let reply = session.table.poll(list).await?;
+                session.charge(reply.len() * 4)?;
+                Ok((reply,))
+            })
+        },
+    )?;
     linker.allow_shadowing(false);
     Ok(())
 }
 
 /// A WASI context that grants nothing: no preopened directories, no environment or
-/// arguments, no network, and stdio that reads nothing and discards output.
-fn closed_wasi() -> WasiCtx {
+/// arguments, no network; stdin reads nothing and output is charged, then discarded.
+fn closed_wasi(meter: Arc<Meter>) -> WasiCtx {
     let mut builder = WasiCtxBuilder::new();
     builder
+        .stdout(Charged(meter.clone()))
+        .stderr(Charged(meter))
         .allow_tcp(false)
         .allow_udp(false)
         .allow_ip_name_lookup(false);
@@ -299,5 +321,120 @@ impl ResourceLimiter for Session {
 
     fn memories(&self) -> usize {
         MAX_MEMORIES
+    }
+}
+
+/// Host calls and bytes of a run, shared with its WASI output streams.
+#[derive(Debug)]
+pub(crate) struct Meter {
+    calls: AtomicU64,
+    bytes: AtomicU64,
+    /// 0 while within budget, else 1 for bytes or 2 for calls.
+    exhausted: AtomicU8,
+    max_calls: u64,
+    per_call: u64,
+    total: u64,
+}
+
+impl Meter {
+    fn new(limits: &Limits) -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            exhausted: AtomicU8::new(0),
+            max_calls: u64::from(limits.calls),
+            per_call: limits.call_bytes as u64,
+            total: limits.bytes,
+        }
+    }
+
+    /// Counts one call; false, and remembered, once the call budget is spent.
+    fn call(&self) -> bool {
+        let calls = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        self.within(calls <= self.max_calls, 2)
+    }
+
+    /// Charges `size` bytes; false, and remembered, once a byte budget is exceeded.
+    fn bytes(&self, size: usize) -> bool {
+        let size = size as u64;
+        let used = self
+            .bytes
+            .fetch_add(size, Ordering::Relaxed)
+            .saturating_add(size);
+        self.within(size <= self.per_call && used <= self.total, 1)
+    }
+
+    fn within(&self, within: bool, code: u8) -> bool {
+        if !within {
+            let _ = self
+                .exhausted
+                .compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
+        }
+        within
+    }
+
+    fn exhausted(&self) -> Option<Limit> {
+        match self.exhausted.load(Ordering::Relaxed) {
+            1 => Some(Limit::Bytes),
+            2 => Some(Limit::Calls),
+            _ => None,
+        }
+    }
+}
+
+/// Guest stdout and stderr: discards what is written, after charging it to the run's budget.
+struct Charged(Arc<Meter>);
+
+impl IsTerminal for Charged {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for Charged {
+    fn async_stream(&self) -> Box<dyn tokio::io::AsyncWrite + Send + Sync> {
+        Box::new(tokio::io::sink())
+    }
+
+    fn p2_stream(&self) -> Box<dyn OutputStream> {
+        Box::new(Discard(self.0.clone()))
+    }
+}
+
+struct Discard(Arc<Meter>);
+
+impl Discard {
+    /// Counts the write as a host call and charges its bytes before anything is allocated.
+    fn take(&self, size: usize) -> StreamResult<()> {
+        let within = self.0.call() && self.0.bytes(size);
+        match self.0.exhausted() {
+            Some(limit) if !within => Err(StreamError::Trap(wasmtime::Error::new(Exceeded(limit)))),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Pollable for Discard {
+    async fn ready(&mut self) {}
+}
+
+#[async_trait::async_trait]
+impl OutputStream for Discard {
+    fn write(&mut self, bytes: bytes::Bytes) -> StreamResult<()> {
+        self.take(bytes.len())
+    }
+
+    fn flush(&mut self) -> StreamResult<()> {
+        Ok(())
+    }
+
+    fn check_write(&mut self) -> StreamResult<usize> {
+        Ok(4096)
+    }
+
+    /// Charged before anything is allocated; the zeroes are never made.
+    fn write_zeroes(&mut self, nelem: usize) -> StreamResult<()> {
+        self.take(nelem)
     }
 }

@@ -17,6 +17,7 @@ build = ["runtime", "dep:toml", "dep:wit-component"]
 # The Wasmtime runtime; without it the crate only reads, checks and writes plugin artifacts.
 runtime = [
     "dep:async-trait",
+    "dep:bytes",
     "dep:getrandom",
     "dep:lru",
     "dep:tokio",
@@ -24,10 +25,12 @@ runtime = [
     "dep:tracing",
     "dep:wasmtime",
     "dep:wasmtime-wasi",
+    "dep:wasmtime-wasi-io",
 ]
 
 [dependencies]
 async-trait = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
 hex = { workspace = true }
 lru = { workspace = true, optional = true }
@@ -44,6 +47,7 @@ wasm-encoder = { workspace = true }
 wasmparser = { workspace = true }
 wasmtime = { workspace = true, optional = true }
 wasmtime-wasi = { workspace = true, optional = true }
+wasmtime-wasi-io = { workspace = true, optional = true }
 wit-component = { workspace = true, optional = true }
 
 [dev-dependencies]

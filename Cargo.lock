@@ -801,6 +801,7 @@ name = "aruna-plugins"
 version = "3.0.0-alpha.171"
 dependencies = [
  "async-trait",
+ "bytes",
  "getrandom 0.4.3",
  "hex",
  "lru",
@@ -817,6 +818,7 @@ dependencies = [
  "wasmparser 0.258.3",
  "wasmtime",
  "wasmtime-wasi",
+ "wasmtime-wasi-io",
  "wit-component",
  "wit-parser",
 ]

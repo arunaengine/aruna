@@ -123,6 +123,7 @@ impl grants::Host for Session {
     async fn granted(&mut self, permission: String, resource: String) -> wasmtime::Result<bool> {
         let size = permission.len() + resource.len();
         let Ok(permission) = permission.parse::<Permission>() else {
+            self.count_call()?;
             self.charge(size)?;
             return Ok(false);
         };
@@ -334,6 +335,7 @@ impl state::Host for Session {
 
 impl log::Host for Session {
     async fn log(&mut self, level: log::Level, message: String) -> wasmtime::Result<()> {
+        self.count_call()?;
         self.charge(message.len())?;
         let mut end = message.len().min(MAX_LOG);
         while !message.is_char_boundary(end) {
