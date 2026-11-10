@@ -80,6 +80,22 @@ impl AdminDocumentState {
                     .map_err(|_| AdminDocumentError::InvalidVaultRecord)?;
                 self.apply_node_value(event, secret_info_path(name), value);
             }
+            AdminDocumentOperation::ConfigPluginSet {
+                name,
+                version,
+                plugin,
+            } => {
+                let matching = |plugin: &crate::plugins::PublishedPlugin| {
+                    plugin.valid() && plugin.name == *name && plugin.version == *version
+                };
+                if plugin.as_ref().is_some_and(|plugin| !matching(plugin)) {
+                    return Err(AdminDocumentError::InvalidPlugin);
+                }
+                let value = (plugin.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidPlugin)?;
+                self.apply_node_value(event, plugin_entry_path(name, version), value);
+            }
             AdminDocumentOperation::ConfigEmailSet { profile } => {
                 if profile.as_ref().is_some_and(|profile| !profile.valid()) {
                     return Err(AdminDocumentError::InvalidEmailProfile);

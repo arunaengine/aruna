@@ -13,6 +13,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::storage_entries::reducer_state_key;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{CENTRAL_PROVIDER_ID, SESSION_HEADER};
 use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;
@@ -73,6 +74,7 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/access/onboarding/secrets"),
     ("POST", "/access/sessions"),
     ("POST", "/access/users/register"),
+    ("POST", "/plugins"),
     ("POST", "/system/realm/nodes/{node_id}/promote"),
     ("POST", "/system/realm/secrets"),
     ("POST", "/system/realm/secrets/{name}/rotate"),
@@ -392,9 +394,26 @@ async fn relay(
             Some((name, value))
         })
         .collect();
-    let body = match Bytes::from_request(request, &()).await {
-        Ok(body) => body,
-        Err(rejection) => return rejection.into_response(),
+    // An artifact upload is read only for a caller who may publish, within this node's memory.
+    let mut _memory = None;
+    let body = if route == "/plugins" {
+        let auth = request
+            .extensions()
+            .get::<Option<AuthContext>>()
+            .cloned()
+            .flatten();
+        match crate::routes::plugins::read_upload(state, auth, request).await {
+            Ok((_, body, memory)) => {
+                _memory = Some(memory);
+                body
+            }
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        match Bytes::from_request(request, &()).await {
+            Ok(body) => body,
+            Err(rejection) => return rejection.into_response(),
+        }
     };
 
     // Targets are tried in order, but only a failure that provably predates

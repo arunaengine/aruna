@@ -33,6 +33,7 @@ pub mod oidc_providers;
 pub mod onboarding;
 pub mod pid;
 pub mod placement;
+pub mod plugins;
 pub mod policies;
 pub mod portal;
 pub mod promotion;
@@ -129,6 +130,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(webhooks::router())
         .merge(emails::router())
         .merge(email_profile::router())
+        .merge(plugins::router())
         .merge(policies::router())
         .merge(portal::router())
         .merge(oidc_providers::router())
@@ -818,6 +820,8 @@ pub(crate) mod tests {
             "DELETE",
             "/data/groups/{group_id}/distributed-buckets/{set_id}",
         ),
+        ("POST", "/plugins"),
+        ("GET", "/plugins"),
     ];
 
     /// Documented path to the runtime template that serves it. Catch-all ids

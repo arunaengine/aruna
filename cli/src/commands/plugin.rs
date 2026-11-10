@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use aruna_plugins::artifact::ArtifactDigest;
 use aruna_plugins::manifest::valid_plugin;
 use aruna_plugins::package::build_project;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::Context;
 use crate::args::{Language, PluginCommand};
+use crate::client::read_json;
 use crate::error::CliError;
 
 /// The host contract every non-Rust project builds against; the Rust SDK carries its own copy.
@@ -76,6 +77,8 @@ pub async fn plugin(context: &mut Context<'_>, command: PluginCommand) -> Result
                 "created {shown}; next: aruna-cli plugin build {shown}"
             ))
         }
+        PluginCommand::Publish { artifact } => publish(context, &artifact).await,
+        PluginCommand::List { name } => list(context, name).await,
         PluginCommand::Build { path } => {
             let built = build_project(&path).map_err(|err| CliError::usage(err.to_string()))?;
             let summary = Built {
@@ -116,6 +119,69 @@ fn create(name: &str, language: Language, path: &Path) -> Result<(), CliError> {
         std::fs::write(target, content.replace("{{name}}", name))?;
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PluginView {
+    name: String,
+    version: String,
+    title: Option<String>,
+    digest: String,
+    size: u64,
+    published_at_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PluginPage {
+    plugins: Vec<PluginView>,
+    next: Option<String>,
+}
+
+/// Uploads one artifact; a management node answers once enough copies are stored.
+async fn publish(context: &mut Context<'_>, artifact: &Path) -> Result<(), CliError> {
+    let bytes = std::fs::read(artifact)?;
+    let api = context.api()?;
+    let request = api.request(reqwest::Method::POST, "plugins")?;
+    let request = request.header(reqwest::header::CONTENT_TYPE, "application/wasm");
+    let published: PluginView = read_json(request.body(bytes).send().await?).await?;
+    match context.out.json {
+        true => context.out.json(&published),
+        false => context.out.line(format!(
+            "published {} {} {}",
+            published.name, published.version, published.digest
+        )),
+    }
+}
+
+/// Lists every published version, following the cursor across pages.
+async fn list(context: &mut Context<'_>, name: Option<String>) -> Result<(), CliError> {
+    let api = context.api()?;
+    let mut plugins = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut query = vec![("limit", "1000".to_string())];
+        query.extend(name.clone().map(|name| ("name", name)));
+        query.extend(cursor.take().map(|cursor| ("cursor", cursor)));
+        let page: PluginPage = api.get("plugins", &query).await?;
+        plugins.extend(page.plugins);
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    let rows = (plugins.iter())
+        .map(|p| {
+            vec![
+                p.name.clone(),
+                p.version.clone(),
+                p.title.clone().unwrap_or_default(),
+                p.digest.clone(),
+            ]
+        })
+        .collect();
+    context
+        .out
+        .listing(&plugins, &["NAME", "VERSION", "TITLE", "DIGEST"], rows)
 }
 
 #[derive(Debug, Serialize)]

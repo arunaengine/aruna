@@ -462,6 +462,14 @@ pub enum AdminDocumentOperation {
         name: crate::secrets::SecretName,
         info: Option<crate::secrets::SecretRecord>,
     },
+    /// Publishes or withdraws one plugin version. Each version is its own path; two
+    /// publishes of one version at once leave it absent until it is published again.
+    #[serde(rename = "RealmConfigPluginSet")]
+    ConfigPluginSet {
+        name: String,
+        version: String,
+        plugin: Option<crate::plugins::PublishedPlugin>,
+    },
 }
 
 impl AdminDocumentOperation {

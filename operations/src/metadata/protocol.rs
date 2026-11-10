@@ -680,6 +680,22 @@ pub enum MetadataTransportMessage {
     OpenSettingResult {
         result: Result<aruna_core::compute::SecretBytes, MetadataReadError>,
     },
+    /// One chunk of a plugin artifact a management node hands another to keep before publishing.
+    StoreArtifact {
+        chunk: crate::plugins::copies::Chunk,
+    },
+    /// `true` once the receiver holds the whole artifact and it checked out.
+    ArtifactStored {
+        result: Result<bool, MetadataReadError>,
+    },
+    /// One chunk of a published plugin artifact by digest, asked of a management node.
+    FetchArtifact {
+        digest: String,
+        index: u32,
+    },
+    FetchedArtifact {
+        result: Result<crate::plugins::copies::Chunk, MetadataReadError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.

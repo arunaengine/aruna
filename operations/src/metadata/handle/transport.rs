@@ -536,6 +536,10 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::RealmSecretResult { .. } => "realm_secret_result",
         MetadataTransportMessage::OpenSetting { .. } => "open_setting",
         MetadataTransportMessage::OpenSettingResult { .. } => "open_setting_result",
+        MetadataTransportMessage::StoreArtifact { .. } => "store_artifact",
+        MetadataTransportMessage::ArtifactStored { .. } => "artifact_stored",
+        MetadataTransportMessage::FetchArtifact { .. } => "fetch_artifact",
+        MetadataTransportMessage::FetchedArtifact { .. } => "fetched_artifact",
     }
 }
 
@@ -766,6 +770,40 @@ impl MetadataHandle {
             .map_err(|_| MetadataReadError::Unavailable)?
         {
             MetadataTransportMessage::RealmSecretResult { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// Hands the management node `node_id` one chunk of a plugin artifact to keep; `true` once
+    /// it holds the whole, checked artifact.
+    pub async fn request_store_artifact(
+        &self,
+        node_id: NodeId,
+        chunk: crate::plugins::copies::Chunk,
+    ) -> Result<bool, MetadataReadError> {
+        let request = MetadataTransportMessage::StoreArtifact { chunk };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::ArtifactStored { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// One chunk of a published plugin artifact from the management node `node_id`, unchecked.
+    pub async fn request_artifact(
+        &self,
+        node_id: NodeId,
+        digest: String,
+        index: u32,
+    ) -> Result<crate::plugins::copies::Chunk, MetadataReadError> {
+        let request = MetadataTransportMessage::FetchArtifact { digest, index };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::FetchedArtifact { result } => result,
             _ => Err(MetadataReadError::Unavailable),
         }
     }
