@@ -385,6 +385,7 @@ dependencies = [
  "aruna-core",
  "aruna-net",
  "aruna-operations",
+ "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
  "astral_async_zip",
