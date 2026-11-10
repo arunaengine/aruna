@@ -1,5 +1,5 @@
 //! Tests the local copy store: chunked copies, sync before an acknowledgement, the bound on
-//! unsettled copies, the sweep, and copies across a restart.
+//! unsettled copies, the sweep, interrupted writes, copies across a restart and held memory.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -15,6 +15,8 @@ use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::{TempDir, tempdir};
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
+/// A fixed clock for the copies these tests write.
+const T0: u64 = 1_762_700_000_000;
 
 fn context(storage_handle: StorageHandle) -> DriverContext {
     DriverContext {
@@ -33,25 +35,23 @@ fn opened() -> (TempDir, DriverContext) {
     (dir, context(storage))
 }
 
-/// A storage that passes every effect to `real` but fails the first `failures` syncs.
-fn failing_sync(real: StorageHandle, failures: usize) -> StorageHandle {
+/// A storage that passes every effect to `real`, but fails the `nth` effect (counted from 0)
+/// that `matching` selects.
+fn faulty(real: StorageHandle, matching: fn(&StorageEffect) -> bool, nth: usize) -> StorageHandle {
     let (handle, receivers) = StorageHandle::new();
-    let left = Arc::new(AtomicUsize::new(failures));
+    let seen = Arc::new(AtomicUsize::new(0));
     for receiver in [receivers.foreground, receivers.bulk] {
-        let (real, left) = (real.clone(), left.clone());
+        let (real, seen) = (real.clone(), seen.clone());
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             while let Ok((effect, response, ..)) = receiver.recv() {
-                let failing = matches!(effect, StorageEffect::SyncAll)
-                    && left
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                        .is_ok();
+                let failing = matching(&effect) && seen.fetch_add(1, Ordering::SeqCst) == nth;
                 let event = match failing {
                     true => StorageEvent::Error {
-                        error: StorageError::PersistError("sync failed".into()),
+                        error: StorageError::PersistError("injected failure".into()),
                     },
                     false => match runtime.block_on(real.send_storage_effect(effect)) {
                         Event::Storage(event) => event,
@@ -63,6 +63,20 @@ fn failing_sync(real: StorageHandle, failures: usize) -> StorageHandle {
         });
     }
     handle
+}
+
+fn faulty_context(matching: fn(&StorageEffect) -> bool, nth: usize) -> (TempDir, DriverContext) {
+    let dir = tempdir().unwrap();
+    let real = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    (dir, context(faulty(real, matching, nth)))
+}
+
+fn syncs(effect: &StorageEffect) -> bool {
+    matches!(effect, StorageEffect::SyncAll)
+}
+
+fn commits(effect: &StorageEffect) -> bool {
+    matches!(effect, StorageEffect::CommitTransaction { .. })
 }
 
 /// The fixture with a custom section appended, so it spans three chunks.
@@ -105,6 +119,22 @@ fn digest(bytes: &[u8]) -> String {
     ArtifactDigest::of(bytes).to_string()
 }
 
+async fn local(ctx: &DriverContext, digest: &str) -> Option<Vec<u8>> {
+    read_local(ctx, digest)
+        .await
+        .unwrap()
+        .map(|copy| copy.bytes)
+}
+
+async fn rows(ctx: &DriverContext) -> usize {
+    let rows = scan_all(&ctx.storage_handle, PLUGIN_ARTIFACT_KEYSPACE, None).await;
+    rows.unwrap().len()
+}
+
+fn after_grace(time: u64) -> u64 {
+    time + GRACE.as_millis() as u64 + 1
+}
+
 #[tokio::test]
 async fn chunked_copy() {
     let (_dir, ctx) = opened();
@@ -113,70 +143,48 @@ async fn chunked_copy() {
     let digest = digest(&big);
     assert!(check_artifact(&big).is_ok());
     assert_eq!(chunk_count(big.len() as u64), 3);
+    let store = |chunk| store_chunk(&ctx, &config, chunk, T0);
 
     let mut short = chunk_of(&digest, &big, 0);
     short.bytes.0.pop();
-    assert!(matches!(
-        store_chunk(&ctx, &config, short).await,
-        Err(ArtifactError::Mismatch)
-    ));
+    assert!(matches!(store(short).await, Err(ArtifactError::Mismatch)));
     let mut huge = chunk_of(&digest, &big, 0);
     huge.total = MAX_ARTIFACT as u64 + 1;
-    assert!(matches!(
-        store_chunk(&ctx, &config, huge).await,
-        Err(ArtifactError::Mismatch)
-    ));
+    assert!(matches!(store(huge).await, Err(ArtifactError::Mismatch)));
 
-    assert!(
-        !store_chunk(&ctx, &config, chunk_of(&digest, &big, 2))
-            .await
-            .unwrap()
-    );
-    assert!(
-        !store_chunk(&ctx, &config, chunk_of(&digest, &big, 0))
-            .await
-            .unwrap()
-    );
+    assert!(!store(chunk_of(&digest, &big, 2)).await.unwrap());
+    assert!(!store(chunk_of(&digest, &big, 0)).await.unwrap());
     let mut corrupt = chunk_of(&digest, &big, 1);
     corrupt.bytes.0[0] ^= 1;
-    let refused = store_chunk(&ctx, &config, corrupt.clone()).await;
+    let refused = store(corrupt.clone()).await;
     assert!(
         matches!(refused, Err(ArtifactError::Mismatch)),
         "{refused:?}"
     );
-    assert_eq!(read_local(&ctx, &digest).await.unwrap(), None);
+    assert_eq!(local(&ctx, &digest).await, None);
 
-    assert!(
-        store_chunk(&ctx, &config, chunk_of(&digest, &big, 1))
-            .await
-            .unwrap()
-    );
-    assert_eq!(read_local(&ctx, &digest).await.unwrap(), Some(big.clone()));
-    assert!(
-        store_chunk(&ctx, &config, corrupt).await.unwrap(),
-        "a done copy stays"
-    );
-    assert_eq!(read_local(&ctx, &digest).await.unwrap(), Some(big.clone()));
+    assert!(store(chunk_of(&digest, &big, 1)).await.unwrap());
+    assert_eq!(local(&ctx, &digest).await, Some(big.clone()));
+    assert!(store(corrupt).await.unwrap(), "a done copy stays");
+    assert_eq!(local(&ctx, &digest).await, Some(big.clone()));
     let (total, first) = read_chunk(&ctx, &digest, 0).await.unwrap().unwrap();
     assert_eq!((total, first.len()), (big.len() as u64, CHUNK));
     assert_eq!(read_chunk(&ctx, &digest, 3).await.unwrap(), None);
+    assert!(has_local(&ctx, &digest).await.unwrap());
 }
 
 #[tokio::test]
 async fn sync_before_ack() {
-    let dir = tempdir().unwrap();
-    let real = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let ctx = context(failing_sync(real, 1));
+    let (_dir, ctx) = faulty_context(syncs, 0);
     let config = config(&[]);
-    let digest = digest(FIXTURE);
-    let chunk = chunk_of(&digest, FIXTURE, 0);
-    let failed = store_chunk(&ctx, &config, chunk.clone()).await;
+    let chunk = chunk_of(&digest(FIXTURE), FIXTURE, 0);
+    let failed = store_chunk(&ctx, &config, chunk.clone(), T0).await;
     assert!(
         matches!(failed, Err(ArtifactError::Storage(_))),
         "{failed:?}"
     );
     // The done row exists, but only a resend whose sync succeeds acknowledges the copy.
-    assert!(store_chunk(&ctx, &config, chunk).await.unwrap());
+    assert!(store_chunk(&ctx, &config, chunk, T0).await.unwrap());
 }
 
 #[tokio::test]
@@ -191,12 +199,13 @@ async fn bounds_unsettled() {
         chunk
     };
     for n in 0..(MAX_UNSETTLED / MAX_ARTIFACT as u64) as u8 {
-        assert!(!store_chunk(&ctx, &unpublished, chunk(n)).await.unwrap());
+        assert!(!store_chunk(&ctx, &unpublished, chunk(n), T0).await.unwrap());
     }
-    let refused = store_chunk(&ctx, &unpublished, chunk(200)).await;
+    let refused = store_chunk(&ctx, &unpublished, chunk(200), T0).await;
     assert!(matches!(refused, Err(ArtifactError::Busy)), "{refused:?}");
     // A published copy is always welcome, however much is unsettled.
-    store_local(&ctx, &config(&[FIXTURE]), &digest(FIXTURE), FIXTURE)
+    let published = config(&[FIXTURE]);
+    store_local(&ctx, &published, &digest(FIXTURE), FIXTURE, T0)
         .await
         .unwrap();
 }
@@ -206,39 +215,137 @@ async fn sweeps_abandoned() {
     let (_dir, ctx) = opened();
     let big = padded();
     let published = config(&[FIXTURE]);
-    store_local(&ctx, &published, &digest(FIXTURE), FIXTURE)
+    store_local(&ctx, &published, &digest(FIXTURE), FIXTURE, T0)
         .await
         .unwrap();
-    store_local(&ctx, &published, &digest(&big), &big)
+    store_local(&ctx, &published, &digest(&big), &big, T0)
         .await
         .unwrap();
-    let partial = chunk_of(&digest(&big), &big, 0);
-    let other = format!("sha256:{}", "ee".repeat(32));
-    let mut unfinished = partial.clone();
-    unfinished.digest = other.clone();
-    assert!(!store_chunk(&ctx, &published, unfinished).await.unwrap());
+    let mut unfinished = chunk_of(&digest(&big), &big, 0);
+    unfinished.digest = format!("sha256:{}", "ee".repeat(32));
+    assert!(!store_chunk(&ctx, &published, unfinished, T0).await.unwrap());
 
-    let now = unix_timestamp_millis();
     assert_eq!(
-        sweep_copies(&ctx, &published, now).await.unwrap(),
+        sweep_copies(&ctx, &published, T0).await.unwrap(),
         0,
         "recent copies stay"
     );
-    let later = now + GRACE.as_millis() as u64 + 1;
-    assert_eq!(sweep_copies(&ctx, &published, later).await.unwrap(), 2);
     assert_eq!(
-        read_local(&ctx, &digest(FIXTURE)).await.unwrap(),
-        Some(FIXTURE.to_vec())
+        sweep_copies(&ctx, &published, after_grace(T0))
+            .await
+            .unwrap(),
+        2
     );
-    assert_eq!(read_local(&ctx, &digest(&big)).await.unwrap(), None);
-    let rows = scan_all(&ctx.storage_handle, PLUGIN_ARTIFACT_KEYSPACE, None)
-        .await
-        .unwrap();
+    assert_eq!(local(&ctx, &digest(FIXTURE)).await, Some(FIXTURE.to_vec()));
+    assert_eq!(local(&ctx, &digest(&big)).await, None);
     assert_eq!(
-        rows.len(),
+        rows(&ctx).await,
         2,
         "only the published copy's chunk and done row remain"
     );
+}
+
+#[tokio::test]
+async fn resend_keeps_copy() {
+    // A resend acknowledges an unpublished copy again, so its retention starts over.
+    let (_dir, ctx) = opened();
+    let unpublished = config(&[]);
+    let chunk = chunk_of(&digest(FIXTURE), FIXTURE, 0);
+    assert!(
+        store_chunk(&ctx, &unpublished, chunk.clone(), T0)
+            .await
+            .unwrap()
+    );
+    let resent = after_grace(T0) - 2;
+    assert!(
+        store_chunk(&ctx, &unpublished, chunk, resent)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        sweep_copies(&ctx, &unpublished, after_grace(T0))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(local(&ctx, &digest(FIXTURE)).await, Some(FIXTURE.to_vec()));
+    assert_eq!(
+        sweep_copies(&ctx, &unpublished, after_grace(resent))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(rows(&ctx).await, 0);
+}
+
+#[tokio::test]
+async fn interrupted_local_write() {
+    // A local write that fails after its first chunk leaves a counted, sweepable unfinished copy.
+    let (_dir, ctx) = faulty_context(commits, 1);
+    let unpublished = config(&[]);
+    let big = padded();
+    let failed = store_local(&ctx, &unpublished, &digest(&big), &big, T0).await;
+    assert!(
+        matches!(failed, Err(ArtifactError::Storage(_))),
+        "{failed:?}"
+    );
+    assert_eq!(local(&ctx, &digest(&big)).await, None);
+    assert_eq!(rows(&ctx).await, 2, "the first chunk and its progress row");
+    assert_eq!(
+        sweep_copies(&ctx, &unpublished, after_grace(T0))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(rows(&ctx).await, 0);
+}
+
+#[tokio::test]
+async fn interrupted_completion() {
+    // A failed completion leaves the copy unfinished, never half complete; a resend completes it.
+    let (_dir, ctx) = faulty_context(commits, 0);
+    let unpublished = config(&[]);
+    let chunk = chunk_of(&digest(FIXTURE), FIXTURE, 0);
+    let failed = store_chunk(&ctx, &unpublished, chunk.clone(), T0).await;
+    assert!(
+        matches!(failed, Err(ArtifactError::Storage(_))),
+        "{failed:?}"
+    );
+    assert!(!has_local(&ctx, &digest(FIXTURE)).await.unwrap());
+    assert!(store_chunk(&ctx, &unpublished, chunk, T0).await.unwrap());
+    assert_eq!(
+        rows(&ctx).await,
+        2,
+        "the chunk and its done row, no progress row"
+    );
+
+    // A stale progress row next to a published done row only removes itself.
+    let published = config(&[FIXTURE]);
+    let progress = Progress::new(FIXTURE.len() as u64, T0).encode();
+    write_rows(&ctx, vec![(progress_key(&digest(FIXTURE)), progress)])
+        .await
+        .unwrap();
+    assert_eq!(
+        sweep_copies(&ctx, &published, after_grace(T0))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(local(&ctx, &digest(FIXTURE)).await, Some(FIXTURE.to_vec()));
+    assert_eq!(rows(&ctx).await, 2);
+}
+
+#[tokio::test]
+async fn holds_memory() {
+    // Assembled bytes carry their share of the node's memory budget until they are dropped.
+    let (_dir, ctx) = opened();
+    let big = padded();
+    store_local(&ctx, &config(&[]), &digest(&big), &big, T0)
+        .await
+        .unwrap();
+    let copy = read_local(&ctx, &digest(&big)).await.unwrap().unwrap();
+    assert_eq!(copy.reserved_mib(), big.len().div_ceil(1 << 20) as u32);
+    assert_eq!(copy.bytes, big);
 }
 
 #[tokio::test]
@@ -249,22 +356,13 @@ async fn survives_restart() {
     let big = padded();
     let digest = digest(&big);
     let ctx = context(FjallStorage::open(&path).unwrap());
-    assert!(
-        !store_chunk(&ctx, &config, chunk_of(&digest, &big, 0))
-            .await
-            .unwrap()
-    );
-    assert!(
-        !store_chunk(&ctx, &config, chunk_of(&digest, &big, 1))
-            .await
-            .unwrap()
-    );
+    let first = store_chunk(&ctx, &config, chunk_of(&digest, &big, 0), T0).await;
+    assert!(!first.unwrap());
+    let second = store_chunk(&ctx, &config, chunk_of(&digest, &big, 1), T0).await;
+    assert!(!second.unwrap());
     ctx.storage_handle.close().await;
     let ctx = context(FjallStorage::open(&path).unwrap());
-    assert!(
-        store_chunk(&ctx, &config, chunk_of(&digest, &big, 2))
-            .await
-            .unwrap()
-    );
-    assert_eq!(read_local(&ctx, &digest).await.unwrap(), Some(big));
+    let last = store_chunk(&ctx, &config, chunk_of(&digest, &big, 2), T0).await;
+    assert!(last.unwrap());
+    assert_eq!(local(&ctx, &digest).await, Some(big));
 }
