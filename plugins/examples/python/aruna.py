@@ -37,6 +37,18 @@ def _event(trigger: Any) -> dict:
     return {"kind": "timer", "tick": trigger.value}
 
 
+def _failure(error: Exception) -> types.Failure:
+    """A handler's own failure stays; an unavailable host is retryable, any other error permanent."""
+    value = error.value if isinstance(error, Err) else None
+    if isinstance(value, types.Failure):
+        return value
+    if isinstance(value, types.HostError):
+        retry = value.kind == types.ErrorKind.UNAVAILABLE
+        kind = types.FailureKind.RETRYABLE if retry else types.FailureKind.PERMANENT
+        return types.Failure(kind, f"host call failed ({value.kind.name.lower()}): {value.message}")
+    return types.Failure(types.FailureKind.PERMANENT, str(error if value is None else value))
+
+
 class WitWorld(wit_world.WitWorld):
     def handle(self, handler: str, invocation: types.Invocation) -> str | None:
         function = _handlers.get(handler)
@@ -45,11 +57,8 @@ class WitWorld(wit_world.WitWorld):
         ctx = Context(invocation.run, invocation.install, invocation.group, json.loads(invocation.settings))
         try:
             result = function(ctx, _event(invocation.trigger))
-        except Err as error:
-            message = getattr(error.value, "message", str(error.value))
-            raise Err(types.Failure(types.FailureKind.PERMANENT, message))
         except Exception as error:
-            raise Err(types.Failure(types.FailureKind.PERMANENT, str(error)))
+            raise Err(_failure(error))
         if result is None or isinstance(result, str):
             return result
         return json.dumps(result)
