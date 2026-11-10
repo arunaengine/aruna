@@ -51,6 +51,7 @@ pub struct RemoveGroupOperation {
     /// transaction.
     fence: crate::placement::fence::WriteFence,
     state: RemoveGroupState,
+    conflicts: u8,
     output: Option<Result<(Group, GroupAuthorizationDocument), RemoveGroupError>>,
 }
 
@@ -156,6 +157,7 @@ impl RemoveGroupOperation {
             input,
             fence: Default::default(),
             state: RemoveGroupState::Init,
+            conflicts: 0,
             output: None,
         }
     }
@@ -598,10 +600,24 @@ impl RemoveGroupOperation {
 
     fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
+            if error == StorageError::TransactionConflict
+                && matches!(self.state, RemoveGroupState::CommitTransaction { .. })
+                && self.conflicts < super::CONFLICT_RETRIES
+            {
+                return Err(self.restart_after_conflict());
+            }
             return Err(self.fail(error.into()));
         }
 
         Ok(event)
+    }
+
+    /// A conflicted commit already discarded its transaction, so the retry
+    /// opens a fresh one and rereads every row, including the realm config.
+    fn restart_after_conflict(&mut self) -> Effects {
+        self.conflicts += 1;
+        self.fence = Default::default();
+        self.start()
     }
 }
 
@@ -748,7 +764,10 @@ pub mod test {
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
@@ -762,7 +781,9 @@ pub mod test {
     use crate::driver::{DriverContext, drive};
     use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::groups::remove_role::{RemoveGroupConfig, RemoveGroupError, RemoveGroupOperation};
+    use crate::groups::remove_role::{
+        RemoveGroupConfig, RemoveGroupError, RemoveGroupOperation, RemoveGroupState,
+    };
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
     async fn test_context() -> (DriverContext, NetHandle, TempDir) {
@@ -829,6 +850,75 @@ pub mod test {
             path_restrictions: None,
             session: None,
         }
+    }
+
+    #[test]
+    fn retries_commit_conflict() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let group_id = Ulid::from_bytes([8u8; 16]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([10u8; 16]), realm_id),
+            realm_id,
+        };
+        let group = Group {
+            display_name: "Test group".to_string(),
+            group_id,
+            realm_id,
+            roles: HashSet::new(),
+            owner: actor.user_id,
+        };
+        let auth_doc = GroupAuthorizationDocument {
+            group_id,
+            policies: Vec::new(),
+            roles: HashMap::new(),
+        };
+        let config = RemoveGroupConfig {
+            auth_context: auth_context(&actor),
+            actor,
+            realm_id,
+            group_id,
+            role_id: Ulid::from_bytes([11u8; 16]),
+        };
+        let conflict = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            })
+        };
+        let mut operation = RemoveGroupOperation::new(config.clone());
+        let commit = |operation: &mut RemoveGroupOperation| {
+            operation.state = RemoveGroupState::CommitTransaction {
+                txn_id: TxnId::generate(),
+                group: group.clone(),
+                auth_doc: auth_doc.clone(),
+                admin_outbox_written: true,
+            };
+            operation.step(conflict())
+        };
+
+        for _ in 0..crate::groups::CONFLICT_RETRIES {
+            let effects = commit(&mut operation);
+            assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+            assert_eq!(operation.state, RemoveGroupState::Auth);
+        }
+        commit(&mut operation);
+        assert_eq!(
+            operation.finalize(),
+            Err(RemoveGroupError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
+
+        // Before the commit the transaction is still open, so a conflict aborts it.
+        let mut operation = RemoveGroupOperation::new(config);
+        let txn_id = TxnId::generate();
+        operation.state = RemoveGroupState::GetGroup { txn_id };
+        let effects = operation.step(conflict());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })] if *id == txn_id
+        ));
+        assert_eq!(operation.state, RemoveGroupState::Error);
     }
 
     #[test]
