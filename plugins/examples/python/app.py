@@ -5,6 +5,7 @@
 import json
 
 from aruna import WitWorld, handler  # noqa: F401  WitWorld is the component's entry point
+from componentize_py_types import Err
 from wit_world.imports import connections, grants, metadata_read, metadata_write, types
 
 
@@ -22,6 +23,8 @@ def dataset_created(ctx, event):
     request = connections.Request("catalog", connections.Method.POST, "", [], headers, body, None)
     reply = connections.send(request)
     if grants.granted("metadata.write", dataset):
-        catalog = json.loads(reply.json or "{}").get("/id")
-        patch = json.dumps({"identifier": {"catalog": catalog}})
+        fields = json.loads(reply.json or "{}")
+        if "/id" not in fields:
+            raise Err(types.Failure(types.FailureKind.PERMANENT, "the response has no field `/id`"))
+        patch = json.dumps({"identifier": {"catalog": fields["/id"]}})
         metadata_write.patch(dataset, patch, doc.revision, None)

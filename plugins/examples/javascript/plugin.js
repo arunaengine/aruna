@@ -18,8 +18,12 @@ const handlers = {
     const request = { connection: "catalog", method: "post", path: "", query: [], headers, body: json({ id: dataset, title }) };
     const reply = send(request);
     if (granted("metadata.write", dataset)) {
-      const id = JSON.parse(reply.json ?? "{}")["/id"];
-      patch(dataset, JSON.stringify({ identifier: { catalog: id } }), doc.revision, undefined);
+      const fields = JSON.parse(reply.json ?? "{}");
+      if (!("/id" in fields)) {
+        throw { kind: "permanent", message: "the response has no field `/id`" };
+      }
+      const identifier = { catalog: fields["/id"] };
+      patch(dataset, JSON.stringify({ identifier }), doc.revision, undefined);
     }
   },
 };
