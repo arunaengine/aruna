@@ -11,7 +11,7 @@ use crate::structs::identity::auth::Actor;
 use crate::types::GroupId;
 use crate::user::validation::{
     DEACTIVATED_ATTRIBUTE, INSTALL_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX,
-    SERVICE_GROUP_ATTRIBUTE,
+    SERVICE_GROUP_ATTRIBUTE, STOPPED_BY_INSTALL,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -45,6 +45,14 @@ impl User {
 
     pub fn is_deactivated(&self) -> bool {
         self.attributes.contains_key(DEACTIVATED_ATTRIBUTE)
+    }
+
+    /// Whether the account's own plugin install deactivated it, not an administrator.
+    pub fn stopped_by_install(&self) -> bool {
+        self.attributes
+            .get(DEACTIVATED_ATTRIBUTE)
+            .map(String::as_str)
+            == Some(STOPPED_BY_INSTALL)
     }
 
     /// The owning group when this account is a service account.

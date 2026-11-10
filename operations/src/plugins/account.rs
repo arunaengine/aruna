@@ -258,7 +258,8 @@ pub(crate) async fn set_active(
         active,
         now: unix_timestamp_secs(),
     })
-    .guarded(guard);
+    .guarded(guard)
+    .by_install();
     drive(status, ctx).await.map_err(|error| error.to_string())
 }
 

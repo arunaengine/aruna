@@ -8,9 +8,11 @@ use crate::plugins::account::{ensure_role, guard_of};
 use crate::plugins::grants::role_paths;
 use crate::plugins::install::repair_install;
 use crate::plugins::install::tests::Fixture;
+use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation};
 use crate::users::admin_audit::{AuditPageInput, AuditPageOperation};
 use aruna_core::structs::identity::admin_audit::AuditIndex;
 use aruna_core::structs::identity::auth::{PathRestriction, Permission as Access};
+use aruna_core::time::unix_timestamp_secs;
 use serde_json::json;
 
 fn needs_objects() -> Value {
@@ -302,4 +304,33 @@ async fn stale_node_changes() {
             .unwrap()
     );
     assert_eq!(a.role(&active).await.unwrap().permissions, wanted);
+}
+
+#[tokio::test]
+async fn keeps_admin_deactivation() {
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let (node, realm) = (actor.node_id, actor.realm_id);
+    let scope = scope_of(realm, &installed);
+    let identity = Identity::of(&installed);
+
+    // The install's own stop is repaired.
+    teardown(ctx, actor, &auth, &scope, identity, guard_of(&installed))
+        .await
+        .unwrap();
+    assert!(repair_install(ctx, node, realm, &installed).await.unwrap());
+    assert!(!fixture.account(&installed).await.unwrap().is_deactivated());
+
+    // An administrator's deactivation stays through repair.
+    let stop = AccountStatusOperation::new(AccountStatusConfig {
+        actor: actor.clone(),
+        auth_context: auth.clone(),
+        target: installed.account,
+        active: false,
+        now: unix_timestamp_secs(),
+    });
+    drive(stop, ctx).await.unwrap();
+    assert!(!repair_install(ctx, node, realm, &installed).await.unwrap());
+    assert!(fixture.account(&installed).await.unwrap().is_deactivated());
 }

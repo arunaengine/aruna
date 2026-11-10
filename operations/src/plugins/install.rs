@@ -23,7 +23,8 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::account::{
-    Identity, account_name, check_ready, ensure_account, ensure_role, guard_of, read_auth, teardown,
+    Identity, account_name, check_ready, ensure_account, ensure_role, guard_of, read_auth,
+    read_user, teardown,
 };
 use super::grants::{
     GrantError, Grants, InstallScope, accesses, carry_grants, check_supported, narrow_grants,
@@ -343,6 +344,14 @@ pub(crate) async fn repair_install(
     if check_ready(ctx, &scope, identity, &paths).await.is_ok() {
         return Ok(false);
     }
+    let step = |step| move |error| InstallError::Step { step, error };
+    // An administrator's deactivation stands; repair restores only what the install stopped.
+    let user = read_user(ctx, identity.account)
+        .await
+        .map_err(step("account"))?;
+    if user.is_some_and(|user| user.is_deactivated() && !user.stopped_by_install()) {
+        return Ok(false);
+    }
     let actor = Actor {
         node_id,
         user_id: install.granted_by,
@@ -356,7 +365,6 @@ pub(crate) async fn repair_install(
     };
     let guard = guard_of(install);
     let name = account_name(ctx, &install.plugin, scope.group_id).await;
-    let step = |step| move |error| InstallError::Step { step, error };
     ensure_account(ctx, &actor, &auth, &scope, identity, name, guard)
         .await
         .map_err(step("account"))?;
