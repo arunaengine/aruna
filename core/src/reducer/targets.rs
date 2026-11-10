@@ -413,17 +413,29 @@ impl AdminDocumentState {
             .collect()
     }
 
-    /// Published plugin versions sorted by name and version. A withdrawn or conflicting one is absent.
+    /// Published plugin versions sorted by name and version. A withdrawn version is absent, and
+    /// so is a conflicting one unless every competing entry publishes the same artifact.
     pub fn materialized_plugins(&self) -> Vec<crate::plugins::PublishedPlugin> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return Vec::new();
         }
-        (self.user_subject_ids)
-            .range(PLUGIN_ENTRY_PREFIX.to_string()..)
-            .take_while(|(path, _)| path.starts_with(PLUGIN_ENTRY_PREFIX))
-            .filter(|(path, _)| !self.conflicts.contains_key(*path))
-            .filter_map(|(_, version)| serde_json::from_str(version.value.as_deref()?).ok())
-            .collect()
+        let prefixed = |path: &&String| path.starts_with(PLUGIN_ENTRY_PREFIX);
+        let settled = (self
+            .user_subject_ids
+            .range(PLUGIN_ENTRY_PREFIX.to_string()..))
+        .take_while(|(path, _)| prefixed(path))
+        .filter(|(path, _)| !self.conflicts.contains_key(*path))
+        .filter_map(|(path, version)| {
+            Some((path, serde_json::from_str(version.value.as_deref()?).ok()?))
+        });
+        let agreed = (self.conflicts.range(PLUGIN_ENTRY_PREFIX.to_string()..))
+            .take_while(|(path, _)| prefixed(path))
+            .filter_map(|(path, conflict)| {
+                Some((path, crate::plugins::same_artifact(&conflict.values)?))
+            });
+        let entries: BTreeMap<&String, crate::plugins::PublishedPlugin> =
+            settled.chain(agreed).collect();
+        entries.into_values().collect()
     }
 
     /// Display names of realm nodes, by node id. A cleared or conflicting name is absent.

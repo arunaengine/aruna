@@ -42,6 +42,32 @@ impl PublishedPlugin {
     }
 }
 
+/// The one entry concurrent publications of a version agree on: every competing value is an
+/// entry of the same artifact. The earliest publication is kept, so every node picks the same.
+pub fn same_artifact(values: &[crate::reducer::AdminConflictValue]) -> Option<PublishedPlugin> {
+    let entries = (values.iter())
+        .map(|value| serde_json::from_str::<PublishedPlugin>(value.value.as_deref()?).ok())
+        .collect::<Option<Vec<PublishedPlugin>>>()?;
+    let first = entries.first()?;
+    fn artifact(entry: &PublishedPlugin) -> (&str, &str, &str, u64, &str) {
+        (
+            &entry.name,
+            &entry.version,
+            &entry.digest,
+            entry.size,
+            &entry.manifest,
+        )
+    }
+    if !entries
+        .iter()
+        .all(|entry| artifact(entry) == artifact(first))
+    {
+        return None;
+    }
+    let order = |entry: &PublishedPlugin| (entry.published_at_ms, entry.published_by.to_string());
+    entries.into_iter().min_by_key(order)
+}
+
 /// A plugin name: 1 to 64 of `a-z`, `0-9` or `-`, starting with a letter, no `-` at the end.
 pub fn valid_name(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -90,6 +116,50 @@ mod tests {
             let mut invalid = entry();
             edit(&mut invalid);
             assert!(!invalid.valid(), "{invalid:?}");
+        }
+    }
+
+    /// Two managers publish `left` and `right` concurrently, then each applies the other's event.
+    fn concurrent(left: PublishedPlugin, right: PublishedPlugin) -> [Vec<PublishedPlugin>; 2] {
+        use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+        use crate::reducer::AdminDocumentState;
+        use crate::structs::identity::auth::Actor;
+
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let manager = |seed: u8| Actor {
+            node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        let set = |plugin: PublishedPlugin| AdminDocumentOperation::ConfigPluginSet {
+            name: plugin.name.clone(),
+            version: plugin.version.clone(),
+            plugin: Some(plugin),
+        };
+        let (mut a, mut b) = (
+            AdminDocumentState::new(target.clone()),
+            AdminDocumentState::new(target),
+        );
+        let from_a = a.apply_operation(&manager(3), set(left)).unwrap();
+        let from_b = b.apply_operation(&manager(4), set(right)).unwrap();
+        a.apply(&from_b).unwrap();
+        b.apply(&from_a).unwrap();
+        [a.materialized_plugins(), b.materialized_plugins()]
+    }
+
+    #[test]
+    fn coalesces_retries() {
+        // A retry of the same bytes through another manager stays published, the earliest kept.
+        let mut retry = entry();
+        retry.published_at_ms = 9;
+        for seen in concurrent(entry(), retry.clone()) {
+            assert_eq!(seen, vec![entry()]);
+        }
+        // Two different artifacts of one version keep the conflict rule: the version is hidden.
+        retry.digest = format!("sha256:{}", "cd".repeat(32));
+        for seen in concurrent(entry(), retry.clone()) {
+            assert!(seen.is_empty(), "{seen:?}");
         }
     }
 }
