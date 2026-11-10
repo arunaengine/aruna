@@ -111,6 +111,8 @@ pub trait Broker: Send + Sync {
     /// Records that a write did not finish within its deadline, so its outcome is unknown.
     /// The run's slot is held until this returns or its own deadline passes.
     async fn abandoned(&self, cx: &CallContext, intent: &Intent);
+    /// Keeps one guest log line, already cut to its bound; a broker may drop it.
+    async fn log(&self, _cx: &CallContext, _level: &str, _message: &str) {}
 }
 
 impl HostError {

@@ -12,10 +12,12 @@ pub mod install;
 pub mod intents;
 pub mod lifecycle;
 pub mod publish;
+pub mod rate;
 pub mod receiver;
 pub mod records;
 pub mod runs;
 pub mod settings;
+pub mod state;
 pub mod store;
 
 use serde::{Deserialize, Serialize};

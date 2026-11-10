@@ -159,3 +159,37 @@ async fn object_calls() {
         .unwrap_err();
     assert_eq!(remote.kind, ErrorKind::Unavailable);
 }
+
+#[tokio::test]
+async fn state_and_log() {
+    let (_fixture, broker, _, _dir) = broker().await;
+    let put = StatePut {
+        key: "cursor".into(),
+        value: b"a".to_vec(),
+        expected: None,
+        intent: Intent::new(0, None, &[b"cursor", b"a"]),
+    };
+    assert_eq!(broker.state_put(&cx(), put.clone()).await.unwrap(), 1);
+    // The same call again answers its stored version and writes nothing.
+    assert_eq!(broker.state_put(&cx(), put).await.unwrap(), 1);
+    let entry = broker.state_get(&cx(), "cursor").await.unwrap().unwrap();
+    assert_eq!((entry.version, entry.value), (1, b"a".to_vec()));
+    let stale = StatePut {
+        key: "cursor".into(),
+        value: b"b".to_vec(),
+        expected: None,
+        intent: Intent::new(1, None, &[b"cursor", b"b"]),
+    };
+    let refused = broker.state_put(&cx(), stale).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Conflict);
+    let empty = broker.state_get(&cx(), "").await.unwrap_err();
+    assert_eq!(empty.kind, ErrorKind::Invalid);
+
+    broker.log(&cx(), "info", "started").await;
+    let lines = broker.take_log();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(
+        (lines[0].level.as_str(), lines[0].message.as_str()),
+        ("info", "started")
+    );
+}

@@ -5,16 +5,18 @@
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use aruna_core::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::plugin_runs::{LogLine, PluginRun};
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
     Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
     ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
@@ -25,7 +27,9 @@ use ulid::Ulid;
 
 use super::check::{RunScope, check_call, matching, unavailable};
 use super::grants::{accesses, parse_grants};
-use super::intents::{Begun, begin, mark_unknown, settle_in};
+use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in};
+use super::rate::take_call;
+use super::state::{PutError, check_key, put_state, read_state};
 use super::store::{StoreError, Txn, transact};
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
@@ -48,14 +52,43 @@ pub struct RunBroker {
     scope: RunScope,
     /// A call at a known ordinal came with other arguments than before.
     changed: AtomicBool,
+    /// Guest log lines, bounded as the run keeps them.
+    log: Mutex<PluginRun>,
 }
 
 impl RunBroker {
     pub fn new(ctx: Arc<DriverContext>, scope: RunScope) -> Self {
+        let mut lines = scope.run.clone();
+        lines.log.clear();
         Self {
             ctx,
+            log: Mutex::new(lines),
             scope,
             changed: AtomicBool::new(false),
+        }
+    }
+
+    /// The log lines the guest wrote, within the run's bounds.
+    pub fn take_log(&self) -> Vec<LogLine> {
+        let mut run = self
+            .log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut run.log)
+    }
+
+    /// Steps 0 to 2 and 5: the run may call now, within the install's call rate.
+    async fn admitted(
+        &self,
+        target: Option<(Permission, &str)>,
+    ) -> Result<PluginInstall, HostError> {
+        let install = check_call(&self.ctx, &self.scope, target).await?;
+        match take_call(install.install_id, std::time::Instant::now()) {
+            true => Ok(install),
+            false => Err(HostError::new(
+                ErrorKind::Limit,
+                "the install makes calls too fast",
+            )),
         }
     }
 
@@ -70,7 +103,7 @@ impl RunBroker {
         permission: Permission,
         target: &str,
     ) -> Result<(PluginInstall, AuthContext), HostError> {
-        let install = check_call(&self.ctx, &self.scope, Some((permission, target))).await?;
+        let install = self.admitted(Some((permission, target))).await?;
         let patterns = matching(&install, permission, target)?;
         Ok((
             install.clone(),
@@ -83,7 +116,7 @@ impl RunBroker {
         &self,
         permission: Permission,
     ) -> Result<(PluginInstall, AuthContext), HostError> {
-        let install = check_call(&self.ctx, &self.scope, None).await?;
+        let install = self.admitted(None).await?;
         let grants = parse_grants(&install.grants);
         let patterns = grants.get(&permission).cloned().unwrap_or_default();
         Ok((
@@ -164,8 +197,7 @@ impl RunBroker {
                 }
             }
             Err(Outcome::None(error)) => {
-                let clear =
-                    async |txn: &Txn<'_>| super::intents::clear_in(txn, run_id, intent).await;
+                let clear = async |txn: &Txn<'_>| clear_in(txn, run_id, intent).await;
                 transact::<(), StoreError>(&self.ctx, clear)
                     .await
                     .map_err(|error| unavailable(error.0))?;
@@ -421,12 +453,47 @@ impl Broker for RunBroker {
         Err(unavailable("connections are not available in this release"))
     }
 
-    async fn state_get(&self, _cx: &CallContext, _key: &str) -> Result<Option<Entry>, HostError> {
-        Err(unavailable("private state is not available yet"))
+    async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {
+        check_key(key)?;
+        let install = self.admitted(None).await?;
+        let entry = read_state(&self.ctx, install.install_id, key).await;
+        entry.map_err(|error| unavailable(error.0))
     }
 
-    async fn state_put(&self, _cx: &CallContext, _put: StatePut) -> Result<u64, HostError> {
-        Err(unavailable("private state is not available yet"))
+    async fn state_put(&self, _cx: &CallContext, put: StatePut) -> Result<u64, HostError> {
+        check_key(&put.key)?;
+        let install = self.admitted(None).await?;
+        if let Some(reply) = self.begun(&put.intent).await? {
+            return reply
+                .parse()
+                .map_err(|_| unavailable("a stored reply is not a version"));
+        }
+        let run_id = self.scope.run.run_id;
+        match put_state(&self.ctx, run_id, install.install_id, &put).await {
+            Ok(version) => Ok(version),
+            Err(PutError::Refused(message, kind)) => {
+                let clear = async |txn: &Txn<'_>| clear_in(txn, run_id, &put.intent).await;
+                transact::<(), StoreError>(&self.ctx, clear)
+                    .await
+                    .map_err(|error| unavailable(error.0))?;
+                Err(HostError::new(kind, message))
+            }
+            Err(PutError::Store(error)) => Err(self.unknown(&put.intent, &error.0).await),
+        }
+    }
+
+    async fn log(&self, _cx: &CallContext, level: &str, message: &str) {
+        if self.admitted(None).await.is_ok() {
+            let mut run = self
+                .log
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            run.push_log(LogLine {
+                at_ms: unix_timestamp_millis(),
+                level: level.to_string(),
+                message: message.to_string(),
+            });
+        }
     }
 
     async fn abandoned(&self, _cx: &CallContext, intent: &Intent) {

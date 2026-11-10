@@ -342,12 +342,20 @@ impl log::Host for Session {
             end -= 1;
         }
         let text = &message[..end];
+        let name = match level {
+            log::Level::Debug => "debug",
+            log::Level::Info => "info",
+            log::Level::Warn => "warn",
+            log::Level::Error => "error",
+        };
         match level {
             log::Level::Debug => tracing::debug!(target: "aruna_plugins::guest", "{text}"),
             log::Level::Info => tracing::info!(target: "aruna_plugins::guest", "{text}"),
             log::Level::Warn => tracing::warn!(target: "aruna_plugins::guest", "{text}"),
             log::Level::Error => tracing::error!(target: "aruna_plugins::guest", "{text}"),
         }
+        let (broker, cx) = self.log_target();
+        broker.log(&cx, name, text).await;
         Ok(())
     }
 }
