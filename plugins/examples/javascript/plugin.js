@@ -41,14 +41,16 @@ export async function handle(name, invocation) {
     group: invocation.group,
     settings: JSON.parse(invocation.settings),
   };
-  let result;
   try {
-    result = await handler(ctx, toEvent(invocation.trigger));
+    const result = await handler(ctx, toEvent(invocation.trigger));
+    return result === undefined ? undefined : typeof result === "string" ? result : JSON.stringify(result, bigints);
   } catch (error) {
     throw failure(error);
   }
-  return result === undefined ? undefined : typeof result === "string" ? result : JSON.stringify(result);
 }
+
+// JSON has no BigInt, so a timer tick or another 64-bit number is written as a decimal string.
+const bigints = (_, value) => (typeof value === "bigint" ? value.toString() : value);
 
 // The plain event of a trigger: manual input as JSON, the timer tick, or the record's fields.
 function toEvent({ tag, val }) {
