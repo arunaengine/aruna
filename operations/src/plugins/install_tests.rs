@@ -271,18 +271,18 @@ async fn resumes_after_steps() {
         let record = fixture.prepared_only(id).await;
         let (scope, identity) = (scope_of(actor.realm_id, &record), Identity::of(&record));
         if stop >= 2 {
-            ensure_account(ctx, actor, &auth, &scope, identity, "x".into())
+            ensure_account(ctx, actor, &auth, &scope, identity, "x".into(), guard_of(&record))
                 .await
                 .unwrap();
         }
         if stop >= 3 {
             let paths = role_paths(&parse_grants(&record.grants));
-            ensure_role(ctx, actor, &auth, &scope, identity, &paths)
+            ensure_role(ctx, actor, &auth, &scope, identity, &paths, guard_of(&record))
                 .await
                 .unwrap();
         }
         if stop == 4 {
-            teardown(ctx, actor, &auth, &scope, identity).await.unwrap();
+            teardown(ctx, actor, &auth, &scope, identity, guard_of(&record)).await.unwrap();
             assert!(fixture.account(&record).await.unwrap().is_deactivated());
             assert!(fixture.role(&record).await.is_none());
         }

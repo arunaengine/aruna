@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use tracing::info;
 use ulid::Ulid;
 
-use super::account::{Identity, teardown};
+use super::account::{Identity, guard_of, teardown};
 use super::grants::{
     Grants, carry_grants, check_supported, narrow_grants, parse_grants, stored_grants,
 };
@@ -169,12 +169,19 @@ pub async fn remove_install(
         }
     };
     let scope = scope_of(actor.realm_id, &removing);
-    teardown(ctx, actor, auth, &scope, Identity::of(&removing))
-        .await
-        .map_err(|error| InstallError::Step {
-            step: "remove",
-            error,
-        })?;
+    teardown(
+        ctx,
+        actor,
+        auth,
+        &scope,
+        Identity::of(&removing),
+        guard_of(&removing),
+    )
+    .await
+    .map_err(|error| InstallError::Step {
+        step: "remove",
+        error,
+    })?;
     let action = AdminAuditAction::PluginRemoved;
     let audit = AdminAuditRecord::for_install(action, actor.user_id, &removing);
     let delete = InstallEntryOperation::new(InstallEntryConfig {

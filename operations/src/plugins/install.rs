@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
 use aruna_core::UserId;
-use aruna_core::plugin_installs::{InstallState, PluginInstall, Prerequisite};
+use aruna_core::plugin_installs::{InstallGuard, InstallState, PluginInstall, Prerequisite};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::account::{
-    Identity, account_name, check_ready, ensure_account, ensure_role, read_auth, teardown,
+    Identity, account_name, check_ready, ensure_account, ensure_role, guard_of, read_auth, teardown,
 };
 use super::grants::{
     GrantError, Grants, InstallScope, accesses, carry_grants, check_supported, narrow_grants,
@@ -35,6 +35,7 @@ use crate::auth::permission_rules::permission_rules;
 use crate::auth::request_policy::{PolicyRequestExtras, enforce_policies, policy_request_with};
 use crate::driver::{DriverContext, drive};
 use crate::realm::get_config::GetConfigOperation;
+use crate::realm::mutate_placement::is_management;
 use crate::users::service_account::check::{ServiceCheckConfig, ServiceCheckOperation};
 
 #[derive(Debug, Error)]
@@ -217,7 +218,18 @@ pub(crate) async fn settle(
     let scope = scope_of(actor.realm_id, &record);
     let grants = parse_grants(&record.grants);
     let identity = Identity::of(&record);
-    let ready = make_ready(ctx, actor, auth, &scope, identity, &record.plugin, &grants).await;
+    let guard = guard_of(&record);
+    let ready = make_ready(
+        ctx,
+        actor,
+        auth,
+        &scope,
+        identity,
+        &record.plugin,
+        &grants,
+        guard,
+    );
+    let ready = ready.await;
     let prerequisites = match ready {
         Ok(prerequisites) => prerequisites,
         Err((step, error)) => {
@@ -243,7 +255,7 @@ pub(crate) async fn settle(
 }
 
 /// Undoes a failed preparation and records the failed step, unless another change of the
-/// install moved on meanwhile.
+/// install moved on meanwhile; the undo writes themselves refuse a record that moved on.
 async fn abandon(
     ctx: &DriverContext,
     actor: &Actor,
@@ -266,7 +278,15 @@ async fn abandon(
         return;
     }
     let scope = scope_of(actor.realm_id, record);
-    if let Err(error) = teardown(ctx, actor, auth, &scope, Identity::of(record)).await {
+    let undo = teardown(
+        ctx,
+        actor,
+        auth,
+        &scope,
+        Identity::of(record),
+        guard_of(record),
+    );
+    if let Err(error) = undo.await {
         warn!(%id, %error, "Could not undo a failed plugin install step");
     }
     let mut failed = record.clone();
@@ -287,18 +307,79 @@ async fn make_ready(
     identity: Identity,
     plugin: &str,
     grants: &Grants,
+    guard: InstallGuard,
 ) -> Result<Vec<Prerequisite>, (&'static str, String)> {
     let name = account_name(ctx, plugin, scope.group_id).await;
-    ensure_account(ctx, actor, auth, scope, identity, name)
+    ensure_account(ctx, actor, auth, scope, identity, name, guard)
         .await
         .map_err(|error| ("account", error))?;
     let paths = role_paths(grants);
-    ensure_role(ctx, actor, auth, scope, identity, &paths)
+    ensure_role(ctx, actor, auth, scope, identity, &paths, guard)
         .await
         .map_err(|error| ("role", error))?;
     check_ready(ctx, scope, identity, &paths)
         .await
         .map_err(|error| ("check", error))
+}
+
+/// Repairs the account and role of every settled install from its current record on a
+/// management node, as the approving admin. Another node's late change of either is undone.
+pub async fn reconcile_installs(ctx: &DriverContext) -> Result<usize, InstallError> {
+    let Some(net) = ctx.net_handle.as_ref() else {
+        return Ok(0);
+    };
+    let (node_id, realm_id) = (net.node_id(), *net.realm_id());
+    let config = read_config(ctx, realm_id).await?;
+    if !is_management(&config, node_id) {
+        return Ok(0);
+    }
+    let mut repaired = 0;
+    for install in &config.installs {
+        let settled = !matches!(
+            install.state,
+            InstallState::Preparing | InstallState::Removing
+        );
+        if settled && repair_install(ctx, node_id, realm_id, install).await? {
+            repaired += 1;
+        }
+    }
+    Ok(repaired)
+}
+
+/// Makes one settled install's account and role match its record again; `true` if it changed.
+pub(crate) async fn repair_install(
+    ctx: &DriverContext,
+    node_id: aruna_core::NodeId,
+    realm_id: RealmId,
+    install: &PluginInstall,
+) -> Result<bool, InstallError> {
+    let (scope, identity) = (scope_of(realm_id, install), Identity::of(install));
+    let paths = role_paths(&parse_grants(&install.grants));
+    if check_ready(ctx, &scope, identity, &paths).await.is_ok() {
+        return Ok(false);
+    }
+    let actor = Actor {
+        node_id,
+        user_id: install.granted_by,
+        realm_id,
+    };
+    let auth = AuthContext {
+        user_id: install.granted_by,
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let guard = guard_of(install);
+    let name = account_name(ctx, &install.plugin, scope.group_id).await;
+    let step = |step| move |error| InstallError::Step { step, error };
+    ensure_account(ctx, &actor, &auth, &scope, identity, name, guard)
+        .await
+        .map_err(step("account"))?;
+    ensure_role(ctx, &actor, &auth, &scope, identity, &paths, guard)
+        .await
+        .map_err(step("role"))?;
+    info!(install = %install.install_id, "Repaired a plugin install's account and role");
+    Ok(true)
 }
 
 pub(crate) fn scope_of(realm_id: RealmId, install: &PluginInstall) -> InstallScope {
@@ -340,8 +421,8 @@ pub(crate) async fn check_admin(
 }
 
 /// Refuses grants the caller does not hold now: each action with its own access and operation
-/// `plugin.<permission>` against roles, denies below a subtree, restrictions and policies. A
-/// subtree is refused while a policy reads the path, as no single check proves every path below.
+/// `plugin.<permission>` against roles, denies below a subtree, restrictions and policies. Any
+/// policy reading the path refuses every subtree, even one guarded off for plugins.
 pub(crate) async fn check_holder(
     ctx: &DriverContext,
     auth: &AuthContext,

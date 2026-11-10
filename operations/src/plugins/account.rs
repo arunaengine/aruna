@@ -12,7 +12,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, USER_KEYSPACE,
 };
-use aruna_core::plugin_installs::{PluginInstall, Prerequisite};
+use aruna_core::plugin_installs::{InstallGuard, PluginInstall, Prerequisite};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission as Access, Role};
@@ -46,6 +46,14 @@ impl Identity {
     }
 }
 
+/// The guard that ties a prerequisite write to the record revision it was computed from.
+pub(crate) fn guard_of(install: &PluginInstall) -> InstallGuard {
+    InstallGuard {
+        install_id: install.install_id,
+        revision: install.revision,
+    }
+}
+
 /// Creates the account, or reactivates it. An account with another owner or marker, or one
 /// that holds any role but the install's, fails the install.
 pub(crate) async fn ensure_account(
@@ -55,6 +63,7 @@ pub(crate) async fn ensure_account(
     scope: &InstallScope,
     identity: Identity,
     name: String,
+    guard: InstallGuard,
 ) -> Result<(), String> {
     check_alone(ctx, scope, identity).await?;
     match read_user(ctx, identity.account).await? {
@@ -66,7 +75,8 @@ pub(crate) async fn ensure_account(
                 name,
                 user_id: identity.account,
                 install: Some(scope.install_id),
-            });
+            })
+            .guarded(guard);
             drive(create, ctx)
                 .await
                 .map(drop)
@@ -76,7 +86,7 @@ pub(crate) async fn ensure_account(
             Err("an account with this id belongs elsewhere".into())
         }
         Some(user) if user.is_deactivated() => {
-            set_active(ctx, actor, auth, identity.account, true).await
+            set_active(ctx, actor, auth, identity.account, true, guard).await
         }
         Some(_) => Ok(()),
     }
@@ -91,6 +101,7 @@ pub(crate) async fn ensure_role(
     scope: &InstallScope,
     identity: Identity,
     paths: &HashMap<String, Access>,
+    guard: InstallGuard,
 ) -> Result<(), String> {
     let auth_doc = read_auth(ctx, scope.group_id)
         .await?
@@ -110,7 +121,8 @@ pub(crate) async fn ensure_role(
         realm_id: scope.realm_id,
         group_id: scope.group_id,
         role,
-    });
+    })
+    .guarded(guard);
     drive(add, ctx)
         .await
         .map(drop)
@@ -173,10 +185,11 @@ pub(crate) async fn teardown(
     auth: &AuthContext,
     scope: &InstallScope,
     identity: Identity,
+    guard: InstallGuard,
 ) -> Result<(), String> {
     let user = read_user(ctx, identity.account).await?;
     if user.is_some_and(|user| owned(&user, scope) && !user.is_deactivated()) {
-        set_active(ctx, actor, auth, identity.account, false).await?;
+        set_active(ctx, actor, auth, identity.account, false, guard).await?;
     }
     let auth_doc = read_auth(ctx, scope.group_id).await?;
     let role = auth_doc.and_then(|auth_doc| auth_doc.roles.get(&identity.role_id).cloned());
@@ -187,7 +200,8 @@ pub(crate) async fn teardown(
             realm_id: scope.realm_id,
             group_id: scope.group_id,
             role_id: identity.role_id,
-        });
+        })
+        .guarded(guard);
         drive(remove, ctx)
             .await
             .map_err(|error| error.to_string())?;
@@ -235,6 +249,7 @@ pub(crate) async fn set_active(
     auth: &AuthContext,
     account: UserId,
     active: bool,
+    guard: InstallGuard,
 ) -> Result<(), String> {
     let status = AccountStatusOperation::new(AccountStatusConfig {
         actor: actor.clone(),
@@ -242,7 +257,8 @@ pub(crate) async fn set_active(
         target: account,
         active,
         now: unix_timestamp_secs(),
-    });
+    })
+    .guarded(guard);
     drive(status, ctx).await.map_err(|error| error.to_string())
 }
 
