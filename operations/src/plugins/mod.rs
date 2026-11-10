@@ -6,6 +6,7 @@ pub mod artifacts;
 pub mod copies;
 pub mod grants;
 pub mod publish;
+pub mod records;
 pub mod settings;
 
 use serde::{Deserialize, Serialize};
