@@ -826,6 +826,14 @@ pub(crate) mod tests {
         ),
         ("POST", "/plugins"),
         ("GET", "/plugins"),
+        ("POST", "/plugins/{name}/installs"),
+        ("GET", "/plugin-installs"),
+        ("GET", "/plugin-installs/{id}"),
+        ("DELETE", "/plugin-installs/{id}"),
+        ("PUT", "/plugin-installs/{id}/grants"),
+        ("PUT", "/plugin-installs/{id}/version"),
+        ("POST", "/plugin-installs/{id}/pause"),
+        ("POST", "/plugin-installs/{id}/resume"),
     ];
 
     /// Documented path to the runtime template that serves it. Catch-all ids
