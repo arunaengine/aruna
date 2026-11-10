@@ -7,6 +7,7 @@ mod copy;
 mod data;
 mod jobs;
 mod meta;
+mod plugin;
 mod realm;
 
 use crate::args::{Cli, Command};
@@ -89,6 +90,7 @@ pub async fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<(), CliError> {
         Command::Jobs(command) => jobs::jobs(context, command).await,
         Command::Meta(command) => meta::meta(context, command).await,
         Command::Share(args) => data::share(context, args).await,
+        Command::Plugin(command) => plugin::plugin(context, command).await,
     }
 }
 

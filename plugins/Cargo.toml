@@ -1,0 +1,58 @@
+# Manifest of aruna-plugins: plugin manifests, artifact sections and the WASM component runtime.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["build", "runtime"]
+# Builds projects with their toolchain and packages the result, compiled against the host.
+build = ["runtime", "dep:toml", "dep:wit-component"]
+# The Wasmtime runtime; without it the crate only reads, checks and writes plugin artifacts.
+runtime = [
+    "dep:async-trait",
+    "dep:bytes",
+    "dep:getrandom",
+    "dep:lru",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:tracing",
+    "dep:wasmtime",
+    "dep:wasmtime-wasi",
+    "dep:wasmtime-wasi-io",
+]
+
+[dependencies]
+async-trait = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+hex = { workspace = true }
+lru = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+url = { workspace = true }
+wasm-encoder = { workspace = true }
+wasmparser = { workspace = true }
+wasmtime = { workspace = true, optional = true }
+wasmtime-wasi = { workspace = true, optional = true }
+wasmtime-wasi-io = { workspace = true, optional = true }
+wit-component = { workspace = true, optional = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+toml = { workspace = true }
+wit-component = { workspace = true, features = ["dummy-module"] }
+wit-parser = { workspace = true }

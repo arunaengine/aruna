@@ -1,0 +1,9 @@
+// The part of wasi:random the test guest calls; the host provides the whole interface.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+package wasi:random@0.2.12;
+
+interface random {
+  get-random-bytes: func(len: u64) -> list<u8>;
+}

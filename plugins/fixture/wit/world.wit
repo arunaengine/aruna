@@ -1,0 +1,12 @@
+// WASI imports the test guest uses to check that WASI calls are counted and bounded.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+package aruna-test:wasi;
+
+world probe {
+  import wasi:random/random@0.2.12;
+  import wasi:clocks/monotonic-clock@0.2.12;
+  import wasi:cli/stdout@0.2.12;
+  import wasi:io/poll@0.2.12;
+}

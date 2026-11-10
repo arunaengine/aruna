@@ -1,0 +1,206 @@
+// Guest contract between Aruna and one plugin component; each interface needs its own permission.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+package aruna:plugin@0.2.0;
+
+/// Data shared by the handler export and the host interfaces.
+interface types {
+  /// One header or query pair.
+  record field {
+    name: string,
+    value: string,
+  }
+
+  /// A verified webhook request; authentication headers are already removed.
+  record webhook-request {
+    method: string,
+    query: string,
+    headers: list<field>,
+    body: list<u8>,
+  }
+
+  record webhook-delivery {
+    delivery-id: option<string>,
+    request: webhook-request,
+  }
+
+  /// A committed change in the install's group; kind is the trigger name.
+  record watch-event {
+    kind: string,
+    path: string,
+    %resource: string,
+    revision: string,
+  }
+
+  /// Why the host started the handler: manual input is JSON text, a timer gives its tick time.
+  variant trigger {
+    manual(string),
+    webhook(webhook-delivery),
+    event(watch-event),
+    timer(u64),
+  }
+
+  /// Input of every handler call; settings are the install's JSON settings.
+  record invocation {
+    run: string,
+    install: string,
+    group: string,
+    settings: string,
+    trigger: trigger,
+  }
+
+  enum failure-kind {
+    permanent,
+    retryable,
+    invalid-input,
+  }
+
+  record failure {
+    kind: failure-kind,
+    message: string,
+  }
+
+  enum error-kind {
+    not-granted,
+    denied,
+    invalid,
+    limit,
+    conflict,
+    unknown-outcome,
+    unavailable,
+    not-found,
+  }
+
+  record host-error {
+    kind: error-kind,
+    message: string,
+  }
+}
+
+/// Checks a grant before trying an optional call; needs no permission.
+interface grants {
+  granted: func(permission: string, %resource: string) -> bool;
+}
+
+/// Reads dataset metadata of the group (`metadata.read`).
+interface metadata-read {
+  use types.{host-error};
+
+  record document {
+    %resource: string,
+    revision: string,
+    json: string,
+  }
+
+  record listing {
+    resources: list<string>,
+    cursor: option<string>,
+  }
+
+  get: func(%resource: string) -> result<document, host-error>;
+  %list: func(cursor: option<string>) -> result<listing, host-error>;
+}
+
+/// Changes dataset metadata if its revision is still `expected` (`metadata.write`).
+interface metadata-write {
+  use types.{host-error};
+
+  patch: func(
+    %resource: string,
+    patch: string,
+    expected: string,
+    key: option<string>,
+  ) -> result<string, host-error>;
+}
+
+/// Reads object information and listings of the group, never bytes (`objects.read`).
+interface objects-read {
+  use types.{host-error};
+
+  record object-info {
+    path: string,
+    size: u64,
+    version: string,
+  }
+
+  record object-page {
+    objects: list<object-info>,
+    cursor: option<string>,
+  }
+
+  info: func(path: string) -> result<object-info, host-error>;
+  %list: func(prefix: string, cursor: option<string>) -> result<object-page, host-error>;
+}
+
+/// Sends requests through the connections the manifest declares (`connections.send`).
+interface connections {
+  use types.{field, host-error};
+
+  enum method {
+    get,
+    head,
+    post,
+    put,
+    patch,
+    delete,
+  }
+
+  /// `path` is relative to the connection's prefix; `key` names the effect across runs.
+  record request {
+    connection: string,
+    method: method,
+    path: string,
+    query: list<field>,
+    headers: list<field>,
+    body: list<u8>,
+    key: option<string>,
+  }
+
+  /// The status, and the response fields the manifest allows as a JSON object keyed by pointer.
+  record response {
+    status: u16,
+    json: option<string>,
+  }
+
+  send: func(request: request) -> result<response, host-error>;
+}
+
+/// Small private values of the install, changed by compare and swap.
+interface state {
+  use types.{host-error};
+
+  record entry {
+    version: u64,
+    value: list<u8>,
+  }
+
+  get: func(key: string) -> result<option<entry>, host-error>;
+  put: func(key: string, value: list<u8>, expected: option<u64>) -> result<u64, host-error>;
+}
+
+interface log {
+  enum level {
+    debug,
+    info,
+    warn,
+    error,
+  }
+
+  log: func(level: level, message: string);
+}
+
+/// One plugin: every handler is called through `handle` with its manifest name.
+world plugin {
+  use types.{invocation, failure};
+
+  import grants;
+  import metadata-read;
+  import metadata-write;
+  import objects-read;
+  import connections;
+  import state;
+  import log;
+
+  export handle: func(handler: string, invocation: invocation) -> result<option<string>, failure>;
+}

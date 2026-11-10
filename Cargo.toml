@@ -17,6 +17,10 @@ members = [
     "operations",
     "aruna-doctor",
     "cli",
+    "plugins",
+    "plugins/example",
+    "plugins/fixture",
+    "plugins/sdk",
     "registry",
     "scripts/compute-helper",
 ]
@@ -25,7 +29,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.174"
+version = "3.0.0-alpha.175"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -43,6 +47,8 @@ aruna-compute = { path = "compute", default-features = false }
 aruna-core = { path = "core" }
 aruna-net = { path = "net" }
 aruna-operations = { path = "operations" }
+aruna-plugin = { path = "plugins/sdk" }
+aruna-plugins = { path = "plugins", default-features = false }
 aruna-storage = { path = "storage" }
 aruna-tasks = { path = "tasks" }
 
@@ -261,6 +267,28 @@ utoipa-axum = "0.3.0"
 utoipa-swagger-ui = { version = "10.0.1", features = ["axum"] }
 # Exact: the portal's wasm-bindgen-cli must match this version.
 wasm-bindgen = "=0.2.127"
+# Plugin runtime: wit-bindgen 0.61 and wasm-tools 0.258 match the component async ABI of wasmtime 49.
+wasm-encoder = "0.258.3"
+wasmparser = { version = "0.258.3", default-features = false, features = [
+    "component-model",
+    "features",
+    "simd",
+    "std",
+    "validate",
+] }
+wasmtime = { version = "49.0.5", default-features = false, features = [
+    "async",
+    "call-hook",
+    "component-model",
+    "cranelift",
+    "runtime",
+    "std",
+] }
+wasmtime-wasi = { version = "49.0.5", default-features = false, features = ["p2"] }
+wasmtime-wasi-io = "49.0.5"
+wit-bindgen = "0.61.1"
+wit-component = "0.258.3"
+wit-parser = "0.258.3"
 windows-native-keyring-store = "1.1.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }

@@ -16,6 +16,7 @@ name = "aruna-cli"
 path = "src/main.rs"
 
 [dependencies]
+aruna-plugins = { workspace = true, features = ["build"] }
 aws-sdk-s3 = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }

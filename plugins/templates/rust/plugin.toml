@@ -1,0 +1,9 @@
+# Plugin manifest: what the plugin asks for. Build with `aruna-cli plugin build`.
+name = "{{name}}"
+version = "0.1.0"
+
+[triggers]
+manual = { handler = "run" }
+
+[permissions]
+required = []

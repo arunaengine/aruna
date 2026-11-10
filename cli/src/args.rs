@@ -88,6 +88,9 @@ pub enum Command {
     Meta(MetaCommand),
     /// Create a share link for a bucket, folder or file.
     Share(ShareArgs),
+    /// Start and build WASM plugins.
+    #[command(subcommand)]
+    Plugin(PluginCommand),
 }
 
 #[derive(Debug, Args)]
@@ -98,6 +101,24 @@ pub struct LoginArgs {
     /// The realm website for share links; defaults to the API's origin.
     #[arg(long)]
     pub website: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PluginCommand {
+    /// Start a Rust plugin project: plugin.toml, Cargo.toml and src/lib.rs.
+    New {
+        /// Plugin name, such as dataset-announcer.
+        name: String,
+        /// Folder to create; defaults to the name.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Build the plugin in a folder into one checked artifact for publishing.
+    Build {
+        /// Folder with plugin.toml and Cargo.toml.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
