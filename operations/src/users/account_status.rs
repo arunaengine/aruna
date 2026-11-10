@@ -86,6 +86,7 @@ pub struct AccountStatusOperation {
     /// The group owning a service account target, whose administrators may read its audit row.
     owner_group: Option<GroupId>,
     output: Option<Result<(), AccountStatusError>>,
+    guard: Option<aruna_core::plugin_installs::InstallGuard>,
 }
 
 impl AccountStatusOperation {
@@ -95,7 +96,14 @@ impl AccountStatusOperation {
             state: AccountStatusState::Init,
             owner_group: None,
             output: None,
+            guard: None,
         }
+    }
+
+    /// Marks the account only while the install record is still at the guard's revision.
+    pub fn guarded(mut self, guard: aruna_core::plugin_installs::InstallGuard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     fn fail(&mut self, error: AccountStatusError) -> Effects {
@@ -238,7 +246,8 @@ impl AccountStatusOperation {
                 alias: None,
                 subject: None,
             })
-            .audited(audit),
+            .audited(audit)
+            .guarded(self.guard),
             |result| Event::SubOperation(SubOperationEvent::UserUpdated {
                 result: result.map(|_| ()).map_err(|error| error.to_string()),
             }),

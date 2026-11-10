@@ -41,6 +41,26 @@ impl InstallState {
     }
 }
 
+/// Makes a role or account write of an install conditional: it applies only while this node's
+/// record of the install still has `revision`, read in the write's own transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstallGuard {
+    pub install_id: Ulid,
+    pub revision: u64,
+}
+
+impl InstallGuard {
+    pub fn admits(
+        &self,
+        config: Option<&crate::structs::identity::realm::RealmConfigDocument>,
+    ) -> bool {
+        let install = config.and_then(|config| {
+            (config.installs.iter()).find(|install| install.install_id == self.install_id)
+        });
+        install.is_some_and(|install| install.revision == self.revision)
+    }
+}
+
 /// A write another document must contain before a node decides about this install: the
 /// target's clock right after the write.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

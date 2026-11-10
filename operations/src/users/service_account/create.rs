@@ -48,6 +48,8 @@ pub struct CreateServiceConfig {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateServiceError {
+    #[error("the plugin install changed meanwhile; this change is stale")]
+    Superseded,
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -92,6 +94,7 @@ pub struct CreateServiceOperation {
     fence: crate::placement::fence::WriteFence,
     state: CreateServiceState,
     output: Option<Result<User, CreateServiceError>>,
+    guard: Option<aruna_core::plugin_installs::InstallGuard>,
 }
 
 impl CreateServiceOperation {
@@ -101,7 +104,14 @@ impl CreateServiceOperation {
             fence: Default::default(),
             state: CreateServiceState::Init,
             output: None,
+            guard: None,
         }
+    }
+
+    /// Creates the account only while the install record is still at the guard's revision.
+    pub fn guarded(mut self, guard: aruna_core::plugin_installs::InstallGuard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     fn fail(&mut self, error: CreateServiceError) -> Effects {
@@ -163,6 +173,9 @@ impl CreateServiceOperation {
             Ok(config) => config,
             Err(error) => return self.fail(error.into()),
         };
+        if (self.guard).is_some_and(|guard| !guard.admits(config.as_ref())) {
+            return self.fail(CreateServiceError::Superseded);
+        }
         match self.write_user(txn_id, config.as_ref()) {
             Ok(effects) => effects,
             Err(error) => self.fail(error),

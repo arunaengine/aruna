@@ -61,6 +61,7 @@ pub struct AddRoleOperation {
     conflicts: u8,
     output: Option<Result<(Group, GroupAuthorizationDocument), AddRoleError>>,
     narrowed: bool,
+    guard: Option<aruna_core::plugin_installs::InstallGuard>,
 }
 
 impl std::fmt::Debug for AddRoleOperation {
@@ -144,6 +145,8 @@ pub enum AddRoleState {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum AddRoleError {
+    #[error("the plugin install changed meanwhile; this change is stale")]
+    Superseded,
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -187,6 +190,12 @@ fn reserved_role_name(name: &str) -> bool {
 }
 
 impl AddRoleOperation {
+    /// Applies the role only while the install record is still at the guard's revision.
+    pub fn guarded(mut self, guard: aruna_core::plugin_installs::InstallGuard) -> Self {
+        self.guard = Some(guard);
+        self
+    }
+
     pub fn new(input: AddRoleConfig) -> Self {
         AddRoleOperation {
             input,
@@ -195,6 +204,7 @@ impl AddRoleOperation {
             conflicts: 0,
             output: None,
             narrowed: false,
+            guard: None,
         }
     }
 
@@ -437,6 +447,9 @@ impl AddRoleOperation {
             .as_deref()
             .map(RealmConfigDocument::from_bytes)
             .transpose()?;
+        if (self.guard).is_some_and(|guard| !guard.admits(realm_config.as_ref())) {
+            return Err(AddRoleError::Superseded);
+        }
         let placement = realm_config
             .as_ref()
             .map(|config| target_placement_ref(config, &document_target, Default::default()))

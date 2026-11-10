@@ -99,6 +99,7 @@ pub struct UpdateUserOperation {
     output: Option<Result<User, UpdateUserError>>,
     deactivating: bool,
     audit: Option<AdminAuditRecord>,
+    guard: Option<aruna_core::plugin_installs::InstallGuard>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +143,8 @@ enum UpdateUserState {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UpdateUserError {
+    #[error("the plugin install changed meanwhile; this change is stale")]
+    Superseded,
     #[error("Unauthorized")]
     Unauthorized,
     #[error("User not found")]
@@ -216,7 +219,14 @@ impl UpdateUserOperation {
             output: None,
             deactivating: false,
             audit: None,
+            guard: None,
         }
+    }
+
+    /// Changes the user only while the install record is still at the guard's revision.
+    pub fn guarded(mut self, guard: Option<aruna_core::plugin_installs::InstallGuard>) -> Self {
+        self.guard = guard;
+        self
     }
 
     /// Commits the audit rows of `record` in the same transaction as the user change.
@@ -420,6 +430,9 @@ impl UpdateUserOperation {
             .as_deref()
             .map(RealmConfigDocument::from_bytes)
             .transpose()?;
+        if (self.guard).is_some_and(|guard| !guard.admits(realm_config.as_ref())) {
+            return Err(UpdateUserError::Superseded);
+        }
         if let Some(AliasChange::Add {
             alias,
             issued_at,
