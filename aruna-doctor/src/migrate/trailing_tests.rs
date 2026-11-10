@@ -2,9 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::migrate_output;
 use super::super::tests::{read, write};
+use super::super::{migrate, migrate_output};
 use super::*;
+use crate::error::CliError;
 use aruna_core::secrets::{SecretName, SecretScope};
 use aruna_core::structs::execution::harvest::{HarvestSelector, HarvestSource};
 use aruna_core::structs::execution::job::JobId;
@@ -309,4 +310,22 @@ fn older_values_kept() {
     assert_eq!(classify::<Grown>(&current, LAYOUTS), Row::Current);
     let longer = [current.as_slice(), &[0]].concat();
     assert_eq!(classify::<Grown>(&longer, LAYOUTS), Row::Unknown);
+}
+
+#[tokio::test]
+async fn unknown_rows_fail() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let path = temp.path().join("db");
+    write(
+        &path,
+        ADMIN_AUDIT_KEYSPACE,
+        vec![(b"broken".as_slice(), vec![0xff; 3])],
+    );
+    let database = path.to_str().expect("path").to_string();
+    let result = migrate(database, None).await;
+    assert!(matches!(result, Err(CliError::UnknownRows(1))));
+    assert_eq!(
+        read(&path, ADMIN_AUDIT_KEYSPACE)[b"broken".as_slice()],
+        vec![0xff; 3]
+    );
 }

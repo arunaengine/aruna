@@ -191,7 +191,7 @@ pub struct MigrateOutput {
     pub mirror_repairs_scanned: usize,
     pub mirror_repairs_rewritten: usize,
     /// Rows of those keyspaces that match no known shape, left unchanged, as
-    /// `keyspace/key: reason`.
+    /// `keyspace/key: reason`. Any such row makes the command fail after it prints this output.
     pub unknown_rows: Vec<String>,
 }
 
@@ -216,6 +216,9 @@ pub async fn migrate(database_path: String, sync_path: Option<String>) -> Result
     .map_err(std::io::Error::other)??;
 
     println!("{}", serde_json::to_string_pretty(&output)?);
+    if !output.unknown_rows.is_empty() {
+        return Err(CliError::UnknownRows(output.unknown_rows.len()));
+    }
     Ok(())
 }
 
