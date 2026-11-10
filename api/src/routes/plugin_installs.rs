@@ -6,11 +6,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use aruna_core::UserId;
 use aruna_core::errors::StorageError;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::GroupId;
+use aruna_operations::plugins::account::plugin_account;
 use aruna_operations::plugins::grants::{GrantError, InstallScope, parse_grants};
 use aruna_operations::plugins::install::{
     InstallError, InstallRequest, install_plugin, pick_version, prepare_install, read_config,
@@ -521,5 +523,34 @@ pub(crate) fn map_error(error: InstallError) -> ServerError {
         ) => ServerError::Conflict(message),
         InstallError::Unavailable(_) => ServerError::ServiceUnavailableReason(message),
         InstallError::Manifest(_) | InstallError::Record(_) => ServerError::InternalError(message),
+    }
+}
+
+/// Refuses member, role, admin and token changes of a plugin account; its install manages it.
+pub(crate) async fn refuse_plugin_account(
+    state: &ServerState,
+    user_id: UserId,
+) -> ServerResult<()> {
+    match plugin_account(&state.get_ctx(), user_id).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(ServerError::Conflict(
+            "the account acts for a plugin install; change the install instead".into(),
+        )),
+        Err(error) => Err(ServerError::InternalError(error)),
+    }
+}
+
+/// Refuses deleting the role a plugin install computed for its account.
+pub(crate) async fn refuse_plugin_role(state: &ServerState, role_id: Ulid) -> ServerResult<()> {
+    let config = load_config(state).await?;
+    match config
+        .installs
+        .iter()
+        .any(|install| install.role_id == role_id)
+    {
+        false => Ok(()),
+        true => Err(ServerError::Conflict(
+            "the role belongs to a plugin install; change its grants instead".into(),
+        )),
     }
 }

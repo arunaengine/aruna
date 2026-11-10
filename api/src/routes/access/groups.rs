@@ -8,6 +8,7 @@ use crate::auth::{
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
 use crate::routes::git::location::StorageLocationRequest;
+use crate::routes::plugin_installs::{refuse_plugin_account, refuse_plugin_role};
 use crate::routes::storage::objects::object_page;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
@@ -1581,6 +1582,7 @@ pub async fn add_group_member(
     let group_id = parse_group_id(&group_id)?;
     let user_id = parse_member_id(&request.user_id)?;
     refuse_group_edit(&state).await?;
+    refuse_plugin_account(&state, user_id).await?;
 
     ensure_permission(
         &state,
@@ -1688,6 +1690,7 @@ pub async fn remove_group_member(
         .map(|role_id| parse_role_id(role_id).map(|role_id| HashSet::from([role_id])))
         .transpose()?;
     refuse_group_edit(&state).await?;
+    refuse_plugin_account(&state, user_id).await?;
 
     // Self-leave via this endpoint needs no admin permission, matching the operation.
     if user_id != auth.user_id {
@@ -1891,6 +1894,9 @@ pub async fn create_group_role(
         .iter()
         .map(|user_id| parse_member_id(user_id))
         .collect::<ServerResult<HashSet<UserId>>>()?;
+    for user_id in &assigned_users {
+        refuse_plugin_account(&state, *user_id).await?;
+    }
     if request.public {
         assigned_users.insert(UserId::nil(realm_id));
     }
@@ -1971,6 +1977,7 @@ pub async fn delete_group_role(
     let group_id = parse_group_id(&group_id)?;
     let role_id = parse_role_id(&role_id)?;
     refuse_group_edit(&state).await?;
+    refuse_plugin_role(&state, role_id).await?;
 
     ensure_permission(
         &state,

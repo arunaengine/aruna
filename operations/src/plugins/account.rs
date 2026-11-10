@@ -235,3 +235,10 @@ pub(crate) async fn read_row(
         other => Err(format!("{other:?}")),
     }
 }
+
+/// Whether the account acts for a plugin install; it changes only through that install.
+pub async fn plugin_account(ctx: &DriverContext, user_id: UserId) -> Result<bool, String> {
+    Ok(read_user(ctx, user_id)
+        .await?
+        .is_some_and(|user| user.install().is_some()))
+}
