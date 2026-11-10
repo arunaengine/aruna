@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::plugins::account::{ensure_role, guard_of};
+use crate::plugins::grants::role_paths;
+use crate::plugins::install::repair_install;
 use crate::plugins::install::tests::Fixture;
 use crate::users::admin_audit::{AuditPageInput, AuditPageOperation};
 use aruna_core::structs::identity::admin_audit::AuditIndex;
@@ -209,4 +212,94 @@ async fn fixture_plugin(
         .await
         .unwrap();
     pick_version(&config, &install.plugin, Some(&install.digest)).unwrap()
+}
+
+#[tokio::test]
+async fn stale_node_changes() {
+    // Node A stalls in a grant change while node B finishes another one; A's late role write and
+    // cleanup must not break B's newer active install, on either node.
+    let fixture = Fixture::new().await;
+    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let id = installed.install_id;
+    let (a, b) = fixture.split().await;
+    let a_auth = a.auth();
+    let scope = scope_of(a.actor.realm_id, &installed);
+    let manifest = read_manifest(&fixture_plugin(&a, &installed).await).unwrap();
+    let dropped = BTreeMap::from([("metadata.write".to_string(), Vec::new())]);
+    let grants_a = narrow_grants(&manifest, &scope, &dropped).unwrap();
+    let stale = preparing(&installed, &grants_a);
+    let stale = write_record(
+        &a.ctx,
+        &a.actor,
+        &a_auth,
+        Some(installed.revision),
+        stale,
+        None,
+    );
+    let stale = stale.await.unwrap();
+    a.deliver_config(&b).await;
+
+    let meta = format!("/{}/g/{}/meta", b.actor.realm_id, b.group_id);
+    let runs = BTreeMap::from([(
+        "metadata.write".to_string(),
+        vec![format!("{meta}/runs/**")],
+    )]);
+    let active = set_grants(&b.ctx, &b.actor, &b.auth(), id, &runs)
+        .await
+        .unwrap();
+    assert_eq!(active.state, InstallState::Active);
+    let wanted = role_paths(&parse_grants(&active.grants));
+
+    // A writes its role before it learns of B's record; that role reaches B late, and B repairs.
+    let identity = Identity::of(&stale);
+    let paths_a = role_paths(&grants_a);
+    let write = ensure_role(
+        &a.ctx,
+        &a.actor,
+        &a_auth,
+        &scope,
+        identity,
+        &paths_a,
+        guard_of(&stale),
+    );
+    write.await.unwrap();
+    a.deliver_group(&b).await;
+    assert_ne!(b.role(&active).await.unwrap().permissions, wanted);
+    let node = b.actor.node_id;
+    assert!(
+        repair_install(&b.ctx, node, b.actor.realm_id, &active)
+            .await
+            .unwrap()
+    );
+    assert_eq!(b.role(&active).await.unwrap().permissions, wanted);
+
+    // Once A holds B's record, its stale role write and cleanup are refused, and A repairs too.
+    b.deliver_config(&a).await;
+    let again = ensure_role(
+        &a.ctx,
+        &a.actor,
+        &a_auth,
+        &scope,
+        identity,
+        &paths_a,
+        guard_of(&stale),
+    );
+    assert!(again.await.is_err(), "a stale role write is refused");
+    let undo = teardown(
+        &a.ctx,
+        &a.actor,
+        &a_auth,
+        &scope,
+        identity,
+        guard_of(&stale),
+    )
+    .await;
+    assert!(undo.is_err(), "a stale cleanup is refused");
+    assert!(!a.account(&active).await.unwrap().is_deactivated());
+    assert!(
+        repair_install(&a.ctx, node, a.actor.realm_id, &active)
+            .await
+            .unwrap()
+    );
+    assert_eq!(a.role(&active).await.unwrap().permissions, wanted);
 }

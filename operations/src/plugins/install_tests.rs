@@ -6,19 +6,24 @@
 use super::*;
 use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use crate::plugins::account::read_user;
+use crate::plugins::account::{read_row, read_user};
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
-use aruna_core::keyspaces::AUTH_KEYSPACE;
+use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{Permission as Access, Role};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
+use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::{TempDir, tempdir};
 
 pub(crate) struct Fixture {
@@ -28,18 +33,40 @@ pub(crate) struct Fixture {
     pub group_id: GroupId,
 }
 
+/// A driver context on the storage in `dir`, passed through `wrap`.
+fn node_context(dir: &Path, wrap: impl FnOnce(StorageHandle) -> StorageHandle) -> DriverContext {
+    let storage = aruna_storage::FjallStorage::open(dir.to_str().unwrap()).unwrap();
+    DriverContext {
+        storage_handle: wrap(storage),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        match entry.file_type().unwrap().is_dir() {
+            true => copy_dir(&entry.path(), &target),
+            false => drop(std::fs::copy(entry.path(), target).unwrap()),
+        }
+    }
+}
+
 impl Fixture {
     pub(crate) async fn new() -> Self {
+        Self::on(|storage| storage).await
+    }
+
+    /// A fixture whose storage is passed through `wrap` first.
+    pub(crate) async fn on(wrap: impl FnOnce(StorageHandle) -> StorageHandle) -> Self {
         let dir = tempdir().unwrap();
-        let ctx = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: Some(TaskHandle::new()),
-            compute_handle: None,
-        };
+        let ctx = node_context(dir.path(), wrap);
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
@@ -71,6 +98,63 @@ impl Fixture {
         fixture.realm_roles(&[]).await;
         fixture.publish("0.1.0", "ab", json!({})).await;
         fixture
+    }
+
+    /// Two management nodes of one realm that start from this fixture's state.
+    pub(crate) async fn split(self) -> (Fixture, Fixture) {
+        let Fixture {
+            _dir,
+            ctx,
+            actor,
+            group_id,
+        } = self;
+        ctx.storage_handle.close().await;
+        let copy = tempdir().unwrap();
+        copy_dir(_dir.path(), copy.path());
+        let node = |dir: TempDir| Fixture {
+            ctx: node_context(dir.path(), |storage| storage),
+            _dir: dir,
+            actor: actor.clone(),
+            group_id,
+        };
+        (node(_dir), node(copy))
+    }
+
+    /// Hands this node's realm config to `other`, as replication would.
+    pub(crate) async fn deliver_config(&self, other: &Fixture) {
+        let realm_id = self.actor.realm_id;
+        let document = DocumentTarget::RealmConfig { realm_id };
+        let state = reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id });
+        let rows = [
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key().to_vec(),
+            ),
+            (DOCUMENT_STATE_KEYSPACE.to_string(), state.to_vec()),
+        ];
+        self.deliver(other, &rows).await;
+    }
+
+    /// Hands this node's group and its roles to `other`, as replication would.
+    pub(crate) async fn deliver_group(&self, other: &Fixture) {
+        let group_id = self.group_id;
+        let state = reducer_state_key(&AdminDocumentTarget::Group { group_id });
+        let rows = [
+            (AUTH_KEYSPACE.to_string(), group_id.to_bytes().to_vec()),
+            (GROUP_KEYSPACE.to_string(), group_id.to_bytes().to_vec()),
+            (DOCUMENT_STATE_KEYSPACE.to_string(), state.to_vec()),
+        ];
+        self.deliver(other, &rows).await;
+    }
+
+    async fn deliver(&self, other: &Fixture, rows: &[(String, Vec<u8>)]) {
+        for (key_space, key) in rows {
+            let value = read_row(&self.ctx, key_space, key.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            other.write_row(key_space, key.clone(), value).await;
+        }
     }
 
     pub(crate) fn auth(&self) -> AuthContext {
@@ -271,18 +355,36 @@ async fn resumes_after_steps() {
         let record = fixture.prepared_only(id).await;
         let (scope, identity) = (scope_of(actor.realm_id, &record), Identity::of(&record));
         if stop >= 2 {
-            ensure_account(ctx, actor, &auth, &scope, identity, "x".into(), guard_of(&record))
-                .await
-                .unwrap();
+            ensure_account(
+                ctx,
+                actor,
+                &auth,
+                &scope,
+                identity,
+                "x".into(),
+                guard_of(&record),
+            )
+            .await
+            .unwrap();
         }
         if stop >= 3 {
             let paths = role_paths(&parse_grants(&record.grants));
-            ensure_role(ctx, actor, &auth, &scope, identity, &paths, guard_of(&record))
-                .await
-                .unwrap();
+            ensure_role(
+                ctx,
+                actor,
+                &auth,
+                &scope,
+                identity,
+                &paths,
+                guard_of(&record),
+            )
+            .await
+            .unwrap();
         }
         if stop == 4 {
-            teardown(ctx, actor, &auth, &scope, identity, guard_of(&record)).await.unwrap();
+            teardown(ctx, actor, &auth, &scope, identity, guard_of(&record))
+                .await
+                .unwrap();
             assert!(fixture.account(&record).await.unwrap().is_deactivated());
             assert!(fixture.role(&record).await.is_none());
         }
@@ -479,4 +581,94 @@ fn accesses_per_action() {
         [Access::READ, Access::WRITE]
     );
     assert_eq!(accesses(Permission::MetadataRead), [Access::READ]);
+}
+
+/// A storage that passes every effect to `real` and fails the commit numbered `fail_at`, counting
+/// from 0; `seen` counts the commits so far.
+fn failing_commit(
+    real: StorageHandle,
+    seen: Arc<AtomicUsize>,
+    fail_at: Arc<AtomicUsize>,
+) -> StorageHandle {
+    let (handle, receivers) = StorageHandle::new();
+    for receiver in [receivers.foreground, receivers.bulk] {
+        let (real, seen, fail_at) = (real.clone(), seen.clone(), fail_at.clone());
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            while let Ok((effect, response, ..)) = receiver.recv() {
+                let commit = matches!(effect, StorageEffect::CommitTransaction { .. });
+                let failing =
+                    commit && seen.fetch_add(1, Ordering::SeqCst) == fail_at.load(Ordering::SeqCst);
+                let event = match failing {
+                    true => aruna_core::events::StorageEvent::Error {
+                        error: aruna_core::errors::StorageError::PersistError("injected".into()),
+                    },
+                    false => match runtime.block_on(real.send_storage_effect(effect)) {
+                        aruna_core::events::Event::Storage(event) => event,
+                        other => panic!("unexpected event: {other:?}"),
+                    },
+                };
+                response.send(event);
+            }
+        });
+    }
+    handle
+}
+
+/// A fixture whose commits are counted in the first value and fail at the second.
+async fn counted() -> (Fixture, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let (seen, fail_at) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(usize::MAX)),
+    );
+    let (inner_seen, inner_fail) = (seen.clone(), fail_at.clone());
+    let fixture = Fixture::on(move |storage| failing_commit(storage, inner_seen, inner_fail)).await;
+    (fixture, seen, fail_at)
+}
+
+#[tokio::test]
+async fn failed_activation() {
+    // The activation is an install's last commit. Count a whole install's commits on one node,
+    // then fail exactly that commit on another: the install stays preparing, a retry finishes.
+    let id = Ulid::from_parts(9, 4);
+    let (probe, seen, _) = counted().await;
+    let start = seen.load(Ordering::SeqCst);
+    probe.install(&probe.request(Some(id))).await.unwrap();
+    let commits = seen.load(Ordering::SeqCst) - start;
+
+    let (fixture, seen, fail_at) = counted().await;
+    fail_at.store(seen.load(Ordering::SeqCst) + commits - 1, Ordering::SeqCst);
+    let request = fixture.request(Some(id));
+    let failed = fixture.install(&request).await;
+    assert!(matches!(failed, Err(InstallError::Record(_))), "{failed:?}");
+    let record = fixture.installs().await.remove(0);
+    assert_eq!(record.state, InstallState::Preparing);
+    assert!(fixture.account(&record).await.is_some());
+    assert!(fixture.role(&record).await.is_some());
+    let retried = fixture.install(&request).await.unwrap();
+    assert_eq!(retried.state, InstallState::Active);
+}
+
+#[tokio::test]
+async fn copy_needs_both() {
+    // `objects.copy` needs both READ and WRITE: a policy denying either one refuses the grant.
+    for denied in ["read", "write"] {
+        let fixture = Fixture::new().await;
+        let copy = json!({ "permissions": { "required": ["metadata.read"], "optional": ["objects.copy"] } });
+        let digest = fixture.publish("0.1.1", "cd", copy).await;
+        let mut request = fixture.request(None);
+        request.version = Some(digest);
+        let rule = format!("operation == 'plugin.objects.copy' && permission == '{denied}'");
+        fixture.deny(&[&rule]).await;
+        let refused = fixture.install(&request).await;
+        assert!(
+            matches!(refused, Err(InstallError::NotHeld(_))),
+            "{denied}: {refused:?}"
+        );
+        request.grants.insert("objects.copy".into(), Vec::new());
+        assert!(fixture.install(&request).await.is_ok(), "{denied}");
+    }
 }
