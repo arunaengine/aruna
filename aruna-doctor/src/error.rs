@@ -75,4 +75,6 @@ pub enum CliError {
     },
     #[error("OIDC provider '{0}' is not configured")]
     OidcNotFound(String),
+    #[error("{0} rows match no known shape and were left unchanged; see unknown_rows")]
+    UnknownRows(usize),
 }

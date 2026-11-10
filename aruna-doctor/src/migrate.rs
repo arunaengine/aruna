@@ -31,13 +31,14 @@ use aruna_core::realm_vault::RealmVaultRecord;
 use aruna_core::secrets::SecretRecord;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
 use aruna_core::structs::execution::email::RealmEmailProfile;
-use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
+use aruna_core::structs::execution::harvest::{HarvestSource, RepositoryConnectorSecret};
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::structs::execution::source_connector::SourceConnector;
+use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, ReplicaQuota};
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
@@ -49,6 +50,7 @@ use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use aruna_operations::replication::queue::LiveObligationRecord;
+use aruna_operations::sync::mirror_repair::SyncMirrorRecord;
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use layouts::{CONNECTOR, HEAD, NODE_INFO, OBLIGATION, padded};
@@ -75,6 +77,7 @@ mod sizes;
 mod staging;
 mod sync_ops;
 mod topic_purge;
+mod trailing;
 mod uploads;
 mod user_sessions;
 mod vault;
@@ -178,6 +181,18 @@ pub struct MigrateOutput {
     /// replication jobs moved to their new key with their key waits and plaintext requests,
     /// and unfinished staging checkpoints.
     pub stale_rows_deleted: BTreeMap<&'static str, usize>,
+    /// Admin audit rows from before the secret they are about, which gain none.
+    pub audit_rows_scanned: usize,
+    pub audit_rows_rewritten: usize,
+    /// Harvest sources from before the last started job, which gain none.
+    pub harvest_sources_scanned: usize,
+    pub harvest_sources_rewritten: usize,
+    /// Pending sync mirror repairs from before the rollback flag, which gain `false`.
+    pub mirror_repairs_scanned: usize,
+    pub mirror_repairs_rewritten: usize,
+    /// Rows of those keyspaces that match no known shape, left unchanged, as
+    /// `keyspace/key: reason`. Any such row makes the command fail after it prints this output.
+    pub unknown_rows: Vec<String>,
 }
 
 /// Non-zero counts by keyspace; a keyspace listed twice adds up.
@@ -201,6 +216,9 @@ pub async fn migrate(database_path: String, sync_path: Option<String>) -> Result
     .map_err(std::io::Error::other)??;
 
     println!("{}", serde_json::to_string_pretty(&output)?);
+    if !output.unknown_rows.is_empty() {
+        return Err(CliError::UnknownRows(output.unknown_rows.len()));
+    }
     Ok(())
 }
 
@@ -263,6 +281,9 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         db.keyspace(CONNECTOR_REFERENCE_KEYSPACE, KeyspaceCreateOptions::default)?;
     let root_rows = db.keyspace(ROOT_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
     let snapshot_rows = db.keyspace(NODE_STATS_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let audit_rows = db.keyspace(trailing::AUDIT.0, KeyspaceCreateOptions::default)?;
+    let harvest_rows = db.keyspace(trailing::HARVEST.0, KeyspaceCreateOptions::default)?;
+    let mirror_rows = db.keyspace(trailing::MIRROR.0, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
     let mut evidence = families::Evidence::default();
@@ -542,6 +563,26 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     })?;
     // The node rows go first, so an interrupted purge still finds `/node-info-v2` and resumes.
     let (info_ops, fanout_cursors) = info_topics::purge_topics(sync_path, &info.topics)?;
+    // Each batch commits on its own; a rerun skips the rows an earlier run already rewrote.
+    let mut unknown_rows = Vec::new();
+    let audits = trailing::missing_fields::<AdminAuditRecord>(
+        &db,
+        &audit_rows,
+        trailing::AUDIT,
+        &mut unknown_rows,
+    )?;
+    let harvests = trailing::missing_fields::<HarvestSource>(
+        &db,
+        &harvest_rows,
+        trailing::HARVEST,
+        &mut unknown_rows,
+    )?;
+    let mirrors = trailing::missing_fields::<SyncMirrorRecord>(
+        &db,
+        &mirror_rows,
+        trailing::MIRROR,
+        &mut unknown_rows,
+    )?;
 
     Ok(MigrateOutput {
         database_path: database_path.to_string(),
@@ -604,6 +645,13 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
                 .map(|(_, name, rows)| (*name, rows.len())),
         ),
         stale_rows_deleted: counts(stale_rows.iter().map(|(_, name, keys)| (*name, keys.len()))),
+        audit_rows_scanned: audits.scanned,
+        audit_rows_rewritten: audits.rewritten,
+        harvest_sources_scanned: harvests.scanned,
+        harvest_sources_rewritten: harvests.rewritten,
+        mirror_repairs_scanned: mirrors.scanned,
+        mirror_repairs_rewritten: mirrors.rewritten,
+        unknown_rows,
     })
 }
 
