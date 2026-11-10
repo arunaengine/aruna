@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::plugins::artifacts::read_local;
+use crate::plugins::copies::read_local;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::keyspaces::AUTH_KEYSPACE;

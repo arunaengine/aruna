@@ -682,7 +682,7 @@ pub enum MetadataTransportMessage {
     },
     /// One chunk of a plugin artifact a management node hands another to keep before publishing.
     StoreArtifact {
-        chunk: crate::plugins::artifacts::Chunk,
+        chunk: crate::plugins::copies::Chunk,
     },
     /// `true` once the receiver holds the whole artifact and it checked out.
     ArtifactStored {
@@ -694,7 +694,7 @@ pub enum MetadataTransportMessage {
         index: u32,
     },
     FetchedArtifact {
-        result: Result<crate::plugins::artifacts::Chunk, MetadataReadError>,
+        result: Result<crate::plugins::copies::Chunk, MetadataReadError>,
     },
 }
 

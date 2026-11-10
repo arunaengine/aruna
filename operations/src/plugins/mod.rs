@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod artifacts;
+pub mod copies;
 pub mod publish;
 
 use serde::{Deserialize, Serialize};

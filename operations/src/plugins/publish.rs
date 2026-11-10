@@ -26,7 +26,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use super::artifacts::{ArtifactError, chunk_count, chunk_of, managers, store_local};
+use super::artifacts::{ArtifactError, managers};
+use super::copies::{chunk_count, chunk_of, store_local};
 use super::copies_needed;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};

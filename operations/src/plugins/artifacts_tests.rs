@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::plugins::copies::{CHUNK, chunk_of};
 use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
 use tempfile::{TempDir, tempdir};
