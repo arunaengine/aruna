@@ -118,6 +118,8 @@ pub struct InstallView {
     pub account: String,
     /// `preparing`, `active`, `paused`, `blocked` or `removing`.
     pub status: String,
+    /// An admin paused it; it stays paused through updates and grant changes until resumed.
+    pub paused: bool,
     #[schema(value_type = Object)]
     pub settings: Value,
     pub granted_by: String,
@@ -145,7 +147,7 @@ pub struct InstallListQuery {
     pub limit: Option<usize>,
 }
 
-const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "status": "active", "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"]}}"#;
+const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "status": "active", "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"]}}"#;
 
 pub(crate) fn view_example() -> Value {
     serde_json::from_str(VIEW_EXAMPLE).unwrap_or(Value::Null)
@@ -165,8 +167,9 @@ every other node relays it to one.
 - Checks the version, the settings and the grants. Grants default to everything the manifest
   requests on the whole group; the caller must hold every granted right now.
 - With `preview=true` the call answers only the summary and an install id, and writes nothing.
-  Sending the same request with that `id` installs it; a retry with the id resumes the same
-  install, another request with the id is refused.
+  Sending the same request with that `id` and the summary's digest as `version` installs exactly
+  what the summary showed; a retry with the id resumes the same install, another request with
+  the id is refused. A retry without `version` keeps the existing install's version.
 - The install is written `preparing`, its account and role are made right, and it becomes
   `active` as the last write. A failed step leaves it `preparing` with the step in `failed`.
 - Plugins with secret slots or webhooks cannot be installed yet.
@@ -429,6 +432,7 @@ fn view_in(config: &RealmConfigDocument, install: PluginInstall) -> InstallView 
         group: install.group_id.to_string(),
         account: install.account.to_string(),
         status: install.state.as_str().to_string(),
+        paused: install.paused,
         settings: serde_json::from_str(&install.settings).unwrap_or(Value::Null),
         granted_by: install.granted_by.to_string(),
         revision: install.revision,

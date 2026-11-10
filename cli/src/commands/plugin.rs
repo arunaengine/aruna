@@ -331,8 +331,9 @@ async fn install(
     }
     lines.push(match preview {
         true => format!(
-            "install with --id {}",
-            summary["id"].as_str().unwrap_or_default()
+            "install with --id {} --version {}",
+            summary["id"].as_str().unwrap_or_default(),
+            summary["digest"].as_str().unwrap_or_default()
         ),
         false => format!(
             "installed as {} ({})",
