@@ -19,8 +19,8 @@ use tracing::{debug, warn};
 
 use super::ArtifactBytes;
 use super::copies::{
-    Chunk, chunk_count, chunk_fits, read_chunk, read_local, reserve, store_chunk, store_local,
-    sweep_copies,
+    Assembled, Chunk, chunk_count, chunk_fits, has_local, read_chunk, read_local, reserve,
+    store_chunk, store_local, sweep_copies,
 };
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
@@ -59,19 +59,19 @@ pub fn check_published(bytes: &[u8], plugin: &PublishedPlugin) -> Result<(), Art
 }
 
 /// The published artifact with `digest`: this node's copy, else one from a management node,
-/// checked and kept here.
+/// checked and kept here. The caller holds the bytes' memory reservation until it drops them.
 pub async fn fetch_artifact(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     digest: &str,
-) -> Result<Vec<u8>, ArtifactError> {
+) -> Result<Assembled, ArtifactError> {
     let plugin = (config.plugins.iter())
         .find(|plugin| plugin.digest == digest)
         .ok_or(ArtifactError::NotPublished)?;
-    if let Some(bytes) = read_local(ctx, digest).await?
-        && check_published(&bytes, plugin).is_ok()
+    if let Some(local) = read_local(ctx, digest).await?
+        && check_published(&local.bytes, plugin).is_ok()
     {
-        return Ok(bytes);
+        return Ok(local);
     }
     let metadata = (ctx.metadata_handle.as_ref())
         .ok_or_else(|| ArtifactError::Unavailable("metadata transport unavailable".into()))?;
@@ -79,10 +79,10 @@ pub async fn fetch_artifact(
     let mut last = "the realm has no other management node".to_string();
     for node_id in managers(config).filter(|node| Some(*node) != local) {
         match fetch_chunks(metadata, node_id, digest).await {
-            Ok(bytes) => match check_published(&bytes, plugin) {
+            Ok(fetched) => match check_published(&fetched.bytes, plugin) {
                 Ok(()) => {
-                    store_local(ctx, config, digest, &bytes).await?;
-                    return Ok(bytes);
+                    store_local(ctx, config, digest, &fetched.bytes, now()).await?;
+                    return Ok(fetched);
                 }
                 Err(error) => last = format!("{node_id}: {error}"),
             },
@@ -93,12 +93,13 @@ pub async fn fetch_artifact(
 }
 
 /// Every chunk of an artifact from one management node, in order, each placed and sized
-/// exactly; the whole is checked by the caller. Memory for it is reserved while it arrives.
+/// exactly; the whole is checked by the caller. The memory it needs is reserved before it
+/// arrives and travels with the bytes.
 async fn fetch_chunks(
     metadata: &crate::metadata::MetadataHandle,
     node_id: NodeId,
     digest: &str,
-) -> Result<Vec<u8>, MetadataReadError> {
+) -> Result<Assembled, MetadataReadError> {
     let first = metadata
         .request_artifact(node_id, digest.to_string(), 0)
         .await?;
@@ -107,7 +108,7 @@ async fn fetch_chunks(
     if !fits(&first, 0) {
         return Err(MetadataReadError::Forbidden);
     }
-    let _memory = reserve(first.total as usize).ok_or(MetadataReadError::Unavailable)?;
+    let memory = reserve(first.total as usize).ok_or(MetadataReadError::Unavailable)?;
     let mut bytes = Vec::with_capacity(first.total as usize);
     bytes.extend(first.bytes.0);
     for index in 1..chunk_count(first.total) {
@@ -119,7 +120,12 @@ async fn fetch_chunks(
         }
         bytes.extend(chunk.bytes.0);
     }
-    Ok(bytes)
+    Ok(Assembled::new(bytes, memory))
+}
+
+/// This node's wall time, which copy retention is measured in.
+fn now() -> u64 {
+    unix_timestamp_millis()
 }
 
 /// Management nodes in realm config order.
@@ -174,7 +180,7 @@ pub(crate) async fn serve_store(
     let (config, local) = local_config(ctx).await?;
     check_store(&config, local, peer)?;
     let digest = chunk.digest.clone();
-    match store_chunk(ctx, &config, chunk).await {
+    match store_chunk(ctx, &config, chunk, now()).await {
         Ok(complete) => {
             debug!(%peer, %digest, complete, "Stored a plugin artifact chunk");
             Ok(complete)
@@ -223,7 +229,7 @@ pub async fn repair_artifacts(ctx: &DriverContext) -> Result<usize, ArtifactErro
     let (config, local) = local_config(ctx)
         .await
         .map_err(|_| ArtifactError::Unavailable("realm config unavailable".into()))?;
-    let swept = sweep_copies(ctx, &config, unix_timestamp_millis()).await?;
+    let swept = sweep_copies(ctx, &config, now()).await?;
     if swept > 0 {
         debug!(swept, "Reclaimed abandoned plugin artifact copies");
     }
@@ -233,8 +239,13 @@ pub async fn repair_artifacts(ctx: &DriverContext) -> Result<usize, ArtifactErro
     let digests: BTreeSet<&str> = config.plugins.iter().map(|p| p.digest.as_str()).collect();
     let mut copied = 0;
     for digest in digests {
-        if read_local(ctx, digest).await?.is_some() {
-            continue;
+        match has_local(ctx, digest).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(%digest, %error, "Could not look up a plugin artifact copy");
+                continue;
+            }
         }
         match fetch_artifact(ctx, &config, digest).await {
             Ok(_) => copied += 1,

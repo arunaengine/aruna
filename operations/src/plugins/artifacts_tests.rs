@@ -121,7 +121,7 @@ async fn fetch_checks_copy() {
         matches!(missing, Err(ArtifactError::Unavailable(_))),
         "{missing:?}"
     );
-    store_local(&ctx, &config, &digest, b"tampered")
+    store_local(&ctx, &config, &digest, b"tampered", 1)
         .await
         .unwrap();
     let tampered = fetch_artifact(&ctx, &config, &digest).await;
@@ -129,9 +129,11 @@ async fn fetch_checks_copy() {
         matches!(tampered, Err(ArtifactError::Unavailable(_))),
         "a bad local copy is not used"
     );
-    store_local(&ctx, &config, &digest, FIXTURE).await.unwrap();
+    store_local(&ctx, &config, &digest, FIXTURE, 1)
+        .await
+        .unwrap();
     let fetched = fetch_artifact(&ctx, &config, &digest).await.unwrap();
-    assert_eq!(fetched, FIXTURE);
+    assert_eq!(fetched.bytes, FIXTURE);
     let unpublished = format!("sha256:{}", "ab".repeat(32));
     let refused = fetch_artifact(&ctx, &config, &unpublished).await;
     assert!(

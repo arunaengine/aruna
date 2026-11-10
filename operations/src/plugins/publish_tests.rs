@@ -178,7 +178,7 @@ async fn publishes_after_copies() {
     assert_eq!(published(&ctx).await, [plugin.clone()]);
     let kept = read_local(&ctx, &plugin.digest).await.unwrap();
     assert_eq!(
-        kept.as_deref(),
+        kept.map(|copy| copy.bytes).as_deref(),
         Some(FIXTURE),
         "the publishing node keeps a copy"
     );
@@ -224,7 +224,7 @@ async fn refuses_before_storing() {
         "{refused:?}"
     );
     let digest = ArtifactDigest::of(FIXTURE).to_string();
-    assert_eq!(read_local(&ctx, &digest).await.unwrap(), None);
+    assert!(read_local(&ctx, &digest).await.unwrap().is_none());
     let invalid = publish_plugin(&ctx, actor.clone(), auth(&actor), b"not wasm".to_vec()).await;
     assert!(
         matches!(invalid, Err(PublishError::Invalid(_))),

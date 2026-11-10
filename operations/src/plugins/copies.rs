@@ -11,7 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PLUGIN_ARTIFACT_KEYSPACE;
 use aruna_core::plugins::MAX_ARTIFACT;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::TxnId;
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
@@ -24,7 +24,8 @@ use crate::storage_read::scan_all;
 pub const CHUNK: usize = 8 << 20;
 /// Bytes of unfinished and unpublished copies one node keeps at most.
 pub const MAX_UNSETTLED: u64 = 8 * MAX_ARTIFACT as u64;
-/// How long an unfinished or unpublished copy stays untouched before it is reclaimed.
+/// How long an unfinished or unpublished copy stays untouched before it is reclaimed. It is
+/// measured in this node's wall time, so a clock correction shortens or extends it.
 pub const GRACE: Duration = Duration::from_secs(3600);
 /// Memory one node spends at most on artifact uploads and assemblies, in MiB.
 const MEMORY_MIB: u32 = 256;
@@ -40,6 +41,30 @@ pub type MemoryPermit = SemaphorePermit<'static>;
 pub fn reserve(bytes: usize) -> Option<MemoryPermit> {
     let mib = u32::try_from(bytes.div_ceil(1 << 20).max(1)).ok()?;
     MEMORY.try_acquire_many(mib).ok()
+}
+
+/// A whole artifact in memory together with the memory reserved for it; dropping it releases
+/// the reservation, so whoever consumes the bytes holds it until done.
+pub struct Assembled {
+    pub bytes: Vec<u8>,
+    memory: MemoryPermit,
+}
+
+impl Assembled {
+    pub fn new(bytes: Vec<u8>, memory: MemoryPermit) -> Self {
+        Self { bytes, memory }
+    }
+
+    /// MiB this artifact holds of the node's budget.
+    pub fn reserved_mib(&self) -> u32 {
+        self.memory.num_permits() as u32
+    }
+}
+
+impl std::fmt::Debug for Assembled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Assembled({} bytes)", self.bytes.len())
+    }
 }
 
 /// One piece of an artifact in a node message; chunk `index` covers bytes from `index * CHUNK`.
@@ -82,15 +107,22 @@ pub fn chunk_fits(chunk: &Chunk) -> bool {
     sized && placed && chunk.bytes.0.len() as u64 == chunk_len(chunk.total, chunk.index)
 }
 
-/// Reads this node's complete copy, or `None` without one.
+/// Whether this node keeps a complete copy, without reading it.
+pub async fn has_local(ctx: &DriverContext, digest: &str) -> Result<bool, ArtifactError> {
+    Ok(read_done(ctx, digest).await?.is_some())
+}
+
+/// Reads this node's complete copy within the memory budget, or `None` without one.
 pub async fn read_local(
     ctx: &DriverContext,
     digest: &str,
-) -> Result<Option<Vec<u8>>, ArtifactError> {
+) -> Result<Option<Assembled>, ArtifactError> {
     let Some(done) = read_done(ctx, digest).await? else {
         return Ok(None);
     };
-    assemble(ctx, digest, done.total).await.map(Some)
+    let memory = reserve(done.total as usize).ok_or(ArtifactError::Busy)?;
+    let bytes = assemble(ctx, digest, done.total).await?;
+    Ok(Some(Assembled::new(bytes, memory)))
 }
 
 /// One chunk of this node's complete copy and the copy's length.
@@ -109,35 +141,55 @@ pub async fn read_chunk(
     Ok(bytes.map(|bytes| (done.total, bytes)))
 }
 
-/// Writes this node's whole copy, then its done row, and syncs before anyone is told.
+/// Writes this node's whole copy and syncs before anyone is told. Progress is kept with every
+/// chunk, so an interrupted write is counted and swept like an unfinished copy from a peer.
 pub async fn store_local(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     digest: &str,
     bytes: &[u8],
+    now_ms: u64,
 ) -> Result<(), ArtifactError> {
     let _writes = WRITES.lock().await;
     if read_done(ctx, digest).await?.is_none() && read_progress(ctx, digest).await?.is_none() {
         admit(ctx, config, digest, bytes.len() as u64).await?;
     }
+    let mut progress = Progress::new(bytes.len() as u64, now_ms);
     for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
-        write_rows(ctx, vec![(chunk_key(digest, index as u32), chunk.to_vec())]).await?;
+        progress.mark(index as u32, now_ms);
+        let rows = vec![
+            (chunk_key(digest, index as u32), chunk.to_vec()),
+            (progress_key(digest), progress.encode()),
+        ];
+        // The first write drops an older done row, so a half-replaced copy is never complete.
+        let deletes = match index {
+            0 => vec![done_key(digest)],
+            _ => Vec::new(),
+        };
+        apply(ctx, rows, deletes).await?;
     }
-    finish(ctx, digest, bytes.len() as u64).await
+    finish(ctx, digest, bytes.len() as u64, now_ms).await
 }
 
 /// Keeps one chunk of a copy another management node sends. Once every chunk is here and the
-/// whole artifact checks out, the copy is done; `true` means it is done and synced now.
+/// whole artifact checks out, the copy is done; `true` means it is done and synced now. A
+/// resend to a done copy restarts its retention before it is acknowledged.
 pub async fn store_chunk(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     chunk: Chunk,
+    now_ms: u64,
 ) -> Result<bool, ArtifactError> {
     if !chunk_fits(&chunk) {
         return Err(ArtifactError::Mismatch);
     }
     let _writes = WRITES.lock().await;
-    if read_done(ctx, &chunk.digest).await?.is_some() {
+    if let Some(done) = read_done(ctx, &chunk.digest).await? {
+        if done.total != chunk.total {
+            return Err(ArtifactError::Mismatch);
+        }
+        let refreshed = Done::encode(done.total, now_ms);
+        write_rows(ctx, vec![(done_key(&chunk.digest), refreshed)]).await?;
         sync(ctx).await?;
         return Ok(true);
     }
@@ -146,10 +198,10 @@ pub async fn store_chunk(
         Some(progress) => progress,
         None => {
             admit(ctx, config, &chunk.digest, chunk.total).await?;
-            Progress::new(chunk.total)
+            Progress::new(chunk.total, now_ms)
         }
     };
-    progress.mark(chunk.index);
+    progress.mark(chunk.index, now_ms);
     let rows = vec![
         (chunk_key(&chunk.digest, chunk.index), chunk.bytes.0),
         (progress_key(&chunk.digest), progress.encode()),
@@ -160,17 +212,17 @@ pub async fn store_chunk(
     }
     let _memory = reserve(chunk.total as usize).ok_or(ArtifactError::Busy)?;
     let bytes = assemble(ctx, &chunk.digest, chunk.total).await?;
-    let whole =
-        ArtifactDigest::of(&bytes).as_str() == chunk.digest && check_artifact(&bytes).is_ok();
-    if !whole {
+    let digest = ArtifactDigest::of(&bytes);
+    if digest.as_str() != chunk.digest || check_artifact(&bytes).is_err() {
         return Err(ArtifactError::Mismatch);
     }
-    finish(ctx, &chunk.digest, chunk.total).await?;
+    finish(ctx, &chunk.digest, chunk.total, now_ms).await?;
     Ok(true)
 }
 
-/// Deletes unfinished copies and unpublished complete copies untouched for the grace period;
-/// published copies stay. Returns how many copies it deleted.
+/// Deletes unfinished copies and unpublished complete copies untouched for the grace period.
+/// Published and pinned copies stay, and a stale progress row next to a done row only loses
+/// itself. Returns how many copies it deleted.
 pub async fn sweep_copies(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
@@ -178,27 +230,33 @@ pub async fn sweep_copies(
 ) -> Result<usize, ArtifactError> {
     let _writes = WRITES.lock().await;
     let grace = GRACE.as_millis() as u64;
-    let published = published(config);
-    let mut stale = Vec::new();
+    let kept = published(config);
+    let done = scan_rows(ctx, b"d/", Done::decode).await?;
+    let complete: BTreeSet<&str> = done.iter().map(|(digest, _)| digest.as_str()).collect();
+    let mut deleted = 0;
     for (digest, progress) in scan_rows(ctx, b"p/", Progress::decode).await? {
-        if progress.updated_ms.saturating_add(grace) < now_ms {
-            stale.push((progress_key(&digest), digest, progress.total));
+        if progress.updated_ms.saturating_add(grace) >= now_ms {
+            continue;
         }
-    }
-    for (digest, done) in scan_rows(ctx, b"d/", Done::decode).await? {
-        if !published.contains(digest.as_str()) && done.completed_ms.saturating_add(grace) < now_ms
-        {
-            stale.push((done_key(&digest), digest, done.total));
+        let mut keys = vec![progress_key(&digest)];
+        if !complete.contains(digest.as_str()) {
+            keys.extend((0..chunk_count(progress.total)).map(|i| chunk_key(&digest, i)));
+            deleted += 1;
         }
-    }
-    for (row, digest, total) in &stale {
-        let mut keys: Vec<Vec<u8>> = (0..chunk_count(*total))
-            .map(|i| chunk_key(digest, i))
-            .collect();
-        keys.push(row.clone());
         delete_rows(ctx, keys).await?;
     }
-    Ok(stale.len())
+    for (digest, done) in &done {
+        if kept.contains(digest.as_str()) || done.completed_ms.saturating_add(grace) >= now_ms {
+            continue;
+        }
+        let mut keys: Vec<Vec<u8>> = (0..chunk_count(done.total))
+            .map(|i| chunk_key(digest, i))
+            .collect();
+        keys.push(done_key(digest));
+        delete_rows(ctx, keys).await?;
+        deleted += 1;
+    }
+    Ok(deleted)
 }
 
 /// Refuses a new copy that would push the unfinished and unpublished bytes over the bound.
@@ -224,21 +282,24 @@ async fn admit(
     }
 }
 
+/// Digests whose copies stay: published versions.
 fn published(config: &RealmConfigDocument) -> BTreeSet<&str> {
-    config
-        .plugins
-        .iter()
+    (config.plugins.iter())
         .map(|plugin| plugin.digest.as_str())
         .collect()
 }
 
-/// A complete copy: its length and when it was done, in this node's clock.
+/// A complete copy: its length and when it was last confirmed, in this node's clock.
 struct Done {
     total: u64,
     completed_ms: u64,
 }
 
 impl Done {
+    fn encode(total: u64, completed_ms: u64) -> Vec<u8> {
+        [total.to_le_bytes(), completed_ms.to_le_bytes()].concat()
+    }
+
     fn decode(row: &[u8]) -> Option<Self> {
         let (total, completed_ms) = two_numbers(row)?;
         Some(Self {
@@ -256,18 +317,18 @@ struct Progress {
 }
 
 impl Progress {
-    fn new(total: u64) -> Self {
+    fn new(total: u64, now_ms: u64) -> Self {
         let bits = chunk_count(total).div_ceil(8) as usize;
         Self {
             total,
-            updated_ms: unix_timestamp_millis(),
+            updated_ms: now_ms,
             received: vec![0; bits],
         }
     }
 
-    fn mark(&mut self, index: u32) {
+    fn mark(&mut self, index: u32, now_ms: u64) {
         self.received[index as usize / 8] |= 1 << (index % 8);
-        self.updated_ms = unix_timestamp_millis();
+        self.updated_ms = now_ms;
     }
 
     fn complete(&self) -> bool {
@@ -353,11 +414,16 @@ async fn assemble(ctx: &DriverContext, digest: &str, total: u64) -> Result<Vec<u
     Ok(bytes)
 }
 
-/// Writes the done row, drops the progress row and syncs: only then may a copy count.
-async fn finish(ctx: &DriverContext, digest: &str, total: u64) -> Result<(), ArtifactError> {
-    let done = [total.to_le_bytes(), unix_timestamp_millis().to_le_bytes()].concat();
-    write_rows(ctx, vec![(done_key(digest), done)]).await?;
-    delete_rows(ctx, vec![progress_key(digest)]).await?;
+/// Writes the done row and drops the progress row in one transaction, then syncs: only then
+/// may a copy count. A crash leaves either the unfinished copy or the complete one.
+async fn finish(
+    ctx: &DriverContext,
+    digest: &str,
+    total: u64,
+    now_ms: u64,
+) -> Result<(), ArtifactError> {
+    let done = vec![(done_key(digest), Done::encode(total, now_ms))];
+    apply(ctx, done, vec![progress_key(digest)]).await?;
     sync(ctx).await
 }
 
@@ -372,19 +438,80 @@ async fn sync(ctx: &DriverContext) -> Result<(), ArtifactError> {
     }
 }
 
+/// Writes `rows` and deletes `keys` in one transaction: all of them or none.
+async fn apply(
+    ctx: &DriverContext,
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    keys: Vec<Vec<u8>>,
+) -> Result<(), ArtifactError> {
+    let start = StorageEffect::StartTransaction { read: false };
+    let txn_id = match ctx.storage_handle.send_storage_effect(start).await {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        other => return Err(ArtifactError::Storage(format!("{other:?}"))),
+    };
+    match apply_in(ctx, txn_id, rows, keys).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let abort = StorageEffect::AbortTransaction { txn_id };
+            ctx.storage_handle.send_storage_effect(abort).await;
+            Err(error)
+        }
+    }
+}
+
+async fn apply_in(
+    ctx: &DriverContext,
+    txn_id: TxnId,
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    keys: Vec<Vec<u8>>,
+) -> Result<(), ArtifactError> {
+    let writes = (rows.into_iter())
+        .map(|(key, value)| {
+            (
+                PLUGIN_ARTIFACT_KEYSPACE.to_string(),
+                key.into(),
+                value.into(),
+            )
+        })
+        .collect();
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: Some(txn_id),
+    };
+    match ctx.storage_handle.send_storage_effect(write).await {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        other => return Err(ArtifactError::Storage(format!("{other:?}"))),
+    }
+    if !keys.is_empty() {
+        let deletes = (keys.into_iter())
+            .map(|key| (PLUGIN_ARTIFACT_KEYSPACE.to_string(), key.into()))
+            .collect();
+        let delete = StorageEffect::BatchDelete {
+            deletes,
+            txn_id: Some(txn_id),
+        };
+        match ctx.storage_handle.send_storage_effect(delete).await {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+            other => return Err(ArtifactError::Storage(format!("{other:?}"))),
+        }
+    }
+    let commit = StorageEffect::CommitTransaction { txn_id };
+    match ctx.storage_handle.send_storage_effect(commit).await {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        other => Err(ArtifactError::Storage(format!("{other:?}"))),
+    }
+}
+
 /// The rows below `prefix`, keyed by digest, that decode; others are left for a later sweep.
 async fn scan_rows<T>(
     ctx: &DriverContext,
     prefix: &[u8],
     decode: fn(&[u8]) -> Option<T>,
 ) -> Result<Vec<(String, T)>, ArtifactError> {
-    let rows = scan_all(
-        &ctx.storage_handle,
-        PLUGIN_ARTIFACT_KEYSPACE,
-        Some(prefix.to_vec().into()),
-    )
-    .await
-    .map_err(ArtifactError::Storage)?;
+    let prefix_key = Some(prefix.to_vec().into());
+    let rows = scan_all(&ctx.storage_handle, PLUGIN_ARTIFACT_KEYSPACE, prefix_key)
+        .await
+        .map_err(ArtifactError::Storage)?;
     Ok((rows.into_iter())
         .filter_map(|(key, value)| {
             let digest = std::str::from_utf8(key.get(prefix.len()..)?)

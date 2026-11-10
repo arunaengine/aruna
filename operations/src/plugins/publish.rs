@@ -91,6 +91,7 @@ pub async fn publish_plugin(
         return Err(PublishError::NotManagementNode);
     }
     let digest = ArtifactDigest::of(&artifact);
+    let published_at = unix_timestamp_millis();
     let entry = PublishedPlugin {
         name: manifest.name.clone(),
         version: manifest.version.clone(),
@@ -99,12 +100,12 @@ pub async fn publish_plugin(
         manifest: serde_json::to_string(&manifest)
             .map_err(|err| PublishError::Invalid(err.to_string()))?,
         published_by: actor.user_id,
-        published_at_ms: unix_timestamp_millis(),
+        published_at_ms: published_at,
     };
     if let Some(existing) = same_version(&config, &entry)? {
         return Ok(existing);
     }
-    store_local(ctx, &config, digest.as_str(), &artifact).await?;
+    store_local(ctx, &config, digest.as_str(), &artifact, published_at).await?;
     let digest = digest.to_string();
     let mut copies = copy_to_managers(ctx, &config, actor.node_id, &digest, &artifact).await;
     copies.insert(actor.node_id);
