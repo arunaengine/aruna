@@ -106,6 +106,12 @@ pub async fn settle_in(
         .await
 }
 
+/// Removes the intent of a call that ended without an effect, so it may be made again.
+pub async fn clear_in(txn: &Txn<'_>, run_id: Ulid, intent: &Intent) -> Result<(), StoreError> {
+    let key = intent_key(run_id, intent.ordinal);
+    txn.delete(PLUGIN_INTENTS_KEYSPACE, vec![key]).await
+}
+
 /// Marks a call whose effect may have happened without a recorded reply.
 pub async fn mark_unknown(
     ctx: &DriverContext,
