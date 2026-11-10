@@ -103,7 +103,7 @@ pub async fn publish_plugin(
     if let Some(existing) = same_version(&config, &entry)? {
         return Ok(existing);
     }
-    store_local(ctx, digest.as_str(), &artifact).await?;
+    store_local(ctx, &config, digest.as_str(), &artifact).await?;
     let digest = digest.to_string();
     let stored = 1 + copy_to_managers(ctx, &config, actor.node_id, &digest, &artifact).await;
     let needed = copies_needed(managers(&config).count());

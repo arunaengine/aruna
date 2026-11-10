@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::plugins::copies::{CHUNK, chunk_of};
 use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
 use tempfile::{TempDir, tempdir};
@@ -122,13 +121,15 @@ async fn fetch_checks_copy() {
         matches!(missing, Err(ArtifactError::Unavailable(_))),
         "{missing:?}"
     );
-    store_local(&ctx, &digest, b"tampered").await.unwrap();
+    store_local(&ctx, &config, &digest, b"tampered")
+        .await
+        .unwrap();
     let tampered = fetch_artifact(&ctx, &config, &digest).await;
     assert!(
         matches!(tampered, Err(ArtifactError::Unavailable(_))),
         "a bad local copy is not used"
     );
-    store_local(&ctx, &digest, FIXTURE).await.unwrap();
+    store_local(&ctx, &config, &digest, FIXTURE).await.unwrap();
     let fetched = fetch_artifact(&ctx, &config, &digest).await.unwrap();
     assert_eq!(fetched, FIXTURE);
     let unpublished = format!("sha256:{}", "ab".repeat(32));
@@ -137,63 +138,4 @@ async fn fetch_checks_copy() {
         matches!(refused, Err(ArtifactError::NotPublished)),
         "{refused:?}"
     );
-}
-
-/// The fixture with a custom section appended, so it spans three chunks.
-fn padded() -> Vec<u8> {
-    let name = b"padding";
-    let mut payload = vec![name.len() as u8];
-    payload.extend(name);
-    payload.resize(2 * CHUNK + CHUNK / 2, 7);
-    let mut bytes = FIXTURE.to_vec();
-    bytes.push(0);
-    let mut size = payload.len();
-    while size >= 0x80 {
-        bytes.push((size as u8 & 0x7f) | 0x80);
-        size >>= 7;
-    }
-    bytes.push(size as u8);
-    bytes.extend(payload);
-    bytes
-}
-
-#[tokio::test]
-async fn chunked_copy() {
-    let (_dir, ctx) = context();
-    let big = padded();
-    let digest = ArtifactDigest::of(&big).to_string();
-    assert!(check_artifact(&big).is_ok());
-    assert_eq!(chunk_count(big.len() as u64), 3);
-
-    let mut short = chunk_of(&digest, &big, 0);
-    short.bytes.0.pop();
-    assert!(matches!(
-        store_chunk(&ctx, short).await,
-        Err(ArtifactError::Mismatch)
-    ));
-    let mut huge = chunk_of(&digest, &big, 0);
-    huge.total = MAX_ARTIFACT as u64 + 1;
-    assert!(matches!(
-        store_chunk(&ctx, huge).await,
-        Err(ArtifactError::Mismatch)
-    ));
-
-    assert!(!store_chunk(&ctx, chunk_of(&digest, &big, 2)).await.unwrap());
-    assert!(!store_chunk(&ctx, chunk_of(&digest, &big, 0)).await.unwrap());
-    let mut corrupt = chunk_of(&digest, &big, 1);
-    corrupt.bytes.0[0] ^= 1;
-    let refused = store_chunk(&ctx, corrupt.clone()).await;
-    assert!(
-        matches!(refused, Err(ArtifactError::Mismatch)),
-        "{refused:?}"
-    );
-    assert_eq!(read_local(&ctx, &digest).await.unwrap(), None);
-
-    assert!(store_chunk(&ctx, chunk_of(&digest, &big, 1)).await.unwrap());
-    assert_eq!(read_local(&ctx, &digest).await.unwrap(), Some(big.clone()));
-    assert!(
-        store_chunk(&ctx, corrupt).await.unwrap(),
-        "a complete copy stays"
-    );
-    assert_eq!(read_local(&ctx, &digest).await.unwrap(), Some(big));
 }

@@ -8,24 +8,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::plugins::{MAX_ARTIFACT, PublishedPlugin};
+use aruna_core::plugins::PublishedPlugin;
 use aruna_core::realm_vault::FetchScope;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
 use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::ArtifactBytes;
 use super::copies::{
-    Chunk, chunk_count, chunk_key, read_local, read_row, read_total, store_chunk, store_local,
+    Chunk, chunk_count, chunk_fits, read_chunk, read_local, reserve, store_chunk, store_local,
+    sweep_copies,
 };
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::{is_management, node_kind};
 
-/// How often a management node looks for published artifacts it lacks.
+/// How often a node sweeps its copies and a management node repairs missing ones.
 const REPAIR_INTERVAL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Error)]
@@ -38,6 +40,8 @@ pub enum ArtifactError {
     Unavailable(String),
     #[error("local artifact storage failed: {0}")]
     Storage(String),
+    #[error("this node holds too many unsettled copies or uses its artifact memory; retry later")]
+    Busy,
 }
 
 /// Whether `bytes` are exactly the artifact `plugin` publishes: digest, size and manifest.
@@ -77,7 +81,7 @@ pub async fn fetch_artifact(
         match fetch_chunks(metadata, node_id, digest).await {
             Ok(bytes) => match check_published(&bytes, plugin) {
                 Ok(()) => {
-                    store_local(ctx, digest, &bytes).await?;
+                    store_local(ctx, config, digest, &bytes).await?;
                     return Ok(bytes);
                 }
                 Err(error) => last = format!("{node_id}: {error}"),
@@ -88,7 +92,8 @@ pub async fn fetch_artifact(
     Err(ArtifactError::Unavailable(last))
 }
 
-/// Every chunk of an artifact from one management node, in order and unchecked.
+/// Every chunk of an artifact from one management node, in order, each placed and sized
+/// exactly; the whole is checked by the caller. Memory for it is reserved while it arrives.
 async fn fetch_chunks(
     metadata: &crate::metadata::MetadataHandle,
     node_id: NodeId,
@@ -97,16 +102,19 @@ async fn fetch_chunks(
     let first = metadata
         .request_artifact(node_id, digest.to_string(), 0)
         .await?;
-    if first.total > MAX_ARTIFACT as u64 {
+    let fits =
+        |chunk: &Chunk, index| chunk.index == index && chunk.digest == digest && chunk_fits(chunk);
+    if !fits(&first, 0) {
         return Err(MetadataReadError::Forbidden);
     }
-    let mut bytes = first.bytes.0;
+    let _memory = reserve(first.total as usize).ok_or(MetadataReadError::Unavailable)?;
+    let mut bytes = Vec::with_capacity(first.total as usize);
+    bytes.extend(first.bytes.0);
     for index in 1..chunk_count(first.total) {
         let chunk = metadata
             .request_artifact(node_id, digest.to_string(), index)
             .await?;
-        let fits = bytes.len() + chunk.bytes.0.len() <= first.total as usize;
-        if chunk.total != first.total || chunk.index != index || !fits {
+        if chunk.total != first.total || !fits(&chunk, index) {
             return Err(MetadataReadError::Forbidden);
         }
         bytes.extend(chunk.bytes.0);
@@ -166,7 +174,7 @@ pub(crate) async fn serve_store(
     let (config, local) = local_config(ctx).await?;
     check_store(&config, local, peer)?;
     let digest = chunk.digest.clone();
-    match store_chunk(ctx, chunk).await {
+    match store_chunk(ctx, &config, chunk).await {
         Ok(complete) => {
             debug!(%peer, %digest, complete, "Stored a plugin artifact chunk");
             Ok(complete)
@@ -185,19 +193,15 @@ pub(crate) async fn serve_fetch(
 ) -> Result<Chunk, MetadataReadError> {
     let (config, local) = local_config(ctx).await?;
     check_fetch(&config, local, peer, &digest)?;
-    let total = match read_total(ctx, &digest).await {
-        Ok(Some(total)) if index < chunk_count(total) => total,
-        Ok(Some(_)) => return Err(MetadataReadError::NotFound),
-        _ => return Err(MetadataReadError::Unavailable),
-    };
-    match read_row(ctx, chunk_key(&digest, index)).await {
-        Ok(Some(bytes)) => Ok(Chunk {
+    match read_chunk(ctx, &digest, index).await {
+        Ok(Some((total, bytes))) => Ok(Chunk {
             digest,
             index,
             total,
             bytes: ArtifactBytes(bytes),
         }),
-        _ => Err(MetadataReadError::Unavailable),
+        Ok(None) => Err(MetadataReadError::NotFound),
+        Err(_) => Err(MetadataReadError::Unavailable),
     }
 }
 
@@ -219,6 +223,10 @@ pub async fn repair_artifacts(ctx: &DriverContext) -> Result<usize, ArtifactErro
     let (config, local) = local_config(ctx)
         .await
         .map_err(|_| ArtifactError::Unavailable("realm config unavailable".into()))?;
+    let swept = sweep_copies(ctx, &config, unix_timestamp_millis()).await?;
+    if swept > 0 {
+        debug!(swept, "Reclaimed abandoned plugin artifact copies");
+    }
     if !is_management(&config, local) {
         return Ok(0);
     }
