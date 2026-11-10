@@ -673,6 +673,21 @@ async fn send(request: reqwest::RequestBuilder) -> TestResult<(StatusCode, Value
     Ok((status, response.json().await.unwrap_or(Value::Null)))
 }
 
+/// Enabling encryption starts a transition even on an empty bucket; a mode change waits for it.
+async fn transition_settled(http: &reqwest::Client, url: &str, token: &str) -> TestResult<()> {
+    shared::wait_until(
+        "settled transition",
+        std::time::Duration::from_secs(120),
+        std::time::Duration::from_millis(50),
+        || async move {
+            send(http.get(url).bearer_auth(token))
+                .await
+                .is_ok_and(|(_, status)| status["transition"]["finished_at_ms"].is_u64())
+        },
+    )
+    .await
+}
+
 fn submission(record: &Value, enc: [u8; 32], ciphertext: &[u8]) -> Value {
     json!({"context":record,"enc":STANDARD.encode(enc),"ciphertext":STANDARD.encode(ciphertext)})
 }
@@ -1491,8 +1506,11 @@ async fn abe_members() -> TestResult<()> {
         for (mode, generation) in [("node_managed", 0), ("off", 1)] {
             let body = json!({"mode":mode,"expected_generation":generation});
             let request = http.put(encryption("abe-plain-a")).bearer_auth(&owner);
-            let response = request.json(&body).send().await?;
-            assert!(response.status().is_success(), "{mode}");
+            let (status, reply) = send(request.json(&body)).await?;
+            assert!(status.is_success(), "{mode}: {status} {reply}");
+            if mode == "node_managed" {
+                transition_settled(&http, &encryption("abe-plain-a"), &owner).await?;
+            }
         }
         let auth = AuthContext {
             user_id: seed.user_id,
@@ -1529,8 +1547,11 @@ async fn abe_members() -> TestResult<()> {
             }
             let body = json!({"mode":mode,"expected_generation":generation});
             let request = http.put(encryption(bucket)).bearer_auth(&owner);
-            let response = request.json(&body).send().await?;
-            assert!(response.status().is_success(), "{mode}");
+            let (status, reply) = send(request.json(&body)).await?;
+            assert!(status.is_success(), "{mode}: {status} {reply}");
+            if mode == "node_managed" {
+                transition_settled(&http, &encryption(bucket), &owner).await?;
+            }
         }
         let lock = http.post(format!("{}/lock", encryption(bucket)));
         assert!(lock.bearer_auth(&owner).send().await?.status().is_success());
