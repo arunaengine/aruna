@@ -14,9 +14,9 @@ use crate::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EMAIL_SETTINGS_KEYSPACE, EVENT_LOG_KEYSPACE,
     GIT_PACK_KEYSPACE, GIT_RECORD_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE,
     ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATS_KEYSPACE,
-    PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE, REPOSITORY_LINK_KEYSPACE, USER_KEY_KEYSPACE,
-    USER_KEYSPACE, VAULT_REVISION_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
-    WEBHOOK_SETTINGS_KEYSPACE,
+    OWNER_SECRETS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    REPOSITORY_LINK_KEYSPACE, USER_KEY_KEYSPACE, USER_KEYSPACE, VAULT_REVISION_KEYSPACE,
+    WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE, WEBHOOK_SETTINGS_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use crate::repository::link_key;
@@ -130,6 +130,14 @@ pub enum DocumentTarget {
     WebhookSubscription {
         owner: UserId,
         subscription_id: Ulid,
+    },
+    /// One immutable register write of a user or group secret.
+    OwnerSecret {
+        realm_id: RealmId,
+        owner: crate::secret_registers::SecretOwner,
+        name: crate::secrets::SecretName,
+        part: crate::secret_registers::SecretPart,
+        write_id: Ulid,
     },
 }
 
@@ -437,6 +445,7 @@ impl DocumentTarget {
             Self::WatchSubscription { owner, .. }
             | Self::EmailPreference { owner, .. }
             | Self::WebhookSubscription { owner, .. } => TopicId::realm(owner.realm_id),
+            Self::OwnerSecret { realm_id, .. } => TopicId::realm(*realm_id),
             Self::NodeInfo { realm_id, .. } => TopicId::realm(*realm_id),
             Self::PlacementPolicy { policy_id } => TopicId::metadata(*policy_id),
         }
@@ -460,6 +469,7 @@ impl DocumentTarget {
             Self::WatchSubscription { .. } => WATCH_SUBSCRIPTIONS_KEYSPACE,
             Self::EmailPreference { .. } => EMAIL_SETTINGS_KEYSPACE,
             Self::WebhookSubscription { .. } => WEBHOOK_SETTINGS_KEYSPACE,
+            Self::OwnerSecret { .. } => OWNER_SECRETS_KEYSPACE,
             Self::NodeInfo { .. } => NODE_INFO_KEYSPACE,
             Self::PlacementPolicy { .. } => PLACEMENT_POLICY_KEYSPACE,
             Self::RepositoryLink { .. } => REPOSITORY_LINK_KEYSPACE,
@@ -523,6 +533,15 @@ impl DocumentTarget {
                 owner,
                 subscription_id: id,
             } => ByteView::from(setting_key(owner, *id)),
+            Self::OwnerSecret {
+                owner,
+                name,
+                part,
+                write_id,
+                ..
+            } => ByteView::from(crate::secret_registers::document_key(
+                owner, name, *part, *write_id,
+            )),
             Self::NodeInfo { node_id, .. } => ByteView::from(node_info_key(*node_id)),
             Self::PlacementPolicy { policy_id } => ByteView::from(placement_policy_key(*policy_id)),
             Self::RepositoryLink {
@@ -598,7 +617,8 @@ impl DocumentTarget {
             Self::WatchInterest { .. }
             | Self::WatchSubscription { .. }
             | Self::EmailPreference { .. }
-            | Self::WebhookSubscription { .. } => bytes.extend_from_slice(b"/watch-interest"),
+            | Self::WebhookSubscription { .. }
+            | Self::OwnerSecret { .. } => bytes.extend_from_slice(b"/watch-interest"),
             // Realm-shared: every node's info document rides one topic
             // (no node id in the suffix) so all realm nodes receive every peer's.
             Self::NodeInfo { .. } => bytes.extend_from_slice(b"/node-info"),

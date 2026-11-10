@@ -44,6 +44,12 @@ impl AdminDocumentClock {
         self.sequence_for(&dot.origin_node_id) >= dot.origin_seq
     }
 
+    /// Whether this clock covers every component of `other`, a missing component counting as 0.
+    /// Of two concurrent clocks neither covers the other.
+    pub fn covers(&self, other: &AdminDocumentClock) -> bool {
+        (other.origins.iter()).all(|(origin, seq)| self.sequence_for(origin) >= *seq)
+    }
+
     pub fn advance(&mut self, origin_node_id: NodeId, origin_seq: u64) {
         let current = self.origins.entry(origin_node_id).or_default();
         *current = (*current).max(origin_seq);
@@ -60,6 +66,22 @@ pub struct AdminDocumentDot {
     pub event_id: Ulid,
     pub origin_node_id: NodeId,
     pub origin_seq: u64,
+}
+
+/// One stretch of a node's infrastructure membership: its add event and every removal event that
+/// saw that add. Retained after removal and re-addition, so old writes keep their evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeInterval {
+    pub node_id: NodeId,
+    pub added: AdminDocumentDot,
+    pub removed: Vec<AdminDocumentDot>,
+}
+
+impl NodeInterval {
+    /// Whether a writer whose realm config clock was `clock` was inside this interval.
+    pub fn open_at(&self, clock: &AdminDocumentClock) -> bool {
+        clock.observes(&self.added) && !self.removed.iter().any(|dot| clock.observes(dot))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,6 +454,13 @@ pub enum AdminDocumentOperation {
     #[serde(rename = "RealmConfigEmailSet")]
     ConfigEmailSet {
         profile: Option<crate::structs::execution::email::RealmEmailProfile>,
+    },
+    /// Sets or deletes the record of one named realm secret. Each name is its own path;
+    /// concurrent writes of one name leave it absent until a realm admin writes it again.
+    #[serde(rename = "RealmConfigSecretSet")]
+    ConfigSecretSet {
+        name: crate::secrets::SecretName,
+        info: Option<crate::secrets::SecretRecord>,
     },
 }
 

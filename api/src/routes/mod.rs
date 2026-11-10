@@ -41,6 +41,7 @@ pub mod repository;
 pub mod rocrate_import;
 pub mod running_jobs;
 pub mod search;
+pub mod secrets;
 pub mod shares;
 pub mod staging;
 pub mod storage;
@@ -134,6 +135,10 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(promotion::router())
         .merge(realm_admins::router())
         .merge(search::router())
+        .merge(secrets::node::router())
+        .merge(secrets::realm::router())
+        .merge(secrets::group::router())
+        .merge(secrets::user::router())
         .merge(shares::router())
         .merge(access::service_accounts::router())
         .merge(access::sessions::router())
@@ -452,6 +457,31 @@ pub(crate) mod tests {
         ("GET", "/system/realm/email"),
         ("PUT", "/system/realm/email"),
         ("DELETE", "/system/realm/email"),
+        ("GET", "/system/node/secrets"),
+        ("POST", "/system/node/secrets"),
+        ("GET", "/system/node/secrets/{name}"),
+        ("PUT", "/system/node/secrets/{name}"),
+        ("DELETE", "/system/node/secrets/{name}"),
+        ("POST", "/system/node/secrets/{name}/rotate"),
+        ("GET", "/system/realm/secrets"),
+        ("POST", "/system/realm/secrets"),
+        ("GET", "/system/realm/secrets/{name}"),
+        ("PUT", "/system/realm/secrets/{name}"),
+        ("DELETE", "/system/realm/secrets/{name}"),
+        ("POST", "/system/realm/secrets/{name}/rotate"),
+        ("GET", "/data/groups/{group_id}/secrets"),
+        ("POST", "/data/groups/{group_id}/secrets"),
+        ("GET", "/data/groups/{group_id}/secrets/{name}"),
+        ("PUT", "/data/groups/{group_id}/secrets/{name}"),
+        ("DELETE", "/data/groups/{group_id}/secrets/{name}"),
+        ("POST", "/data/groups/{group_id}/secrets/{name}/rotate"),
+        ("GET", "/access/users/me/secrets"),
+        ("POST", "/access/users/me/secrets"),
+        ("GET", "/access/users/me/secrets/{name}"),
+        ("PUT", "/access/users/me/secrets/{name}"),
+        ("DELETE", "/access/users/me/secrets/{name}"),
+        ("POST", "/access/users/me/secrets/{name}/rotate"),
+        ("GET", "/access/users/me/secrets/{name}/value"),
         ("GET", "/system/realm/federation"),
         ("GET", "/system/realm/placement"),
         ("GET", "/system/realm/portal-features"),

@@ -353,19 +353,64 @@ impl AdminDocumentState {
             .collect()
     }
 
-    /// Realm vault records sorted by entry key. A never set, deleted or conflicting entry is absent.
+    /// Realm vault records sorted by entry key. A never set, deleted or conflicting entry is absent,
+    /// and so is a named secret value no present secret record points at.
     pub fn materialized_realm_vault(&self) -> Vec<crate::realm_vault::RealmVaultRecord> {
+        use crate::realm_vault::{RealmSecretRef, RealmVaultPurpose, RealmVaultRecord};
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
             return Vec::new();
         }
-        let mut records: Vec<crate::realm_vault::RealmVaultRecord> = (self.user_subject_ids)
+        let referenced: BTreeSet<RealmSecretRef> = (self.materialized_realm_secrets().iter())
+            .map(|info| RealmSecretRef::named(info.value_id))
+            .collect();
+        let mut records: Vec<RealmVaultRecord> = (self.user_subject_ids)
             .range(VAULT_ENTRY_PREFIX.to_string()..)
             .take_while(|(path, _)| path.starts_with(VAULT_ENTRY_PREFIX))
             .filter(|(path, _)| !self.conflicts.contains_key(*path))
             .filter_map(|(_, version)| serde_json::from_str(version.value.as_deref()?).ok())
+            .filter(|record: &RealmVaultRecord| {
+                let reference = RealmSecretRef {
+                    entry: record.entry,
+                    revision: record.revision,
+                };
+                record.entry.purpose != RealmVaultPurpose::NamedSecret
+                    || referenced.contains(&reference)
+            })
             .collect();
         records.sort_by_key(|record| record.entry.key());
         records
+    }
+
+    /// Named realm secret records sorted by name. A never set, deleted or conflicting name is absent.
+    pub fn materialized_realm_secrets(&self) -> Vec<crate::secrets::SecretRecord> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return Vec::new();
+        }
+        (self
+            .user_subject_ids
+            .range(SECRET_INFO_PREFIX.to_string()..))
+        .take_while(|(path, _)| path.starts_with(SECRET_INFO_PREFIX))
+        .filter(|(path, _)| !self.conflicts.contains_key(*path))
+        .filter_map(|(_, version)| serde_json::from_str(version.value.as_deref()?).ok())
+        .collect()
+    }
+
+    /// The current record of one realm secret name and every record competing with it. A write
+    /// of that name supersedes them all, so their values may retire; nothing else may.
+    pub fn realm_secret_candidates(
+        &self,
+        name: &crate::secrets::SecretName,
+    ) -> Vec<crate::secrets::SecretRecord> {
+        let path = secret_info_path(name);
+        let conflicting = (self.conflicts.get(&path).into_iter())
+            .flat_map(|conflict| &conflict.values)
+            .filter_map(|candidate| candidate.value.as_deref());
+        (self.user_subject_ids.get(&path))
+            .and_then(|version| version.value.as_deref())
+            .into_iter()
+            .chain(conflicting)
+            .filter_map(|value| serde_json::from_str(value).ok())
+            .collect()
     }
 
     /// Display names of realm nodes, by node id. A cleared or conflicting name is absent.
@@ -676,5 +721,84 @@ impl AdminDocumentState {
                 self.user_subject_ids.remove(path);
             }
         }
+    }
+}
+
+/// The stored form of one membership event; a removal keeps the clock it was made with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum MembershipEvent {
+    Added {
+        dot: AdminDocumentDot,
+    },
+    Removed {
+        dot: AdminDocumentDot,
+        observed: crate::admin_documents::AdminDocumentClock,
+    },
+}
+
+impl AdminDocumentState {
+    /// Keeps one infrastructure add or removal event of `node_id` for good, under its own path.
+    pub(super) fn record_membership(
+        &mut self,
+        event: &AdminDocumentEvent,
+        node_id: &NodeId,
+        removal: bool,
+    ) {
+        let record = match removal {
+            false => MembershipEvent::Added { dot: event.dot() },
+            true => MembershipEvent::Removed {
+                dot: event.dot(),
+                observed: event.observed.clone(),
+            },
+        };
+        let value = serde_json::to_string(&record).ok();
+        self.apply_node_value(event, node_history_path(node_id, event.event_id), value);
+    }
+
+    /// Every infrastructure membership interval the realm config has seen, also of removed
+    /// and re-added nodes. A removal closes the adds its event had seen.
+    pub fn node_intervals(&self) -> Vec<crate::admin_documents::NodeInterval> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return Vec::new();
+        }
+        let mut adds = Vec::new();
+        let mut removals = Vec::new();
+        let history = (self
+            .user_subject_ids
+            .range(NODE_HISTORY_PREFIX.to_string()..))
+        .take_while(|(path, _)| path.starts_with(NODE_HISTORY_PREFIX));
+        for (path, version) in history {
+            let Some(node_id) = (path.strip_prefix(NODE_HISTORY_PREFIX))
+                .and_then(|rest| rest.split_once('.'))
+                .and_then(|(node, _)| NodeId::from_str(node).ok())
+            else {
+                continue;
+            };
+            match version.value.as_deref().map(serde_json::from_str) {
+                Some(Ok(MembershipEvent::Added { dot })) => adds.push((node_id, dot)),
+                Some(Ok(MembershipEvent::Removed { dot, observed })) => {
+                    removals.push((node_id, dot, observed));
+                }
+                _ => {}
+            }
+        }
+        (adds.into_iter())
+            .map(|(node_id, added)| {
+                let removed = (removals.iter())
+                    .filter(|(removed_node, dot, observed)| {
+                        *removed_node == node_id
+                            && (observed.observes(&added)
+                                || (dot.origin_node_id == added.origin_node_id
+                                    && dot.origin_seq > added.origin_seq))
+                    })
+                    .map(|(_, dot, _)| *dot)
+                    .collect();
+                crate::admin_documents::NodeInterval {
+                    node_id,
+                    added,
+                    removed,
+                }
+            })
+            .collect()
     }
 }

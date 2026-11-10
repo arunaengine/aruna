@@ -295,6 +295,8 @@ pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
 pub const EMAIL_SETTINGS_KEYSPACE: &str = "notification_email_settings";
 /// Webhook setting register writes, replicated per user and all kept.
 pub const WEBHOOK_SETTINGS_KEYSPACE: &str = "notification_webhook_settings";
+/// User and group secret register writes by owner, name, part and write id; all kept.
+pub const OWNER_SECRETS_KEYSPACE: &str = "owner_secrets";
 pub const WATCH_SUBSCRIPTIONS_KEYSPACE: &str = "notification_watch_subscriptions";
 pub const WATCH_INTEREST_KEYSPACE: &str = "notification_watch_interest";
 /// The newest deletion time of a bucket per recipient, which drops older notices about it.
@@ -505,6 +507,8 @@ pub const NODE_STATE_KEYSPACE: &str = "node_state";
 pub const FEDERATION_KEYSPACE: &str = "federation_publication";
 /// Secrets this node opens by itself, sealed with its node vault key. Never replicated.
 pub const NODE_VAULT_KEYSPACE: &str = "node_vault";
+/// Named node secrets by name: kind, rules and field names. Their values live in the node vault.
+pub const NODE_SECRETS_KEYSPACE: &str = "node_secrets";
 /// The one row of `NODE_STATE_KEYSPACE` that holds the node's identity.
 pub const NODE_STATE_KEY: &[u8] = b"node_state";
 /// Realm signing key a promotion handed to this node; its next start moves it into the identity.
@@ -711,6 +715,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NOTIFICATION_OUTBOX_KEYSPACE,
     EMAIL_SETTINGS_KEYSPACE,
     WEBHOOK_SETTINGS_KEYSPACE,
+    OWNER_SECRETS_KEYSPACE,
     WATCH_SUBSCRIPTIONS_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,
     NOTIFICATION_CUTOFF_KEYSPACE,
@@ -796,6 +801,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NODE_STATE_KEYSPACE,
     FEDERATION_KEYSPACE,
     NODE_VAULT_KEYSPACE,
+    NODE_SECRETS_KEYSPACE,
     ONBOARDING_KEYSPACE,
     DHT_KEYSPACE,
     CRAQLE_TERMS_KEYSPACE,

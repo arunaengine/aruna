@@ -1,4 +1,5 @@
-//! Reads one bounded page of this node's administrative audit rows for the realm or a group.
+//! Reads one bounded page of this node's administrative audit rows for the realm, a group or an
+//! owner's secrets.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,8 +8,10 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::admin_audit::{AdminAuditRecord, audit_key, audit_prefix};
-use aruna_core::types::{Effects, GroupId};
+use aruna_core::structs::identity::admin_audit::{
+    AdminAuditRecord, AuditIndex, audit_key, audit_prefix,
+};
+use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -17,8 +20,8 @@ pub const MAX_AUDIT_LIMIT: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditPageInput {
-    /// `None` reads the realm rows, which hold every recorded change.
-    pub group_id: Option<GroupId>,
+    /// The realm rows hold every recorded change.
+    pub index: AuditIndex,
     pub start_after: Option<Ulid>,
     pub limit: usize,
 }
@@ -80,14 +83,14 @@ impl Operation for AuditPageOperation {
     type Error = AuditPageError;
 
     fn start(&mut self) -> Effects {
-        let group_id = self.input.group_id;
+        let index = self.input.index;
         let start = self
             .input
             .start_after
-            .map(|audit_id| IterStart::After(audit_key(group_id, audit_id).into()));
+            .map(|audit_id| IterStart::After(audit_key(index, audit_id).into()));
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: ADMIN_AUDIT_KEYSPACE.to_string(),
-            prefix: Some(audit_prefix(group_id).into()),
+            prefix: Some(audit_prefix(index).into()),
             start,
             limit: self.input.limit + 1,
             txn_id: None,

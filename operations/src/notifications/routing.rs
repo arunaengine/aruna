@@ -127,6 +127,35 @@ pub fn route_resource_event(
                 ));
             }
         }
+        ResourceEvent::SecretUseWidened {
+            name,
+            group_id,
+            node_id,
+            actor_user_id,
+        } => {
+            let mut managers = match (group_id, ctx.group_auth, ctx.realm_auth) {
+                (Some(_), Some(group_auth), _) => group_admin_ids(group_auth),
+                (None, _, Some(realm_auth)) => realm_admin_ids(realm_auth),
+                _ => Vec::new(),
+            };
+            // The actor may manage through another role, such as a realm groups administrator.
+            managers.push(*actor_user_id);
+            managers.sort();
+            managers.dedup();
+            for manager in managers {
+                records.push(NotificationRecord::new(
+                    manager,
+                    NotificationClass::Direct,
+                    NotificationKind::SecretUseWidened {
+                        name: name.clone(),
+                        group_id: *group_id,
+                        node_id: *node_id,
+                        actor_user_id: *actor_user_id,
+                    },
+                    now_ms,
+                ));
+            }
+        }
         ResourceEvent::NodeOnboarded { realm_id, node_id } => {
             if let Some(realm_auth) = ctx.realm_auth {
                 for admin in realm_admin_ids(realm_auth) {
@@ -730,6 +759,36 @@ mod pure_tests {
             )
             .len(),
             1
+        );
+    }
+
+    #[test]
+    fn widening_reaches_actor() {
+        // A realm groups administrator outside the group admin role still gets the notice, once.
+        let doc = group_with_admins(HashSet::from([user(1), user(2)]));
+        let notice = |actor| ResourceEvent::SecretUseWidened {
+            name: "catalog-key".to_string(),
+            group_id: Some(doc.group_id),
+            node_id: None,
+            actor_user_id: actor,
+        };
+        let context = || RoutingContext {
+            group_auth: Some(&doc),
+            realm_auth: None,
+            realm_id: REALM,
+        };
+        let recipients = |actor| {
+            let records = route_resource_event(&notice(actor), context(), 100);
+            records
+                .iter()
+                .map(|record| record.recipient)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(recipients(user(5)), vec![user(1), user(2), user(5)]);
+        assert_eq!(
+            recipients(user(1)),
+            vec![user(1), user(2)],
+            "no duplicate for an admin"
         );
     }
 }

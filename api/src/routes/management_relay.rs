@@ -54,10 +54,12 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/system/realm/admins/{user_id}"),
     ("DELETE", "/system/realm/email"),
     ("DELETE", "/system/realm/oidc-providers/{id}"),
+    ("DELETE", "/system/realm/secrets/{name}"),
     ("GET", "/access/groups/{id}/service-accounts"),
     ("GET", "/access/onboarding/secrets"),
     ("GET", "/access/onboarding/secrets/{id}/status"),
     ("GET", "/access/token"),
+    ("GET", "/access/users/me/secrets/{name}/value"),
     ("GET", "/system/realm/placement"),
     ("PATCH", "/access/users/me/devices/{id}"),
     ("PATCH", "/system/realm/nodes/{node_id}"),
@@ -72,6 +74,8 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/access/sessions"),
     ("POST", "/access/users/register"),
     ("POST", "/system/realm/nodes/{node_id}/promote"),
+    ("POST", "/system/realm/secrets"),
+    ("POST", "/system/realm/secrets/{name}/rotate"),
     ("PUT", "/access/policies/realm"),
     ("PUT", "/access/users/{id}/status"),
     ("PUT", "/compute/config"),
@@ -81,6 +85,7 @@ const RELAYED_ROUTES: &[(&str, &str)] = &[
     ("PUT", "/system/realm/oidc-providers/{id}"),
     ("PUT", "/system/realm/portal-features"),
     ("PUT", "/system/realm/quota"),
+    ("PUT", "/system/realm/secrets/{name}"),
 ];
 
 /// Routes every node passes to the realm's merge coordinator, a management node itself included.

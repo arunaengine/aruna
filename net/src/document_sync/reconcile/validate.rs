@@ -1111,6 +1111,54 @@ pub(in crate::document_sync) fn validate_watch_upsert(
     Ok(())
 }
 
+/// A register write: a notification setting or an owner secret document.
+pub(in crate::document_sync) fn validate_register_upsert(
+    target: &DocumentTarget,
+    bytes: &[u8],
+    change: &DocumentChange,
+) -> std::result::Result<(), String> {
+    match target {
+        DocumentTarget::OwnerSecret { .. } => validate_secret_upsert(target, bytes, change),
+        _ => validate_setting_upsert(target, bytes, change),
+    }
+}
+
+/// An owner secret syncs as one generation 1 upsert per immutable write, stamped by its actor.
+/// Whether the writer counts is decided at selection, never here, so every node stores alike.
+pub(in crate::document_sync) fn validate_secret_upsert(
+    target: &DocumentTarget,
+    bytes: &[u8],
+    change: &DocumentChange,
+) -> std::result::Result<(), String> {
+    if change.kind != DocumentChangeKind::Upsert || change.current.generation != 1 {
+        return Err("a secret write must carry a generation 1 upsert revision".to_string());
+    }
+    let DocumentTarget::OwnerSecret {
+        owner,
+        name,
+        part,
+        write_id,
+        ..
+    } = target
+    else {
+        return Err("the target is not an owner secret".to_string());
+    };
+    let document = aruna_core::secret_registers::SecretDocument::from_bytes(bytes)
+        .map_err(|error| format!("undecodable secret write: {error}"))?;
+    document.check()?;
+    let matches = document.owner == *owner
+        && document.name == *name
+        && document.part() == *part
+        && document.stamp.write_id == *write_id;
+    if !matches {
+        return Err("the secret write does not match its target".to_string());
+    }
+    match document.stamp.written_by(change.current.actor) {
+        true => Ok(()),
+        false => Err("the secret stamp names another node than its actor".to_string()),
+    }
+}
+
 /// A notification setting syncs as one generation 1 upsert per immutable version.
 pub(in crate::document_sync) fn validate_setting_upsert(
     target: &DocumentTarget,
@@ -1622,6 +1670,15 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("realm email profile is malformed".to_string());
             }
         }
+        AdminDocumentOperation::ConfigSecretSet {
+            name,
+            info: Some(info),
+        } => {
+            let scope = aruna_core::secrets::SecretScope::Realm;
+            if info.name != *name || info.check(scope).is_err() {
+                return Err("realm secret record is malformed".to_string());
+            }
+        }
         AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
@@ -1845,6 +1902,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::MergeCoordinatorSet { .. }
         | AdminDocumentOperation::ConfigVaultSet { .. }
         | AdminDocumentOperation::ConfigEmailSet { .. }
+        | AdminDocumentOperation::ConfigSecretSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
         AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
     };

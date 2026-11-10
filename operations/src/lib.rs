@@ -35,6 +35,7 @@ pub mod realm;
 pub mod realm_vault;
 pub mod replication;
 pub mod s3;
+pub mod secrets;
 pub mod session;
 pub mod shard;
 pub mod shares;

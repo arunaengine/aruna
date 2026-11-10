@@ -129,6 +129,9 @@ pub struct NotificationResponse {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share_id: Option<String>,
+    /// The secret a `secret_use_widened` notice is about; a node or group id names its scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -278,6 +281,7 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
         versions_synced: None,
         error: None,
         share_id: None,
+        secret: None,
     };
     match &record.kind {
         NotificationKind::GroupJoinRequested {
@@ -419,6 +423,17 @@ fn notification_response(record: &NotificationRecord) -> NotificationResponse {
             response.bucket = Some(bucket.clone());
             response.key = Some(key.clone());
             response.size_bytes = Some(*size_bytes);
+        }
+        NotificationKind::SecretUseWidened {
+            name,
+            group_id,
+            node_id,
+            actor_user_id,
+        } => {
+            response.secret = Some(name.clone());
+            response.group_id = group_id.map(|id| id.to_string());
+            response.node_id = node_id.map(|id| id.to_string());
+            response.actor_user_id = Some(actor_user_id.to_string());
         }
     }
     response
