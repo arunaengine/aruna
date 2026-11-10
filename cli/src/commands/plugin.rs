@@ -1,4 +1,4 @@
-//! Starts plugin projects and builds them with their toolchain into one checked artifact.
+//! Starts plugin projects in any supported language and builds them into one checked artifact.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,30 +10,67 @@ use aruna_plugins::package::build_project;
 use serde::Serialize;
 
 use super::Context;
-use crate::args::PluginCommand;
+use crate::args::{Language, PluginCommand};
 use crate::error::CliError;
 
-/// Template files of a Rust project as (path, content); `{{name}}` becomes the plugin name.
-const TEMPLATE: [(&str, &str); 3] = [
-    (
-        "plugin.toml",
-        include_str!("../../../plugins/templates/rust/plugin.toml"),
-    ),
-    (
-        "Cargo.toml",
-        include_str!("../../../plugins/templates/rust/Cargo.toml"),
-    ),
-    (
-        "src/lib.rs",
-        include_str!("../../../plugins/templates/rust/src/lib.rs"),
-    ),
-];
+/// The host contract every non-Rust project builds against; the Rust SDK carries its own copy.
+const CONTRACT: &str = include_str!("../../../plugins/wit/plugin.wit");
+
+/// Template files per language as (path, content); `{{name}}` becomes the plugin name.
+fn template(language: Language) -> Vec<(&'static str, &'static str)> {
+    match language {
+        Language::Rust => vec![
+            (
+                "plugin.toml",
+                include_str!("../../../plugins/templates/rust/plugin.toml"),
+            ),
+            (
+                "Cargo.toml",
+                include_str!("../../../plugins/templates/rust/Cargo.toml"),
+            ),
+            (
+                "src/lib.rs",
+                include_str!("../../../plugins/templates/rust/src/lib.rs"),
+            ),
+        ],
+        Language::Javascript => vec![
+            (
+                "plugin.toml",
+                include_str!("../../../plugins/templates/javascript/plugin.toml"),
+            ),
+            (
+                "plugin.js",
+                include_str!("../../../plugins/templates/javascript/plugin.js"),
+            ),
+            ("wit/plugin.wit", CONTRACT),
+        ],
+        Language::Python => vec![
+            (
+                "plugin.toml",
+                include_str!("../../../plugins/templates/python/plugin.toml"),
+            ),
+            (
+                "app.py",
+                include_str!("../../../plugins/templates/python/app.py"),
+            ),
+            (
+                "aruna.py",
+                include_str!("../../../plugins/templates/python/aruna.py"),
+            ),
+            ("wit/plugin.wit", CONTRACT),
+        ],
+    }
+}
 
 pub async fn plugin(context: &mut Context<'_>, command: PluginCommand) -> Result<(), CliError> {
     match command {
-        PluginCommand::New { name, path } => {
+        PluginCommand::New {
+            name,
+            language,
+            path,
+        } => {
             let path = path.unwrap_or_else(|| PathBuf::from(&name));
-            create(&name, &path)?;
+            create(&name, language, &path)?;
             let shown = path.display();
             context.out.line(format!(
                 "created {shown}; next: aruna-cli plugin build {shown}"
@@ -59,7 +96,7 @@ pub async fn plugin(context: &mut Context<'_>, command: PluginCommand) -> Result
 }
 
 /// Writes a starter project with one manual handler into an empty or new folder.
-fn create(name: &str, path: &Path) -> Result<(), CliError> {
+fn create(name: &str, language: Language, path: &Path) -> Result<(), CliError> {
     if !valid_plugin(name) {
         return Err(CliError::usage(
             "a plugin name has 1 to 64 of a-z, 0-9 and -, starts with a letter and does not end with -",
@@ -71,7 +108,7 @@ fn create(name: &str, path: &Path) -> Result<(), CliError> {
             path.display()
         )));
     }
-    for (file, content) in TEMPLATE {
+    for (file, content) in template(language) {
         let target = path.join(file);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
@@ -94,19 +131,25 @@ mod tests {
     use aruna_plugins::package::load_manifest;
 
     #[test]
-    fn starter_project() {
+    fn starter_projects() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("lab-sync");
-        create("lab-sync", &path).unwrap();
-        let mut manifest = load_manifest(&path).unwrap();
-        assert_eq!(manifest.name, "lab-sync");
-        assert_eq!(manifest.wire(None), Ok(()));
-        let code = std::fs::read_to_string(path.join("src").join("lib.rs")).unwrap();
+        for language in [Language::Rust, Language::Javascript, Language::Python] {
+            let path = dir.path().join(format!("{language:?}").to_lowercase());
+            create("lab-sync", language, &path).unwrap();
+            let mut manifest = load_manifest(&path).unwrap();
+            assert_eq!(manifest.name, "lab-sync");
+            assert_eq!(manifest.wire(None), Ok(()), "{language:?}");
+            assert_eq!(manifest.build.is_some(), language != Language::Rust);
+        }
+        let rust = dir.path().join("rust");
+        let code = std::fs::read_to_string(rust.join("src").join("lib.rs")).unwrap();
         assert!(code.contains("aruna_plugin::export!(run);"));
+        let contract = std::fs::read_to_string(dir.path().join("python/wit/plugin.wit")).unwrap();
+        assert_eq!(contract, CONTRACT);
         assert!(
-            create("lab-sync", &path).is_err(),
+            create("lab-sync", Language::Rust, &rust).is_err(),
             "a folder with files is refused"
         );
-        assert!(create("Lab", &dir.path().join("other")).is_err());
+        assert!(create("Lab", Language::Rust, &dir.path().join("other")).is_err());
     }
 }

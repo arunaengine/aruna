@@ -103,12 +103,26 @@ pub struct LoginArgs {
     pub website: Option<String>,
 }
 
+/// Languages with a project template whose toolchain was checked to build a plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Language {
+    /// cargo with the aruna-plugin crate.
+    Rust,
+    /// jco componentize, run through npx.
+    Javascript,
+    /// componentize-py, run through uv.
+    Python,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum PluginCommand {
-    /// Start a Rust plugin project: plugin.toml, Cargo.toml and src/lib.rs.
+    /// Start a plugin project with plugin.toml and a first handler.
     New {
         /// Plugin name, such as dataset-announcer.
         name: String,
+        /// Language of the project; its toolchain builds the component.
+        #[arg(long, value_enum, default_value_t = Language::Rust)]
+        language: Language,
         /// Folder to create; defaults to the name.
         #[arg(long)]
         path: Option<PathBuf>,

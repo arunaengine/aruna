@@ -1,0 +1,31 @@
+# Example plugin: posts each new dataset of the group to a catalog, or one dataset by hand.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "dataset-announcer"
+version = "0.1.0"
+title = "Announce new datasets"
+
+[settings]
+catalog_url = { title = "Catalog address", type = "url" }
+
+[secrets]
+catalog_key = { title = "Catalog API key", kind = "bearer" }
+
+[connections.catalog]
+url = "{catalog_url}/api/records"
+methods = ["POST"]
+auth = "catalog_key"
+response = ["/id"]
+
+[triggers]
+dataset_created = {}
+manual = { handler = "dataset_created", input = "dataset" }
+
+[permissions]
+required = ["metadata.read"]
+optional = ["metadata.write"]
+
+[build]
+command = ["uv", "run", "--no-project", "--with", "componentize-py==0.25.1", "componentize-py", "-d", "../../wit", "-w", "plugin", "componentize", "app", "-o", "plugin.wasm"]
+output = "plugin.wasm"
