@@ -1,12 +1,14 @@
 //! Serves one run's host calls on the receiver: every call passes the per call check, and a
-//! mutating call records its intent before its effect.
+//! mutating call records its intent before its effect. Objects answer info and listings only.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use aruna_core::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::identity::auth::{
@@ -25,7 +27,7 @@ use super::check::{RunScope, check_call, matching, unavailable};
 use super::grants::{accesses, parse_grants};
 use super::intents::{Begun, begin, mark_unknown, settle_in};
 use super::store::{StoreError, Txn, transact};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::api::{
     ExportMetadataRequest, ExportMetadataResult, ListVisibleRequest, MetadataApiError,
@@ -33,6 +35,9 @@ use crate::metadata::api::{
 };
 use crate::metadata::forward::{export_rocrate_routed, route_metadata_update};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
+use crate::s3::bucket::get::GetBucketOperation;
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
 
 /// Entries of one metadata or object listing page.
 const PAGE: usize = 100;
@@ -191,6 +196,38 @@ impl RunBroker {
             Begun::Unknown(reason) => Err(HostError::new(ErrorKind::UnknownOutcome, reason)),
         }
     }
+
+    /// The local bucket and key of an object path below the install's group data.
+    async fn object_at(
+        &self,
+        install: &PluginInstall,
+        path: &str,
+    ) -> Result<(String, String), HostError> {
+        let invalid =
+            || HostError::new(ErrorKind::Invalid, format!("{path} is not an object path"));
+        let root = format!("/{}/g/{}/data/", self.scope.realm_id, install.group_id);
+        let rest = path.strip_prefix(&root).ok_or_else(invalid)?;
+        let mut parts = rest.splitn(3, '/');
+        let (node, bucket) = (
+            parts.next().unwrap_or_default(),
+            parts.next().ok_or_else(invalid)?,
+        );
+        let key = parts.next().unwrap_or_default().to_string();
+        let node = NodeId::from_str(node).map_err(|_| invalid())?;
+        if node != self.scope.local {
+            return Err(unavailable(
+                "objects of another node are not reachable from plugins yet",
+            ));
+        }
+        let info = drive(GetBucketOperation::new(bucket.to_string()), &self.ctx).await;
+        match info {
+            Ok(info) if info.group_id == install.group_id => Ok((bucket.to_string(), key)),
+            _ => Err(HostError::new(
+                ErrorKind::NotFound,
+                format!("no bucket at {path}"),
+            )),
+        }
+    }
 }
 
 /// How a mutating call ended without a reply.
@@ -305,17 +342,75 @@ impl Broker for RunBroker {
         self.record(&patch.intent, outcome).await
     }
 
-    async fn objects_info(&self, _cx: &CallContext, _path: &str) -> Result<ObjectInfo, HostError> {
-        Err(unavailable("object calls are not available yet"))
+    async fn objects_info(&self, _cx: &CallContext, path: &str) -> Result<ObjectInfo, HostError> {
+        let (install, _) = self.checked(Permission::ObjectsRead, path).await?;
+        let (bucket, key) = self.object_at(&install, path).await?;
+        let head = HeadObjectInput {
+            bucket,
+            key,
+            version_id: None,
+        };
+        let head = drive(HeadObjectOperation::new(head), &self.ctx).await;
+        let head =
+            head.map_err(|_| HostError::new(ErrorKind::NotFound, format!("no object at {path}")))?;
+        Ok(ObjectInfo {
+            path: path.to_string(),
+            size: head.location.map_or(0, |location| location.blob_size),
+            version: head
+                .resolved_version_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+        })
     }
 
     async fn objects_list(
         &self,
         _cx: &CallContext,
-        _prefix: &str,
-        _cursor: Option<String>,
+        prefix: &str,
+        cursor: Option<String>,
     ) -> Result<ObjectPage, HostError> {
-        Err(unavailable("object calls are not available yet"))
+        let (install, _) = self.listing(Permission::ObjectsRead).await?;
+        let (bucket, key) = self.object_at(&install, prefix).await?;
+        let bucket_root = prefix
+            .strip_suffix(key.as_str())
+            .unwrap_or(prefix)
+            .to_string();
+        let invalid = || HostError::new(ErrorKind::Invalid, "bad cursor");
+        let token = match cursor {
+            Some(cursor) => Some(
+                ListContinuationToken::from_bytes(&hex::decode(cursor).map_err(|_| invalid())?)
+                    .map_err(|_| invalid())?,
+            ),
+            None => None,
+        };
+        let input = ListBucketInput {
+            bucket,
+            group_id: install.group_id,
+            continuation_token: token,
+            max_keys: Some(PAGE),
+            prefix: (!key.is_empty()).then_some(key),
+            delimiter: None,
+            start_after: None,
+        };
+        let listed = drive(ListBucketOperation::new(input), &self.ctx).await;
+        let listed = listed.map_err(|error| unavailable(error.to_string()))?;
+        let objects = (listed.objects.into_iter())
+            .map(|object| ObjectInfo {
+                path: format!("{bucket_root}{}", object.head.key),
+                size: object.location.map_or(0, |location| location.blob_size),
+                version: object.version_id.to_string(),
+            })
+            .filter(|object| matching(&install, Permission::ObjectsRead, &object.path).is_ok())
+            .collect();
+        let cursor = match listed.continuation_token {
+            Some(token) => Some(hex::encode(
+                token
+                    .to_bytes()
+                    .map_err(|error| unavailable(error.to_string()))?,
+            )),
+            None => None,
+        };
+        Ok(ObjectPage { objects, cursor })
     }
 
     async fn connection_send(

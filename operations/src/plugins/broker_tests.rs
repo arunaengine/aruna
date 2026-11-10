@@ -1,5 +1,5 @@
-//! Tests metadata calls through the broker: reads, listings, and a revision-checked patch
-//! answered again from its intent, refused when stale, and failing the run when changed.
+//! Tests metadata and object calls through the broker: reads, listings, a revision-checked
+//! patch answered again from its intent, a changed call, and objects outside the grants.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -125,4 +125,37 @@ async fn metadata_calls() {
     let changed = broker.metadata_patch(&cx(), other).await.unwrap_err();
     assert_eq!(changed.kind, ErrorKind::Conflict);
     assert!(broker.changed());
+}
+
+#[tokio::test]
+async fn object_calls() {
+    let (fixture, broker, _, _dir) = broker().await;
+    let data = format!("/{}/g/{}/data", fixture.actor.realm_id, fixture.group_id);
+    let path = format!("{data}/{}/bucket/a.txt", fixture.actor.node_id);
+    let refused = broker.objects_info(&cx(), &path).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::NotGranted);
+    let meta = format!("/{}/g/{}/meta/x", fixture.actor.realm_id, fixture.group_id);
+    assert!(broker.granted(&cx(), Permission::MetadataRead, &meta).await);
+    assert!(!broker.granted(&cx(), Permission::ObjectsRead, &path).await);
+
+    // With `objects.read`, objects of other nodes and buckets outside the group are refused.
+    let reads = serde_json::json!({ "permissions": { "required": ["objects.read"] } });
+    let mut request = fixture.request(None);
+    request.version = Some(fixture.publish("0.1.1", "cd", reads).await);
+    let installed = fixture.install(&request).await.unwrap();
+    let mut scope = broker.scope.clone();
+    scope.run.install_id = installed.install_id;
+    scope.run.digest = installed.digest;
+    let objects = RunBroker::new(broker.ctx.clone(), scope);
+    let missing = objects.objects_info(&cx(), &path).await.unwrap_err();
+    assert_eq!(missing.kind, ErrorKind::NotFound);
+    let remote = format!(
+        "{data}/{}/bucket/a.txt",
+        iroh::SecretKey::from_bytes(&[9u8; 32]).public()
+    );
+    let remote = objects
+        .objects_list(&cx(), &remote, None)
+        .await
+        .unwrap_err();
+    assert_eq!(remote.kind, ErrorKind::Unavailable);
 }
