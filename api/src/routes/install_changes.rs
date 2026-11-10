@@ -69,7 +69,8 @@ serves the call and every other node relays it to one.
 **Behavior**
 - A permission left out gets all of the group, an empty list removes an optional one; required
   permissions and connections cannot be removed. The caller must hold every granted right now.
-- A `blocked` install becomes `active`, since the admin approved what it needs."#,
+- A `blocked` install becomes `active`, since the admin approved what it needs, or `paused`
+  when an admin paused it before."#,
     params(("id" = String, Path, description = "The install id")),
     request_body(content = GrantsBody, example = json!({"grants": {"metadata.write": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/runs/**"]}})),
     responses(

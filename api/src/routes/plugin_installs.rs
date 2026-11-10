@@ -173,6 +173,8 @@ every other node relays it to one.
 - The install is written `preparing`, its account and role are made right, and it becomes
   `active` as the last write. A failed step leaves it `preparing` with the step in `failed`.
 - Plugins with secret slots or webhooks cannot be installed yet.
+- While any enabled realm or group policy reads the request path, a grant on a subtree is
+  refused, even when the policy's guard leaves plugin operations out; exact paths stay usable.
 
 **Errors**
 - 400 when a setting or grant is invalid, or the plugin cannot be installed yet.
