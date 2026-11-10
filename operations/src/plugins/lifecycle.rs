@@ -1,35 +1,34 @@
 //! Changes an install after it is active: its grants, its version, pause and resume, removal.
-//! Each change is a group admin's, is audited, and expects the record revision it read.
+//! A role change first writes the install `preparing` with the change and its audit row, so the
+//! role is never wider than an audited record; settling then activates it.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
-use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::manifest::Manifest;
 use serde_json::{Map, Value};
 use tracing::info;
 use ulid::Ulid;
 
-use super::account::{check_ready, ensure_role, teardown};
+use super::account::{Identity, teardown};
 use super::grants::{
-    Grants, InstallScope, carry_grants, check_supported, narrow_grants, parse_grants, role_paths,
-    stored_grants,
+    Grants, carry_grants, check_supported, narrow_grants, parse_grants, stored_grants,
 };
 use super::install::{
-    InstallError, check_admin, check_holder, pick_version, read_config, read_manifest, write_record,
+    InstallError, check_admin, check_holder, lock_install, pick_version, read_config,
+    read_manifest, scope_of, settle, write_record,
 };
 use super::records::{InstallEntryConfig, InstallEntryOperation};
 use super::settings::check_settings;
 use crate::driver::{DriverContext, drive};
 
 /// Replaces the grants: a permission left out gets all of the group, an empty list removes an
-/// optional one. A blocked install becomes active, since the admin approved what it needs.
+/// optional one. The caller must hold every grant. It also retries a failed earlier change.
 pub async fn set_grants(
     ctx: &DriverContext,
     actor: &Actor,
@@ -37,32 +36,24 @@ pub async fn set_grants(
     install_id: Ulid,
     choices: &BTreeMap<String, Vec<String>>,
 ) -> Result<PluginInstall, InstallError> {
+    let _lock = lock_install(install_id).await;
     let (config, current) = load(ctx, actor, auth, install_id).await?;
-    settled(&current)?;
-    let manifest = read_manifest(&pinned(&config, &current)?)?;
-    let scope = scope_of(actor, &current);
+    changeable(&current)?;
+    let plugin = pick_version(&config, &current.plugin, Some(&current.digest))?;
+    let manifest = read_manifest(&plugin)?;
+    let scope = scope_of(actor.realm_id, &current);
     let grants = narrow_grants(&manifest, &scope, choices)?;
-    check_holder(ctx, auth, &scope, &role_paths(&grants)).await?;
-    let mut next = regrant(ctx, actor, auth, &scope, &current, &grants).await?;
+    check_holder(ctx, auth, &scope, &grants).await?;
+    let mut next = preparing(&current, &grants);
     next.granted_by = actor.user_id;
-    if next.state == InstallState::Blocked {
-        next.state = InstallState::Active;
-        next.active_since_ms = Some(unix_timestamp_millis());
-    }
-    commit(
-        ctx,
-        actor,
-        auth,
-        &current,
-        next,
-        AdminAuditAction::PluginGrantsChanged,
-    )
-    .await
+    let action = AdminAuditAction::PluginGrantsChanged;
+    let next = commit(ctx, actor, auth, &current, next, action).await?;
+    settle(ctx, actor, auth, next, None).await
 }
 
 /// Moves the install to another published version of the same plugin. It keeps the grants the
-/// new version still requests and grants nothing new; it is blocked while something it
-/// requires is not granted. Returns the record and what still needs approval.
+/// new version still requests, which the caller must hold now, and grants nothing new; it is
+/// blocked while something it requires is not granted. Returns the record and what is missing.
 pub async fn update_install(
     ctx: &DriverContext,
     actor: &Actor,
@@ -71,49 +62,43 @@ pub async fn update_install(
     digest: &str,
     settings: Option<&Map<String, Value>>,
 ) -> Result<(PluginInstall, Vec<String>), InstallError> {
+    let _lock = lock_install(install_id).await;
     let (config, current) = load(ctx, actor, auth, install_id).await?;
-    settled(&current)?;
+    changeable(&current)?;
     let plugin = pick_version(&config, &current.plugin, Some(digest))?;
-    let manifest: Manifest = read_manifest(&plugin)?;
+    let manifest = read_manifest(&plugin)?;
     check_supported(&manifest)?;
     let stored: Map<String, Value> = serde_json::from_str(&current.settings).unwrap_or_default();
     let settings = check_settings(&manifest, settings.unwrap_or(&stored))?;
-    let scope = scope_of(actor, &current);
+    let scope = scope_of(actor.realm_id, &current);
     let (kept, missing) = carry_grants(&parse_grants(&current.grants), &manifest, &scope);
-    let mut next = regrant(ctx, actor, auth, &scope, &current, &kept).await?;
+    check_holder(ctx, auth, &scope, &kept).await?;
+    let mut next = preparing(&current, &kept);
     next.version = plugin.version;
     next.digest = plugin.digest;
     next.settings = settings;
-    next.state = match (missing.is_empty(), current.state) {
-        (false, _) => InstallState::Blocked,
-        (true, InstallState::Blocked) => InstallState::Active,
-        (true, state) => state,
-    };
-    let record = commit(
-        ctx,
-        actor,
-        auth,
-        &current,
-        next,
-        AdminAuditAction::PluginUpdated,
-    )
-    .await?;
-    Ok((record, missing))
+    let action = AdminAuditAction::PluginUpdated;
+    let next = commit(ctx, actor, auth, &current, next, action).await?;
+    Ok((settle(ctx, actor, auth, next, None).await?, missing))
 }
 
-/// Stops runs and keeps everything else; a paused install passes no per call check.
+/// Stops runs and keeps everything else. A blocked install stays blocked, and paused.
 pub async fn pause_install(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
     install_id: Ulid,
 ) -> Result<PluginInstall, InstallError> {
+    let _lock = lock_install(install_id).await;
     let (_, current) = load(ctx, actor, auth, install_id).await?;
-    if current.state != InstallState::Active {
-        return Err(InstallError::State(current.state.as_str()));
-    }
+    let state = match current.state {
+        InstallState::Active => InstallState::Paused,
+        InstallState::Blocked if !current.paused => InstallState::Blocked,
+        state => return Err(InstallError::State(state.as_str())),
+    };
     let mut next = current.clone();
-    next.state = InstallState::Paused;
+    next.paused = true;
+    next.state = state;
     next.revision += 1;
     commit(
         ctx,
@@ -126,20 +111,33 @@ pub async fn pause_install(
     .await
 }
 
-/// Makes a paused install active again; events before now are not replayed.
+/// Lifts a pause. The install becomes active only while everything it requires is granted,
+/// else it stays blocked; events from the pause are not replayed.
 pub async fn resume_install(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
     install_id: Ulid,
 ) -> Result<PluginInstall, InstallError> {
-    let (_, current) = load(ctx, actor, auth, install_id).await?;
-    if current.state != InstallState::Paused {
+    let _lock = lock_install(install_id).await;
+    let (config, current) = load(ctx, actor, auth, install_id).await?;
+    let paused = matches!(current.state, InstallState::Paused | InstallState::Blocked);
+    if !current.paused || !paused {
         return Err(InstallError::State(current.state.as_str()));
     }
+    let plugin = pick_version(&config, &current.plugin, Some(&current.digest))?;
+    let manifest = read_manifest(&plugin)?;
+    let scope = scope_of(actor.realm_id, &current);
+    let (_, missing) = carry_grants(&parse_grants(&current.grants), &manifest, &scope);
     let mut next = current.clone();
-    next.state = InstallState::Active;
-    next.active_since_ms = Some(unix_timestamp_millis());
+    next.paused = false;
+    next.state = match missing.is_empty() {
+        true => InstallState::Active,
+        false => InstallState::Blocked,
+    };
+    if next.state == InstallState::Active {
+        next.active_since_ms = Some(unix_timestamp_millis());
+    }
     next.revision += 1;
     commit(
         ctx,
@@ -160,6 +158,7 @@ pub async fn remove_install(
     auth: &AuthContext,
     install_id: Ulid,
 ) -> Result<PluginInstall, InstallError> {
+    let _lock = lock_install(install_id).await;
     let (_, current) = load(ctx, actor, auth, install_id).await?;
     let removing = match current.state {
         InstallState::Removing => current,
@@ -170,15 +169,15 @@ pub async fn remove_install(
             write_record(ctx, actor, auth, Some(current.revision), next, None).await?
         }
     };
-    let scope = scope_of(actor, &removing);
-    teardown(ctx, actor, auth, &scope)
+    let scope = scope_of(actor.realm_id, &removing);
+    teardown(ctx, actor, auth, &scope, Identity::of(&removing))
         .await
         .map_err(|error| InstallError::Step {
             step: "remove",
             error,
         })?;
-    let audit =
-        AdminAuditRecord::for_install(AdminAuditAction::PluginRemoved, actor.user_id, &removing);
+    let action = AdminAuditAction::PluginRemoved;
+    let audit = AdminAuditRecord::for_install(action, actor.user_id, &removing);
     let delete = InstallEntryOperation::new(InstallEntryConfig {
         actor: actor.clone(),
         auth_context: auth.clone(),
@@ -209,53 +208,26 @@ async fn load(
     Ok((config, install))
 }
 
-/// Refuses changes to an install that is not prepared yet or being removed.
-fn settled(install: &PluginInstall) -> Result<(), InstallError> {
+/// Refuses changes while the install is removed or not installed yet. A `preparing` install
+/// that was active before failed an earlier change, which a new change retries.
+fn changeable(install: &PluginInstall) -> Result<(), InstallError> {
     match install.state {
-        InstallState::Preparing | InstallState::Removing => {
+        InstallState::Removing => Err(InstallError::State(install.state.as_str())),
+        InstallState::Preparing if install.active_since_ms.is_none() => {
             Err(InstallError::State(install.state.as_str()))
         }
-        InstallState::Active | InstallState::Paused | InstallState::Blocked => Ok(()),
+        _ => Ok(()),
     }
 }
 
-fn pinned(
-    config: &RealmConfigDocument,
-    install: &PluginInstall,
-) -> Result<PublishedPlugin, InstallError> {
-    pick_version(config, &install.plugin, Some(&install.digest))
-}
-
-fn scope_of(actor: &Actor, install: &PluginInstall) -> InstallScope {
-    InstallScope {
-        realm_id: actor.realm_id,
-        group_id: install.group_id,
-        install_id: install.install_id,
-    }
-}
-
-/// Sets the role to `grants` and returns the next record with them and the new prerequisites.
-async fn regrant(
-    ctx: &DriverContext,
-    actor: &Actor,
-    auth: &AuthContext,
-    scope: &InstallScope,
-    current: &PluginInstall,
-    grants: &Grants,
-) -> Result<PluginInstall, InstallError> {
-    let step = |step| move |error| InstallError::Step { step, error };
-    let paths = role_paths(grants);
-    ensure_role(ctx, actor, auth, scope, current.account, &paths)
-        .await
-        .map_err(step("role"))?;
-    let prerequisites = check_ready(ctx, scope, current.account, &paths)
-        .await
-        .map_err(step("check"))?;
+/// The next record of a role change: inactive, with the new grants, until it is settled.
+fn preparing(current: &PluginInstall, grants: &Grants) -> PluginInstall {
     let mut next = current.clone();
+    next.state = InstallState::Preparing;
     next.grants = stored_grants(grants);
-    next.prerequisites = prerequisites;
+    next.failed = None;
     next.revision += 1;
-    Ok(next)
+    next
 }
 
 async fn commit(

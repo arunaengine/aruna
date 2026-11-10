@@ -60,6 +60,8 @@ pub struct PluginInstall {
     /// The published artifact this install pins.
     pub digest: String,
     pub state: InstallState,
+    /// An admin paused it; it stays paused through updates and grant changes until resumed.
+    pub paused: bool,
     /// The checked setting values as a JSON object.
     pub settings: String,
     /// Granted resource patterns by permission name, each within what the manifest requests.
@@ -93,6 +95,7 @@ impl PluginInstall {
             && serde_json::from_str::<serde_json::Value>(&self.settings)
                 .is_ok_and(|value| value.is_object());
         let active = self.state != InstallState::Active || self.active_since_ms.is_some();
+        let paused = self.state != InstallState::Paused || self.paused;
         let size = serde_json::to_vec(self).is_ok_and(|json| json.len() <= MAX_RECORD);
         !self.install_id.is_nil()
             && valid_name(&self.plugin)
@@ -103,6 +106,7 @@ impl PluginInstall {
             && grants
             && settings
             && active
+            && paused
             && size
     }
 }
@@ -134,6 +138,7 @@ mod tests {
             version: "0.1.0".into(),
             digest: format!("sha256:{}", "ab".repeat(32)),
             state: InstallState::Active,
+            paused: false,
             settings: r#"{"catalog_url":"https://catalog.example.org"}"#.into(),
             grants: BTreeMap::from([("metadata.read".to_string(), vec![pattern])]),
             account: UserId::local(install_id, realm_id),
@@ -159,7 +164,8 @@ mod tests {
             serde_json::from_str::<PluginInstall>(&json).unwrap(),
             record
         );
-        let cases: [fn(&mut PluginInstall); 8] = [
+        let cases: [fn(&mut PluginInstall); 9] = [
+            |i| i.state = InstallState::Paused,
             |i| i.install_id = Ulid::nil(),
             |i| i.digest = "sha256:ab".into(),
             |i| i.settings = "[]".into(),

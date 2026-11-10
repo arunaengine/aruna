@@ -3,27 +3,31 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, LazyLock};
 
 use aruna_core::UserId;
 use aruna_core::plugin_installs::{InstallState, PluginInstall, Prerequisite};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission as Access};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_plugins::artifact::ArtifactDigest;
 use aruna_plugins::manifest::Manifest;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
 use thiserror::Error;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use super::account::{account_name, check_ready, ensure_account, ensure_role, teardown};
+use super::account::{
+    Identity, account_name, check_ready, ensure_account, ensure_role, read_auth, teardown,
+};
 use super::grants::{
-    GrantError, Grants, InstallScope, check_supported, narrow_grants, role_paths, stored_grants,
+    GrantError, Grants, InstallScope, accesses, carry_grants, check_supported, narrow_grants,
+    parse_grants, role_paths, stored_grants,
 };
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
 use super::settings::{SettingError, check_settings};
@@ -87,7 +91,8 @@ pub struct Prepared {
     pub request: String,
 }
 
-/// Checks a request as a group admin and writes nothing; a preview answers with this.
+/// Checks a request as a group admin and writes nothing; a preview answers with this. Without
+/// a version, a retry of an existing install keeps its digest and a new install takes the newest.
 pub async fn prepare_install(
     ctx: &DriverContext,
     auth: &AuthContext,
@@ -96,7 +101,14 @@ pub async fn prepare_install(
 ) -> Result<Prepared, InstallError> {
     check_admin(ctx, auth, request.group_id).await?;
     let config = read_config(ctx, realm_id).await?;
-    let plugin = pick_version(&config, &request.plugin, request.version.as_deref())?;
+    let existing = (request.install_id).and_then(|id| {
+        config
+            .installs
+            .iter()
+            .find(|install| install.install_id == id)
+    });
+    let version = (request.version.as_deref()).or(existing.map(|install| install.digest.as_str()));
+    let plugin = pick_version(&config, &request.plugin, version)?;
     let manifest = read_manifest(&plugin)?;
     check_supported(&manifest)?;
     let settings = check_settings(&manifest, &request.settings)?;
@@ -106,7 +118,7 @@ pub async fn prepare_install(
         install_id: request.install_id.unwrap_or_else(Ulid::generate),
     };
     let grants = narrow_grants(&manifest, &scope, &request.grants)?;
-    check_holder(ctx, auth, &scope, &role_paths(&grants)).await?;
+    check_holder(ctx, auth, &scope, &grants).await?;
     let request = request_digest(&plugin.digest, &scope, &settings, &grants);
     Ok(Prepared {
         scope,
@@ -118,7 +130,8 @@ pub async fn prepare_install(
     })
 }
 
-/// Installs, or resumes the install with the request's id. Answers once it is active.
+/// Installs, or resumes the install with the request's id. Answers once it is settled; an
+/// existing settled install is checked again before it is answered.
 pub async fn install_plugin(
     ctx: &DriverContext,
     actor: &Actor,
@@ -126,8 +139,9 @@ pub async fn install_plugin(
     request: &InstallRequest,
 ) -> Result<PluginInstall, InstallError> {
     let prepared = prepare_install(ctx, auth, actor.realm_id, request).await?;
-    let config = read_config(ctx, actor.realm_id).await?;
     let id = prepared.scope.install_id;
+    let _lock = lock_install(id).await;
+    let config = read_config(ctx, actor.realm_id).await?;
     let record = match config
         .installs
         .iter()
@@ -139,41 +153,28 @@ pub async fn install_plugin(
         Some(existing) if existing.state == InstallState::Removing => {
             return Err(InstallError::State("being removed"));
         }
-        Some(existing) if existing.state != InstallState::Preparing => return Ok(existing.clone()),
+        Some(existing) if existing.state != InstallState::Preparing => {
+            let paths = role_paths(&parse_grants(&existing.grants));
+            let identity = Identity::of(existing);
+            check_ready(ctx, &prepared.scope, identity, &paths)
+                .await
+                .map_err(|error| InstallError::Step {
+                    step: "check",
+                    error,
+                })?;
+            return Ok(existing.clone());
+        }
         Some(existing) => existing.clone(),
         None => write_record(ctx, actor, auth, None, new_record(actor, &prepared), None).await?,
     };
-    let prerequisites = match make_ready(ctx, actor, auth, &prepared, record.account).await {
-        Ok(prerequisites) => prerequisites,
-        Err((step, error)) => {
-            if let Err(error) = teardown(ctx, actor, auth, &prepared.scope).await {
-                warn!(%id, %error, "Could not undo a failed plugin install");
-            }
-            let mut failed = record.clone();
-            failed.failed = Some(step.to_string());
-            failed.revision += 1;
-            if let Err(error) =
-                write_record(ctx, actor, auth, Some(record.revision), failed, None).await
-            {
-                warn!(%id, %error, "Could not record the failed plugin install step");
-            }
-            return Err(InstallError::Step { step, error });
-        }
-    };
-    let mut active = record.clone();
-    active.state = InstallState::Active;
-    active.active_since_ms = Some(unix_timestamp_millis());
-    active.failed = None;
-    active.prerequisites = prerequisites;
-    active.granted_by = actor.user_id;
-    active.revision += 1;
-    let audit =
-        AdminAuditRecord::for_install(AdminAuditAction::PluginInstalled, actor.user_id, &active);
-    let active = write_record(ctx, actor, auth, Some(record.revision), active, Some(audit)).await?;
-    info!(%id, plugin = %active.plugin, version = %active.version, "Installed a plugin");
-    Ok(active)
+    let audit = Some(AdminAuditAction::PluginInstalled);
+    let settled = settle(ctx, actor, auth, record, audit).await?;
+    info!(%id, plugin = %settled.plugin, version = %settled.version, "Installed a plugin");
+    Ok(settled)
 }
 
+/// The record of a new install. The account and role ids are fresh, never taken from the
+/// caller, so no existing user or role can be adopted or replaced.
 fn new_record(actor: &Actor, prepared: &Prepared) -> PluginInstall {
     let scope = &prepared.scope;
     PluginInstall {
@@ -183,10 +184,11 @@ fn new_record(actor: &Actor, prepared: &Prepared) -> PluginInstall {
         version: prepared.plugin.version.clone(),
         digest: prepared.plugin.digest.clone(),
         state: InstallState::Preparing,
+        paused: false,
         settings: prepared.settings.clone(),
         grants: stored_grants(&prepared.grants),
-        account: UserId::local(scope.install_id, scope.realm_id),
-        role_id: scope.install_id,
+        account: UserId::local(Ulid::generate(), scope.realm_id),
+        role_id: Ulid::generate(),
         granted_by: actor.user_id,
         request: prepared.request.clone(),
         revision: 1,
@@ -196,27 +198,128 @@ fn new_record(actor: &Actor, prepared: &Prepared) -> PluginInstall {
     }
 }
 
+/// Makes a `preparing` record's account and role match it, then writes its settled state:
+/// blocked while something required is not granted, else paused or active. A failure undoes
+/// the account and role, but only while the record is still the revision this call wrote.
+pub(crate) async fn settle(
+    ctx: &DriverContext,
+    actor: &Actor,
+    auth: &AuthContext,
+    record: PluginInstall,
+    audit: Option<AdminAuditAction>,
+) -> Result<PluginInstall, InstallError> {
+    let config = read_config(ctx, actor.realm_id).await?;
+    let manifest = read_manifest(&pick_version(
+        &config,
+        &record.plugin,
+        Some(&record.digest),
+    )?)?;
+    let scope = scope_of(actor.realm_id, &record);
+    let grants = parse_grants(&record.grants);
+    let identity = Identity::of(&record);
+    let ready = make_ready(ctx, actor, auth, &scope, identity, &record.plugin, &grants).await;
+    let prerequisites = match ready {
+        Ok(prerequisites) => prerequisites,
+        Err((step, error)) => {
+            abandon(ctx, actor, auth, &record, step).await;
+            return Err(InstallError::Step { step, error });
+        }
+    };
+    let mut next = record.clone();
+    let (_, missing) = carry_grants(&grants, &manifest, &scope);
+    next.state = match (missing.is_empty(), record.paused) {
+        (false, _) => InstallState::Blocked,
+        (true, true) => InstallState::Paused,
+        (true, false) => InstallState::Active,
+    };
+    if next.state == InstallState::Active {
+        next.active_since_ms.get_or_insert(unix_timestamp_millis());
+    }
+    next.failed = None;
+    next.prerequisites = prerequisites;
+    next.revision += 1;
+    let audit = audit.map(|action| AdminAuditRecord::for_install(action, actor.user_id, &next));
+    write_record(ctx, actor, auth, Some(record.revision), next, audit).await
+}
+
+/// Undoes a failed preparation and records the failed step, unless another change of the
+/// install moved on meanwhile.
+async fn abandon(
+    ctx: &DriverContext,
+    actor: &Actor,
+    auth: &AuthContext,
+    record: &PluginInstall,
+    step: &'static str,
+) {
+    let id = record.install_id;
+    let current = read_config(ctx, actor.realm_id)
+        .await
+        .ok()
+        .and_then(|config| {
+            config
+                .installs
+                .into_iter()
+                .find(|install| install.install_id == id)
+        });
+    if current.as_ref() != Some(record) {
+        warn!(%id, step, "A plugin install changed meanwhile; leaving it as it is");
+        return;
+    }
+    let scope = scope_of(actor.realm_id, record);
+    if let Err(error) = teardown(ctx, actor, auth, &scope, Identity::of(record)).await {
+        warn!(%id, %error, "Could not undo a failed plugin install step");
+    }
+    let mut failed = record.clone();
+    failed.failed = Some(step.to_string());
+    failed.revision += 1;
+    if let Err(error) = write_record(ctx, actor, auth, Some(record.revision), failed, None).await {
+        warn!(%id, %error, "Could not record the failed plugin install step");
+    }
+}
+
 /// Steps 2 to 5: the account, its role, then a check of both against current state. The
 /// secret use rules join as step 4 once plugins with secrets can be installed.
 async fn make_ready(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
-    prepared: &Prepared,
-    account: UserId,
+    scope: &InstallScope,
+    identity: Identity,
+    plugin: &str,
+    grants: &Grants,
 ) -> Result<Vec<Prerequisite>, (&'static str, String)> {
-    let scope = &prepared.scope;
-    let name = account_name(ctx, &prepared.plugin.name, scope.group_id).await;
-    ensure_account(ctx, actor, auth, scope, account, name)
+    let name = account_name(ctx, plugin, scope.group_id).await;
+    ensure_account(ctx, actor, auth, scope, identity, name)
         .await
         .map_err(|error| ("account", error))?;
-    let paths = role_paths(&prepared.grants);
-    ensure_role(ctx, actor, auth, scope, account, &paths)
+    let paths = role_paths(grants);
+    ensure_role(ctx, actor, auth, scope, identity, &paths)
         .await
         .map_err(|error| ("role", error))?;
-    check_ready(ctx, scope, account, &paths)
+    check_ready(ctx, scope, identity, &paths)
         .await
         .map_err(|error| ("check", error))
+}
+
+pub(crate) fn scope_of(realm_id: RealmId, install: &PluginInstall) -> InstallScope {
+    InstallScope {
+        realm_id,
+        group_id: install.group_id,
+        install_id: install.install_id,
+    }
+}
+
+/// Holds the lock of one install on this node, so its changes never overlap here.
+pub(crate) async fn lock_install(install_id: Ulid) -> OwnedMutexGuard<()> {
+    static LOCKS: LazyLock<std::sync::Mutex<HashMap<Ulid, Arc<Mutex<()>>>>> =
+        LazyLock::new(Default::default);
+    let lock = {
+        let mut locks = LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.entry(install_id).or_default().clone()
+    };
+    lock.lock_owned().await
 }
 
 /// Refuses a caller who is not an admin of the group.
@@ -236,30 +339,51 @@ pub(crate) async fn check_admin(
         .map_err(|_| InstallError::Unauthorized)
 }
 
-/// Refuses grants the caller does not hold now: every path with its access, including denies
-/// below a granted subtree, the session's own restrictions and the request policies.
+/// Refuses grants the caller does not hold now. Every granted action is checked with its own
+/// access and the operation `plugin.<permission>`: roles, denies below a granted subtree, the
+/// session's restrictions and the request policies. A subtree is refused while a policy reads
+/// the path, since no single check proves it allows every path below.
 pub(crate) async fn check_holder(
     ctx: &DriverContext,
     auth: &AuthContext,
     scope: &InstallScope,
-    paths: &HashMap<String, Access>,
+    grants: &Grants,
 ) -> Result<(), InstallError> {
     let root = format!("/{}/g/{}", scope.realm_id, scope.group_id);
     let rules = permission_rules(ctx, auth, &root)
         .await
         .map_err(|error| InstallError::Unavailable(error.to_string()))?;
-    for (pattern, access) in paths {
-        let held = match pattern.strip_suffix("**") {
-            Some(base) => rules.holds_below(base, access),
-            None => rules.allows(pattern, access),
-        };
-        let what = || format!("{access} on {pattern}");
-        if !held {
-            return Err(InstallError::NotHeld(what()));
-        }
-        let request = policy_request_with(pattern, access, Some(auth), PolicyRequestExtras::rest());
-        if let Err(error) = enforce_policies(ctx, scope.realm_id, &request).await {
-            return Err(InstallError::NotHeld(format!("{} ({error})", what())));
+    let config = read_config(ctx, scope.realm_id).await?;
+    let group = read_auth(ctx, scope.group_id)
+        .await
+        .map_err(InstallError::Unavailable)?;
+    let group_policies = group.iter().flat_map(|auth_doc| auth_doc.policies.iter());
+    let path_policies =
+        (config.request_policies.iter().chain(group_policies)).any(|policy| policy.reads_path());
+    for (permission, patterns) in grants {
+        for pattern in patterns {
+            let subtree = pattern.strip_suffix("**");
+            if subtree.is_some() && path_policies {
+                let why = "a request policy reads the path, so grant exact paths";
+                return Err(InstallError::NotHeld(format!(
+                    "{permission} on {pattern} ({why})"
+                )));
+            }
+            for access in accesses(*permission) {
+                let what = || format!("{permission} ({access}) on {pattern}");
+                let held = match subtree {
+                    Some(base) => rules.holds_below(base, access),
+                    None => rules.allows(pattern, access),
+                };
+                if !held {
+                    return Err(InstallError::NotHeld(what()));
+                }
+                let extras = PolicyRequestExtras::operation(format!("plugin.{permission}"));
+                let request = policy_request_with(pattern, access, Some(auth), extras);
+                if let Err(error) = enforce_policies(ctx, scope.realm_id, &request).await {
+                    return Err(InstallError::NotHeld(format!("{} ({error})", what())));
+                }
+            }
         }
     }
     Ok(())
@@ -323,4 +447,4 @@ pub(crate) async fn write_record(
 
 #[cfg(test)]
 #[path = "install_tests.rs"]
-mod tests;
+pub(crate) mod tests;
