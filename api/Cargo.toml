@@ -42,6 +42,12 @@ url = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true }
 
+# HTTPS
+rustls = { workspace = true }
+rustls-webpki = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+
 # REST
 axum = { workspace = true }
 byteview = { workspace = true }
@@ -82,6 +88,7 @@ rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",
 ] }
+rcgen = { workspace = true }
 tempfile = { workspace = true }
 zip = { workspace = true }
 

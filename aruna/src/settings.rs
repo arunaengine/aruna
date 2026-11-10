@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use aruna_api::https::HostRoutes;
 use aruna_api::portal::{LegalDocument, LegalSource, PortalLogin};
 use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::federation::valid_federation_url;
@@ -114,6 +115,19 @@ pub struct Settings {
     pub node_labels: BTreeMap<String, String>,
     pub node_location: Option<String>,
     pub node_weight: Option<u32>,
+    /// `None` unless `HTTPS_SOCKET_ADDRESS` turns native HTTPS on.
+    pub https: Option<HttpsSettings>,
+}
+
+/// Native HTTPS: the listener, the certificate files and the routed public origins.
+#[derive(Clone, Debug)]
+pub struct HttpsSettings {
+    pub address: SocketAddr,
+    pub certificate: PathBuf,
+    pub key: PathBuf,
+    pub ca: Option<PathBuf>,
+    pub redirect: Option<SocketAddr>,
+    pub routes: HostRoutes,
 }
 
 impl std::fmt::Debug for Settings {
@@ -309,7 +323,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         return Err(SetupError::MissingConfigValue("API_PUBLIC_URL"));
     }
 
-    Ok(Settings {
+    let mut settings = Settings {
         storage_path,
         metadata_storage_path,
         metadata_search_storage,
@@ -360,7 +374,10 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         node_labels,
         node_location,
         node_weight,
-    })
+        https: None,
+    };
+    settings.https = https_env(env, &mut settings)?;
+    Ok(settings)
 }
 
 fn required_var(env: &dyn SettingsEnv, key: &'static str) -> Result<String, SetupError> {
@@ -1033,6 +1050,151 @@ pub(crate) fn validate_relay_urls(key: &'static str, urls: &[String]) -> Result<
     Ok(())
 }
 
+/// Settings that only native HTTPS reads; each needs `HTTPS_SOCKET_ADDRESS`.
+const HTTPS_KEYS: [&str; 4] = [
+    "HTTPS_CERTIFICATE_PATH",
+    "HTTPS_KEY_PATH",
+    "HTTPS_CA_PATH",
+    "REDIRECT_SOCKET_ADDRESS",
+];
+
+/// Native HTTPS settings, checked against the public URLs they route. In native
+/// mode `S3_HOST` is stored in lower case, as the S3 parser compares it exactly.
+fn https_env(
+    env: &dyn SettingsEnv,
+    settings: &mut Settings,
+) -> Result<Option<HttpsSettings>, SetupError> {
+    const ADDRESS_KEY: &str = "HTTPS_SOCKET_ADDRESS";
+    let Some(address) = optional_nonempty_env(env, ADDRESS_KEY)? else {
+        for key in HTTPS_KEYS {
+            if let Some(value) = optional_nonempty_env(env, key)? {
+                return Err(invalid_config_value(
+                    key,
+                    value,
+                    "needs HTTPS_SOCKET_ADDRESS",
+                ));
+            }
+        }
+        return Ok(None);
+    };
+    let address = SocketAddr::from_str(address.trim())
+        .map_err(|error| invalid_config_value(ADDRESS_KEY, &address, error))?;
+    let certificate = PathBuf::from(required_nonempty_env(env, "HTTPS_CERTIFICATE_PATH")?);
+    let key = PathBuf::from(required_nonempty_env(env, "HTTPS_KEY_PATH")?);
+    let ca = optional_nonempty_env(env, "HTTPS_CA_PATH")?.map(PathBuf::from);
+    let redirect = match optional_nonempty_env(env, "REDIRECT_SOCKET_ADDRESS")? {
+        Some(value) => Some(
+            SocketAddr::from_str(value.trim())
+                .map_err(|error| invalid_config_value("REDIRECT_SOCKET_ADDRESS", &value, error))?,
+        ),
+        None => None,
+    };
+    if redirect == Some(address) {
+        return Err(invalid_config_value(
+            "REDIRECT_SOCKET_ADDRESS",
+            address.to_string(),
+            "must differ from HTTPS_SOCKET_ADDRESS",
+        ));
+    }
+    let api = https_origin("API_PUBLIC_URL", settings.api_public_url.as_deref())?;
+    let s3 = match settings.s3_host {
+        Some(_) => Some(https_origin(
+            "S3_PUBLIC_URL",
+            settings.s3_public_url.as_deref(),
+        )?),
+        None => None,
+    };
+    let portal = match settings.portal {
+        PortalConfig::Artifact { .. } => Some(https_origin(
+            "PORTAL_PUBLIC_URL",
+            settings.portal_public_url.as_deref(),
+        )?),
+        PortalConfig::Disabled => None,
+    };
+    if let (Some(s3), Some(s3_host)) = (&s3, settings.s3_host.as_mut()) {
+        let lowered = s3_host.to_ascii_lowercase();
+        let host = lowered.split(':').next().unwrap_or_default();
+        if Some(host) != s3.host_str() {
+            return Err(invalid_config_value(
+                "S3_HOST",
+                s3_host.as_str(),
+                "must name the host of S3_PUBLIC_URL with native HTTPS",
+            ));
+        }
+        *s3_host = lowered;
+    }
+    check_hosts(&api, s3.as_ref(), portal.as_ref())?;
+    if let Some(portal) = &portal {
+        let origin = portal.origin().ascii_serialization();
+        let cors = aruna_api::cors::CorsConfig::new(settings.cors_allowed_origins.clone());
+        if !reqwest::header::HeaderValue::from_str(&origin).is_ok_and(|value| cors.allows(&value)) {
+            return Err(invalid_config_value(
+                "CORS_ALLOWED_ORIGINS",
+                settings.cors_allowed_origins.join(","),
+                format!("must allow the portal origin {origin}"),
+            ));
+        }
+    }
+    Ok(Some(HttpsSettings {
+        address,
+        certificate,
+        key,
+        ca,
+        redirect,
+        routes: HostRoutes::new(&api, s3.as_ref(), portal.as_ref()),
+    }))
+}
+
+/// A routed public URL must be an HTTPS origin with a DNS host: no user, path,
+/// query or fragment, so URLs built from it match what native HTTPS serves.
+fn https_origin(key: &'static str, value: Option<&str>) -> Result<reqwest::Url, SetupError> {
+    let value = value.ok_or(SetupError::MissingConfigValue(key))?;
+    let url =
+        reqwest::Url::parse(value).map_err(|error| invalid_config_value(key, value, error))?;
+    let origin = url.scheme() == "https"
+        && url.domain().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.path(), "" | "/")
+        && url.query().is_none()
+        && url.fragment().is_none();
+    match origin {
+        true => Ok(url),
+        false => Err(invalid_config_value(
+            key,
+            value,
+            "native HTTPS needs an https origin with a DNS host and no path, query or user",
+        )),
+    }
+}
+
+/// Every route needs its own host, and S3 owns the subdomains of its host.
+fn check_hosts(
+    api: &reqwest::Url,
+    s3: Option<&reqwest::Url>,
+    portal: Option<&reqwest::Url>,
+) -> Result<(), SetupError> {
+    let host = |url: &reqwest::Url| url.host_str().unwrap_or_default().to_string();
+    let s3_host = s3.map(host);
+    let named = [("API_PUBLIC_URL", Some(api)), ("PORTAL_PUBLIC_URL", portal)];
+    for (key, url) in named {
+        let Some(url) = url else { continue };
+        let own = host(url);
+        let clashes = s3_host
+            .as_deref()
+            .is_some_and(|s3| own == s3 || own.ends_with(&format!(".{s3}")))
+            || (key == "PORTAL_PUBLIC_URL" && own == host(api));
+        if clashes {
+            return Err(invalid_config_value(
+                key,
+                url.as_str(),
+                "shares its host with another native HTTPS route",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1556,5 +1718,131 @@ mod tests {
             labels.keys().cloned().collect::<Vec<_>>(),
             vec!["a".to_string(), "b".to_string()]
         );
+    }
+
+    /// A native HTTPS node with S3 and a portal; cases override single values.
+    fn native(pairs: &[(&str, &str)]) -> Result<Settings, SetupError> {
+        let mut all = vec![
+            ("HTTPS_SOCKET_ADDRESS", "127.0.0.1:0"),
+            ("HTTPS_CERTIFICATE_PATH", "/tls/fullchain.pem"),
+            ("HTTPS_KEY_PATH", "/tls/privkey.pem"),
+            ("API_PUBLIC_URL", "https://api.test"),
+            ("S3_HOST", "s3.test"),
+            ("S3_ADDRESS", "127.0.0.1:0"),
+            ("S3_PUBLIC_URL", "https://s3.test"),
+            ("PORTAL_MODE", "artifact"),
+            ("PORTAL_DIR", "/tmp/aruna-portal"),
+            ("PORTAL_SOCKET_ADDRESS", "127.0.0.1:0"),
+            ("PORTAL_PUBLIC_URL", "https://portal.test"),
+            ("CORS_ALLOWED_ORIGINS", "https://portal.test"),
+        ];
+        all.extend_from_slice(pairs);
+        parse(&all)
+    }
+
+    fn native_key(pairs: &[(&str, &str)]) -> &'static str {
+        match native(pairs) {
+            Err(SetupError::InvalidConfigValue { key, .. }) => key,
+            Err(SetupError::MissingConfigValue(key)) => key,
+            Err(other) => panic!("expected a config value error, got {other:?}"),
+            Ok(_) => panic!("expected {pairs:?} to be refused"),
+        }
+    }
+
+    #[test]
+    fn native_https_parses() {
+        let settings = native(&[("REDIRECT_SOCKET_ADDRESS", "127.0.0.1:8080")]).unwrap();
+        let https = settings.https.expect("native HTTPS is on");
+        assert_eq!(https.key, PathBuf::from("/tls/privkey.pem"));
+        assert_eq!(https.redirect, Some("127.0.0.1:8080".parse().unwrap()));
+        assert_eq!(
+            https.routes.origin(aruna_api::https::HostRoute::Portal),
+            Some("https://portal.test")
+        );
+        assert!(parse(&[]).unwrap().https.is_none());
+    }
+
+    #[test]
+    fn https_needs_address() {
+        for key in HTTPS_KEYS {
+            let error = parse(&[(key, "/tls/file.pem")]).unwrap_err();
+            assert_eq!(invalid_key(error), key);
+        }
+        assert_eq!(
+            native_key(&[("HTTPS_KEY_PATH", "")]),
+            "HTTPS_KEY_PATH",
+            "an empty key path is refused"
+        );
+        assert_eq!(
+            native_key(&[("REDIRECT_SOCKET_ADDRESS", "127.0.0.1:0")]),
+            "REDIRECT_SOCKET_ADDRESS"
+        );
+    }
+
+    #[test]
+    fn https_origin_only() {
+        for value in [
+            "http://api.test",
+            "https://10.0.0.1",
+            "https://user@api.test",
+            "https://api.test/aruna",
+            "https://api.test/?a=1",
+            "https://api.test/#top",
+        ] {
+            assert_eq!(native_key(&[("API_PUBLIC_URL", value)]), "API_PUBLIC_URL");
+            assert!(
+                parse(&[("API_PUBLIC_URL", value)]).is_ok(),
+                "ingress mode keeps accepting {value}"
+            );
+        }
+        let settings = native(&[("API_PUBLIC_URL", "https://api.test:8443/")]).unwrap();
+        assert_eq!(
+            settings
+                .https
+                .unwrap()
+                .routes
+                .origin(aruna_api::https::HostRoute::Rest),
+            Some("https://api.test:8443")
+        );
+    }
+
+    #[test]
+    fn s3_host_matches() {
+        assert_eq!(native_key(&[("S3_HOST", "storage.internal")]), "S3_HOST");
+        let native = native(&[("S3_HOST", "S3.Test")]).unwrap();
+        assert_eq!(native.s3_host.as_deref(), Some("s3.test"));
+        let ingress = parse(&[("S3_HOST", "S3.Test"), ("S3_ADDRESS", "127.0.0.1:0")]).unwrap();
+        assert_eq!(ingress.s3_host.as_deref(), Some("S3.Test"));
+    }
+
+    #[test]
+    fn routes_need_hosts() {
+        assert_eq!(
+            native_key(&[("PORTAL_PUBLIC_URL", "https://api.test")]),
+            "PORTAL_PUBLIC_URL"
+        );
+        assert_eq!(
+            native_key(&[("API_PUBLIC_URL", "https://api.s3.test")]),
+            "API_PUBLIC_URL"
+        );
+        assert_eq!(native_key(&[("S3_PUBLIC_URL", "")]), "S3_PUBLIC_URL");
+        assert_eq!(
+            native_key(&[("PORTAL_PUBLIC_URL", "")]),
+            "PORTAL_PUBLIC_URL"
+        );
+    }
+
+    #[test]
+    fn cors_allows_portal() {
+        assert_eq!(
+            native_key(&[("CORS_ALLOWED_ORIGINS", "https://other.test")]),
+            "CORS_ALLOWED_ORIGINS"
+        );
+        for value in ["*", "https://portal.test/"] {
+            assert!(
+                native(&[("CORS_ALLOWED_ORIGINS", value)]).is_ok(),
+                "{value}"
+            );
+        }
     }
 }

@@ -6,7 +6,7 @@ use super::routes_at;
 use crate::auth::{ensure_permission, require_realm_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::ServerError;
-use crate::forwarded::{client_ip, external_base_url};
+use crate::forwarded::{DirectOrigin, client_ip, external_base_url};
 use crate::rate_limit::LocalKey;
 use crate::server::state::{RestInterfaceRuntime, ServerState};
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -312,9 +312,15 @@ enum ResolveOutcome {
 pub async fn get_service_info(
     State(state): State<Arc<ServerState>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    direct: Option<Extension<DirectOrigin>>,
     headers: HeaderMap,
 ) -> (StatusCode, Json<DrsServiceResponse>) {
-    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
+    let base_url = external_base_url(
+        state.trusted_proxies(),
+        peer.ip(),
+        &headers,
+        direct.as_deref(),
+    );
     (
         StatusCode::OK,
         Json(DrsServiceResponse {
@@ -481,10 +487,16 @@ pub async fn get_object(
     Extension(auth): Extension<Option<AuthContext>>,
     Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    direct: Option<Extension<DirectOrigin>>,
     headers: HeaderMap,
     Path(object_id): Path<String>,
 ) -> Response {
-    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
+    let base_url = external_base_url(
+        state.trusted_proxies(),
+        peer.ip(),
+        &headers,
+        direct.as_deref(),
+    );
     let anonymous = auth.is_none();
     let auth = match drs_auth(state.as_ref(), auth) {
         Ok(auth) => auth,
@@ -595,6 +607,7 @@ pub async fn post_objects(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    direct: Option<Extension<DirectOrigin>>,
     headers: HeaderMap,
     Json(body): Json<DrsBulkBody>,
 ) -> Response {
@@ -604,7 +617,12 @@ pub async fn post_objects(
         ))
         .into_response();
     }
-    let base_url = external_base_url(state.trusted_proxies(), peer.ip(), &headers);
+    let base_url = external_base_url(
+        state.trusted_proxies(),
+        peer.ip(),
+        &headers,
+        direct.as_deref(),
+    );
     let anonymous = auth.is_none();
     let auth = match drs_auth(state.as_ref(), auth) {
         Ok(auth) => auth,

@@ -318,7 +318,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -331,6 +331,8 @@ dependencies = [
  "aruna-storage",
  "aruna-tasks",
  "aws-sdk-s3",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
  "axum",
  "base64 0.23.1",
  "blake3",
@@ -353,6 +355,7 @@ dependencies = [
  "opentelemetry_sdk",
  "postcard",
  "rand 0.10.3",
+ "rcgen",
  "reqwest 0.13.5",
  "rmcp",
  "rustix",
@@ -364,6 +367,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-opentelemetry",
@@ -373,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "ahash",
  "aruna-blob",
@@ -410,14 +414,18 @@ dependencies = [
  "postcard",
  "prometheus-client",
  "rand 0.10.3",
+ "rcgen",
  "reqwest 0.13.5",
  "rmcp",
+ "rustls",
+ "rustls-webpki",
  "s3s",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http 0.7.1",
@@ -431,13 +439,14 @@ dependencies = [
  "utoipa-axum",
  "utoipa-swagger-ui",
  "uuid",
+ "webpki-roots",
  "zeroize",
  "zip",
 ]
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aruna-core",
  "aruna-kpabe",
@@ -490,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-cli"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "apple-native-keyring-store",
  "aruna-plugins",
@@ -519,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -549,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "rustix",
  "serde_json",
@@ -559,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -613,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "ahash",
  "aruna",
@@ -656,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aes-gcm 0.11.1",
  "bls12_381_plus",
@@ -672,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe-wasm"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aruna-kpabe",
  "blake3",
@@ -686,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -714,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -780,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "serde",
  "serde_json",
@@ -789,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin-fixture"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aruna-plugin",
  "serde_json",
@@ -798,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugins"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "async-trait",
  "bytes",
@@ -825,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-registry"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -855,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -873,13 +882,52 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 dependencies = [
  "aruna-core",
  "async-trait",
  "iroh",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "asn1-rs"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f43a50ac4fdca5df8e885c21b835997f0a1cdee65494a6847694a98652d9d8"
+dependencies = [
+ "asn1-rs-derive",
+ "asn1-rs-impl",
+ "displaydoc",
+ "nom 7.1.3",
+ "num-traits",
+ "rusticata-macros",
+ "thiserror 2.0.21",
+ "time",
+]
+
+[[package]]
+name = "asn1-rs-derive"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3109e49b1e4909e9db6515a30c633684d68cdeaa252f215214cb4fa1a5bfee2c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "synstructure 0.13.2",
+]
+
+[[package]]
+name = "asn1-rs-impl"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1603,6 +1651,15 @@ name = "bit-vec"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
+name = "bit-vec"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bit-vec"
@@ -2997,6 +3054,20 @@ dependencies = [
  "const-oid 0.10.2",
  "pem-rfc7468 1.0.0",
  "zeroize",
+]
+
+[[package]]
+name = "der-parser"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07da5016415d5a3c4dd39b11ed26f915f52fc4e0dc197d87908bc916e51bc1a6"
+dependencies = [
+ "asn1-rs",
+ "displaydoc",
+ "nom 7.1.3",
+ "num-bigint",
+ "num-traits",
+ "rusticata-macros",
 ]
 
 [[package]]
@@ -6244,6 +6315,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oid-registry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
+dependencies = [
+ "asn1-rs",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7911,6 +7991,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.14.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
+dependencies = [
+ "pem 4.0.0",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "x509-parser",
+ "yasna",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8443,6 +8537,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rusticata-macros"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
+dependencies = [
+ "nom 7.1.3",
 ]
 
 [[package]]
@@ -9527,6 +9630,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 dependencies = [
  "futures-core",
+]
+
+[[package]]
+name = "synstructure"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -11614,6 +11728,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "x509-parser"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom 7.1.3",
+ "oid-registry",
+ "ring",
+ "rusticata-macros",
+ "thiserror 2.0.21",
+ "time",
+]
+
+[[package]]
 name = "xattr"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11651,6 +11783,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
+name = "yasna"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5f6765e852b9b4dc8e2a76843e4d64d1cea8e79bcde0b6901aea8e7c7f08282"
+dependencies = [
+ "bit-vec 0.9.1",
+ "time",
+]
+
+[[package]]
 name = "yoke"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11670,7 +11812,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.7",
- "synstructure",
+ "synstructure 0.14.0",
 ]
 
 [[package]]
@@ -11711,7 +11853,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.7",
- "synstructure",
+ "synstructure 0.14.0",
 ]
 
 [[package]]

@@ -26,6 +26,8 @@ use super::auth::AuthProvider;
 use super::service::ArunaS3Service;
 use crate::cors::CorsConfig;
 use crate::error::S3ServerError;
+use crate::https::HostCheck;
+use crate::https::listener::CombinedListener;
 use crate::rate_limit::{LocalKey, LocalLease};
 use crate::telemetry::{RequestCancelGuard, emit_request_completed, make_request_span};
 use aruna_core::NodeId;
@@ -36,6 +38,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketCorsConfiguration;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use axum::serve::Listener;
 use futures_core::future::BoxFuture;
 use http::{Method, Request, header};
 use hyper::body::Incoming;
@@ -56,6 +59,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinHandle;
+use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::instrument::WithSubscriber;
@@ -611,6 +615,8 @@ pub struct WrappingService {
     // Proxies whose forwarded client address may be charged instead of the peer.
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
     timeouts: S3ServerTimeouts,
+    // Set on TLS connections only: requests for another route's host get `421`.
+    host_check: Option<HostCheck>,
 }
 
 fn build_s3_service(
@@ -763,10 +769,12 @@ impl S3Server {
     /// every child's release instead of detaching it with the accept task.
     pub fn run_with_listener(
         self,
-        listener: TcpListener,
+        listener: impl Into<CombinedListener>,
         shutdown: CancellationToken,
     ) -> Result<(SocketAddr, S3ServerHandle), S3ServerError> {
-        let local_addr = listener.local_addr()?;
+        let mut listener = listener.into();
+        let local_addr = Listener::local_addr(&listener)?;
+        let host_check = listener.host_check();
         let connection_limit = self.connection_limit.clone();
         let timeouts = self.timeouts;
         let service = WrappingService {
@@ -785,6 +793,7 @@ impl S3Server {
             activity: None,
             trusted_proxies: self.trusted_proxies,
             timeouts,
+            host_check: None,
         };
         let mut connection = ConnBuilder::new(TokioExecutor::new()).http1_only();
         connection
@@ -800,13 +809,7 @@ impl S3Server {
             loop {
                 let (socket, peer) = tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    accepted = listener.accept() => match accepted {
-                        Ok(ok) => ok,
-                        Err(err) => {
-                            error!("error accepting connection: {err}");
-                            continue;
-                        }
-                    },
+                    accepted = Listener::accept(&mut listener) => accepted,
                 };
                 // Bound concurrent connections without retaining sockets at capacity.
                 let permit = match connection_limit.clone().try_acquire_owned() {
@@ -819,6 +822,9 @@ impl S3Server {
                 };
                 let mut service = service.clone();
                 service.peer_ip = Some(peer.ip());
+                if matches!(socket, Either::Right(_)) {
+                    service.host_check = host_check.clone();
+                }
                 let activity = Arc::new(ConnectionActivity::with_idle(timeouts.connection_idle));
                 service.activity = Some(activity.clone());
                 let builder = connection.clone();
@@ -953,6 +959,13 @@ impl Service<Request<Incoming>> for WrappingService {
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
+        if let Some(check) = &self.host_check
+            && !check.allows(req.uri(), req.headers())
+        {
+            let mut response = HttpResponse::new(s3s::Body::empty());
+            *response.status_mut() = http::StatusCode::MISDIRECTED_REQUEST;
+            return Box::pin(std::future::ready(Ok(response)));
+        }
         let (mut parts, body) = req.into_parts();
         super::auth::hide_tokens(&mut parts.headers);
         restore_signed_expect(&mut parts.headers);
@@ -1189,6 +1202,7 @@ mod tests {
             activity: None,
             trusted_proxies: Arc::new(Vec::new()),
             timeouts: S3ServerTimeouts::default(),
+            host_check: None,
         };
         let status = async {
             super::super::auth::hide_tokens(request.headers_mut());

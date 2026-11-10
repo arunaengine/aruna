@@ -10,7 +10,7 @@ use crate::shutdown::{
 use crate::startup;
 use crate::startup::background::{Background, BackgroundOutcome, start as start_background};
 use crate::startup::listeners::{ServerBindings, bind as bind_servers, device_wipe_armed};
-use crate::startup::listeners::{portal_exit, s3_exit, session_s3_exit};
+use crate::startup::listeners::{https_exit, portal_exit, s3_exit, session_s3_exit};
 use crate::startup::resources::NodeResources;
 
 /// What the node process accomplished, mapped to one exit behavior by the
@@ -67,6 +67,8 @@ pub enum Service {
     Portal,
     /// The optional session bridge listener; only sessions lose their endpoint.
     SessionS3,
+    /// The native HTTPS front, redirect and certificate reload.
+    Https,
     Ops,
 }
 
@@ -84,7 +86,7 @@ pub enum ServiceExit {
 /// must answer `/readyz` through the drain. Changing a policy is behavior.
 pub fn supervision(service: Service) -> ServiceExit {
     match service {
-        Service::Rest | Service::S3 | Service::Portal => ServiceExit::StopsNode,
+        Service::Rest | Service::S3 | Service::Portal | Service::Https => ServiceExit::StopsNode,
         Service::SessionS3 | Service::Ops => ServiceExit::ReportedOnly,
     }
 }
@@ -306,6 +308,7 @@ async fn run_node_owned(
         s3_handle,
         mut portal_handle,
         mut session_s3_handle,
+        mut https_handle,
         realm_id: _,
         node_id: _,
         is_initial_boot: _,
@@ -337,6 +340,9 @@ async fn run_node_owned(
             }
             message = session_s3_exit(session_s3_handle.as_mut()) => {
                 Some((Service::SessionS3, message))
+            }
+            message = https_exit(https_handle.as_mut()) => {
+                Some((Service::Https, message))
             }
             _ = device_wipe_armed(device_wipe.as_ref()) => None,
             _ = stop_token.cancelled() => None,
@@ -375,6 +381,7 @@ async fn run_node_owned(
         s3: s3_handle,
         portal: portal_handle,
         session_s3: session_s3_handle,
+        https: https_handle,
         monitoring: Some(resources.monitoring),
         task_handle: resources.task_handle,
         jobs_runtime: resources.jobs_runtime,
@@ -466,6 +473,12 @@ fn observed_listener_exit(bindings: &ServerBindings) -> Option<(Service, Service
         .is_some_and(aruna_api::s3::server::S3ServerHandle::is_finished)
     {
         Some((Service::SessionS3, supervision(Service::SessionS3)))
+    } else if bindings
+        .https_handle
+        .as_ref()
+        .is_some_and(aruna_api::https::listener::HttpsHandle::is_finished)
+    {
+        Some((Service::Https, supervision(Service::Https)))
     } else {
         None
     }
@@ -507,20 +520,22 @@ async fn release_unready(
         monitoring,
         ops_handle,
     } = resources;
-    let (rest, s3, portal, session_s3) = match bindings {
+    let (rest, s3, portal, session_s3, https) = match bindings {
         Some(ServerBindings {
             rest_handle,
             s3_handle,
             portal_handle,
             session_s3_handle,
+            https_handle,
             ..
         }) => (
             Some(rest_handle),
             s3_handle,
             portal_handle,
             session_s3_handle,
+            https_handle,
         ),
-        None => (None, None, None, None),
+        None => (None, None, None, None, None),
     };
     NodeShutdown {
         shutdown,
@@ -529,6 +544,7 @@ async fn release_unready(
         s3,
         portal,
         session_s3,
+        https,
         monitoring: Some(monitoring),
         task_handle,
         jobs_runtime,
@@ -552,6 +568,7 @@ mod pure_tests {
         assert_eq!(supervision(Service::Rest), ServiceExit::StopsNode);
         assert_eq!(supervision(Service::S3), ServiceExit::StopsNode);
         assert_eq!(supervision(Service::Portal), ServiceExit::StopsNode);
+        assert_eq!(supervision(Service::Https), ServiceExit::StopsNode);
         assert_eq!(supervision(Service::SessionS3), ServiceExit::ReportedOnly);
         assert_eq!(supervision(Service::Ops), ServiceExit::ReportedOnly);
     }
@@ -1182,6 +1199,7 @@ mod tests {
             s3: None,
             portal: None,
             session_s3: None,
+            https: None,
             monitoring: None,
             task_handle: aruna_tasks::TaskHandle::new(),
             jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),

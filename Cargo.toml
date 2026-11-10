@@ -29,7 +29,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.178"
+version = "3.0.0-alpha.179"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -209,6 +209,8 @@ rmcp = { version = "3.9.0", default-features = false, features = [
 ] }
 rustix = { version = "1.1.5", features = ["fs", "process"] }
 rustls = { version = "0.23.46", features = ["ring"] }
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["std"] }
+rcgen = "0.14.10"
 kube = { version = "4.2.0", default-features = false, features = [
     "client",
     "jsonpatch",
@@ -239,6 +241,7 @@ tempfile = "3.27.0"
 thiserror = "2.0.21"
 thiserror-core = { package = "thiserror", version = "2.0.21", default-features = false }
 tokio = { version = "1.53.2", features = ["full", "tracing"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["logging", "tls12", "ring"] }
 toml = "1.1.8"
 tokio-util = { version = "0.7.20", features = ["compat", "io-util", "rt"] }
 tower = { version = "0.5.3", features = ["limit"] }
@@ -286,6 +289,7 @@ wasmtime = { version = "49.0.5", default-features = false, features = [
 ] }
 wasmtime-wasi = { version = "49.0.5", default-features = false, features = ["p2"] }
 wasmtime-wasi-io = "49.0.5"
+webpki-roots = "1.0.10"
 wit-bindgen = "0.61.1"
 wit-component = "0.258.3"
 wit-parser = "0.258.3"

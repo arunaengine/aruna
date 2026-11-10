@@ -19,22 +19,49 @@ pub fn peer_is_trusted(trusted_proxies: &[IpNet], peer: IpAddr) -> bool {
     trusted_proxies.iter().any(|net| net.contains(&peer))
 }
 
+/// The configured API origin, attached to requests that arrived over native TLS.
+#[derive(Clone, Debug)]
+pub struct DirectOrigin {
+    scheme: String,
+    authority: String,
+}
+
+impl DirectOrigin {
+    /// Takes an origin such as `https://api.example.org:8443`.
+    pub fn new(origin: &str) -> Self {
+        let (scheme, authority) = origin.split_once("://").unwrap_or(("https", origin));
+        Self {
+            scheme: scheme.to_string(),
+            authority: authority.trim_end_matches('/').to_string(),
+        }
+    }
+}
+
 /// Base URL (`scheme://host`) as seen by the client. Forwarded scheme and host
-/// are honored only from trusted proxies; non-HTTP schemes use transport-derived
-/// values.
-pub fn external_base_url(trusted_proxies: &[IpNet], peer: IpAddr, headers: &HeaderMap) -> String {
+/// are honored only from trusted proxies; otherwise a TLS request uses the
+/// configured origin and a plain request `http` with its `Host`.
+pub fn external_base_url(
+    trusted_proxies: &[IpNet],
+    peer: IpAddr,
+    headers: &HeaderMap,
+    direct: Option<&DirectOrigin>,
+) -> String {
     let from_proxy = peer_is_trusted(trusted_proxies, peer);
     let scheme = from_proxy
         .then(|| header_str(headers, "x-forwarded-proto"))
         .flatten()
         .filter(|scheme| !scheme.contains(','))
         .filter(|scheme| *scheme == "http" || *scheme == "https")
+        .or(direct.map(|direct| direct.scheme.as_str()))
         .unwrap_or("http");
     let host = from_proxy
         .then(|| header_str(headers, "x-forwarded-host"))
         .flatten()
         .filter(|host| !host.contains(','))
-        .or_else(|| header_str(headers, http::header::HOST.as_str()))
+        .or_else(|| match direct {
+            Some(direct) => Some(direct.authority.as_str()),
+            None => header_str(headers, http::header::HOST.as_str()),
+        })
         .unwrap_or("localhost");
     format!("{scheme}://{host}")
 }
@@ -67,7 +94,7 @@ pub fn client_ip(trusted_proxies: &[IpNet], peer: IpAddr, headers: &HeaderMap) -
 
 #[cfg(test)]
 mod tests {
-    use super::{client_ip, external_base_url};
+    use super::{DirectOrigin, client_ip, external_base_url};
     use axum::http::{HeaderMap, HeaderValue};
     use std::net::IpAddr;
     use std::str::FromStr;
@@ -92,7 +119,7 @@ mod tests {
         // A direct caller cannot forge its own origin via forwarded headers.
         let peer = IpAddr::from_str("203.0.113.9").unwrap();
         assert_eq!(
-            external_base_url(&proxies(), peer, &forwarded_headers()),
+            external_base_url(&proxies(), peer, &forwarded_headers(), None),
             "http://node.internal"
         );
     }
@@ -101,7 +128,7 @@ mod tests {
     fn honors_trusted_proxy() {
         let peer = IpAddr::from_str("10.1.2.3").unwrap();
         assert_eq!(
-            external_base_url(&proxies(), peer, &forwarded_headers()),
+            external_base_url(&proxies(), peer, &forwarded_headers(), None),
             "https://drs.example"
         );
     }
@@ -115,7 +142,7 @@ mod tests {
         );
         let peer = IpAddr::from_str("10.1.2.3").unwrap();
         assert_eq!(
-            external_base_url(&proxies(), peer, &headers),
+            external_base_url(&proxies(), peer, &headers, None),
             "https://node.internal"
         );
     }
@@ -126,7 +153,7 @@ mod tests {
         headers.append("x-forwarded-proto", HeaderValue::from_static("https"));
         let peer = IpAddr::from_str("10.1.2.3").unwrap();
         assert_eq!(
-            external_base_url(&proxies(), peer, &headers),
+            external_base_url(&proxies(), peer, &headers, None),
             "http://drs.example"
         );
     }
@@ -140,7 +167,7 @@ mod tests {
         );
         let peer = IpAddr::from_str("10.1.2.3").unwrap();
         assert_eq!(
-            external_base_url(&proxies(), peer, &headers),
+            external_base_url(&proxies(), peer, &headers, None),
             "https://node.internal"
         );
     }
@@ -151,7 +178,7 @@ mod tests {
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https, http"));
         let peer = IpAddr::from_str("10.1.2.3").unwrap();
         assert_eq!(
-            external_base_url(&proxies(), peer, &headers),
+            external_base_url(&proxies(), peer, &headers, None),
             "http://drs.example"
         );
     }
@@ -164,7 +191,7 @@ mod tests {
         let mut headers = forwarded_headers();
         headers.insert("x-forwarded-proto", HeaderValue::from_static("javascript"));
         assert_eq!(
-            external_base_url(&proxies(), peer, &headers),
+            external_base_url(&proxies(), peer, &headers, None),
             "http://drs.example"
         );
     }
@@ -274,8 +301,37 @@ mod tests {
     fn defaults_without_headers() {
         let peer = IpAddr::from_str("127.0.0.1").unwrap();
         assert_eq!(
-            external_base_url(&[], peer, &HeaderMap::new()),
+            external_base_url(&[], peer, &HeaderMap::new(), None),
             "http://localhost"
+        );
+    }
+
+    #[test]
+    fn tls_uses_origin() {
+        // A direct TLS caller gets the configured origin, whatever its `Host` says.
+        let direct = DirectOrigin::new("https://api.example.org:8443");
+        let peer = IpAddr::from_str("203.0.113.9").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("evil.test"));
+        for headers in [headers, HeaderMap::new()] {
+            assert_eq!(
+                external_base_url(&proxies(), peer, &headers, Some(&direct)),
+                "https://api.example.org:8443"
+            );
+        }
+    }
+
+    #[test]
+    fn tls_keeps_proxy() {
+        let direct = DirectOrigin::new("https://api.example.org");
+        let peer = IpAddr::from_str("10.1.2.3").unwrap();
+        assert_eq!(
+            external_base_url(&proxies(), peer, &forwarded_headers(), Some(&direct)),
+            "https://drs.example"
+        );
+        assert_eq!(
+            external_base_url(&proxies(), peer, &HeaderMap::new(), Some(&direct)),
+            "https://api.example.org"
         );
     }
 }

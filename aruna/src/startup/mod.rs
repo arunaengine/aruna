@@ -4,6 +4,7 @@
 
 pub mod background;
 pub mod federation;
+pub mod https;
 pub mod listeners;
 pub mod realm;
 pub mod resources;

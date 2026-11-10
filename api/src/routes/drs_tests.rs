@@ -359,6 +359,7 @@ async fn rejects_nonlocal_version() {
             Extension(Some(auth.clone())),
             Extension(None),
             ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            None,
             HeaderMap::new(),
             Path(arn.to_string()),
         )
@@ -401,6 +402,7 @@ async fn returns_missing_version() {
         Extension(Some(auth)),
         Extension(None),
         ConnectInfo("127.0.0.1:1".parse().unwrap()),
+        None,
         HeaderMap::new(),
         Path(missing.to_string()),
     )
@@ -426,6 +428,7 @@ async fn caps_bulk_ids() {
         State(state),
         Extension(None),
         ConnectInfo("127.0.0.1:1".parse().unwrap()),
+        None,
         HeaderMap::new(),
         axum::Json(DrsBulkBody { object_ids }),
     )
@@ -851,6 +854,7 @@ mod global {
             Extension(Some(node.owner.clone())),
             Extension(None),
             ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            None,
             HeaderMap::new(),
             Path(id.to_string()),
         )
@@ -933,6 +937,7 @@ mod global {
             State(node.state.clone()),
             Extension(Some(node.owner.clone())),
             ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            None,
             HeaderMap::new(),
             Json(DrsBulkBody {
                 object_ids: vec![id.clone()],
@@ -997,6 +1002,7 @@ mod global {
             Extension(Some(auth.clone())),
             Extension(None),
             ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            None,
             HeaderMap::new(),
             Path(id.to_string()),
         )
@@ -1045,6 +1051,7 @@ mod global {
             Extension(Some(node.owner.clone())),
             Extension(None),
             ConnectInfo("127.0.0.1:1".parse().unwrap()),
+            None,
             HeaderMap::new(),
             Path(arn(version_id)),
         )

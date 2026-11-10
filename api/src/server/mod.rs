@@ -7,12 +7,16 @@ use crate::csp::baseline_security_headers;
 use crate::error::ServerSetupError;
 use crate::routes::rest_router;
 pub mod state;
+use crate::forwarded::DirectOrigin;
+use crate::https::listener::CombinedListener;
+use crate::https::{HostRoute, check_host};
 pub(crate) use crate::server::state::{ServerState, swagger_ui};
-use axum::Router;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Redirect, Response};
+use axum::serve::Listener;
+use axum::{Extension, Router};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,10 +117,11 @@ impl Server {
     /// requests already in flight run to completion before this returns.
     pub async fn run_with_listener(
         self,
-        listener: TcpListener,
+        listener: impl Into<CombinedListener>,
         shutdown: CancellationToken,
     ) -> Result<(), ServerSetupError> {
-        let bound_addr = listener.local_addr()?;
+        let listener = listener.into();
+        let bound_addr = Listener::local_addr(&listener)?;
         self.state
             .register_rest_public(bound_addr, self.api_public_url.as_deref())
             .await;
@@ -141,13 +146,19 @@ impl Server {
                 }
             }));
 
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await
-        .map_err(|e| ServerSetupError::Runtime(e.to_string()))?;
+        // TLS connections get the route's host check; plain ones keep today's router.
+        // TLS requests build absolute URLs from the configured API origin, never from `Host`.
+        let tls_router = listener.host_check().map(|check| {
+            let tls = router.clone();
+            let tls = match check.routes().origin(HostRoute::Rest) {
+                Some(origin) => tls.layer(Extension(DirectOrigin::new(origin))),
+                None => tls,
+            };
+            tls.layer(from_fn_with_state(check, check_host))
+        });
+        crate::https::listener::serve_routers(listener, router, tls_router, shutdown)
+            .await
+            .map_err(|e| ServerSetupError::Runtime(e.to_string()))?;
 
         Ok(())
     }

@@ -262,7 +262,7 @@ async fn base_url(state: &ServerState, peer: std::net::IpAddr, headers: &HeaderM
         return format!("{}{OAI_PATH}", rest.api_base_url.trim_end_matches('/'));
     }
     if crate::forwarded::peer_is_trusted(state.trusted_proxies(), peer) {
-        let base = external_base_url(state.trusted_proxies(), peer, headers);
+        let base = external_base_url(state.trusted_proxies(), peer, headers, None);
         return format!("{base}/api/v1{OAI_PATH}");
     }
     BASE_URL_FALLBACK.to_string()
