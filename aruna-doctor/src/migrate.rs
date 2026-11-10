@@ -180,7 +180,7 @@ pub struct MigrateOutput {
     /// replication jobs moved to their new key with their key waits and plaintext requests,
     /// and unfinished staging checkpoints.
     pub stale_rows_deleted: BTreeMap<&'static str, usize>,
-    /// Admin audit rows from before their newest optional fields, which gain them as empty.
+    /// Admin audit rows from before the secret they are about, which gain none.
     pub audit_rows_scanned: usize,
     pub audit_rows_rewritten: usize,
     /// Harvest sources from before the last started job, which gain none.
@@ -462,19 +462,6 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         let sealed = seal_rows(&db, &rows, name, secret_key, &mut secrets_skipped)?;
         secrets.push((rows, sealed));
     }
-    let mut unknown_rows = Vec::new();
-    let audits = trailing::missing_options::<AdminAuditRecord>(
-        &db,
-        &audit_rows,
-        trailing::AUDIT,
-        &mut unknown_rows,
-    )?;
-    let harvests = trailing::missing_options::<HarvestSource>(
-        &db,
-        &harvest_rows,
-        trailing::HARVEST,
-        &mut unknown_rows,
-    )?;
     let vault_rows = db.keyspace(NODE_VAULT_KEYSPACE, KeyspaceCreateOptions::default)?;
     let mut moves = Vec::new();
     for moved in vault::MOVED_KEYSPACES {
@@ -507,8 +494,6 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&staging_rows, &staged.rewrites.rows),
         (&owner_rows, &stale.owner_writes),
         (&cleanup_rows, &old_uploads.blob_deletes),
-        (&audit_rows, &audits.rows),
-        (&harvest_rows, &harvests.rows),
     ]
     .into_iter()
     .chain(
@@ -570,6 +555,20 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     })?;
     // The node rows go first, so an interrupted purge still finds `/node-info-v2` and resumes.
     let (info_ops, fanout_cursors) = info_topics::purge_topics(sync_path, &info.topics)?;
+    // Each batch commits on its own; a rerun skips the rows an earlier run already rewrote.
+    let mut unknown_rows = Vec::new();
+    let audits = trailing::missing_fields::<AdminAuditRecord>(
+        &db,
+        &audit_rows,
+        trailing::AUDIT,
+        &mut unknown_rows,
+    )?;
+    let harvests = trailing::missing_fields::<HarvestSource>(
+        &db,
+        &harvest_rows,
+        trailing::HARVEST,
+        &mut unknown_rows,
+    )?;
 
     Ok(MigrateOutput {
         database_path: database_path.to_string(),
@@ -633,9 +632,9 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         ),
         stale_rows_deleted: counts(stale_rows.iter().map(|(_, name, keys)| (*name, keys.len()))),
         audit_rows_scanned: audits.scanned,
-        audit_rows_rewritten: audits.rows.len(),
+        audit_rows_rewritten: audits.rewritten,
         harvest_sources_scanned: harvests.scanned,
-        harvest_sources_rewritten: harvests.rows.len(),
+        harvest_sources_rewritten: harvests.rewritten,
         unknown_rows,
     })
 }
