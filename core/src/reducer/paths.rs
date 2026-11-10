@@ -124,6 +124,9 @@ pub(super) fn operation_paths(op: &AdminDocumentOperation) -> Vec<String> {
         AdminDocumentOperation::ConfigPluginSet { name, version, .. } => {
             vec![plugin_entry_path(name, version)]
         }
+        AdminDocumentOperation::ConfigInstallSet { install_id, .. } => {
+            vec![plugin_install_path(install_id)]
+        }
         AdminDocumentOperation::NodeNameSet { node_id, .. } => vec![node_name_path(node_id)],
         AdminDocumentOperation::NodePlaceSet { node_id, .. } => vec![node_place_path(node_id)],
         AdminDocumentOperation::ConfigPoliciesSet { .. } => {
@@ -315,6 +318,13 @@ pub const PLUGIN_ENTRY_PREFIX: &str = "realm_config.plugins.";
 /// One path per published version, `realm_config.plugins.<name>@<version>`.
 pub fn plugin_entry_path(name: &str, version: &str) -> String {
     format!("{PLUGIN_ENTRY_PREFIX}{name}@{version}")
+}
+
+pub const PLUGIN_INSTALL_PREFIX: &str = "realm_config.plugin_installs.";
+
+/// One path per install, `realm_config.plugin_installs.<install id>`.
+pub fn plugin_install_path(install_id: &ulid::Ulid) -> String {
+    format!("{PLUGIN_INSTALL_PREFIX}{install_id}")
 }
 
 pub fn config_oidc_path(provider_id: &str) -> String {

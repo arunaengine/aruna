@@ -1692,6 +1692,20 @@ fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), 
                 return Err("published plugin entry is malformed".to_string());
             }
         }
+        // The writing management node checked the admin, the grants and the published version.
+        AdminDocumentOperation::ConfigInstallSet {
+            install_id,
+            install,
+        } => {
+            let matching = install.as_ref().is_none_or(|install| {
+                install.valid()
+                    && install.install_id == *install_id
+                    && install.account.realm_id == event.actor.realm_id
+            });
+            if !matching || install_id.is_nil() {
+                return Err("plugin install record is malformed".to_string());
+            }
+        }
         AdminDocumentOperation::CandidateMapPublished { map } => {
             let mut seen = std::collections::BTreeSet::new();
             if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
@@ -1917,6 +1931,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         | AdminDocumentOperation::ConfigEmailSet { .. }
         | AdminDocumentOperation::ConfigSecretSet { .. }
         | AdminDocumentOperation::ConfigPluginSet { .. }
+        | AdminDocumentOperation::ConfigInstallSet { .. }
         | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
         AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
     };

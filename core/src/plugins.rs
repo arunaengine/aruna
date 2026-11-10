@@ -29,11 +29,7 @@ pub struct PublishedPlugin {
 impl PublishedPlugin {
     /// Whether the entry is well formed. The publishing management node checked the artifact.
     pub fn valid(&self) -> bool {
-        let lower = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
-        let digest = self
-            .digest
-            .strip_prefix("sha256:")
-            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(lower));
+        let digest = valid_digest(&self.digest);
         let size = usize::try_from(self.size).is_ok_and(|size| (1..=MAX_ARTIFACT).contains(&size));
         let manifest = (1..=MAX_MANIFEST).contains(&self.manifest.len())
             && serde_json::from_str::<serde_json::Value>(&self.manifest)
@@ -66,6 +62,12 @@ pub fn same_artifact(values: &[crate::reducer::AdminConflictValue]) -> Option<Pu
     }
     let order = |entry: &PublishedPlugin| (entry.published_at_ms, entry.published_by.to_string());
     entries.into_iter().min_by_key(order)
+}
+
+/// A digest in the form `sha256:<64 lowercase hex>`.
+pub fn valid_digest(digest: &str) -> bool {
+    let lower = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+    (digest.strip_prefix("sha256:")).is_some_and(|hex| hex.len() == 64 && hex.bytes().all(lower))
 }
 
 /// A plugin name: 1 to 64 of `a-z`, `0-9` or `-`, starting with a letter, no `-` at the end.

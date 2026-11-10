@@ -858,6 +858,7 @@ fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
             | AdminDocumentOperation::ConfigEmailSet { .. }
             | AdminDocumentOperation::ConfigSecretSet { .. }
             | AdminDocumentOperation::ConfigPluginSet { .. }
+            | AdminDocumentOperation::ConfigInstallSet { .. }
     )
 }
 

@@ -164,6 +164,7 @@ impl From<LegacyConfig> for RealmConfigDocument {
             vault: Vec::new(),
             secrets: Vec::new(),
             plugins: Vec::new(),
+            installs: Vec::new(),
         }
     }
 }

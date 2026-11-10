@@ -438,6 +438,19 @@ impl AdminDocumentState {
         entries.into_values().collect()
     }
 
+    /// Plugin install records sorted by install id. A deleted or conflicting one is absent.
+    pub fn materialized_installs(&self) -> Vec<crate::plugin_installs::PluginInstall> {
+        if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
+            return Vec::new();
+        }
+        (self.user_subject_ids)
+            .range(PLUGIN_INSTALL_PREFIX.to_string()..)
+            .take_while(|(path, _)| path.starts_with(PLUGIN_INSTALL_PREFIX))
+            .filter(|(path, _)| !self.conflicts.contains_key(*path))
+            .filter_map(|(_, version)| serde_json::from_str(version.value.as_deref()?).ok())
+            .collect()
+    }
+
     /// Display names of realm nodes, by node id. A cleared or conflicting name is absent.
     pub fn materialized_node_names(&self) -> BTreeMap<NodeId, String> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
