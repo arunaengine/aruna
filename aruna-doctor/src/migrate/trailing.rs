@@ -6,7 +6,9 @@
 use super::session_refs::{self, Layout};
 use super::{decode_error, row_note};
 use crate::explorer::ExplorerError;
-use aruna_core::keyspaces::{ADMIN_AUDIT_KEYSPACE, HARVEST_SOURCE_KEYSPACE};
+use aruna_core::keyspaces::{
+    ADMIN_AUDIT_KEYSPACE, HARVEST_SOURCE_KEYSPACE, MIRROR_REPAIR_KEYSPACE,
+};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -19,6 +21,8 @@ pub(super) type Shapes = (&'static str, &'static [Layout]);
 pub(super) const AUDIT: Shapes = (ADMIN_AUDIT_KEYSPACE, &[&[("AdminAuditRecord", 6)]]);
 /// Harvest sources before `last_job`.
 pub(super) const HARVEST: Shapes = (HARVEST_SOURCE_KEYSPACE, &[&[("HarvestSource", 12)]]);
+/// Pending sync mirror repairs before `rollback`.
+pub(super) const MIRROR: Shapes = (MIRROR_REPAIR_KEYSPACE, &[&[("SyncMirrorRecord", 5)]]);
 
 /// Rows read, and rewritten at most, per transaction.
 const BATCH_ROWS: usize = 1024;

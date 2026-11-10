@@ -50,6 +50,7 @@ use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use aruna_operations::replication::queue::LiveObligationRecord;
+use aruna_operations::sync::mirror_repair::SyncMirrorRecord;
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use layouts::{CONNECTOR, HEAD, NODE_INFO, OBLIGATION, padded};
@@ -186,6 +187,9 @@ pub struct MigrateOutput {
     /// Harvest sources from before the last started job, which gain none.
     pub harvest_sources_scanned: usize,
     pub harvest_sources_rewritten: usize,
+    /// Pending sync mirror repairs from before the rollback flag, which gain `false`.
+    pub mirror_repairs_scanned: usize,
+    pub mirror_repairs_rewritten: usize,
     /// Rows of those keyspaces that match no known shape, left unchanged, as
     /// `keyspace/key: reason`.
     pub unknown_rows: Vec<String>,
@@ -276,6 +280,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let snapshot_rows = db.keyspace(NODE_STATS_KEYSPACE, KeyspaceCreateOptions::default)?;
     let audit_rows = db.keyspace(trailing::AUDIT.0, KeyspaceCreateOptions::default)?;
     let harvest_rows = db.keyspace(trailing::HARVEST.0, KeyspaceCreateOptions::default)?;
+    let mirror_rows = db.keyspace(trailing::MIRROR.0, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
     let mut evidence = families::Evidence::default();
@@ -569,6 +574,12 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         trailing::HARVEST,
         &mut unknown_rows,
     )?;
+    let mirrors = trailing::missing_fields::<SyncMirrorRecord>(
+        &db,
+        &mirror_rows,
+        trailing::MIRROR,
+        &mut unknown_rows,
+    )?;
 
     Ok(MigrateOutput {
         database_path: database_path.to_string(),
@@ -635,6 +646,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         audit_rows_rewritten: audits.rewritten,
         harvest_sources_scanned: harvests.scanned,
         harvest_sources_rewritten: harvests.rewritten,
+        mirror_repairs_scanned: mirrors.scanned,
+        mirror_repairs_rewritten: mirrors.rewritten,
         unknown_rows,
     })
 }

@@ -5,19 +5,22 @@
 use super::super::migrate_output;
 use super::super::tests::{read, write};
 use super::*;
-use aruna_core::UserId;
 use aruna_core::secrets::{SecretName, SecretScope};
 use aruna_core::structs::execution::harvest::{HarvestSelector, HarvestSource};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord, SecretAudit};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::GroupId;
+use aruna_core::{NodeId, UserId};
+use aruna_operations::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use fjall::KeyspaceCreateOptions;
 use serde::Deserialize;
 use std::path::Path;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
 
 const REALM: RealmId = RealmId([1; 32]);
@@ -137,6 +140,88 @@ fn harvest_gains_job() {
     source.last_job = None;
     assert_eq!(migrated, source);
     assert_eq!(stored[b"current".as_slice()], current);
+}
+
+/// A pending mirror repair as stored before `rollback`.
+#[derive(Serialize)]
+struct OldMirror {
+    relationship: SyncRelationship,
+    intent: SyncMirrorIntent,
+    due_at_ms: u64,
+    attempts: u32,
+    last_error: Option<String>,
+}
+
+fn node(seed: u8) -> NodeId {
+    iroh::SecretKey::from_bytes(&[seed; 32]).public()
+}
+
+fn relationship(seed: u8) -> SyncRelationship {
+    SyncRelationship {
+        id: Ulid::from_bytes([seed; 16]),
+        source: ArunaArn::s3_bucket(REALM, node(3), "source").expect("source"),
+        target: ArunaArn::s3_bucket(REALM, node(4), "target").expect("target"),
+        mode: SyncMode::Continuous,
+        reference_handling: Default::default(),
+        reference_serving: false,
+        replicate_deletes: true,
+        created_by: user(5),
+        created_at: SystemTime::UNIX_EPOCH,
+        state: SyncState::Enabled,
+        status: SyncStatusSnapshot::default(),
+    }
+}
+
+#[test]
+fn mirror_gains_rollback() {
+    let old = OldMirror {
+        relationship: relationship(2),
+        intent: SyncMirrorIntent::Delete,
+        due_at_ms: 9,
+        attempts: 3,
+        last_error: Some("target unreachable".to_string()),
+    };
+    let rolled = SyncMirrorRecord {
+        relationship: relationship(6),
+        intent: SyncMirrorIntent::Reconcile,
+        due_at_ms: 1,
+        attempts: 0,
+        last_error: None,
+        rollback: true,
+    };
+    let current = postcard::to_allocvec(&rolled).expect("current row encodes");
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let path = temp.path().join("db");
+    let database = path.to_str().expect("path");
+    let rows = vec![
+        (
+            [2; 16].as_slice(),
+            postcard::to_allocvec(&old).expect("old row encodes"),
+        ),
+        ([6; 16].as_slice(), current.clone()),
+    ];
+    write(&path, MIRROR_REPAIR_KEYSPACE, rows);
+    let output = migrate_output(database).expect("migration runs");
+    assert_eq!(
+        (
+            output.mirror_repairs_scanned,
+            output.mirror_repairs_rewritten
+        ),
+        (2, 1)
+    );
+    let stored = read(&path, MIRROR_REPAIR_KEYSPACE);
+    let migrated: SyncMirrorRecord =
+        postcard::from_bytes(&stored[[2; 16].as_slice()]).expect("decodes");
+    let expected = SyncMirrorRecord {
+        relationship: old.relationship,
+        intent: old.intent,
+        due_at_ms: old.due_at_ms,
+        attempts: old.attempts,
+        last_error: old.last_error,
+        rollback: false,
+    };
+    assert_eq!(migrated, expected);
+    assert_eq!(stored[[6; 16].as_slice()], current);
 }
 
 fn audit_rows(path: &Path) -> (OptimisticTxDatabase, OptimisticTxKeyspace) {
