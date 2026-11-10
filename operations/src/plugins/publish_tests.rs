@@ -8,6 +8,7 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
+use std::collections::BTreeSet;
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
 
@@ -97,11 +98,21 @@ async fn write_entry(
     ctx: &DriverContext,
     plugin: PublishedPlugin,
 ) -> Result<PublishedPlugin, EntryError> {
+    write_copies(ctx, plugin, BTreeSet::from([node(1)])).await
+}
+
+/// Writes the entry as if `copies` had confirmed a complete copy.
+async fn write_copies(
+    ctx: &DriverContext,
+    plugin: PublishedPlugin,
+    copies: BTreeSet<NodeId>,
+) -> Result<PublishedPlugin, EntryError> {
     let actor = actor();
     let config = PublishEntryConfig {
         auth_context: auth(&actor),
         actor,
         plugin,
+        copies,
     };
     drive(PublishEntryOperation::new(config), ctx).await
 }
@@ -221,4 +232,25 @@ async fn refuses_before_storing() {
     );
     let large = publish_plugin(&ctx, actor.clone(), auth(&actor), vec![0; MAX_ARTIFACT + 1]).await;
     assert!(matches!(large, Err(PublishError::TooLarge)), "{large:?}");
+}
+
+#[tokio::test]
+async fn counts_current_managers() {
+    // Managers 1, 10 and 11: a copy confirmed by a node that left the managers does not count.
+    let (_dir, ctx) = context();
+    seed(&ctx, &actor(), RealmNodeKind::Management, 2, true).await;
+    let digest = format!("sha256:{}", "ab".repeat(32));
+    let left = BTreeSet::from([node(1), node(99)]);
+    let refused = write_copies(&ctx, entry(&digest), left).await;
+    assert_eq!(
+        refused,
+        Err(EntryError::TooFewCopies {
+            stored: 1,
+            needed: 2
+        })
+    );
+    assert!(published(&ctx).await.is_empty());
+    let remote = BTreeSet::from([node(1), node(10)]);
+    assert!(write_copies(&ctx, entry(&digest), remote).await.is_ok());
+    assert_eq!(published(&ctx).await.len(), 1);
 }

@@ -23,6 +23,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
 use smallvec::smallvec;
+use std::collections::BTreeSet;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -105,15 +106,18 @@ pub async fn publish_plugin(
     }
     store_local(ctx, &config, digest.as_str(), &artifact).await?;
     let digest = digest.to_string();
-    let stored = 1 + copy_to_managers(ctx, &config, actor.node_id, &digest, &artifact).await;
-    let needed = copies_needed(managers(&config).count());
+    let mut copies = copy_to_managers(ctx, &config, actor.node_id, &digest, &artifact).await;
+    copies.insert(actor.node_id);
+    let (stored, needed) = (copies.len(), copies_needed(managers(&config).count()));
     if stored < needed {
         return Err(PublishError::TooFewCopies { stored, needed });
     }
+    // The entry transaction counts these copies again against the managers it reads.
     let write = PublishEntryOperation::new(PublishEntryConfig {
         actor,
         auth_context,
         plugin: entry,
+        copies,
     });
     let published = drive(write, ctx).await?;
     info!(name = %published.name, version = %published.version, digest = %published.digest, stored, "Published a plugin version");
@@ -134,16 +138,17 @@ fn same_version(
     }
 }
 
-/// Sends the artifact to every other management node at once; returns how many stored it.
+/// Sends the artifact to every other management node at once; returns the nodes that confirmed
+/// a complete, synced copy.
 async fn copy_to_managers(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: aruna_core::NodeId,
     digest: &str,
     artifact: &[u8],
-) -> usize {
+) -> BTreeSet<aruna_core::NodeId> {
     let Some(metadata) = ctx.metadata_handle.as_ref() else {
-        return 0;
+        return BTreeSet::new();
     };
     let peers = managers(config).filter(|node| *node != local);
     let copies = peers.map(|node_id| async move {
@@ -160,10 +165,10 @@ async fn copy_to_managers(
         if let Err(error) = &complete {
             warn!(%node_id, ?error, "A management node did not store a plugin artifact");
         }
-        complete == Ok(true)
+        (complete == Ok(true)).then_some(node_id)
     });
     let results = futures_util::future::join_all(copies).await;
-    results.into_iter().filter(|stored| *stored).count()
+    results.into_iter().flatten().collect()
 }
 
 #[derive(Debug, PartialEq)]
@@ -172,6 +177,8 @@ pub struct PublishEntryConfig {
     /// The caller's own token context, so a path-restricted credential stays restricted.
     pub auth_context: AuthContext,
     pub plugin: PublishedPlugin,
+    /// Management nodes that confirmed a complete, synced copy, this one included.
+    pub copies: BTreeSet<aruna_core::NodeId>,
 }
 
 /// Writes one published plugin version into the realm config. An identical entry is kept;
@@ -214,6 +221,10 @@ pub enum EntryError {
     NotManagementNode,
     #[error("version {0} of this plugin is already published with other bytes")]
     VersionTaken(String),
+    #[error(
+        "{stored} of {needed} needed current management nodes stored the artifact; nothing was published"
+    )]
+    TooFewCopies { stored: usize, needed: usize },
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("operation did not finish")]
@@ -305,6 +316,12 @@ impl PublishEntryOperation {
             }
             Some(_) => return Err(EntryError::VersionTaken(plugin.version)),
             None => {}
+        }
+        let current: BTreeSet<_> = managers(&document).collect();
+        let stored = self.config.copies.intersection(&current).count();
+        let needed = copies_needed(current.len());
+        if stored < needed {
+            return Err(EntryError::TooFewCopies { stored, needed });
         }
         let operation = AdminDocumentOperation::ConfigPluginSet {
             name: plugin.name.clone(),
