@@ -144,6 +144,65 @@ pub enum PluginCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Install a published plugin into a group; needs group admin rights.
+    Install {
+        /// Plugin name.
+        name: String,
+        /// The group the plugin acts in.
+        #[arg(long)]
+        group: String,
+        /// The published digest to pin; the newest version when omitted.
+        #[arg(long)]
+        version: Option<String>,
+        /// A setting as `name=value`; a JSON value is read as JSON, anything else as text.
+        #[arg(long = "setting", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
+        /// A grant as `permission=pattern`, repeated for more; `permission=` removes it.
+        #[arg(long = "grant", value_name = "PERMISSION=PATTERN")]
+        grants: Vec<String>,
+        /// Show the summary and an install id without installing.
+        #[arg(long)]
+        preview: bool,
+        /// The install id a preview showed; installing with it again resumes that install.
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// List the plugin installs of a group.
+    Installs {
+        /// The group whose installs to list.
+        #[arg(long)]
+        group: String,
+    },
+    /// Replace the grants of an install; a permission left out gets all of the group.
+    Grants {
+        /// The install id.
+        id: String,
+        /// A grant as `permission=pattern`, repeated for more; `permission=` removes it.
+        #[arg(long = "grant", value_name = "PERMISSION=PATTERN")]
+        grants: Vec<String>,
+    },
+    /// Move an install to another published version of its plugin.
+    Update {
+        /// The install id.
+        id: String,
+        /// The published digest to move to.
+        version: String,
+    },
+    /// Pause an install; it runs nothing until resumed.
+    Pause {
+        /// The install id.
+        id: String,
+    },
+    /// Resume a paused install.
+    Resume {
+        /// The install id.
+        id: String,
+    },
+    /// Remove an install and deactivate its account.
+    Remove {
+        /// The install id.
+        id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -432,6 +491,32 @@ mod tests {
         };
         assert_eq!((args.source.as_str(), args.part_size), ("a.txt", 8));
         assert!(parse(&["cp", "a", "b", "--part-size", "1"]).is_err());
+    }
+
+    #[test]
+    fn parses_plugin_install() {
+        let line = [
+            "plugin",
+            "install",
+            "announcer",
+            "--group",
+            "g",
+            "--grant",
+            "a=b",
+            "--grant",
+            "c=",
+        ];
+        let Command::Plugin(PluginCommand::Install {
+            grants, preview, ..
+        }) = parse(&line).unwrap().command
+        else {
+            panic!("expected plugin install");
+        };
+        assert_eq!(
+            (grants, preview),
+            (vec!["a=b".to_string(), "c=".to_string()], false)
+        );
+        assert!(parse(&["plugin", "install", "announcer"]).is_err());
     }
 
     #[test]
