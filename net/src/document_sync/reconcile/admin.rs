@@ -605,6 +605,11 @@ async fn group_transaction(
             )),
         };
     }
+    // A duplicate leaves the reducer state as stored; rewriting it would only
+    // conflict a local group change that read the row.
+    if apply_status == AdminApplyStatus::Duplicate {
+        return abort_txn(storage, txn_id).await;
+    }
     if apply_status != AdminApplyStatus::Applied {
         return replace_batch_in(
             storage,

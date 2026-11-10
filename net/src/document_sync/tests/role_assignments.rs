@@ -353,6 +353,61 @@ async fn new_role_materializes() {
 }
 
 #[tokio::test]
+async fn duplicate_keeps_readers() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([13; 32]);
+    let group_id = Ulid::from_parts(41, 1);
+    let target = AdminDocumentTarget::Group { group_id };
+    let document_target = DocumentTarget::GroupAuthorization { group_id };
+    let actor = test_actor(
+        9,
+        UserId::local(Ulid::from_parts(42, 2), realm_id),
+        realm_id,
+    );
+    let event = test_admin_event(
+        Ulid::from_parts(43, 3),
+        target.clone(),
+        &actor,
+        1,
+        AdminDocumentOperation::GroupAssignmentAdded {
+            role_id: Ulid::from_parts(44, 4),
+            user_id: UserId::local(Ulid::from_parts(45, 5), realm_id),
+        },
+    );
+    apply_admin_operation(&storage, document_target.clone(), event.clone())
+        .await
+        .expect("first delivery applies");
+
+    // A local group change reads the reducer state row inside its own transaction.
+    let txn_id = start_storage_transaction(&storage)
+        .await
+        .expect("transaction starts");
+    transaction_read(
+        &storage,
+        DOCUMENT_STATE_KEYSPACE.to_string(),
+        reducer_state_key(&target),
+        Some(txn_id),
+    )
+    .await
+    .expect("reducer state reads");
+    apply_admin_operation(&storage, document_target, event)
+        .await
+        .expect("duplicate delivery succeeds");
+    replace_batch_in(
+        &storage,
+        txn_id,
+        Vec::new(),
+        vec![(
+            GROUP_KEYSPACE.to_string(),
+            group_id.to_bytes().into(),
+            b"local change".to_vec().into(),
+        )],
+    )
+    .await
+    .expect("a redelivered event must not conflict the local change");
+}
+
+#[tokio::test]
 async fn assignment_conflict_materializes() {
     let (_dir, storage) = test_storage();
     let realm_id = RealmId::from_bytes([11; 32]);
