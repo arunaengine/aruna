@@ -11,6 +11,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::time::{Instant, timeout_at};
+
 use aruna_plugins::broker::{
     Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
     ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
@@ -22,8 +24,12 @@ use aruna_plugins::{
     CancellationToken, Compiled, FailureKind, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
 };
 
-/// Generous cap on one build and run, downloads included, so a stuck toolchain fails the test.
+/// Generous deadline for one case, build with downloads, compile and runs together.
 const HANG_CAP: Duration = Duration::from_secs(1800);
+/// Set for a child run of this binary that only builds the project it names.
+const BUILD_VAR: &str = "ARUNA_PLUGIN_BUILD";
+/// Where that child run writes the built artifact.
+const OUT_VAR: &str = "ARUNA_PLUGIN_BUILT";
 
 /// The catalog's answer to a new record; the manifest lets the code read only `/id`.
 const RECORD: &str = r#"{"id":"c-1","secret":"s"}"#;
@@ -179,27 +185,90 @@ fn limits() -> Limits {
     }
 }
 
-/// Builds the project and compiles it, all within the hang cap.
-async fn build(project: PathBuf) -> (Runtime, Arc<Compiled>) {
-    let shown = project.display().to_string();
-    let building = tokio::task::spawn_blocking(move || build_project(&project));
-    let built = tokio::time::timeout(HANG_CAP, building)
-        .await
-        .unwrap_or_else(|_| panic!("{shown}: the build ended within the hang cap"))
-        .unwrap()
-        .unwrap_or_else(|err| panic!("{shown}: {err}"));
+/// A built and compiled plugin and the deadline its case must end by.
+struct Plugin {
+    runtime: Runtime,
+    compiled: Arc<Compiled>,
+    deadline: Instant,
+}
+
+/// Builds the project in a child process and compiles it; the whole case shares one deadline.
+async fn build(project: PathBuf) -> Plugin {
+    let deadline = Instant::now() + HANG_CAP;
+    let artifact = build_child(&project, deadline).await.unwrap();
     let runtime = Runtime::new(RuntimeConfig {
         max_artifact: 64 << 20,
         ceiling: limits(),
         ..RuntimeConfig::default()
     })
     .unwrap();
-    let compiled = runtime.prepare(built.artifact).await.unwrap();
-    (runtime, compiled)
+    let compiled = timeout_at(deadline, runtime.prepare(artifact))
+        .await
+        .expect("the compile ended before the deadline")
+        .unwrap();
+    Plugin {
+        runtime,
+        compiled,
+        deadline,
+    }
+}
+
+/// Builds `project` in a child run of this binary, in a process group of its own, so a stuck
+/// toolchain is killed with everything it started once the deadline passes.
+async fn build_child(project: &Path, deadline: Instant) -> Result<Vec<u8>, String> {
+    let name = project.file_name().unwrap().to_string_lossy().to_string();
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("built-{name}.wasm"));
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command.args(["build_entry", "--exact", "--nocapture", "--test-threads=1"]);
+    command
+        .env(BUILD_VAR, project)
+        .env(OUT_VAR, &out)
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().unwrap();
+    match timeout_at(deadline, child.wait()).await {
+        Ok(Ok(status)) if status.success() => std::fs::read(out).map_err(|err| err.to_string()),
+        Ok(status) => Err(format!("{name}: the build failed: {status:?}")),
+        Err(_) => {
+            stop_tree(&mut child).await;
+            Err(format!(
+                "{name}: the build passed the deadline and was killed"
+            ))
+        }
+    }
+}
+
+/// Kills a child and everything it started, and reaps it.
+async fn stop_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child
+        .id()
+        .and_then(|id| rustix::process::Pid::from_raw(id as i32))
+    {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let tree = ["/F", "/T", "/PID", &pid.to_string()];
+        let _ = Command::new("taskkill").args(tree).status();
+    }
+    let _ = child.kill().await;
+}
+
+/// The child side of [`build_child`]: does nothing unless it was started for a build.
+#[test]
+fn build_entry() {
+    let (Some(project), Some(out)) = (std::env::var_os(BUILD_VAR), std::env::var_os(OUT_VAR))
+    else {
+        return;
+    };
+    let built = build_project(Path::new(&project)).unwrap_or_else(|err| panic!("{err}"));
+    std::fs::write(out, built.artifact).unwrap();
 }
 
 async fn run(
-    (runtime, compiled): &(Runtime, Arc<Compiled>),
+    plugin: &Plugin,
     handler: &str,
     trigger: Trigger,
     broker: Arc<Catalog>,
@@ -216,9 +285,10 @@ async fn run(
         limits: limits(),
         cancel: CancellationToken::new(),
     };
-    tokio::time::timeout(HANG_CAP, runtime.invoke(compiled, call, broker))
+    let invoke = plugin.runtime.invoke(&plugin.compiled, call, broker);
+    timeout_at(plugin.deadline, invoke)
         .await
-        .expect("the run ended within the hang cap")
+        .expect("the run ended before the deadline")
 }
 
 fn example(language: &str) -> PathBuf {
@@ -315,22 +385,13 @@ fn probe(language: &str, code: &str) -> PathBuf {
 }
 
 /// Runs a probe by hand with `input` and by a timer, and checks what each answer became.
-async fn check_probe(language: &str, plugin: &(Runtime, Arc<Compiled>), plain: &str) {
+async fn check_probe(language: &str, plugin: &Plugin, plain: &str, tick: &str) {
     let manual = |input: &str| Trigger::Manual(serde_json::json!(input).to_string());
     let answer = run(plugin, "run", manual("plain"), Catalog::new(RECORD)).await;
     assert_eq!(answer.unwrap().as_deref(), Some(plain), "{language}");
-    let tick = run(
-        plugin,
-        "run",
-        Trigger::Timer(1_762_700_000_000),
-        Catalog::new(RECORD),
-    )
-    .await;
-    assert_eq!(
-        tick.unwrap().as_deref(),
-        Some("tick 1762700000000"),
-        "{language}"
-    );
+    let timer = Trigger::Timer(1_762_700_000_000);
+    let answer = run(plugin, "run", timer, Catalog::new(RECORD)).await;
+    assert_eq!(answer.unwrap().as_deref(), Some(tick), "{language}");
     for (input, kind) in [
         ("retry", FailureKind::Retryable),
         ("missing", FailureKind::Retryable),
@@ -352,7 +413,7 @@ const JAVASCRIPT_PROBE: &str = r#"import { get } from "aruna:plugin/metadata-rea
 
 const handlers = {
   async run(ctx, event) {
-    if (event.kind === "timer") return `tick ${event.tick}`;
+    if (event.kind === "timer") return { tick: event.tick };
     if (event.input === "retry") throw { kind: "retryable", message: "try later" };
     if (event.input !== "plain") return get(event.input).json;
     await Promise.resolve();
@@ -369,7 +430,7 @@ from wit_world.imports import metadata_read, types
 @handler
 def run(ctx, event):
     if event["kind"] == "timer":
-        return f"tick {event['tick']}"
+        return {"tick": event["tick"]}
     if event["input"] == "retry":
         raise Err(types.Failure(types.FailureKind.RETRYABLE, "try later"))
     if event["input"] != "plain":
@@ -402,7 +463,8 @@ async fn announces_python() {
 async fn probes_javascript() {
     if available("javascript", "npx") {
         let plugin = build(probe("javascript", JAVASCRIPT_PROBE)).await;
-        check_probe("javascript", &plugin, "awaited").await;
+        let tick = r#"{"tick":"1762700000000"}"#;
+        check_probe("javascript", &plugin, "awaited", tick).await;
     }
 }
 
@@ -410,6 +472,20 @@ async fn probes_javascript() {
 async fn probes_python() {
     if available("python", "uv") {
         let plugin = build(probe("python", PYTHON_PROBE)).await;
-        check_probe("python", &plugin, "plain").await;
+        check_probe("python", &plugin, "plain", r#"{"tick": 1762700000000}"#).await;
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn kills_stuck_builds() {
+    // A toolchain that never ends is killed with its process group once the deadline passes.
+    let project = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stuck");
+    std::fs::create_dir_all(&project).unwrap();
+    let manifest = "name = \"stuck\"\nversion = \"0.1.0\"\n\n[build]\n\
+                    command = [\"sleep\", \"600\"]\noutput = \"plugin.wasm\"\n";
+    std::fs::write(project.join("plugin.toml"), manifest).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let built = build_child(&project, deadline).await;
+    assert!(built.is_err_and(|why| why.contains("deadline")));
 }
