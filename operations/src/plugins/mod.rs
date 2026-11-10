@@ -7,6 +7,7 @@ pub mod artifacts;
 pub mod copies;
 pub mod grants;
 pub mod install;
+pub mod lifecycle;
 pub mod publish;
 pub mod records;
 pub mod settings;
