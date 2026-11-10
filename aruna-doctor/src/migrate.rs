@@ -31,7 +31,7 @@ use aruna_core::realm_vault::RealmVaultRecord;
 use aruna_core::secrets::SecretRecord;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
 use aruna_core::structs::execution::email::RealmEmailProfile;
-use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
+use aruna_core::structs::execution::harvest::{HarvestSource, RepositoryConnectorSecret};
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
@@ -183,6 +183,9 @@ pub struct MigrateOutput {
     /// Admin audit rows from before their newest optional fields, which gain them as empty.
     pub audit_rows_scanned: usize,
     pub audit_rows_rewritten: usize,
+    /// Harvest sources from before the last started job, which gain none.
+    pub harvest_sources_scanned: usize,
+    pub harvest_sources_rewritten: usize,
     /// Rows of those keyspaces that match no known shape, left unchanged, as
     /// `keyspace/key: reason`.
     pub unknown_rows: Vec<String>,
@@ -272,6 +275,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let root_rows = db.keyspace(ROOT_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
     let snapshot_rows = db.keyspace(NODE_STATS_KEYSPACE, KeyspaceCreateOptions::default)?;
     let audit_rows = db.keyspace(trailing::AUDIT.0, KeyspaceCreateOptions::default)?;
+    let harvest_rows = db.keyspace(trailing::HARVEST.0, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
     let mut evidence = families::Evidence::default();
@@ -465,6 +469,12 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         trailing::AUDIT,
         &mut unknown_rows,
     )?;
+    let harvests = trailing::missing_options::<HarvestSource>(
+        &db,
+        &harvest_rows,
+        trailing::HARVEST,
+        &mut unknown_rows,
+    )?;
     let vault_rows = db.keyspace(NODE_VAULT_KEYSPACE, KeyspaceCreateOptions::default)?;
     let mut moves = Vec::new();
     for moved in vault::MOVED_KEYSPACES {
@@ -498,6 +508,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&owner_rows, &stale.owner_writes),
         (&cleanup_rows, &old_uploads.blob_deletes),
         (&audit_rows, &audits.rows),
+        (&harvest_rows, &harvests.rows),
     ]
     .into_iter()
     .chain(
@@ -623,6 +634,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         stale_rows_deleted: counts(stale_rows.iter().map(|(_, name, keys)| (*name, keys.len()))),
         audit_rows_scanned: audits.scanned,
         audit_rows_rewritten: audits.rows.len(),
+        harvest_sources_scanned: harvests.scanned,
+        harvest_sources_rewritten: harvests.rows.len(),
         unknown_rows,
     })
 }

@@ -4,7 +4,7 @@
 
 use super::{Rewrites, row_note};
 use crate::explorer::ExplorerError;
-use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
+use aruna_core::keyspaces::{ADMIN_AUDIT_KEYSPACE, HARVEST_SOURCE_KEYSPACE};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::de::DeserializeOwned;
 
@@ -13,6 +13,8 @@ pub(super) type Added = (&'static str, usize);
 
 /// Admin audit rows before `secret`.
 pub(super) const AUDIT: Added = (ADMIN_AUDIT_KEYSPACE, 1);
+/// Harvest sources before `last_job`.
+pub(super) const HARVEST: Added = (HARVEST_SOURCE_KEYSPACE, 1);
 
 /// Rows of `T` that lack trailing optional fields gain them as `None`; current rows stay as
 /// they are. Rows that match no shape are added to `unknown` and left unchanged.
@@ -53,12 +55,14 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::secrets::{SecretName, SecretScope};
+    use aruna_core::structs::execution::harvest::{HarvestSelector, HarvestSource};
     use aruna_core::structs::identity::admin_audit::{
         AdminAuditAction, AdminAuditRecord, SecretAudit,
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::GroupId;
     use serde::{Deserialize, Serialize};
+    use std::time::{Duration, UNIX_EPOCH};
     use ulid::Ulid;
 
     /// An admin audit row as stored before `secret`.
@@ -116,6 +120,41 @@ mod tests {
         assert_eq!(stored[b"broken".as_slice()], vec![0xff; 3]);
         let again = migrate_output(database).expect("migration repeats");
         assert_eq!(again.audit_rows_rewritten, 0);
+    }
+
+    #[test]
+    fn harvest_gains_job() {
+        let realm = RealmId::from_bytes([1; 32]);
+        let source = HarvestSource::new(
+            Ulid::from_parts(1, 1),
+            Ulid::from_parts(2, 2),
+            Ulid::from_parts(3, 3),
+            "oai".to_string(),
+            "/harvest".to_string(),
+            HarvestSelector {
+                set: Some("set".to_string()),
+                metadata_prefix: None,
+            },
+            Some(60_000),
+            UNIX_EPOCH + Duration::from_secs(5),
+            UserId::local(Ulid::from_parts(4, 4), realm),
+        );
+        let current = source.to_bytes().expect("source encodes");
+        // The row ends with `last_job: None`, one zero byte the old shape lacked.
+        let old = current[..current.len() - 1].to_vec();
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("db");
+        let database = path.to_str().expect("path");
+        write(
+            &path,
+            HARVEST_SOURCE_KEYSPACE,
+            vec![(b"old".as_slice(), old)],
+        );
+        let output = migrate_output(database).expect("migration runs");
+        assert_eq!(output.harvest_sources_rewritten, 1);
+        let stored = read(&path, HARVEST_SOURCE_KEYSPACE);
+        let migrated = HarvestSource::from_bytes(&stored[b"old".as_slice()]).expect("decodes");
+        assert_eq!(migrated, source);
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
