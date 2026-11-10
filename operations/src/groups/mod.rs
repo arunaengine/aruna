@@ -30,6 +30,10 @@ use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use byteview::ByteView;
 
+/// Presence refreshes, node-info heartbeats, placement timers and synced realm config write while
+/// a group change is in flight; a caller must not see their SSI conflict as a failure.
+pub(crate) const CONFLICT_RETRIES: u8 = 5;
+
 pub(crate) fn parse_auth_record(
     value: Option<ByteView>,
 ) -> Result<Option<GroupAuthorizationDocument>, ConversionError> {

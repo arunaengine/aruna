@@ -58,6 +58,7 @@ pub struct AddRoleOperation {
     /// transaction.
     fence: crate::placement::fence::WriteFence,
     state: AddRoleState,
+    conflicts: u8,
     output: Option<Result<(Group, GroupAuthorizationDocument), AddRoleError>>,
     narrowed: bool,
 }
@@ -191,6 +192,7 @@ impl AddRoleOperation {
             input,
             fence: Default::default(),
             state: AddRoleState::Init,
+            conflicts: 0,
             output: None,
             narrowed: false,
         }
@@ -814,10 +816,25 @@ impl AddRoleOperation {
 
     fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
+            if error == StorageError::TransactionConflict
+                && matches!(self.state, AddRoleState::CommitTransaction { .. })
+                && self.conflicts < super::CONFLICT_RETRIES
+            {
+                return Err(self.restart_after_conflict());
+            }
             return Err(self.fail(error.into()));
         }
 
         Ok(event)
+    }
+
+    /// A conflicted commit already discarded its transaction, so the retry
+    /// opens a fresh one and rereads every row, including the realm config.
+    fn restart_after_conflict(&mut self) -> Effects {
+        self.conflicts += 1;
+        self.fence = Default::default();
+        self.narrowed = false;
+        self.start()
     }
 }
 
@@ -1061,6 +1078,7 @@ pub mod test {
     };
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
@@ -1172,6 +1190,72 @@ pub mod test {
                 .collect(),
             other => panic!("unexpected storage event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn retries_commit_conflict() {
+        let realm_id = RealmId::from_bytes([5u8; 32]);
+        let group_id = Ulid::from_bytes([6u8; 16]);
+        let role_id = Ulid::from_bytes([7u8; 16]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([9u8; 16]), realm_id),
+            realm_id,
+        };
+        let group = Group {
+            display_name: "Test group".to_string(),
+            group_id,
+            realm_id,
+            roles: HashSet::new(),
+            owner: actor.user_id,
+        };
+        let auth_doc = GroupAuthorizationDocument {
+            group_id,
+            policies: Vec::new(),
+            roles: HashMap::new(),
+        };
+        let mut operation = AddRoleOperation::new(AddRoleConfig {
+            auth_context: auth_context(&actor),
+            actor,
+            realm_id,
+            group_id,
+            role: Role {
+                role_id,
+                name: "steward".to_string(),
+                permissions: HashMap::from([(
+                    format!("/{realm_id}/g/{group_id}/datasets"),
+                    Permission::READ,
+                )]),
+                assigned_users: HashSet::new(),
+            },
+        });
+        let commit = |operation: &mut AddRoleOperation| {
+            operation.narrowed = true;
+            operation.state = AddRoleState::CommitTransaction {
+                txn_id: TxnId::generate(),
+                group: group.clone(),
+                auth_doc: auth_doc.clone(),
+                admin_outbox_written: true,
+                new_members: Vec::new(),
+            };
+            operation.step(Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }))
+        };
+
+        for _ in 0..crate::groups::CONFLICT_RETRIES {
+            let effects = commit(&mut operation);
+            assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+            assert_eq!(operation.state, AddRoleState::Auth);
+            assert!(!operation.narrowed);
+        }
+        commit(&mut operation);
+        assert_eq!(
+            operation.finalize(),
+            Err(AddRoleError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
     }
 
     #[test]

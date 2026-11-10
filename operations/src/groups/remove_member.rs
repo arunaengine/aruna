@@ -53,6 +53,7 @@ pub struct RemoveFromOperation {
     /// transaction.
     fence: crate::placement::fence::WriteFence,
     state: RemoveFromState,
+    conflicts: u8,
     output: Option<Result<GroupAuthorizationDocument, RemoveFromError>>,
 }
 
@@ -152,6 +153,7 @@ impl RemoveFromOperation {
             input,
             fence: Default::default(),
             state: RemoveFromState::Init,
+            conflicts: 0,
             output: None,
         }
     }
@@ -626,10 +628,24 @@ impl RemoveFromOperation {
 
     fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
+            if error == StorageError::TransactionConflict
+                && matches!(self.state, RemoveFromState::CommitTransaction { .. })
+                && self.conflicts < super::CONFLICT_RETRIES
+            {
+                return Err(self.restart_after_conflict());
+            }
             return Err(self.fail(error.into()));
         }
 
         Ok(event)
+    }
+
+    /// A conflicted commit already discarded its transaction, so the retry
+    /// opens a fresh one and rereads every row, including the realm config.
+    fn restart_after_conflict(&mut self) -> Effects {
+        self.conflicts += 1;
+        self.fence = Default::default();
+        self.start()
     }
 }
 
@@ -846,6 +862,7 @@ pub mod test {
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
     use aruna_core::operation::Operation;
@@ -869,7 +886,9 @@ pub mod test {
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
-    use crate::groups::remove_member::{RemoveFromError, RemoveFromInput, RemoveFromOperation};
+    use crate::groups::remove_member::{
+        RemoveFromError, RemoveFromInput, RemoveFromOperation, RemoveFromState,
+    };
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
     async fn test_context() -> (DriverContext, NetHandle, TempDir) {
@@ -957,6 +976,67 @@ pub mod test {
 
         assert!(operation.start().is_empty());
         assert_eq!(operation.finalize(), Err(RemoveFromError::InvalidUserId));
+    }
+
+    #[test]
+    fn retries_commit_conflict() {
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::from_bytes([7u8; 16]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([9u8; 16]), realm_id),
+            realm_id,
+        };
+        let auth_doc = GroupAuthorizationDocument {
+            group_id,
+            policies: Vec::new(),
+            roles: HashMap::new(),
+        };
+        let input = RemoveFromInput {
+            actor,
+            group_id,
+            user_id: UserId::local(Ulid::from_bytes([10u8; 16]), realm_id),
+            role_ids: None,
+        };
+        let conflict = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            })
+        };
+        let mut operation = RemoveFromOperation::new(input.clone());
+        let commit = |operation: &mut RemoveFromOperation| {
+            operation.state = RemoveFromState::CommitTransaction {
+                txn_id: TxnId::generate(),
+                auth_doc: auth_doc.clone(),
+                admin_outbox_written: true,
+                was_member: true,
+            };
+            operation.step(conflict())
+        };
+
+        for _ in 0..crate::groups::CONFLICT_RETRIES {
+            let effects = commit(&mut operation);
+            assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+            assert_eq!(operation.state, RemoveFromState::Auth);
+        }
+        commit(&mut operation);
+        assert_eq!(
+            operation.finalize(),
+            Err(RemoveFromError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
+
+        // Before the commit the transaction is still open, so a conflict aborts it.
+        let mut operation = RemoveFromOperation::new(input);
+        let txn_id = TxnId::generate();
+        operation.state = RemoveFromState::ReadAdminState { txn_id };
+        let effects = operation.step(conflict());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })] if *id == txn_id
+        ));
+        assert_eq!(operation.state, RemoveFromState::Error);
     }
 
     #[test]

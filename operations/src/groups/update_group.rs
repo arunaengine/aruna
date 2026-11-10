@@ -66,6 +66,7 @@ pub struct UpdateGroupOperation {
     /// Bucket the group rows publish onto, read inside the write transaction.
     fence: crate::placement::fence::WriteFence,
     state: UpdateGroupState,
+    conflicts: u8,
     output: Option<Result<Group, UpdateGroupError>>,
 }
 
@@ -135,8 +136,17 @@ impl UpdateGroupOperation {
             txn_id: None,
             fence: Default::default(),
             state: UpdateGroupState::Init,
+            conflicts: 0,
             output: None,
         }
+    }
+
+    /// A conflicted commit already discarded its transaction, so the retry
+    /// opens a fresh one and rereads every row, including the realm config.
+    fn restart_after_conflict(&mut self) -> Effects {
+        self.conflicts += 1;
+        self.fence = Default::default();
+        self.start()
     }
 
     fn admin_change(&self) -> Result<AdminDocumentOperation, UpdateGroupError> {
@@ -461,6 +471,11 @@ impl Operation for UpdateGroupOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
+                    if error == StorageError::TransactionConflict
+                        && self.conflicts < super::CONFLICT_RETRIES
+                    {
+                        return self.restart_after_conflict();
+                    }
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
@@ -518,11 +533,12 @@ fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentState) {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation};
+    use super::{UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, UpdateGroupState};
     use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
         DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
@@ -759,6 +775,34 @@ mod pure_tests {
             Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
         ));
         assert_eq!(operation.finalize(), Err(UpdateGroupError::GroupNotFound));
+    }
+
+    #[test]
+    fn retries_commit_conflict() {
+        let mut operation = UpdateGroupOperation::new(config("Platform"));
+        let commit = |operation: &mut UpdateGroupOperation| {
+            operation.txn_id = Some(TxnId::generate());
+            operation.state = UpdateGroupState::CommitTransaction {
+                group: stored_group(),
+            };
+            operation.step(Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }))
+        };
+
+        for _ in 0..crate::groups::CONFLICT_RETRIES {
+            let effects = commit(&mut operation);
+            assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+            assert_eq!(operation.state, UpdateGroupState::AuthGroupAdmin);
+            assert_eq!(operation.txn_id, None);
+        }
+        assert!(commit(&mut operation).is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(UpdateGroupError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
     }
 
     #[test]

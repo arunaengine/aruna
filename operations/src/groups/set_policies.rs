@@ -55,6 +55,7 @@ pub struct SetGroupOperation {
     /// transaction.
     fence: crate::placement::fence::WriteFence,
     state: SetGroupState,
+    conflicts: u8,
     output: Option<Result<GroupAuthorizationDocument, SetGroupError>>,
 }
 
@@ -121,8 +122,17 @@ impl SetGroupOperation {
             txn_id: None,
             fence: Default::default(),
             state: SetGroupState::Init,
+            conflicts: 0,
             output: None,
         }
+    }
+
+    /// A conflicted commit already discarded its transaction, so the retry
+    /// opens a fresh one and rereads every row, including the realm config.
+    fn restart_after_conflict(&mut self) -> Effects {
+        self.conflicts += 1;
+        self.fence = Default::default();
+        self.start()
     }
 
     fn document_ref(&self) -> DocumentTarget {
@@ -433,6 +443,11 @@ impl Operation for SetGroupOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
+                    if error == StorageError::TransactionConflict
+                        && self.conflicts < super::CONFLICT_RETRIES
+                    {
+                        return self.restart_after_conflict();
+                    }
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
@@ -489,7 +504,7 @@ fn apply_reducer_policies(
 
 #[cfg(test)]
 mod tests {
-    use super::{SetGroupConfig, SetGroupError, SetGroupOperation};
+    use super::{SetGroupConfig, SetGroupError, SetGroupOperation, SetGroupState};
     use crate::driver::{DriverContext, drive};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
@@ -501,7 +516,9 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::request_policy::RequestPolicy;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
+    use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_core::types::TxnId;
     use aruna_storage::storage::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -704,6 +721,57 @@ mod tests {
         .await
         .unwrap();
         assert!(auth_doc.policies.is_empty());
+    }
+
+    #[test]
+    fn retries_commit_conflict() {
+        let realm_id = RealmId([24u8; 32]);
+        let actor = actor(realm_id);
+        let group_id = Ulid::from_bytes([10u8; 16]);
+        let config = group_config(&actor, group_id, Vec::new(), None);
+        let conflict = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            })
+        };
+        let mut operation = SetGroupOperation::new(config.clone());
+        let commit = |operation: &mut SetGroupOperation| {
+            operation.txn_id = Some(TxnId::generate());
+            operation.state = SetGroupState::CommitTransaction {
+                document: GroupAuthorizationDocument {
+                    group_id,
+                    policies: Vec::new(),
+                    roles: Default::default(),
+                },
+            };
+            operation.step(conflict())
+        };
+
+        for _ in 0..crate::groups::CONFLICT_RETRIES {
+            let effects = commit(&mut operation);
+            assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+            assert_eq!(operation.state, SetGroupState::Auth);
+            assert_eq!(operation.txn_id, None);
+        }
+        assert!(commit(&mut operation).is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(SetGroupError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
+
+        // Before the commit the transaction is still open, so a conflict aborts it.
+        let mut operation = SetGroupOperation::new(config);
+        let txn_id = TxnId::generate();
+        operation.txn_id = Some(txn_id);
+        operation.state = SetGroupState::ReadCurrent;
+        let effects = operation.step(conflict());
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })] if *id == txn_id
+        ));
+        assert_eq!(operation.state, SetGroupState::Error);
     }
 
     #[test]
