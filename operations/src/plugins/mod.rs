@@ -4,6 +4,7 @@
 
 pub mod account;
 pub mod artifacts;
+pub mod check;
 pub mod copies;
 pub mod grants;
 pub mod install;
