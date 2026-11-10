@@ -321,3 +321,7 @@ pub(crate) async fn write_record(
     drive(write, ctx).await?;
     Ok(install)
 }
+
+#[cfg(test)]
+#[path = "install_tests.rs"]
+mod tests;
