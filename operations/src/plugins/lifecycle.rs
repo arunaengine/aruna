@@ -241,3 +241,7 @@ async fn commit(
     let audit = AdminAuditRecord::for_install(action, actor.user_id, &next);
     write_record(ctx, actor, auth, Some(current.revision), next, Some(audit)).await
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod tests;
