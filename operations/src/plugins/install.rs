@@ -1,6 +1,5 @@
-//! Installs a published plugin into a group. The record is written `preparing` first, then the
-//! account and its role are made right, and activation is the last write. Every step checks the
-//! current state, so a retry or a restart with the same install id resumes.
+//! Installs a published plugin into a group: the record `preparing` first, then account and role,
+//! activation last. Each step checks current state, so a retry with the same id resumes.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
