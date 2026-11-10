@@ -511,6 +511,14 @@ pub const NODE_VAULT_KEYSPACE: &str = "node_vault";
 pub const NODE_SECRETS_KEYSPACE: &str = "node_secrets";
 /// Published plugin artifacts by digest bytes. Management nodes keep every published one.
 pub const PLUGIN_ARTIFACT_KEYSPACE: &str = "plugin_artifacts";
+/// Runs of the installs this node receives, by install and run id, and their timer rows.
+pub const PLUGIN_RUNS_KEYSPACE: &str = "plugin_runs";
+/// Unfinished runs of the installs this node receives, by install and run id.
+pub const PLUGIN_QUEUE_KEYSPACE: &str = "plugin_queue";
+/// Mutating plugin calls by run and call ordinal, written before their effects.
+pub const PLUGIN_INTENTS_KEYSPACE: &str = "plugin_intents";
+/// Private plugin state by install and key, with each install's byte count.
+pub const PLUGIN_STATE_KEYSPACE: &str = "plugin_state";
 /// The one row of `NODE_STATE_KEYSPACE` that holds the node's identity.
 pub const NODE_STATE_KEY: &[u8] = b"node_state";
 /// Realm signing key a promotion handed to this node; its next start moves it into the identity.
@@ -805,6 +813,10 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NODE_VAULT_KEYSPACE,
     NODE_SECRETS_KEYSPACE,
     PLUGIN_ARTIFACT_KEYSPACE,
+    PLUGIN_RUNS_KEYSPACE,
+    PLUGIN_QUEUE_KEYSPACE,
+    PLUGIN_INTENTS_KEYSPACE,
+    PLUGIN_STATE_KEYSPACE,
     ONBOARDING_KEYSPACE,
     DHT_KEYSPACE,
     CRAQLE_TERMS_KEYSPACE,

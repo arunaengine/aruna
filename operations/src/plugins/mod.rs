@@ -11,7 +11,9 @@ pub mod lifecycle;
 pub mod publish;
 pub mod receiver;
 pub mod records;
+pub mod runs;
 pub mod settings;
+pub mod store;
 
 use serde::{Deserialize, Serialize};
 
