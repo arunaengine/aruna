@@ -38,6 +38,26 @@ pub struct PortalConfig {
     /// The registry the portal lists while the realm has no federation settings.
     pub registry_url: Option<String>,
     pub login: Option<PortalLogin>,
+    /// False hides the landing page; served as `landing: false`.
+    pub landing: bool,
+    /// The deployment's legal documents in display order, served as `legal`.
+    pub legal: Vec<LegalDocument>,
+}
+
+/// One legal document: a label and either an external page or Markdown text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LegalDocument {
+    pub label: String,
+    #[serde(flatten)]
+    pub source: LegalSource,
+}
+
+/// Served as `url` or `markdown` beside the label.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LegalSource {
+    Url(String),
+    Markdown(String),
 }
 
 /// Login choices the portal offers in its login chooser, served unchanged as `login`.
@@ -83,6 +103,8 @@ struct PortalState {
     api_base_url: Arc<str>,
     registry_url: Option<String>,
     login: Option<PortalLogin>,
+    landing: bool,
+    legal: Arc<[LegalDocument]>,
 }
 
 pub fn router(state: Arc<ServerState>, config: PortalConfig) -> Router {
@@ -100,6 +122,8 @@ pub fn router(state: Arc<ServerState>, config: PortalConfig) -> Router {
             api_base_url: Arc::from(api_base_url),
             registry_url: config.registry_url,
             login: config.login,
+            landing: config.landing,
+            legal: Arc::from(config.legal),
         })
 }
 
@@ -130,6 +154,10 @@ struct PortalRuntimeConfig<'a> {
     registry_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     login: Option<&'a PortalLogin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    landing: Option<bool>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    legal: &'a [LegalDocument],
 }
 
 async fn portal_config(State(state): State<PortalState>) -> Response {
@@ -150,12 +178,14 @@ async fn portal_config(State(state): State<PortalState>) -> Response {
         Err(GetConfigError::DocumentNotFound) => state.registry_url.clone(),
         Err(error) => return ServerError::InternalError(error.to_string()).into_response(),
     };
-    Json(PortalRuntimeConfig {
+    let config = Json(PortalRuntimeConfig {
         api_base_url: &state.api_base_url,
         registry_url,
         login: state.login.as_ref(),
-    })
-    .into_response()
+        landing: (!state.landing).then_some(false),
+        legal: &state.legal,
+    });
+    ([(header::CACHE_CONTROL, NO_CACHE)], config).into_response()
 }
 
 async fn realm_descriptor(State(state): State<PortalState>) -> Response {
@@ -277,7 +307,7 @@ impl IntoResponse for PortalServeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{IMMUTABLE_CACHE, NO_CACHE, PortalConfig, serve_portal_request};
+    use super::{IMMUTABLE_CACHE, LegalSource, NO_CACHE, PortalConfig, serve_portal_request};
     use crate::cors::CorsConfig;
     use crate::csp::PortalCspConfig;
     use crate::server::state::{PortalStatus, ServerState};
@@ -399,6 +429,8 @@ mod tests {
                 csp: PortalCspConfig::new(vec!["https://peer.test/".to_string()]),
                 registry_url: None,
                 login: None,
+                landing: true,
+                legal: Vec::new(),
             },
         );
 
@@ -606,6 +638,8 @@ mod tests {
                 csp: PortalCspConfig::new(Vec::new()),
                 registry_url: None,
                 login: Some(login),
+                landing: true,
+                legal: Vec::new(),
             },
         );
 
@@ -624,6 +658,51 @@ mod tests {
                 ],
                 "accountUrl": "https://idp.example.org/account"
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn serves_legal_documents() {
+        let tempdir = tempdir().unwrap();
+        let (state, _state_dir) = setup_state().await;
+        std::fs::write(tempdir.path().join("index.html"), "<html>portal</html>").unwrap();
+        enable_portal(&state, tempdir.path()).await;
+        let document = |label: &str, source| super::LegalDocument {
+            label: label.to_string(),
+            source,
+        };
+        let router = super::router(
+            state,
+            PortalConfig {
+                api_public_url: TEST_API_URL.to_string(),
+                csp: PortalCspConfig::new(Vec::new()),
+                registry_url: None,
+                login: None,
+                landing: false,
+                legal: vec![
+                    document(
+                        "Imprint",
+                        LegalSource::Url("https://example.org/imprint".to_string()),
+                    ),
+                    document("Privacy", LegalSource::Markdown("# Privacy\n".to_string())),
+                ],
+            },
+        );
+
+        let response = router
+            .oneshot(request(Method::GET, "/portal-config.json"))
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[header::CACHE_CONTROL], NO_CACHE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["landing"], serde_json::json!(false));
+        assert_eq!(
+            config["legal"],
+            serde_json::json!([
+                {"label": "Imprint", "url": "https://example.org/imprint"},
+                {"label": "Privacy", "markdown": "# Privacy\n"}
+            ])
         );
     }
 
@@ -660,6 +739,8 @@ mod tests {
                 csp: PortalCspConfig::new(Vec::new()),
                 registry_url: Some("https://default.example.org/".to_string()),
                 login: None,
+                landing: true,
+                legal: Vec::new(),
             },
         );
         assert_eq!(

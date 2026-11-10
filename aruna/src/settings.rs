@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use aruna_api::portal::PortalLogin;
+use aruna_api::portal::{LegalDocument, LegalSource, PortalLogin};
 use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::federation::valid_federation_url;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -626,6 +626,8 @@ fn portal_config_env(env: &dyn SettingsEnv) -> Result<PortalConfig, SetupError> 
                 },
                 socket_addr,
                 login: portal_login_env(env)?,
+                landing: portal_landing_env(env)?,
+                legal: portal_legal_env(env)?,
             })
         }
         _ => Err(invalid_config_value(
@@ -677,6 +679,70 @@ fn portal_login_env(env: &dyn SettingsEnv) -> Result<Option<PortalLogin>, SetupE
         }
     }
     Ok(Some(login))
+}
+
+/// `PORTAL_LANDING` keeps (`enabled`, the default) or hides (`disabled`) the landing page.
+fn portal_landing_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
+    const KEY: &str = "PORTAL_LANDING";
+    let Some(value) = optional_nonempty_env(env, KEY)? else {
+        return Ok(true);
+    };
+    match normalize_env_value(&value).as_str() {
+        "enabled" => Ok(true),
+        "disabled" => Ok(false),
+        _ => Err(invalid_config_value(
+            KEY,
+            value,
+            "expected enabled or disabled",
+        )),
+    }
+}
+
+/// One `PORTAL_LEGAL` entry as the operator writes it.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegalEntry {
+    label: String,
+    url: Option<String>,
+    file: Option<PathBuf>,
+}
+
+/// `PORTAL_LEGAL` lists the legal documents as JSON; each `file` is read once, at startup.
+fn portal_legal_env(env: &dyn SettingsEnv) -> Result<Vec<LegalDocument>, SetupError> {
+    const KEY: &str = "PORTAL_LEGAL";
+    let Some(value) = optional_nonempty_env(env, KEY)? else {
+        return Ok(Vec::new());
+    };
+    let entries: Vec<LegalEntry> = serde_json::from_str(&value)
+        .map_err(|error| invalid_config_value(KEY, value.clone(), error))?;
+    entries
+        .into_iter()
+        .map(|entry| {
+            legal_document(entry).map_err(|error| invalid_config_value(KEY, value.clone(), error))
+        })
+        .collect()
+}
+
+fn legal_document(entry: LegalEntry) -> Result<LegalDocument, String> {
+    if entry.label.trim().is_empty() {
+        return Err("every document needs a label".to_string());
+    }
+    let source = match (entry.url, entry.file) {
+        // The parser repairs input such as `https:/host`; serve its canonical form, not the input.
+        (Some(url), None) => match reqwest::Url::parse(&url) {
+            Ok(parsed) if parsed.scheme() == "https" => LegalSource::Url(parsed.into()),
+            _ => return Err(format!("url {url} must be an HTTPS URL")),
+        },
+        (None, Some(file)) => match std::fs::read_to_string(&file) {
+            Ok(text) => LegalSource::Markdown(text),
+            Err(error) => return Err(format!("cannot read {}: {error}", file.display())),
+        },
+        _ => return Err(format!("{} needs exactly one of url and file", entry.label)),
+    };
+    Ok(LegalDocument {
+        label: entry.label,
+        source,
+    })
 }
 
 fn optional_nonempty_env(
@@ -1279,6 +1345,7 @@ mod tests {
             socket_addr,
             artifact,
             login,
+            ..
         } = settings.portal
         else {
             panic!("artifact portal must parse");
@@ -1354,6 +1421,106 @@ mod tests {
         ] {
             assert_eq!(invalid_key(login(invalid).unwrap_err()), "PORTAL_LOGIN");
         }
+    }
+
+    fn portal_site(pairs: &[(&str, &str)]) -> Result<(bool, Vec<LegalDocument>), SetupError> {
+        let mut all = vec![
+            ("PORTAL_MODE", "artifact"),
+            ("PORTAL_DIR", "/var/lib/aruna/portal"),
+            ("PORTAL_SOCKET_ADDRESS", "127.0.0.1:8080"),
+            ("API_PUBLIC_URL", "https://api.example"),
+        ];
+        all.extend_from_slice(pairs);
+        parse(&all).map(|settings| match settings.portal {
+            PortalConfig::Artifact { landing, legal, .. } => (landing, legal),
+            PortalConfig::Disabled => panic!("artifact portal must parse"),
+        })
+    }
+
+    #[test]
+    fn portal_landing_parses() {
+        assert!(portal_site(&[]).unwrap().0);
+        assert!(portal_site(&[("PORTAL_LANDING", "")]).unwrap().0);
+        assert!(portal_site(&[("PORTAL_LANDING", "enabled")]).unwrap().0);
+        assert!(!portal_site(&[("PORTAL_LANDING", "Disabled")]).unwrap().0);
+        assert_eq!(
+            invalid_key(portal_site(&[("PORTAL_LANDING", "off")]).unwrap_err()),
+            "PORTAL_LANDING"
+        );
+    }
+
+    #[test]
+    fn portal_legal_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let privacy = dir.path().join("privacy.md");
+        std::fs::write(&privacy, "# Privacy\n").unwrap();
+        let missing = dir.path().join("missing.md");
+        let binary = dir.path().join("binary.md");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+        let valid = format!(
+            r#"[{{"label":"Imprint","url":"https://example.org/imprint"}},
+                {{"label":"Privacy","file":{}}}]"#,
+            serde_json::to_string(&privacy).unwrap()
+        );
+
+        assert!(portal_site(&[]).unwrap().1.is_empty());
+        assert_eq!(
+            portal_site(&[("PORTAL_LEGAL", &valid)]).unwrap().1,
+            vec![
+                LegalDocument {
+                    label: "Imprint".to_string(),
+                    source: LegalSource::Url("https://example.org/imprint".to_string()),
+                },
+                LegalDocument {
+                    label: "Privacy".to_string(),
+                    source: LegalSource::Markdown("# Privacy\n".to_string()),
+                },
+            ]
+        );
+        let both = format!(
+            r#"[{{"label":"Terms","url":"https://example.org/terms","file":{}}}]"#,
+            serde_json::to_string(&privacy).unwrap()
+        );
+        let unread = format!(
+            r#"[{{"label":"Terms","file":{}}}]"#,
+            serde_json::to_string(&missing).unwrap()
+        );
+        let not_text = format!(
+            r#"[{{"label":"Terms","file":{}}}]"#,
+            serde_json::to_string(&binary).unwrap()
+        );
+        let invalid = [
+            "not json",
+            r#"{"label":"Terms","url":"https://example.org/terms"}"#,
+            r#"[{"label":"Terms"}]"#,
+            r#"[{"label":" ","url":"https://example.org/terms"}]"#,
+            r#"[{"label":"Terms","url":"http://example.org/terms"}]"#,
+            r#"[{"label":"Terms","url":"example.org/terms"}]"#,
+            r#"[{"label":"Terms","link":"https://example.org/terms"}]"#,
+            &both,
+            &unread,
+            &not_text,
+        ];
+        for value in invalid {
+            let error = portal_site(&[("PORTAL_LEGAL", value)]).unwrap_err();
+            assert_eq!(invalid_key(error), "PORTAL_LEGAL", "{value}");
+        }
+        let repaired = r#"[{"label":"Privacy","url":"https:/example.org/privacy"}]"#;
+        assert_eq!(
+            portal_site(&[("PORTAL_LEGAL", repaired)]).unwrap().1[0].source,
+            LegalSource::Url("https://example.org/privacy".to_string())
+        );
+    }
+
+    #[test]
+    fn portal_site_ignored() {
+        let settings = parse(&[
+            ("PORTAL_MODE", "disabled"),
+            ("PORTAL_LANDING", "off"),
+            ("PORTAL_LEGAL", "not json"),
+        ])
+        .unwrap();
+        assert!(matches!(settings.portal, PortalConfig::Disabled));
     }
 
     #[test]
