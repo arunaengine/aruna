@@ -39,6 +39,11 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .layer(DefaultBodyLimit::max(MAX_ARTIFACT))
 }
 
+/// A plugin artifact as a request body: the bytes of a WebAssembly component.
+#[derive(ToSchema)]
+#[schema(value_type = String, format = Binary)]
+pub struct ArtifactBody(pub Vec<u8>);
+
 /// One published plugin version, without its manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PluginView {
@@ -105,16 +110,17 @@ management node serves the call and every other node relays it to one.
   answers 503. A realm with one management node keeps one copy.
 - Publishing the same bytes again answers the existing entry, also through another management
   node at the same time. A version is never replaced.
+- Two different artifacts of one version published at the same time through different
+  management nodes can both answer 201; once the nodes sync, that version is hidden until it is
+  published again.
 - The caller's rights are checked before the body is read. Each node spends a bounded amount of
   memory on uploads and answers 503 while that is in use.
 
 **Errors**
 - 400 when the artifact is not a valid plugin.
-- 409 when this version is already published with other bytes, also when two different artifacts
-  of one version are published at the same time: that version stays unpublished until it is
-  published again.
+- 409 when this version is already published with other bytes on this node.
 - 503 when too few current management nodes confirmed a copy, or this node is busy."#,
-    request_body(content = Vec<u8>, content_type = "application/wasm", description = "The plugin artifact"),
+    request_body(content = ArtifactBody, content_type = "application/wasm", description = "The plugin artifact"),
     responses(
         (status = 201, description = "The published version", body = PluginView,
             example = json!({"name": "dataset-announcer", "version": "0.1.0", "title": "Announce new datasets", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "size": 98304, "published_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "published_at_ms": 1762700000000u64})),
@@ -285,6 +291,23 @@ mod tests {
             },
         );
         Request::new(axum::body::Body::from_stream(stream))
+    }
+
+    #[test]
+    fn binary_body() {
+        // The artifact body is declared as a binary string, not as an array of integers.
+        let (_, doc) = router().split_for_parts();
+        let doc = serde_json::to_value(doc).unwrap();
+        let media = &doc["paths"]["/plugins"]["post"]["requestBody"]["content"]["application/wasm"];
+        let schema = match media["schema"]["$ref"].as_str() {
+            Some(reference) => &doc["components"]["schemas"][reference.rsplit('/').next().unwrap()],
+            None => &media["schema"],
+        };
+        assert_eq!(
+            (schema["type"].as_str(), schema["format"].as_str()),
+            (Some("string"), Some("binary")),
+            "{schema}"
+        );
     }
 
     #[tokio::test]
