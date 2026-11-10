@@ -11,9 +11,9 @@ use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::plugins::MAX_ARTIFACT;
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::storage_entries::reducer_state_key;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{CENTRAL_PROVIDER_ID, SESSION_HEADER};
 use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;
@@ -394,14 +394,20 @@ async fn relay(
             Some((name, value))
         })
         .collect();
-    // A plugin artifact is larger than the server body limit, so it brings its own.
+    // An artifact upload is read only for a caller who may publish, within this node's memory.
+    let mut _memory = None;
     let body = if route == "/plugins" {
-        match axum::body::to_bytes(request.into_body(), MAX_ARTIFACT).await {
-            Ok(body) => body,
-            Err(_) => {
-                let message = format!("request body exceeds {} MiB", MAX_ARTIFACT >> 20);
-                return ServerError::PayloadTooLarge(message).into_response();
+        let auth = request
+            .extensions()
+            .get::<Option<AuthContext>>()
+            .cloned()
+            .flatten();
+        match crate::routes::plugins::read_upload(state, auth, request).await {
+            Ok((_, body, memory)) => {
+                _memory = Some(memory);
+                body
             }
+            Err(error) => return error.into_response(),
         }
     } else {
         match Bytes::from_request(request, &()).await {

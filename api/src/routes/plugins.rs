@@ -10,11 +10,12 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::plugins::artifacts::ArtifactError;
+use aruna_operations::plugins::copies::{MemoryPermit, reserve};
 use aruna_operations::plugins::publish::{EntryError, PublishError, publish_plugin};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::http::{StatusCode, header};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -102,12 +103,18 @@ management node serves the call and every other node relays it to one.
   nodes. The version is published only after a majority of management nodes stored it (at
   least two when the realm has two or more); otherwise nothing is published and the call
   answers 503. A realm with one management node keeps one copy.
-- Publishing the same bytes again answers the existing entry. A version is never replaced.
+- Publishing the same bytes again answers the existing entry, also through another management
+  node at the same time. A version is never replaced.
+- The caller's rights are checked before the body is read. Each node spends a bounded amount of
+  memory on uploads and answers 503 while that is in use.
 
 **Errors**
 - 400 when the artifact is not a valid plugin.
-- 409 when this version is already published with other bytes."#,
-    request_body(content = String, content_type = "application/wasm", description = "The plugin artifact"),
+- 409 when this version is already published with other bytes, also when two different artifacts
+  of one version are published at the same time: that version stays unpublished until it is
+  published again.
+- 503 when too few current management nodes confirmed a copy, or this node is busy."#,
+    request_body(content = Vec<u8>, content_type = "application/wasm", description = "The plugin artifact"),
     responses(
         (status = 201, description = "The published version", body = PluginView,
             example = json!({"name": "dataset-announcer", "version": "0.1.0", "title": "Announce new datasets", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "size": 98304, "published_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "published_at_ms": 1762700000000u64})),
@@ -124,21 +131,49 @@ management node serves the call and every other node relays it to one.
 pub async fn publish(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    body: Bytes,
+    request: Request,
 ) -> ServerResult<(StatusCode, Json<PluginView>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-    // Request policies live at this boundary; the operation only checks roles.
-    let path = policy_admin_path(state.get_realm_id());
-    ensure_permission(&state, &auth, path, Permission::WRITE).await?;
+    let (auth, body, _memory) = read_upload(&state, auth, request).await?;
     let actor = Actor {
         node_id: state.get_node_id(),
         user_id: auth.user_id,
         realm_id: state.get_realm_id(),
     };
-    let published = publish_plugin(&state.get_ctx(), actor, auth, body.to_vec())
+    let published = publish_plugin(&state.get_ctx(), actor, auth, Vec::from(body))
         .await
         .map_err(map_publish_error)?;
     Ok((StatusCode::CREATED, Json(published.into())))
+}
+
+/// Reads an artifact upload only after the caller may publish and this node reserved memory for
+/// it; the permit is held until the caller drops it, also when the request is cancelled.
+pub(crate) async fn read_upload(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    request: Request,
+) -> ServerResult<(AuthContext, Bytes, MemoryPermit)> {
+    let auth = require_unrestricted_auth(state, auth)?;
+    // Request policies live at this boundary; the operation only checks roles.
+    let path = policy_admin_path(state.get_realm_id());
+    ensure_permission(state, &auth, path, Permission::WRITE).await?;
+    let too_large =
+        || ServerError::PayloadTooLarge(format!("the artifact exceeds {} MiB", MAX_ARTIFACT >> 20));
+    let declared = (request.headers().get(header::CONTENT_LENGTH))
+        .and_then(|value| value.to_str().ok()?.parse::<usize>().ok());
+    if declared.is_some_and(|length| length > MAX_ARTIFACT) {
+        return Err(too_large());
+    }
+    let busy = || {
+        ServerError::ServiceUnavailableReason(
+            "artifact uploads use this node's memory; retry later".into(),
+        )
+    };
+    let memory = reserve(declared.unwrap_or(MAX_ARTIFACT)).ok_or_else(busy)?;
+    let limit = declared.unwrap_or(MAX_ARTIFACT);
+    let body = axum::body::to_bytes(request.into_body(), limit)
+        .await
+        .map_err(|_| too_large())?;
+    Ok((auth, body, memory))
 }
 
 #[utoipa::path(
@@ -221,9 +256,10 @@ fn map_publish_error(error: PublishError) -> ServerError {
         PublishError::Entry(EntryError::Unauthorized | EntryError::NotManagementNode) => {
             ServerError::Forbidden
         }
-        PublishError::TooFewCopies { .. } | PublishError::Unavailable(_) => {
-            ServerError::ServiceUnavailableReason(error.to_string())
-        }
+        PublishError::TooFewCopies { .. }
+        | PublishError::Entry(EntryError::TooFewCopies { .. })
+        | PublishError::Artifact(ArtifactError::Busy)
+        | PublishError::Unavailable(_) => ServerError::ServiceUnavailableReason(error.to_string()),
         PublishError::Artifact(ArtifactError::Unavailable(_)) => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
@@ -234,8 +270,42 @@ fn map_publish_error(error: PublishError) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::routes::{test_context, test_state, test_storage};
     use aruna_core::UserId;
+    use aruna_core::keys::generate_signing_key;
+    use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
+
+    /// An upload whose body fails the test as soon as anything reads it.
+    fn unread() -> Request {
+        let stream = futures_util::stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<Bytes, std::io::Error>>> {
+                panic!("the body was read before the caller was checked")
+            },
+        );
+        Request::new(axum::body::Body::from_stream(stream))
+    }
+
+    #[tokio::test]
+    async fn checks_before_reading() {
+        let (_dir, storage) = test_storage();
+        let signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        let capabilities = NodeCapabilities::management_node(signing_key).unwrap();
+        let node_id = iroh::SecretKey::generate().public();
+        let context = std::sync::Arc::new(test_context(storage));
+        let state = test_state(context, realm_id, node_id, capabilities).await;
+        let anonymous = read_upload(&state, None, unread()).await;
+        assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+        let stranger = AuthContext {
+            user_id: UserId::local(Ulid::generate(), realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        assert!(read_upload(&state, Some(stranger), unread()).await.is_err());
+    }
 
     fn plugin(name: &str, version: &str) -> PublishedPlugin {
         PublishedPlugin {
