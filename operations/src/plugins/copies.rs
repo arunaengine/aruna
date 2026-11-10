@@ -282,10 +282,14 @@ async fn admit(
     }
 }
 
-/// Digests whose copies stay: published versions.
+/// Digests whose copies stay: published versions and versions an install pins.
 fn published(config: &RealmConfigDocument) -> BTreeSet<&str> {
-    (config.plugins.iter())
-        .map(|plugin| plugin.digest.as_str())
+    let pinned = config
+        .installs
+        .iter()
+        .map(|install| install.digest.as_str());
+    (config.plugins.iter().map(|plugin| plugin.digest.as_str()))
+        .chain(pinned)
         .collect()
 }
 
