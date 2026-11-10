@@ -65,6 +65,7 @@ impl Broker for Recorder {
         self.note("metadata_get");
         match resource {
             "missing" => return Err(HostError::new(ErrorKind::NotFound, "x".repeat(200))),
+            "slow" => tokio::time::sleep(Duration::from_millis(50)).await,
             "block" => {
                 self.blocked.notify_one();
                 std::future::pending::<()>().await;
@@ -535,11 +536,76 @@ async fn wasi_calls_bounded() {
         output(invoke(clock.clone(), Arc::default()).await),
         serde_json::json!(true)
     );
-    let mut counted = clock;
+    let mut counted = random(8);
     counted.limits.calls = 0;
     let ended = invoke(counted, Arc::default()).await;
     assert!(
         matches!(ended, Err(InvokeError::Limit(Limit::Calls))),
         "WASI calls count: {ended:?}"
+    );
+}
+
+#[tokio::test]
+async fn fill_keeps_calls() {
+    // A large fill costs much fuel at once; neither it nor the yields may change the count.
+    for slow in [false, true] {
+        let mut input =
+            serde_json::json!({"call": "fill", "size": 8 << 20, "spin": 50_000_000u64, "logs": 5});
+        if slow {
+            input["slow"] = true.into();
+        }
+        let allowed = 5 + u32::from(slow);
+        let mut exact = probe(input.clone());
+        exact.limits.calls = allowed;
+        assert_eq!(
+            output(invoke(exact, Arc::default()).await),
+            serde_json::json!(1),
+            "slow {slow}"
+        );
+        let mut short = probe(input);
+        short.limits.calls = allowed - 1;
+        let ended = invoke(short, Arc::default()).await;
+        assert!(
+            matches!(ended, Err(InvokeError::Limit(Limit::Calls))),
+            "slow {slow}: {ended:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn streams_charged() {
+    let bounded = |input: serde_json::Value| {
+        let mut run = probe(input);
+        run.limits.bytes = 64 << 10;
+        run
+    };
+    for call in ["write", "zeroes"] {
+        let within = bounded(serde_json::json!({"call": call, "size": 4096, "times": 10}));
+        assert_eq!(
+            output(invoke(within, Arc::default()).await),
+            serde_json::json!(true),
+            "{call}"
+        );
+        let over = bounded(serde_json::json!({"call": call, "size": 4096, "times": 20}));
+        let ended = invoke(over, Arc::default()).await;
+        assert!(
+            matches!(ended, Err(InvokeError::Limit(Limit::Bytes))),
+            "{call}: {ended:?}"
+        );
+    }
+    // Poll lists stay under the store's handle limit; a 1 KiB budget makes 500 entries too many.
+    let polled = |size: u64| {
+        let mut run = probe(serde_json::json!({"call": "poll", "size": size}));
+        run.limits.bytes = 1024;
+        run
+    };
+    assert_eq!(
+        output(invoke(polled(10), Arc::default()).await),
+        serde_json::json!(10)
+    );
+    let ended = invoke(polled(500), Arc::default()).await;
+    assert!(
+        matches!(ended, Err(InvokeError::Limit(Limit::Bytes))),
+        "poll: {ended:?}"
     );
 }

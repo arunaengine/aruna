@@ -26,6 +26,7 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             .unwrap_or_default()
             .to_string()
     };
+    let number = |name: &str| input.get(name).and_then(Value::as_u64).unwrap_or_default();
     let call = text("call");
     Ok(match call.as_str() {
         "settings" => ctx.settings::<Value>()?,
@@ -68,6 +69,41 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             json!(wasi::wasi::random::random::get_random_bytes(len).len())
         }
         "clock" => json!(wasi::wasi::clocks::monotonic_clock::now() > 0),
+        "write" | "zeroes" => {
+            let out = wasi::wasi::cli::stdout::get_stdout();
+            let size = number("size") as usize;
+            let chunk = vec![b'x'; size];
+            for _ in 0..number("times") {
+                let written = match call.as_str() {
+                    "write" => out.blocking_write_and_flush(&chunk),
+                    _ => out.write_zeroes(size as u64),
+                };
+                written.map_err(|_| Error::failed("the stream refused"))?;
+            }
+            json!(true)
+        }
+        "poll" => {
+            // The stream must outlive its pollable, so it is held until the end.
+            let out = wasi::wasi::cli::stdout::get_stdout();
+            let pollable = out.subscribe();
+            let list = vec![&pollable; number("size") as usize];
+            json!(wasi::wasi::io::poll::poll(&list).len())
+        }
+        "fill" => {
+            let mut buffer = vec![0u8; number("size") as usize];
+            black_box(&mut buffer).fill(1);
+            let mut value = 0u64;
+            for _ in 0..number("spin") {
+                value = black_box(value.wrapping_add(1));
+            }
+            if input.get("slow").is_some() {
+                ctx.metadata().get("slow").await?;
+            }
+            for _ in 0..number("logs") {
+                ctx.log(Level::Debug, "after the fill");
+            }
+            json!(buffer[0])
+        }
         "errors" => {
             let mut failed = 0;
             for _ in 0..1000 {

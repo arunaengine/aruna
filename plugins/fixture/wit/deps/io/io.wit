@@ -1,0 +1,30 @@
+// The part of wasi:io the test guest calls; the host provides the whole interfaces.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+package wasi:io@0.2.12;
+
+interface error {
+  resource error;
+}
+
+interface poll {
+  resource pollable;
+  poll: func(in: list<borrow<pollable>>) -> list<u32>;
+}
+
+interface streams {
+  use error.{error};
+  use poll.{pollable};
+
+  variant stream-error {
+    last-operation-failed(error),
+    closed,
+  }
+
+  resource output-stream {
+    blocking-write-and-flush: func(contents: list<u8>) -> result<_, stream-error>;
+    write-zeroes: func(len: u64) -> result<_, stream-error>;
+    subscribe: func() -> pollable;
+  }
+}

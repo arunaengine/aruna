@@ -1,0 +1,10 @@
+// The part of wasi:cli the test guest calls; the host provides the whole interface.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+package wasi:cli@0.2.12;
+
+interface stdout {
+  use wasi:io/streams@0.2.12.{output-stream};
+  get-stdout: func() -> output-stream;
+}
