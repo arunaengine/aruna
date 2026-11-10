@@ -12,6 +12,7 @@ use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::distribution::resolve::version_holders;
 use crate::driver::DriverContext;
 use crate::driver::drive;
+use crate::metadata::materialization_queue::capture_pending;
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::get::GetBucketOperation;
@@ -78,6 +79,14 @@ pub(super) async fn current(
     revision: Option<&MetadataRawRevision>,
     materializing: bool,
 ) -> Result<Option<(Ulid, String)>, GitError> {
+    // A job that published its graph, a late merge too, stores it only when it finishes, so
+    // until then the raw view can be older. A job still waiting for dependencies holds nothing.
+    if !materializing {
+        let captured = capture_pending(&context.storage_handle, document.document_id).await;
+        if captured.map_err(|_| GitError::Unavailable)? {
+            return Ok(None);
+        }
+    }
     let raw = match revision {
         Some(revision) => Some(revision.clone()),
         None => crate::metadata::raw_revision::load_raw_view(context, document.document_id, None)
@@ -962,3 +971,7 @@ fn erased<'a, T>(
 ) -> std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>> {
     Box::pin(future)
 }
+
+#[cfg(test)]
+#[path = "snapshot_tests.rs"]
+mod tests;

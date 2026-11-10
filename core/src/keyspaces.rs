@@ -52,6 +52,8 @@ pub const RAW_BUDGET_KEYSPACE: &str = "metadata_raw_budgets";
 pub const MATERIALIZATION_JOB_KEYSPACE: &str = "metadata_materialization_jobs";
 pub const DOCUMENT_JOB_KEYSPACE: &str = "metadata_materialization_document_jobs";
 pub const DEAD_LETTER_KEYSPACE: &str = "metadata_materialization_dead_letters";
+/// Jobs that published a Git snapshot whose graph their finish batch has not stored yet.
+pub const MATERIALIZATION_CAPTURE_KEYSPACE: &str = "metadata_materialization_captures";
 pub const MATERIALIZATION_PRUNE_KEYSPACE: &str = "metadata_materialization_prunes";
 pub const DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
 /// Reduced distribution records by set id, materialized from their admin reducer state.
@@ -584,6 +586,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     MATERIALIZATION_JOB_KEYSPACE,
     DOCUMENT_JOB_KEYSPACE,
     DEAD_LETTER_KEYSPACE,
+    MATERIALIZATION_CAPTURE_KEYSPACE,
     MATERIALIZATION_PRUNE_KEYSPACE,
     DOCUMENT_STATE_KEYSPACE,
     DISTRIBUTION_KEYSPACE,
