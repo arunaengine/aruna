@@ -197,18 +197,18 @@ pub fn within(pattern: &str, root: &str) -> bool {
     })
 }
 
-/// The role access a permission needs on its patterns.
-fn access(permission: Permission) -> Access {
+/// The accesses a permission's actions need on its patterns, as the plan's table checks them.
+pub fn accesses(permission: Permission) -> &'static [Access] {
     match permission {
-        Permission::MetadataWrite
-        | Permission::ObjectsCopy
-        | Permission::TransfersDownload
-        | Permission::JobsRun => Access::WRITE,
+        Permission::ObjectsCopy => &[Access::READ, Access::WRITE],
+        Permission::MetadataWrite | Permission::TransfersDownload | Permission::JobsRun => {
+            &[Access::WRITE]
+        }
         Permission::MetadataRead
         | Permission::ObjectsRead
         | Permission::TransfersUpload
         | Permission::ConnectionsSend
-        | Permission::SecretsValue => Access::READ,
+        | Permission::SecretsValue => &[Access::READ],
     }
 }
 
@@ -218,7 +218,7 @@ pub fn role_paths(grants: &Grants) -> HashMap<String, Access> {
     for (permission, patterns) in grants {
         for pattern in patterns {
             let held = paths.entry(pattern.clone()).or_insert(Access::READ);
-            if access(*permission) == Access::WRITE {
+            if accesses(*permission).contains(&Access::WRITE) {
                 *held = Access::WRITE;
             }
         }
