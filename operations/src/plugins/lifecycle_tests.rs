@@ -6,10 +6,11 @@
 use super::*;
 use crate::plugins::account::{ensure_role, guard_of};
 use crate::plugins::grants::role_paths;
-use crate::plugins::install::repair_install;
 use crate::plugins::install::tests::Fixture;
+use crate::plugins::install::{repair_install, repair_settled};
 use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation};
 use crate::users::admin_audit::{AuditPageInput, AuditPageOperation};
+use aruna_core::UserId;
 use aruna_core::structs::identity::admin_audit::AuditIndex;
 use aruna_core::structs::identity::auth::{PathRestriction, Permission as Access};
 use aruna_core::time::unix_timestamp_secs;
@@ -333,4 +334,25 @@ async fn keeps_admin_deactivation() {
     drive(stop, ctx).await.unwrap();
     assert!(!repair_install(ctx, node, realm, &installed).await.unwrap());
     assert!(fixture.account(&installed).await.unwrap().is_deactivated());
+}
+
+#[tokio::test]
+async fn repairs_after_failure() {
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let (node, realm) = (actor.node_id, actor.realm_id);
+    let scope = scope_of(realm, &installed);
+    let identity = Identity::of(&installed);
+    teardown(ctx, actor, &auth, &scope, identity, guard_of(&installed))
+        .await
+        .unwrap();
+
+    // The first entry's approving admin holds no rights, so its repair fails; the next still runs.
+    let mut orphaned = installed.clone();
+    orphaned.granted_by = UserId::new(Ulid::from_parts(9, 9), realm);
+    let repaired = repair_settled(ctx, node, realm, &[orphaned, installed.clone()]).await;
+    assert_eq!(repaired, 1);
+    assert!(!fixture.account(&installed).await.unwrap().is_deactivated());
+    assert!(fixture.role(&installed).await.is_some());
 }

@@ -319,17 +319,32 @@ pub async fn reconcile_installs(ctx: &DriverContext) -> Result<usize, InstallErr
     if !is_management(&config, node_id) {
         return Ok(0);
     }
+    Ok(repair_settled(ctx, node_id, realm_id, &config.installs).await)
+}
+
+/// Repairs each settled install; one that fails is logged and the others are still repaired.
+pub(crate) async fn repair_settled(
+    ctx: &DriverContext,
+    node_id: aruna_core::NodeId,
+    realm_id: RealmId,
+    installs: &[PluginInstall],
+) -> usize {
     let mut repaired = 0;
-    for install in &config.installs {
-        let settled = !matches!(
+    for install in installs {
+        if matches!(
             install.state,
             InstallState::Preparing | InstallState::Removing
-        );
-        if settled && repair_install(ctx, node_id, realm_id, install).await? {
-            repaired += 1;
+        ) {
+            continue;
+        }
+        match repair_install(ctx, node_id, realm_id, install).await {
+            Ok(changed) => repaired += usize::from(changed),
+            Err(error) => {
+                warn!(install = %install.install_id, %error, "Could not repair a plugin install");
+            }
         }
     }
-    Ok(repaired)
+    repaired
 }
 
 /// Makes one settled install's account and role match its record again; `true` if it changed.
