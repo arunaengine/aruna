@@ -33,6 +33,7 @@ use thiserror::Error;
 use tracing::{trace, warn};
 use ulid::Ulid;
 
+use super::CONFLICT_RETRIES;
 use crate::groups::update_group::{MAX_NAME_LEN, normalize_group_name};
 use crate::placement::target_placement_ref;
 
@@ -45,10 +46,6 @@ pub struct CreateGroupConfig {
     /// (realm admins are exempt).
     pub owner_cap: Option<u32>,
 }
-
-/// Presence refreshes, node-info heartbeats and placement timers write while a
-/// create is in flight; a caller must not see their SSI conflict as a 409.
-const CONFLICT_RETRIES: u8 = 5;
 
 #[derive(PartialEq)]
 pub struct CreateGroupOperation {

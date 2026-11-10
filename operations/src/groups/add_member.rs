@@ -53,6 +53,7 @@ pub struct AddUserOperation {
     /// transaction.
     fence: crate::placement::fence::WriteFence,
     state: AddUserState,
+    conflicts: u8,
     output: Option<Result<GroupAuthorizationDocument, AddUserError>>,
 }
 
@@ -154,6 +155,7 @@ impl AddUserOperation {
             input,
             fence: Default::default(),
             state: AddUserState::Init,
+            conflicts: 0,
             output: None,
         }
     }
@@ -662,10 +664,24 @@ impl AddUserOperation {
 
     fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
+            if error == StorageError::TransactionConflict
+                && matches!(self.state, AddUserState::CommitTransaction { .. })
+                && self.conflicts < super::CONFLICT_RETRIES
+            {
+                return Err(self.restart_after_conflict());
+            }
             return Err(self.fail(error.into()));
         }
 
         Ok(event)
+    }
+
+    /// A conflicted commit already discarded its transaction, so the retry
+    /// opens a fresh one and rereads every row, including the realm config.
+    fn restart_after_conflict(&mut self) -> Effects {
+        self.conflicts += 1;
+        self.fence = Default::default();
+        self.start()
     }
 }
 
@@ -841,6 +857,7 @@ pub mod test {
     };
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
     use aruna_core::operation::Operation;
@@ -1001,6 +1018,52 @@ pub mod test {
 
         assert!(operation.start().is_empty());
         assert_eq!(operation.finalize(), Err(AddUserError::InvalidUserId));
+    }
+
+    #[test]
+    fn retries_commit_conflict() {
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let group_id = Ulid::from_bytes([7u8; 16]);
+        let actor = Actor {
+            node_id: node(8),
+            user_id: UserId::local(Ulid::from_bytes([9u8; 16]), realm_id),
+            realm_id,
+        };
+        let auth_doc = GroupAuthorizationDocument {
+            group_id,
+            policies: Vec::new(),
+            roles: HashMap::new(),
+        };
+        let mut operation = AddUserOperation::new(AddUserInput {
+            actor,
+            group_id,
+            user_id: UserId::local(Ulid::from_bytes([10u8; 16]), realm_id),
+            role_ids: HashSet::from([Ulid::from_bytes([11u8; 16])]),
+        });
+        let commit = |operation: &mut AddUserOperation| {
+            operation.state = AddUserState::CommitTransaction {
+                txn_id: TxnId::generate(),
+                auth_doc: auth_doc.clone(),
+                admin_outbox_written: true,
+                newly_added: true,
+            };
+            operation.step(Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }))
+        };
+
+        for _ in 0..crate::groups::CONFLICT_RETRIES {
+            let effects = commit(&mut operation);
+            assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+            assert_eq!(operation.state, AddUserState::Auth);
+        }
+        commit(&mut operation);
+        assert_eq!(
+            operation.finalize(),
+            Err(AddUserError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
     }
 
     #[test]
