@@ -23,6 +23,7 @@ pub mod federation;
 pub mod git;
 pub mod identifiers;
 pub mod info;
+pub mod install_changes;
 pub mod link_routes;
 pub mod management_relay;
 pub mod metadata;
@@ -133,6 +134,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(email_profile::router())
         .merge(plugins::router())
         .merge(plugin_installs::router())
+        .merge(install_changes::router())
         .merge(policies::router())
         .merge(portal::router())
         .merge(oidc_providers::router())
