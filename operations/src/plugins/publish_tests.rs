@@ -175,7 +175,7 @@ async fn publishes_after_copies() {
         (plugin.name.as_str(), plugin.size),
         ("fixture", FIXTURE.len() as u64)
     );
-    assert_eq!(published(&ctx).await, [plugin.clone()]);
+    assert_eq!(published(&ctx).await, std::slice::from_ref(&plugin));
     let kept = read_local(&ctx, &plugin.digest).await.unwrap();
     assert_eq!(
         kept.map(|copy| copy.bytes).as_deref(),
