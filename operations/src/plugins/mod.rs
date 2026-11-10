@@ -8,6 +8,7 @@ pub mod check;
 pub mod copies;
 pub mod grants;
 pub mod install;
+pub mod intents;
 pub mod lifecycle;
 pub mod publish;
 pub mod receiver;
