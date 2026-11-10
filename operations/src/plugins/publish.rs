@@ -26,8 +26,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use super::artifacts::{ArtifactError, managers, store_local};
-use super::{ArtifactBytes, copies_needed};
+use super::artifacts::{ArtifactError, chunk_count, chunk_of, managers, store_local};
+use super::copies_needed;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::placement::target_placement_ref;
@@ -103,7 +103,8 @@ pub async fn publish_plugin(
         return Ok(existing);
     }
     store_local(ctx, digest.as_str(), &artifact).await?;
-    let stored = 1 + copy_to_managers(ctx, &config, actor.node_id, artifact).await;
+    let digest = digest.to_string();
+    let stored = 1 + copy_to_managers(ctx, &config, actor.node_id, &digest, &artifact).await;
     let needed = copies_needed(managers(&config).count());
     if stored < needed {
         return Err(PublishError::TooFewCopies { stored, needed });
@@ -137,21 +138,28 @@ async fn copy_to_managers(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: aruna_core::NodeId,
-    artifact: Vec<u8>,
+    digest: &str,
+    artifact: &[u8],
 ) -> usize {
     let Some(metadata) = ctx.metadata_handle.as_ref() else {
         return 0;
     };
     let peers = managers(config).filter(|node| *node != local);
-    let copies = peers.map(|node_id| {
-        let artifact = ArtifactBytes(artifact.clone());
-        async move {
-            let stored = metadata.request_store_artifact(node_id, artifact).await;
-            if let Err(error) = &stored {
-                warn!(%node_id, ?error, "A management node did not store a plugin artifact");
+    let copies = peers.map(|node_id| async move {
+        // Chunks go one after another; the last answer says whether the copy is complete.
+        let mut complete = Ok(false);
+        for index in 0..chunk_count(artifact.len() as u64) {
+            complete = metadata
+                .request_store_artifact(node_id, chunk_of(digest, artifact, index))
+                .await;
+            if complete.is_err() {
+                break;
             }
-            stored.is_ok()
         }
+        if let Err(error) = &complete {
+            warn!(%node_id, ?error, "A management node did not store a plugin artifact");
+        }
+        complete == Ok(true)
     });
     let results = futures_util::future::join_all(copies).await;
     results.into_iter().filter(|stored| *stored).count()

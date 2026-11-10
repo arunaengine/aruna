@@ -1197,13 +1197,13 @@ impl MetadataHandle {
                 let result = Box::pin(served).await;
                 (MetadataTransportMessage::OpenSettingResult { result }, None)
             }
-            MetadataTransportMessage::StoreArtifact { artifact } => {
-                let stored = crate::plugins::artifacts::serve_store(context, peer, artifact);
+            MetadataTransportMessage::StoreArtifact { chunk } => {
+                let stored = crate::plugins::artifacts::serve_store(context, peer, chunk);
                 let result = Box::pin(stored).await;
                 (MetadataTransportMessage::ArtifactStored { result }, None)
             }
-            MetadataTransportMessage::FetchArtifact { digest } => {
-                let fetched = crate::plugins::artifacts::serve_fetch(context, peer, digest);
+            MetadataTransportMessage::FetchArtifact { digest, index } => {
+                let fetched = crate::plugins::artifacts::serve_fetch(context, peer, digest, index);
                 let result = Box::pin(fetched).await;
                 (MetadataTransportMessage::FetchedArtifact { result }, None)
             }

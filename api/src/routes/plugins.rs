@@ -97,7 +97,7 @@ pub struct PluginQuery {
 management node serves the call and every other node relays it to one.
 
 **Behavior**
-- The body is the artifact: a WebAssembly component with its manifest embedded, at most 4 MiB.
+- The body is the artifact: a WebAssembly component with its manifest embedded, at most 64 MiB.
 - The artifact is checked, stored durably on this node and copied to the other management
   nodes. The version is published only after a majority of management nodes stored it (at
   least two when the realm has two or more); otherwise nothing is published and the call
@@ -115,7 +115,7 @@ management node serves the call and every other node relays it to one.
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 409, description = "The version is published with other bytes, or another realm configuration update won the race", body = ErrorResponse),
-        (status = 413, description = "The artifact exceeds 4 MiB", body = ErrorResponse),
+        (status = 413, description = "The artifact exceeds 64 MiB", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
         (status = 503, description = "Too few management nodes stored the artifact, or none was reachable", body = ErrorResponse)
     ),

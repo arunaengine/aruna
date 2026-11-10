@@ -774,13 +774,14 @@ impl MetadataHandle {
         }
     }
 
-    /// Asks the management node `node_id` to keep a plugin artifact durably before publishing.
+    /// Hands the management node `node_id` one chunk of a plugin artifact to keep; `true` once
+    /// it holds the whole, checked artifact.
     pub async fn request_store_artifact(
         &self,
         node_id: NodeId,
-        artifact: crate::plugins::ArtifactBytes,
-    ) -> Result<(), MetadataReadError> {
-        let request = MetadataTransportMessage::StoreArtifact { artifact };
+        chunk: crate::plugins::artifacts::Chunk,
+    ) -> Result<bool, MetadataReadError> {
+        let request = MetadataTransportMessage::StoreArtifact { chunk };
         match send_remote_request(&self.inner, &Span::current(), node_id, request)
             .await
             .map_err(|_| MetadataReadError::Unavailable)?
@@ -790,13 +791,14 @@ impl MetadataHandle {
         }
     }
 
-    /// A published plugin artifact by digest from the management node `node_id`, unchecked.
+    /// One chunk of a published plugin artifact from the management node `node_id`, unchecked.
     pub async fn request_artifact(
         &self,
         node_id: NodeId,
         digest: String,
-    ) -> Result<crate::plugins::ArtifactBytes, MetadataReadError> {
-        let request = MetadataTransportMessage::FetchArtifact { digest };
+        index: u32,
+    ) -> Result<crate::plugins::artifacts::Chunk, MetadataReadError> {
+        let request = MetadataTransportMessage::FetchArtifact { digest, index };
         match send_remote_request(&self.inner, &Span::current(), node_id, request)
             .await
             .map_err(|_| MetadataReadError::Unavailable)?

@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::UserId;
 
-/// Largest artifact a realm admin may publish; it travels whole in one node message.
-pub const MAX_ARTIFACT: usize = 4 << 20;
+/// Largest artifact a realm admin may publish; nodes copy and fetch it in chunks.
+pub const MAX_ARTIFACT: usize = 64 << 20;
 pub const MAX_MANIFEST: usize = 64 * 1024;
 const MAX_NAME: usize = 64;
 

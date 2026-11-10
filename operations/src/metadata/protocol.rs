@@ -680,19 +680,21 @@ pub enum MetadataTransportMessage {
     OpenSettingResult {
         result: Result<aruna_core::compute::SecretBytes, MetadataReadError>,
     },
-    /// A plugin artifact one management node hands another to keep before it is published.
+    /// One chunk of a plugin artifact a management node hands another to keep before publishing.
     StoreArtifact {
-        artifact: crate::plugins::ArtifactBytes,
+        chunk: crate::plugins::artifacts::Chunk,
     },
+    /// `true` once the receiver holds the whole artifact and it checked out.
     ArtifactStored {
-        result: Result<(), MetadataReadError>,
+        result: Result<bool, MetadataReadError>,
     },
-    /// A published plugin artifact by digest, asked of a management node.
+    /// One chunk of a published plugin artifact by digest, asked of a management node.
     FetchArtifact {
         digest: String,
+        index: u32,
     },
     FetchedArtifact {
-        result: Result<crate::plugins::ArtifactBytes, MetadataReadError>,
+        result: Result<crate::plugins::artifacts::Chunk, MetadataReadError>,
     },
 }
 

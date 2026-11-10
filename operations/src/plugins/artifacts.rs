@@ -25,6 +25,8 @@ use crate::metadata::protocol::MetadataReadError;
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::{is_management, node_kind};
 
+/// Bytes of one artifact chunk; node messages stay far below their 16 MiB limit.
+pub const CHUNK: usize = 8 << 20;
 /// How often a management node looks for published artifacts it lacks.
 const REPAIR_INTERVAL: Duration = Duration::from_secs(600);
 
@@ -40,14 +42,134 @@ pub enum ArtifactError {
     Storage(String),
 }
 
-/// Reads this node's copy, if it has one.
+/// Reads this node's copy, if it is complete: its completion row names the length, and the
+/// chunks below it hold the bytes.
 pub async fn read_local(
     ctx: &DriverContext,
     digest: &str,
 ) -> Result<Option<Vec<u8>>, ArtifactError> {
+    let Some(total) = read_total(ctx, digest).await? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::with_capacity(total as usize);
+    for index in 0..chunk_count(total) {
+        let chunk = read_row(ctx, chunk_key(digest, index)).await?;
+        bytes.extend(chunk.ok_or_else(|| storage("a chunk of a complete copy is missing"))?);
+    }
+    match bytes.len() as u64 == total {
+        true => Ok(Some(bytes)),
+        false => Err(storage("a complete copy has the wrong length")),
+    }
+}
+
+/// Writes this node's whole copy, then its completion row, and syncs before anyone is told.
+pub async fn store_local(
+    ctx: &DriverContext,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<(), ArtifactError> {
+    for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
+        write_row(ctx, chunk_key(digest, index as u32), chunk.to_vec()).await?;
+    }
+    finish_local(ctx, digest, bytes.len() as u64).await
+}
+
+/// Keeps one chunk of a copy another management node sends. Once every chunk is here and the
+/// whole artifact checks out, the copy is completed; `true` means it is complete now.
+pub async fn store_chunk(ctx: &DriverContext, chunk: Chunk) -> Result<bool, ArtifactError> {
+    let count = chunk_count(chunk.total);
+    let sized = chunk.total > 0 && chunk.total <= MAX_ARTIFACT as u64 && chunk.index < count;
+    if !sized {
+        return Err(ArtifactError::Mismatch);
+    }
+    let expected = (chunk.total - u64::from(chunk.index) * CHUNK as u64).min(CHUNK as u64);
+    if chunk.bytes.0.len() as u64 != expected {
+        return Err(ArtifactError::Mismatch);
+    }
+    if read_total(ctx, &chunk.digest).await?.is_some() {
+        return Ok(true);
+    }
+    write_row(ctx, chunk_key(&chunk.digest, chunk.index), chunk.bytes.0).await?;
+    let mut bytes = Vec::with_capacity(chunk.total as usize);
+    for index in 0..count {
+        match read_row(ctx, chunk_key(&chunk.digest, index)).await? {
+            Some(part) => bytes.extend(part),
+            None => return Ok(false),
+        }
+    }
+    let whole =
+        ArtifactDigest::of(&bytes).as_str() == chunk.digest && check_artifact(&bytes).is_ok();
+    if !whole {
+        return Err(ArtifactError::Mismatch);
+    }
+    finish_local(ctx, &chunk.digest, chunk.total).await?;
+    Ok(true)
+}
+
+/// One piece of an artifact in a node message; chunk `index` covers bytes from `index * CHUNK`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Chunk {
+    pub digest: String,
+    pub index: u32,
+    pub total: u64,
+    pub bytes: ArtifactBytes,
+}
+
+/// The chunks an artifact of `total` bytes has.
+pub fn chunk_count(total: u64) -> u32 {
+    total.div_ceil(CHUNK as u64) as u32
+}
+
+/// The `index`-th chunk of `bytes`, ready to send.
+pub fn chunk_of(digest: &str, bytes: &[u8], index: u32) -> Chunk {
+    let start = (index as usize * CHUNK).min(bytes.len());
+    let end = (start + CHUNK).min(bytes.len());
+    Chunk {
+        digest: digest.to_string(),
+        index,
+        total: bytes.len() as u64,
+        bytes: ArtifactBytes(bytes[start..end].to_vec()),
+    }
+}
+
+fn chunk_key(digest: &str, index: u32) -> Vec<u8> {
+    [digest.as_bytes(), b"/", &index.to_be_bytes()].concat()
+}
+
+/// The length of this node's copy, once it is complete.
+async fn read_total(ctx: &DriverContext, digest: &str) -> Result<Option<u64>, ArtifactError> {
+    let Some(row) = read_row(ctx, digest.as_bytes().to_vec()).await? else {
+        return Ok(None);
+    };
+    let row = row.try_into().map_err(|_| storage("a bad length row"))?;
+    Ok(Some(u64::from_le_bytes(row)))
+}
+
+fn storage(why: &str) -> ArtifactError {
+    ArtifactError::Storage(why.to_string())
+}
+
+async fn finish_local(ctx: &DriverContext, digest: &str, total: u64) -> Result<(), ArtifactError> {
+    write_row(
+        ctx,
+        digest.as_bytes().to_vec(),
+        total.to_le_bytes().to_vec(),
+    )
+    .await?;
+    match ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::SyncAll)
+        .await
+    {
+        Event::Storage(StorageEvent::SyncAllFinished) => Ok(()),
+        other => Err(ArtifactError::Storage(format!("{other:?}"))),
+    }
+}
+
+async fn read_row(ctx: &DriverContext, key: Vec<u8>) -> Result<Option<Vec<u8>>, ArtifactError> {
     let read = StorageEffect::Read {
         key_space: PLUGIN_ARTIFACT_KEYSPACE.to_string(),
-        key: digest.as_bytes().to_vec().into(),
+        key: key.into(),
         txn_id: None,
     };
     match ctx.storage_handle.send_storage_effect(read).await {
@@ -56,28 +178,15 @@ pub async fn read_local(
     }
 }
 
-/// Writes this node's copy and syncs it to disk before anyone is told it is stored.
-pub async fn store_local(
-    ctx: &DriverContext,
-    digest: &str,
-    bytes: &[u8],
-) -> Result<(), ArtifactError> {
+async fn write_row(ctx: &DriverContext, key: Vec<u8>, value: Vec<u8>) -> Result<(), ArtifactError> {
     let write = StorageEffect::Write {
         key_space: PLUGIN_ARTIFACT_KEYSPACE.to_string(),
-        key: digest.as_bytes().to_vec().into(),
-        value: bytes.to_vec().into(),
+        key: key.into(),
+        value: value.into(),
         txn_id: None,
     };
     match ctx.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => return Err(ArtifactError::Storage(format!("{other:?}"))),
-    }
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::SyncAll)
-        .await
-    {
-        Event::Storage(StorageEvent::SyncAllFinished) => Ok(()),
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         other => Err(ArtifactError::Storage(format!("{other:?}"))),
     }
 }
@@ -116,8 +225,8 @@ pub async fn fetch_artifact(
     let local = ctx.net_handle.as_ref().map(|net| net.node_id());
     let mut last = "the realm has no other management node".to_string();
     for node_id in managers(config).filter(|node| Some(*node) != local) {
-        match metadata.request_artifact(node_id, digest.to_string()).await {
-            Ok(ArtifactBytes(bytes)) => match check_published(&bytes, plugin) {
+        match fetch_chunks(metadata, node_id, digest).await {
+            Ok(bytes) => match check_published(&bytes, plugin) {
                 Ok(()) => {
                     store_local(ctx, digest, &bytes).await?;
                     return Ok(bytes);
@@ -128,6 +237,32 @@ pub async fn fetch_artifact(
         }
     }
     Err(ArtifactError::Unavailable(last))
+}
+
+/// Every chunk of an artifact from one management node, in order and unchecked.
+async fn fetch_chunks(
+    metadata: &crate::metadata::MetadataHandle,
+    node_id: NodeId,
+    digest: &str,
+) -> Result<Vec<u8>, MetadataReadError> {
+    let first = metadata
+        .request_artifact(node_id, digest.to_string(), 0)
+        .await?;
+    if first.total > MAX_ARTIFACT as u64 {
+        return Err(MetadataReadError::Forbidden);
+    }
+    let mut bytes = first.bytes.0;
+    for index in 1..chunk_count(first.total) {
+        let chunk = metadata
+            .request_artifact(node_id, digest.to_string(), index)
+            .await?;
+        let fits = bytes.len() + chunk.bytes.0.len() <= first.total as usize;
+        if chunk.total != first.total || chunk.index != index || !fits {
+            return Err(MetadataReadError::Forbidden);
+        }
+        bytes.extend(chunk.bytes.0);
+    }
+    Ok(bytes)
 }
 
 /// Management nodes in realm config order.
@@ -171,37 +306,48 @@ pub fn check_fetch(
     }
 }
 
-/// The management side of a copy before publishing: checks the peer and the artifact, then
-/// keeps it durably. A stored but never published copy only takes space.
+/// The management side of a copy before publishing: checks the peer, keeps the chunk, and
+/// completes the copy once all chunks arrived and the whole artifact checks out. A stored
+/// but never published copy only takes space.
 pub(crate) async fn serve_store(
     ctx: &DriverContext,
     peer: NodeId,
-    artifact: ArtifactBytes,
-) -> Result<(), MetadataReadError> {
+    chunk: Chunk,
+) -> Result<bool, MetadataReadError> {
     let (config, local) = local_config(ctx).await?;
     check_store(&config, local, peer)?;
-    let bytes = artifact.0;
-    if bytes.len() > MAX_ARTIFACT || check_artifact(&bytes).is_err() {
-        return Err(MetadataReadError::Forbidden);
+    let digest = chunk.digest.clone();
+    match store_chunk(ctx, chunk).await {
+        Ok(complete) => {
+            debug!(%peer, %digest, complete, "Stored a plugin artifact chunk");
+            Ok(complete)
+        }
+        Err(ArtifactError::Mismatch) => Err(MetadataReadError::Forbidden),
+        Err(_) => Err(MetadataReadError::Unavailable),
     }
-    let digest = ArtifactDigest::of(&bytes);
-    store_local(ctx, digest.as_str(), &bytes)
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?;
-    debug!(%peer, %digest, "Stored a plugin artifact copy");
-    Ok(())
 }
 
-/// The management side of a fetch by digest.
+/// The management side of a fetch: one chunk of a published artifact this node keeps.
 pub(crate) async fn serve_fetch(
     ctx: &DriverContext,
     peer: NodeId,
     digest: String,
-) -> Result<ArtifactBytes, MetadataReadError> {
+    index: u32,
+) -> Result<Chunk, MetadataReadError> {
     let (config, local) = local_config(ctx).await?;
     check_fetch(&config, local, peer, &digest)?;
-    match read_local(ctx, &digest).await {
-        Ok(Some(bytes)) => Ok(ArtifactBytes(bytes)),
+    let total = match read_total(ctx, &digest).await {
+        Ok(Some(total)) if index < chunk_count(total) => total,
+        Ok(Some(_)) => return Err(MetadataReadError::NotFound),
+        _ => return Err(MetadataReadError::Unavailable),
+    };
+    match read_row(ctx, chunk_key(&digest, index)).await {
+        Ok(Some(bytes)) => Ok(Chunk {
+            digest,
+            index,
+            total,
+            bytes: ArtifactBytes(bytes),
+        }),
         _ => Err(MetadataReadError::Unavailable),
     }
 }
