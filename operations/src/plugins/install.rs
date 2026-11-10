@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
 use aruna_core::UserId;
-use aruna_core::plugin_installs::{InstallGuard, InstallState, PluginInstall, Prerequisite};
+use aruna_core::plugin_installs::{InstallState, PluginInstall, Prerequisite};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -217,20 +217,7 @@ pub(crate) async fn settle(
     )?)?;
     let scope = scope_of(actor.realm_id, &record);
     let grants = parse_grants(&record.grants);
-    let identity = Identity::of(&record);
-    let guard = guard_of(&record);
-    let ready = make_ready(
-        ctx,
-        actor,
-        auth,
-        &scope,
-        identity,
-        &record.plugin,
-        &grants,
-        guard,
-    );
-    let ready = ready.await;
-    let prerequisites = match ready {
+    let prerequisites = match make_ready(ctx, actor, auth, &scope, &record).await {
         Ok(prerequisites) => prerequisites,
         Err((step, error)) => {
             abandon(ctx, actor, auth, &record, step).await;
@@ -297,23 +284,21 @@ async fn abandon(
     }
 }
 
-/// Steps 2 to 5: the account, its role, then a check of both against current state. The
-/// secret use rules join as step 4 once plugins with secrets can be installed.
+/// Steps 2 to 5 for `record`: the account, its role, then a check of both against current
+/// state, each write refused once the record moved on. Secret use rules join as step 4 later.
 async fn make_ready(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
     scope: &InstallScope,
-    identity: Identity,
-    plugin: &str,
-    grants: &Grants,
-    guard: InstallGuard,
+    record: &PluginInstall,
 ) -> Result<Vec<Prerequisite>, (&'static str, String)> {
-    let name = account_name(ctx, plugin, scope.group_id).await;
+    let (identity, guard) = (Identity::of(record), guard_of(record));
+    let name = account_name(ctx, &record.plugin, scope.group_id).await;
     ensure_account(ctx, actor, auth, scope, identity, name, guard)
         .await
         .map_err(|error| ("account", error))?;
-    let paths = role_paths(grants);
+    let paths = role_paths(&parse_grants(&record.grants));
     ensure_role(ctx, actor, auth, scope, identity, &paths, guard)
         .await
         .map_err(|error| ("role", error))?;
