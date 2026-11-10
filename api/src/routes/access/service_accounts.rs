@@ -133,6 +133,7 @@ async fn create_account(
     let group_id = parse_group_id(&group_id)?;
     let user = drive(
         CreateServiceOperation::new(CreateServiceConfig {
+            install: None,
             actor: Actor {
                 node_id: state.get_node_id(),
                 user_id: auth.user_id,

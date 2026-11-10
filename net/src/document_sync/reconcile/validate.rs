@@ -5,7 +5,8 @@
 use super::*;
 use aruna_core::structs::execution::setting::validate_setting;
 use aruna_core::user::validation::{
-    DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, SERVICE_GROUP_ATTRIBUTE,
+    DEACTIVATED_ATTRIBUTE, INSTALL_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX,
+    SERVICE_GROUP_ATTRIBUTE,
 };
 
 impl ConfigValidationCache {
@@ -715,6 +716,12 @@ fn service_owner(
             let fresh =
                 current_user.is_none() && attributes.is_none_or(|attributes| attributes.is_empty());
             fresh.then(|| value.parse().ok()).flatten()
+        }
+        // The install marker is set once, right after the owner, and never changed.
+        AdminDocumentOperation::UserAttributeSet { key, .. } if key == INSTALL_ATTRIBUTE => {
+            let marked = current_user.is_some_and(|user| user.install().is_some())
+                || (attributes.as_ref()).is_some_and(|map| map.contains_key(INSTALL_ATTRIBUTE));
+            stored.filter(|_| !marked)
         }
         AdminDocumentOperation::UserAttributeSet { key, .. }
         | AdminDocumentOperation::UserAttributeRemoved { key }
@@ -2012,4 +2019,40 @@ enum ReportParticipation {
     Participant,
     UnknownPlan,
     Foreign,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
+
+    #[test]
+    fn marker_set_once() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group = Ulid::from_parts(1, 9);
+        let user_id = UserId::local(Ulid::from_parts(1, 7), realm_id);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            user_id: UserId::local(Ulid::from_parts(1, 3), realm_id),
+            realm_id,
+        };
+        let set = |key: &str, value: String| AdminDocumentOperation::UserAttributeSet {
+            key: key.to_string(),
+            value,
+        };
+        let mut state = AdminDocumentState::new(AdminDocumentTarget::User { user_id });
+        let owner = state.apply_operation(&actor, set(SERVICE_GROUP_ATTRIBUTE, group.to_string()));
+        assert_eq!(service_owner(&owner.unwrap(), None, None), Some(group));
+        let owned = state.clone();
+        let marker = state.apply_operation(&actor, set(INSTALL_ATTRIBUTE, "a".into()));
+        assert_eq!(
+            service_owner(&marker.unwrap(), Some(&owned), None),
+            Some(group)
+        );
+        let marked = state.clone();
+        let again = state.apply_operation(&actor, set(INSTALL_ATTRIBUTE, "b".into()));
+        assert_eq!(service_owner(&again.unwrap(), Some(&marked), None), None);
+    }
 }

@@ -10,7 +10,8 @@ use crate::errors::ConversionError;
 use crate::structs::identity::auth::Actor;
 use crate::types::GroupId;
 use crate::user::validation::{
-    DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, SERVICE_GROUP_ATTRIBUTE,
+    DEACTIVATED_ATTRIBUTE, INSTALL_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX,
+    SERVICE_GROUP_ATTRIBUTE,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -51,6 +52,11 @@ impl User {
         self.attributes
             .get(SERVICE_GROUP_ATTRIBUTE)
             .and_then(|group| group.parse().ok())
+    }
+
+    /// The plugin install this service account acts for.
+    pub fn install(&self) -> Option<ulid::Ulid> {
+        (self.attributes.get(INSTALL_ATTRIBUTE)).and_then(|install| install.parse().ok())
     }
 
     /// The account this one was merged into; a merged account stays deactivated.
