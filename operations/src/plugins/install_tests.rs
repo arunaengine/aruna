@@ -707,3 +707,47 @@ async fn keeps_receiver() {
         None
     );
 }
+
+#[tokio::test]
+async fn picks_among_holders() {
+    // With several holders the pick is the same whatever the entry order, and skips a draining one.
+    use crate::plugins::receiver::{eligible, pick_receiver};
+    use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::structs::placement::record::NodePlacementEntry;
+    let fixture = Fixture::new().await;
+    let (realm, group) = (fixture.actor.realm_id, fixture.group_id);
+    let mut config = read_config(&fixture.ctx, realm).await.unwrap();
+    let (node, entry) = (config.nodes[0].clone(), config.placement_map[0].clone());
+    for seed in [3u8, 4] {
+        let node_id = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        let mut added = node.clone();
+        added.node_id = node_id.to_string();
+        added.kind = RealmNodeKind::Server;
+        config.nodes.push(added);
+        config.placement_map.push(NodePlacementEntry {
+            node_id,
+            ..entry.clone()
+        });
+    }
+    for strategy in &mut config.strategies {
+        strategy.replica_count = Some(2);
+    }
+    config.candidate_maps.clear();
+    config.placement_activations.clear();
+    let mut reordered = config.clone();
+    reordered.nodes.reverse();
+    reordered.placement_map.reverse();
+    config.snapshot_candidate_map();
+    reordered.snapshot_candidate_map();
+    let picked = pick_receiver(&config, realm, group).unwrap();
+    assert!(eligible(&config, picked));
+    assert_eq!(pick_receiver(&reordered, realm, group), Some(picked));
+
+    let entry = (config.placement_map.iter_mut()).find(|entry| entry.node_id == picked);
+    entry.unwrap().draining = true;
+    let next = pick_receiver(&config, realm, group);
+    assert!(
+        next.is_some_and(|next| next != picked && eligible(&config, next)),
+        "{next:?}"
+    );
+}

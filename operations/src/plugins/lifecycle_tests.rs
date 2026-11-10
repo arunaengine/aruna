@@ -41,8 +41,10 @@ async fn later_changes() {
     assert_eq!(role.permissions[&format!("{meta}/runs/**")], Access::WRITE);
     assert_eq!(role.permissions[&format!("{meta}/**")], Access::READ);
 
+    assert_eq!(narrowed.receiver, installed.receiver);
     let paused = pause_install(ctx, actor, &auth, id).await.unwrap();
     assert_eq!((paused.state, paused.paused), (InstallState::Paused, true));
+    assert_eq!(paused.receiver, installed.receiver);
     assert!(matches!(
         pause_install(ctx, actor, &auth, id).await,
         Err(InstallError::State(_))
@@ -60,6 +62,7 @@ async fn later_changes() {
         (updated.state, missing),
         (InstallState::Blocked, vec!["objects.read".to_string()])
     );
+    assert_eq!(updated.receiver, installed.receiver);
     assert_eq!(
         updated.grants["metadata.write"],
         vec![format!("{meta}/runs/**")]
