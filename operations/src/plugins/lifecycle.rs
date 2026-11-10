@@ -1,6 +1,5 @@
-//! Changes an install after it is active: its grants, its version, pause and resume, removal.
-//! A role change first writes the install `preparing` with the change and its audit row, so the
-//! role is never wider than an audited record; settling then activates it.
+//! Changes an active install: grants, version, pause, resume, removal. A role change first writes
+//! an audited `preparing` record, so the role is never wider than an audited record.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

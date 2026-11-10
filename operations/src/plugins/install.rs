@@ -339,10 +339,9 @@ pub(crate) async fn check_admin(
         .map_err(|_| InstallError::Unauthorized)
 }
 
-/// Refuses grants the caller does not hold now. Every granted action is checked with its own
-/// access and the operation `plugin.<permission>`: roles, denies below a granted subtree, the
-/// session's restrictions and the request policies. A subtree is refused while a policy reads
-/// the path, since no single check proves it allows every path below.
+/// Refuses grants the caller does not hold now: each action with its own access and operation
+/// `plugin.<permission>` against roles, denies below a subtree, restrictions and policies. A
+/// subtree is refused while a policy reads the path, as no single check proves every path below.
 pub(crate) async fn check_holder(
     ctx: &DriverContext,
     auth: &AuthContext,
