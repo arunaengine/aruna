@@ -1660,6 +1660,7 @@ async fn abe_rotation() -> TestResult<()> {
             Ok::<_, Box<dyn std::error::Error>>(objects)
         };
         let old = open_all().await?;
+        transition_settled(http, &encryption, token).await?;
         let rotate = json!({"expected_generation":settings["storage_generation"]});
         let (status, rotated) = send(
             http.post(format!("{encryption}/rotate"))
