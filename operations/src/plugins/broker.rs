@@ -394,6 +394,8 @@ impl Broker for RunBroker {
         if !earlier.map_err(|error| unavailable(error.0))? {
             same_revision(record.last_event_id, expected)?;
         }
+        // An invalid patch is refused before its intent exists, so it leaves no uncertainty.
+        let change = dataset_change(&jsonld, &patch.patch)?;
         if let Some(reply) = self.begun(&patch.intent).await? {
             return Ok(reply);
         }
@@ -407,8 +409,7 @@ impl Broker for RunBroker {
             "plugin {} install {} run {run}",
             install.plugin, install.install_id
         );
-        let jsonld = dataset_change(&jsonld, &patch.patch)?;
-        let mutation = UpdateDocumentMutation::UpsertContextualEntity { jsonld };
+        let mutation = UpdateDocumentMutation::UpsertContextualEntity { jsonld: change };
         let update = route_metadata_update(
             &self.ctx,
             actor,

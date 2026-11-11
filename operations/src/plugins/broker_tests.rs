@@ -468,3 +468,28 @@ async fn expected_revision() {
     assert_eq!(now.revision, read.revision);
     assert!(same_revision(Ulid::from_parts(5, 1), Ulid::from_parts(5, 1)).is_ok());
 }
+
+#[tokio::test]
+async fn invalid_patches() {
+    // A patch refused before dispatch leaves no intent behind, so the run needs no attention.
+    use crate::plugins::intents::open_intent;
+    let (_fixture, broker, document, _dir) = broker().await;
+    let read = broker
+        .metadata_get(&cx(), &document.to_string())
+        .await
+        .unwrap();
+    for (ordinal, bad) in [r#"{"@id":"./other"}"#, "[1]", "not json"]
+        .into_iter()
+        .enumerate()
+    {
+        let change = patch(document, &read.revision, ordinal as u32, bad);
+        let refused = broker.metadata_patch(&cx(), change).await.unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::Invalid, "{bad}");
+    }
+    assert_eq!(
+        open_intent(&broker.ctx, broker.scope.run.run_id)
+            .await
+            .unwrap(),
+        None
+    );
+}
