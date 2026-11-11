@@ -327,7 +327,10 @@ impl UpdateDocumentOperation {
             node_id: self.config.actor.node_id,
             operation: event.payload.audit_operation(),
             occurred_at_ms: event.occurred_at_ms,
-            details: Some(event.payload.materialization_kind().to_string()),
+            details: Some(audit_details(
+                event.payload.materialization_kind(),
+                self.message.as_deref(),
+            )),
         }
     }
 
@@ -1339,6 +1342,15 @@ impl Operation for UpdateDocumentOperation {
     }
 }
 
+/// The audit details of an update: what it changed, and the commit message that names who
+/// made it, such as a plugin with its install and run.
+fn audit_details(kind: &str, message: Option<&str>) -> String {
+    match message {
+        Some(message) => format!("{kind}; {message}"),
+        None => kind.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::*;
@@ -2091,6 +2103,15 @@ mod pure_tests {
         for lifecycle in lifecycles(&noted) {
             assert_eq!(lifecycle.message(), Some("Add the raw file"));
         }
+        let audit = |writes: &[(String, ByteView, ByteView)]| {
+            let (_, _, value) = (writes.iter())
+                .find(|(keyspace, _, _)| keyspace == METADATA_AUDIT_KEYSPACE)
+                .expect("audit row is written");
+            postcard::from_bytes::<MetadataAuditRecord>(value).unwrap()
+        };
+        let details = audit(&noted).details.unwrap_or_default();
+        assert!(details.ends_with("; Add the raw file"), "{details}");
+        assert!(!audit(&plain).details.unwrap_or_default().contains(';'));
     }
 
     #[test]
