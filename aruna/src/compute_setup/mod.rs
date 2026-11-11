@@ -11,13 +11,13 @@
 
 mod settings;
 
-#[cfg(feature = "apptainer")]
+#[cfg(all(feature = "apptainer", unix))]
 mod apptainer;
 #[cfg(feature = "docker")]
 mod docker;
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
-#[cfg(feature = "slurm")]
+#[cfg(all(feature = "slurm", unix))]
 mod slurm;
 
 use aruna_compute::ExecutorRegistry;
@@ -130,7 +130,7 @@ pub(super) struct KubernetesSettings {
 }
 
 /// Read only by the Slurm builder, which the non-default `slurm` feature compiles.
-#[cfg_attr(not(feature = "slurm"), allow(dead_code))]
+#[cfg_attr(not(all(feature = "slurm", unix)), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
 pub(super) struct SlurmSettings {
     pub(super) state_root: PathBuf,
@@ -224,9 +224,9 @@ async fn build_docker(
     ))
 }
 
-#[cfg(feature = "apptainer")]
+#[cfg(all(feature = "apptainer", unix))]
 use apptainer::build as build_apptainer;
-#[cfg(not(feature = "apptainer"))]
+#[cfg(not(all(feature = "apptainer", unix)))]
 async fn build_apptainer(
     _settings: &ComputeSettings,
     _apptainer: &ApptainerSettings,
@@ -250,9 +250,9 @@ async fn build_kubernetes(
     ))
 }
 
-#[cfg(feature = "slurm")]
+#[cfg(all(feature = "slurm", unix))]
 use slurm::build as build_slurm;
-#[cfg(not(feature = "slurm"))]
+#[cfg(not(all(feature = "slurm", unix)))]
 async fn build_slurm(
     _settings: &ComputeSettings,
     _slurm: &SlurmSettings,

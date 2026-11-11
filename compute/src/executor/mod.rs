@@ -24,7 +24,8 @@ pub mod config;
 pub mod logs;
 pub mod staging;
 
-#[cfg(feature = "apptainer")]
+// Apptainer runs on Linux only; its supervisor uses Unix sockets, signals and exec.
+#[cfg(all(feature = "apptainer", unix))]
 pub mod apptainer;
 
 #[cfg(feature = "docker")]
@@ -112,13 +113,13 @@ pub fn dispatch_helper() -> Option<i32> {
     if !matches!(mode, "apptainer-supervisor" | "payload-launcher") {
         return None;
     }
-    #[cfg(feature = "apptainer")]
+    #[cfg(all(feature = "apptainer", unix))]
     {
         Some(apptainer::dispatch(mode))
     }
-    #[cfg(not(feature = "apptainer"))]
+    #[cfg(not(all(feature = "apptainer", unix)))]
     {
-        eprintln!("Apptainer helper mode requires the apptainer feature");
+        eprintln!("Apptainer helper mode requires the apptainer feature on Unix");
         Some(78)
     }
 }
