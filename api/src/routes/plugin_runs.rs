@@ -19,11 +19,11 @@ use aruna_operations::plugins::runs::{RunError, list_runs, read_run, resolve_run
 use aruna_operations::users::service_account::group_admin_path;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, State};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use ulid::Ulid;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
@@ -242,16 +242,70 @@ fn lost(receiver: NodeId, reason: &str) -> Response {
 
 fn run_error(error: RunError) -> Response {
     match error {
-        RunError::NotFound => ServerError::NotFound,
-        RunError::NotWaiting(_) => ServerError::Conflict(error.to_string()),
-        RunError::Full(_) => ServerError::Refused(
-            StatusCode::TOO_MANY_REQUESTS,
-            "runs_queued",
-            error.to_string(),
-        ),
-        RunError::Store(_) => ServerError::ServiceUnavailableReason(error.to_string()),
+        RunError::NotFound => ServerError::NotFound.into_response(),
+        RunError::NotWaiting(_) => ServerError::Conflict(error.to_string()).into_response(),
+        RunError::Full(_) => {
+            let full = StatusCode::TOO_MANY_REQUESTS;
+            let mut refused =
+                ServerError::Refused(full, "runs_queued", error.to_string()).into_response();
+            let wait = HeaderValue::from(QUEUE_RETRY_SECS);
+            refused.headers_mut().insert(header::RETRY_AFTER, wait);
+            refused
+        }
+        RunError::Store(_) => {
+            ServerError::ServiceUnavailableReason(error.to_string()).into_response()
+        }
     }
-    .into_response()
+}
+
+/// A run just queued by hand.
+fn queued_example() -> Value {
+    let mut run = run_example(false);
+    run["state"] = json!("queued");
+    run["attempts"] = json!(0);
+    run["finished_ms"] = Value::Null;
+    run["output"] = Value::Null;
+    run
+}
+
+/// A run a person resolved after it needed attention.
+fn resolved_example() -> Value {
+    let mut run = run_example(false);
+    run["message"] = json!("01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm resolved it as done");
+    run["output"] = Value::Null;
+    run
+}
+
+/// Seconds a caller waits before starting a run again after the queue was full; runs leave the
+/// queue as they finish or are resolved.
+const QUEUE_RETRY_SECS: u32 = 60;
+
+/// One run as the run routes answer it.
+fn run_example(log: bool) -> Value {
+    let log = match log {
+        true => {
+            json!([{"at_ms": 1762700001200u64, "level": "info", "message": "posted the dataset to the catalog"}])
+        }
+        false => json!([]),
+    };
+    json!({
+        "id": "01JBX7Y3S5M3Q8Y1V9K2T4R6Q1",
+        "install": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1",
+        "state": "succeeded",
+        "handler": "on_manual",
+        "trigger": "manual",
+        "started_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm",
+        "input": "{\"dataset\":\"01JBX7Y3S5M3Q8Y1V9K2T4R6P4\"}",
+        "occurrence_ms": null,
+        "revision": 2,
+        "attempts": 1,
+        "due_ms": 1762700000000u64,
+        "created_ms": 1762700000000u64,
+        "finished_ms": 1762700001500u64,
+        "message": null,
+        "output": "c-1",
+        "log": log
+    })
 }
 
 fn start_error(error: StartError) -> Response {
@@ -286,14 +340,15 @@ fn start_error(error: StartError) -> Response {
   the receiver and the reason.
 - After the install is removed, the node that ran it still lists, reads and resolves its runs."#,
     params(("id" = String, Path, description = "The install id")),
-    request_body = StartBody,
+    request_body(content = StartBody, example = json!({"input": {"dataset": "01JBX7Y3S5M3Q8Y1V9K2T4R6P4"}})),
     responses(
-        (status = 201, description = "The queued run", body = RunView),
+        (status = 201, description = "The queued run", body = RunView, example = json!(queued_example())),
         (status = 400, description = "The input is not JSON of at most 64 KiB", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 409, description = "The install is not active or has no manual trigger", body = ErrorResponse),
-        (status = 429, description = "The install has its limit of unfinished runs", body = ErrorResponse),
+        (status = 429, description = "The install has its limit of unfinished and unresolved runs", body = ErrorResponse,
+            headers(("Retry-After" = u32, description = "Seconds before starting a run again"))),
         (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -366,7 +421,7 @@ pub async fn start(
 - After the install is removed, the node that ran it still lists, reads and resolves its runs."#,
     params(("id" = String, Path, description = "The install id"), RunListQuery),
     responses(
-        (status = 200, description = "One page of runs", body = RunPage),
+        (status = 200, description = "One page of runs", body = RunPage, example = json!({"runs": [run_example(false)], "next": null})),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
@@ -434,7 +489,7 @@ pub async fn list(
         ("run" = String, Path, description = "The run id")
     ),
     responses(
-        (status = 200, description = "The run", body = RunView),
+        (status = 200, description = "The run", body = RunView, example = json!(run_example(true))),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install or run has this id", body = ErrorResponse),
         (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
@@ -487,9 +542,9 @@ pub async fn get_run(
         ("id" = String, Path, description = "The install id"),
         ("run" = String, Path, description = "The run id")
     ),
-    request_body = ResolveBody,
+    request_body(content = ResolveBody, example = json!({"done": true})),
     responses(
-        (status = 200, description = "The resolved run", body = RunView),
+        (status = 200, description = "The resolved run", body = RunView, example = json!(resolved_example())),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install or run has this id", body = ErrorResponse),
         (status = 409, description = "The run does not need attention", body = ErrorResponse),
@@ -577,6 +632,14 @@ mod tests {
             output: None,
             log: Vec::new(),
         }
+    }
+
+    #[test]
+    fn full_queue_waits() {
+        let refused = run_error(RunError::Full(100));
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let wait = refused.headers().get(header::RETRY_AFTER);
+        assert_eq!(wait.and_then(|value| value.to_str().ok()), Some("60"));
     }
 
     #[tokio::test]
