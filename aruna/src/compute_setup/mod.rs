@@ -97,6 +97,8 @@ pub(super) struct DockerSettings {
     pub(super) state_root: Option<PathBuf>,
 }
 
+/// Read only by the Apptainer builder, which is compiled on Unix.
+#[cfg_attr(not(all(feature = "apptainer", unix)), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
 pub(super) struct ApptainerSettings {
     pub(super) cgroup_root: PathBuf,
