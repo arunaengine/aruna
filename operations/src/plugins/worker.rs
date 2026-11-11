@@ -15,7 +15,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::permission::Permission;
-use aruna_plugins::{CancellationToken, FailureKind, Invocation, InvokeError, Runtime, Trigger};
+use aruna_plugins::{
+    CancellationToken, FailureKind, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
+};
 use tokio_util::task::TaskTracker;
 use tracing::warn;
 use ulid::Ulid;
@@ -321,6 +323,12 @@ fn invocation(
     let trigger = match &run.trigger {
         RunTrigger::Manual { input, .. } => Trigger::Manual(input.clone()),
         RunTrigger::Timer { occurrence_ms } => Trigger::Timer(*occurrence_ms),
+        RunTrigger::Event(event) => Trigger::Event(WatchEvent {
+            kind: event.kind.name().into(),
+            path: event.path.clone(),
+            resource: event.resource.clone(),
+            revision: event.revision.clone(),
+        }),
     };
     Invocation {
         run: run.run_id.to_string(),

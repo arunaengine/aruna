@@ -83,7 +83,7 @@ pub struct RunView {
     /// `queued`, `running`, `succeeded`, `failed`, `needs-attention` or `cancelled`.
     pub state: String,
     pub handler: String,
-    /// `manual` or `timer`.
+    /// `manual`, `timer` or `event`.
     pub trigger: String,
     /// Who started a manual run.
     pub started_by: Option<String>,
@@ -91,6 +91,8 @@ pub struct RunView {
     pub input: Option<String>,
     /// When a timer occurrence was due.
     pub occurrence_ms: Option<u64>,
+    /// The source event of an event run.
+    pub event: Option<RunEvent>,
     /// The install revision the run was admitted with.
     pub revision: u64,
     pub attempts: u32,
@@ -103,6 +105,21 @@ pub struct RunView {
     pub log: Vec<RunLogLine>,
 }
 
+/// The source event an event run was started for.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RunEvent {
+    /// `dataset_created` or `data_uploaded`.
+    pub kind: String,
+    /// The policy path the install's grants are checked on.
+    pub path: String,
+    /// The document id or object path the guest receives.
+    pub resource: String,
+    /// The document event or object version.
+    pub revision: String,
+    /// The event's identity, the same on every node that journaled it.
+    pub source: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RunPage {
     pub runs: Vec<RunView>,
@@ -111,9 +128,21 @@ pub struct RunPage {
 }
 
 fn view(run: PluginRun) -> RunView {
-    let (trigger, started_by, input, occurrence_ms) = match run.trigger {
-        RunTrigger::Manual { by, input } => ("manual", Some(by.to_string()), Some(input), None),
-        RunTrigger::Timer { occurrence_ms } => ("timer", None, None, Some(occurrence_ms)),
+    let (trigger, started_by, input, occurrence_ms, event) = match run.trigger {
+        RunTrigger::Manual { by, input } => {
+            ("manual", Some(by.to_string()), Some(input), None, None)
+        }
+        RunTrigger::Timer { occurrence_ms } => ("timer", None, None, Some(occurrence_ms), None),
+        RunTrigger::Event(event) => {
+            let event = RunEvent {
+                kind: event.kind.name().into(),
+                path: event.path,
+                resource: event.resource,
+                revision: event.revision,
+                source: event.source,
+            };
+            ("event", None, None, None, Some(event))
+        }
     };
     RunView {
         id: run.run_id.to_string(),
@@ -124,6 +153,7 @@ fn view(run: PluginRun) -> RunView {
         started_by,
         input,
         occurrence_ms,
+        event,
         revision: run.revision,
         attempts: run.attempts,
         due_ms: run.due_ms,
@@ -297,6 +327,7 @@ fn run_example(log: bool) -> Value {
         "started_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm",
         "input": "{\"dataset\":\"01JBX7Y3S5M3Q8Y1V9K2T4R6P4\"}",
         "occurrence_ms": null,
+        "event": null,
         "revision": 2,
         "attempts": 1,
         "due_ms": 1762700000000u64,

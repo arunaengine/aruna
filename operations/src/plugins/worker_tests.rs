@@ -8,12 +8,14 @@ use std::collections::BTreeMap;
 use super::*;
 use crate::driver::drive;
 use crate::plugins::copies::store_local;
+use crate::plugins::dispatch::event_run;
 use crate::plugins::install::InstallRequest;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::intents::mark_unknown;
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use crate::plugins::runs::admit;
 use crate::plugins::runs::tests::queued;
+use aruna_core::plugin_runs::{SourceEvent, SourceKind};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_plugins::artifact::{ArtifactDigest, attach_manifest, read_manifest};
 use aruna_plugins::broker::Intent;
@@ -147,6 +149,44 @@ async fn finishes_runs() {
         .unwrap();
     assert_eq!(open.state, RunState::NeedsAttention);
     assert!(unfinished(&fixture.ctx).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn event_input() {
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let event = SourceEvent {
+        kind: SourceKind::DatasetCreated,
+        group_id: install.group_id,
+        path: "/r/g/x/meta/D1".into(),
+        resource: "D1".into(),
+        revision: "r1".into(),
+        source: "dataset_created/e1".into(),
+        anchor_ms: 1,
+        journaled_ms: 1,
+    };
+    let run = event_run(&config, &install, &event, 0).unwrap();
+    assert_eq!(run.handler, "echo");
+    let call = invocation(&run, &install, Limits::default(), CancellationToken::new());
+    let Trigger::Event(given) = call.trigger else {
+        panic!("an event run calls its handler with the event")
+    };
+    let fields = [given.kind, given.path, given.resource, given.revision];
+    assert_eq!(fields, ["dataset_created", "/r/g/x/meta/D1", "D1", "r1"]);
+
+    admit(&fixture.ctx, &run).await.unwrap();
+    let worker = worker(&fixture);
+    assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
+    worker.settle().await;
+    let done = read_run(&fixture.ctx, install.install_id, run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
+    let output = done.output.unwrap_or_default();
+    assert!(output.ends_with("change dataset_created D1 r1"), "{output}");
 }
 
 #[tokio::test]

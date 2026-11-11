@@ -43,6 +43,8 @@ pub enum RunTrigger {
     Manual { by: UserId, input: String },
     /// An `every` timer occurrence that was due at `occurrence_ms`.
     Timer { occurrence_ms: u64 },
+    /// A journaled source event an event trigger of the install matched.
+    Event(SourceEvent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
