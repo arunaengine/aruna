@@ -31,6 +31,10 @@ pub mod sweep;
 pub mod waiting;
 pub mod worker;
 
+#[cfg(test)]
+#[path = "events_tests.rs"]
+mod events_tests;
+
 use serde::{Deserialize, Serialize};
 
 /// Artifact bytes in a node message; Debug prints only their length.
