@@ -152,3 +152,57 @@ async fn selects_group_secret() {
         Err(ReleaseError::Refused(Refusal::Entry))
     );
 }
+
+#[tokio::test]
+async fn node_binding_checks() {
+    use crate::secrets::node::{NodeChange, NodeSecretOperation};
+    let fixture = Fixture::keyed().await;
+    fixture
+        .ctx
+        .storage_handle
+        .open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    let name = SecretName::try_from("api-key".to_string()).unwrap();
+    let bearer = SecretKind::parse("bearer").unwrap();
+    let local = fixture.actor.node_id;
+    let mine = (local, local);
+    let missing = check_node_binding(&fixture.ctx, mine, &name, &bearer).await;
+    assert_eq!(missing, Err(NodeCheckError::Missing));
+    let change = SecretChange::Create {
+        name: name.clone(),
+        kind: bearer.clone(),
+        description: String::new(),
+        settings: SecretSettings::new(),
+        uses: Vec::new(),
+        fields: SecretFields::new([("token".to_string(), Secret::new(TOKEN))].into()),
+    };
+    let input = NodeChange {
+        realm_id: fixture.actor.realm_id,
+        node_id: local,
+        actor: fixture.actor.user_id,
+        change,
+        now_ms: 1,
+        write_id: Ulid::from_parts(66, 2),
+    };
+    drive(NodeSecretOperation::new(input), &fixture.ctx)
+        .await
+        .unwrap();
+    assert_eq!(
+        check_node_binding(&fixture.ctx, mine, &name, &bearer).await,
+        Ok(())
+    );
+    let basic = SecretKind::parse("basic").unwrap();
+    let other = check_node_binding(&fixture.ctx, mine, &name, &basic).await;
+    assert_eq!(other, Err(NodeCheckError::OtherKind));
+    // Another receiver is asked over the transport, which this fixture does not run.
+    let receiver = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+    let remote = check_node_binding(&fixture.ctx, (local, receiver), &name, &bearer).await;
+    assert_eq!(remote, Err(NodeCheckError::Unavailable));
+    // Only a management node may ask a receiver.
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let served = node_check_for(&fixture.ctx, (&config, receiver), &name, &bearer).await;
+    assert_eq!(served, Err(NodeCheckError::Forbidden));
+    let asked = node_check_for(&fixture.ctx, (&config, local), &name, &bearer).await;
+    assert_eq!(asked, Ok(()));
+}

@@ -1225,6 +1225,11 @@ impl MetadataHandle {
                 let result = Box::pin(released).await;
                 (MetadataTransportMessage::SecretReleased { result }, None)
             }
+            MetadataTransportMessage::CheckNodeSecret { name, kind } => {
+                let checked = crate::plugins::bound::serve_node_check(context, peer, name, kind);
+                let result = Box::pin(checked).await;
+                (MetadataTransportMessage::NodeSecretChecked { result }, None)
+            }
             MetadataTransportMessage::PromotionCheck => {
                 let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
                 let result = Box::pin(ready).await;

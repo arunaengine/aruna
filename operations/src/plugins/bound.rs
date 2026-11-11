@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use aruna_core::NodeId;
 use aruna_core::compute::SecretBytes;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -20,6 +21,7 @@ use ulid::Ulid;
 use super::install::{pick_version, read_manifest};
 use super::store::Txn;
 use crate::driver::DriverContext;
+use crate::realm::mutate_placement::is_management;
 use crate::secrets::node::{record_key, value_entry};
 use crate::secrets::owner::{EntryReader, open_value};
 
@@ -216,6 +218,77 @@ pub async fn open(
             }
         }
     }
+}
+
+/// Why a node binding does not fit its slot on the install's receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum NodeCheckError {
+    #[error("the receiver has no node secret of this name")]
+    Missing,
+    #[error("the node secret has another kind than the slot")]
+    OtherKind,
+    #[error("only a management node may ask")]
+    Forbidden,
+    #[error("the receiver did not answer")]
+    Unavailable,
+}
+
+/// Whether this node holds the node secret `name` with `kind`.
+pub async fn node_secret_fits(
+    ctx: &DriverContext,
+    name: &SecretName,
+    kind: &SecretKind,
+) -> Result<(), NodeCheckError> {
+    let row = Txn::direct(ctx)
+        .read(NODE_SECRETS_KEYSPACE, &record_key(name))
+        .await;
+    let row = row.map_err(|_| NodeCheckError::Unavailable)?;
+    let record = row.and_then(|bytes| postcard::from_bytes::<SecretRecord>(&bytes).ok());
+    match record {
+        None => Err(NodeCheckError::Missing),
+        Some(record) if record.kind != *kind => Err(NodeCheckError::OtherKind),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Checks a node binding where it lives: on `receiver`, here or over the metadata transport.
+pub async fn check_node_binding(
+    ctx: &DriverContext,
+    (local, receiver): (NodeId, NodeId),
+    name: &SecretName,
+    kind: &SecretKind,
+) -> Result<(), NodeCheckError> {
+    if receiver == local {
+        return node_secret_fits(ctx, name, kind).await;
+    }
+    let metadata = ctx.metadata_handle.as_ref();
+    let metadata = metadata.ok_or(NodeCheckError::Unavailable)?;
+    let asked = metadata.request_node_check(receiver, name.clone(), kind.clone());
+    asked.await
+}
+
+/// The receiver side of a node binding check, for a management node that installs.
+pub(crate) async fn serve_node_check(
+    ctx: &DriverContext,
+    peer: NodeId,
+    name: SecretName,
+    kind: SecretKind,
+) -> Result<(), NodeCheckError> {
+    let local = super::artifacts::local_config(ctx).await;
+    let (config, _) = local.map_err(|_| NodeCheckError::Unavailable)?;
+    node_check_for(ctx, (&config, peer), &name, &kind).await
+}
+
+async fn node_check_for(
+    ctx: &DriverContext,
+    (config, peer): (&RealmConfigDocument, NodeId),
+    name: &SecretName,
+    kind: &SecretKind,
+) -> Result<(), NodeCheckError> {
+    if !is_management(config, peer) {
+        return Err(NodeCheckError::Forbidden);
+    }
+    node_secret_fits(ctx, name, kind).await
 }
 
 #[cfg(test)]

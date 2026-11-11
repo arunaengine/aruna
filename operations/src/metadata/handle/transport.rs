@@ -546,6 +546,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::EventsDecided { .. } => "events_decided",
         MetadataTransportMessage::ReleaseSecret { .. } => "release_secret",
         MetadataTransportMessage::SecretReleased { .. } => "secret_released",
+        MetadataTransportMessage::CheckNodeSecret { .. } => "check_node_secret",
+        MetadataTransportMessage::NodeSecretChecked { .. } => "node_secret_checked",
     }
 }
 
@@ -839,6 +841,21 @@ impl MetadataHandle {
         {
             MetadataTransportMessage::EventsDecided { result } => result,
             _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// Whether the node `node_id` holds the node secret `name` with `kind`.
+    pub async fn request_node_check(
+        &self,
+        node_id: NodeId,
+        name: aruna_core::secrets::SecretName,
+        kind: aruna_core::secrets::SecretKind,
+    ) -> Result<(), crate::plugins::bound::NodeCheckError> {
+        use crate::plugins::bound::NodeCheckError;
+        let request = MetadataTransportMessage::CheckNodeSecret { name, kind };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
+            Ok(MetadataTransportMessage::NodeSecretChecked { result }) => result,
+            _ => Err(NodeCheckError::Unavailable),
         }
     }
 

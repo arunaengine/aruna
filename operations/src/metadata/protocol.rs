@@ -715,6 +715,14 @@ pub enum MetadataTransportMessage {
     SecretReleased {
         result: Result<crate::plugins::release::Released, crate::plugins::release::ReleaseError>,
     },
+    /// A management node asks an install's receiver whether it holds a node secret of a kind.
+    CheckNodeSecret {
+        name: aruna_core::secrets::SecretName,
+        kind: aruna_core::secrets::SecretKind,
+    },
+    NodeSecretChecked {
+        result: Result<(), crate::plugins::bound::NodeCheckError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.
