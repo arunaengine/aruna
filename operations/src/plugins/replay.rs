@@ -156,7 +156,7 @@ async fn start_replay(
 ) -> Result<ReplayRow, StoreError> {
     let kept_from = now_ms.saturating_sub(JOURNAL_RETENTION_MS);
     if start.is_some_and(|start| start < kept_from) {
-        let mut outbox = Outbox::default();
+        let mut outbox = Outbox::new(now_ms);
         for kind in [SourceKind::DatasetCreated, SourceKind::DataUploaded] {
             let trigger = super::dispatch::event_trigger(kind);
             if target.coverage.contains_key(&trigger)
@@ -247,7 +247,7 @@ async fn replay_page(
         coverage: coverage.clone(),
     };
     let (new, old) = (target(&task.next.coverage), target(&task.old));
-    let mut outbox = Outbox::default();
+    let mut outbox = Outbox::new(now_ms);
     let mut read = 0;
     for (row, value) in rows.iter().take_while(|(row, _)| *row < task.until) {
         read += 1;

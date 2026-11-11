@@ -115,7 +115,7 @@ async fn match_page(
 ) -> Result<usize, StoreError> {
     let (rows, _) = (txn.page(EVENT_JOURNAL_KEYSPACE, &[PENDING_ROW], None, JOURNAL_PAGE)).await?;
     let stale = now_ms.saturating_sub(JOURNAL_RETENTION_MS);
-    let (mut done, mut outbox) = (Vec::new(), Outbox::default());
+    let (mut done, mut outbox) = (Vec::new(), Outbox::new(now_ms));
     for (key, value) in &rows {
         done.push(key.clone());
         if !keep {
@@ -139,14 +139,23 @@ async fn match_page(
 }
 
 /// The forward rows and gap counts of one transaction, with each install's queued count.
-#[derive(Default)]
 pub(crate) struct Outbox {
+    now_ms: u64,
     forward: Vec<(Vec<u8>, Vec<u8>)>,
     queued: BTreeMap<Ulid, usize>,
     gaps: BTreeMap<Vec<u8>, GapRow>,
 }
 
 impl Outbox {
+    pub(crate) fn new(now_ms: u64) -> Self {
+        Self {
+            now_ms,
+            forward: Vec::new(),
+            queued: BTreeMap::new(),
+            gaps: BTreeMap::new(),
+        }
+    }
+
     /// Queues the event of the journal row `key` for the install at `revision`, or counts a gap
     /// when the row is stale or the install has `bound` rows queued.
     pub(crate) async fn offer(
@@ -174,6 +183,7 @@ impl Outbox {
                     install_id,
                     revision,
                     event: event.clone(),
+                    queued_ms: self.now_ms,
                 };
                 self.forward
                     .push((outbox_key(install_id, key), encode(&row)?));

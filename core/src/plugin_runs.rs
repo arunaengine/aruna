@@ -296,6 +296,8 @@ pub fn journal_entries(
 
 /// Forward rows of one install a node keeps at most; matching beyond records a gap.
 pub const EVENTS_QUEUED: usize = 10_000;
+/// How long a forward row is sent before it is dropped as a gap.
+pub const SEND_EXPIRY_MS: u64 = 3 * 24 * 3600 * 1000;
 
 /// A matched event this node sends to the install's receiver.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +306,8 @@ pub struct ForwardRow {
     /// The install revision the event was matched with; the receiver waits until it has it.
     pub revision: u64,
     pub event: SourceEvent,
+    /// When this node queued the row; its send expiry counts from here.
+    pub queued_ms: u64,
 }
 
 /// Key of a forward row: the install, then the event's pending row key without its kind.
@@ -320,6 +324,8 @@ pub enum GapReason {
     Full,
     /// The event's journal row passed its retention before it was matched.
     Pruned,
+    /// The forward row was not decided by the receiver before its send expiry.
+    Expired,
 }
 
 /// Undelivered events of one install, kind and reason, as the node that lost them counts them.

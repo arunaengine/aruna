@@ -9,6 +9,7 @@ pub mod check;
 pub mod clock;
 pub mod copies;
 pub mod dispatch;
+pub mod forward;
 pub mod grants;
 pub mod install;
 pub mod intents;
