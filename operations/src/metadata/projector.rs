@@ -533,6 +533,8 @@ pub async fn project_create_events(
             && !source_journaled(context, &created.source).await?
         {
             writes.extend(journal_entries(&created)?);
+            // A skipped projection still fences the batch on the document's lifecycle.
+            late_graphs.insert(event.record.graph_iri.clone());
         }
         let needs_projection =
             !registry_exists || event_is_newer || holders_changed || needs_materialization;
@@ -1924,11 +1926,52 @@ mod tests {
         assert_ne!(registry_ref, event.record.placement);
     }
 
+    /// Rows that arrived before the create event: none, its registry row, or the registry row
+    /// and the materialized status of a newer update.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Before {
+        Nothing,
+        Registry,
+        Update,
+    }
+
+    fn arrived_before(
+        event: &MetadataEventRecord,
+        before: Before,
+    ) -> Vec<(String, ByteView, ByteView)> {
+        let mut record = event.record.clone();
+        if before == Before::Update {
+            record.last_event_id = Ulid::from_parts(event.event_id.timestamp_ms() + 1, 1);
+            record.updated_at_ms += 1_000;
+        }
+        let mut rows = aruna_core::storage_entries::registry_write_entries(&record).unwrap();
+        if before == Before::Update {
+            let status = MaterializationStatusRecord {
+                document_id: record.document_id,
+                event_id: record.last_event_id,
+                graph_iri: record.graph_iri.clone(),
+                context_digest: None,
+                dataset_digest: None,
+                state: aruna_core::metadata::MaterializationState::Materialized,
+                attempts: 1,
+                failures: 0,
+                last_error: None,
+                updated_at_ms: record.updated_at_ms,
+            };
+            let entry = aruna_core::storage_entries::materialization_status_entry(&status);
+            rows.push(entry.unwrap());
+        }
+        match before {
+            Before::Nothing => Vec::new(),
+            Before::Registry | Before::Update => rows,
+        }
+    }
+
     // A create is journaled once on an infrastructure node with the origin's anchor, also when
-    // the replicated registry row arrived before the create event; devices journal nothing.
+    // its registry row or a newer update arrived first; devices journal nothing.
     #[tokio::test]
     async fn journals_first_projection() {
-        let journaled = async |local: NodeId, kind: RealmNodeKind, registry_first: bool| {
+        let journaled = async |local: NodeId, kind: RealmNodeKind, before: Before| {
             let dir = tempdir().expect("temp dir");
             let storage =
                 FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage");
@@ -1941,10 +1984,9 @@ mod tests {
                 ByteView::from(postcard::to_allocvec(&config).expect("config")),
             );
             write_entries(&storage, vec![config_row]).await;
-            if registry_first {
-                let registry = aruna_core::storage_entries::registry_write_entries(&event.record);
-                let registry = registry.expect("registry rows");
-                write_entries(&storage, registry).await;
+            let earlier = arrived_before(&event, before);
+            if !earlier.is_empty() {
+                write_entries(&storage, earlier).await;
             }
             let context = DriverContext {
                 storage_handle: storage.clone(),
@@ -1977,9 +2019,11 @@ mod tests {
             (event, rows)
         };
         let holder = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
-        let (_, late) = journaled(holder, RealmNodeKind::Server, true).await;
+        let (_, late) = journaled(holder, RealmNodeKind::Server, Before::Registry).await;
         assert_eq!(late.len(), 1);
-        let (event, rows) = journaled(holder, RealmNodeKind::Server, false).await;
+        let (_, updated) = journaled(holder, RealmNodeKind::Server, Before::Update).await;
+        assert_eq!(updated.len(), 1);
+        let (event, rows) = journaled(holder, RealmNodeKind::Server, Before::Nothing).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].source,
@@ -1988,7 +2032,7 @@ mod tests {
         assert_eq!(rows[0].anchor_ms, event.event_id.timestamp_ms());
         assert_eq!(rows[0].resource, event.record.document_id.to_string());
         let owner = UserId::local(Ulid::from_parts(4, 4), event.record.realm_id);
-        let (_, none) = journaled(holder, RealmNodeKind::User { owner }, false).await;
+        let (_, none) = journaled(holder, RealmNodeKind::User { owner }, Before::Nothing).await;
         assert!(none.is_empty());
     }
 
