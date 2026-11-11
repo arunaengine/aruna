@@ -206,3 +206,41 @@ async fn unresolved_count() {
         .unwrap();
     admit(&ctx, &queued(install, 500)).await.unwrap();
 }
+
+#[tokio::test]
+async fn resolved_expire() {
+    // A resolved run and its intents leave with the retention like any finished run.
+    use crate::plugins::intents::{mark_unknown, open_intent, written};
+    use aruna_core::UserId;
+    use aruna_core::plugin_runs::RUN_RETENTION_MS;
+    use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_plugins::broker::Intent;
+    let (_dir, ctx) = opened();
+    let install = Ulid::from_parts(1, 1);
+    let mut run = queued(install, 1);
+    admit(&ctx, &run).await.unwrap();
+    let intent = Intent::new(0, None, &[b"x"]);
+    mark_unknown(&ctx, run.run_id, &intent, "lost")
+        .await
+        .unwrap();
+    run.finish(
+        RunState::NeedsAttention,
+        Some("call 0 is unknown".into()),
+        5,
+    );
+    save_run(&ctx, &run).await.unwrap();
+    let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
+    let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
+    let resolved = resolve_run(&ctx, install, run.run_id, true, &audit)
+        .await
+        .unwrap();
+    assert_eq!(open_intent(&ctx, run.run_id).await.unwrap(), None);
+    let later = resolved.finished_ms.unwrap() + RUN_RETENTION_MS;
+    assert_eq!(prune_runs(&ctx, later).await.unwrap(), 1);
+    assert_eq!(
+        read_run(&ctx, install, run.run_id).await,
+        Err(RunError::NotFound)
+    );
+    assert!(!written(&ctx, run.run_id, &intent).await.unwrap());
+}

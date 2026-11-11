@@ -21,6 +21,10 @@ pub enum IntentState {
     Unknown {
         reason: String,
     },
+    /// A person decided whether the effect happened; nothing waits on the call any more.
+    Resolved {
+        done: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +71,9 @@ pub async fn begin(
             Some(record) => match record.state {
                 IntentState::Settled { reply } => return Ok(Begun::Settled(reply)),
                 IntentState::Unknown { reason } => return Ok(Begun::Unknown(reason)),
+                IntentState::Resolved { .. } => {
+                    return Ok(Begun::Unknown("a person resolved this call".into()));
+                }
                 IntentState::Pending => {
                     let reason = "an earlier attempt of this call did not finish".to_string();
                     (
@@ -153,7 +160,7 @@ pub async fn open_intent(ctx: &DriverContext, run_id: Ulid) -> Result<Option<Str
         let ordinal = <[u8; 4]>::try_from(ordinal.as_slice()).map(u32::from_be_bytes);
         let ordinal = ordinal.map_or_else(|_| "?".to_string(), |ordinal| ordinal.to_string());
         match decode::<IntentRecord>(&value)?.state {
-            IntentState::Settled { .. } => {}
+            IntentState::Settled { .. } | IntentState::Resolved { .. } => {}
             IntentState::Pending => {
                 return Ok(Some(format!("call {ordinal} may have had its effect")));
             }
@@ -165,6 +172,25 @@ pub async fn open_intent(ctx: &DriverContext, run_id: Ulid) -> Result<Option<Str
         }
     }
     Ok(None)
+}
+
+/// Records a person's decision on every pending or unknown intent of a run.
+pub async fn resolve_intents(txn: &Txn<'_>, run_id: Ulid, done: bool) -> Result<(), StoreError> {
+    let rows = txn
+        .scan(PLUGIN_INTENTS_KEYSPACE, &run_id.to_bytes())
+        .await?;
+    let mut resolved = Vec::new();
+    for (key, value) in rows {
+        let mut record = decode::<IntentRecord>(&value)?;
+        if matches!(
+            record.state,
+            IntentState::Pending | IntentState::Unknown { .. }
+        ) {
+            record.state = IntentState::Resolved { done };
+            resolved.push((key, encode(&record)?));
+        }
+    }
+    txn.write(PLUGIN_INTENTS_KEYSPACE, resolved).await
 }
 
 /// Removes every intent of a run.

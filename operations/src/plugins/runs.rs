@@ -13,7 +13,7 @@ use aruna_core::time::unix_timestamp_millis;
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use super::intents::{drop_intents, open_intent};
+use super::intents::{drop_intents, open_intent, resolve_intents};
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
 
@@ -113,7 +113,7 @@ pub async fn save_in(txn: &Txn<'_>, run: &PluginRun) -> Result<(), RunError> {
 }
 
 /// Ends a run that needs attention as a person decided: `done` when its effects happened.
-/// The audit row is written with it.
+/// Its open intents record the decision and the audit row is written in the same transaction.
 pub async fn resolve_run(
     ctx: &DriverContext,
     install_id: Ulid,
@@ -135,6 +135,7 @@ pub async fn resolve_run(
         let message = format!("{} resolved it as {outcome}", audit.actor);
         run.finish(state, Some(message), unix_timestamp_millis());
         save_in(txn, &run).await?;
+        resolve_intents(txn, run_id, done).await?;
         let entries = audit
             .entries()
             .map_err(|error| StoreError(error.to_string()))?;
