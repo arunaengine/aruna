@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{
     EVENTS_QUEUED, ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW,
-    SourceEvent, SourceKind, gap_key, outbox_key,
+    SourceEvent, SourceKind, gap_key, outbox_key, source_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::GroupId;
@@ -131,11 +131,13 @@ async fn match_page(
     let (mut done, mut outbox) = (Vec::new(), Outbox::new(now_ms));
     for (key, value) in &rows {
         done.push(key.clone());
+        let event = SourceEvent::from_bytes(value);
         if !keep {
             done.push([&[JOURNAL_ROW][..], &key[1..]].concat());
+            done.extend(event.ok().map(|event| source_key(&event.source)));
             continue;
         }
-        let Ok(event) = SourceEvent::from_bytes(value) else {
+        let Ok(event) = event else {
             continue;
         };
         for target in targets.iter().filter(|target| target.matches(&event)) {

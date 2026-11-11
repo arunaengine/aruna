@@ -54,6 +54,7 @@ use crate::placement::{
 };
 use crate::sync::shard_placement::sort_node_ids;
 use crate::tasks::queue_backoff::conflict_backoff;
+use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateDocumentConfig {
@@ -602,6 +603,10 @@ impl CreateDocumentOperation {
             writes.push(raw_budget_entry(&raw_budget)?);
             writes.push(create_acceptance_entry(&create_event)?);
             writes.push(profile_validation_entry(&status)?);
+            // The accepting node journals the creation for plugins in its commit batch.
+            let now = aruna_core::time::unix_timestamp_millis();
+            let created = SourceEvent::dataset_created(&create_event, now);
+            writes.extend(journal_entries(&created)?);
             if let Some(message) = &self.message {
                 writes.push(commit_message_entry(&create_event, message)?);
             }

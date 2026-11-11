@@ -1835,9 +1835,10 @@ fn dedup_keeps_writer() {
     };
     let version = BlobVersion::from_bytes(&writes[0].2).unwrap();
     assert_eq!(version.created_by, writer);
-    // The new version is journaled in the same batch: a kept row and a pending row.
+    // The new version is journaled in the same batch: a kept row, a pending row and its
+    // source-id row.
     let journal: Vec<_> = (writes.iter())
-        .filter(|(space, ..)| space == "event_journal")
+        .filter(|(space, key, _)| space == "event_journal" && key[0] != b'i')
         .map(|(_, _, value)| aruna_core::plugin_runs::SourceEvent::from_bytes(value).unwrap())
         .collect();
     assert_eq!(journal.len(), 2);
