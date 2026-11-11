@@ -13,7 +13,7 @@ use crate::plugins::lifecycle::set_grants;
 use crate::plugins::worker::tests::{created, installed};
 
 /// Journals `event` on this node as a committing transaction would.
-async fn journal(fixture: &Fixture, event: &SourceEvent) {
+pub(crate) async fn journal(fixture: &Fixture, event: &SourceEvent) {
     let rows = (journal_entries(event).unwrap().into_iter())
         .map(|(_, key, value)| (key.to_vec(), value.to_vec()))
         .collect();
@@ -24,7 +24,7 @@ async fn journal(fixture: &Fixture, event: &SourceEvent) {
 }
 
 /// The forward rows of `install` on this node, in journal order.
-async fn forwarded(fixture: &Fixture, install: &PluginInstall) -> Vec<String> {
+pub(crate) async fn forwarded(fixture: &Fixture, install: &PluginInstall) -> Vec<String> {
     let txn = Txn::direct(&fixture.ctx);
     let prefix = install.install_id.to_bytes();
     let rows = txn.scan(PLUGIN_OUTBOX_KEYSPACE, &prefix).await.unwrap();
@@ -33,7 +33,11 @@ async fn forwarded(fixture: &Fixture, install: &PluginInstall) -> Vec<String> {
         .collect()
 }
 
-async fn gap(fixture: &Fixture, install: &PluginInstall, reason: GapReason) -> Option<GapRow> {
+pub(crate) async fn gap(
+    fixture: &Fixture,
+    install: &PluginInstall,
+    reason: GapReason,
+) -> Option<GapRow> {
     let key = gap_key(install.install_id, SourceKind::DatasetCreated, reason);
     let txn = Txn::direct(&fixture.ctx);
     let row = txn.read(PLUGIN_GAPS_KEYSPACE, &key).await.unwrap();
@@ -48,7 +52,7 @@ async fn pending(fixture: &Fixture) -> usize {
         .len()
 }
 
-async fn config(fixture: &Fixture) -> RealmConfigDocument {
+pub(crate) async fn config(fixture: &Fixture) -> RealmConfigDocument {
     read_config(&fixture.ctx, fixture.actor.realm_id)
         .await
         .unwrap()

@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{
     EVENTS_QUEUED, ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW,
-    SourceEvent, gap_key, outbox_key,
+    SourceEvent, SourceKind, gap_key, outbox_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::GroupId;
@@ -29,15 +29,15 @@ use crate::realm::mutate_placement::node_kind;
 
 /// An active install with event triggers, as the matcher sees it.
 pub struct Target {
-    install_id: Ulid,
-    group_id: GroupId,
-    revision: u64,
-    coverage: BTreeMap<TriggerKind, BTreeSet<String>>,
+    pub(crate) install_id: Ulid,
+    pub(crate) group_id: GroupId,
+    pub(crate) revision: u64,
+    pub(crate) coverage: BTreeMap<TriggerKind, BTreeSet<String>>,
 }
 
 impl Target {
     /// Whether the install's trigger of the event's kind covers the event's path.
-    fn matches(&self, event: &SourceEvent) -> bool {
+    pub(crate) fn matches(&self, event: &SourceEvent) -> bool {
         self.group_id == event.group_id
             && (self.coverage.get(&event_trigger(event.kind)))
                 .is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &event.path)))
@@ -115,9 +115,7 @@ async fn match_page(
 ) -> Result<usize, StoreError> {
     let (rows, _) = (txn.page(EVENT_JOURNAL_KEYSPACE, &[PENDING_ROW], None, JOURNAL_PAGE)).await?;
     let stale = now_ms.saturating_sub(JOURNAL_RETENTION_MS);
-    let (mut done, mut forward) = (Vec::new(), Vec::new());
-    let mut queued: BTreeMap<Ulid, usize> = BTreeMap::new();
-    let mut gaps: BTreeMap<Vec<u8>, GapRow> = BTreeMap::new();
+    let (mut done, mut outbox) = (Vec::new(), Outbox::default());
     for (key, value) in &rows {
         done.push(key.clone());
         if !keep {
@@ -128,64 +126,96 @@ async fn match_page(
             continue;
         };
         for target in targets.iter().filter(|target| target.matches(&event)) {
-            let id = target.install_id;
-            let count = match queued.get(&id) {
-                Some(count) => *count,
-                None => (txn
-                    .page(PLUGIN_OUTBOX_KEYSPACE, &id.to_bytes(), None, bound)
-                    .await?)
-                    .0
-                    .len(),
-            };
-            let reason = match () {
-                () if event.journaled_ms < stale => GapReason::Pruned,
-                () if count >= bound => GapReason::Full,
-                () => {
-                    let row = ForwardRow {
-                        install_id: id,
-                        revision: target.revision,
-                        event: event.clone(),
-                    };
-                    forward.push((outbox_key(id, key), encode(&row)?));
-                    queued.insert(id, count + 1);
-                    continue;
-                }
-            };
-            queued.insert(id, count);
-            count_gap(txn, &mut gaps, id, &event, reason).await?;
+            let install = (target.install_id, target.revision);
+            let stale = event.journaled_ms < stale;
+            outbox
+                .offer(txn, install, key, &event, stale, bound)
+                .await?;
         }
     }
-    txn.write(PLUGIN_OUTBOX_KEYSPACE, forward).await?;
-    let gaps = (gaps.into_iter())
-        .map(|(key, row)| Ok((key, encode(&row)?)))
-        .collect::<Result<_, StoreError>>()?;
-    txn.write(PLUGIN_GAPS_KEYSPACE, gaps).await?;
+    outbox.commit(txn).await?;
     txn.delete(EVENT_JOURNAL_KEYSPACE, done).await?;
     Ok(rows.len())
 }
 
-/// Counts `event` in the install's gap row of its kind and `reason`.
-async fn count_gap(
-    txn: &Txn<'_>,
-    gaps: &mut BTreeMap<Vec<u8>, GapRow>,
-    install_id: Ulid,
-    event: &SourceEvent,
-    reason: GapReason,
-) -> Result<(), StoreError> {
-    let key = gap_key(install_id, event.kind, reason);
-    if !gaps.contains_key(&key) {
-        let stored = match txn.read(PLUGIN_GAPS_KEYSPACE, &key).await? {
-            Some(bytes) => decode(&bytes)?,
-            None => GapRow::new(event.kind, reason),
+/// The forward rows and gap counts of one transaction, with each install's queued count.
+#[derive(Default)]
+pub(crate) struct Outbox {
+    forward: Vec<(Vec<u8>, Vec<u8>)>,
+    queued: BTreeMap<Ulid, usize>,
+    gaps: BTreeMap<Vec<u8>, GapRow>,
+}
+
+impl Outbox {
+    /// Queues the event of the journal row `key` for the install at `revision`, or counts a gap
+    /// when the row is stale or the install has `bound` rows queued.
+    pub(crate) async fn offer(
+        &mut self,
+        txn: &Txn<'_>,
+        (install_id, revision): (Ulid, u64),
+        key: &[u8],
+        event: &SourceEvent,
+        stale: bool,
+        bound: usize,
+    ) -> Result<(), StoreError> {
+        let count = match self.queued.get(&install_id) {
+            Some(count) => *count,
+            None => (txn.page(PLUGIN_OUTBOX_KEYSPACE, &install_id.to_bytes(), None, bound))
+                .await?
+                .0
+                .len(),
         };
-        gaps.insert(key.clone(), stored);
+        self.queued.insert(install_id, count);
+        let reason = match () {
+            () if stale => GapReason::Pruned,
+            () if count >= bound => GapReason::Full,
+            () => {
+                let row = ForwardRow {
+                    install_id,
+                    revision,
+                    event: event.clone(),
+                };
+                self.forward
+                    .push((outbox_key(install_id, key), encode(&row)?));
+                self.queued.insert(install_id, count + 1);
+                return Ok(());
+            }
+        };
+        self.gap(txn, install_id, (event.kind, event.anchor_ms), reason)
+            .await
     }
-    if let Some(row) = gaps.get_mut(&key) {
-        row.add(event.anchor_ms);
+
+    /// Counts one undelivered event of `kind` with the anchor `anchor_ms`.
+    pub(crate) async fn gap(
+        &mut self,
+        txn: &Txn<'_>,
+        install_id: Ulid,
+        (kind, anchor_ms): (SourceKind, u64),
+        reason: GapReason,
+    ) -> Result<(), StoreError> {
+        let key = gap_key(install_id, kind, reason);
+        if !self.gaps.contains_key(&key) {
+            let stored = match txn.read(PLUGIN_GAPS_KEYSPACE, &key).await? {
+                Some(bytes) => decode(&bytes)?,
+                None => GapRow::new(kind, reason),
+            };
+            self.gaps.insert(key.clone(), stored);
+        }
+        if let Some(row) = self.gaps.get_mut(&key) {
+            row.add(anchor_ms);
+        }
+        Ok(())
     }
-    Ok(())
+
+    pub(crate) async fn commit(self, txn: &Txn<'_>) -> Result<(), StoreError> {
+        txn.write(PLUGIN_OUTBOX_KEYSPACE, self.forward).await?;
+        let gaps = (self.gaps.into_iter())
+            .map(|(key, row)| Ok((key, encode(&row)?)))
+            .collect::<Result<_, StoreError>>()?;
+        txn.write(PLUGIN_GAPS_KEYSPACE, gaps).await
+    }
 }
 
 #[cfg(test)]
 #[path = "matcher_tests.rs"]
-mod tests;
+pub(crate) mod tests;
