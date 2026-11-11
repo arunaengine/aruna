@@ -130,6 +130,11 @@ jobs:
       - name: Run the local folder service tests
         run: cargo test -p aruna-blob --lib --locked local_fs
 
+      # The node itself must build on Windows; the other platform jobs never compile it there.
+      - name: Check the node build
+        if: runner.os == 'Windows'
+        run: cargo check -p aruna --locked
+
   native-git:
     name: Native Git tests
     needs: test-build

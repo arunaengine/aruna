@@ -318,7 +318,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "ahash",
  "aruna-blob",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aruna-core",
  "aruna-kpabe",
@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-cli"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "apple-native-keyring-store",
  "aruna-plugins",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-compute-helper"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "rustix",
  "serde_json",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "ahash",
  "aruna",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aes-gcm 0.11.1",
  "bls12_381_plus",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-kpabe-wasm"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aruna-kpabe",
  "blake3",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aruna-blob",
  "aruna-compute",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "serde",
  "serde_json",
@@ -800,7 +800,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugin-fixture"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aruna-plugin",
  "serde_json",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-plugins"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "async-trait",
  "bytes",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-registry"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.185"
+version = "3.0.0-alpha.186"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -2215,7 +2215,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3194,7 +3194,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3529,7 +3529,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6070,7 +6070,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7828,7 +7828,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8553,15 +8553,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8630,7 +8630,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9896,7 +9896,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11255,7 +11255,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

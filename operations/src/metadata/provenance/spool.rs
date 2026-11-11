@@ -3,10 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+#[cfg(unix)]
+use {
+    std::fs::DirBuilder,
+    std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+};
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use serde_json::{Map, Value, json};
@@ -144,6 +148,7 @@ impl Spool {
 
 /// The private folder of export working state: this user's own, readable by nobody else.
 /// Entries that crashed exports left behind are removed first.
+#[cfg(unix)]
 pub fn scratch_dir() -> io::Result<PathBuf> {
     let uid = rustix::process::geteuid().as_raw();
     let dir = std::env::temp_dir().join(format!("aruna-provenance-{uid}"));
@@ -165,6 +170,25 @@ pub fn scratch_dir() -> io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// On Windows the user's own temporary folder keeps this private; a shared `TMP` or `TEMP`
+/// folder does not, and process entries are never reclaimed there.
+#[cfg(not(unix))]
+pub fn scratch_dir() -> io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join("aruna-provenance");
+    match std::fs::create_dir(&dir) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+        _ => {}
+    }
+    // A link of this name is never used.
+    if !std::fs::symlink_metadata(&dir)?.is_dir() {
+        return Err(io::Error::other(
+            "the export scratch folder is not a folder",
+        ));
+    }
+    reclaim(&dir);
+    Ok(dir)
+}
+
 /// A new entry name of this process: `<pid>-<ulid>`, which tells whose it is.
 pub fn scratch_name() -> String {
     format!("{}-{}", std::process::id(), Ulid::generate())
@@ -172,11 +196,11 @@ pub fn scratch_name() -> String {
 
 /// Creates a new scratch file only this user may read.
 pub fn scratch_file(path: &std::path::Path) -> io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
 }
 
 /// Removes entries of processes that no longer run; anything else in the folder stays.
@@ -205,6 +229,7 @@ fn reclaim(dir: &std::path::Path) {
 }
 
 /// Whether a process of this id runs; one that cannot be asked counts as running.
+#[cfg(unix)]
 fn alive(pid: i32) -> bool {
     match rustix::process::Pid::from_raw(pid) {
         Some(pid) => !matches!(
@@ -213,4 +238,9 @@ fn alive(pid: i32) -> bool {
         ),
         None => true,
     }
+}
+
+#[cfg(not(unix))]
+fn alive(_pid: i32) -> bool {
+    true
 }

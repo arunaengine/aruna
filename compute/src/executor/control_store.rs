@@ -105,6 +105,7 @@ impl<T: ControlState + Serialize + DeserializeOwned> ControlGuard<T> {
     }
 }
 
+#[cfg(all(feature = "apptainer", unix))]
 pub(crate) fn read_required<T: DeserializeOwned>(path: &Path) -> Result<T, ControlError> {
     let mut file = File::open(path).map_err(ControlError::Io)?;
     let mut bytes = Vec::new();
