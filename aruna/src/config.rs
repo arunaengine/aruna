@@ -504,7 +504,7 @@ pub fn validate_wipe_roots(
     let roots: Vec<std::path::PathBuf> = roots.iter().map(|root| normalize_root(root)).collect();
     for root in &roots {
         let refuse = |message: &str| SetupError::InvalidConfigValue {
-            key: "STORAGE_PATH",
+            key: "DATABASE_DIR",
             value: root.display().to_string(),
             message: message.to_string(),
         };
@@ -769,7 +769,7 @@ mod tests {
     /// the case's overrides.
     fn settings_env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         let mut env = BTreeMap::from([
-            ("STORAGE_PATH".to_string(), "/tmp/aruna-none".to_string()),
+            ("DATABASE_DIR".to_string(), "/tmp/aruna-none".to_string()),
             ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
             ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),
             ("S3_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
@@ -978,7 +978,7 @@ mod tests {
         storage.close().await;
 
         let env = settings_env(&[
-            ("STORAGE_PATH", tempdir.path().to_str().unwrap()),
+            ("DATABASE_DIR", tempdir.path().to_str().unwrap()),
             ("ONBOARDING_SECRET", "definitely-not-a-valid-secret"),
         ]);
 
@@ -1016,7 +1016,7 @@ mod tests {
 
         // No ONBOARDING_SECRET: a phase past the bootstrap refresh must not
         // require one.
-        let env = settings_env(&[("STORAGE_PATH", tempdir.path().to_str().unwrap())]);
+        let env = settings_env(&[("DATABASE_DIR", tempdir.path().to_str().unwrap())]);
 
         let (config, _storage) = resolve_settings(read_settings_from(&env).unwrap())
             .await
@@ -1045,7 +1045,7 @@ mod tests {
         drop(store);
         storage.close().await;
 
-        let env = settings_env(&[("STORAGE_PATH", tempdir.path().to_str().unwrap())]);
+        let env = settings_env(&[("DATABASE_DIR", tempdir.path().to_str().unwrap())]);
         let (config, _storage) = resolve_settings(read_settings_from(&env).unwrap())
             .await
             .unwrap();
@@ -1062,7 +1062,7 @@ mod tests {
     async fn cancel_skips_identity() {
         let tempdir = tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let env = settings_env(&[("STORAGE_PATH", tempdir.path().to_str().unwrap())]);
+        let env = settings_env(&[("DATABASE_DIR", tempdir.path().to_str().unwrap())]);
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();
 

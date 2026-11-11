@@ -654,7 +654,7 @@ mod tests {
 
         let map: std::collections::BTreeMap<String, String> = [
             (
-                "STORAGE_PATH".to_string(),
+                "DATABASE_DIR".to_string(),
                 temp.path().to_str().expect("utf8 path").to_string(),
             ),
             ("SOCKET_ADDRESS".to_string(), rest_addr.to_string()),
@@ -731,7 +731,7 @@ mod tests {
         files: &[String; 2],
     ) -> (crate::config::Config, aruna_storage::StorageHandle) {
         let map: std::collections::BTreeMap<String, String> = [
-            ("STORAGE_PATH", temp.join("store").to_str().expect("utf8")),
+            ("DATABASE_DIR", temp.join("store").to_str().expect("utf8")),
             ("SOCKET_ADDRESS", &rest.to_string()),
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:0"),
             ("PORTAL_MODE", "disabled"),

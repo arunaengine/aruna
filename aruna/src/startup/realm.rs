@@ -353,7 +353,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let map: std::collections::BTreeMap<String, String> = [
             (
-                "STORAGE_PATH".to_string(),
+                "DATABASE_DIR".to_string(),
                 temp.path().to_str().expect("utf8 path").to_string(),
             ),
             ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),

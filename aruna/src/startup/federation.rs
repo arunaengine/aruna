@@ -182,7 +182,7 @@ mod tests {
     async fn node(pairs: &[(&str, &str)]) -> (TempDir, Config, DriverContext) {
         let dir = tempfile::tempdir().unwrap();
         let mut env = BTreeMap::from([
-            ("STORAGE_PATH", dir.path().to_str().unwrap()),
+            ("DATABASE_DIR", dir.path().to_str().unwrap()),
             ("SOCKET_ADDRESS", "127.0.0.1:0"),
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:0"),
             ("S3_HOST", "127.0.0.1:0"),

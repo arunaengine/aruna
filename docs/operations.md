@@ -17,9 +17,9 @@ the [README](../README.md) to get a node running.
   nodes, `3002` health and metrics, and `3003` the portal. Inside a container, bind `0.0.0.0` for
   every port you publish. Port `3002` has no authentication, so publish it on loopback only. With
   [native HTTPS](#native-https), one more port serves all three over TLS.
-- **Data folder.** Everything below `STORAGE_PATH` is node state: the database, metadata, document
+- **Data folder.** Everything below `DATABASE_DIR` is node state: the database, metadata, document
   sync, Git repositories, the node identity and, by default, the stored files (`blobstore`). One
-  volume at `STORAGE_PATH` holds all of it unless you point `BLOB_ROOT` or `BLOB_BACKENDS_PATH`
+  volume at `DATABASE_DIR` holds all of it unless you point `CONTENT_DIR` or `BLOB_BACKENDS_PATH`
   elsewhere.
 - **Keys.** The node creates its realm and node keys on the first start and keeps them in the data
   folder. There is nothing to generate. The tracked `.env` in this repository holds published demo
@@ -149,12 +149,12 @@ services:
 
 - **Live backup.** `aruna-doctor backup <data folder> <target file>` writes a consistent copy of the
   running node's database. It works on Unix only and refuses to overwrite an existing file. The
-  stored files (`BLOB_ROOT` and other storage backends) are not part of it. Copy them separately.
+  stored files (`CONTENT_DIR` and other storage backends) are not part of it. Copy them separately.
 - **Full copy.** To back up everything at once, stop the node and copy the whole data folder. The
   folder holds the node identity, which protects stored secrets such as access tokens. A node
   restored without it cannot read these secrets.
 - **Restore.** `aruna-doctor restore <backup file> <new folder>` builds a new data folder from a
-  backup. The new folder must not exist yet. Start the node with `STORAGE_PATH` set to it. The
+  backup. The new folder must not exist yet. Start the node with `DATABASE_DIR` set to it. The
   node then checks every bucket, and `GET /data/buckets/{bucket}/storage/check` lists versions
   whose stored file is missing.
 - **Upgrade.** Stop the node, run `aruna-doctor migrate <data folder>` with the new version, then

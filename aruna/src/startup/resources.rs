@@ -1087,7 +1087,7 @@ mod tests {
             let temp = tempdir().expect("temp dir");
             let path = temp.path().to_str().expect("utf8 path").to_string();
             let map: std::collections::BTreeMap<String, String> = [
-                ("STORAGE_PATH".to_string(), path.clone()),
+                ("DATABASE_DIR".to_string(), path.clone()),
                 ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
                 ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
                 ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),
@@ -1138,7 +1138,7 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         let path = temp.path().to_str().expect("utf8 path").to_string();
         let map: std::collections::BTreeMap<String, String> = [
-            ("STORAGE_PATH".to_string(), path.clone()),
+            ("DATABASE_DIR".to_string(), path.clone()),
             ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
             ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
             ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),

@@ -29,7 +29,7 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 const CHILD_MODE_ENV: &str = "ARUNA_METADATA_RESTART_PERSISTENCE_CHILD";
-const STORAGE_PATH_ENV: &str = "ARUNA_METADATA_RESTART_STORAGE_PATH";
+const DATABASE_DIR_ENV: &str = "ARUNA_METADATA_RESTART_DATABASE_DIR";
 const METADATA_PATH_ENV: &str = "ARUNA_METADATA_RESTART_METADATA_PATH";
 const CHILD_TEST_NAME: &str = "restart_persistence::child_writes_flushes";
 
@@ -44,7 +44,7 @@ async fn restart_persists_flush() -> Result<(), Box<dyn std::error::Error>> {
         .arg(CHILD_TEST_NAME)
         .arg("--nocapture")
         .env(CHILD_MODE_ENV, "1")
-        .env(STORAGE_PATH_ENV, storage_dir.path())
+        .env(DATABASE_DIR_ENV, storage_dir.path())
         .env(METADATA_PATH_ENV, metadata_dir.path())
         .output()?;
     if !output.status.success() {
@@ -89,7 +89,7 @@ async fn child_writes_flushes() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let storage_path = child_path(STORAGE_PATH_ENV)?;
+    let storage_path = child_path(DATABASE_DIR_ENV)?;
     let metadata_path = child_path(METADATA_PATH_ENV)?;
     let (context, actor, config) = build_context(&storage_path, &metadata_path)?;
     seed_realm_config(&context, &actor, &config).await?;

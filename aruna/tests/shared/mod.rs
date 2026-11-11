@@ -1280,7 +1280,7 @@ async fn load_env_config(
 ) -> TestResult<(Config, StorageHandle)> {
     let env: std::collections::BTreeMap<String, String> = [
         (
-            "STORAGE_PATH".to_string(),
+            "DATABASE_DIR".to_string(),
             joiner_dir.path().to_str().unwrap().to_string(),
         ),
         ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),

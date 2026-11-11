@@ -149,7 +149,7 @@ pub fn read_settings() -> Result<Settings, SetupError> {
 
 /// Parses one explicit operator-input source.
 pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError> {
-    let storage_path = required_var(env, "STORAGE_PATH")?;
+    let storage_path = required_var(env, "DATABASE_DIR")?;
     let metadata_storage_path = env
         .var("CRAQLE_STORAGE_PATH")
         .unwrap_or_else(|| format!("{storage_path}/craqle"));
@@ -167,7 +167,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{storage_path}/spool")));
     let blob_root = env
-        .var("BLOB_ROOT")
+        .var("CONTENT_DIR")
         .unwrap_or_else(|| format!("{storage_path}/blobstore"));
     let blob_bucket_prefix = env.var("BLOB_BUCKET_PREFIX");
 
@@ -1205,7 +1205,7 @@ mod tests {
     fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         let mut env = BTreeMap::from([
             (
-                "STORAGE_PATH".to_string(),
+                "DATABASE_DIR".to_string(),
                 "/tmp/aruna-settings".to_string(),
             ),
             ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
@@ -1232,10 +1232,10 @@ mod tests {
     #[test]
     fn missing_path_named() {
         let mut raw = env(&[]);
-        raw.remove("STORAGE_PATH");
+        raw.remove("DATABASE_DIR");
         assert!(matches!(
             read_settings_from(&raw),
-            Err(SetupError::MissingConfigValue("STORAGE_PATH"))
+            Err(SetupError::MissingConfigValue("DATABASE_DIR"))
         ));
     }
 

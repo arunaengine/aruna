@@ -92,7 +92,7 @@ Create a file `aruna.env`. The node reads it as `/run/.env`. Replace the OIDC va
 your login server.
 
 ```bash
-STORAGE_PATH=/data
+DATABASE_DIR=/data
 SOCKET_ADDRESS=0.0.0.0:3000
 P2P_SOCKET_ADDRESS=0.0.0.0:3001
 OPS_SOCKET_ADDRESS=0.0.0.0:3002
