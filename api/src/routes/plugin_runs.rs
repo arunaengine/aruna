@@ -8,13 +8,15 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunTrigger};
-use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord, PluginAudit};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::GroupId;
 use aruna_operations::plugins::dispatch::{StartError, start_run};
 use aruna_operations::plugins::install::{InstallError, read_config};
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::runs::{RunError, list_runs, read_run, resolve_run};
+use aruna_operations::users::service_account::group_admin_path;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -22,13 +24,15 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use ulid::Ulid;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::{ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError};
 use crate::routes::management_relay::relay_to_node;
-use crate::routes::plugin_installs::{admin_call, parse_id};
+use crate::routes::plugin_installs::parse_id;
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 100;
@@ -145,25 +149,44 @@ struct Call {
     body: Bytes,
 }
 
+/// The install a run call is about, after the caller proved admin of its group.
+struct Served {
+    auth: AuthContext,
+    install_id: Ulid,
+    /// `None` once the install was removed; its runs stay on the node that ran them.
+    install: Option<PluginInstall>,
+}
+
 /// Authorizes the caller as admin of the install's group, then answers 503 while the receiver
-/// is lost, relays to the receiver, or returns the install this node serves.
+/// is lost, relays to the receiver, or serves here. The runs of a removed install stay
+/// readable and resolvable on the node that ran them.
 async fn serve(
     state: &Arc<ServerState>,
     auth: Option<AuthContext>,
     id: &str,
+    run: Option<&str>,
     call: Call,
-) -> Result<(AuthContext, PluginInstall), Response> {
-    let (auth, install_id) = admin_call(state, auth, id)
-        .await
-        .map_err(IntoResponse::into_response)?;
+) -> Result<Served, Response> {
+    let failed = IntoResponse::into_response;
+    let auth = require_realm_auth(state, auth).map_err(failed)?;
+    let install_id = parse_id(id).map_err(failed)?;
     let config = read_config(&state.get_ctx(), state.get_realm_id()).await;
     let config = config.map_err(|error| {
         ServerError::ServiceUnavailableReason(error.to_string()).into_response()
     })?;
-    let install = (config.installs.iter())
+    let Some(install) = (config.installs.iter())
         .find(|install| install.install_id == install_id)
         .cloned()
-        .ok_or_else(|| ServerError::NotFound.into_response())?;
+    else {
+        let group_id = kept_group(state, install_id, run).await?;
+        ensure_admin(state, &auth, group_id).await?;
+        return Ok(Served {
+            auth,
+            install_id,
+            install: None,
+        });
+    };
+    ensure_admin(state, &auth, install.group_id).await?;
     if let Some(reason) = lost_reason(&config, install.receiver) {
         return Err(lost(install.receiver, reason));
     }
@@ -178,7 +201,38 @@ async fn serve(
         );
         return Err(relayed.await);
     }
-    Ok((auth, install))
+    Ok(Served {
+        auth,
+        install_id,
+        install: Some(install),
+    })
+}
+
+/// The group of a removed install whose runs this node keeps, from the named run or any.
+async fn kept_group(
+    state: &ServerState,
+    install_id: Ulid,
+    run: Option<&str>,
+) -> Result<GroupId, Response> {
+    let ctx = state.get_ctx();
+    let kept = match run.map(parse_id) {
+        Some(Ok(run_id)) => read_run(&ctx, install_id, run_id).await.ok(),
+        Some(Err(error)) => return Err(error.into_response()),
+        None => (list_runs(&ctx, install_id, None, 1).await.ok())
+            .and_then(|(runs, _)| runs.into_iter().next()),
+    };
+    kept.map(|run| run.group_id)
+        .ok_or_else(|| ServerError::NotFound.into_response())
+}
+
+async fn ensure_admin(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: GroupId,
+) -> Result<(), Response> {
+    let path = group_admin_path(state.get_realm_id(), group_id);
+    (ensure_permission(state, auth, path, Permission::WRITE).await)
+        .map_err(IntoResponse::into_response)
 }
 
 fn lost(receiver: NodeId, reason: &str) -> Response {
@@ -229,7 +283,8 @@ fn start_error(error: StartError) -> Response {
 **Behavior**
 - The install's receiver keeps its runs and answers; every other node relays the call there.
 - While the receiver is drained, gone or no longer a server, the call answers 503 and names
-  the receiver and the reason."#,
+  the receiver and the reason.
+- After the install is removed, the node that ran it still lists, reads and resolves its runs."#,
     params(("id" = String, Path, description = "The install id")),
     request_body = StartBody,
     responses(
@@ -262,8 +317,13 @@ pub async fn start(
         headers,
         body,
     };
-    let (auth, install) = match serve(&state, auth, &id, call).await {
-        Ok(served) => served,
+    let (auth, install) = match serve(&state, auth, &id, None, call).await {
+        Ok(Served {
+            auth,
+            install: Some(install),
+            ..
+        }) => (auth, install),
+        Ok(_) => return ServerError::NotFound.into_response(),
         Err(response) => return response,
     };
     let Ok(parsed) = parsed else {
@@ -302,7 +362,8 @@ pub async fn start(
 **Behavior**
 - The install's receiver keeps its runs and answers; every other node relays the call there.
 - While the receiver is drained, gone or no longer a server, the call answers 503 and names
-  the receiver and the reason."#,
+  the receiver and the reason.
+- After the install is removed, the node that ran it still lists, reads and resolves its runs."#,
     params(("id" = String, Path, description = "The install id"), RunListQuery),
     responses(
         (status = 200, description = "One page of runs", body = RunPage),
@@ -327,8 +388,8 @@ pub async fn list(
         headers,
         body: Bytes::new(),
     };
-    let install = match serve(&state, auth, &id, call).await {
-        Ok((_, install)) => install,
+    let install_id = match serve(&state, auth, &id, None, call).await {
+        Ok(served) => served.install_id,
         Err(response) => return response,
     };
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
@@ -339,7 +400,7 @@ pub async fn list(
         Ok(after) => after,
         Err(error) => return error.into_response(),
     };
-    match list_runs(&state.get_ctx(), install.install_id, after, limit).await {
+    match list_runs(&state.get_ctx(), install_id, after, limit).await {
         Ok((runs, next)) => {
             let runs = (runs.into_iter())
                 .map(|mut run| {
@@ -366,7 +427,8 @@ pub async fn list(
 **Behavior**
 - The install's receiver keeps its runs and answers; every other node relays the call there.
 - While the receiver is drained, gone or no longer a server, the call answers 503 and names
-  the receiver and the reason."#,
+  the receiver and the reason.
+- After the install is removed, the node that ran it still lists, reads and resolves its runs."#,
     params(
         ("id" = String, Path, description = "The install id"),
         ("run" = String, Path, description = "The run id")
@@ -393,15 +455,15 @@ pub async fn get_run(
         headers,
         body: Bytes::new(),
     };
-    let install = match serve(&state, auth, &id, call).await {
-        Ok((_, install)) => install,
+    let install_id = match serve(&state, auth, &id, Some(&run), call).await {
+        Ok(served) => served.install_id,
         Err(response) => return response,
     };
     let run_id = match parse_id(&run) {
         Ok(run_id) => run_id,
         Err(error) => return error.into_response(),
     };
-    match read_run(&state.get_ctx(), install.install_id, run_id).await {
+    match read_run(&state.get_ctx(), install_id, run_id).await {
         Ok(run) => Json(view(run)).into_response(),
         Err(error) => run_error(error),
     }
@@ -419,7 +481,8 @@ pub async fn get_run(
 **Behavior**
 - The install's receiver keeps its runs and answers; every other node relays the call there.
 - While the receiver is drained, gone or no longer a server, the call answers 503 and names
-  the receiver and the reason."#,
+  the receiver and the reason.
+- After the install is removed, the node that ran it still lists, reads and resolves its runs."#,
     params(
         ("id" = String, Path, description = "The install id"),
         ("run" = String, Path, description = "The run id")
@@ -450,7 +513,7 @@ pub async fn resolve(
         headers,
         body,
     };
-    let (auth, install) = match serve(&state, auth, &id, call).await {
+    let served = match serve(&state, auth, &id, Some(&run), call).await {
         Ok(served) => served,
         Err(response) => return response,
     };
@@ -458,18 +521,136 @@ pub async fn resolve(
         return ServerError::BadRequestReason("the body or run id is not valid".into())
             .into_response();
     };
-    let action = AdminAuditAction::PluginRunResolved;
-    let audit = AdminAuditRecord::for_install(action, auth.user_id, &install);
-    match resolve_run(
-        &state.get_ctx(),
-        install.install_id,
-        run_id,
-        parsed.done,
-        &audit,
-    )
-    .await
-    {
+    let ctx = state.get_ctx();
+    let kept = match read_run(&ctx, served.install_id, run_id).await {
+        Ok(kept) => kept,
+        Err(error) => return run_error(error),
+    };
+    let actor = served.auth.user_id;
+    let target = served.install.map_or(actor, |install| install.account);
+    let audit = AdminAuditRecord {
+        group_id: Some(kept.group_id),
+        plugin: Some(PluginAudit {
+            plugin: kept.plugin,
+            version: kept.version,
+            install_id: served.install_id,
+        }),
+        ..AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, actor, target)
+    };
+    match resolve_run(&ctx, served.install_id, run_id, parsed.done, &audit).await {
         Ok(run) => Json(view(run)).into_response(),
         Err(error) => run_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The runs of a removed install stay readable and resolvable for the group's admins.
+    use super::*;
+    use crate::tests::routes::{
+        seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
+    };
+    use aruna_core::UserId;
+    use aruna_core::plugin_runs::RunState;
+    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_operations::plugins::runs::{admit, save_run};
+
+    fn waiting_run(install_id: Ulid, group_id: GroupId) -> PluginRun {
+        PluginRun {
+            run_id: Ulid::from_parts(5, 5),
+            install_id,
+            group_id,
+            plugin: "announcer".into(),
+            version: "0.1.0".into(),
+            revision: 1,
+            digest: format!("sha256:{}", "ab".repeat(32)),
+            handler: "on_timer".into(),
+            settings: "{}".into(),
+            trigger: RunTrigger::Timer { occurrence_ms: 1 },
+            state: RunState::Queued,
+            attempts: 1,
+            due_ms: 1,
+            created_ms: 1,
+            finished_ms: None,
+            message: None,
+            output: None,
+            log: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_install_runs() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let ctx = Arc::new(test_context(storage));
+        let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
+        let state = Arc::new(test_state(ctx.clone(), realm_id, node_id, capabilities).await);
+        let admin = UserId::new(Ulid::from_bytes([3u8; 16]), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: admin,
+            realm_id,
+        };
+        seed_realm_config(&ctx, realm_id, &actor).await;
+        seed_realm_auth(&ctx, realm_id, &actor).await;
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        seed_group_docs(&ctx, realm_id, &actor, group_id, "lab", admin).await;
+        // The install is gone from the realm config; its run waits for a person on this node.
+        let install_id = Ulid::from_parts(7, 7);
+        let mut run = waiting_run(install_id, group_id);
+        admit(&ctx, &run).await.unwrap();
+        run.finish(
+            RunState::NeedsAttention,
+            Some("call 0 is unknown".into()),
+            2,
+        );
+        save_run(&ctx, &run).await.unwrap();
+
+        let auth = |user: UserId| AuthContext {
+            user_id: user,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let path = format!(
+            "/api/v1/plugin-installs/{install_id}/runs/{}/resolve",
+            run.run_id
+        );
+        let resolve_as = |user: UserId| {
+            let state = state.clone();
+            let path = path.clone();
+            async move {
+                resolve(
+                    State(state),
+                    Extension(Some(auth(user))),
+                    Path((install_id.to_string(), run.run_id.to_string())),
+                    OriginalUri(path.parse().unwrap()),
+                    Method::POST,
+                    HeaderMap::new(),
+                    Bytes::from_static(br#"{"done":true}"#),
+                )
+                .await
+                .status()
+            }
+        };
+        let stranger = UserId::new(Ulid::from_bytes([8u8; 16]), realm_id);
+        assert_eq!(resolve_as(stranger).await, StatusCode::FORBIDDEN);
+        assert_eq!(resolve_as(admin).await, StatusCode::OK);
+        let resolved = read_run(&ctx, install_id, run.run_id).await.unwrap();
+        assert_eq!(resolved.state, RunState::Succeeded);
+        assert_eq!(resolve_as(admin).await, StatusCode::CONFLICT);
+        let missing = Ulid::from_parts(9, 9);
+        let unknown = get_run(
+            State(state.clone()),
+            Extension(Some(auth(admin))),
+            Path((missing.to_string(), run.run_id.to_string())),
+            OriginalUri(path.parse().unwrap()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 }

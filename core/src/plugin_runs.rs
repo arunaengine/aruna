@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::UserId;
+use crate::types::GroupId;
 
 /// Runs of one install that run at once on its receiver.
 pub const RUNS_PARALLEL: usize = 4;
-/// Unfinished runs one install keeps at most; an admission beyond it is refused.
+/// Unfinished and unresolved runs one install keeps at most; an admission beyond is refused.
 pub const RUNS_QUEUED: usize = 100;
 /// How long a finished run, its intents and its stored replies are kept.
 pub const RUN_RETENTION_MS: u64 = 30 * 24 * 3600 * 1000;
@@ -79,6 +80,11 @@ pub struct LogLine {
 pub struct PluginRun {
     pub run_id: Ulid,
     pub install_id: Ulid,
+    /// The install's group, plugin and version, so the run stays readable and resolvable by
+    /// the group's admins after the install is removed.
+    pub group_id: GroupId,
+    pub plugin: String,
+    pub version: String,
     /// The install revision and the artifact the run was admitted with.
     pub revision: u64,
     pub digest: String,
@@ -147,7 +153,11 @@ pub fn timer_key(install_id: Ulid) -> Vec<u8> {
     key
 }
 
-/// Key of an unfinished run in the queue keyspace: by install, then by run id.
+/// Value of a queue row whose run ended needing attention: it waits for a person, not to run,
+/// and still counts against the install's limit.
+pub const ATTENTION_ROW: &[u8] = b"a";
+
+/// Key of an unfinished or unresolved run in the queue keyspace: by install, then by run id.
 pub fn queue_key(install_id: Ulid, run_id: Ulid) -> Vec<u8> {
     let mut key = install_id.to_bytes().to_vec();
     key.extend_from_slice(&run_id.to_bytes());
@@ -170,6 +180,9 @@ mod tests {
         let mut run = PluginRun {
             run_id: Ulid::from_parts(2, 1),
             install_id: Ulid::from_parts(1, 1),
+            group_id: Ulid::from_parts(1, 2),
+            plugin: "announcer".into(),
+            version: "0.1.0".into(),
             revision: 1,
             digest: String::new(),
             handler: "on_manual".into(),

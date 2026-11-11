@@ -66,6 +66,9 @@ fn new_run(
     PluginRun {
         run_id: Ulid::generate(),
         install_id: install.install_id,
+        group_id: install.group_id,
+        plugin: install.plugin.clone(),
+        version: install.version.clone(),
         revision: install.revision,
         digest: install.digest.clone(),
         handler,

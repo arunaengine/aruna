@@ -28,6 +28,9 @@ pub(crate) fn queued(install_id: Ulid, seq: u64) -> PluginRun {
     PluginRun {
         run_id: Ulid::from_parts(seq, 1),
         install_id,
+        group_id: Ulid::from_parts(1, 9),
+        plugin: "announcer".into(),
+        version: "0.1.0".into(),
         revision: 1,
         digest: format!("sha256:{}", "ab".repeat(32)),
         handler: "on_manual".into(),
@@ -170,4 +173,36 @@ async fn keeps_open_calls() {
         .unwrap();
     assert_eq!(prune_runs(&ctx, 10 + RUN_RETENTION_MS).await.unwrap(), 0);
     assert!(read_run(&ctx, install, run.run_id).await.is_ok());
+}
+
+#[tokio::test]
+async fn unresolved_count() {
+    // A run that needs attention keeps its place until a person resolves it.
+    use aruna_core::UserId;
+    use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
+    use aruna_core::structs::identity::realm::RealmId;
+    let (_dir, ctx) = opened();
+    let install = Ulid::from_parts(1, 1);
+    let mut waiting = queued(install, 1);
+    admit(&ctx, &waiting).await.unwrap();
+    waiting.finish(
+        RunState::NeedsAttention,
+        Some("call 0 is unknown".into()),
+        5,
+    );
+    save_run(&ctx, &waiting).await.unwrap();
+    for seq in 2..=RUNS_QUEUED as u64 {
+        admit(&ctx, &queued(install, seq)).await.unwrap();
+    }
+    let refused = admit(&ctx, &queued(install, 500)).await;
+    assert_eq!(refused, Err(RunError::Full(RUNS_QUEUED)));
+    let running = unfinished(&ctx).await.unwrap();
+    assert_eq!(running.len(), RUNS_QUEUED - 1);
+    assert!(!running.contains(&(install, waiting.run_id)));
+    let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
+    let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
+    resolve_run(&ctx, install, waiting.run_id, false, &audit)
+        .await
+        .unwrap();
+    admit(&ctx, &queued(install, 500)).await.unwrap();
 }

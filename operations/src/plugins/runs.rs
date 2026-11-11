@@ -5,8 +5,8 @@
 
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_RUNS_KEYSPACE};
 use aruna_core::plugin_runs::{
-    PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState, parse_queue_key, queue_key,
-    run_key, run_prefix,
+    ATTENTION_ROW, PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState, parse_queue_key,
+    queue_key, run_key, run_prefix,
 };
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::time::unix_timestamp_millis;
@@ -24,7 +24,7 @@ pub static ADMISSIONS: Mutex<()> = Mutex::const_new(());
 pub enum RunError {
     #[error(transparent)]
     Store(#[from] StoreError),
-    #[error("the install has {0} unfinished runs, its limit")]
+    #[error("the install has {0} unfinished or unresolved runs, its limit")]
     Full(usize),
     #[error("no run with this id")]
     NotFound,
@@ -82,10 +82,12 @@ pub async fn list_runs(
     Ok((runs, next))
 }
 
-/// The install and run ids of every unfinished run on this node.
+/// The install and run ids of every unfinished run on this node; unresolved runs wait for a
+/// person and are left out.
 pub async fn unfinished(ctx: &DriverContext) -> Result<Vec<(Ulid, Ulid)>, RunError> {
     let rows = Txn::direct(ctx).scan(PLUGIN_QUEUE_KEYSPACE, &[]).await?;
     Ok((rows.iter())
+        .filter(|(_, value)| value.as_slice() != ATTENTION_ROW)
         .filter_map(|(key, _)| parse_queue_key(key))
         .collect())
 }
@@ -98,9 +100,14 @@ pub async fn save_run(ctx: &DriverContext, run: &PluginRun) -> Result<(), RunErr
 pub async fn save_in(txn: &Txn<'_>, run: &PluginRun) -> Result<(), RunError> {
     let row = vec![(run_key(run.install_id, run.run_id), encode(run)?)];
     txn.write(PLUGIN_RUNS_KEYSPACE, row).await?;
-    if run.state.finished() {
-        let queued = vec![queue_key(run.install_id, run.run_id)];
-        txn.delete(PLUGIN_QUEUE_KEYSPACE, queued).await?;
+    let queued = queue_key(run.install_id, run.run_id);
+    match run.state {
+        RunState::NeedsAttention => {
+            let waiting = vec![(queued, ATTENTION_ROW.to_vec())];
+            txn.write(PLUGIN_QUEUE_KEYSPACE, waiting).await?;
+        }
+        state if state.finished() => txn.delete(PLUGIN_QUEUE_KEYSPACE, vec![queued]).await?,
+        _ => {}
     }
     Ok(())
 }
