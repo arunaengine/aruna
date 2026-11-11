@@ -210,6 +210,7 @@ fn new_record(actor: &Actor, prepared: &Prepared, receiver: NodeId) -> PluginIns
         prerequisites: Vec::new(),
         activated_by: None,
         widened: None,
+        secrets: BTreeMap::new(),
     }
 }
 

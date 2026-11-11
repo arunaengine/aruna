@@ -475,7 +475,7 @@ pub enum AdminDocumentOperation {
     #[serde(rename = "RealmConfigInstallSet")]
     ConfigInstallSet {
         install_id: ulid::Ulid,
-        install: Option<crate::plugin_installs::PluginInstall>,
+        install: Option<Box<crate::plugin_installs::PluginInstall>>,
     },
 }
 

@@ -907,6 +907,7 @@ mod tests {
             prerequisites: Vec::new(),
             activated_by: Some(node_id),
             widened: None,
+            secrets: Default::default(),
         });
         let row = config.to_bytes(&actor).unwrap();
         write_doc(

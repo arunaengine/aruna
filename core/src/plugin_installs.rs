@@ -9,6 +9,7 @@ use ulid::Ulid;
 
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentTarget};
 use crate::plugins::{valid_digest, valid_name, valid_version};
+use crate::secrets::{SecretName, SecretScope};
 use crate::types::{GroupId, RoleId};
 use crate::{NodeId, UserId};
 
@@ -16,6 +17,8 @@ use crate::{NodeId, UserId};
 pub const MAX_SETTINGS: usize = 64 * 1024;
 /// Bytes of a whole install record, as JSON.
 pub const MAX_RECORD: usize = 256 * 1024;
+/// Secret slots one install binds at most, as many as a manifest declares.
+pub const MAX_SLOTS: usize = 32;
 
 /// Only `active` installs dispatch runs, pass the per call check or match a vault use rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +122,69 @@ pub struct PluginInstall {
     /// The last revision change that grew the events the install matches.
     #[serde(default)]
     pub widened: Option<Widening>,
+    /// The secret each slot of the manifest uses, by slot name.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretBinding>,
+}
+
+/// Which vault a slot's secret lives in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundScope {
+    /// The install's group.
+    Group,
+    Realm,
+    /// The node vault of the install's receiver; node secrets never leave their node.
+    Node,
+}
+
+/// The secret one slot of an install uses. The record is the only binding a release reads.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretBinding {
+    pub scope: BoundScope,
+    pub name: SecretName,
+}
+
+impl SecretBinding {
+    /// `group:<name>`, `realm:<name>` or `node:<name>`; a bare name is a group secret.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (scope, name) = match text.split_once(':') {
+            Some(("group", name)) => (BoundScope::Group, name),
+            Some(("realm", name)) => (BoundScope::Realm, name),
+            Some(("node", name)) => (BoundScope::Node, name),
+            Some(_) => return None,
+            None => (BoundScope::Group, text),
+        };
+        let name = SecretName::try_from(name.to_string()).ok()?;
+        Some(Self { scope, name })
+    }
+
+    /// The vault scope of the bound secret for an install of `group_id`.
+    pub fn scope(&self, group_id: GroupId) -> SecretScope {
+        match self.scope {
+            BoundScope::Group => SecretScope::Group(group_id),
+            BoundScope::Realm => SecretScope::Realm,
+            BoundScope::Node => SecretScope::Node,
+        }
+    }
+}
+
+impl std::fmt::Display for SecretBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let scope = match self.scope {
+            BoundScope::Group => "group",
+            BoundScope::Realm => "realm",
+            BoundScope::Node => "node",
+        };
+        write!(f, "{scope}:{}", self.name)
+    }
+}
+
+/// A slot name as a manifest declares it: 1 to 64 of `a-z`, `0-9`, `_` and `-`.
+fn valid_slot(slot: &str) -> bool {
+    let allowed =
+        |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte);
+    !slot.is_empty() && slot.len() <= 64 && slot.bytes().all(allowed)
 }
 
 /// When and where an install's event coverage (trigger kinds, or the grant patterns their
@@ -145,6 +211,7 @@ impl PluginInstall {
         let active = self.state != InstallState::Active || self.active_since_ms.is_some();
         let paused = self.state != InstallState::Paused || self.paused;
         let size = serde_json::to_vec(self).is_ok_and(|json| json.len() <= MAX_RECORD);
+        let slots = self.secrets.len() <= MAX_SLOTS && self.secrets.keys().all(|s| valid_slot(s));
         !self.install_id.is_nil()
             && valid_name(&self.plugin)
             && valid_version(&self.version)
@@ -156,6 +223,7 @@ impl PluginInstall {
             && active
             && paused
             && size
+            && slots
     }
 }
 
@@ -207,6 +275,10 @@ mod tests {
                 by: node,
                 extends: 1,
             }),
+            secrets: BTreeMap::from([(
+                "catalog_key".to_string(),
+                SecretBinding::parse("group:catalog-key").unwrap(),
+            )]),
         }
     }
 
@@ -219,7 +291,11 @@ mod tests {
             serde_json::from_str::<PluginInstall>(&json).unwrap(),
             record
         );
-        let cases: [fn(&mut PluginInstall); 9] = [
+        let cases: [fn(&mut PluginInstall); 10] = [
+            |i| {
+                let binding = SecretBinding::parse("key").unwrap();
+                drop(i.secrets.insert("Key Slot".into(), binding))
+            },
             |i| i.state = InstallState::Paused,
             |i| i.install_id = Ulid::nil(),
             |i| i.digest = "sha256:ab".into(),
@@ -240,6 +316,20 @@ mod tests {
             edit(&mut invalid);
             assert!(!invalid.valid(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn binding_text() {
+        for text in ["group:catalog-key", "realm:shared", "node:local"] {
+            let binding = SecretBinding::parse(text).unwrap();
+            assert_eq!(binding.to_string(), text);
+        }
+        let bare = SecretBinding::parse("catalog-key").unwrap();
+        assert_eq!(bare.scope, BoundScope::Group);
+        assert_eq!(SecretBinding::parse("user:mine"), None);
+        assert_eq!(SecretBinding::parse("group:Bad Name"), None);
+        let group_id = Ulid::from_parts(1, 9);
+        assert_eq!(bare.scope(group_id), SecretScope::Group(group_id));
     }
 
     #[test]
@@ -282,10 +372,11 @@ mod tests {
             realm_id,
         };
         let mut state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
-        let set = |install_id, install| AdminDocumentOperation::ConfigInstallSet {
-            install_id,
-            install,
-        };
+        let set =
+            |install_id, install: Option<PluginInstall>| AdminDocumentOperation::ConfigInstallSet {
+                install_id,
+                install: install.map(Box::new),
+            };
         let other = set(Ulid::from_parts(2, 2), Some(record.clone()));
         let refused = state.apply_operation(&actor, other);
         assert_eq!(refused.err(), Some(AdminDocumentError::InvalidInstall));
