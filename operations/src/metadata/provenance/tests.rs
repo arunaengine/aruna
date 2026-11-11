@@ -268,6 +268,7 @@ fn scratch_stays_private() {
 }
 
 #[test]
+#[cfg(unix)]
 fn crashed_scratch_reclaimed() {
     // Entries of exports whose process is gone are removed before the next export; entries of
     // running processes and anything else stay.

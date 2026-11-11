@@ -170,7 +170,8 @@ pub fn scratch_dir() -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// The temporary folder is already private to its user on Windows.
+/// On Windows the user's own temporary folder keeps this private; a shared `TMP` or `TEMP`
+/// folder does not, and process entries are never reclaimed there.
 #[cfg(not(unix))]
 pub fn scratch_dir() -> io::Result<PathBuf> {
     let dir = std::env::temp_dir().join("aruna-provenance");
