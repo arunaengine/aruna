@@ -6,6 +6,7 @@ pub mod account;
 pub mod artifacts;
 pub mod broker;
 pub mod check;
+pub mod cleanup;
 pub mod clock;
 pub mod copies;
 pub mod decide;

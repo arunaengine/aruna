@@ -29,6 +29,7 @@ use ulid::Ulid;
 use super::artifacts::fetch_artifact;
 use super::broker::RunBroker;
 use super::check::{RunScope, check_call};
+use super::cleanup::sweep_events;
 use super::clock::probe_clock;
 use super::decide::{decide_batch, prune_seen};
 use super::dispatch::{enqueue_timers, event_trigger};
@@ -203,6 +204,13 @@ impl Worker {
             started += 1;
         }
         Ok(started)
+    }
+
+    async fn sweep(&self, now_ms: u64) -> Result<usize, String> {
+        let config = read_config(&self.ctx, self.realm_id).await;
+        let config = config.map_err(|error| error.to_string())?;
+        let swept = sweep_events(&self.ctx, &config, now_ms).await;
+        swept.map_err(|error| error.to_string())
     }
 
     /// Hands a batch to its receiver; this node decides the batches of the installs it runs.
@@ -511,6 +519,9 @@ pub fn spawn_worker(
                 }
                 if let Err(error) = prune_seen(&worker.ctx, now).await {
                     warn!(%error, "Could not prune plugin event dedup records");
+                }
+                if let Err(error) = worker.sweep(now).await {
+                    warn!(%error, "Could not delete stale plugin event rows");
                 }
             }
             tokio::select! {
