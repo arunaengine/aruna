@@ -13,7 +13,7 @@ use aruna_core::time::unix_timestamp_millis;
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use super::intents::drop_intents;
+use super::intents::{drop_intents, open_intent};
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
 
@@ -152,6 +152,10 @@ pub async fn prune_runs(ctx: &DriverContext, now_ms: u64) -> Result<usize, RunEr
         let expired = (run.finished_ms)
             .is_some_and(|finished| finished.saturating_add(RUN_RETENTION_MS) <= now_ms);
         if !expired || run.state == RunState::NeedsAttention {
+            continue;
+        }
+        // A run whose calls may have had effects, or cannot be read, keeps its record.
+        if !matches!(open_intent(ctx, run.run_id).await, Ok(None)) {
             continue;
         }
         transact(ctx, async |txn: &Txn<'_>| {

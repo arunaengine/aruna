@@ -90,7 +90,7 @@ async fn paged_runs() {
 
 #[tokio::test]
 async fn pruned_runs() {
-    use crate::plugins::intents::{begin, open_intent};
+    use crate::plugins::intents::{begin, open_intent, settle_in};
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
     use aruna_plugins::broker::Intent;
     let (_dir, ctx) = opened();
@@ -106,9 +106,10 @@ async fn pruned_runs() {
         let finished = if seq == 3 { 50 * RUN_RETENTION_MS } else { 10 };
         run.finish(state, None, finished);
         save_run(&ctx, &run).await.unwrap();
-        begin(&ctx, run.run_id, &Intent::new(0, None, &[b"x"]))
-            .await
-            .unwrap();
+        let intent = Intent::new(0, None, &[b"x"]);
+        begin(&ctx, run.run_id, &intent).await.unwrap();
+        let settle = async |txn: &Txn<'_>| settle_in(txn, run.run_id, &intent, "r".into()).await;
+        transact(&ctx, settle).await.unwrap();
         ended.push(run);
     }
     let waiting = queued(install, 4);
@@ -151,4 +152,22 @@ async fn resolved_runs() {
     assert!(resolved.message.unwrap_or_default().ends_with("as done"));
     let again = resolve_run(&ctx, install, run.run_id, false, &audit).await;
     assert_eq!(again, Err(RunError::NotWaiting("succeeded")));
+}
+
+#[tokio::test]
+async fn keeps_open_calls() {
+    use crate::plugins::intents::mark_unknown;
+    use aruna_core::plugin_runs::RUN_RETENTION_MS;
+    use aruna_plugins::broker::Intent;
+    let (_dir, ctx) = opened();
+    let install = Ulid::from_parts(1, 1);
+    let mut run = queued(install, 1);
+    admit(&ctx, &run).await.unwrap();
+    run.finish(RunState::Failed, None, 10);
+    save_run(&ctx, &run).await.unwrap();
+    mark_unknown(&ctx, run.run_id, &Intent::new(0, None, &[b"x"]), "lost")
+        .await
+        .unwrap();
+    assert_eq!(prune_runs(&ctx, 10 + RUN_RETENTION_MS).await.unwrap(), 0);
+    assert!(read_run(&ctx, install, run.run_id).await.is_ok());
 }

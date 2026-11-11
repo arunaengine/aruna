@@ -28,6 +28,7 @@ use super::install::read_config;
 use super::intents::open_intent;
 use super::receiver::{eligible, lost_reason};
 use super::runs::{prune_runs, read_run, save_run, unfinished};
+use super::store::StoreError;
 use crate::driver::DriverContext;
 
 /// How often the worker looks for due runs.
@@ -173,13 +174,14 @@ impl Worker {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Ends a queued run whose install is gone.
+    /// Ends a queued run whose install is gone, unless its intents decide otherwise.
     async fn drop_run(&self, install_id: Ulid, run_id: Ulid, now_ms: u64) -> Result<(), String> {
         let mut run = read_run(&self.ctx, install_id, run_id)
             .await
             .map_err(|error| error.to_string())?;
-        let message = "the install was removed".to_string();
-        run.finish(RunState::Cancelled, Some(message), now_ms);
+        let open = open_intent(&self.ctx, run_id).await;
+        let ended = Ended::Cancelled("the install was removed".to_string());
+        conclude(&mut run, ended, false, open, now_ms);
         save_run(&self.ctx, &run)
             .await
             .map_err(|error| error.to_string())
@@ -218,26 +220,14 @@ impl Worker {
         run.log = broker.take_log();
         let now = unix_timestamp_millis();
         let open = open_intent(&self.ctx, run.run_id).await;
-        match (ended, open) {
-            _ if broker.changed() => {
-                let message = "the run made a call that differs from its earlier attempt";
-                run.finish(RunState::Failed, Some(message.into()), now);
-            }
-            (_, Ok(Some(reason))) => run.finish(RunState::NeedsAttention, Some(reason), now),
-            (_, Err(error)) => retry(&mut run, error.to_string(), now),
-            (Ended::Output(output), _) => {
-                run.output = output;
-                run.finish(RunState::Succeeded, None, now);
-            }
-            (Ended::Failed(message), _) => run.finish(RunState::Failed, Some(message), now),
-            (Ended::Cancelled(message), _) => {
+        let ended = match ended {
+            Ended::Cancelled(message) => {
                 let reason = self.reasons().remove(&run.run_id);
-                let message = reason.map_or(message, str::to_string);
-                run.finish(RunState::Cancelled, Some(message), now);
+                Ended::Cancelled(reason.map_or(message, str::to_string))
             }
-            (Ended::Retry(message), _) => retry(&mut run, message, now),
-            (Ended::Stopped, _) => {}
-        }
+            other => other,
+        };
+        conclude(&mut run, ended, broker.changed(), open, now);
         if let Err(error) = save_run(&self.ctx, &run).await {
             warn!(run = %run.run_id, %error, "Could not save a finished plugin run");
         }
@@ -317,6 +307,44 @@ fn invocation(run: &PluginRun, install: &PluginInstall, cancel: CancellationToke
         limits: Limits::default(),
         cancel,
     }
+}
+
+/// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown
+/// makes it need attention, and unreadable intents keep it queued without using an attempt.
+fn conclude(
+    run: &mut PluginRun,
+    ended: Ended,
+    changed: bool,
+    open: Result<Option<String>, StoreError>,
+    now_ms: u64,
+) {
+    match open {
+        Ok(Some(reason)) => return run.finish(RunState::NeedsAttention, Some(reason), now_ms),
+        Err(error) => return hold(run, format!("its calls are not readable: {error}"), now_ms),
+        Ok(None) => {}
+    }
+    if changed {
+        let message = "the run made a call that differs from its earlier attempt";
+        return run.finish(RunState::Failed, Some(message.into()), now_ms);
+    }
+    match ended {
+        Ended::Output(output) => {
+            run.output = output;
+            run.finish(RunState::Succeeded, None, now_ms);
+        }
+        Ended::Failed(message) => run.finish(RunState::Failed, Some(message), now_ms),
+        Ended::Cancelled(message) => run.finish(RunState::Cancelled, Some(message), now_ms),
+        Ended::Retry(message) => retry(run, message, now_ms),
+        Ended::Stopped => {}
+    }
+}
+
+/// Queues the run again soon without counting the attempt that just ended.
+fn hold(run: &mut PluginRun, message: String, now_ms: u64) {
+    run.attempts = run.attempts.saturating_sub(1);
+    run.state = RunState::Queued;
+    run.message = Some(message);
+    run.due_ms = now_ms.saturating_add(TICK.as_millis() as u64);
 }
 
 /// Queues the run again after a backoff, or fails it after its last attempt.

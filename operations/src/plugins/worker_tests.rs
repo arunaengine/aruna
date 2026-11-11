@@ -240,3 +240,76 @@ async fn revoked_runs() {
     assert_eq!(state(&queued).await.0, RunState::Cancelled);
     assert!(unfinished(ctx).await.unwrap().is_empty());
 }
+
+#[test]
+fn intents_decide_first() {
+    let mut run = queued(Ulid::from_parts(1, 1), 1);
+    run.attempts = MAX_ATTEMPTS;
+    let unknown = Ok(Some("call 0 has an unknown outcome".to_string()));
+    // A changed call does not hide an unknown one.
+    let mut changed = run.clone();
+    conclude(
+        &mut changed,
+        Ended::Failed("x".into()),
+        true,
+        unknown.clone(),
+        9,
+    );
+    assert_eq!(changed.state, RunState::NeedsAttention);
+    let mut cancelled = run.clone();
+    conclude(
+        &mut cancelled,
+        Ended::Cancelled("removed".into()),
+        false,
+        unknown,
+        9,
+    );
+    assert_eq!(cancelled.state, RunState::NeedsAttention);
+    // Unreadable intents never end a run, also after its last attempt.
+    for ended in [
+        Ended::Retry("x".into()),
+        Ended::Failed("x".into()),
+        Ended::Output(None),
+    ] {
+        let mut held = run.clone();
+        let unreadable = Err(StoreError("read failed".into()));
+        conclude(&mut held, ended, false, unreadable, 9);
+        assert_eq!(
+            (held.state, held.attempts),
+            (RunState::Queued, MAX_ATTEMPTS - 1)
+        );
+    }
+    let mut last = run.clone();
+    conclude(&mut last, Ended::Retry("x".into()), false, Ok(None), 9);
+    assert_eq!(last.state, RunState::Failed);
+}
+
+#[tokio::test]
+async fn removed_with_intents() {
+    // A queued run of a removed install whose call may have had its effect needs attention.
+    use crate::plugins::lifecycle::remove_install;
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let install = installed(&fixture).await;
+    let open = admitted(&fixture, &install, 1, "echo").await;
+    let clean = admitted(&fixture, &install, 2, "echo").await;
+    let intent = Intent::new(0, None, &[b"patch"]);
+    mark_unknown(ctx, open.run_id, &intent, "timed out")
+        .await
+        .unwrap();
+    remove_install(ctx, actor, &auth, install.install_id)
+        .await
+        .unwrap();
+    worker(&fixture)
+        .claim(unix_timestamp_millis())
+        .await
+        .unwrap();
+    let state = async |run: &PluginRun| {
+        read_run(ctx, install.install_id, run.run_id)
+            .await
+            .unwrap()
+            .state
+    };
+    assert_eq!(state(&open).await, RunState::NeedsAttention);
+    assert_eq!(state(&clean).await, RunState::Cancelled);
+}
