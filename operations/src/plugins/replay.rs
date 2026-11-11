@@ -162,9 +162,11 @@ async fn start_replay(
             if target.coverage.contains_key(&trigger)
                 && old.get(&trigger) != target.coverage.get(&trigger)
             {
-                let gap = (kind, start.unwrap_or_default());
+                // The journal no longer shows how many events the pruned part held.
+                let range = (start.unwrap_or_default(), kept_from);
+                let id = target.install_id;
                 outbox
-                    .gap(txn, target.install_id, gap, GapReason::Pruned)
+                    .lost_range(txn, id, (kind, GapReason::Pruned), range)
                     .await?;
             }
         }

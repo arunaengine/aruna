@@ -218,6 +218,31 @@ impl Outbox {
         (kind, anchor_ms): (SourceKind, u64),
         reason: GapReason,
     ) -> Result<(), StoreError> {
+        let row = self.loaded(txn, install_id, (kind, reason)).await?;
+        row.add(anchor_ms);
+        Ok(())
+    }
+
+    /// Counts a lost range of events of unknown size between two times.
+    pub(crate) async fn lost_range(
+        &mut self,
+        txn: &Txn<'_>,
+        install_id: Ulid,
+        (kind, reason): (SourceKind, GapReason),
+        (from_ms, to_ms): (u64, u64),
+    ) -> Result<(), StoreError> {
+        let row = self.loaded(txn, install_id, (kind, reason)).await?;
+        row.add_range(from_ms, to_ms);
+        Ok(())
+    }
+
+    /// The install's gap row of `kind` and `reason`, read once per transaction.
+    async fn loaded(
+        &mut self,
+        txn: &Txn<'_>,
+        install_id: Ulid,
+        (kind, reason): (SourceKind, GapReason),
+    ) -> Result<&mut GapRow, StoreError> {
         let key = gap_key(install_id, kind, reason);
         if !self.gaps.contains_key(&key) {
             let stored = match txn.read(PLUGIN_GAPS_KEYSPACE, &key).await? {
@@ -226,10 +251,10 @@ impl Outbox {
             };
             self.gaps.insert(key.clone(), stored);
         }
-        if let Some(row) = self.gaps.get_mut(&key) {
-            row.add(anchor_ms);
-        }
-        Ok(())
+        Ok(self
+            .gaps
+            .entry(key)
+            .or_insert_with(|| GapRow::new(kind, reason)))
     }
 
     pub(crate) async fn commit(self, txn: &Txn<'_>) -> Result<(), StoreError> {

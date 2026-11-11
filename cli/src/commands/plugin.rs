@@ -393,8 +393,12 @@ async fn delivery(context: &mut Context<'_>, id: &str) -> Result<(), CliError> {
         lines.push(format!("oldest waiting: {} s", age / 1000));
     }
     for gap in view["gaps"].as_array().into_iter().flatten() {
+        let least = match gap["unknown"].as_bool().unwrap_or(false) {
+            true => "at least ",
+            false => "",
+        };
         lines.push(format!(
-            "not delivered: {} {} ({})",
+            "not delivered: {least}{} {} ({})",
             gap["count"].as_u64().unwrap_or(0),
             gap["kind"].as_str().unwrap_or_default(),
             gap["reason"].as_str().unwrap_or_default()

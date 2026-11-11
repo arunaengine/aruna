@@ -315,6 +315,7 @@ pub async fn event_delivery(ctx: &DriverContext, install_id: Ulid) -> Result<Del
         let total = (totals.entry((row.kind, row.reason)))
             .or_insert_with(|| GapRow::new(row.kind, row.reason));
         total.count += row.count;
+        total.unknown |= row.unknown;
         total.earliest_ms = total.earliest_ms.min(row.earliest_ms);
         total.latest_ms = total.latest_ms.max(row.latest_ms);
     }

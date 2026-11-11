@@ -208,6 +208,9 @@ async fn pruned_journal() {
     plan_replays(&fixture.ctx, &config, local, now, no_clock)
         .await
         .unwrap();
+    // The pruned part held an unknown number of events.
     let pruned = gap(&fixture, &install, GapReason::Pruned).await.unwrap();
-    assert_eq!(pruned.count, 1);
+    assert_eq!((pruned.count, pruned.unknown), (0, true));
+    let since = install.active_since_ms.unwrap();
+    assert!(pruned.earliest_ms < since && pruned.latest_ms == now - JOURNAL_RETENTION_MS);
 }

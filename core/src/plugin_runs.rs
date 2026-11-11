@@ -376,6 +376,8 @@ pub struct GapRow {
     pub kind: SourceKind,
     pub reason: GapReason,
     pub count: u64,
+    /// Whether a range of events of unknown size was lost as well; `count` is a lower bound.
+    pub unknown: bool,
     /// Anchors of the earliest and the latest event counted.
     pub earliest_ms: u64,
     pub latest_ms: u64,
@@ -390,6 +392,7 @@ impl GapRow {
             kind,
             reason,
             count: 0,
+            unknown: false,
             earliest_ms: u64::MAX,
             latest_ms: 0,
             sequence: 0,
@@ -402,6 +405,14 @@ impl GapRow {
         self.count += 1;
         self.earliest_ms = self.earliest_ms.min(anchor_ms);
         self.latest_ms = self.latest_ms.max(anchor_ms);
+        self.sequence += 1;
+    }
+
+    /// Counts a lost range of events of unknown size between two times.
+    pub fn add_range(&mut self, from_ms: u64, to_ms: u64) {
+        self.unknown = true;
+        self.earliest_ms = self.earliest_ms.min(from_ms);
+        self.latest_ms = self.latest_ms.max(to_ms);
         self.sequence += 1;
     }
 }

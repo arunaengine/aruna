@@ -640,6 +640,8 @@ pub struct GapView {
     /// `full`, `pruned`, `expired`, `waited` or `late`.
     pub reason: String,
     pub count: u64,
+    /// Whether a range of events of unknown size was lost as well; `count` is a lower bound.
+    pub unknown: bool,
     /// Origin times of the earliest and the latest event counted.
     pub earliest_ms: u64,
     pub latest_ms: u64,
@@ -676,7 +678,7 @@ pub struct DeliveryView {
 - Sync triggers are listed in `undelivered`: they are not delivered yet."#,
     params(("id" = String, Path, description = "The install id")),
     responses(
-        (status = 200, description = "The install's event delivery", body = DeliveryView, example = json!({"waiting": 1, "oldest_age_ms": 4200, "gaps": [{"kind": "data_uploaded", "reason": "full", "count": 3, "earliest_ms": 1762700000000u64, "latest_ms": 1762700060000u64}], "undelivered": ["sync_completed"], "note": null})),
+        (status = 200, description = "The install's event delivery", body = DeliveryView, example = json!({"waiting": 1, "oldest_age_ms": 4200, "gaps": [{"kind": "data_uploaded", "reason": "full", "count": 3, "unknown": false, "earliest_ms": 1762700000000u64, "latest_ms": 1762700060000u64}], "undelivered": ["sync_completed"], "note": null})),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
@@ -723,6 +725,7 @@ pub async fn delivery(
             kind: row.kind.name().to_string(),
             reason: row.reason.as_str().to_string(),
             count: row.count,
+            unknown: row.unknown,
             earliest_ms: row.earliest_ms,
             latest_ms: row.latest_ms,
         })
