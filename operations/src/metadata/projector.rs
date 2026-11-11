@@ -23,7 +23,7 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataError, MetadataEventPayload,
     MetadataEventRecord, MetadataLifecycleRecord,
 };
-use aruna_core::plugin_runs::{JOURNAL_RETENTION_MS, SourceEvent, journal_entries, source_key};
+use aruna_core::plugin_runs::{DEDUP_RETENTION_MS, SourceEvent, journal_entries, source_key};
 use aruna_core::storage_entries::{
     delete_projection_entry, document_job_entry, document_lifecycle_entry, document_lifecycle_key,
     event_log_key, graph_lifecycle_key, lifecycle_revision_change, materialization_job_entry,
@@ -513,10 +513,10 @@ pub async fn project_create_events(
             needs_materialization_drain = true;
             continue;
         }
-        // Each infrastructure holder journals a creation once by its source id, whether the
-        // registry row or the event came first, while its origin anchor is in the retention.
+        // Each infrastructure holder journals a creation once by its source id, whatever came
+        // first, while a receiver could still run it; one that arrives too late counts a gap.
         let created = SourceEvent::dataset_created(&event, now_ms);
-        let fresh = now_ms <= created.anchor_ms.saturating_add(JOURNAL_RETENTION_MS);
+        let fresh = now_ms <= created.anchor_ms.saturating_add(DEDUP_RETENTION_MS);
         if fresh
             && matches!(
                 event.payload,
@@ -1972,51 +1972,7 @@ mod tests {
     #[tokio::test]
     async fn journals_first_projection() {
         let journaled = async |local: NodeId, kind: RealmNodeKind, before: Before| {
-            let dir = tempdir().expect("temp dir");
-            let storage =
-                FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage");
-            let event = create_event();
-            let mut config = realm_config(event.record.realm_id, &[]);
-            config.ensure_node(local, kind);
-            let config_row = (
-                aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
-                ByteView::from(*event.record.realm_id.as_bytes()),
-                ByteView::from(postcard::to_allocvec(&config).expect("config")),
-            );
-            write_entries(&storage, vec![config_row]).await;
-            let earlier = arrived_before(&event, before);
-            if !earlier.is_empty() {
-                write_entries(&storage, earlier).await;
-            }
-            let context = DriverContext {
-                storage_handle: storage.clone(),
-                net_handle: None,
-                blob_handle: None,
-                metadata_handle: None,
-                task_handle: None,
-                compute_handle: None,
-            };
-            for _ in 0..2 {
-                project_create_event(&context, event.clone(), Some(local))
-                    .await
-                    .expect("projection succeeds");
-            }
-            let rows = storage
-                .send_storage_effect(StorageEffect::Iter {
-                    key_space: aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE.to_string(),
-                    prefix: Some(ByteView::from(vec![aruna_core::plugin_runs::JOURNAL_ROW])),
-                    start: None,
-                    limit: 10,
-                    txn_id: None,
-                })
-                .await;
-            let Event::Storage(StorageEvent::IterResult { values, .. }) = rows else {
-                panic!("journal rows are readable");
-            };
-            let rows: Vec<SourceEvent> = (values.iter())
-                .map(|(_, value)| SourceEvent::from_bytes(value).unwrap())
-                .collect();
-            (event, rows)
+            journaled_aged(local, kind, before, 0).await
         };
         let holder = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
         let (_, late) = journaled(holder, RealmNodeKind::Server, Before::Registry).await;
@@ -2034,6 +1990,77 @@ mod tests {
         let owner = UserId::local(Ulid::from_parts(4, 4), event.record.realm_id);
         let (_, none) = journaled(holder, RealmNodeKind::User { owner }, Before::Nothing).await;
         assert!(none.is_empty());
+    }
+
+    // A holder that returns after eight days still journals a create its receivers could run.
+    #[tokio::test]
+    async fn journals_delayed_create() {
+        let holder = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+        let age = 8 * 24 * 3600 * 1000;
+        let (event, rows) =
+            journaled_aged(holder, RealmNodeKind::Server, Before::Nothing, age).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].anchor_ms, event.event_id.timestamp_ms());
+        let gone = DEDUP_RETENTION_MS + 1;
+        let (_, none) = journaled_aged(holder, RealmNodeKind::Server, Before::Nothing, gone).await;
+        assert!(none.is_empty());
+    }
+
+    /// Projects a create minted `age_ms` ago twice on `local` and returns its journal rows.
+    async fn journaled_aged(
+        local: NodeId,
+        kind: RealmNodeKind,
+        before: Before,
+        age_ms: u64,
+    ) -> (MetadataEventRecord, Vec<SourceEvent>) {
+        let dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage");
+        let mut event = create_event();
+        let minted = aruna_core::time::unix_timestamp_millis() - age_ms;
+        event.event_id = Ulid::from_parts(minted, event.event_id.random());
+        event.record.establishing_event_id = event.event_id;
+        event.record.last_event_id = event.event_id;
+        let mut config = realm_config(event.record.realm_id, &[]);
+        config.ensure_node(local, kind);
+        let config_row = (
+            aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+            ByteView::from(*event.record.realm_id.as_bytes()),
+            ByteView::from(postcard::to_allocvec(&config).expect("config")),
+        );
+        write_entries(&storage, vec![config_row]).await;
+        let earlier = arrived_before(&event, before);
+        if !earlier.is_empty() {
+            write_entries(&storage, earlier).await;
+        }
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        for _ in 0..2 {
+            project_create_event(&context, event.clone(), Some(local))
+                .await
+                .expect("projection succeeds");
+        }
+        let rows = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE.to_string(),
+                prefix: Some(ByteView::from(vec![aruna_core::plugin_runs::JOURNAL_ROW])),
+                start: None,
+                limit: 10,
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = rows else {
+            panic!("journal rows are readable");
+        };
+        let rows: Vec<SourceEvent> = (values.iter())
+            .map(|(_, value)| SourceEvent::from_bytes(value).unwrap())
+            .collect();
+        (event, rows)
     }
 
     // Another holder names the author's commit message in its audit row, from the replicated

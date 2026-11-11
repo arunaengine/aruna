@@ -217,6 +217,17 @@ async fn dedup_retention() {
 }
 
 #[tokio::test]
+async fn delayed_creation_runs() {
+    // A creation journaled eight days after its origin is still within the dedup horizon.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let now = unix_timestamp_millis();
+    let row = event(&install, "D1", now - 8 * DAY).1;
+    let outcome = decided_at(&fixture, &[row], fixture.actor.node_id, now).await;
+    assert_eq!(outcome, [Outcome::Queued]);
+}
+
+#[tokio::test]
 async fn late_rows_refused() {
     // Rows past their anchor's retention, also another holder's late row, never run.
     let fixture = Fixture::new().await;

@@ -7,7 +7,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE;
 use aruna_core::plugin_runs::{
-    JOURNAL_RETENTION_MS, JOURNAL_ROW, SOURCE_ROW, SourceEvent, journal_entries, journal_key,
+    DEDUP_RETENTION_MS, JOURNAL_RETENTION_MS, JOURNAL_ROW, SOURCE_ROW, SourceEvent,
+    journal_entries, journal_key,
 };
 use ulid::Ulid;
 
@@ -61,8 +62,8 @@ pub fn journaled(effect: Effect, event: &SourceEvent) -> Result<Effect, Conversi
     }
 }
 
-/// Deletes kept rows journaled longer than the retention ago, and source-id rows whose anchor
-/// is that old, after which a source is not journaled again; returns how many rows.
+/// Deletes kept rows journaled longer than the retention ago, and source-id rows past the
+/// dedup horizon, after which a source is not journaled again; returns how many rows.
 pub async fn prune_journal(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
     let txn = Txn::direct(ctx);
     let kept_from = now_ms.saturating_sub(JOURNAL_RETENTION_MS);
@@ -86,7 +87,7 @@ pub async fn prune_journal(ctx: &DriverContext, now_ms: u64) -> Result<usize, St
     let old: Vec<Vec<u8>> = (sources.into_iter())
         .filter(|(_, value)| {
             let anchor = value.as_slice().try_into().map(u64::from_be_bytes);
-            anchor.is_ok_and(|anchor| anchor < kept_from)
+            anchor.is_ok_and(|anchor| now_ms > anchor.saturating_add(DEDUP_RETENTION_MS))
         })
         .map(|(key, _)| key)
         .collect();
@@ -125,19 +126,23 @@ mod tests {
             txn.write(EVENT_JOURNAL_KEYSPACE, rows).await.unwrap();
         }
         let now = 15 + JOURNAL_RETENTION_MS;
-        // One kept row and the source-id row of the same old event.
-        assert_eq!(prune_journal(&ctx, now).await.unwrap(), 2);
-        let sources = txn
-            .scan(EVENT_JOURNAL_KEYSPACE, &[SOURCE_ROW])
-            .await
-            .unwrap();
-        assert_eq!(sources.len(), 2);
+        assert_eq!(prune_journal(&ctx, now).await.unwrap(), 1);
         let (kept, _) = journal_page(&txn, JOURNAL_ROW, None, 10).await.unwrap();
         let times: Vec<u64> = kept.iter().map(|(_, row)| row.journaled_ms).collect();
         assert_eq!(times, [20, 10 + JOURNAL_RETENTION_MS]);
         // Pending rows are the matcher's; retention pruning leaves them.
         let (pending, _) = journal_page(&txn, b'u', None, 10).await.unwrap();
         assert_eq!(pending.len(), 3);
+        // Source-id rows stay until the dedup horizon, so a late copy is not journaled again.
+        let sources = async || {
+            txn.scan(EVENT_JOURNAL_KEYSPACE, &[SOURCE_ROW])
+                .await
+                .unwrap()
+        };
+        assert_eq!(sources().await.len(), 3);
+        let horizon = 25 + DEDUP_RETENTION_MS;
+        assert_eq!(prune_journal(&ctx, horizon).await.unwrap(), 3);
+        assert_eq!(sources().await.len(), 1);
     }
 
     #[tokio::test]
