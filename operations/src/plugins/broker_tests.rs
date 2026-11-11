@@ -226,12 +226,66 @@ async fn object_paths() {
     let dataset = format!("/{realm}/g/{group}/data/{node}/dataset/**");
     let (objects, install) = objects_broker(&fixture, &broker, &[dataset]).await;
     let listed = vec![("set/private".to_string(), 1, "v1".to_string())];
-    assert!(objects.visible(&install, "data", listed).await.is_empty());
+    assert!(
+        objects
+            .visible(&install, "data", listed)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let listed = vec![("private".to_string(), 1, "v1".to_string())];
-    let shown = objects.visible(&install, "dataset", listed).await;
+    let shown = objects
+        .visible(&install, "dataset", listed.clone())
+        .await
+        .unwrap();
     let path = format!("/{realm}/g/{group}/data/{node}/dataset/private");
     assert_eq!(
         shown.iter().map(|object| &object.path).collect::<Vec<_>>(),
         [&path]
+    );
+}
+
+#[tokio::test]
+async fn listings_authorize() {
+    // A target an individual call refuses is left out of the listing too.
+    let (fixture, broker, document, _dir) = broker().await;
+    let listed = broker.metadata_list(&cx(), None).await.unwrap();
+    assert_eq!(listed.resources, [document.to_string()]);
+    fixture.deny(&["operation == 'plugin.metadata.read'"]).await;
+    let refused = broker.metadata_get(&cx(), &document.to_string()).await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::Denied);
+    assert!(
+        broker
+            .metadata_list(&cx(), None)
+            .await
+            .unwrap()
+            .resources
+            .is_empty()
+    );
+
+    let (realm, group, node) = (
+        fixture.actor.realm_id,
+        fixture.group_id,
+        fixture.actor.node_id,
+    );
+    let data = format!("/{realm}/g/{group}/data/{node}/data/**");
+    fixture.deny(&[]).await;
+    let (objects, install) = objects_broker(&fixture, &broker, &[data]).await;
+    let listed = vec![("a.txt".to_string(), 1, "v1".to_string())];
+    let shown = objects
+        .visible(&install, "data", listed.clone())
+        .await
+        .unwrap();
+    assert_eq!(shown.len(), 1);
+    fixture.deny(&["operation == 'plugin.objects.read'"]).await;
+    let path = format!("/{realm}/g/{group}/data/{node}/data/a.txt");
+    let refused = objects.objects_info(&cx(), &path).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Denied);
+    assert!(
+        objects
+            .visible(&install, "data", listed)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }

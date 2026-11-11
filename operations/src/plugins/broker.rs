@@ -26,7 +26,7 @@ use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
 use ulid::Ulid;
 
-use super::check::{RunScope, check_call, matching, unavailable};
+use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
 use super::grants::{accesses, parse_grants};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in};
 use super::rate::take_call;
@@ -264,23 +264,48 @@ impl RunBroker {
 }
 
 impl RunBroker {
-    /// The listed objects of a local bucket the grants cover, each named by the permission path
-    /// of its own bucket and key, never by the text of the listing prefix.
+    /// Whether the account may reach a listed target now: the grants must cover it and it must
+    /// pass the same authorization as an individual call. Only an unavailable check fails.
+    async fn authorized(
+        &self,
+        install: &PluginInstall,
+        permission: Permission,
+        target: &str,
+    ) -> Result<bool, HostError> {
+        let Ok(patterns) = matching(install, permission, target) else {
+            return Ok(false);
+        };
+        match authorize_call(&self.ctx, install, permission, target, &patterns).await {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind == ErrorKind::Unavailable => Err(error),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// The listed objects of a local bucket the account may read, each named by the permission
+    /// path of its own bucket and key, never by the text of the listing prefix.
     async fn visible(
         &self,
         install: &PluginInstall,
         bucket: &str,
         objects: Vec<(String, u64, String)>,
-    ) -> Vec<ObjectInfo> {
+    ) -> Result<Vec<ObjectInfo>, HostError> {
         let (realm, group, node) = (self.scope.realm_id, install.group_id, self.scope.local);
-        (objects.into_iter())
-            .map(|(key, size, version)| ObjectInfo {
-                path: object_permission_path(realm, group, node, bucket, &key),
-                size,
-                version,
-            })
-            .filter(|object| matching(install, Permission::ObjectsRead, &object.path).is_ok())
-            .collect()
+        let mut visible = Vec::new();
+        for (key, size, version) in objects {
+            let path = object_permission_path(realm, group, node, bucket, &key);
+            if self
+                .authorized(install, Permission::ObjectsRead, &path)
+                .await?
+            {
+                visible.push(ObjectInfo {
+                    path,
+                    size,
+                    version,
+                });
+            }
+        }
+        Ok(visible)
     }
 }
 
@@ -335,17 +360,16 @@ impl Broker for RunBroker {
         let listed = list_visible_documents(&self.ctx, self.scope.realm_id, request).await;
         let listed = listed.map_err(api_error)?;
         let full = listed.documents.len() >= PAGE;
-        let resources = (listed.documents.iter())
-            .filter(|document| {
-                matching(
-                    &install,
-                    Permission::MetadataRead,
-                    &document.record.permission_path,
-                )
-                .is_ok()
-            })
-            .map(|document| document.record.document_id.to_string())
-            .collect();
+        let mut resources = Vec::new();
+        for document in &listed.documents {
+            let path = &document.record.permission_path;
+            if self
+                .authorized(&install, Permission::MetadataRead, path)
+                .await?
+            {
+                resources.push(document.record.document_id.to_string());
+            }
+        }
         let cursor = full.then(|| (offset + listed.documents.len()).to_string());
         Ok(Listing { resources, cursor })
     }
@@ -450,7 +474,7 @@ impl Broker for RunBroker {
                 (object.head.key, size, object.version_id.to_string())
             })
             .collect();
-        let objects = self.visible(&install, &bucket, listed_objects).await;
+        let objects = self.visible(&install, &bucket, listed_objects).await?;
         let cursor = match listed.continuation_token {
             Some(token) => Some(hex::encode(
                 token
