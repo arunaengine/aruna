@@ -7,6 +7,7 @@ pub mod artifacts;
 pub mod broker;
 pub mod check;
 pub mod copies;
+pub mod dispatch;
 pub mod grants;
 pub mod install;
 pub mod intents;

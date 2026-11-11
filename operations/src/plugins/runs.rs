@@ -14,7 +14,7 @@ use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
 
 /// Serializes admissions on this node, so no install passes its queue bound.
-static ADMISSIONS: Mutex<()> = Mutex::const_new(());
+pub static ADMISSIONS: Mutex<()> = Mutex::const_new(());
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RunError {
@@ -29,19 +29,21 @@ pub enum RunError {
 /// Stores a new queued run, unless its install already has `RUNS_QUEUED` unfinished ones.
 pub async fn admit(ctx: &DriverContext, run: &PluginRun) -> Result<(), RunError> {
     let _admitting = ADMISSIONS.lock().await;
-    transact(ctx, async |txn: &Txn<'_>| {
-        let prefix = run.install_id.to_bytes();
-        let queued = txn.scan(PLUGIN_QUEUE_KEYSPACE, &prefix).await?.len();
-        if queued >= RUNS_QUEUED {
-            return Err(RunError::Full(queued));
-        }
-        let queue = vec![(queue_key(run.install_id, run.run_id), Vec::new())];
-        txn.write(PLUGIN_QUEUE_KEYSPACE, queue).await?;
-        let row = vec![(run_key(run.install_id, run.run_id), encode(run)?)];
-        txn.write(PLUGIN_RUNS_KEYSPACE, row).await?;
-        Ok(())
-    })
-    .await
+    transact(ctx, async |txn: &Txn<'_>| admit_in(txn, run).await).await
+}
+
+/// Admits the run in `txn`; the caller holds `ADMISSIONS`.
+pub async fn admit_in(txn: &Txn<'_>, run: &PluginRun) -> Result<(), RunError> {
+    let prefix = run.install_id.to_bytes();
+    let queued = txn.scan(PLUGIN_QUEUE_KEYSPACE, &prefix).await?.len();
+    if queued >= RUNS_QUEUED {
+        return Err(RunError::Full(queued));
+    }
+    let queue = vec![(queue_key(run.install_id, run.run_id), Vec::new())];
+    txn.write(PLUGIN_QUEUE_KEYSPACE, queue).await?;
+    let row = vec![(run_key(run.install_id, run.run_id), encode(run)?)];
+    txn.write(PLUGIN_RUNS_KEYSPACE, row).await?;
+    Ok(())
 }
 
 pub async fn read_run(

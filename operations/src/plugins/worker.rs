@@ -23,6 +23,7 @@ use ulid::Ulid;
 use super::artifacts::fetch_artifact;
 use super::broker::RunBroker;
 use super::check::RunScope;
+use super::dispatch::enqueue_timers;
 use super::install::read_config;
 use super::intents::open_intent;
 use super::runs::{read_run, save_run, unfinished};
@@ -81,19 +82,21 @@ impl Worker {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Starts the due runs of the active installs this node receives, at most `RUNS_PARALLEL`
-    /// per install. A run found `running` that no task runs was cut off and starts again.
+    /// Queues due timer occurrences, then starts the due runs of the active installs this node
+    /// receives, at most `RUNS_PARALLEL` per install. A `running` run no task runs starts again.
     pub async fn claim(self: &Arc<Self>, now_ms: u64) -> Result<usize, String> {
         if self.stopping.is_cancelled() {
             return Ok(0);
         }
-        let queued = unfinished(&self.ctx)
+        let config = read_config(&self.ctx, self.realm_id)
             .await
             .map_err(|error| error.to_string())?;
-        if queued.is_empty() {
+        if !(config.installs.iter()).any(|install| install.receiver == self.local) {
             return Ok(0);
         }
-        let config = read_config(&self.ctx, self.realm_id)
+        let timers = enqueue_timers(&self.ctx, &config, self.local, now_ms).await;
+        timers.map_err(|error| error.to_string())?;
+        let queued = unfinished(&self.ctx)
             .await
             .map_err(|error| error.to_string())?;
         let mut started = 0;
@@ -315,4 +318,4 @@ pub fn spawn_worker(
 
 #[cfg(test)]
 #[path = "worker_tests.rs"]
-mod tests;
+pub(crate) mod tests;

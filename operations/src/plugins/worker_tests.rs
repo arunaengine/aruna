@@ -50,7 +50,7 @@ fn runnable() -> Vec<u8> {
 }
 
 /// An install of the runnable fixture whose artifact this node keeps.
-async fn installed(fixture: &Fixture) -> PluginInstall {
+pub(crate) async fn installed(fixture: &Fixture) -> PluginInstall {
     let bytes = runnable();
     let manifest = read_manifest(&bytes).unwrap();
     let digest = ArtifactDigest::of(&bytes).to_string();
