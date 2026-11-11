@@ -41,12 +41,15 @@ impl InstallState {
     }
 }
 
-/// Makes a role or account write of an install conditional: it applies only while this node's
-/// record of the install still has `revision`, read in the write's own transaction.
+/// Makes a role or account write of an install conditional on this node's record of the
+/// install, read in the write's own transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InstallGuard {
-    pub install_id: Ulid,
-    pub revision: u64,
+pub enum InstallGuard {
+    /// Admits while the record still has `revision`.
+    Revision { install_id: Ulid, revision: u64 },
+    /// Admits while the record is absent or conflicting, or names an account other than
+    /// `account`: the account is no longer the install's.
+    Unnamed { install_id: Ulid, account: UserId },
 }
 
 impl InstallGuard {
@@ -54,10 +57,18 @@ impl InstallGuard {
         &self,
         config: Option<&crate::structs::identity::realm::RealmConfigDocument>,
     ) -> bool {
+        let (Self::Revision { install_id, .. } | Self::Unnamed { install_id, .. }) = self;
         let install = config.and_then(|config| {
-            (config.installs.iter()).find(|install| install.install_id == self.install_id)
+            (config.installs.iter()).find(|install| install.install_id == *install_id)
         });
-        install.is_some_and(|install| install.revision == self.revision)
+        match self {
+            Self::Revision { revision, .. } => {
+                install.is_some_and(|install| install.revision == *revision)
+            }
+            Self::Unnamed { account, .. } => {
+                install.is_none_or(|install| install.account != *account)
+            }
+        }
     }
 }
 
@@ -208,6 +219,32 @@ mod tests {
             edit(&mut invalid);
             assert!(!invalid.valid(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn guard_variants() {
+        use crate::structs::identity::realm::RealmConfigDocument;
+        let record = install();
+        let mut config = RealmConfigDocument::new(record.account.realm_id, Vec::new(), 1);
+        config.installs.push(record.clone());
+        let install_id = record.install_id;
+        let revision = InstallGuard::Revision {
+            install_id,
+            revision: 1,
+        };
+        let named = InstallGuard::Unnamed {
+            install_id,
+            account: record.account,
+        };
+        let other = InstallGuard::Unnamed {
+            install_id,
+            account: record.granted_by,
+        };
+        assert!(revision.admits(Some(&config)) && !named.admits(Some(&config)));
+        assert!(other.admits(Some(&config)));
+        config.installs.clear();
+        assert!(!revision.admits(Some(&config)) && named.admits(Some(&config)));
+        assert!(named.admits(None));
     }
 
     #[test]

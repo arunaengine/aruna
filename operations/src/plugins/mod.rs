@@ -20,6 +20,7 @@ pub mod runs;
 pub mod settings;
 pub mod state;
 pub mod store;
+pub mod sweep;
 pub mod worker;
 
 use serde::{Deserialize, Serialize};

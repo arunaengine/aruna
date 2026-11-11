@@ -25,7 +25,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::auth::revoke_token::{RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation};
 use crate::users::update_user::{UpdateUserInput, UpdateUserOperation};
 
-const REALM_ADMIN_ROLE: &str = "realm_admin";
+pub(crate) const REALM_ADMIN_ROLE: &str = "realm_admin";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccountStatusConfig {
@@ -116,7 +116,7 @@ impl AccountStatusOperation {
         self
     }
 
-    /// Marks the account only while the install record is still at the guard's revision.
+    /// Marks the account only while the guard admits it, read in the same transaction.
     pub fn guarded(mut self, guard: aruna_core::plugin_installs::InstallGuard) -> Self {
         self.guard = Some(guard);
         self
