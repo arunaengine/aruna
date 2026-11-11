@@ -87,6 +87,7 @@ pub(crate) async fn installed(fixture: &Fixture) -> PluginInstall {
         settings: settings.as_object().cloned().unwrap_or_default(),
         grants: BTreeMap::new(),
         install_id: None,
+        secrets: BTreeMap::new(),
     };
     fixture.install(&request).await.unwrap()
 }

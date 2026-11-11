@@ -8,11 +8,12 @@ use std::sync::Arc;
 
 use aruna_core::UserId;
 use aruna_core::errors::StorageError;
-use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::GroupId;
 use aruna_operations::plugins::account::plugin_account;
+use aruna_operations::plugins::bound::vault_kind;
 use aruna_operations::plugins::grants::{GrantError, InstallScope, parse_grants};
 use aruna_operations::plugins::install::{
     InstallError, InstallRequest, install_plugin, pick_version, prepare_install, read_config,
@@ -69,6 +70,10 @@ pub struct InstallBody {
     pub grants: BTreeMap<String, Vec<String>>,
     /// The id a preview answered; sending the same request with it resumes that install.
     pub id: Option<String>,
+    /// The secret of each slot as `group:<name>`, `realm:<name>` or `node:<name>` (the
+    /// receiver's node vault); a slot left out uses the group secret of the slot's name.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -107,8 +112,20 @@ pub struct InstallSummary {
     pub connections: Vec<ConnectionLine>,
     /// Trigger kinds, such as `manual` or `dataset_created`.
     pub triggers: Vec<String>,
+    /// The secret each slot uses.
+    pub secrets: Vec<SecretLine>,
     /// What the admin should know before approving, such as triggers not delivered yet.
     pub warnings: Vec<String>,
+}
+
+/// One secret slot of the summary: its kind and the secret it uses.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SecretLine {
+    pub slot: String,
+    /// `bearer`, `basic`, `header` or `hmac`.
+    pub kind: String,
+    /// `group:<name>`, `realm:<name>` or `node:<name>`.
+    pub secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -155,7 +172,7 @@ pub struct InstallListQuery {
     pub limit: Option<usize>,
 }
 
-const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"], "warnings": []}}"#;
+const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"], "secrets": [{"slot": "catalog_key", "kind": "bearer", "secret": "group:catalog-key"}], "warnings": []}}"#;
 
 pub(crate) fn view_example() -> Value {
     serde_json::from_str(VIEW_EXAMPLE).unwrap_or(Value::Null)
@@ -181,6 +198,9 @@ relays it to one.
   the id is refused. A retry without `version` keeps the existing install's version.
 - The install is written `preparing`, its account and role are made right, and it becomes
   `active` as the last write. A failed step leaves it `preparing` with the step in `failed`.
+- Each secret slot binds a secret by `secrets`, the group secret of the slot's name by default.
+  A group or realm secret is checked here, a node secret on the receiver; it must exist with the
+  slot's kind. A realm or node secret needs its use rule from a realm admin; the summary warns.
 - Plugins with secret slots or webhooks cannot be installed yet.
 - While any enabled realm or group policy reads the request path, a grant on a subtree is
   refused, even when the policy's guard leaves plugin operations out; exact paths stay usable.
@@ -191,7 +211,7 @@ relays it to one.
 - 404 when no published version matches.
 - 409 when the id belongs to another request or a step failed."#,
     params(("name" = String, Path, description = "The plugin name"), InstallQuery),
-    request_body(content = InstallBody, example = json!({"group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "settings": {"catalog_url": "https://catalog.example.org"}, "grants": {"metadata.write": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/runs/**"]}})),
+    request_body(content = InstallBody, example = json!({"group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "settings": {"catalog_url": "https://catalog.example.org"}, "grants": {"metadata.write": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/runs/**"]}, "secrets": {"catalog_key": "group:catalog-key"}})),
     responses(
         (status = 200, description = "The summary of a preview", body = InstallSummary, example = json!(view_example()["summary"])),
         (status = 201, description = "The active install", body = InstallView, example = json!(view_example())),
@@ -221,9 +241,13 @@ pub async fn install(
         settings: body.settings,
         grants: body.grants,
         install_id: body.id.as_deref().map(parse_id).transpose()?,
+        secrets: body.secrets,
     };
     let ctx = state.get_ctx();
     let preview = query.preview.unwrap_or(false);
+    if !preview && !request.secrets.is_empty() {
+        require_unrestricted_auth(&state, Some(auth.clone()))?;
+    }
     if !preview {
         let config = load_config(&state).await?;
         let chosen = pick_version(&config, &request.plugin, request.version.as_deref()).ok();
@@ -235,11 +259,12 @@ pub async fn install(
             .await
             .map_err(map_error)?;
         let grants = aruna_operations::plugins::grants::stored_grants(&prepared.grants);
+        let granted = (&grants, &prepared.secrets);
         let summary = summary(
             &prepared.manifest,
             &prepared.plugin.digest,
             &prepared.scope,
-            &grants,
+            granted,
         );
         return Ok(Json(summary).into_response());
     }
@@ -469,7 +494,10 @@ fn view_in(config: &RealmConfigDocument, install: PluginInstall) -> InstallView 
         install_id: install.install_id,
     };
     let summary = match manifest {
-        Some(manifest) => summary(&manifest, &install.digest, &scope, &install.grants),
+        Some(manifest) => {
+            let granted = (&install.grants, &install.secrets);
+            summary(&manifest, &install.digest, &scope, granted)
+        }
         None => bare_summary(&install),
     };
     // A lost receiver blocks the install here; its stored state stays as it is.
@@ -502,7 +530,10 @@ fn summary(
     manifest: &Manifest,
     digest: &str,
     scope: &InstallScope,
-    grants: &BTreeMap<String, Vec<String>>,
+    (grants, bound): (
+        &BTreeMap<String, Vec<String>>,
+        &BTreeMap<String, SecretBinding>,
+    ),
 ) -> InstallSummary {
     let granted = parse_grants(grants);
     let required = &manifest.permissions.required;
@@ -538,10 +569,24 @@ fn summary(
             .keys()
             .map(|kind| kind.as_str().to_string())
             .collect(),
-        warnings: match undelivered(manifest).is_empty() {
-            true => Vec::new(),
-            false => vec![SYNC_WARNING.to_string()],
-        },
+        secrets: (bound.iter())
+            .map(|(slot, binding)| SecretLine {
+                slot: slot.clone(),
+                kind: (manifest.secrets.get(slot))
+                    .and_then(|declared| vault_kind(declared.kind))
+                    .map_or_else(String::new, |kind| kind.as_str().to_string()),
+                secret: binding.to_string(),
+            })
+            .collect(),
+        warnings: (undelivered(manifest)
+            .first()
+            .map(|_| SYNC_WARNING.to_string()))
+        .into_iter()
+        .chain(bound.iter().filter_map(|(slot, binding)| {
+            let shared = matches!(binding.scope, BoundScope::Realm | BoundScope::Node);
+            shared.then(|| format!("a realm admin adds the use rule of `{binding}` for `{slot}`"))
+        }))
+        .collect(),
     }
 }
 
@@ -564,6 +609,7 @@ fn bare_summary(install: &PluginInstall) -> InstallSummary {
         permissions,
         connections: Vec::new(),
         triggers: Vec::new(),
+        secrets: Vec::new(),
         warnings: Vec::new(),
     }
 }
@@ -575,7 +621,8 @@ pub(crate) fn map_error(error: InstallError) -> ServerError {
         InstallError::NotPublished | InstallError::NotFound => ServerError::NotFound,
         InstallError::Grant(GrantError::Unsupported(_))
         | InstallError::Grant(_)
-        | InstallError::Setting(_) => ServerError::BadRequestReason(message),
+        | InstallError::Setting(_)
+        | InstallError::Binding(_) => ServerError::BadRequestReason(message),
         InstallError::Changed | InstallError::State(_) | InstallError::Step { .. } => {
             ServerError::Conflict(message)
         }
@@ -746,7 +793,8 @@ mod tests {
             let manifest =
                 serde_json::json!({"name": "p", "version": "0.1.0", "triggers": triggers});
             let manifest: Manifest = serde_json::from_value(manifest).unwrap();
-            summary(&manifest, "sha256:ab", &scope, &BTreeMap::new()).warnings
+            let none = (&BTreeMap::new(), &BTreeMap::new());
+            summary(&manifest, "sha256:ab", &scope, none).warnings
         };
         let sync_only = warned(serde_json::json!({"sync_failed": {}}));
         let mixed = warned(serde_json::json!({"sync_completed": {}, "dataset_created": {}}));

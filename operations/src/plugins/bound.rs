@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::NodeId;
@@ -161,7 +162,7 @@ pub async fn select(
 }
 
 /// Drives the register reader of one name on the node's own storage.
-async fn read_entry(
+pub(crate) async fn read_entry(
     ctx: &DriverContext,
     realm_id: RealmId,
     owner: &SecretOwner,
@@ -218,6 +219,102 @@ pub async fn open(
             }
         }
     }
+}
+
+/// The vault kind a manifest slot kind names.
+pub fn vault_kind(kind: aruna_plugins::manifest::SecretKind) -> Option<SecretKind> {
+    let name = serde_json::to_value(kind).ok()?;
+    SecretKind::parse(name.as_str()?).ok()
+}
+
+/// Who installs into which group, on which management node, for which receiver.
+#[derive(Clone, Copy, Debug)]
+pub struct BindPlace {
+    pub group_id: aruna_core::types::GroupId,
+    pub local: Option<NodeId>,
+    pub receiver: Option<NodeId>,
+}
+
+/// The bindings of every slot the manifest declares, from `requested` (slot to `scope:name`)
+/// or the same name in the group, each checked where it lives; and the warnings for slots whose
+/// use rule a realm admin must add.
+pub async fn bind_slots(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    place: BindPlace,
+    manifest: &aruna_plugins::manifest::Manifest,
+    requested: &BTreeMap<String, String>,
+) -> Result<(BTreeMap<String, SecretBinding>, Vec<String>), BindError> {
+    if let Some(slot) = requested
+        .keys()
+        .find(|slot| !manifest.secrets.contains_key(*slot))
+    {
+        return Err(BindError::Invalid(format!(
+            "the manifest has no secret slot `{slot}`"
+        )));
+    }
+    let (mut bindings, mut warnings) = (BTreeMap::new(), Vec::new());
+    for (slot, declared) in &manifest.secrets {
+        let text = requested
+            .get(slot)
+            .cloned()
+            .unwrap_or_else(|| format!("group:{slot}"));
+        let invalid = || BindError::Invalid(format!("`{text}` is not a secret of slot `{slot}`"));
+        let binding = SecretBinding::parse(&text).ok_or_else(invalid)?;
+        let kind = vault_kind(declared.kind).ok_or_else(invalid)?;
+        let shown = kind.as_str();
+        let missing = || BindError::Invalid(format!("no {shown} secret `{binding}` for `{slot}`"));
+        match binding.scope {
+            BoundScope::Group => {
+                let owner = SecretOwner::Group(place.group_id);
+                let entry = read_entry(ctx, config.realm_id, &owner, &binding.name).await;
+                let entry = entry.map_err(|error| BindError::Unavailable(error.to_string()))?;
+                if !entry.is_some_and(|entry| entry.kind() == Some(&kind)) {
+                    return Err(missing());
+                }
+            }
+            BoundScope::Realm => {
+                let record = config
+                    .secrets
+                    .iter()
+                    .find(|record| record.name == binding.name);
+                if !record.is_some_and(|record| record.kind == kind) {
+                    return Err(missing());
+                }
+                warnings.push(format!(
+                    "a realm admin adds the use rule of `{binding}` for `{slot}`"
+                ));
+            }
+            BoundScope::Node => {
+                let (Some(local), Some(receiver)) = (place.local, place.receiver) else {
+                    return Err(BindError::Unavailable(
+                        "the receiver is not known yet".into(),
+                    ));
+                };
+                match check_node_binding(ctx, (local, receiver), &binding.name, &kind).await {
+                    Ok(()) => {}
+                    Err(NodeCheckError::Unavailable) => {
+                        return Err(BindError::Unavailable("the receiver did not answer".into()));
+                    }
+                    Err(_) => return Err(missing()),
+                }
+                warnings.push(format!(
+                    "a realm admin adds the use rule of `{binding}` for `{slot}`"
+                ));
+            }
+        }
+        bindings.insert(slot.clone(), binding);
+    }
+    Ok((bindings, warnings))
+}
+
+/// Why slots could not be bound.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BindError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 /// Why a node binding does not fit its slot on the install's receiver.

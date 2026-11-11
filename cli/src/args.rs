@@ -160,6 +160,9 @@ pub enum PluginCommand {
         /// A grant as `permission=pattern`, repeated for more; `permission=` removes it.
         #[arg(long = "grant", value_name = "PERMISSION=PATTERN")]
         grants: Vec<String>,
+        /// A secret slot's secret as `slot=group:name`, `slot=realm:name` or `slot=node:name`.
+        #[arg(long = "secret", value_name = "SLOT=SECRET")]
+        secrets: Vec<String>,
         /// Show the summary and an install id without installing.
         #[arg(long)]
         preview: bool,
@@ -535,9 +538,14 @@ mod tests {
             "a=b",
             "--grant",
             "c=",
+            "--secret",
+            "api_key=realm:shared",
         ];
         let Command::Plugin(PluginCommand::Install {
-            grants, preview, ..
+            grants,
+            secrets,
+            preview,
+            ..
         }) = parse(&line).unwrap().command
         else {
             panic!("expected plugin install");
@@ -546,6 +554,7 @@ mod tests {
             (grants, preview),
             (vec!["a=b".to_string(), "c=".to_string()], false)
         );
+        assert_eq!(secrets, ["api_key=realm:shared"]);
         assert!(parse(&["plugin", "install", "announcer"]).is_err());
     }
 

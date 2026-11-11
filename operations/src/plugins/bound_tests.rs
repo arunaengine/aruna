@@ -13,8 +13,8 @@ use serde_json::json;
 
 use super::*;
 use crate::driver::drive;
-use crate::plugins::install::read_config;
 use crate::plugins::install::tests::{Fixture, REALM_KEY};
+use crate::plugins::install::{pick_version, read_config, read_manifest};
 use crate::secrets::SecretChange;
 use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
 
@@ -205,4 +205,78 @@ async fn node_binding_checks() {
     assert_eq!(served, Err(NodeCheckError::Forbidden));
     let asked = node_check_for(&fixture.ctx, (&config, local), &name, &bearer).await;
     assert_eq!(asked, Ok(()));
+}
+
+#[tokio::test]
+async fn slots_bind() {
+    let fixture = Fixture::keyed().await;
+    let install = bound(&fixture).await;
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let plugin = pick_version(&config, &install.plugin, Some(&install.digest)).unwrap();
+    let manifest = read_manifest(&plugin).unwrap();
+    let place = BindPlace {
+        group_id: install.group_id,
+        local: Some(fixture.actor.node_id),
+        receiver: Some(install.receiver),
+    };
+    let bind = |pairs: &[(&str, &str)]| {
+        let requested: BTreeMap<String, String> = (pairs.iter())
+            .map(|(slot, secret)| (slot.to_string(), secret.to_string()))
+            .collect();
+        let (ctx, config, manifest) = (&fixture.ctx, &config, &manifest);
+        async move { bind_slots(ctx, config, place, manifest, &requested).await }
+    };
+    // By default the slot uses the group secret of its name, which does not exist.
+    assert!(matches!(bind(&[]).await, Err(BindError::Invalid(_))));
+    secret(&fixture, &install).await;
+    let (bindings, warnings) = bind(&[("api_key", "group:api-key")]).await.unwrap();
+    assert_eq!(bindings["api_key"].to_string(), "group:api-key");
+    assert!(warnings.is_empty());
+    for wrong in [
+        ("other", "group:api-key"),
+        ("api_key", "user:mine"),
+        ("api_key", "realm:api-key"),
+    ] {
+        assert!(
+            matches!(bind(&[wrong]).await, Err(BindError::Invalid(_))),
+            "{wrong:?}"
+        );
+    }
+    // A node secret of the slot's kind binds, with a warning about its rule.
+    fixture
+        .ctx
+        .storage_handle
+        .open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    let input = crate::secrets::node::NodeChange {
+        realm_id: fixture.actor.realm_id,
+        node_id: fixture.actor.node_id,
+        actor: fixture.actor.user_id,
+        change: SecretChange::Create {
+            name: SecretName::try_from("local-key".to_string()).unwrap(),
+            kind: SecretKind::parse("basic").unwrap(),
+            description: String::new(),
+            settings: SecretSettings::new(),
+            uses: Vec::new(),
+            fields: SecretFields::new(
+                [("username", "u"), ("password", "p")]
+                    .map(|(name, value)| (name.to_string(), Secret::new(value)))
+                    .into(),
+            ),
+        },
+        now_ms: 1,
+        write_id: Ulid::from_parts(66, 3),
+    };
+    drive(
+        crate::secrets::node::NodeSecretOperation::new(input),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
+    let kind = bind(&[("api_key", "node:local-key")]).await;
+    assert!(
+        matches!(kind, Err(BindError::Invalid(_))),
+        "a basic secret for a bearer slot"
+    );
 }

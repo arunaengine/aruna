@@ -247,6 +247,7 @@ impl Fixture {
             settings: settings.as_object().cloned().unwrap_or_default(),
             grants: BTreeMap::new(),
             install_id,
+            secrets: BTreeMap::new(),
         }
     }
 

@@ -87,14 +87,19 @@ pub async fn plugin(context: &mut Context<'_>, command: PluginCommand) -> Result
             version,
             settings,
             grants,
+            secrets,
             preview,
             id,
         } => {
+            let bound = (secrets.iter())
+                .map(|pair| split_pair(pair))
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
             let body = serde_json::json!({
                 "group": group,
                 "version": version,
                 "settings": setting_values(&settings)?,
                 "grants": grant_choices(&grants)?,
+                "secrets": bound,
                 "id": id,
             });
             install(context, &name, &body, preview).await
@@ -345,6 +350,14 @@ async fn install(
         lines.push(format!(
             "  {} granted on {granted} paths",
             line["permission"].as_str().unwrap_or_default()
+        ));
+    }
+    for line in summary["secrets"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "  secret {} ({}) uses {}",
+            line["slot"].as_str().unwrap_or_default(),
+            line["kind"].as_str().unwrap_or_default(),
+            line["secret"].as_str().unwrap_or_default()
         ));
     }
     for line in summary["connections"].as_array().into_iter().flatten() {
