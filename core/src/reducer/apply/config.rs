@@ -96,6 +96,21 @@ impl AdminDocumentState {
                     .map_err(|_| AdminDocumentError::InvalidPlugin)?;
                 self.apply_node_value(event, plugin_entry_path(name, version), value);
             }
+            AdminDocumentOperation::ConfigInstallSet {
+                install_id,
+                install,
+            } => {
+                let matching = |install: &crate::plugin_installs::PluginInstall| {
+                    install.valid() && install.install_id == *install_id
+                };
+                if install.as_ref().is_some_and(|install| !matching(install)) {
+                    return Err(AdminDocumentError::InvalidInstall);
+                }
+                let value = (install.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidInstall)?;
+                self.apply_node_value(event, plugin_install_path(install_id), value);
+            }
             AdminDocumentOperation::ConfigEmailSet { profile } => {
                 if profile.as_ref().is_some_and(|profile| !profile.valid()) {
                     return Err(AdminDocumentError::InvalidEmailProfile);

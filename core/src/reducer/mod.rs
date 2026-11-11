@@ -119,6 +119,8 @@ pub enum AdminDocumentError {
     InvalidEmailProfile,
     #[error("published plugin entry is malformed or written to another version's path")]
     InvalidPlugin,
+    #[error("plugin install record is malformed or written to another install's path")]
+    InvalidInstall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

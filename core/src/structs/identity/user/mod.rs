@@ -10,7 +10,8 @@ use crate::errors::ConversionError;
 use crate::structs::identity::auth::Actor;
 use crate::types::GroupId;
 use crate::user::validation::{
-    DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, SERVICE_GROUP_ATTRIBUTE,
+    DEACTIVATED_ATTRIBUTE, INSTALL_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX,
+    SERVICE_GROUP_ATTRIBUTE, STOPPED_BY_INSTALL,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -46,11 +47,24 @@ impl User {
         self.attributes.contains_key(DEACTIVATED_ATTRIBUTE)
     }
 
+    /// Whether the account's own plugin install deactivated it, not an administrator.
+    pub fn stopped_by_install(&self) -> bool {
+        self.attributes
+            .get(DEACTIVATED_ATTRIBUTE)
+            .map(String::as_str)
+            == Some(STOPPED_BY_INSTALL)
+    }
+
     /// The owning group when this account is a service account.
     pub fn service_group(&self) -> Option<GroupId> {
         self.attributes
             .get(SERVICE_GROUP_ATTRIBUTE)
             .and_then(|group| group.parse().ok())
+    }
+
+    /// The plugin install this service account acts for.
+    pub fn install(&self) -> Option<ulid::Ulid> {
+        (self.attributes.get(INSTALL_ATTRIBUTE)).and_then(|install| install.parse().ok())
     }
 
     /// The account this one was merged into; a merged account stays deactivated.

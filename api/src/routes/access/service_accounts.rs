@@ -133,6 +133,7 @@ async fn create_account(
     let group_id = parse_group_id(&group_id)?;
     let user = drive(
         CreateServiceOperation::new(CreateServiceConfig {
+            install: None,
             actor: Actor {
                 node_id: state.get_node_id(),
                 user_id: auth.user_id,
@@ -252,6 +253,7 @@ async fn create_token(
     let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let account_id = UserId::from_string(&account_id).map_err(|_| ServerError::BadRequest)?;
+    crate::routes::plugin_installs::refuse_plugin_account(&state, account_id).await?;
     drive(
         ServiceCheckOperation::new(ServiceCheckConfig {
             auth_context: auth.clone(),

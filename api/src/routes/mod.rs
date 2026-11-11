@@ -23,6 +23,7 @@ pub mod federation;
 pub mod git;
 pub mod identifiers;
 pub mod info;
+pub mod install_changes;
 pub mod link_routes;
 pub mod management_relay;
 pub mod metadata;
@@ -33,6 +34,7 @@ pub mod oidc_providers;
 pub mod onboarding;
 pub mod pid;
 pub mod placement;
+pub mod plugin_installs;
 pub mod plugins;
 pub mod policies;
 pub mod portal;
@@ -131,6 +133,8 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(emails::router())
         .merge(email_profile::router())
         .merge(plugins::router())
+        .merge(plugin_installs::router())
+        .merge(install_changes::router())
         .merge(policies::router())
         .merge(portal::router())
         .merge(oidc_providers::router())
@@ -822,6 +826,14 @@ pub(crate) mod tests {
         ),
         ("POST", "/plugins"),
         ("GET", "/plugins"),
+        ("POST", "/plugins/{name}/installs"),
+        ("GET", "/plugin-installs"),
+        ("GET", "/plugin-installs/{id}"),
+        ("DELETE", "/plugin-installs/{id}"),
+        ("PUT", "/plugin-installs/{id}/grants"),
+        ("PUT", "/plugin-installs/{id}/version"),
+        ("POST", "/plugin-installs/{id}/pause"),
+        ("POST", "/plugin-installs/{id}/resume"),
     ];
 
     /// Documented path to the runtime template that serves it. Catch-all ids

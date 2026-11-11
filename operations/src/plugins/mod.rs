@@ -2,9 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod account;
 pub mod artifacts;
 pub mod copies;
+pub mod grants;
+pub mod install;
+pub mod lifecycle;
 pub mod publish;
+pub mod receiver;
+pub mod records;
+pub mod settings;
 
 use serde::{Deserialize, Serialize};
 

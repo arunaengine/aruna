@@ -198,6 +198,27 @@ impl PermissionRules {
         }
     }
 
+    /// Like [`Self::reads_below`] for `required` access: a WRITE needs WRITE grants on the whole
+    /// subtree, and no deny of a role or a scoped token may reach into it.
+    pub fn holds_below(&self, path: &str, required: &Permission) -> bool {
+        if *required == Permission::READ {
+            return self.reads_below(path);
+        }
+        let held = |permission: &Permission| *permission != Permission::READ;
+        let patterns: Vec<_> = (self.rules.iter())
+            .filter(|rule| rule.direct && held(&rule.permission))
+            .map(|rule| (rule.matcher.glob().glob(), &rule.permission))
+            .collect();
+        let restrictions = self.restrictions.as_ref().map(|rules| {
+            (rules.iter())
+                .filter(|rule| held(&rule.permission))
+                .map(|rule| (rule.matcher.glob().glob(), &rule.permission))
+                .collect::<Vec<_>>()
+        });
+        covers_below(&patterns, path)
+            && restrictions.is_none_or(|restrictions| covers_below(&restrictions, path))
+    }
+
     fn restrictions_allow(&self, path: &str, required: &Permission) -> bool {
         let Some(restrictions) = self.restrictions.as_ref() else {
             return true;
@@ -1056,6 +1077,39 @@ mod pure_tests {
             (format!("{root}/node/bucket/raw/x/**"), Permission::DENY),
         ]));
         assert!(!denied.reads_below(&format!("{root}/node/bucket/raw/")));
+    }
+
+    #[test]
+    fn write_below_subtree() {
+        let meta = "/realm/g/group/meta";
+        let write = direct_rules(HashMap::from([(format!("{meta}/**"), Permission::WRITE)]));
+        assert!(write.holds_below(&format!("{meta}/"), &Permission::WRITE));
+        assert!(write.holds_below(&format!("{meta}/runs/"), &Permission::READ));
+        let read = direct_rules(HashMap::from([(format!("{meta}/**"), Permission::READ)]));
+        assert!(!read.holds_below(&format!("{meta}/"), &Permission::WRITE));
+        assert!(read.holds_below(&format!("{meta}/"), &Permission::READ));
+        let denied = direct_rules(HashMap::from([
+            (format!("{meta}/**"), Permission::WRITE),
+            (format!("{meta}/secret/**"), Permission::DENY),
+        ]));
+        assert!(!denied.holds_below(&format!("{meta}/"), &Permission::WRITE));
+        assert!(denied.holds_below(&format!("{meta}/runs/"), &Permission::WRITE));
+        let restricted = PermissionRules::from_roles(
+            vec![CollectedRole {
+                role: role(
+                    HashMap::from([(format!("{meta}/**"), Permission::WRITE)]),
+                    HashSet::new(),
+                ),
+                direct: true,
+                public: false,
+            }],
+            Some(&[PathRestriction {
+                pattern: format!("{meta}/**"),
+                permission: Permission::READ,
+            }]),
+        )
+        .expect("patterns compile");
+        assert!(!restricted.holds_below(&format!("{meta}/"), &Permission::WRITE));
     }
 
     #[test]

@@ -366,3 +366,40 @@ async fn survives_restart() {
     assert!(last.unwrap());
     assert_eq!(local(&ctx, &digest).await, Some(big));
 }
+
+#[tokio::test]
+async fn keeps_pinned_copies() {
+    // A version an install pins keeps its copy, even when it is no longer published.
+    use aruna_core::plugin_installs::{InstallState, PluginInstall};
+    let (_dir, ctx) = opened();
+    let mut pinned = config(&[]);
+    store_local(&ctx, &pinned, &digest(FIXTURE), FIXTURE, T0)
+        .await
+        .unwrap();
+    let realm_id = pinned.realm_id;
+    pinned.installs.push(PluginInstall {
+        install_id: ulid::Ulid::from_parts(1, 7),
+        group_id: ulid::Ulid::from_parts(1, 9),
+        plugin: "fixture".into(),
+        version: "0.2.0".into(),
+        digest: digest(FIXTURE),
+        state: InstallState::Active,
+        paused: false,
+        settings: "{}".into(),
+        grants: Default::default(),
+        account: UserId::nil(realm_id),
+        role_id: ulid::Ulid::from_parts(1, 8),
+        receiver: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+        granted_by: UserId::nil(realm_id),
+        request: digest(FIXTURE),
+        revision: 2,
+        active_since_ms: Some(T0),
+        failed: None,
+        prerequisites: Vec::new(),
+    });
+    assert_eq!(
+        sweep_copies(&ctx, &pinned, after_grace(T0)).await.unwrap(),
+        0
+    );
+    assert_eq!(local(&ctx, &digest(FIXTURE)).await, Some(FIXTURE.to_vec()));
+}

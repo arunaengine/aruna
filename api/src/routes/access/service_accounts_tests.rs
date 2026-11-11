@@ -155,6 +155,32 @@ async fn token_carries_account() {
 }
 
 #[tokio::test]
+async fn plugin_account_refused() {
+    // A plugin's account acts only through its install: no token is issued for it.
+    let fixture = fixture().await;
+    let install = Ulid::generate();
+    let account = UserId::local(install, fixture.admin.realm_id);
+    let create = CreateServiceOperation::new(CreateServiceConfig {
+        actor: Actor {
+            node_id: fixture.state.get_node_id(),
+            user_id: fixture.admin.user_id,
+            realm_id: fixture.admin.realm_id,
+        },
+        auth_context: fixture.admin.clone(),
+        group_id: Ulid::from_string(&fixture.group).unwrap(),
+        name: "plugin announcer (bots)".to_string(),
+        user_id: account,
+        install: Some(install),
+    });
+    drive(create, &fixture.state.get_ctx()).await.unwrap();
+    let refused = token(&fixture, &account.to_string(), None).await;
+    assert!(
+        matches!(refused, Err(ServerError::Conflict(_))),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
 async fn outsiders_refused() {
     let fixture = fixture().await;
     let account = create(&fixture, &fixture.admin).await.unwrap();

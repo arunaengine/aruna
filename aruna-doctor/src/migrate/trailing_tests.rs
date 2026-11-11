@@ -53,6 +53,32 @@ fn old_audit(seed: u64) -> Vec<u8> {
     .expect("old row encodes")
 }
 
+/// An admin audit row as stored before `plugin`, with its `secret`.
+#[derive(Serialize)]
+struct SecretOnly {
+    audit_id: Ulid,
+    action: AdminAuditAction,
+    actor: UserId,
+    target: UserId,
+    group_id: Option<GroupId>,
+    session_id: Option<String>,
+    secret: Option<SecretAudit>,
+}
+
+fn secret_only() -> Vec<u8> {
+    let record = secret_audit(Some(Ulid::from_parts(6, 6)));
+    postcard::to_allocvec(&SecretOnly {
+        audit_id: record.audit_id,
+        action: record.action,
+        actor: record.actor,
+        target: record.target,
+        group_id: record.group_id,
+        session_id: record.session_id,
+        secret: record.secret,
+    })
+    .expect("row before plugin encodes")
+}
+
 fn secret_audit(write_id: Option<Ulid>) -> AdminAuditRecord {
     let secret = SecretAudit {
         scope: SecretScope::User(user(1)),
@@ -69,14 +95,15 @@ fn audit_gains_secret() {
         .to_bytes()
         .expect("current row encodes");
     let ended = secret_audit(None).to_bytes().expect("row encodes");
-    // A current row cut before its last `write_id`, and one with a byte too many.
-    let cut = ended[..ended.len() - 1].to_vec();
+    // A current row cut inside its `secret`, before `write_id`, and one with a byte too many.
+    let cut = ended[..ended.len() - 2].to_vec();
     let longer = [current.as_slice(), &[0]].concat();
     let temp = tempfile::tempdir().expect("temporary directory");
     let path = temp.path().join("db");
     let database = path.to_str().expect("path");
     let rows = vec![
         (b"old".as_slice(), old_audit(1)),
+        (b"secret".as_slice(), secret_only()),
         (b"current".as_slice(), current.clone()),
         (b"cut".as_slice(), cut.clone()),
         (b"longer".as_slice(), longer.clone()),
@@ -85,7 +112,7 @@ fn audit_gains_secret() {
     let output = migrate_output(database).expect("migration runs");
     assert_eq!(
         (output.audit_rows_scanned, output.audit_rows_rewritten),
-        (4, 1)
+        (5, 2)
     );
     assert_eq!(output.unknown_rows.len(), 2);
     assert!(output.unknown_rows[0].starts_with("admin_audit/"));
@@ -93,6 +120,13 @@ fn audit_gains_secret() {
     let migrated = AdminAuditRecord::from_bytes(&stored[b"old".as_slice()]).expect("decodes");
     assert_eq!(migrated.session_id.as_deref(), Some("session"));
     assert_eq!(migrated.secret, None);
+    // A row missing only `plugin` keeps its secret.
+    let kept = AdminAuditRecord::from_bytes(&stored[b"secret".as_slice()]).expect("decodes");
+    assert_eq!(
+        kept.secret.and_then(|secret| secret.write_id),
+        Some(Ulid::from_parts(6, 6))
+    );
+    assert_eq!(kept.plugin, None);
     assert_eq!(stored[b"current".as_slice()], current);
     assert_eq!(
         (&stored[b"cut".as_slice()], &stored[b"longer".as_slice()]),

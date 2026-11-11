@@ -470,6 +470,13 @@ pub enum AdminDocumentOperation {
         version: String,
         plugin: Option<crate::plugins::PublishedPlugin>,
     },
+    /// Writes or deletes one plugin install record. Two writes of one install at once leave it
+    /// absent until it is written again.
+    #[serde(rename = "RealmConfigInstallSet")]
+    ConfigInstallSet {
+        install_id: ulid::Ulid,
+        install: Option<crate::plugin_installs::PluginInstall>,
+    },
 }
 
 impl AdminDocumentOperation {

@@ -20,7 +20,7 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, TxnId};
-use aruna_core::user::validation::SERVICE_GROUP_ATTRIBUTE;
+use aruna_core::user::validation::{INSTALL_ATTRIBUTE, SERVICE_GROUP_ATTRIBUTE};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -42,10 +42,14 @@ pub struct CreateServiceConfig {
     pub group_id: GroupId,
     pub name: String,
     pub user_id: UserId,
+    /// The plugin install the account acts for; it is marked with it for good.
+    pub install: Option<ulid::Ulid>,
 }
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateServiceError {
+    #[error("the plugin install changed meanwhile; this change is stale")]
+    Superseded,
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -90,6 +94,7 @@ pub struct CreateServiceOperation {
     fence: crate::placement::fence::WriteFence,
     state: CreateServiceState,
     output: Option<Result<User, CreateServiceError>>,
+    guard: Option<aruna_core::plugin_installs::InstallGuard>,
 }
 
 impl CreateServiceOperation {
@@ -99,7 +104,14 @@ impl CreateServiceOperation {
             fence: Default::default(),
             state: CreateServiceState::Init,
             output: None,
+            guard: None,
         }
+    }
+
+    /// Creates the account only while the install record is still at the guard's revision.
+    pub fn guarded(mut self, guard: aruna_core::plugin_installs::InstallGuard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     fn fail(&mut self, error: CreateServiceError) -> Effects {
@@ -161,6 +173,9 @@ impl CreateServiceOperation {
             Ok(config) => config,
             Err(error) => return self.fail(error.into()),
         };
+        if (self.guard).is_some_and(|guard| !guard.admits(config.as_ref())) {
+            return self.fail(CreateServiceError::Superseded);
+        }
         match self.write_user(txn_id, config.as_ref()) {
             Ok(effects) => effects,
             Err(error) => self.fail(error),
@@ -174,13 +189,16 @@ impl CreateServiceOperation {
         config: Option<&RealmConfigDocument>,
     ) -> Result<Effects, CreateServiceError> {
         let group = self.config.group_id.to_string();
-        let user = User {
+        let mut user = User {
             user_id: self.config.user_id,
             name: self.config.name.trim().to_string(),
             subject_ids: Vec::new(),
             alias_user_ids: Default::default(),
             attributes: HashMap::from([(SERVICE_GROUP_ATTRIBUTE.to_string(), group.clone())]),
         };
+        let marker = (self.config.install).map(|install| (INSTALL_ATTRIBUTE, install.to_string()));
+        user.attributes
+            .extend(marker.clone().map(|(key, value)| (key.to_string(), value)));
         let actor = &self.config.actor;
         let document_target = DocumentTarget::User {
             user_id: user.user_id,
@@ -204,15 +222,21 @@ impl CreateServiceOperation {
             sync_revision_entry(&document_target, &initial_sync_change(actor, placement))?,
         ];
         // Ownership first, so receivers admit the name change as the owning group's administrator.
-        for operation in [
-            AdminDocumentOperation::UserAttributeSet {
+        let marker = marker.map(|(key, value)| AdminDocumentOperation::UserAttributeSet {
+            key: key.to_string(),
+            value,
+        });
+        let operations = [
+            Some(AdminDocumentOperation::UserAttributeSet {
                 key: SERVICE_GROUP_ATTRIBUTE.to_string(),
                 value: group.clone(),
-            },
-            AdminDocumentOperation::UserNameSet {
+            }),
+            marker,
+            Some(AdminDocumentOperation::UserNameSet {
                 name: user.name.clone(),
-            },
-        ] {
+            }),
+        ];
+        for operation in operations.into_iter().flatten() {
             let event = reducer_state.apply_operation(actor, operation)?;
             let record = new_identified_record(
                 event.event_id,

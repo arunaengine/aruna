@@ -53,6 +53,7 @@ pub struct RemoveGroupOperation {
     state: RemoveGroupState,
     conflicts: u8,
     output: Option<Result<(Group, GroupAuthorizationDocument), RemoveGroupError>>,
+    guard: Option<aruna_core::plugin_installs::InstallGuard>,
 }
 
 impl std::fmt::Debug for RemoveGroupOperation {
@@ -117,6 +118,8 @@ pub enum RemoveGroupState {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum RemoveGroupError {
+    #[error("the plugin install changed meanwhile; this change is stale")]
+    Superseded,
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -159,7 +162,14 @@ impl RemoveGroupOperation {
             state: RemoveGroupState::Init,
             conflicts: 0,
             output: None,
+            guard: None,
         }
+    }
+
+    /// Removes the role only while the install record is still at the guard's revision.
+    pub fn guarded(mut self, guard: aruna_core::plugin_installs::InstallGuard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     fn handle_authorization(&mut self, event: Event) -> Effects {
@@ -367,6 +377,9 @@ impl RemoveGroupOperation {
             .as_deref()
             .map(RealmConfigDocument::from_bytes)
             .transpose()?;
+        if (self.guard).is_some_and(|guard| !guard.admits(realm_config.as_ref())) {
+            return Err(RemoveGroupError::Superseded);
+        }
         let placement = realm_config
             .as_ref()
             .map(|config| target_placement_ref(config, &document_target, Default::default()))

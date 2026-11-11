@@ -293,6 +293,7 @@ pub(in crate::document_sync) fn overlay_realm_config(
     config.vault = reducer_state.materialized_realm_vault();
     config.secrets = reducer_state.materialized_realm_secrets();
     config.plugins = reducer_state.materialized_plugins();
+    config.installs = reducer_state.materialized_installs();
 
     config.revocation_floor = config.revocation_floor.max(reducer_state.revocation_floor);
     // Without an index, the existing set remains fail-closed until each entry's expiry.
@@ -391,6 +392,7 @@ pub(in crate::document_sync) fn materialized_realm_config(
         vault: Vec::new(),
         secrets: Vec::new(),
         plugins: Vec::new(),
+        installs: Vec::new(),
     };
     overlay_realm_config(&mut config, reducer_state, now, now_ms, revocation_index);
     Some(config)

@@ -9,6 +9,7 @@ use ulid::Ulid;
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::keyspaces::ADMIN_AUDIT_KEYSPACE;
+use crate::plugin_installs::PluginInstall;
 use crate::secrets::{SecretName, SecretScope};
 use crate::types::GroupId;
 
@@ -29,6 +30,20 @@ pub enum AdminAuditAction {
     SecretDeleted,
     /// The owner read back a readable user secret.
     SecretRead,
+    PluginInstalled,
+    PluginGrantsChanged,
+    PluginUpdated,
+    PluginPaused,
+    PluginResumed,
+    PluginRemoved,
+}
+
+/// The plugin install a plugin row is about.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAudit {
+    pub plugin: String,
+    pub version: String,
+    pub install_id: Ulid,
 }
 
 /// The secret a row is about; never its value or field values.
@@ -54,6 +69,7 @@ pub struct AdminAuditRecord {
     /// The session a restricted token belongs to; never the token itself.
     pub session_id: Option<String>,
     pub secret: Option<SecretAudit>,
+    pub plugin: Option<PluginAudit>,
 }
 
 impl AdminAuditRecord {
@@ -66,6 +82,20 @@ impl AdminAuditRecord {
             group_id: None,
             session_id: None,
             secret: None,
+            plugin: None,
+        }
+    }
+
+    /// A row about a plugin install: the target is its account, the group its owner.
+    pub fn for_install(action: AdminAuditAction, actor: UserId, install: &PluginInstall) -> Self {
+        Self {
+            group_id: Some(install.group_id),
+            plugin: Some(PluginAudit {
+                plugin: install.plugin.clone(),
+                version: install.version.clone(),
+                install_id: install.install_id,
+            }),
+            ..Self::new(action, actor, install.account)
         }
     }
 

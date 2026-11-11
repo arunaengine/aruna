@@ -11,8 +11,13 @@ pub const ATTRIBUTE_VALUE_BYTES: usize = 4096;
 pub const RESERVED_PREFIX: &str = "aruna-engine.org/";
 /// Present while the account is deactivated.
 pub const DEACTIVATED_ATTRIBUTE: &str = "aruna-engine.org/deactivated";
+/// The deactivated value a plugin install writes when it stops its own account; any other value
+/// is an explicit deactivation, which the install's repair leaves alone.
+pub const STOPPED_BY_INSTALL: &str = "plugin-install";
 /// Group that owns a service account.
 pub const SERVICE_GROUP_ATTRIBUTE: &str = "aruna-engine.org/service-group";
+/// The plugin install a service account acts for; set once when the account is created.
+pub const INSTALL_ATTRIBUTE: &str = "aruna-engine.org/install";
 /// The account a merged account was merged into; set together with deactivation.
 pub const MERGED_INTO_ATTRIBUTE: &str = "aruna-engine.org/merged-into";
 /// Prefix of one attribute per secondary account a primary account absorbed, keyed by its ulid.

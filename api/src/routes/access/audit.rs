@@ -51,8 +51,8 @@ pub struct AdminAuditQuery {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct AdminAuditRow {
     pub audit_id: String,
-    /// `account_deactivated`, `account_reactivated`, `service_account_created` or
-    /// `restricted_token_issued`.
+    /// `account_deactivated`, `account_reactivated`, `service_account_created`,
+    /// `restricted_token_issued`, a `secret_` action or a `plugin_` action.
     pub action: String,
     pub actor: String,
     pub target: String,
@@ -63,8 +63,18 @@ pub struct AdminAuditRow {
     /// The secret a secret row is about; never its value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret: Option<AuditSecret>,
+    /// The plugin install a plugin row is about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<AuditPlugin>,
     pub result: String,
     pub recorded_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct AuditPlugin {
+    pub plugin: String,
+    pub version: String,
+    pub install_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -104,9 +114,10 @@ pub struct AdminAuditPage {
 **Behavior**
 - Recorded changes are account deactivation and reactivation, service account creation, the
   issuance of a token with path restrictions, and the creation, replacement, rotation, deletion
-  and owner read-back of named secrets. Each row names the actor, the target account, the owning
-  group when there is one, the session of an issued token, the secret (scope, owner, name, never
-  its value) and the result `succeeded`.
+  and owner read-back of named secrets, and plugin installs, grant changes, updates, pauses,
+  resumes and removals. Each row names the actor, the target account, the owning group when there
+  is one, the session of an issued token, the secret (scope, owner, name, never its value), the
+  plugin install (plugin, version, install id) and the result `succeeded`.
 - A row is written only after its change succeeded on this node; denied or failed attempts and
   changes made on other nodes are absent, so every page reports `partial` as true.
 - The realm rows hold every recorded change. The rows of a group hold the changes to its service
@@ -212,6 +223,12 @@ fn row(record: AdminAuditRecord) -> AdminAuditRow {
         AdminAuditAction::SecretRotated => "secret_rotated",
         AdminAuditAction::SecretDeleted => "secret_deleted",
         AdminAuditAction::SecretRead => "secret_read",
+        AdminAuditAction::PluginInstalled => "plugin_installed",
+        AdminAuditAction::PluginGrantsChanged => "plugin_grants_changed",
+        AdminAuditAction::PluginUpdated => "plugin_updated",
+        AdminAuditAction::PluginPaused => "plugin_paused",
+        AdminAuditAction::PluginResumed => "plugin_resumed",
+        AdminAuditAction::PluginRemoved => "plugin_removed",
     };
     AdminAuditRow {
         audit_id: record.audit_id.to_string(),
@@ -221,6 +238,11 @@ fn row(record: AdminAuditRecord) -> AdminAuditRow {
         group_id: record.group_id.map(|id| id.to_string()),
         session_id: record.session_id,
         secret: record.secret.map(audit_secret),
+        plugin: record.plugin.map(|plugin| AuditPlugin {
+            plugin: plugin.plugin,
+            version: plugin.version,
+            install_id: plugin.install_id.to_string(),
+        }),
         result: "succeeded".to_string(),
         recorded_at_ms: record.audit_id.timestamp_ms(),
     }

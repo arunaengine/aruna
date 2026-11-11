@@ -27,7 +27,8 @@ use crate::metadata::protocol::MetadataReadError;
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::{is_management, node_kind};
 
-/// How often a node sweeps its copies and a management node repairs missing ones.
+/// How often a node sweeps its copies, and a management node repairs missing copies and the
+/// accounts and roles of its installs.
 const REPAIR_INTERVAL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Error)]
@@ -266,6 +267,9 @@ pub fn spawn_repair(context: Arc<DriverContext>, shutdown: &Shutdown) {
             }
             if let Err(error) = repair_artifacts(context.as_ref()).await {
                 warn!(%error, "Plugin artifact repair failed");
+            }
+            if let Err(error) = super::install::reconcile_installs(context.as_ref()).await {
+                warn!(%error, "Plugin install repair failed");
             }
         }
     });

@@ -117,6 +117,7 @@ async fn change_admin(
     let auth = require_realm_auth(state, auth)?;
     let realm_id = state.get_realm_id();
     let user_id = UserId::from_string(user_id).map_err(|_| ServerError::BadRequest)?;
+    crate::routes::plugin_installs::refuse_plugin_account(state, user_id).await?;
     // Request policies live at this boundary; the operation only checks roles.
     ensure_permission(
         state,

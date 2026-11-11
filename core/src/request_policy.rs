@@ -88,6 +88,16 @@ pub struct RequestPolicy {
 }
 
 impl RequestPolicy {
+    /// Whether an enabled policy may decide by the request path; one that does not compile may.
+    pub fn reads_path(&self) -> bool {
+        let reads = |source: &str| {
+            Program::compile(source).map_or(true, |program| {
+                program.references().variables().contains(&"path")
+            })
+        };
+        self.enabled && (reads(&self.expression) || self.when.as_deref().is_some_and(reads))
+    }
+
     pub fn applies_to_reads(&self) -> bool {
         if !self.enabled {
             return false;
@@ -625,6 +635,18 @@ mod tests {
             expression: expression.to_string(),
             enabled: true,
         }
+    }
+
+    #[test]
+    fn detects_path_reads() {
+        assert!(policy("path.startsWith('/r/g/x/meta/private')").reads_path());
+        assert!(!policy("operation == 'plugin.metadata.write'").reads_path());
+        assert!(policy("this does not compile (").reads_path());
+        let mut guarded = policy("true");
+        guarded.when = Some("path == '/r'".into());
+        assert!(guarded.reads_path());
+        guarded.enabled = false;
+        assert!(!guarded.reads_path());
     }
 
     #[test]

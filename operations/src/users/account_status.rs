@@ -15,7 +15,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::{Effects, GroupId};
-use aruna_core::user::validation::DEACTIVATED_ATTRIBUTE;
+use aruna_core::user::validation::{DEACTIVATED_ATTRIBUTE, STOPPED_BY_INSTALL};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -86,6 +86,9 @@ pub struct AccountStatusOperation {
     /// The group owning a service account target, whose administrators may read its audit row.
     owner_group: Option<GroupId>,
     output: Option<Result<(), AccountStatusError>>,
+    guard: Option<aruna_core::plugin_installs::InstallGuard>,
+    /// Marks a deactivation as the plugin install's own, not an administrator's.
+    by_install: bool,
 }
 
 impl AccountStatusOperation {
@@ -95,7 +98,28 @@ impl AccountStatusOperation {
             state: AccountStatusState::Init,
             owner_group: None,
             output: None,
+            guard: None,
+            by_install: false,
         }
+    }
+
+    fn deactivated_value(&self) -> String {
+        match self.by_install {
+            true => STOPPED_BY_INSTALL.to_string(),
+            false => "true".to_string(),
+        }
+    }
+
+    /// Records the deactivation as the account's own plugin install stopping it.
+    pub fn by_install(mut self) -> Self {
+        self.by_install = true;
+        self
+    }
+
+    /// Marks the account only while the install record is still at the guard's revision.
+    pub fn guarded(mut self, guard: aruna_core::plugin_installs::InstallGuard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     fn fail(&mut self, error: AccountStatusError) -> Effects {
@@ -219,7 +243,7 @@ impl AccountStatusOperation {
             (HashMap::new(), vec![DEACTIVATED_ATTRIBUTE.to_string()])
         } else {
             (
-                HashMap::from([(DEACTIVATED_ATTRIBUTE.to_string(), "true".to_string())]),
+                HashMap::from([(DEACTIVATED_ATTRIBUTE.to_string(), self.deactivated_value())]),
                 Vec::new(),
             )
         };
@@ -238,7 +262,8 @@ impl AccountStatusOperation {
                 alias: None,
                 subject: None,
             })
-            .audited(audit),
+            .audited(audit)
+            .guarded(self.guard),
             |result| Event::SubOperation(SubOperationEvent::UserUpdated {
                 result: result.map(|_| ()).map_err(|error| error.to_string()),
             }),

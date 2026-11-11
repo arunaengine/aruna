@@ -19,6 +19,7 @@ aruna-core = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
 aruna-operations = { workspace = true }
+aruna-plugins = { workspace = true }
 aruna-tasks = { workspace = true }
 
 # General

@@ -8,6 +8,8 @@ use aruna_plugins::artifact::ArtifactDigest;
 use aruna_plugins::manifest::valid_plugin;
 use aruna_plugins::package::build_project;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 use super::Context;
 use crate::args::{Language, PluginCommand};
@@ -79,6 +81,62 @@ pub async fn plugin(context: &mut Context<'_>, command: PluginCommand) -> Result
         }
         PluginCommand::Publish { artifact } => publish(context, &artifact).await,
         PluginCommand::List { name } => list(context, name).await,
+        PluginCommand::Install {
+            name,
+            group,
+            version,
+            settings,
+            grants,
+            preview,
+            id,
+        } => {
+            let body = serde_json::json!({
+                "group": group,
+                "version": version,
+                "settings": setting_values(&settings)?,
+                "grants": grant_choices(&grants)?,
+                "id": id,
+            });
+            install(context, &name, &body, preview).await
+        }
+        PluginCommand::Installs { group } => installs(context, &group).await,
+        PluginCommand::Grants { id, grants } => {
+            let body = serde_json::json!({ "grants": grant_choices(&grants)? });
+            let path = format!("plugin-installs/{id}/grants");
+            change(context, reqwest::Method::PUT, &path, &body).await
+        }
+        PluginCommand::Update { id, version } => {
+            let body = serde_json::json!({ "version": version });
+            let path = format!("plugin-installs/{id}/version");
+            change(context, reqwest::Method::PUT, &path, &body).await
+        }
+        PluginCommand::Pause { id } => {
+            let path = format!("plugin-installs/{id}/pause");
+            change(
+                context,
+                reqwest::Method::POST,
+                &path,
+                &serde_json::json!({}),
+            )
+            .await
+        }
+        PluginCommand::Resume { id } => {
+            let path = format!("plugin-installs/{id}/resume");
+            change(
+                context,
+                reqwest::Method::POST,
+                &path,
+                &serde_json::json!({}),
+            )
+            .await
+        }
+        PluginCommand::Remove { id } => {
+            context
+                .api()?
+                .delete(&format!("plugin-installs/{id}"))
+                .await?;
+            context.out.line(format!("removed {id}"))
+        }
         PluginCommand::Build { path } => {
             let built = build_project(&path).map_err(|err| CliError::usage(err.to_string()))?;
             let summary = Built {
@@ -182,6 +240,164 @@ async fn list(context: &mut Context<'_>, name: Option<String>) -> Result<(), Cli
     context
         .out
         .listing(&plugins, &["NAME", "VERSION", "TITLE", "DIGEST"], rows)
+}
+
+/// `name=value` pairs; a value that parses as JSON is JSON, anything else is text.
+fn setting_values(pairs: &[String]) -> Result<serde_json::Map<String, Value>, CliError> {
+    let mut values = serde_json::Map::new();
+    for pair in pairs {
+        let (name, value) = split_pair(pair)?;
+        let value = serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.into()));
+        values.insert(name.to_string(), value);
+    }
+    Ok(values)
+}
+
+/// `permission=pattern` pairs grouped by permission; `permission=` keeps an empty list.
+fn grant_choices(pairs: &[String]) -> Result<BTreeMap<String, Vec<String>>, CliError> {
+    let mut choices: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for pair in pairs {
+        let (permission, pattern) = split_pair(pair)?;
+        let patterns = choices.entry(permission.to_string()).or_default();
+        if !pattern.is_empty() {
+            patterns.push(pattern.to_string());
+        }
+    }
+    Ok(choices)
+}
+
+fn split_pair(pair: &str) -> Result<(&str, &str), CliError> {
+    pair.split_once('=')
+        .filter(|(name, _)| !name.is_empty())
+        .ok_or_else(|| CliError::usage(format!("`{pair}` is not of the form name=value")))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InstallView {
+    id: String,
+    plugin: String,
+    version: String,
+    status: String,
+    #[serde(default)]
+    failed: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InstallPage {
+    installs: Vec<InstallView>,
+    next: Option<String>,
+}
+
+/// Installs, or with `preview` shows the summary and the id to install with.
+async fn install(
+    context: &mut Context<'_>,
+    name: &str,
+    body: &Value,
+    preview: bool,
+) -> Result<(), CliError> {
+    let api = context.api()?;
+    let request = api.request(reqwest::Method::POST, &format!("plugins/{name}/installs"))?;
+    let request = request
+        .query(&[("preview", preview.to_string())])
+        .json(body);
+    let answer: Value = read_json(request.send().await?).await?;
+    if context.out.json {
+        return context.out.json(&answer);
+    }
+    let summary = match preview {
+        true => &answer,
+        false => &answer["summary"],
+    };
+    let mut lines = vec![format!(
+        "{} {} ({}) for group {}",
+        summary["plugin"].as_str().unwrap_or_default(),
+        summary["version"].as_str().unwrap_or_default(),
+        summary["digest"].as_str().unwrap_or_default(),
+        summary["group"].as_str().unwrap_or_default(),
+    )];
+    for line in summary["permissions"].as_array().into_iter().flatten() {
+        let granted = line["granted"].as_array().map_or(0, Vec::len);
+        lines.push(format!(
+            "  {} granted on {granted} paths",
+            line["permission"].as_str().unwrap_or_default()
+        ));
+    }
+    for line in summary["connections"].as_array().into_iter().flatten() {
+        let granted = line["granted"].as_bool().unwrap_or(false);
+        lines.push(format!(
+            "  connection {} granted: {granted}",
+            line["url"].as_str().unwrap_or_default()
+        ));
+    }
+    lines.push(match preview {
+        true => format!(
+            "install with --id {} --version {}",
+            summary["id"].as_str().unwrap_or_default(),
+            summary["digest"].as_str().unwrap_or_default()
+        ),
+        false => format!(
+            "installed as {} ({})",
+            answer["id"].as_str().unwrap_or_default(),
+            answer["status"].as_str().unwrap_or_default()
+        ),
+    });
+    context.out.line(lines.join("\n"))
+}
+
+/// Lists the installs of a group, following the cursor across pages.
+async fn installs(context: &mut Context<'_>, group: &str) -> Result<(), CliError> {
+    let api = context.api()?;
+    let mut installs = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut query = vec![("group", group.to_string()), ("limit", "1000".to_string())];
+        query.extend(cursor.take().map(|cursor| ("cursor", cursor)));
+        let page: InstallPage = api.get("plugin-installs", &query).await?;
+        installs.extend(page.installs);
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    let rows = (installs.iter())
+        .map(|i| {
+            vec![
+                i.id.clone(),
+                i.plugin.clone(),
+                i.version.clone(),
+                i.status.clone(),
+            ]
+        })
+        .collect();
+    context
+        .out
+        .listing(&installs, &["ID", "PLUGIN", "VERSION", "STATUS"], rows)
+}
+
+/// Sends one change of an install and shows its new state.
+async fn change(
+    context: &mut Context<'_>,
+    method: reqwest::Method,
+    path: &str,
+    body: &Value,
+) -> Result<(), CliError> {
+    let answer: Value = context.api()?.send(method, path, body).await?;
+    if context.out.json {
+        return context.out.json(&answer);
+    }
+    let install = answer.get("install").unwrap_or(&answer);
+    let view: InstallView = serde_json::from_value(install.clone())?;
+    let mut line = format!(
+        "{} {} {} {}",
+        view.id, view.plugin, view.version, view.status
+    );
+    let missing: Vec<&str> = (answer["missing"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect();
+    if !missing.is_empty() {
+        line.push_str(&format!("; grant first: {}", missing.join(", ")));
+    }
+    context.out.line(line)
 }
 
 #[derive(Debug, Serialize)]
