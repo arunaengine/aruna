@@ -26,6 +26,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::{TempDir, tempdir};
 
+/// The signing key of the realm of [`Fixture::keyed`].
+pub(crate) const REALM_KEY: [u8; 32] = [9u8; 32];
+
 pub(crate) struct Fixture {
     _dir: TempDir,
     pub ctx: DriverContext,
@@ -65,9 +68,22 @@ impl Fixture {
 
     /// A fixture whose storage is passed through `wrap` first.
     pub(crate) async fn on(wrap: impl FnOnce(StorageHandle) -> StorageHandle) -> Self {
+        Self::in_realm(RealmId::from_bytes([1u8; 32]), wrap).await
+    }
+
+    /// A fixture whose realm id is the public half of `REALM_KEY`, so its realm keys exist.
+    pub(crate) async fn keyed() -> Self {
+        let key = ed25519_dalek::SigningKey::from_bytes(&REALM_KEY);
+        let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
+        Self::in_realm(realm_id, |storage| storage).await
+    }
+
+    async fn in_realm(
+        realm_id: RealmId,
+        wrap: impl FnOnce(StorageHandle) -> StorageHandle,
+    ) -> Self {
         let dir = tempdir().unwrap();
         let ctx = node_context(dir.path(), wrap);
-        let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
             user_id: UserId::local(Ulid::from_parts(1, 1), realm_id),
