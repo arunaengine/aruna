@@ -237,11 +237,11 @@ fn valid_permission(name: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::structs::identity::realm::RealmId;
 
-    fn install() -> PluginInstall {
+    pub(crate) fn install() -> PluginInstall {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let install_id = Ulid::from_parts(1, 7);
         let group_id = Ulid::from_parts(1, 9);

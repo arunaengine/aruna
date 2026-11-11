@@ -17,10 +17,14 @@ use std::ops::Bound;
 /// A keyspace and the stored field counts of its record's older layouts, newest first.
 pub(super) type Shapes = (&'static str, &'static [Layout]);
 
-/// Admin audit rows before `plugin`, and before `secret`.
+/// Admin audit rows before `secret_use` (alpha.188), before `plugin`, and before `secret`.
 pub(super) const AUDIT: Shapes = (
     ADMIN_AUDIT_KEYSPACE,
-    &[&[("AdminAuditRecord", 7)], &[("AdminAuditRecord", 6)]],
+    &[
+        &[("AdminAuditRecord", 8)],
+        &[("AdminAuditRecord", 7)],
+        &[("AdminAuditRecord", 6)],
+    ],
 );
 /// Harvest sources before `last_job`.
 pub(super) const HARVEST: Shapes = (HARVEST_SOURCE_KEYSPACE, &[&[("HarvestSource", 12)]]);
