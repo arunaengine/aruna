@@ -6,6 +6,7 @@ pub mod account;
 pub mod artifacts;
 pub mod broker;
 pub mod check;
+pub mod clock;
 pub mod copies;
 pub mod dispatch;
 pub mod grants;

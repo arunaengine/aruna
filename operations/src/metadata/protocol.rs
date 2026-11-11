@@ -696,6 +696,11 @@ pub enum MetadataTransportMessage {
     FetchedArtifact {
         result: Result<crate::plugins::copies::Chunk, MetadataReadError>,
     },
+    /// The clock of an infrastructure node, asked to map an install's activation time.
+    ProbeClock,
+    ClockProbed {
+        result: Result<u64, MetadataReadError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.

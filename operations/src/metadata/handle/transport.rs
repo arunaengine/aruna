@@ -540,6 +540,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ArtifactStored { .. } => "artifact_stored",
         MetadataTransportMessage::FetchArtifact { .. } => "fetch_artifact",
         MetadataTransportMessage::FetchedArtifact { .. } => "fetched_artifact",
+        MetadataTransportMessage::ProbeClock => "probe_clock",
+        MetadataTransportMessage::ClockProbed { .. } => "clock_probed",
     }
 }
 
@@ -804,6 +806,18 @@ impl MetadataHandle {
             .map_err(|_| MetadataReadError::Unavailable)?
         {
             MetadataTransportMessage::FetchedArtifact { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// The clock of the infrastructure node `node_id`, in Unix milliseconds.
+    pub async fn request_clock(&self, node_id: NodeId) -> Result<u64, MetadataReadError> {
+        let request = MetadataTransportMessage::ProbeClock;
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::ClockProbed { result } => result,
             _ => Err(MetadataReadError::Unavailable),
         }
     }

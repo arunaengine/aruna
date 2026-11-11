@@ -212,7 +212,7 @@ pub(crate) async fn serve_fetch(
     }
 }
 
-async fn local_config(
+pub(crate) async fn local_config(
     ctx: &DriverContext,
 ) -> Result<(RealmConfigDocument, NodeId), MetadataReadError> {
     let net = ctx
