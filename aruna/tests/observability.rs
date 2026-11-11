@@ -313,8 +313,8 @@ mod process {
             let storage = self.storage_path();
             let test_env = paths.env_lines();
             let body = format!(
-                "STORAGE_PATH={storage}\n\
-                 BLOB_ROOT={storage}/blobstore\n\
+                "DATABASE_DIR={storage}\n\
+                 CONTENT_DIR={storage}/blobstore\n\
                  SOCKET_ADDRESS=127.0.0.1:{http}\n\
                  P2P_SOCKET_ADDRESS=127.0.0.1:{p2p}\n\
                  OPS_SOCKET_ADDRESS=127.0.0.1:{ops}\n\

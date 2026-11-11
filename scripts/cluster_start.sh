@@ -320,8 +320,8 @@ write_node_env() {
   done
   mkdir -p "$node_dir/storage" "$node_dir/blob"
   {
-    printf 'STORAGE_PATH=%s\n' "$(env_quote "$node_dir/storage")"
-    printf 'BLOB_ROOT=%s\n' "$(env_quote "$node_dir/blob")"
+    printf 'DATABASE_DIR=%s\n' "$(env_quote "$node_dir/storage")"
+    printf 'CONTENT_DIR=%s\n' "$(env_quote "$node_dir/blob")"
     printf 'BLOB_MULTIPART_BUCKET=%s\n' "parts"
     printf 'BLOB_MAX_BUCKET_SIZE=10000\n'
     printf 'SOCKET_ADDRESS=127.0.0.1:%s\n' "$http_port"

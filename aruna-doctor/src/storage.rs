@@ -245,14 +245,14 @@ mod tests {
 
         let _env = TestEnvGuard::set(&[
             (
-                "STORAGE_PATH",
+                "DATABASE_DIR",
                 source_db_path
                     .to_str()
                     .expect("invalid source path")
                     .to_string(),
             ),
             (
-                "BLOB_ROOT",
+                "CONTENT_DIR",
                 blob_root.to_str().expect("invalid blob path").to_string(),
             ),
             ("BLOB_BUCKET_PREFIX", "aruna_test".to_string()),

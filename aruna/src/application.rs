@@ -923,7 +923,7 @@ mod tests {
 
     fn startup_settings(path: &str) -> crate::settings::Settings {
         let map: std::collections::BTreeMap<String, String> = [
-            ("STORAGE_PATH".to_string(), path.to_string()),
+            ("DATABASE_DIR".to_string(), path.to_string()),
             ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
             ("P2P_SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
             ("S3_HOST".to_string(), "127.0.0.1:0".to_string()),

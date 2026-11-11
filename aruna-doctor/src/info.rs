@@ -186,11 +186,11 @@ fn nonzero_timeout(timeout: Duration) -> Duration {
 
 impl ConfigView {
     fn from_env(http_socket_addr: SocketAddr) -> Result<Self, CliError> {
-        let storage_path = dotenvy::var("STORAGE_PATH").ok();
+        let storage_path = dotenvy::var("DATABASE_DIR").ok();
         let metadata_storage_path = dotenvy::var("CRAQLE_STORAGE_PATH")
             .ok()
             .or_else(|| storage_path.as_ref().map(|path| format!("{path}/craqle")));
-        let blob_root = dotenvy::var("BLOB_ROOT").ok().or_else(|| {
+        let blob_root = dotenvy::var("CONTENT_DIR").ok().or_else(|| {
             storage_path
                 .as_ref()
                 .map(|path| format!("{path}/blobstore"))
@@ -328,8 +328,8 @@ mod tests {
         std::fs::create_dir_all(&blob_root).unwrap();
 
         let env_guard = TestEnvGuard::set(&[
-            ("STORAGE_PATH", storage_path.to_str().unwrap().to_string()),
-            ("BLOB_ROOT", blob_root.to_str().unwrap().to_string()),
+            ("DATABASE_DIR", storage_path.to_str().unwrap().to_string()),
+            ("CONTENT_DIR", blob_root.to_str().unwrap().to_string()),
             ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
             ("S3_HOST", "127.0.0.1:0".to_string()),
@@ -459,7 +459,7 @@ mod tests {
     async fn onboarding_secret() {
         let _env_lock = env_lock().lock().await;
         let _guard = TestEnvGuard::set(&[
-            ("STORAGE_PATH", "/tmp/storage".to_string()),
+            ("DATABASE_DIR", "/tmp/storage".to_string()),
             ("ONBOARDING_SECRET", "secret".to_string()),
         ]);
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
@@ -472,8 +472,11 @@ mod tests {
     async fn doctor_matches_defaults() {
         let _env_lock = env_lock().lock().await;
         let _guard = TestEnvGuard::set(&[
-            ("STORAGE_PATH", "/tmp/aruna-doctor-defaults".to_string()),
-            ("BLOB_ROOT", "/tmp/aruna-doctor-defaults/blobs".to_string()),
+            ("DATABASE_DIR", "/tmp/aruna-doctor-defaults".to_string()),
+            (
+                "CONTENT_DIR",
+                "/tmp/aruna-doctor-defaults/blobs".to_string(),
+            ),
             ("METADATA_REPLICATION_FACTOR", "0".to_string()),
         ]);
         let _unset = TestEnvGuard::remove(&["BLOB_MAX_BUCKET_SIZE", "BLOB_MULTIPART_BUCKET"]);
@@ -487,12 +490,34 @@ mod tests {
             Some("uploaded-parts")
         );
         assert_eq!(view.metadata_replication_factor, 1);
+        assert_eq!(view.storage_path, "/tmp/aruna-doctor-defaults");
+        assert_eq!(view.blob_root, "/tmp/aruna-doctor-defaults/blobs");
+        assert_eq!(view.storage_path, settings.storage_path);
+        assert_eq!(view.blob_root, settings.blob_root);
         assert_eq!(view.blob_bucket_size, settings.blob_bucket_size);
         assert_eq!(view.blob_multipart_bucket, settings.blob_multipart_bucket);
         assert_eq!(
             view.metadata_replication_factor,
             settings.metadata_replication_factor
         );
+    }
+
+    #[tokio::test]
+    async fn doctor_content_default() {
+        let _env_lock = env_lock().lock().await;
+        // Load the `.env` file first, so it cannot restore CONTENT_DIR after the removal.
+        let _ = dotenvy::var("CONTENT_DIR");
+        let _guard = TestEnvGuard::set(&[
+            ("DATABASE_DIR", "/tmp/aruna-doctor-content".to_string()),
+            ("METADATA_REPLICATION_FACTOR", "0".to_string()),
+        ]);
+        let _unset = TestEnvGuard::remove(&["CONTENT_DIR"]);
+
+        let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
+        let settings = aruna::settings::read_settings().unwrap();
+
+        assert_eq!(view.blob_root, "/tmp/aruna-doctor-content/blobstore");
+        assert_eq!(view.blob_root, settings.blob_root);
     }
 
     #[tokio::test]

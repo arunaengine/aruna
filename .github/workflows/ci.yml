@@ -792,7 +792,7 @@ jobs:
           GRAFANA_PORT=$((BASE_PORT + 7))
 
           {
-            echo "STORAGE_PATH=/data"
+            echo "DATABASE_DIR=/data"
             echo "ARUNA_FJALL_PERSIST_MODE=buffer"
             echo "SOCKET_ADDRESS=127.0.0.1:$REST_PORT"
             echo "P2P_SOCKET_ADDRESS=127.0.0.1:$P2P_PORT"

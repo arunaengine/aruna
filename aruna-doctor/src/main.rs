@@ -125,9 +125,9 @@ async fn main() -> Result<(), CliError> {
             target_path,
         } => import(snapshot_path, target_path).await?,
         Commands::Backup {
-            storage_path,
+            database_dir,
             target_path,
-        } => backup(storage_path, target_path).await?,
+        } => backup(database_dir, target_path).await?,
         Commands::Restore {
             backup_path,
             target_path,

@@ -83,7 +83,7 @@ impl TlsFiles {
 /// Native settings parsed like a real node, so `S3_HOST` gets the settings normalization.
 fn native_settings(s3_host: &str) -> aruna::settings::Settings {
     let map: BTreeMap<String, String> = [
-        ("STORAGE_PATH", "/tmp/aruna-https-settings"),
+        ("DATABASE_DIR", "/tmp/aruna-https-settings"),
         ("SOCKET_ADDRESS", "127.0.0.1:0"),
         ("PORTAL_MODE", "disabled"),
         ("ARUNA_FJALL_PERSIST_MODE", "buffer"),
