@@ -241,3 +241,41 @@ async fn removed_install_drops() {
     assert_eq!(gap(&fixture, &install, GapReason::Expired).await, None);
     assert_eq!(receiver.batches(), 0);
 }
+
+#[tokio::test]
+async fn bounded_requests() {
+    // Requests to one receiver are split by encoded size, gap reports included.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let now = unix_timestamp_millis();
+    queued(&fixture, &install, &["D1", "D2", "D3", "D4", "D5"], now).await;
+    let mut report = GapRow::new(SourceKind::DataUploaded, GapReason::Full);
+    report.add(now);
+    let report_key = gap_key(
+        install.install_id,
+        SourceKind::DataUploaded,
+        GapReason::Full,
+    );
+    let txn = Txn::direct(&fixture.ctx);
+    txn.write(
+        PLUGIN_GAPS_KEYSPACE,
+        vec![(report_key, encode(&report).unwrap())],
+    )
+    .await
+    .unwrap();
+    let rows = txn.scan(PLUGIN_OUTBOX_KEYSPACE, &[]).await.unwrap();
+    let bound = 2 * rows[0].1.len();
+    let (config, receiver) = (config(&fixture).await, Receiver::default());
+    let (mut backoff, send) = (Backoff::default(), receiver.send(|_| Some(Outcome::Queued)));
+    let decided = send_bounded(&fixture.ctx, &config, (now, bound), &mut backoff, &send).await;
+    assert_eq!(decided, Ok(5));
+    let got = receiver.got.lock().unwrap().clone();
+    assert!(got.len() >= 3, "{} requests", got.len());
+    for batch in &got {
+        let events = (batch.events.iter()).map(|row| encode(row).unwrap().len());
+        let gaps = (batch.gaps.iter()).map(|(_, row)| encode(row).unwrap().len() + 16);
+        assert!(events.chain(gaps).sum::<usize>() <= bound);
+    }
+    assert_eq!(got.iter().map(|batch| batch.gaps.len()).sum::<usize>(), 1);
+    assert!(forwarded(&fixture, &install).await.is_empty());
+}

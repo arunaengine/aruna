@@ -28,8 +28,10 @@ use super::receiver::lost_reason;
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
 
-/// Forward rows of one install sent in one request at most.
+/// Forward rows of one install read for sending in one pass at most.
 const BATCH: usize = 100;
+/// Encoded row bytes of one request at most, well below the transport's 16 MiB message bound.
+const REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BACKOFF_MS: u64 = 10 * 60 * 1000;
 
 /// Matched events and unacknowledged gap counts for one receiver.
@@ -74,11 +76,46 @@ impl Backoff {
     }
 }
 
-/// One receiver's batch and the outbox key of each event in it by install and source id.
+/// One request's batch and the outbox key of each event in it by install and source id.
 type Pending = (EventBatch, BTreeMap<(Ulid, String), Vec<u8>>);
 
-/// Sends one batch to each reachable receiver and applies its decisions; returns how many rows
-/// were decided. Rows of removed installs are dropped, rows past their send expiry become gaps.
+/// One receiver's requests, each with the encoded row bytes it holds.
+#[derive(Default)]
+struct Requests {
+    bound: usize,
+    open: Vec<(Pending, usize)>,
+}
+
+impl Requests {
+    /// The request with room for `size` more bytes; a new one when the last is full. A row
+    /// larger than the bound gets a request of its own.
+    fn room(&mut self, size: usize) -> &mut Pending {
+        let fits =
+            (self.open.last()).is_some_and(|(_, used)| *used == 0 || used + size <= self.bound);
+        if !fits {
+            self.open.push((Pending::default(), 0));
+        }
+        let last = self.open.len() - 1;
+        let (pending, used) = &mut self.open[last];
+        *used += size;
+        pending
+    }
+}
+
+/// The requests to `node`, each holding at most `bound` encoded row bytes.
+fn receiver_requests(
+    batches: &mut BTreeMap<NodeId, Requests>,
+    node: NodeId,
+    bound: usize,
+) -> &mut Requests {
+    let requests = batches.entry(node).or_default();
+    requests.bound = bound;
+    requests
+}
+
+/// Sends each reachable receiver its batches and applies their decisions; returns how many
+/// rows were decided. Rows of removed installs are dropped, rows past their send expiry become
+/// gaps.
 pub async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
@@ -86,7 +123,17 @@ pub async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
     backoff: &mut Backoff,
     send: impl Fn(NodeId, EventBatch) -> F,
 ) -> Result<usize, StoreError> {
-    let mut batches: BTreeMap<NodeId, Pending> = BTreeMap::new();
+    send_bounded(ctx, config, (now_ms, REQUEST_BYTES), backoff, send).await
+}
+
+pub(crate) async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    (now_ms, bound): (u64, usize),
+    backoff: &mut Backoff,
+    send: impl Fn(NodeId, EventBatch) -> F,
+) -> Result<usize, StoreError> {
+    let mut batches: BTreeMap<NodeId, Requests> = BTreeMap::new();
     let open = |node: NodeId| lost_reason(config, node).is_none() && backoff.ready(node, now_ms);
     let mut after = None;
     while let Some(install_id) = next_install(ctx, after).await? {
@@ -96,7 +143,8 @@ pub async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
             drop_rows(ctx, PLUGIN_OUTBOX_KEYSPACE, &install_id.to_bytes()).await?;
             continue;
         };
-        let pending = open(install.receiver).then(|| batches.entry(install.receiver).or_default());
+        let pending = open(install.receiver)
+            .then(|| receiver_requests(&mut batches, install.receiver, bound));
         collect(ctx, install_id, now_ms, pending).await?;
     }
     let gaps = Txn::direct(ctx)
@@ -111,22 +159,27 @@ pub async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
         };
         let row: GapRow = decode(&value)?;
         if row.sequence > row.acked && open(install.receiver) {
-            let (batch, _) = batches.entry(install.receiver).or_default();
+            let (batch, _) =
+                receiver_requests(&mut batches, install.receiver, bound).room(value.len() + 16);
             batch.gaps.push((install_id, row));
         }
     }
     let mut decided = 0;
-    for (receiver, (batch, keys)) in batches {
-        if batch.events.is_empty() && batch.gaps.is_empty() {
-            continue;
+    for (receiver, requests) in batches {
+        let mut failed = false;
+        for ((batch, keys), _) in requests.open {
+            let Ok(decisions) = send(receiver, batch).await else {
+                failed = true;
+                break;
+            };
+            let (count, busy) = apply(ctx, &keys, decisions).await?;
+            decided += count;
+            if busy {
+                failed = true;
+                break;
+            }
         }
-        let Ok(decisions) = send(receiver, batch).await else {
-            backoff.failed(receiver, now_ms);
-            continue;
-        };
-        let (count, busy) = apply(ctx, &keys, decisions).await?;
-        decided += count;
-        match busy {
+        match failed {
             true => backoff.failed(receiver, now_ms),
             false => _ = backoff.0.remove(&receiver),
         }
@@ -168,7 +221,7 @@ async fn collect(
     ctx: &DriverContext,
     install_id: Ulid,
     now_ms: u64,
-    mut pending: Option<&mut Pending>,
+    mut pending: Option<&mut Requests>,
 ) -> Result<(), StoreError> {
     transact(ctx, async |txn: &Txn<'_>| {
         let prefix = install_id.to_bytes();
@@ -178,15 +231,17 @@ async fn collect(
         let (mut expired, mut outbox) = (Vec::new(), Outbox::new(now_ms));
         for (key, value) in rows {
             let row: ForwardRow = decode(&value)?;
+            let size = value.len();
             if now_ms > row.queued_ms.saturating_add(SEND_EXPIRY_MS) {
                 let event = (row.event.kind, row.event.anchor_ms);
                 outbox
                     .gap(txn, install_id, event, GapReason::Expired)
                     .await?;
                 expired.push(key);
-            } else if let Some((batch, keys)) = pending.as_deref_mut()
+            } else if let Some(requests) = pending.as_deref_mut()
                 && !unreadable(txn, &row).await?
             {
+                let (batch, keys) = requests.room(size);
                 keys.insert((install_id, row.event.source.clone()), key);
                 batch.events.push(row);
             }
