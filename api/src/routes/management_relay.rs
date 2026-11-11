@@ -468,6 +468,58 @@ async fn relay(
     ServerError::NoManagementNode.into_response()
 }
 
+/// Passes a call once to one named node, such as the receiver of a plugin install, and its
+/// answer back. A node without a published address or a call that would circle is refused.
+pub(crate) async fn relay_to_node(
+    state: &Arc<ServerState>,
+    node: NodeId,
+    method: Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
+    let unavailable =
+        |reason: String| ServerError::ServiceUnavailableReason(reason).into_response();
+    let config = drive(
+        GetConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await;
+    let Ok(config) = config else {
+        return unavailable("the realm configuration is not readable".into());
+    };
+    let documents = load_node_documents(state, &config).await;
+    let Some(target) = documents.get(&node).and_then(|doc| doc.urls.api.clone()) else {
+        return unavailable(format!("node {node} has no published address"));
+    };
+    let Some(hops) = passed_hops(state, headers, Some(node)) else {
+        return unavailable(format!(
+            "the call to node {node} would circle between nodes"
+        ));
+    };
+    let url = relay_url(&target, uri);
+    let mut outgoing = (RELAY_CLIENT.request(method, &url))
+        .header(RELAY_HOP_HEADER, hops)
+        .body(body);
+    let forwarded = [
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        HeaderName::from_static(SESSION_HEADER),
+    ];
+    for name in forwarded {
+        if let Some(value) = headers.get(&name) {
+            outgoing = outgoing.header(name, value.clone());
+        }
+    }
+    match outgoing.send().await {
+        Ok(response) => relayed_response("node", &url, response).await,
+        Err(error) => {
+            warn!(relay_target = %url, error = %error, "Relay to a node failed");
+            ServerError::RelayFailed.into_response()
+        }
+    }
+}
+
 /// Targets with a fresh failure move last; the order is kept otherwise.
 fn healthy_first(mut targets: Vec<String>, failed: &BTreeMap<String, Instant>) -> Vec<String> {
     targets.sort_by_key(|target| is_fresh(failed.get(target).copied()));
