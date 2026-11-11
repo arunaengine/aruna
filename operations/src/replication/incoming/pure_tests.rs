@@ -2156,6 +2156,42 @@ fn preserves_source_binding() {
 }
 
 #[test]
+fn rewrite_journals_nothing() {
+    // Only a version new to this node is an upload; rewriting one already here journals nothing.
+    let journaled = |existing: Option<BlobVersion>| {
+        let mut manifest = make_manifest(ReplicationItemKind::Materialized);
+        manifest.writer_auth_context = Some(manifest.auth_context.clone());
+        let mut op = IncomingVersionOperation::new(
+            Ulid::from_parts(45, 45),
+            iroh::SecretKey::from_bytes(&[88; 32]).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        op.txn_id = Some(Ulid::from_parts(46, 46));
+        op.destination_group_id = Some(Ulid::from_parts(44, 44));
+        op.existing_blob_location = Some(make_location());
+        op.replaced_version = existing;
+        op.write_version();
+        (op.pending_version_effects.iter())
+            .filter(|effect| {
+                matches!(effect, Effect::Storage(StorageEffect::BatchWrite { writes, .. })
+                    if writes.iter().any(|(space, ..)| space == "event_journal"))
+            })
+            .count()
+    };
+    assert_eq!(journaled(None), 1);
+    let existing = BlobVersion::materialized(
+        [1u8; 32],
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1600000060),
+        test_user_id(),
+        None,
+    );
+    assert_eq!(journaled(Some(existing)), 0);
+}
+
+#[test]
 fn indexes_noncurrent_version() {
     let mut manifest = make_manifest(ReplicationItemKind::Materialized);
     manifest.current_version = false;

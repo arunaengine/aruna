@@ -2187,9 +2187,11 @@ impl IncomingVersionOperation {
                 Err(err) => return self.fail(err.into()),
             }
         }
-        // A new version of the target bucket is journaled last in its transaction; a delete
-        // marker is not an upload.
-        if self.manifest.kind != ReplicationItemKind::DeleteMarker {
+        // A version new to this node is journaled last in its transaction. A delete marker is
+        // not an upload, and a rewrite of a version already here keeps its first anchor.
+        if self.manifest.kind != ReplicationItemKind::DeleteMarker
+            && self.replaced_version.is_none()
+        {
             let group_id = self.destination_group_id.unwrap_or(self.manifest.group_id);
             let uploaded = SourceEvent::data_uploaded(
                 (self.local_realm_id, group_id, self.local_node_id),
