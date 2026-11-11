@@ -203,6 +203,31 @@ pub enum PluginCommand {
         /// The install id.
         id: String,
     },
+    /// Start a run of an install's manual trigger.
+    Run {
+        /// The install id.
+        id: String,
+        /// The trigger's JSON input; `{}` when omitted.
+        #[arg(long)]
+        input: Option<String>,
+    },
+    /// List the runs of an install, or show one run with its log.
+    Runs {
+        /// The install id.
+        id: String,
+        /// A run id; shows that run with its log lines.
+        run: Option<String>,
+    },
+    /// Decide a run that needs attention: whether its effects happened.
+    Resolve {
+        /// The install id.
+        id: String,
+        /// The run id.
+        run: String,
+        /// `true` when the run's effects happened, else `false`.
+        #[arg(long)]
+        done: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -517,6 +542,23 @@ mod tests {
             (vec!["a=b".to_string(), "c=".to_string()], false)
         );
         assert!(parse(&["plugin", "install", "announcer"]).is_err());
+    }
+
+    #[test]
+    fn parses_plugin_runs() {
+        let line = ["plugin", "run", "i1", "--input", "{\"a\":1}"];
+        let Command::Plugin(PluginCommand::Run { input, .. }) = parse(&line).unwrap().command
+        else {
+            panic!("expected plugin run");
+        };
+        assert_eq!(input.as_deref(), Some("{\"a\":1}"));
+        let line = ["plugin", "resolve", "i1", "r1", "--done"];
+        let Command::Plugin(PluginCommand::Resolve { done, .. }) = parse(&line).unwrap().command
+        else {
+            panic!("expected plugin resolve");
+        };
+        assert!(done);
+        assert!(parse(&["plugin", "resolve", "i1"]).is_err());
     }
 
     #[test]

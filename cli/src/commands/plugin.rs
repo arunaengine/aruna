@@ -137,6 +137,30 @@ pub async fn plugin(context: &mut Context<'_>, command: PluginCommand) -> Result
                 .await?;
             context.out.line(format!("removed {id}"))
         }
+        PluginCommand::Run { id, input } => {
+            let input: Value = serde_json::from_str(input.as_deref().unwrap_or("{}"))
+                .map_err(|_| CliError::usage("--input is not JSON"))?;
+            let path = format!("plugin-installs/{id}/runs");
+            let body = serde_json::json!({ "input": input });
+            let run: RunView = (context.api()?)
+                .send(reqwest::Method::POST, &path, &body)
+                .await?;
+            show_run(context, &run)
+        }
+        PluginCommand::Runs { id, run: Some(run) } => {
+            let path = format!("plugin-installs/{id}/runs/{run}");
+            let run: RunView = context.api()?.get(&path, &[]).await?;
+            show_run(context, &run)
+        }
+        PluginCommand::Runs { id, run: None } => runs(context, &id).await,
+        PluginCommand::Resolve { id, run, done } => {
+            let path = format!("plugin-installs/{id}/runs/{run}/resolve");
+            let body = serde_json::json!({ "done": done });
+            let run: RunView = (context.api()?)
+                .send(reqwest::Method::POST, &path, &body)
+                .await?;
+            show_run(context, &run)
+        }
         PluginCommand::Build { path } => {
             let built = build_project(&path).map_err(|err| CliError::usage(err.to_string()))?;
             let summary = Built {
@@ -372,6 +396,85 @@ async fn installs(context: &mut Context<'_>, group: &str) -> Result<(), CliError
     context
         .out
         .listing(&installs, &["ID", "PLUGIN", "VERSION", "STATUS"], rows)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunLine {
+    at_ms: u64,
+    level: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunView {
+    id: String,
+    state: String,
+    trigger: String,
+    attempts: u32,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    log: Vec<RunLine>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunPage {
+    runs: Vec<RunView>,
+    next: Option<String>,
+}
+
+/// One run: its state and outcome, then its log lines.
+fn show_run(context: &mut Context<'_>, run: &RunView) -> Result<(), CliError> {
+    if context.out.json {
+        return context.out.json(run);
+    }
+    let outcome = run
+        .message
+        .as_deref()
+        .or(run.output.as_deref())
+        .unwrap_or_default();
+    context.out.line(format!(
+        "{} {} {} {outcome}",
+        run.id, run.trigger, run.state
+    ))?;
+    for line in &run.log {
+        context
+            .out
+            .line(format!("  {} {} {}", line.at_ms, line.level, line.message))?;
+    }
+    Ok(())
+}
+
+async fn runs(context: &mut Context<'_>, id: &str) -> Result<(), CliError> {
+    let api = context.api()?;
+    let path = format!("plugin-installs/{id}/runs");
+    let mut runs = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut query = vec![("limit", "1000".to_string())];
+        query.extend(cursor.take().map(|cursor| ("cursor", cursor)));
+        let page: RunPage = api.get(&path, &query).await?;
+        runs.extend(page.runs);
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    let rows = (runs.iter())
+        .map(|run| {
+            let message = run.message.clone().unwrap_or_default();
+            vec![
+                run.id.clone(),
+                run.trigger.clone(),
+                run.state.clone(),
+                message,
+            ]
+        })
+        .collect();
+    let header = ["ID", "TRIGGER", "STATE", "MESSAGE"];
+    context.out.listing(&runs, &header, rows)
 }
 
 /// Sends one change of an install and shows its new state.
