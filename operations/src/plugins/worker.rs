@@ -32,6 +32,7 @@ use super::dispatch::{enqueue_timers, event_trigger};
 use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
+use super::matcher::match_pending;
 use super::receiver::{eligible, lost_reason};
 use super::runs::{prune_runs, read_run, save_run, unfinished};
 use super::store::StoreError;
@@ -123,6 +124,9 @@ impl Worker {
         self.revoke(&config);
         let timers = enqueue_timers(&self.ctx, &config, self.local, now_ms).await;
         timers.map_err(|error| error.to_string())?;
+        if let Err(error) = match_pending(&self.ctx, &config, self.local, now_ms).await {
+            warn!(%error, "Could not match plugin events to installs");
+        }
         let queued = unfinished(&self.ctx)
             .await
             .map_err(|error| error.to_string())?;

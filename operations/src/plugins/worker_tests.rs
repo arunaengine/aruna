@@ -153,7 +153,7 @@ async fn finishes_runs() {
 }
 
 /// A created dataset `resource` under the install's whole metadata grant, and that grant's base.
-fn created(install: &PluginInstall, resource: &str) -> (SourceEvent, String) {
+pub(crate) fn created(install: &PluginInstall, resource: &str) -> (SourceEvent, String) {
     let whole = &install.grants["metadata.read"][0];
     let base = whole.strip_suffix("/**").unwrap().to_string();
     let event = SourceEvent {

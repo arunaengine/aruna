@@ -294,6 +294,81 @@ pub fn journal_entries(
         .collect())
 }
 
+/// Forward rows of one install a node keeps at most; matching beyond records a gap.
+pub const EVENTS_QUEUED: usize = 10_000;
+
+/// A matched event this node sends to the install's receiver.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardRow {
+    pub install_id: Ulid,
+    /// The install revision the event was matched with; the receiver waits until it has it.
+    pub revision: u64,
+    pub event: SourceEvent,
+}
+
+/// Key of a forward row: the install, then the event's pending row key without its kind.
+pub fn outbox_key(install_id: Ulid, pending: &[u8]) -> Vec<u8> {
+    let mut key = install_id.to_bytes().to_vec();
+    key.extend_from_slice(pending.get(1..).unwrap_or_default());
+    key
+}
+
+/// Why matched events of an install were not delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum GapReason {
+    /// The install's forward rows on this node were at their bound.
+    Full,
+    /// The event's journal row passed its retention before it was matched.
+    Pruned,
+}
+
+/// Undelivered events of one install, kind and reason, as the node that lost them counts them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapRow {
+    pub kind: SourceKind,
+    pub reason: GapReason,
+    pub count: u64,
+    /// Anchors of the earliest and the latest event counted.
+    pub earliest_ms: u64,
+    pub latest_ms: u64,
+    /// Raised with each counted event; the receiver acknowledges the sequence it has.
+    pub sequence: u64,
+    pub acked: u64,
+}
+
+impl GapRow {
+    pub fn new(kind: SourceKind, reason: GapReason) -> Self {
+        Self {
+            kind,
+            reason,
+            count: 0,
+            earliest_ms: u64::MAX,
+            latest_ms: 0,
+            sequence: 0,
+            acked: 0,
+        }
+    }
+
+    /// Counts one more event with the anchor `anchor_ms`.
+    pub fn add(&mut self, anchor_ms: u64) {
+        self.count += 1;
+        self.earliest_ms = self.earliest_ms.min(anchor_ms);
+        self.latest_ms = self.latest_ms.max(anchor_ms);
+        self.sequence += 1;
+    }
+}
+
+/// Row kind of a gap this node counted as a sender.
+pub const SENDER_GAP: u8 = b's';
+
+/// Key of a sender's gap row: by install, then event kind and reason.
+pub fn gap_key(install_id: Ulid, kind: SourceKind, reason: GapReason) -> Vec<u8> {
+    let mut key = vec![SENDER_GAP];
+    key.extend_from_slice(&install_id.to_bytes());
+    key.extend_from_slice(&[kind as u8, reason as u8]);
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

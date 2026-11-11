@@ -13,6 +13,7 @@ pub mod install;
 pub mod intents;
 pub mod journal;
 pub mod lifecycle;
+pub mod matcher;
 pub mod publish;
 pub mod rate;
 pub mod receiver;
