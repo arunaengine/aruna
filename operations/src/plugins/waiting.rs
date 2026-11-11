@@ -4,14 +4,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::keyspaces::{PLUGIN_GAPS_KEYSPACE, PLUGIN_QUEUE_KEYSPACE, PLUGIN_WAITING_KEYSPACE};
-use aruna_core::plugin_runs::{GapReason, GapRow, WAITING_EXPIRY_MS, reported_key};
+use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_WAITING_KEYSPACE};
+use aruna_core::plugin_runs::{GapReason, WAITING_EXPIRY_MS};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
-use super::decide::{Verdict, WaitingRow, judge, record};
+use super::decide::{Verdict, WaitingRow, judge, local_gap, record};
 use super::forward::Outcome;
 use super::runs::{ADMISSIONS, RunError, admit_in};
-use super::store::{StoreError, Txn, decode, encode, transact};
+use super::store::{StoreError, Txn, decode, transact};
 use crate::driver::DriverContext;
 
 /// Decides each waiting event that is ready or expired; returns how many left the waiting set.
@@ -47,7 +47,7 @@ pub async fn recheck_waiting(
                 },
                 Some(Verdict::Denied(reason)) => Outcome::Denied(reason.clone()),
                 _ => {
-                    expire(txn, local, &waiting).await?;
+                    local_gap(txn, local, &waiting.row, GapReason::Waited).await?;
                     Outcome::Expired
                 }
             };
@@ -57,19 +57,6 @@ pub async fn recheck_waiting(
         left += 1;
     }
     Ok(left)
-}
-
-/// Counts an expired waiting event in this receiver's own gap row.
-async fn expire(txn: &Txn<'_>, local: NodeId, waiting: &WaitingRow) -> Result<(), StoreError> {
-    let (install_id, kind) = (waiting.row.install_id, waiting.row.event.kind);
-    let key = reported_key(local, install_id, kind, GapReason::Waited);
-    let mut row = match txn.read(PLUGIN_GAPS_KEYSPACE, &key).await? {
-        Some(bytes) => decode(&bytes)?,
-        None => GapRow::new(kind, GapReason::Waited),
-    };
-    row.add(waiting.row.event.anchor_ms);
-    txn.write(PLUGIN_GAPS_KEYSPACE, vec![(key, encode(&row)?)])
-        .await
 }
 
 #[cfg(test)]

@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_SEEN_KEYSPACE};
+use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_SEEN_KEYSPACE};
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugin_runs::{ForwardRow, RECEIVER_GAP, RunTrigger};
+use aruna_core::plugin_runs::{ForwardRow, GapRow, RECEIVER_GAP, RunTrigger};
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 

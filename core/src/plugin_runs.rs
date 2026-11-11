@@ -166,6 +166,11 @@ pub fn timer_key(install_id: Ulid) -> Vec<u8> {
 /// and still counts against the install's limit.
 pub const ATTENTION_ROW: &[u8] = b"a";
 
+/// How long a receiver keeps an event's dedup record after its anchor: the journal retention,
+/// the send expiry, the clock skew bound and a day. A row older than this is refused.
+pub const DEDUP_RETENTION_MS: u64 =
+    JOURNAL_RETENTION_MS + SEND_EXPIRY_MS + 5 * 60 * 1000 + 24 * 3600 * 1000;
+
 /// How long an event waits on the receiver for its install record or account writes.
 pub const WAITING_EXPIRY_MS: u64 = 3 * 24 * 3600 * 1000;
 
@@ -335,6 +340,8 @@ pub enum GapReason {
     Expired,
     /// The event waited on the receiver for its install record past the waiting expiry.
     Waited,
+    /// The event reached the receiver after its dedup record would have expired.
+    Late,
 }
 
 /// Undelivered events of one install, kind and reason, as the node that lost them counts them.

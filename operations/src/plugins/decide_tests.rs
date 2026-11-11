@@ -14,7 +14,7 @@ use crate::plugins::install::tests::Fixture;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::runs::tests::queued;
-use crate::plugins::runs::{admit, list_runs, unfinished};
+use crate::plugins::runs::{admit, list_runs, prune_runs, save_run, unfinished};
 use crate::plugins::worker::tests::{created, installed, worker};
 
 /// A created dataset journaled now, and its forward row for `install`.
@@ -32,13 +32,23 @@ fn event(install: &PluginInstall, resource: &str, now: u64) -> (SourceEvent, For
 
 /// Decides `rows` as one batch from this node.
 async fn decided(fixture: &Fixture, rows: &[ForwardRow]) -> Vec<Outcome> {
+    let now = unix_timestamp_millis();
+    decided_at(fixture, rows, fixture.actor.node_id, now).await
+}
+
+/// Decides `rows` as one batch from `sender` at `now`.
+async fn decided_at(
+    fixture: &Fixture,
+    rows: &[ForwardRow],
+    sender: NodeId,
+    now: u64,
+) -> Vec<Outcome> {
     let batch = EventBatch {
         events: rows.to_vec(),
         gaps: Vec::new(),
     };
-    let nodes = (fixture.actor.node_id, fixture.actor.node_id);
+    let nodes = (fixture.actor.node_id, sender);
     let config = config(fixture).await;
-    let now = unix_timestamp_millis();
     let decisions = decide_batch(&fixture.ctx, &config, nodes, batch, now).await;
     (decisions.unwrap().events.into_iter())
         .map(|(.., outcome)| outcome)
@@ -171,4 +181,60 @@ async fn newest_reports() {
         .map(|(_, value)| decode::<GapRow>(value).unwrap().count)
         .collect();
     assert_eq!(counts.iter().sum::<u64>(), 8);
+}
+
+const DAY: u64 = 24 * 3600 * 1000;
+
+#[tokio::test]
+async fn dedup_retention() {
+    // Replayed on day 7, resent on day 10 after its run was pruned: the record still answers.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let (anchor, local) = (unix_timestamp_millis(), fixture.actor.node_id);
+    let row = event(&install, "D1", anchor).1;
+    let first = decided_at(
+        &fixture,
+        std::slice::from_ref(&row),
+        local,
+        anchor + 7 * DAY,
+    );
+    assert_eq!(first.await, [Outcome::Queued]);
+    let mut run = runs(&fixture, &install).await.remove(0);
+    run.finish(RunState::Succeeded, None, anchor + 7 * DAY);
+    save_run(&fixture.ctx, &run).await.unwrap();
+    prune_runs(&fixture.ctx, u64::MAX / 2).await.unwrap();
+    assert_eq!(prune_seen(&fixture.ctx, anchor + 10 * DAY).await, Ok(0));
+    let resent = decided_at(
+        &fixture,
+        std::slice::from_ref(&row),
+        local,
+        anchor + 10 * DAY,
+    );
+    assert_eq!(resent.await, [Outcome::Queued]);
+    assert!(runs(&fixture, &install).await.is_empty());
+    let expired = anchor + DEDUP_RETENTION_MS + 1;
+    assert_eq!(prune_seen(&fixture.ctx, expired).await, Ok(1));
+}
+
+#[tokio::test]
+async fn late_rows_refused() {
+    // Rows past their anchor's retention, also another holder's late row, never run.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let anchor = unix_timestamp_millis();
+    let late = anchor + DEDUP_RETENTION_MS + 1;
+    let holder = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+    for (resource, sender) in [("D1", fixture.actor.node_id), ("D2", holder)] {
+        let row = event(&install, resource, anchor).1;
+        let outcome = decided_at(&fixture, &[row], sender, late).await;
+        assert_eq!(outcome, [Outcome::Expired]);
+    }
+    assert!(runs(&fixture, &install).await.is_empty());
+    let txn = Txn::direct(&fixture.ctx);
+    let gaps = txn
+        .scan(PLUGIN_GAPS_KEYSPACE, &[RECEIVER_GAP])
+        .await
+        .unwrap();
+    let gap: GapRow = decode(&gaps[0].1).unwrap();
+    assert_eq!((gaps.len(), gap.reason, gap.count), (1, GapReason::Late, 2));
 }

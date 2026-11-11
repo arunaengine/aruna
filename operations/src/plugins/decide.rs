@@ -9,8 +9,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
-    ForwardRow, GapReason, GapRow, PluginRun, RUNS_QUEUED, SourceKind, WAITING_ROW, queue_key,
-    reported_key,
+    DEDUP_RETENTION_MS, ForwardRow, GapReason, GapRow, PluginRun, RUNS_QUEUED, SourceKind,
+    WAITING_ROW, queue_key, reported_key,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
@@ -108,6 +108,12 @@ async fn decide(
     if let Some(bytes) = Txn::direct(ctx).read(PLUGIN_SEEN_KEYSPACE, &seen).await? {
         return Ok(decode::<SeenRow>(&bytes)?.outcome);
     }
+    // Its dedup record would be gone, so a run now could repeat one already made.
+    if now_ms > row.event.anchor_ms.saturating_add(DEDUP_RETENTION_MS) {
+        let late = async |txn: &Txn<'_>| local_gap(txn, local, row, GapReason::Late).await;
+        transact(ctx, late).await?;
+        return Ok(Outcome::Expired);
+    }
     let verdict = judge(ctx, config, local, row, now_ms).await?;
     transact(ctx, async |txn: &Txn<'_>| {
         let outcome = match &verdict {
@@ -125,6 +131,46 @@ async fn decide(
         Ok(outcome)
     })
     .await
+}
+
+/// Counts an event this receiver did not run in its own gap row of `reason`.
+pub(crate) async fn local_gap(
+    txn: &Txn<'_>,
+    local: NodeId,
+    row: &ForwardRow,
+    reason: GapReason,
+) -> Result<(), StoreError> {
+    let (install_id, kind) = (row.install_id, row.event.kind);
+    let key = reported_key(local, install_id, kind, reason);
+    let mut gap = match txn.read(PLUGIN_GAPS_KEYSPACE, &key).await? {
+        Some(bytes) => decode(&bytes)?,
+        None => GapRow::new(kind, reason),
+    };
+    gap.add(row.event.anchor_ms);
+    txn.write(PLUGIN_GAPS_KEYSPACE, vec![(key, encode(&gap)?)])
+        .await
+}
+
+/// Deletes the dedup records past their retention; returns how many.
+pub async fn prune_seen(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    let txn = Txn::direct(ctx);
+    let (mut after, mut pruned) = (None, 0);
+    loop {
+        let (rows, next) = txn.page(PLUGIN_SEEN_KEYSPACE, &[], after, 1_000).await?;
+        let old: Vec<Vec<u8>> = (rows.into_iter())
+            .filter(|(_, value)| {
+                decode::<SeenRow>(value)
+                    .is_ok_and(|seen| now_ms > seen.anchor_ms.saturating_add(DEDUP_RETENTION_MS))
+            })
+            .map(|(key, _)| key)
+            .collect();
+        pruned += old.len();
+        txn.delete(PLUGIN_SEEN_KEYSPACE, old).await?;
+        match next {
+            Some(key) => after = Some(key),
+            None => return Ok(pruned),
+        }
+    }
 }
 
 /// Writes the event's dedup record with its outcome.

@@ -30,7 +30,7 @@ use super::artifacts::fetch_artifact;
 use super::broker::RunBroker;
 use super::check::{RunScope, check_call};
 use super::clock::probe_clock;
-use super::decide::decide_batch;
+use super::decide::{decide_batch, prune_seen};
 use super::dispatch::{enqueue_timers, event_trigger};
 use super::forward::{Backoff, Decisions, EventBatch, send_outbox};
 use super::install::read_config;
@@ -508,6 +508,9 @@ pub fn spawn_worker(
                 }
                 if let Err(error) = prune_journal(&worker.ctx, now).await {
                     warn!(%error, "Could not prune the plugin event journal");
+                }
+                if let Err(error) = prune_seen(&worker.ctx, now).await {
+                    warn!(%error, "Could not prune plugin event dedup records");
                 }
             }
             tokio::select! {
