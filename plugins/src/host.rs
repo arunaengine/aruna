@@ -172,6 +172,11 @@ impl Session {
         self.ordinal
     }
 
+    /// The broker and call context a guest log line goes to.
+    pub(crate) fn log_target(&self) -> (Arc<dyn Broker>, CallContext) {
+        (self.broker.clone(), self.cx.clone())
+    }
+
     /// Starts a broker call after the budget and grant checks. A missing grant is
     /// `not-granted`, never a fallback to other rights.
     pub(crate) fn begin(

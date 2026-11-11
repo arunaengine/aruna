@@ -179,7 +179,7 @@ impl Fixture {
             .await;
     }
 
-    async fn write_row(&self, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+    pub(crate) async fn write_row(&self, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
         let write = StorageEffect::Write {
             key_space: key_space.to_string(),
             key: key.into(),

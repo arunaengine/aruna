@@ -42,12 +42,22 @@ pub fn pick_receiver(
 
 /// Whether `node` is a server or management node of the realm that is not draining.
 pub fn eligible(config: &RealmConfigDocument, node: NodeId) -> bool {
-    let infrastructure = matches!(
-        node_kind(config, node),
-        Some(RealmNodeKind::Server | RealmNodeKind::Management)
-    );
-    let draining = config
-        .placement_entry(node)
-        .is_some_and(|entry| entry.draining);
-    infrastructure && !draining
+    lost_reason(config, node).is_none()
+}
+
+/// Why `node` can no longer run installs: it left the realm, is no longer a server or
+/// management node, or is draining. Its installs show as blocked; nothing moves them.
+pub fn lost_reason(config: &RealmConfigDocument, node: NodeId) -> Option<&'static str> {
+    match node_kind(config, node) {
+        None => Some("the node that runs it left the realm"),
+        Some(RealmNodeKind::User { .. }) => Some("the node that runs it is no longer a server"),
+        Some(_)
+            if config
+                .placement_entry(node)
+                .is_some_and(|entry| entry.draining) =>
+        {
+            Some("the node that runs it is draining")
+        }
+        Some(_) => None,
+    }
 }

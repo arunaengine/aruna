@@ -4,14 +4,24 @@
 
 pub mod account;
 pub mod artifacts;
+pub mod broker;
+pub mod check;
 pub mod copies;
+pub mod dispatch;
 pub mod grants;
 pub mod install;
+pub mod intents;
 pub mod lifecycle;
 pub mod publish;
+pub mod rate;
 pub mod receiver;
 pub mod records;
+pub mod runs;
 pub mod settings;
+pub mod state;
+pub mod store;
+pub mod sweep;
+pub mod worker;
 
 use serde::{Deserialize, Serialize};
 

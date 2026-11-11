@@ -48,7 +48,7 @@ impl Identity {
 
 /// The guard that ties a prerequisite write to the record revision it was computed from.
 pub(crate) fn guard_of(install: &PluginInstall) -> InstallGuard {
-    InstallGuard {
+    InstallGuard::Revision {
         install_id: install.install_id,
         revision: install.revision,
     }

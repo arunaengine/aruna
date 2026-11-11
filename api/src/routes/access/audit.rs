@@ -229,6 +229,7 @@ fn row(record: AdminAuditRecord) -> AdminAuditRow {
         AdminAuditAction::PluginPaused => "plugin_paused",
         AdminAuditAction::PluginResumed => "plugin_resumed",
         AdminAuditAction::PluginRemoved => "plugin_removed",
+        AdminAuditAction::PluginRunResolved => "plugin_run_resolved",
     };
     AdminAuditRow {
         audit_id: record.audit_id.to_string(),

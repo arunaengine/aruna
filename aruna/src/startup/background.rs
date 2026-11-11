@@ -15,6 +15,7 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::spawn_metadata_warmup;
 use aruna_operations::node::startup::{RecoveryConfig, RecoveryStatus};
 use aruna_operations::plugins::artifacts::spawn_repair;
+use aruna_operations::plugins::worker::spawn_worker;
 use aruna_operations::s3::session::spawn_session_sweep;
 use aruna_operations::tasks::incoming::TaskQueues;
 use aruna_tasks::TaskHandle;
@@ -56,6 +57,7 @@ pub(crate) enum StartupPhase {
     RecoverChild,
     FeedIndexes,
     RepairPlugins,
+    RunPlugins,
 }
 
 /// The order the node starts its durable background work. Readiness requires
@@ -75,6 +77,7 @@ pub(crate) const STARTUP_PHASES: &[StartupPhase] = &[
     StartupPhase::RecoverChild,
     StartupPhase::FeedIndexes,
     StartupPhase::RepairPlugins,
+    StartupPhase::RunPlugins,
 ];
 
 /// What the ordered background start did, in the same required-versus-optional
@@ -215,6 +218,9 @@ pub(crate) async fn start(
             }
             StartupPhase::FeedIndexes => spawn_index_feed(driver_ctx.clone(), &shutdown),
             StartupPhase::RepairPlugins => spawn_repair(driver_ctx.clone(), &shutdown),
+            StartupPhase::RunPlugins => {
+                spawn_worker(driver_ctx.clone(), realm_id, node_id, &shutdown)
+            }
         }
     }
     if completed_all_phases {
@@ -450,7 +456,7 @@ mod tests {
 mod pure_tests {
     use super::*;
 
-    const ALL_PHASES: [StartupPhase; 13] = [
+    const ALL_PHASES: [StartupPhase; 14] = [
         StartupPhase::Ready,
         StartupPhase::CorePublication,
         StartupPhase::RecoverStaleJobs,
@@ -464,6 +470,7 @@ mod pure_tests {
         StartupPhase::RecoverChild,
         StartupPhase::FeedIndexes,
         StartupPhase::RepairPlugins,
+        StartupPhase::RunPlugins,
     ];
 
     // The executed order is the tested order: readiness before recovery, the

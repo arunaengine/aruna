@@ -35,6 +35,7 @@ pub mod onboarding;
 pub mod pid;
 pub mod placement;
 pub mod plugin_installs;
+pub mod plugin_runs;
 pub mod plugins;
 pub mod policies;
 pub mod portal;
@@ -135,6 +136,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(plugins::router())
         .merge(plugin_installs::router())
         .merge(install_changes::router())
+        .merge(plugin_runs::router())
         .merge(policies::router())
         .merge(portal::router())
         .merge(oidc_providers::router())
@@ -834,6 +836,10 @@ pub(crate) mod tests {
         ("PUT", "/plugin-installs/{id}/version"),
         ("POST", "/plugin-installs/{id}/pause"),
         ("POST", "/plugin-installs/{id}/resume"),
+        ("POST", "/plugin-installs/{id}/runs"),
+        ("GET", "/plugin-installs/{id}/runs"),
+        ("GET", "/plugin-installs/{id}/runs/{run}"),
+        ("POST", "/plugin-installs/{id}/runs/{run}/resolve"),
     ];
 
     /// Documented path to the runtime template that serves it. Catch-all ids

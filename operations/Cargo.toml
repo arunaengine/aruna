@@ -20,7 +20,7 @@ test-hooks = []
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
 aruna-core = { workspace = true }
-aruna-plugins = { workspace = true }
+aruna-plugins = { workspace = true, features = ["runtime"] }
 aruna-storage = { workspace = true }
 aruna-net = { workspace = true }
 aruna-tasks = { workspace = true }

@@ -15,16 +15,16 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    COMMIT_MESSAGE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
-    PENDING_PROJECTION_KEYSPACE,
+    COMMIT_MESSAGE_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE,
+    GRAPH_LIFECYCLE_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataError, MetadataEventPayload,
     MetadataEventRecord, MetadataLifecycleRecord,
 };
 use aruna_core::storage_entries::{
-    delete_projection_entry, document_job_entry, document_lifecycle_entry, event_log_key,
-    graph_lifecycle_key, lifecycle_revision_change, materialization_job_entry,
+    delete_projection_entry, document_job_entry, document_lifecycle_entry, document_lifecycle_key,
+    event_log_key, graph_lifecycle_key, lifecycle_revision_change, materialization_job_entry,
     pending_projection_key, pending_projection_target, registry_delete_entries,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -568,7 +568,8 @@ pub async fn project_create_events(
                 record.fenced_at(generation)
             })
         });
-        let audit = audit_record(&event);
+        let message = event_message(context, &event).await?;
+        let audit = audit_record(&event, message.as_deref());
         if needs_materialization {
             let now = aruna_core::time::unix_timestamp_millis();
             let status = new_pending_status(&event, now);
@@ -722,6 +723,40 @@ async fn author_message(
             "{other:?}"
         ))),
     }
+}
+
+/// The commit message of an event: the author's own row, or on another holder the replicated
+/// lifecycle record when it still carries this event.
+async fn event_message(
+    context: &DriverContext,
+    event: &MetadataEventRecord,
+) -> Result<Option<String>, MetadataProjectionError> {
+    let document_id = event.record.document_id;
+    if let Some(message) = author_message(context, document_id, event.event_id).await? {
+        return Ok(Some(message));
+    }
+    let read = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+            key: document_lifecycle_key(document_id),
+            txn_id: None,
+        })
+        .await;
+    let value = match read {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => {
+            return Err(MetadataProjectionError::UnexpectedEvent(format!(
+                "{other:?}"
+            )));
+        }
+    };
+    let lifecycle =
+        value.and_then(|value| postcard::from_bytes::<MetadataLifecycleRecord>(&value).ok());
+    Ok(lifecycle
+        .filter(|lifecycle| lifecycle.event_id() == event.event_id)
+        .and_then(|lifecycle| lifecycle.message().map(str::to_owned)))
 }
 
 async fn abort_projection_transaction(
@@ -1146,7 +1181,12 @@ async fn metadata_graph_deleted(
         })
 }
 
-fn audit_record(event: &MetadataEventRecord) -> MetadataAuditRecord {
+fn audit_record(event: &MetadataEventRecord, message: Option<&str>) -> MetadataAuditRecord {
+    let kind = format!(
+        "kind={} holders={}",
+        event.payload.materialization_kind(),
+        event.record.holder_node_ids.len()
+    );
     MetadataAuditRecord {
         realm_id: event.record.realm_id,
         group_id: event.record.group_id,
@@ -1156,11 +1196,10 @@ fn audit_record(event: &MetadataEventRecord) -> MetadataAuditRecord {
         node_id: event.node_id,
         operation: event.payload.audit_operation(),
         occurred_at_ms: event.occurred_at_ms,
-        details: Some(format!(
-            "kind={} holders={}",
-            event.payload.materialization_kind(),
-            event.record.holder_node_ids.len()
-        )),
+        details: Some(match message {
+            Some(message) => format!("{kind}; {message}"),
+            None => kind,
+        }),
     }
 }
 
@@ -1818,6 +1857,55 @@ mod tests {
         let registry_ref = registry_placement(&config, &event.record);
         assert_eq!(registry.placement, registry_ref);
         assert_ne!(registry_ref, event.record.placement);
+    }
+
+    // Another holder names the author's commit message in its audit row, from the replicated
+    // lifecycle record of the same event; a record of another event names none.
+    #[tokio::test]
+    async fn projected_audit_message() {
+        let audit_details = async |message: Option<&str>, lifecycle_event: Option<Ulid>| {
+            let dir = tempdir().expect("temp dir");
+            let storage =
+                FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage");
+            let event = create_event();
+            let mut stored = event.clone();
+            stored.event_id = lifecycle_event.unwrap_or(event.event_id);
+            let lifecycle = MetadataLifecycleRecord::for_event(stored, message.map(str::to_owned));
+            let (key_space, key, value) = document_lifecycle_entry(&lifecycle).unwrap();
+            write_entries(&storage, vec![(key_space, key, value)]).await;
+            let context = DriverContext {
+                storage_handle: storage.clone(),
+                net_handle: None,
+                blob_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+                compute_handle: None,
+            };
+            let other = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+            project_create_event(&context, event, Some(other))
+                .await
+                .expect("projection succeeds");
+            let rows = storage
+                .send_storage_effect(StorageEffect::Iter {
+                    key_space: aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE.to_string(),
+                    prefix: None,
+                    start: None,
+                    limit: 10,
+                    txn_id: None,
+                })
+                .await;
+            let Event::Storage(StorageEvent::IterResult { values, .. }) = rows else {
+                panic!("audit rows are readable");
+            };
+            let (_, value) = values.first().expect("an audit row is written");
+            let audit: MetadataAuditRecord = postcard::from_bytes(value).unwrap();
+            audit.details.unwrap_or_default()
+        };
+        let named = audit_details(Some("plugin a install b run c"), None).await;
+        assert!(named.ends_with("; plugin a install b run c"), "{named}");
+        let other = audit_details(Some("not this one"), Some(Ulid::from_parts(1, 1))).await;
+        assert!(!other.contains(';'), "{other}");
+        assert!(!audit_details(None, None).await.contains(';'));
     }
 
     // A locally authored event with no eligible holders must not enqueue an

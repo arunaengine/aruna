@@ -320,7 +320,7 @@ async fn make_ready(
 }
 
 /// Repairs the account and role of every settled install from its current record on a
-/// management node, as the approving admin. Another node's late change of either is undone.
+/// management node, as the approving admin, then sweeps accounts no record names any more.
 pub async fn reconcile_installs(ctx: &DriverContext) -> Result<usize, InstallError> {
     let Some(net) = ctx.net_handle.as_ref() else {
         return Ok(0);
@@ -330,7 +330,13 @@ pub async fn reconcile_installs(ctx: &DriverContext) -> Result<usize, InstallErr
     if !is_management(&config, node_id) {
         return Ok(0);
     }
-    Ok(repair_settled(ctx, node_id, realm_id, &config.installs).await)
+    let repaired = repair_settled(ctx, node_id, realm_id, &config.installs).await;
+    let swept = super::sweep::sweep_orphans(ctx, node_id, &config, unix_timestamp_millis()).await;
+    Ok(repaired
+        + swept.unwrap_or_else(|error| {
+            warn!(%error, "Could not sweep unnamed plugin accounts");
+            0
+        }))
 }
 
 /// Repairs each settled install; one that fails is logged and the others are still repaired.
