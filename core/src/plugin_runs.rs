@@ -1,12 +1,16 @@
-//! Runs of a plugin install on its receiver: the saved invocation, the state and the call log.
-//! A run keeps what it executes with, so a later change of the install never retargets it.
+//! Runs of a plugin install on its receiver, with their saved invocation, state and call log, and
+//! the journaled source events that start runs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::UserId;
+use crate::errors::ConversionError;
+use crate::keyspaces::EVENT_JOURNAL_KEYSPACE;
+use crate::metadata::MetadataEventRecord;
 use crate::types::GroupId;
 
 /// Runs of one install that run at once on its receiver.
@@ -171,6 +175,100 @@ pub fn parse_queue_key(key: &[u8]) -> Option<(Ulid, Ulid)> {
     (key.len() == 32).then(|| (Ulid::from_bytes(install), Ulid::from_bytes(run)))
 }
 
+/// How long a node keeps its journal rows for replay.
+pub const JOURNAL_RETENTION_MS: u64 = 7 * 24 * 3600 * 1000;
+
+/// Row kinds of the journal keyspace: kept rows for replay, and rows not matched yet.
+pub const JOURNAL_ROW: u8 = b'j';
+pub const PENDING_ROW: u8 = b'u';
+
+/// The event kinds this node journals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SourceKind {
+    DatasetCreated,
+    DataUploaded,
+}
+
+impl SourceKind {
+    /// The trigger name a manifest uses for this kind.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::DatasetCreated => "dataset_created",
+            Self::DataUploaded => "data_uploaded",
+        }
+    }
+}
+
+/// One committed source event, as the committing node journaled it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceEvent {
+    pub kind: SourceKind,
+    pub group_id: GroupId,
+    /// The policy path the grants and `authorize()` decide on.
+    pub path: String,
+    /// What the guest names: a document id or an object path.
+    pub resource: String,
+    /// The document event or the object version.
+    pub revision: String,
+    /// The canonical identity, the same on every node that journals the event.
+    pub source: String,
+    /// The origin time the event's dedup expiry counts from; never renewed.
+    pub anchor_ms: u64,
+    /// When this node journaled it, by its own clock; orders replay and pruning only.
+    pub journaled_ms: u64,
+}
+
+impl SourceEvent {
+    /// The creation of a metadata document, from its create event.
+    pub fn dataset_created(event: &MetadataEventRecord, now_ms: u64) -> Self {
+        Self {
+            kind: SourceKind::DatasetCreated,
+            group_id: event.record.group_id,
+            path: event.record.permission_path.clone(),
+            resource: event.record.document_id.to_string(),
+            revision: event.event_id.to_string(),
+            source: format!("dataset_created/{}", event.event_id),
+            anchor_ms: event.event_id.timestamp_ms(),
+            journaled_ms: now_ms,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// Key of a journal row of `kind`: journal time, then a unique suffix.
+pub fn journal_key(kind: u8, journaled_ms: u64, unique: Ulid) -> Vec<u8> {
+    let mut key = vec![kind];
+    key.extend_from_slice(&journaled_ms.to_be_bytes());
+    key.extend_from_slice(&unique.to_bytes());
+    key
+}
+
+/// The kept row and the pending row of one event, for the committing transaction's batch.
+pub fn journal_entries(
+    event: &SourceEvent,
+) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
+    let unique = Ulid::generate();
+    let value = ByteView::from(event.to_bytes()?);
+    Ok([JOURNAL_ROW, PENDING_ROW]
+        .into_iter()
+        .map(|kind| {
+            let key = journal_key(kind, event.journaled_ms, unique);
+            (
+                EVENT_JOURNAL_KEYSPACE.to_string(),
+                key.into(),
+                value.clone(),
+            )
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +318,27 @@ mod tests {
         let key = queue_key(install, late);
         assert_eq!(parse_queue_key(&key), Some((install, late)));
         assert_eq!(parse_queue_key(&key[1..]), None);
+    }
+
+    #[test]
+    fn journal_rows() {
+        let event = SourceEvent {
+            kind: SourceKind::DataUploaded,
+            group_id: Ulid::from_parts(1, 1),
+            path: "/r/g/x/data/n/b/k".into(),
+            resource: "/r/g/x/data/n/b/k".into(),
+            revision: Ulid::from_parts(2, 2).to_string(),
+            source: "data_uploaded/n/b/k/v".into(),
+            anchor_ms: 2,
+            journaled_ms: 5,
+        };
+        let entries = journal_entries(&event).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1[0], JOURNAL_ROW);
+        assert_eq!(entries[1].1[0], PENDING_ROW);
+        assert_eq!(entries[0].1[1..], entries[1].1[1..]);
+        assert_eq!(SourceEvent::from_bytes(&entries[0].2).unwrap(), event);
+        let early = journal_key(JOURNAL_ROW, 4, Ulid::from_parts(9, 9));
+        assert!(early < entries[0].1.to_vec());
     }
 }

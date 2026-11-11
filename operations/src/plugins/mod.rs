@@ -11,6 +11,7 @@ pub mod dispatch;
 pub mod grants;
 pub mod install;
 pub mod intents;
+pub mod journal;
 pub mod lifecycle;
 pub mod publish;
 pub mod rate;

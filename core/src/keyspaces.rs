@@ -511,6 +511,8 @@ pub const NODE_VAULT_KEYSPACE: &str = "node_vault";
 pub const NODE_SECRETS_KEYSPACE: &str = "node_secrets";
 /// Published plugin artifacts by digest bytes. Management nodes keep every published one.
 pub const PLUGIN_ARTIFACT_KEYSPACE: &str = "plugin_artifacts";
+/// Source events of plugin triggers this node committed, kept for replay, and those not matched yet.
+pub const EVENT_JOURNAL_KEYSPACE: &str = "event_journal";
 /// Runs of the installs this node receives, by install and run id, and their timer rows.
 pub const PLUGIN_RUNS_KEYSPACE: &str = "plugin_runs";
 /// Unfinished runs of the installs this node receives, by install and run id.
@@ -813,6 +815,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NODE_VAULT_KEYSPACE,
     NODE_SECRETS_KEYSPACE,
     PLUGIN_ARTIFACT_KEYSPACE,
+    EVENT_JOURNAL_KEYSPACE,
     PLUGIN_RUNS_KEYSPACE,
     PLUGIN_QUEUE_KEYSPACE,
     PLUGIN_INTENTS_KEYSPACE,

@@ -26,6 +26,7 @@ use super::check::RunScope;
 use super::dispatch::enqueue_timers;
 use super::install::read_config;
 use super::intents::open_intent;
+use super::journal::prune_journal;
 use super::receiver::{eligible, lost_reason};
 use super::runs::{prune_runs, read_run, save_run, unfinished};
 use super::store::StoreError;
@@ -414,6 +415,9 @@ pub fn spawn_worker(
                 pruned_at = now;
                 if let Err(error) = prune_runs(&worker.ctx, now).await {
                     warn!(%error, "Could not prune finished plugin runs");
+                }
+                if let Err(error) = prune_journal(&worker.ctx, now).await {
+                    warn!(%error, "Could not prune the plugin event journal");
                 }
             }
             tokio::select! {
