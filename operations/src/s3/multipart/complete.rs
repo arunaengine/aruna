@@ -72,6 +72,10 @@ use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::SystemTime;
+
+use crate::plugins::journal::journaled;
+use aruna_core::plugin_runs::SourceEvent;
+use aruna_core::time::unix_timestamp_millis;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -1734,6 +1738,7 @@ impl CompleteUploadOperation {
         let Some(upload_record) = self.upload_record.as_ref() else {
             return self.schedule_error(CompleteUploadError::CompleteUploadFailed);
         };
+        let group_id = upload_record.group_id;
         let version = match location.get_blake3().map(<[u8; 32]>::try_from) {
             Some(Ok(hash)) => BlobVersion::materialized(
                 hash,
@@ -1779,7 +1784,15 @@ impl CompleteUploadOperation {
         );
         self.stored_policies = version.placement_policies.clone();
         self.version_epoch = version.original_epoch;
-        let effect = match write_version_effect(&version_key, &version, self.txn_id) {
+        let uploaded = SourceEvent::data_uploaded(
+            (self.input.realm_id, group_id, self.input.node_id),
+            (&self.input.bucket, &self.input.key),
+            version_id,
+            unix_timestamp_millis(),
+        );
+        let effect = write_version_effect(&version_key, &version, self.txn_id)
+            .and_then(|effect| journaled(effect, &uploaded));
+        let effect = match effect {
             Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
         };
@@ -1789,7 +1802,7 @@ impl CompleteUploadOperation {
     }
 
     fn version_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.schedule_error(CompleteUploadError::InvalidOperationState);
         };
         let Some(envelope) = self.envelope.take() else {

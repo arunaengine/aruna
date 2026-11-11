@@ -7,10 +7,13 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::NodeId;
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::keyspaces::EVENT_JOURNAL_KEYSPACE;
 use crate::metadata::MetadataEventRecord;
+use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::blob::object_permission_path;
 use crate::types::GroupId;
 
 /// Runs of one install that run at once on its receiver.
@@ -229,6 +232,26 @@ impl SourceEvent {
             revision: event.event_id.to_string(),
             source: format!("dataset_created/{}", event.event_id),
             anchor_ms: event.event_id.timestamp_ms(),
+            journaled_ms: now_ms,
+        }
+    }
+
+    /// A new object version committed on this node; its first commit time is the anchor.
+    pub fn data_uploaded(
+        (realm_id, group_id, node): (RealmId, GroupId, NodeId),
+        (bucket, key): (&str, &str),
+        version_id: Ulid,
+        now_ms: u64,
+    ) -> Self {
+        let path = object_permission_path(realm_id, group_id, node, bucket, key);
+        Self {
+            kind: SourceKind::DataUploaded,
+            group_id,
+            resource: path.clone(),
+            path,
+            revision: version_id.to_string(),
+            source: format!("data_uploaded/{node}/{bucket}/{version_id}/{key}"),
+            anchor_ms: now_ms,
             journaled_ms: now_ms,
         }
     }

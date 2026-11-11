@@ -20,6 +20,7 @@ use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
+use crate::plugins::journal::journaled;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_publication, publication_read};
 use aruna_core::UserId;
@@ -32,6 +33,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -49,6 +51,7 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use std::collections::HashMap;
@@ -607,7 +610,15 @@ impl SealedCopyOperation {
         let version = self.version.take().ok_or(SealedCopyError::InvalidState)?;
         let generation = self.head.as_ref().map_or(0, |head| head.generation);
         let version = stamp_version(version, self.binding.as_ref(), generation, self.epoch);
+        let input = &self.input;
+        let uploaded = SourceEvent::data_uploaded(
+            (input.realm_id, input.group_id, input.node_id),
+            (&input.bucket, &input.dest_key),
+            self.version_id,
+            unix_timestamp_millis(),
+        );
         let effect = write_version_effect(&self.dest_version(), &version, self.txn_id)?;
+        let effect = journaled(effect, &uploaded)?;
         self.version = Some(version);
         self.step = Step::WriteVersion;
         Ok(smallvec![effect])
@@ -850,7 +861,10 @@ impl SealedCopyOperation {
             (Step::ReadLiveness, event) => self.liveness_read(event),
             (Step::WriteHead, _) if written => self.write_index(),
             (Step::WriteIndex, _) if written => self.write_version(),
-            (Step::WriteVersion, _) if written => self.write_owner(),
+            // The version commits with its journal rows in one batch.
+            (Step::WriteVersion, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                self.write_owner()
+            }
             (Step::WriteOwner, _) if written => self.publish_envelope(),
             (Step::FenceAbe, event) => self.abe_fenced(event),
             (Step::WriteEnvelope, Event::Storage(StorageEvent::WriteResult { .. }))

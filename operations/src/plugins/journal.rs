@@ -3,8 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE;
-use aruna_core::plugin_runs::{JOURNAL_RETENTION_MS, JOURNAL_ROW, SourceEvent, journal_key};
+use aruna_core::plugin_runs::{
+    JOURNAL_RETENTION_MS, JOURNAL_ROW, SourceEvent, journal_entries, journal_key,
+};
 use ulid::Ulid;
 
 use super::store::{StoreError, Txn};
@@ -31,6 +35,30 @@ pub async fn journal_page(
         .filter_map(|(key, value)| Some((key, SourceEvent::from_bytes(&value).ok()?)))
         .collect();
     Ok((rows, next))
+}
+
+/// The version write `effect` with the event's journal rows in the same batch. A single write
+/// becomes a batch, so its caller must accept `BatchWriteResult`.
+pub fn journaled(effect: Effect, event: &SourceEvent) -> Result<Effect, ConversionError> {
+    let rows = journal_entries(event)?;
+    match effect {
+        Effect::Storage(StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id,
+        }) => Ok(Effect::Storage(StorageEffect::BatchWrite {
+            writes: [vec![(key_space, key, value)], rows].concat(),
+            txn_id,
+        })),
+        Effect::Storage(StorageEffect::BatchWrite { writes, txn_id }) => {
+            Ok(Effect::Storage(StorageEffect::BatchWrite {
+                writes: [writes, rows].concat(),
+                txn_id,
+            }))
+        }
+        other => Ok(other),
+    }
 }
 
 /// Deletes kept rows journaled longer than the retention ago; returns how many.
