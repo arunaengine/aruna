@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use crate::realm::mutate_placement::node_kind;
 use aruna_core::NodeId;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
@@ -22,12 +23,13 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataError, MetadataEventPayload,
     MetadataEventRecord, MetadataLifecycleRecord,
 };
+use aruna_core::plugin_runs::{DEDUP_RETENTION_MS, SourceEvent, journal_entries, source_key};
 use aruna_core::storage_entries::{
     delete_projection_entry, document_job_entry, document_lifecycle_entry, document_lifecycle_key,
     event_log_key, graph_lifecycle_key, lifecycle_revision_change, materialization_job_entry,
     pending_projection_key, pending_projection_target, registry_delete_entries,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditRecord, MetadataRegistryRecord,
@@ -415,6 +417,7 @@ pub async fn project_create_events(
     // Graphs that only receive a late merge job; their lifecycle still fences the write.
     let mut late_graphs = BTreeSet::new();
     let mut fence = crate::placement::fence::WriteFence::default();
+    let mut journaled = BTreeSet::new();
 
     for event in events {
         let document_id = event.record.document_id;
@@ -509,6 +512,29 @@ pub async fn project_create_events(
             late_graphs.insert(event.record.graph_iri.clone());
             needs_materialization_drain = true;
             continue;
+        }
+        // Each infrastructure holder journals a creation once by its source id, whatever came
+        // first, while a receiver could still run it; one that arrives too late counts a gap.
+        let created = SourceEvent::dataset_created(&event, now_ms);
+        let fresh = now_ms <= created.anchor_ms.saturating_add(DEDUP_RETENTION_MS);
+        if fresh
+            && matches!(
+                event.payload,
+                MetadataEventPayload::Scaffold { .. } | MetadataEventPayload::RoCrate { .. }
+            )
+            && journaled.insert(created.source.clone())
+            && journals(
+                context,
+                &mut realm_configs,
+                event.record.realm_id,
+                local_node_id,
+            )
+            .await?
+            && !source_journaled(context, &created.source).await?
+        {
+            writes.extend(journal_entries(&created)?);
+            // A skipped projection still fences the batch on the document's lifecycle.
+            late_graphs.insert(event.record.graph_iri.clone());
         }
         let needs_projection =
             !registry_exists || event_is_newer || holders_changed || needs_materialization;
@@ -723,6 +749,47 @@ async fn author_message(
             "{other:?}"
         ))),
     }
+}
+
+/// Whether this node keeps a plugin event journal: servers and management nodes do, devices
+/// do not, since their commits are journaled by the holders that accept them.
+/// Whether this node already journaled the source id.
+async fn source_journaled(
+    context: &DriverContext,
+    source: &str,
+) -> Result<bool, MetadataProjectionError> {
+    let read = StorageEffect::Read {
+        key_space: aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE.to_string(),
+        key: source_key(source).into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
+async fn journals(
+    context: &DriverContext,
+    realm_configs: &mut BTreeMap<RealmId, Option<RealmConfigDocument>>,
+    realm_id: RealmId,
+    local: Option<NodeId>,
+) -> Result<bool, MetadataProjectionError> {
+    let Some(local) = local else {
+        return Ok(false);
+    };
+    if let std::collections::btree_map::Entry::Vacant(slot) = realm_configs.entry(realm_id) {
+        slot.insert(read_realm_config(context, realm_id).await?);
+    }
+    let config = realm_configs.get(&realm_id).and_then(Option::as_ref);
+    let kind = config.and_then(|config| node_kind(config, local));
+    Ok(matches!(
+        kind,
+        Some(RealmNodeKind::Server | RealmNodeKind::Management)
+    ))
 }
 
 /// The commit message of an event: the author's own row, or on another holder the replicated
@@ -1857,6 +1924,143 @@ mod tests {
         let registry_ref = registry_placement(&config, &event.record);
         assert_eq!(registry.placement, registry_ref);
         assert_ne!(registry_ref, event.record.placement);
+    }
+
+    /// Rows that arrived before the create event: none, its registry row, or the registry row
+    /// and the materialized status of a newer update.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Before {
+        Nothing,
+        Registry,
+        Update,
+    }
+
+    fn arrived_before(
+        event: &MetadataEventRecord,
+        before: Before,
+    ) -> Vec<(String, ByteView, ByteView)> {
+        let mut record = event.record.clone();
+        if before == Before::Update {
+            record.last_event_id = Ulid::from_parts(event.event_id.timestamp_ms() + 1, 1);
+            record.updated_at_ms += 1_000;
+        }
+        let mut rows = aruna_core::storage_entries::registry_write_entries(&record).unwrap();
+        if before == Before::Update {
+            let status = MaterializationStatusRecord {
+                document_id: record.document_id,
+                event_id: record.last_event_id,
+                graph_iri: record.graph_iri.clone(),
+                context_digest: None,
+                dataset_digest: None,
+                state: aruna_core::metadata::MaterializationState::Materialized,
+                attempts: 1,
+                failures: 0,
+                last_error: None,
+                updated_at_ms: record.updated_at_ms,
+            };
+            let entry = aruna_core::storage_entries::materialization_status_entry(&status);
+            rows.push(entry.unwrap());
+        }
+        match before {
+            Before::Nothing => Vec::new(),
+            Before::Registry | Before::Update => rows,
+        }
+    }
+
+    // A create is journaled once on an infrastructure node with the origin's anchor, also when
+    // its registry row or a newer update arrived first; devices journal nothing.
+    #[tokio::test]
+    async fn journals_first_projection() {
+        let journaled = async |local: NodeId, kind: RealmNodeKind, before: Before| {
+            journaled_aged(local, kind, before, 0).await
+        };
+        let holder = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+        let (_, late) = journaled(holder, RealmNodeKind::Server, Before::Registry).await;
+        assert_eq!(late.len(), 1);
+        let (_, updated) = journaled(holder, RealmNodeKind::Server, Before::Update).await;
+        assert_eq!(updated.len(), 1);
+        let (event, rows) = journaled(holder, RealmNodeKind::Server, Before::Nothing).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].source,
+            format!("dataset_created/{}", event.event_id)
+        );
+        assert_eq!(rows[0].anchor_ms, event.event_id.timestamp_ms());
+        assert_eq!(rows[0].resource, event.record.document_id.to_string());
+        let owner = UserId::local(Ulid::from_parts(4, 4), event.record.realm_id);
+        let (_, none) = journaled(holder, RealmNodeKind::User { owner }, Before::Nothing).await;
+        assert!(none.is_empty());
+    }
+
+    // A holder that returns after eight days still journals a create its receivers could run.
+    #[tokio::test]
+    async fn journals_delayed_create() {
+        let holder = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+        let age = 8 * 24 * 3600 * 1000;
+        let (event, rows) =
+            journaled_aged(holder, RealmNodeKind::Server, Before::Nothing, age).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].anchor_ms, event.event_id.timestamp_ms());
+        let gone = DEDUP_RETENTION_MS + 1;
+        let (_, none) = journaled_aged(holder, RealmNodeKind::Server, Before::Nothing, gone).await;
+        assert!(none.is_empty());
+    }
+
+    /// Projects a create minted `age_ms` ago twice on `local` and returns its journal rows.
+    async fn journaled_aged(
+        local: NodeId,
+        kind: RealmNodeKind,
+        before: Before,
+        age_ms: u64,
+    ) -> (MetadataEventRecord, Vec<SourceEvent>) {
+        let dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage");
+        let mut event = create_event();
+        let minted = aruna_core::time::unix_timestamp_millis() - age_ms;
+        event.event_id = Ulid::from_parts(minted, event.event_id.random());
+        event.record.establishing_event_id = event.event_id;
+        event.record.last_event_id = event.event_id;
+        let mut config = realm_config(event.record.realm_id, &[]);
+        config.ensure_node(local, kind);
+        let config_row = (
+            aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+            ByteView::from(*event.record.realm_id.as_bytes()),
+            ByteView::from(postcard::to_allocvec(&config).expect("config")),
+        );
+        write_entries(&storage, vec![config_row]).await;
+        let earlier = arrived_before(&event, before);
+        if !earlier.is_empty() {
+            write_entries(&storage, earlier).await;
+        }
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        for _ in 0..2 {
+            project_create_event(&context, event.clone(), Some(local))
+                .await
+                .expect("projection succeeds");
+        }
+        let rows = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE.to_string(),
+                prefix: Some(ByteView::from(vec![aruna_core::plugin_runs::JOURNAL_ROW])),
+                start: None,
+                limit: 10,
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = rows else {
+            panic!("journal rows are readable");
+        };
+        let rows: Vec<SourceEvent> = (values.iter())
+            .map(|(_, value)| SourceEvent::from_bytes(value).unwrap())
+            .collect();
+        (event, rows)
     }
 
     // Another holder names the author's commit message in its audit row, from the replicated

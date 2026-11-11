@@ -67,6 +67,10 @@ use bytes::Bytes;
 use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
+
+use crate::plugins::journal::journaled;
+use aruna_core::plugin_runs::SourceEvent;
+use aruna_core::time::unix_timestamp_millis;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -1494,7 +1498,14 @@ impl PutObjectOperation {
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
             };
             self.state = PutObjectState::CreateVersionRecord;
-            match (effect, release) {
+            let config = &self.config;
+            let uploaded = SourceEvent::data_uploaded(
+                (config.realm_id, config.group_id, config.node_id),
+                (&config.request.bucket, &config.request.key),
+                version_id,
+                unix_timestamp_millis(),
+            );
+            let effect = match (effect, release) {
                 // A tagged release crate commits its release row with the version.
                 (
                     Effect::Storage(StorageEffect::Write {
@@ -1504,11 +1515,15 @@ impl PutObjectOperation {
                         txn_id,
                     }),
                     Some(Effect::Storage(StorageEffect::BatchWrite { writes: rows, .. })),
-                ) => smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                ) => Effect::Storage(StorageEffect::BatchWrite {
                     writes: [vec![(key_space, key, value)], rows].concat(),
                     txn_id,
-                })],
-                (effect, _) => smallvec![effect],
+                }),
+                (effect, _) => effect,
+            };
+            match journaled(effect, &uploaded) {
+                Ok(effect) => smallvec![effect],
+                Err(err) => self.emit_error(PutObjectError::ConversionError(err)),
             }
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)

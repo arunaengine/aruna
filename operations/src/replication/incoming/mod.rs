@@ -45,6 +45,7 @@ use aruna_core::keyspaces::{
     PENDING_LOCATION_KEYSPACE, SYNC_RECEIPT_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -81,6 +82,7 @@ use aruna_core::structs::storage::routing::{
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::structs::tagged_receipt;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use std::collections::VecDeque;
@@ -2182,6 +2184,30 @@ impl IncomingVersionOperation {
                 self.txn_id,
             ) {
                 Ok(register) => self.pending_version_effects.push_back(register),
+                Err(err) => return self.fail(err.into()),
+            }
+        }
+        // A version new to this node is journaled last in its transaction. A delete marker is
+        // not an upload, and a rewrite of a version already here keeps its first anchor.
+        if self.manifest.kind != ReplicationItemKind::DeleteMarker
+            && self.replaced_version.is_none()
+        {
+            let group_id = self.destination_group_id.unwrap_or(self.manifest.group_id);
+            let uploaded = SourceEvent::data_uploaded(
+                (self.local_realm_id, group_id, self.local_node_id),
+                (&self.manifest.bucket, &self.manifest.key),
+                self.manifest.version_id,
+                unix_timestamp_millis(),
+            );
+            match journal_entries(&uploaded) {
+                Ok(writes) => {
+                    let batch = StorageEffect::BatchWrite {
+                        writes,
+                        txn_id: self.txn_id,
+                    };
+                    self.pending_version_effects
+                        .push_back(Effect::Storage(batch));
+                }
                 Err(err) => return self.fail(err.into()),
             }
         }

@@ -218,6 +218,11 @@ pub enum PluginCommand {
         /// A run id; shows that run with its log lines.
         run: Option<String>,
     },
+    /// Show an install's waiting events, the events it did not get, and triggers not delivered.
+    Delivery {
+        /// The install id.
+        id: String,
+    },
     /// Decide a run that needs attention: whether its effects happened.
     Resolve {
         /// The install id.
@@ -559,6 +564,9 @@ mod tests {
         };
         assert!(done);
         assert!(parse(&["plugin", "resolve", "i1"]).is_err());
+        let line = ["plugin", "delivery", "i1"];
+        let parsed = parse(&line).unwrap().command;
+        assert!(matches!(parsed, Command::Plugin(PluginCommand::Delivery { id }) if id == "i1"));
     }
 
     #[test]

@@ -299,6 +299,23 @@ pub(crate) async fn read_auth(
         .map_err(|error| error.to_string())
 }
 
+/// Whether this node holds every account and group write the install record names.
+pub(crate) async fn prerequisites_held(
+    ctx: &DriverContext,
+    install: &PluginInstall,
+) -> Result<bool, String> {
+    for prerequisite in &install.prerequisites {
+        let key = reducer_state_key(&prerequisite.target).to_vec();
+        let value = read_row(ctx, DOCUMENT_STATE_KEYSPACE, key).await?;
+        let state = value.as_deref().map(decode_reducer_state).transpose();
+        let state = state.map_err(|error| error.to_string())?;
+        if !state.is_some_and(|state| state.clock.covers(&prerequisite.clock)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) async fn read_row(
     ctx: &DriverContext,
     key_space: &str,

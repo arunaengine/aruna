@@ -1207,6 +1207,15 @@ impl MetadataHandle {
                 let result = Box::pin(fetched).await;
                 (MetadataTransportMessage::FetchedArtifact { result }, None)
             }
+            MetadataTransportMessage::ProbeClock => {
+                let result = Box::pin(crate::plugins::clock::serve_clock(context, peer)).await;
+                (MetadataTransportMessage::ClockProbed { result }, None)
+            }
+            MetadataTransportMessage::ForwardEvents { batch } => {
+                let decided = crate::plugins::decide::serve_events(context, peer, batch);
+                let result = Box::pin(decided).await;
+                (MetadataTransportMessage::EventsDecided { result }, None)
+            }
             MetadataTransportMessage::PromotionCheck => {
                 let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
                 let result = Box::pin(ready).await;

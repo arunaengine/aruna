@@ -359,3 +359,47 @@ async fn repairs_after_failure() {
     assert!(!fixture.account(&installed).await.unwrap().is_deactivated());
     assert!(fixture.role(&installed).await.is_some());
 }
+
+#[tokio::test]
+async fn coverage_times() {
+    // Activation and resume name their node; a grant change that grows the events an install
+    // matches records a widening, and one that narrows them keeps the earlier one.
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let triggers = json!({
+        "triggers": { "dataset_created": { "handler": "on_created" } },
+        "handlers": ["on_created"]
+    });
+    let mut request = fixture.request(None);
+    request.version = Some(fixture.publish("0.3.0", "aa", triggers).await);
+    let meta = format!("/{}/g/{}/meta", actor.realm_id, fixture.group_id);
+    let only = |pattern: &str| {
+        BTreeMap::from([(
+            "metadata.read".to_string(),
+            vec![format!("{meta}/{pattern}")],
+        )])
+    };
+    request.grants = only("a/**");
+    let installed = fixture.install(&request).await.unwrap();
+    let id = installed.install_id;
+    assert_eq!(installed.activated_by, Some(actor.node_id));
+    assert_eq!(installed.widened, None);
+
+    let grown = set_grants(ctx, actor, &auth, id, &only("**"))
+        .await
+        .unwrap();
+    let widened = grown.widened.expect("a wider grant records a widening");
+    assert_eq!(
+        (widened.by, widened.extends),
+        (actor.node_id, installed.revision)
+    );
+    let narrowed = set_grants(ctx, actor, &auth, id, &only("a/**"))
+        .await
+        .unwrap();
+    assert_eq!(narrowed.widened, Some(widened));
+
+    pause_install(ctx, actor, &auth, id).await.unwrap();
+    let resumed = resume_install(ctx, actor, &auth, id).await.unwrap();
+    assert_eq!(resumed.activated_by, Some(actor.node_id));
+    assert!(resumed.active_since_ms >= installed.active_since_ms);
+}

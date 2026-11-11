@@ -3,18 +3,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use aruna_core::plugin_installs::{InstallState, PluginInstall, Widening};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_plugins::manifest::Manifest;
+use aruna_plugins::trigger::TriggerKind;
 use serde_json::{Map, Value};
 use tracing::info;
 use ulid::Ulid;
 
 use super::account::{Identity, guard_of, teardown};
+use super::check::covers;
 use super::grants::{
     Grants, carry_grants, check_supported, narrow_grants, parse_grants, stored_grants,
 };
@@ -45,6 +48,7 @@ pub async fn set_grants(
     check_holder(ctx, auth, &scope, &grants).await?;
     let mut next = preparing(&current, &grants);
     next.granted_by = actor.user_id;
+    widen(&mut next, &current, (&manifest, &manifest), actor);
     let action = AdminAuditAction::PluginGrantsChanged;
     let next = commit(ctx, actor, auth, &current, next, action).await?;
     settle(ctx, actor, auth, next, None).await
@@ -76,6 +80,12 @@ pub async fn update_install(
     next.version = plugin.version;
     next.digest = plugin.digest;
     next.settings = settings;
+    let before = read_manifest(&pick_version(
+        &config,
+        &current.plugin,
+        Some(&current.digest),
+    )?)?;
+    widen(&mut next, &current, (&before, &manifest), actor);
     let action = AdminAuditAction::PluginUpdated;
     let next = commit(ctx, actor, auth, &current, next, action).await?;
     Ok((settle(ctx, actor, auth, next, None).await?, missing))
@@ -136,6 +146,7 @@ pub async fn resume_install(
     };
     if next.state == InstallState::Active {
         next.active_since_ms = Some(unix_timestamp_millis());
+        next.activated_by = Some(actor.node_id);
     }
     next.revision += 1;
     commit(
@@ -234,6 +245,53 @@ fn preparing(current: &PluginInstall, grants: &Grants) -> PluginInstall {
     next.failed = None;
     next.revision += 1;
     next
+}
+
+/// The event coverage of an install: per event trigger kind, the grant patterns its permission
+/// needs. A kind without a needed permission covers everything of the group.
+pub(crate) fn coverage(
+    manifest: &Manifest,
+    grants: &Grants,
+) -> BTreeMap<TriggerKind, BTreeSet<String>> {
+    (manifest.triggers.keys())
+        .filter(|kind| kind.needs().is_some())
+        .map(|kind| {
+            let needed = kind.needs().and_then(|permission| grants.get(&permission));
+            (*kind, needed.cloned().unwrap_or_default())
+        })
+        .collect()
+}
+
+/// Records a widening when the next record matches events the current one did not: a new kind,
+/// or a pattern the current grants of that kind did not hold.
+fn widen(
+    next: &mut PluginInstall,
+    current: &PluginInstall,
+    manifests: (&Manifest, &Manifest),
+    actor: &Actor,
+) {
+    let before = coverage(manifests.0, &parse_grants(&current.grants));
+    let after = coverage(manifests.1, &parse_grants(&next.grants));
+    let grown = (after.iter()).any(|(kind, patterns)| {
+        let held = before.get(kind);
+        (patterns.iter()).any(|pattern| held.is_none_or(|held| !held_covers(held, pattern)))
+    });
+    if grown && current.state == InstallState::Active {
+        next.widened = Some(Widening {
+            at_ms: unix_timestamp_millis(),
+            by: actor.node_id,
+            extends: current.revision,
+        });
+    }
+}
+
+/// Whether a held pattern reaches every path of `pattern`: a subtree only by a subtree.
+pub(crate) fn held_covers(held: &BTreeSet<String>, pattern: &str) -> bool {
+    let (base, subtree) = match pattern.strip_suffix("/**") {
+        Some(base) => (base, true),
+        None => (pattern, false),
+    };
+    (held.iter()).any(|q| (!subtree || q.ends_with("/**")) && covers(q, base))
 }
 
 async fn commit(

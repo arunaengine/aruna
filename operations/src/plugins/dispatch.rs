@@ -6,7 +6,9 @@
 use aruna_core::NodeId;
 use aruna_core::keyspaces::PLUGIN_RUNS_KEYSPACE;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
-use aruna_core::plugin_runs::{MAX_INPUT, PluginRun, RunState, RunTrigger, timer_key};
+use aruna_core::plugin_runs::{
+    MAX_INPUT, PluginRun, RunState, RunTrigger, SourceEvent, SourceKind, timer_key,
+};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_plugins::trigger::TriggerKind;
@@ -124,6 +126,27 @@ pub async fn start_run(
     let run = new_run(install, handler, trigger, now_ms);
     admit(ctx, &run).await?;
     Ok(run)
+}
+
+/// A run of the install's handler for the event's kind, due at `now_ms`, or `None` when the
+/// manifest has no trigger of that kind.
+pub fn event_run(
+    config: &RealmConfigDocument,
+    install: &PluginInstall,
+    event: &SourceEvent,
+    now_ms: u64,
+) -> Option<PluginRun> {
+    let handler = handler(config, install, event_trigger(event.kind))?;
+    let trigger = RunTrigger::Event(event.clone());
+    Some(new_run(install, handler, trigger, now_ms))
+}
+
+/// The manifest trigger a journaled event kind starts.
+pub fn event_trigger(kind: SourceKind) -> TriggerKind {
+    match kind {
+        SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
+        SourceKind::DataUploaded => TriggerKind::DataUploaded,
+    }
 }
 
 /// Queues the due `every` occurrence of each active install this node receives. Missed

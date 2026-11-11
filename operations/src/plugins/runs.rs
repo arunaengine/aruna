@@ -5,8 +5,8 @@
 
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_RUNS_KEYSPACE};
 use aruna_core::plugin_runs::{
-    ATTENTION_ROW, PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState, parse_queue_key,
-    queue_key, run_key, run_prefix,
+    ATTENTION_ROW, PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState, WAITING_ROW,
+    parse_queue_key, queue_key, run_key, run_prefix,
 };
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::time::unix_timestamp_millis;
@@ -87,7 +87,7 @@ pub async fn list_runs(
 pub async fn unfinished(ctx: &DriverContext) -> Result<Vec<(Ulid, Ulid)>, RunError> {
     let rows = Txn::direct(ctx).scan(PLUGIN_QUEUE_KEYSPACE, &[]).await?;
     Ok((rows.iter())
-        .filter(|(_, value)| value.as_slice() != ATTENTION_ROW)
+        .filter(|(_, value)| ![ATTENTION_ROW, WAITING_ROW].contains(&value.as_slice()))
         .filter_map(|(key, _)| parse_queue_key(key))
         .collect())
 }

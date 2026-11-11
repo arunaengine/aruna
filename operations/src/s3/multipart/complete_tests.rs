@@ -1742,14 +1742,20 @@ fn pending_publishes_owner() {
 
     operation.version_id = Some(Ulid::from_parts(5, 1));
     let effects = operation.write_version();
-    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+    // The version commits with its journal rows in one batch.
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
         panic!("expected the version, got {effects:?}")
     };
-    let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+    let version = BlobVersion::from_bytes(writes[0].2.as_ref()).unwrap();
+    assert!(
+        writes[1..]
+            .iter()
+            .all(|(space, ..)| space == "event_journal")
+    );
     assert_eq!(version.state.pending_archive(), Some(&archive));
 
-    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: b"version".to_vec().into(),
+    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
     }));
     let version_key = VersionKey::new("bucket", "object", Ulid::from_parts(5, 1));
     let owner = CopyOwner::new(archive, version_key);
@@ -2000,8 +2006,8 @@ fn envelope_publishes_charged() {
     operation.final_location = Some(location);
     operation.version_id = Some(Ulid::from_parts(5, 1));
     operation.state = CompleteUploadState::WriteVersionRecord;
-    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: b"version".to_vec().into(),
+    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
     }));
     let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice() else {
         panic!("expected the envelope rows, got {effects:?}")
@@ -2037,8 +2043,8 @@ fn publish_envelope(metadata_bytes: u64) -> (CompleteUploadOperation, Effects) {
     operation.final_location = operation.composed_location.clone();
     operation.version_id = Some(Ulid::from_parts(5, 1));
     operation.state = CompleteUploadState::WriteVersionRecord;
-    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: b"version".to_vec().into(),
+    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
     }));
     (operation, effects)
 }

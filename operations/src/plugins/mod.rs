@@ -6,22 +6,34 @@ pub mod account;
 pub mod artifacts;
 pub mod broker;
 pub mod check;
+pub mod cleanup;
+pub mod clock;
 pub mod copies;
+pub mod decide;
 pub mod dispatch;
+pub mod forward;
 pub mod grants;
 pub mod install;
 pub mod intents;
+pub mod journal;
 pub mod lifecycle;
+pub mod matcher;
 pub mod publish;
 pub mod rate;
 pub mod receiver;
 pub mod records;
+pub mod replay;
 pub mod runs;
 pub mod settings;
 pub mod state;
 pub mod store;
 pub mod sweep;
+pub mod waiting;
 pub mod worker;
+
+#[cfg(test)]
+#[path = "events_tests.rs"]
+mod events_tests;
 
 use serde::{Deserialize, Serialize};
 

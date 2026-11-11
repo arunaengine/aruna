@@ -44,6 +44,8 @@ pub struct ApplyInput {
     pub page: ReferencePage,
     pub publisher: NodeId,
     pub realm_id: RealmId,
+    /// This node, which holds the target bucket.
+    pub local: NodeId,
 }
 
 #[derive(Debug, PartialEq)]
@@ -117,7 +119,8 @@ impl PageApplyOperation {
     ) -> Result<Effects, PageError> {
         let guards = self.guards.as_ref().ok_or(PageError::NotFinished)?;
         let page = &self.input.page;
-        let rows = page_rows(page, &self.items, &self.plans, (guards, previous))?;
+        let here = (self.input.realm_id, self.input.local);
+        let rows = page_rows(page, &self.items, &self.plans, (guards, previous), here)?;
         if rows.written == 0 {
             return Ok(self.end(Ok(rows.answer)));
         }

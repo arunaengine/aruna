@@ -1830,11 +1830,20 @@ fn dedup_keeps_writer() {
     let effects = op.step(Event::Storage(StorageEvent::WriteResult {
         key: vec![0].into(),
     }));
-    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
         panic!("expected the version record, got {effects:?}")
     };
-    let version = BlobVersion::from_bytes(value).unwrap();
+    let version = BlobVersion::from_bytes(&writes[0].2).unwrap();
     assert_eq!(version.created_by, writer);
+    // The new version is journaled in the same batch: a kept row, a pending row and its
+    // source-id row.
+    let journal: Vec<_> = (writes.iter())
+        .filter(|(space, key, _)| space == "event_journal" && key[0] != b'i')
+        .map(|(_, _, value)| aruna_core::plugin_runs::SourceEvent::from_bytes(value).unwrap())
+        .collect();
+    assert_eq!(journal.len(), 2);
+    assert_eq!(journal[0].revision, op.version_id.unwrap().to_string());
+    assert!(journal[0].resource.ends_with("/mybucket/some-file.txt"));
 }
 
 #[test]

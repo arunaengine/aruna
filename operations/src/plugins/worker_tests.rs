@@ -8,12 +8,15 @@ use std::collections::BTreeMap;
 use super::*;
 use crate::driver::drive;
 use crate::plugins::copies::store_local;
+use crate::plugins::dispatch::event_run;
 use crate::plugins::install::InstallRequest;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::intents::mark_unknown;
+use crate::plugins::lifecycle::set_grants;
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use crate::plugins::runs::admit;
 use crate::plugins::runs::tests::queued;
+use aruna_core::plugin_runs::{SourceEvent, SourceKind};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_plugins::artifact::{ArtifactDigest, attach_manifest, read_manifest};
 use aruna_plugins::broker::Intent;
@@ -105,7 +108,7 @@ async fn admitted(
 }
 
 /// A worker whose guests may spin until they are cancelled, however slow the machine is.
-fn worker(fixture: &Fixture) -> Arc<Worker> {
+pub(crate) fn worker(fixture: &Fixture) -> Arc<Worker> {
     let ctx = Arc::new(fixture.ctx.clone());
     let mut config = RuntimeConfig::default();
     config.ceiling.fuel = u64::MAX;
@@ -147,6 +150,90 @@ async fn finishes_runs() {
         .unwrap();
     assert_eq!(open.state, RunState::NeedsAttention);
     assert!(unfinished(&fixture.ctx).await.unwrap().is_empty());
+}
+
+/// A created dataset `resource` under the install's whole metadata grant, and that grant's base.
+pub(crate) fn created(install: &PluginInstall, resource: &str) -> (SourceEvent, String) {
+    let whole = &install.grants["metadata.read"][0];
+    let base = whole.strip_suffix("/**").unwrap().to_string();
+    let event = SourceEvent {
+        kind: SourceKind::DatasetCreated,
+        group_id: install.group_id,
+        path: format!("{base}/{resource}"),
+        resource: resource.into(),
+        revision: "r1".into(),
+        source: format!("dataset_created/{resource}"),
+        anchor_ms: 1,
+        journaled_ms: 1,
+    };
+    (event, base)
+}
+
+#[tokio::test]
+async fn event_input() {
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let (event, _) = created(&install, "D1");
+    let run = event_run(&config, &install, &event, 0).unwrap();
+    assert_eq!(run.handler, "echo");
+    let call = invocation(&run, &install, Limits::default(), CancellationToken::new());
+    let Trigger::Event(given) = call.trigger else {
+        panic!("an event run calls its handler with the event")
+    };
+    let fields = [given.kind, given.path, given.resource, given.revision];
+    assert_eq!(fields, ["dataset_created", event.path.as_str(), "D1", "r1"]);
+
+    admit(&fixture.ctx, &run).await.unwrap();
+    let worker = worker(&fixture);
+    assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
+    worker.settle().await;
+    let done = read_run(&fixture.ctx, install.install_id, run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
+    let output = done.output.unwrap_or_default();
+    assert!(output.ends_with("change dataset_created D1 r1"), "{output}");
+}
+
+#[tokio::test]
+async fn event_rechecked() {
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let (event, base) = created(&install, "D1");
+    // An earlier attempt passed the check and was cut short; its grant is removed since.
+    let mut run = event_run(&config, &install, &event, 0).unwrap();
+    admit(&fixture.ctx, &run).await.unwrap();
+    (run.state, run.attempts) = (RunState::Running, 1);
+    save_run(&fixture.ctx, &run).await.unwrap();
+    let narrowed = BTreeMap::from([("metadata.read".into(), vec![format!("{base}/D2/**")])]);
+    let auth = fixture.auth();
+    set_grants(
+        &fixture.ctx,
+        &fixture.actor,
+        &auth,
+        install.install_id,
+        &narrowed,
+    )
+    .await
+    .unwrap();
+
+    let worker = worker(&fixture);
+    assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
+    worker.settle().await;
+    let done = read_run(&fixture.ctx, install.install_id, run.run_id)
+        .await
+        .unwrap();
+    assert_eq!((done.state, done.attempts), (RunState::Cancelled, 2));
+    let message = done.message.unwrap_or_default();
+    assert!(message.contains("is not granted on"), "{message}");
+    // The guest never ran: the echo handler would have stored its output.
+    assert_eq!(done.output, None);
 }
 
 #[tokio::test]
