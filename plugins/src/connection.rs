@@ -139,6 +139,12 @@ impl Connection {
     }
 }
 
+/// Whether a request path below a connection's prefix is empty or plain segments, so it can
+/// never leave the prefix.
+pub fn relative_path(path: &str) -> bool {
+    path.is_empty() || (!path.starts_with('/') && valid_prefix(&format!("/{path}")))
+}
+
 /// Whether `path` is empty or `/`-separated plain segments that cannot leave the prefix.
 fn valid_prefix(path: &str) -> bool {
     if path.is_empty() {

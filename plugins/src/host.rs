@@ -214,14 +214,6 @@ impl Session {
         }))
     }
 
-    /// The response fields a granted connection lets the code read; empty means status only.
-    pub(crate) fn response_fields(&self, connection: &str) -> Vec<String> {
-        self.connections
-            .get(connection)
-            .cloned()
-            .unwrap_or_default()
-    }
-
     pub(crate) fn finish(&mut self, size: usize) -> wasmtime::Result<()> {
         self.pending -= 1;
         self.charge(size)

@@ -20,6 +20,7 @@ pub mod intents;
 pub mod journal;
 pub mod lifecycle;
 pub mod matcher;
+pub mod outbound;
 pub mod publish;
 pub mod rate;
 pub mod receiver;

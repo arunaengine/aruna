@@ -36,6 +36,15 @@ fn leb(mut value: usize, out: &mut Vec<u8>) {
 
 /// The fixture without its secret and connection, which installs refuse.
 fn runnable() -> Vec<u8> {
+    artifact(false)
+}
+
+/// The fixture whose `api` connection sends without a secret.
+pub(crate) fn connected() -> Vec<u8> {
+    artifact(true)
+}
+
+fn artifact(connection: bool) -> Vec<u8> {
     let manifest = read_manifest(FIXTURE).unwrap();
     let json = serde_json::to_vec(&manifest).unwrap();
     let mut content = Vec::new();
@@ -48,13 +57,20 @@ fn runnable() -> Vec<u8> {
     let component = FIXTURE.strip_suffix(section.as_slice()).unwrap();
     let mut narrow = manifest;
     narrow.secrets.clear();
-    narrow.connections.clear();
+    match connection {
+        true => (narrow.connections.values_mut()).for_each(|connection| connection.auth = None),
+        false => narrow.connections.clear(),
+    }
     attach_manifest(component, &narrow).unwrap()
 }
 
 /// An install of the runnable fixture whose artifact this node keeps.
 pub(crate) async fn installed(fixture: &Fixture) -> PluginInstall {
-    let bytes = runnable();
+    install_artifact(fixture, runnable()).await
+}
+
+/// An install of the fixture artifact `bytes`, kept on this node.
+pub(crate) async fn install_artifact(fixture: &Fixture, bytes: Vec<u8>) -> PluginInstall {
     let manifest = read_manifest(&bytes).unwrap();
     let digest = ArtifactDigest::of(&bytes).to_string();
     let plugin = PublishedPlugin {

@@ -80,19 +80,6 @@ fn unknown(message: &str) -> HostError {
     HostError::new(ErrorKind::UnknownOutcome, message)
 }
 
-/// Keeps only the allowed response fields, as an object keyed by JSON pointer; none means
-/// status only. An answer that is not JSON gives no fields.
-pub(crate) fn project(json: Option<String>, pointers: &[String]) -> Option<String> {
-    if pointers.is_empty() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(json.as_deref()?).ok()?;
-    let fields: serde_json::Map<String, serde_json::Value> = (pointers.iter())
-        .filter_map(|pointer| Some((pointer.clone(), value.pointer(pointer)?.clone())))
-        .collect();
-    serde_json::to_string(&fields).ok()
-}
-
 fn fields_len(fields: &[Field]) -> usize {
     fields.iter().map(|f| f.name.len() + f.value.len()).sum()
 }
@@ -260,7 +247,6 @@ impl connections::Host for Session {
             Intent::new(self.next_ordinal(), request.key.clone(), &parts)
         });
         let connection = request.connection.clone();
-        let pointers = self.response_fields(&connection);
         let effect = match &intent {
             Some(intent) => Effect::Write(intent.clone()),
             None => Effect::Read,
@@ -278,11 +264,8 @@ impl connections::Host for Session {
             size,
             effect,
             Needs::Connection(&connection),
-            |broker, cx| async move {
-                let reply = broker.connection_send(&cx, outbound).await?;
-                let json = project(reply.json, &pointers);
-                Ok(Response { json, ..reply })
-            },
+            // The broker applies the exposure; the reply passes through as it answers.
+            |broker, cx| async move { broker.connection_send(&cx, outbound).await },
             |reply: &Response| reply.json.as_ref().map_or(0, String::len) + 2,
         )
         .await

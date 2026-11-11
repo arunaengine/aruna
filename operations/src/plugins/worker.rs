@@ -38,6 +38,7 @@ use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
 use super::matcher::match_pending;
+use super::outbound::Outbound;
 use super::receiver::{eligible, lost_reason};
 use super::replay::{plan_replays, run_replays};
 use super::runs::{prune_runs, read_run, save_run, unfinished};
@@ -82,6 +83,8 @@ pub struct Worker {
     reasons: Mutex<HashMap<Ulid, &'static str>>,
     /// When each receiver of forwarded events is tried again.
     backoff: tokio::sync::Mutex<Backoff>,
+    /// Sends connection requests instead of the node's egress client, in tests.
+    outbound: Mutex<Option<Arc<dyn Outbound>>>,
     /// When the waiting events were last rechecked.
     rechecked: AtomicU64,
     tasks: TaskTracker,
@@ -115,6 +118,7 @@ impl Worker {
             running: Mutex::new(HashMap::new()),
             reasons: Mutex::new(HashMap::new()),
             backoff: tokio::sync::Mutex::default(),
+            outbound: Mutex::new(None),
             rechecked: AtomicU64::new(0),
             tasks: TaskTracker::new(),
             stopping: CancellationToken::new(),
@@ -213,6 +217,13 @@ impl Worker {
         swept.map_err(|error| error.to_string())
     }
 
+    /// Sends connection requests through `outbound` instead of the node's egress client.
+    pub fn use_outbound(&self, outbound: Arc<dyn Outbound>) {
+        if let Ok(mut held) = self.outbound.lock() {
+            *held = Some(outbound);
+        }
+    }
+
     /// Hands a batch to its receiver; this node decides the batches of the installs it runs.
     async fn forward(
         &self,
@@ -298,7 +309,12 @@ impl Worker {
             local: self.local,
             run: run.clone(),
         };
-        let broker = Arc::new(RunBroker::new(self.ctx.clone(), scope));
+        let mut broker = RunBroker::new(self.ctx.clone(), scope);
+        let outbound = self.outbound.lock().ok().and_then(|held| held.clone());
+        if let Some(outbound) = outbound {
+            broker = broker.with_outbound(outbound);
+        }
+        let broker = Arc::new(broker);
         let ended = self.attempt(&run, broker.clone(), cancel).await;
         if matches!(ended, Ended::Stopped) {
             self.running().remove(&run.run_id);
@@ -410,6 +426,12 @@ fn invocation(
         .filter(|(_, patterns)| !patterns.is_empty())
         .filter_map(|(name, _)| name.parse().ok())
         .collect();
+    // A `connections.send` grant path ends in the connection's name.
+    let connections = (install.grants.get(Permission::ConnectionsSend.as_str()))
+        .into_iter()
+        .flatten()
+        .filter_map(|path| path.rsplit('/').next().map(str::to_string))
+        .collect();
     let trigger = match &run.trigger {
         RunTrigger::Manual { input, .. } => Trigger::Manual(input.clone()),
         RunTrigger::Timer { occurrence_ms } => Trigger::Timer(*occurrence_ms),
@@ -428,7 +450,7 @@ fn invocation(
         settings: run.settings.clone(),
         trigger,
         permissions,
-        connections: BTreeSet::new(),
+        connections,
         limits,
         cancel,
     }

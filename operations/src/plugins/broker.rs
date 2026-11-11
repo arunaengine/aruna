@@ -9,9 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aruna_core::NodeId;
+use aruna_core::injection::{OutgoingRequest, expose_response};
 use aruna_core::metadata::AuthToken;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun};
+use aruna_core::secrets::{ResponseExposure, SecretFields, header_name};
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
@@ -22,14 +24,17 @@ use aruna_plugins::broker::{
     Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
     ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
 };
+use aruna_plugins::connection::relative_path;
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
 use serde_json::Value;
 use ulid::Ulid;
 
 use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
-use super::grants::{accesses, parse_grants};
+use super::grants::{InstallScope, accesses, parse_grants};
+use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
+use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::rate::take_call;
 use super::state::{PutError, check_key, put_state, read_state};
 use super::store::{StoreError, Txn, transact};
@@ -51,6 +56,8 @@ const PAGE: usize = 100;
 /// The host side of one run.
 pub struct RunBroker {
     ctx: Arc<DriverContext>,
+    /// Sends connection requests; the node's screened egress client unless a test replaces it.
+    outbound: Arc<dyn Outbound>,
     scope: RunScope,
     /// A call at a known ordinal came with other arguments than before.
     changed: AtomicBool,
@@ -63,11 +70,18 @@ impl RunBroker {
         let mut lines = scope.run.clone();
         lines.log.clear();
         Self {
+            outbound: Arc::new(Egress(ctx.blob_handle.clone())),
             ctx,
             log: Mutex::new(lines),
             scope,
             changed: AtomicBool::new(false),
         }
+    }
+
+    /// The broker with another sender for connection requests.
+    pub fn with_outbound(mut self, outbound: Arc<dyn Outbound>) -> Self {
+        self.outbound = outbound;
+        self
     }
 
     /// The log lines the guest wrote, within the run's bounds.
@@ -497,9 +511,68 @@ impl Broker for RunBroker {
     async fn connection_send(
         &self,
         _cx: &CallContext,
-        _request: SendRequest,
+        request: SendRequest,
     ) -> Result<Response, HostError> {
-        Err(unavailable("connections are not available in this release"))
+        let current = self.admitted(None).await?;
+        let path = install_scope(&current).connection(&request.connection);
+        let (install, _) = self.checked(Permission::ConnectionsSend, &path).await?;
+        let invalid = |why: &str| HostError::new(ErrorKind::Invalid, why);
+        let config = read_config(&self.ctx, self.scope.realm_id).await;
+        let config = config.map_err(|error| unavailable(error.to_string()))?;
+        let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
+        let manifest = plugin.and_then(|plugin| read_manifest(&plugin));
+        let manifest = manifest.map_err(|error| unavailable(error.to_string()))?;
+        let connection = manifest.connections.get(&request.connection);
+        let connection =
+            connection.ok_or_else(|| invalid("the manifest has no such connection"))?;
+        let method = declared_method(request.method);
+        if !connection.methods.contains(&method) {
+            return Err(invalid("the connection does not allow this method"));
+        }
+        if !relative_path(&request.path) {
+            return Err(invalid("the path must stay below the connection's address"));
+        }
+        let settings: Value = serde_json::from_str(&install.settings).unwrap_or(Value::Null);
+        let mut url = connection.base(&settings).map_err(invalid)?;
+        let joined = format!("{}/{}", url.path().trim_end_matches('/'), request.path);
+        url.set_path(&joined);
+        if !request.query.is_empty() {
+            let pairs = request
+                .query
+                .iter()
+                .map(|field| (&field.name, &field.value));
+            url.query_pairs_mut().extend_pairs(pairs);
+        }
+        let headers = (request.headers.iter())
+            .filter(|field| header_name(&field.name) && !credential(&field.name))
+            .map(|field| (field.name.to_ascii_lowercase(), field.value.clone()))
+            .collect();
+        let outgoing = OutgoingRequest {
+            method: method.as_str().to_string(),
+            url,
+            headers,
+        };
+        let exposure = match connection.response.is_empty() {
+            true => ResponseExposure::Status,
+            false => ResponseExposure::Fields {
+                pointers: connection.response.clone(),
+                headers: Vec::new(),
+            },
+        };
+        let Some(intent) = request.intent else {
+            let answer = self.outbound.send(outgoing, request.body).await;
+            let answer = answer.map_err(|error| unavailable(error.to_string()))?;
+            return Ok(exposed(&exposure, &answer));
+        };
+        if let Some(reply) = self.begun(&intent).await? {
+            return stored_reply(&reply);
+        }
+        let outcome = match self.outbound.send(outgoing, request.body).await {
+            Ok(answer) => Ok(reply_text(&exposed(&exposure, &answer))),
+            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
+            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
+        };
+        stored_reply(&self.record(&intent, outcome).await?)
     }
 
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {
@@ -738,6 +811,73 @@ fn write_outcome(error: MetadataWriteError) -> Outcome {
         | MetadataWriteError::Undeliverable(_) => Outcome::Maybe(error.to_string()),
         other => none(ErrorKind::Invalid, other.to_string()),
     }
+}
+
+/// The scope of an install, for its generated grant paths.
+fn install_scope(install: &PluginInstall) -> InstallScope {
+    InstallScope {
+        realm_id: install.account.realm_id,
+        group_id: install.group_id,
+        install_id: install.install_id,
+    }
+}
+
+/// The manifest's name of a method the guest called.
+fn declared_method(method: aruna_plugins::broker::Method) -> aruna_plugins::connection::Method {
+    use aruna_plugins::broker::Method as Called;
+    use aruna_plugins::connection::Method;
+    match method {
+        Called::Get => Method::Get,
+        Called::Head => Method::Head,
+        Called::Post => Method::Post,
+        Called::Put => Method::Put,
+        Called::Patch => Method::Patch,
+        Called::Delete => Method::Delete,
+    }
+}
+
+/// Headers a guest may never set; the host owns credentials.
+fn credential(name: &str) -> bool {
+    ["authorization", "cookie", "proxy-authorization"].contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// The answer as the guest may see it: the one place an exposure applies.
+fn exposed(exposure: &ResponseExposure, answer: &Answer) -> Response {
+    let none = SecretFields::new(Default::default());
+    let shown = expose_response(
+        exposure,
+        &none,
+        answer.status,
+        &answer.headers,
+        &answer.body,
+    );
+    Response {
+        status: shown.status,
+        json: shown
+            .body
+            .map(|body| String::from_utf8_lossy(&body).into_owned()),
+    }
+}
+
+/// The stored reply of a settled send.
+fn reply_text(response: &Response) -> String {
+    serde_json::json!({ "status": response.status, "json": response.json }).to_string()
+}
+
+fn stored_reply(reply: &str) -> Result<Response, HostError> {
+    let value: Value =
+        serde_json::from_str(reply).map_err(|error| unavailable(error.to_string()))?;
+    let status = value
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|s| u16::try_from(s).ok());
+    Ok(Response {
+        status: status.ok_or_else(|| unavailable("a stored reply has no status"))?,
+        json: value
+            .get("json")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 #[cfg(test)]

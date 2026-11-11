@@ -101,6 +101,8 @@ pub trait Broker: Send + Sync {
         prefix: &str,
         cursor: Option<String>,
     ) -> Result<ObjectPage, HostError>;
+    /// Sends through a declared connection; the reply is what the guest may read, already
+    /// limited to the exposure, with the fields as an object keyed by JSON pointer.
     async fn connection_send(
         &self,
         cx: &CallContext,
