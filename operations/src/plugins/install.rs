@@ -208,6 +208,8 @@ fn new_record(actor: &Actor, prepared: &Prepared, receiver: NodeId) -> PluginIns
         active_since_ms: None,
         failed: None,
         prerequisites: Vec::new(),
+        activated_by: None,
+        widened: None,
     }
 }
 
@@ -243,8 +245,9 @@ pub(crate) async fn settle(
         (true, true) => InstallState::Paused,
         (true, false) => InstallState::Active,
     };
-    if next.state == InstallState::Active {
-        next.active_since_ms.get_or_insert(unix_timestamp_millis());
+    if next.state == InstallState::Active && next.active_since_ms.is_none() {
+        next.active_since_ms = Some(unix_timestamp_millis());
+        next.activated_by = Some(actor.node_id);
     }
     next.failed = None;
     next.prerequisites = prerequisites;

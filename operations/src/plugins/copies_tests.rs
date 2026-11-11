@@ -396,6 +396,8 @@ async fn keeps_pinned_copies() {
         active_since_ms: Some(T0),
         failed: None,
         prerequisites: Vec::new(),
+        activated_by: None,
+        widened: None,
     });
     assert_eq!(
         sweep_copies(&ctx, &pinned, after_grace(T0)).await.unwrap(),

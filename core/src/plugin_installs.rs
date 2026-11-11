@@ -113,6 +113,21 @@ pub struct PluginInstall {
     pub failed: Option<String>,
     /// The account and role writes the current revision depends on.
     pub prerequisites: Vec<Prerequisite>,
+    /// The node whose clock `active_since_ms` uses.
+    #[serde(default)]
+    pub activated_by: Option<NodeId>,
+    /// The last revision change that grew the events the install matches.
+    #[serde(default)]
+    pub widened: Option<Widening>,
+}
+
+/// When and where an install's event coverage (trigger kinds, or the grant patterns their
+/// permissions need) last grew, and the active revision whose coverage it extends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Widening {
+    pub at_ms: u64,
+    pub by: NodeId,
+    pub extends: u64,
 }
 
 impl PluginInstall {
@@ -186,6 +201,12 @@ mod tests {
                 target: AdminDocumentTarget::Group { group_id },
                 clock: AdminDocumentClock::default().with_observed(node, 4),
             }],
+            activated_by: Some(node),
+            widened: Some(Widening {
+                at_ms: 9,
+                by: node,
+                extends: 1,
+            }),
         }
     }
 

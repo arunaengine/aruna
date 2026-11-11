@@ -69,6 +69,7 @@ mod families;
 mod federation;
 mod git;
 mod info_topics;
+mod installs;
 mod jobs;
 mod layouts;
 mod mappings;
@@ -761,6 +762,7 @@ fn realm_configs(
         }
         let bytes = realm_config_suffix(&value)
             .or_else(|| federation::upgraded(&value))
+            .or_else(|| installs::upgraded(&value))
             .ok_or_else(|| decode_error(REALM_CONFIG_KEYSPACE, &key, "unknown shape"))?;
         rows.push((key.to_vec(), bytes));
     }
