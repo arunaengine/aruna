@@ -134,9 +134,11 @@ async fn selects_group_secret() {
         (selected.rules.len(), selected.incarnation.is_some()),
         (1, true)
     );
-    let fields = SecretFields::decode(&open(&keys(), config.realm_id, &selected.sealed).unwrap());
+    let opened = open(&fixture.ctx, &keys(), config.realm_id, &selected.sealed).await;
+    let fields = SecretFields::decode(&opened.unwrap());
     assert_eq!(fields.unwrap().get("token"), Some(TOKEN));
-    let missing = open(&ReleaseKeys::default(), config.realm_id, &selected.sealed);
+    let none = ReleaseKeys::default();
+    let missing = open(&fixture.ctx, &none, config.realm_id, &selected.sealed).await;
     assert!(matches!(missing, Err(ReleaseError::Unavailable(_))));
     let realm = SecretBinding::parse("realm:api-key").unwrap();
     assert!(

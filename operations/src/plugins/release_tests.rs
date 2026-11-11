@@ -4,7 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::secrets::SecretFields;
+use aruna_core::compute::Secret;
+use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::secrets::{SecretFields, UseRule};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AuditIndex, audit_prefix};
 
 use super::*;
@@ -31,7 +33,8 @@ async fn released(
     let config = read_config(&fixture.ctx, fixture.actor.realm_id)
         .await
         .unwrap();
-    release(&fixture.ctx, &keys(), (&config, peer), request).await
+    let local = fixture.actor.node_id;
+    release(&fixture.ctx, &keys(), (&config, local, peer), request).await
 }
 
 /// The use audit actions this node recorded, oldest first.
@@ -125,4 +128,74 @@ async fn refusals_per_step() {
         .collect();
     let expected = ["peer", "rule", "policy", "authority", "authority"];
     assert_eq!(steps, expected.map(|step| Some(step.to_string())));
+}
+
+#[tokio::test]
+async fn node_secrets_local() {
+    use crate::driver::drive;
+    use crate::secrets::SecretChange;
+    use crate::secrets::node::{NodeChange, NodeSecretOperation};
+    let fixture = Fixture::keyed().await;
+    fixture
+        .ctx
+        .storage_handle
+        .open_vault(NodeVaultKey::random());
+    let install = bound(&fixture).await;
+    let binding = SecretBinding::parse("node:api-key").unwrap();
+    edit_config(&fixture, |config| {
+        config.installs[0]
+            .secrets
+            .insert("api_key".to_string(), binding);
+    })
+    .await;
+    let rule = UseRule {
+        consumer: SecretConsumer::Plugin {
+            plugin_id: install.plugin.clone(),
+            install_id: install.install_id,
+        },
+        delivery: Delivery::Inject,
+        origins: vec![ORIGIN.to_string()],
+        paths: Vec::new(),
+        methods: Vec::new(),
+        response: ResponseExposure::Status,
+        groups: vec![install.group_id],
+    };
+    let change = SecretChange::Create {
+        name: SecretName::try_from("api-key".to_string()).unwrap(),
+        kind: SecretKind::parse("bearer").unwrap(),
+        description: String::new(),
+        settings: SecretSettings::new(),
+        uses: vec![rule],
+        fields: SecretFields::new([("token".to_string(), Secret::new(TOKEN))].into()),
+    };
+    let input = NodeChange {
+        realm_id: fixture.actor.realm_id,
+        node_id: fixture.actor.node_id,
+        actor: fixture.actor.user_id,
+        change,
+        now_ms: 1,
+        write_id: Ulid::from_parts(66, 1),
+    };
+    drive(NodeSecretOperation::new(input), &fixture.ctx)
+        .await
+        .unwrap();
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let asked = request(&install, &format!("{ORIGIN}/api/records"));
+    let receiver = install.receiver;
+    let mine = (&config, receiver, receiver);
+    let answer = release(&fixture.ctx, &ReleaseKeys::default(), mine, &asked).await;
+    let fields = SecretFields::decode(answer.unwrap().fields.as_ref().unwrap()).unwrap();
+    assert_eq!(fields.get("token"), Some(TOKEN));
+    // A management node never serves another node's secret.
+    let elsewhere = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+    let served = release(
+        &fixture.ctx,
+        &keys(),
+        (&config, elsewhere, receiver),
+        &asked,
+    )
+    .await;
+    assert_eq!(served, Err(ReleaseError::Refused(Refusal::Binding)));
 }

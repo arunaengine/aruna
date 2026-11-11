@@ -6,16 +6,21 @@
 use std::sync::Arc;
 
 use aruna_core::compute::SecretBytes;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::NODE_SECRETS_KEYSPACE;
 use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
 use aruna_core::realm_vault::{RealmSealKey, RealmSecretRef, RealmVaultKey, RealmVaultRecord};
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
-use aruna_core::secrets::{SecretKind, SecretName, SecretSettings, UseRule};
+use aruna_core::secrets::{SecretKind, SecretName, SecretRecord, SecretSettings, UseRule};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::install::{pick_version, read_manifest};
+use super::store::Txn;
 use crate::driver::DriverContext;
+use crate::secrets::node::{record_key, value_entry};
 use crate::secrets::owner::{EntryReader, open_value};
 
 /// The step of the use check that refused a release.
@@ -70,6 +75,8 @@ pub struct Selected {
 pub enum Sealed {
     Owner(Box<SecretEntry>),
     Realm(RealmVaultRecord),
+    /// The node vault entry of a node secret, by its value id.
+    Node(Ulid),
 }
 
 /// The kind the install's manifest declares for `slot`.
@@ -98,6 +105,20 @@ pub async fn select(
     install: &PluginInstall,
     binding: &SecretBinding,
 ) -> Result<Option<Selected>, ReleaseError> {
+    if binding.scope == BoundScope::Node {
+        let key = record_key(&binding.name);
+        let row = Txn::direct(ctx).read(NODE_SECRETS_KEYSPACE, &key).await;
+        let row = row.map_err(|error| ReleaseError::Unavailable(error.to_string()))?;
+        let record = row.and_then(|bytes| postcard::from_bytes::<SecretRecord>(&bytes).ok());
+        return Ok(record.map(|record| Selected {
+            kind: record.kind,
+            settings: record.settings,
+            rules: record.uses,
+            incarnation: None,
+            value_id: record.value_id,
+            sealed: Sealed::Node(record.value_id),
+        }));
+    }
     if binding.scope == BoundScope::Realm {
         let Some(record) = config
             .secrets
@@ -162,7 +183,8 @@ async fn read_entry(
     }
 }
 
-pub fn open(
+pub async fn open(
+    ctx: &DriverContext,
     keys: &ReleaseKeys,
     realm_id: RealmId,
     sealed: &Sealed,
@@ -178,6 +200,20 @@ pub fn open(
             let key = keys.vault.as_ref().ok_or_else(missing)?;
             key.open(&realm_id, record)
                 .map_err(|error| failed(error.to_string()))
+        }
+        Sealed::Node(value_id) => {
+            let entry = value_entry(*value_id);
+            let read = StorageEffect::VaultRead {
+                entry,
+                txn_id: None,
+            };
+            match ctx.storage_handle.send_storage_effect(read).await {
+                Event::Storage(StorageEvent::VaultResult {
+                    secret: Some(secret),
+                    ..
+                }) => Ok(secret),
+                other => Err(failed(format!("the node vault answered {other:?}"))),
+            }
         }
     }
 }

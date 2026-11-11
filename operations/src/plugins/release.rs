@@ -78,7 +78,7 @@ pub fn secret_path(
 pub async fn release(
     ctx: &DriverContext,
     keys: &ReleaseKeys,
-    (config, peer): (&RealmConfigDocument, NodeId),
+    (config, local, peer): (&RealmConfigDocument, NodeId, NodeId),
     request: &ReleaseRequest,
 ) -> Result<Released, ReleaseError> {
     let install = (config.installs.iter())
@@ -94,8 +94,9 @@ pub async fn release(
     if install.receiver != peer {
         return Err(audit.refused(Refusal::Peer, None).await);
     }
-    // Node secrets never leave their node; the receiver releases them itself.
-    let Some(binding) = binding.filter(|binding| binding.scope != BoundScope::Node) else {
+    // Node secrets never leave their node; the receiver releases them for itself.
+    let here = peer == local;
+    let Some(binding) = binding.filter(|binding| here || binding.scope != BoundScope::Node) else {
         return Err(audit.refused(Refusal::Binding, None).await);
     };
     let selected = match select(ctx, config, install, binding).await? {
@@ -152,7 +153,7 @@ pub async fn release(
     audit.write(None, Some(&selected)).await?;
     let fields = match request.held == Some(selected.value_id) {
         true => None,
-        false => Some(open(keys, config.realm_id, &selected.sealed)?),
+        false => Some(open(ctx, keys, config.realm_id, &selected.sealed).await?),
     };
     Ok(Released {
         kind: selected.kind,
@@ -247,8 +248,9 @@ pub(crate) async fn serve_release(
     request: ReleaseRequest,
 ) -> Result<Released, ReleaseError> {
     let local = super::artifacts::local_config(ctx).await;
-    let (config, _) = local.map_err(|error| ReleaseError::Unavailable(format!("{error:?}")))?;
-    release(ctx, &keys, (&config, peer), &request).await
+    let local = local.map_err(|error| ReleaseError::Unavailable(format!("{error:?}")))?;
+    let (config, local) = local;
+    release(ctx, &keys, (&config, local, peer), &request).await
 }
 
 #[cfg(test)]
