@@ -13,6 +13,7 @@ use super::*;
 use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, keys, secret};
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
+use crate::secrets::SecretChange;
 
 fn request(install: &PluginInstall, url: &str) -> ReleaseRequest {
     ReleaseRequest {
@@ -133,7 +134,6 @@ async fn refusals_per_step() {
 #[tokio::test]
 async fn node_secrets_local() {
     use crate::driver::drive;
-    use crate::secrets::SecretChange;
     use crate::secrets::node::{NodeChange, NodeSecretOperation};
     let fixture = Fixture::keyed().await;
     fixture
@@ -198,4 +198,75 @@ async fn node_secrets_local() {
     )
     .await;
     assert_eq!(served, Err(ReleaseError::Refused(Refusal::Binding)));
+}
+
+/// Applies `change` to the group secret `api-key` of `install`.
+async fn change_secret(
+    fixture: &Fixture,
+    install: &PluginInstall,
+    change: SecretChange,
+    seed: u128,
+) {
+    use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
+    let input = OwnerChange {
+        realm_id: fixture.actor.realm_id,
+        node_id: fixture.actor.node_id,
+        owner: aruna_core::secret_registers::SecretOwner::Group(install.group_id),
+        actor: fixture.actor.user_id,
+        change,
+        readable: false,
+        now_ms: 10 + seed as u64,
+        write_ids: [1, 2, 3].map(|part| Ulid::from_parts(80 + seed as u64, part)),
+        txn_id: None,
+    };
+    crate::driver::drive(OwnerSecretOperation::new(input), &fixture.ctx)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rotated_and_deleted() {
+    let fixture = Fixture::keyed().await;
+    let install = bound(&fixture).await;
+    secret(&fixture, &install).await;
+    let receiver = install.receiver;
+    let mut asked = request(&install, &format!("{ORIGIN}/api/records"));
+    let first = released(&fixture, receiver, &asked).await.unwrap();
+    let name = SecretName::try_from("api-key".to_string()).unwrap();
+    let rotated = "canary-rotated-91c2";
+    let fields = SecretFields::new([("token".to_string(), Secret::new(rotated))].into());
+    let rotate = SecretChange::Rotate {
+        name: name.clone(),
+        fields,
+        expected: None,
+    };
+    change_secret(&fixture, &install, rotate, 1).await;
+    // A receiver still holding the old value gets the new one, never a nod to the old.
+    asked.held = Some(first.value_id);
+    let second = released(&fixture, receiver, &asked).await.unwrap();
+    assert_ne!(second.value_id, first.value_id);
+    let fields = SecretFields::decode(second.fields.as_ref().unwrap()).unwrap();
+    assert_eq!(fields.get("token"), Some(rotated));
+    let delete = SecretChange::Delete {
+        name,
+        expected: None,
+    };
+    change_secret(&fixture, &install, delete, 2).await;
+    let gone = released(&fixture, receiver, &asked).await;
+    assert_eq!(gone, Err(ReleaseError::Refused(Refusal::Entry)));
+    // No value form appears in answers, errors or audit rows.
+    let shown = format!(
+        "{first:?}{second:?}{gone:?}{asked:?}{}",
+        gone.clone().unwrap_err()
+    );
+    let txn = Txn::direct(&fixture.ctx);
+    let rows = txn.scan(ADMIN_AUDIT_KEYSPACE, &[]).await.unwrap();
+    let stored: Vec<u8> = rows.into_iter().flat_map(|(_, value)| value).collect();
+    for canary in [TOKEN, rotated] {
+        assert!(!shown.contains(canary), "{canary} in an answer");
+        let found = stored
+            .windows(canary.len())
+            .any(|window| window == canary.as_bytes());
+        assert!(!found, "{canary} in an audit row");
+    }
 }
