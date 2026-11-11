@@ -104,9 +104,19 @@ async fn admitted(
     run
 }
 
+/// A worker whose guests may spin until they are cancelled, however slow the machine is.
 fn worker(fixture: &Fixture) -> Arc<Worker> {
     let ctx = Arc::new(fixture.ctx.clone());
-    Worker::new(ctx, fixture.actor.realm_id, fixture.actor.node_id).unwrap()
+    let mut config = RuntimeConfig::default();
+    config.ceiling.fuel = u64::MAX;
+    config.ceiling.wall = Duration::from_secs(3600);
+    let limits = Limits {
+        fuel: u64::MAX,
+        wall: Duration::from_secs(3600),
+        ..Limits::default()
+    };
+    let node = (fixture.actor.realm_id, fixture.actor.node_id);
+    Worker::with_budget(ctx, node, config, limits).unwrap()
 }
 
 #[tokio::test]

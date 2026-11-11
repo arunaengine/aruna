@@ -58,6 +58,8 @@ pub struct Worker {
     realm_id: RealmId,
     local: NodeId,
     runtime: Runtime,
+    /// The budget of each run.
+    limits: Limits,
     /// Runs executing now, with their install and cancel token.
     running: Mutex<HashMap<Ulid, (Ulid, CancellationToken)>>,
     /// Why a running guest was cancelled, by run.
@@ -72,12 +74,24 @@ impl Worker {
         realm_id: RealmId,
         local: NodeId,
     ) -> Result<Arc<Self>, String> {
-        let runtime = Runtime::new(RuntimeConfig::default()).map_err(|error| error.to_string())?;
+        let config = RuntimeConfig::default();
+        Self::with_budget(ctx, (realm_id, local), config, Limits::default())
+    }
+
+    /// A worker whose runtime has `config` and whose runs get the budget `limits`.
+    pub fn with_budget(
+        ctx: Arc<DriverContext>,
+        (realm_id, local): (RealmId, NodeId),
+        config: RuntimeConfig,
+        limits: Limits,
+    ) -> Result<Arc<Self>, String> {
+        let runtime = Runtime::new(config).map_err(|error| error.to_string())?;
         Ok(Arc::new(Self {
             ctx,
             realm_id,
             local,
             runtime,
+            limits,
             running: Mutex::new(HashMap::new()),
             reasons: Mutex::new(HashMap::new()),
             tasks: TaskTracker::new(),
@@ -268,7 +282,7 @@ impl Worker {
             Ok(compiled) => compiled,
             Err(error) => return Ended::Retry(format!("the artifact does not compile: {error}")),
         };
-        let call = invocation(run, install, cancel);
+        let call = invocation(run, install, self.limits, cancel);
         let invoked = self.runtime.invoke(&compiled, call, broker).await;
         ended(invoked, self.stopping.is_cancelled())
     }
@@ -293,7 +307,12 @@ fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool) -> Ended 
 }
 
 /// The handler call of a run: its saved invocation and the install's grants.
-fn invocation(run: &PluginRun, install: &PluginInstall, cancel: CancellationToken) -> Invocation {
+fn invocation(
+    run: &PluginRun,
+    install: &PluginInstall,
+    limits: Limits,
+    cancel: CancellationToken,
+) -> Invocation {
     let permissions: BTreeSet<Permission> = (install.grants.iter())
         .filter(|(_, patterns)| !patterns.is_empty())
         .filter_map(|(name, _)| name.parse().ok())
@@ -311,7 +330,7 @@ fn invocation(run: &PluginRun, install: &PluginInstall, cancel: CancellationToke
         trigger,
         permissions,
         connections: BTreeSet::new(),
-        limits: Limits::default(),
+        limits,
         cancel,
     }
 }
