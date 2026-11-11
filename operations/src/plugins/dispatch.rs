@@ -183,7 +183,7 @@ async fn enqueue_timer(
             Ok(()) => true,
             Err(RunError::Full(_)) => false,
             Err(RunError::Store(error)) => return Err(error),
-            Err(RunError::NotFound) => false,
+            Err(RunError::NotFound | RunError::NotWaiting(_)) => false,
         };
         row.last_due_ms = occurrence;
         row.skipped += u64::from(!admitted);

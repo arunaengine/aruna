@@ -1,5 +1,5 @@
-//! Serves the runs of a plugin install: start one by hand, list and read runs. Run data lives
-//! on the install's receiver, which answers each call.
+//! Serves the runs of a plugin install: start one by hand, list and read runs, and resolve a
+//! run that needs attention. Run data lives on the install's receiver, which answers each call.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,12 +8,13 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunTrigger};
+use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::plugins::dispatch::{StartError, start_run};
 use aruna_operations::plugins::install::{InstallError, read_config};
 use aruna_operations::plugins::receiver::lost_reason;
-use aruna_operations::plugins::runs::{RunError, list_runs, read_run};
+use aruna_operations::plugins::runs::{RunError, list_runs, read_run, resolve_run};
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -40,6 +41,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::with_openapi(RunsApiDoc::openapi())
         .routes(routes!(start, list))
         .routes(routes!(get_run))
+        .routes(routes!(resolve))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
@@ -47,6 +49,12 @@ pub struct StartBody {
     /// The manual trigger's input; `{}` when absent.
     #[schema(value_type = Object)]
     pub input: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ResolveBody {
+    /// Whether the run's effects happened; it ends `succeeded` when true, else `failed`.
+    pub done: bool,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -181,6 +189,7 @@ fn lost(receiver: NodeId, reason: &str) -> Response {
 fn run_error(error: RunError) -> Response {
     match error {
         RunError::NotFound => ServerError::NotFound,
+        RunError::NotWaiting(_) => ServerError::Conflict(error.to_string()),
         RunError::Full(_) => ServerError::Refused(
             StatusCode::TOO_MANY_REQUESTS,
             "runs_queued",
@@ -393,6 +402,73 @@ pub async fn get_run(
         Err(error) => return error.into_response(),
     };
     match read_run(&state.get_ctx(), install.install_id, run_id).await {
+        Ok(run) => Json(view(run)).into_response(),
+        Err(error) => run_error(error),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/plugin-installs/{id}/runs/{run}/resolve",
+    tag = "plugins",
+    summary = "Resolve a plugin run",
+    description = r#"Ends a run that needs attention as done or not done, and audits the decision.
+
+**Authentication**: realm bearer token of an admin of the install's group.
+
+**Behavior**
+- The install's receiver keeps its runs and answers; every other node relays the call there.
+- While the receiver is drained, gone or no longer a server, the call answers 503 and names
+  the receiver and the reason."#,
+    params(
+        ("id" = String, Path, description = "The install id"),
+        ("run" = String, Path, description = "The run id")
+    ),
+    request_body = ResolveBody,
+    responses(
+        (status = 200, description = "The resolved run", body = RunView),
+        (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
+        (status = 404, description = "No install or run has this id", body = ErrorResponse),
+        (status = 409, description = "The run does not need attention", body = ErrorResponse),
+        (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn resolve(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((id, run)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let parsed = serde_json::from_slice::<ResolveBody>(&body);
+    let call = Call {
+        method,
+        uri,
+        headers,
+        body,
+    };
+    let (auth, install) = match serve(&state, auth, &id, call).await {
+        Ok(served) => served,
+        Err(response) => return response,
+    };
+    let (Ok(parsed), Ok(run_id)) = (parsed, parse_id(&run)) else {
+        return ServerError::BadRequestReason("the body or run id is not valid".into())
+            .into_response();
+    };
+    let action = AdminAuditAction::PluginRunResolved;
+    let audit = AdminAuditRecord::for_install(action, auth.user_id, &install);
+    match resolve_run(
+        &state.get_ctx(),
+        install.install_id,
+        run_id,
+        parsed.done,
+        &audit,
+    )
+    .await
+    {
         Ok(run) => Json(view(run)).into_response(),
         Err(error) => run_error(error),
     }

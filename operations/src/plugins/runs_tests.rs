@@ -124,3 +124,31 @@ async fn pruned_runs() {
         assert!(read_run(&ctx, install, kept.run_id).await.is_ok());
     }
 }
+
+#[tokio::test]
+async fn resolved_runs() {
+    use aruna_core::UserId;
+    use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
+    use aruna_core::structs::identity::realm::RealmId;
+    let (_dir, ctx) = opened();
+    let install = Ulid::from_parts(1, 1);
+    let mut run = queued(install, 1);
+    admit(&ctx, &run).await.unwrap();
+    let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
+    let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
+    let early = resolve_run(&ctx, install, run.run_id, true, &audit).await;
+    assert_eq!(early, Err(RunError::NotWaiting("queued")));
+    run.finish(
+        RunState::NeedsAttention,
+        Some("call 0 is unknown".into()),
+        5,
+    );
+    save_run(&ctx, &run).await.unwrap();
+    let resolved = resolve_run(&ctx, install, run.run_id, true, &audit)
+        .await
+        .unwrap();
+    assert_eq!(resolved.state, RunState::Succeeded);
+    assert!(resolved.message.unwrap_or_default().ends_with("as done"));
+    let again = resolve_run(&ctx, install, run.run_id, false, &audit).await;
+    assert_eq!(again, Err(RunError::NotWaiting("succeeded")));
+}

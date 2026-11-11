@@ -36,6 +36,8 @@ pub enum AdminAuditAction {
     PluginPaused,
     PluginResumed,
     PluginRemoved,
+    /// A person decided the outcome of a plugin run that needed attention.
+    PluginRunResolved,
 }
 
 /// The plugin install a plugin row is about.

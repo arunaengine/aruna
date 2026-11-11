@@ -8,6 +8,8 @@ use aruna_core::plugin_runs::{
     PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState, parse_queue_key, queue_key,
     run_key, run_prefix,
 };
+use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use aruna_core::time::unix_timestamp_millis;
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
@@ -26,6 +28,8 @@ pub enum RunError {
     Full(usize),
     #[error("no run with this id")]
     NotFound,
+    #[error("the run is {0}, not waiting for a resolution")]
+    NotWaiting(&'static str),
 }
 
 /// Stores a new queued run, unless its install already has `RUNS_QUEUED` unfinished ones.
@@ -99,6 +103,41 @@ pub async fn save_in(txn: &Txn<'_>, run: &PluginRun) -> Result<(), RunError> {
         txn.delete(PLUGIN_QUEUE_KEYSPACE, queued).await?;
     }
     Ok(())
+}
+
+/// Ends a run that needs attention as a person decided: `done` when its effects happened.
+/// The audit row is written with it.
+pub async fn resolve_run(
+    ctx: &DriverContext,
+    install_id: Ulid,
+    run_id: Ulid,
+    done: bool,
+    audit: &AdminAuditRecord,
+) -> Result<PluginRun, RunError> {
+    transact(ctx, async |txn: &Txn<'_>| {
+        let key = run_key(install_id, run_id);
+        let row = txn.read(PLUGIN_RUNS_KEYSPACE, &key).await?;
+        let mut run = decode::<PluginRun>(&row.ok_or(RunError::NotFound)?)?;
+        if run.state != RunState::NeedsAttention {
+            return Err(RunError::NotWaiting(run.state.as_str()));
+        }
+        let (state, outcome) = match done {
+            true => (RunState::Succeeded, "done"),
+            false => (RunState::Failed, "not done"),
+        };
+        let message = format!("{} resolved it as {outcome}", audit.actor);
+        run.finish(state, Some(message), unix_timestamp_millis());
+        save_in(txn, &run).await?;
+        let entries = audit
+            .entries()
+            .map_err(|error| StoreError(error.to_string()))?;
+        for (space, key, value) in entries {
+            txn.write(&space, vec![(key.to_vec(), value.to_vec())])
+                .await?;
+        }
+        Ok(run)
+    })
+    .await
 }
 
 /// Removes runs that ended longer than `RUN_RETENTION_MS` ago, with their intents and stored
