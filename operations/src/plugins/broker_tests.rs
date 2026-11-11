@@ -335,3 +335,36 @@ fn merge_patch() {
     assert!(dataset.get("keywords").is_none());
     assert!(merge_dataset(crate_json, "[1]").is_err());
 }
+
+#[tokio::test]
+async fn write_only_patches() {
+    // A plugin that may write a document but not read it patches it at a revision it was given.
+    let (fixture, broker, document, _dir) = broker().await;
+    let read = broker
+        .metadata_get(&cx(), &document.to_string())
+        .await
+        .unwrap();
+    let meta = format!("/{}/g/{}/meta", fixture.actor.realm_id, fixture.group_id);
+    let mut request = fixture.request(None);
+    request.grants = BTreeMap::from([
+        (
+            "metadata.read".to_string(),
+            vec![format!("{meta}/other/**")],
+        ),
+        ("metadata.write".to_string(), vec![format!("{meta}/**")]),
+    ]);
+    let installed = fixture.install(&request).await.unwrap();
+    let mut scope = broker.scope.clone();
+    scope.run.install_id = installed.install_id;
+    scope.run.digest = installed.digest.clone();
+    let writer = RunBroker::new(broker.ctx.clone(), scope);
+    let unread = writer.metadata_get(&cx(), &document.to_string()).await;
+    assert!(unread.is_err());
+    let change = patch(
+        document,
+        &read.revision,
+        0,
+        r#"{"description":"by a writer"}"#,
+    );
+    assert!(writer.metadata_patch(&cx(), change).await.is_ok());
+}

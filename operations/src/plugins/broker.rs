@@ -383,7 +383,8 @@ impl Broker for RunBroker {
         let document_id = parse_document(&patch.resource)?;
         let expected = Ulid::from_string(&patch.expected)
             .map_err(|_| HostError::new(ErrorKind::Invalid, "bad revision"))?;
-        let (_, auth) = self.listing(Permission::MetadataRead).await?;
+        // The target is resolved under the write grants; the plugin never sees what is read.
+        let (_, auth) = self.listing(Permission::MetadataWrite).await?;
         let (record, jsonld) = self.export(document_id, auth, cx.max_bytes).await?;
         let path = &record.permission_path;
         let (install, auth) = self.checked(Permission::MetadataWrite, path).await?;
