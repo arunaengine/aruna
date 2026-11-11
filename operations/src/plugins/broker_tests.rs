@@ -23,7 +23,7 @@ async fn project(ctx: &DriverContext) {
     }
 }
 
-const ENTITY: &str = r#"{"@id":"./file.txt","@type":"File","name":"file"}"#;
+const ENTITY: &str = r#"{"description":"first"}"#;
 
 /// A broker for a run of a fresh install, and a document of the install's group.
 async fn broker() -> (Fixture, RunBroker, Ulid, tempfile::TempDir) {
@@ -118,12 +118,7 @@ async fn metadata_calls() {
     let pending = broker.metadata_get(&cx(), &document.to_string()).await;
     assert_eq!(pending.unwrap_err().kind, ErrorKind::Unavailable);
     project(&broker.ctx).await;
-    let other = patch(
-        document,
-        &revision,
-        0,
-        r#"{"@id":"./b.txt","@type":"File"}"#,
-    );
+    let other = patch(document, &revision, 0, r#"{"description":"other"}"#);
     let changed = broker.metadata_patch(&cx(), other).await.unwrap_err();
     assert_eq!(changed.kind, ErrorKind::Conflict);
     assert!(broker.changed());
@@ -288,4 +283,55 @@ async fn listings_authorize() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn dataset_patches() {
+    // The example plugins' patch adds a field to the dataset and keeps the others.
+    let (_fixture, broker, document, _dir) = broker().await;
+    let resource = document.to_string();
+    let read = broker.metadata_get(&cx(), &resource).await.unwrap();
+    let example = r#"{"identifier":{"catalog":"c-1"}}"#;
+    let revision = broker
+        .metadata_patch(&cx(), patch(document, &read.revision, 0, example))
+        .await
+        .unwrap();
+    project(&broker.ctx).await;
+    let after = broker.metadata_get(&cx(), &resource).await.unwrap();
+    assert_eq!(after.revision, revision);
+    let dataset: Value = serde_json::from_str(&after.json).unwrap();
+    assert_eq!(dataset["name"], "one");
+    assert_eq!(dataset["identifier"], serde_json::json!({"catalog": "c-1"}));
+    // A later patch merges into the stored object.
+    let more = r#"{"identifier":{"doi":"d-1"}}"#;
+    let revision = broker
+        .metadata_patch(&cx(), patch(document, &revision, 1, more))
+        .await
+        .unwrap();
+    project(&broker.ctx).await;
+    let after = broker.metadata_get(&cx(), &resource).await.unwrap();
+    let dataset: Value = serde_json::from_str(&after.json).unwrap();
+    let both = serde_json::json!({"catalog": "c-1", "doi": "d-1"});
+    assert_eq!(dataset["identifier"], both);
+    let moved = patch(document, &revision, 2, r#"{"@id":"./other"}"#);
+    let refused = broker.metadata_patch(&cx(), moved).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Invalid);
+}
+
+#[test]
+fn merge_patch() {
+    let crate_json = r#"{"@graph":[{"@id":"ro-crate-metadata.json","about":{"@id":"./"}},{"@id":"./","name":"a","keywords":["x"],"identifier":{"doi":"d"}}]}"#;
+    let merged = merge_dataset(
+        crate_json,
+        r#"{"identifier":{"catalog":"c"},"keywords":null}"#,
+    );
+    let merged = merged.unwrap();
+    let stored: Value = serde_json::from_str(&merged).unwrap();
+    assert_eq!(stored["@graph"][1]["identifier"]["@type"], "@json");
+    let dataset: Value = serde_json::from_str(&dataset_of(&merged).unwrap()).unwrap();
+    assert_eq!(dataset["name"], "a");
+    let both = serde_json::json!({"doi": "d", "catalog": "c"});
+    assert_eq!(dataset["identifier"], both);
+    assert!(dataset.get("keywords").is_none());
+    assert!(merge_dataset(crate_json, "[1]").is_err());
 }

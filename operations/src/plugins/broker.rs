@@ -24,6 +24,7 @@ use aruna_plugins::broker::{
 };
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
+use serde_json::Value;
 use ulid::Ulid;
 
 use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
@@ -326,13 +327,13 @@ impl Broker for RunBroker {
     async fn metadata_get(&self, cx: &CallContext, resource: &str) -> Result<Document, HostError> {
         let document_id = parse_document(resource)?;
         let (_, auth) = self.listing(Permission::MetadataRead).await?;
-        let (record, json) = self.export(document_id, auth, cx.max_bytes).await?;
+        let (record, jsonld) = self.export(document_id, auth, cx.max_bytes).await?;
         self.checked(Permission::MetadataRead, &record.permission_path)
             .await?;
         Ok(Document {
             resource: resource.to_string(),
             revision: record.last_event_id.to_string(),
-            json,
+            json: dataset_of(&jsonld)?,
         })
     }
 
@@ -383,7 +384,7 @@ impl Broker for RunBroker {
         let expected = Ulid::from_string(&patch.expected)
             .map_err(|_| HostError::new(ErrorKind::Invalid, "bad revision"))?;
         let (_, auth) = self.listing(Permission::MetadataRead).await?;
-        let (record, _) = self.export(document_id, auth, cx.max_bytes).await?;
+        let (record, jsonld) = self.export(document_id, auth, cx.max_bytes).await?;
         let path = &record.permission_path;
         let (install, auth) = self.checked(Permission::MetadataWrite, path).await?;
         if let Some(reply) = self.begun(&patch.intent).await? {
@@ -399,9 +400,8 @@ impl Broker for RunBroker {
             "plugin {} install {} run {run}",
             install.plugin, install.install_id
         );
-        let mutation = UpdateDocumentMutation::UpsertDataEntity {
-            jsonld: patch.patch,
-        };
+        let jsonld = merge_dataset(&jsonld, &patch.patch)?;
+        let mutation = UpdateDocumentMutation::ReplaceRoCrate { jsonld };
         let update = route_metadata_update(
             &self.ctx,
             actor,
@@ -540,6 +540,118 @@ impl Broker for RunBroker {
     async fn abandoned(&self, _cx: &CallContext, intent: &Intent) {
         let reason = "the call did not finish in time";
         let _ = mark_unknown(&self.ctx, self.scope.run.run_id, intent, reason).await;
+    }
+}
+
+/// The type a JSON literal comes back with from the stored graph.
+const JSON_LITERAL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
+
+/// The dataset entity of a crate, the one its metadata descriptor is about.
+fn dataset_mut(crate_json: &mut Value) -> Result<&mut Value, HostError> {
+    let graph = (crate_json.get_mut("@graph").and_then(Value::as_array_mut))
+        .ok_or_else(|| unavailable("the stored crate has no graph"))?;
+    let id_of = |entity: &Value| {
+        entity
+            .get("@id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let root = (graph.iter())
+        .find(|entity| id_of(entity).as_deref() == Some("ro-crate-metadata.json"))
+        .and_then(|descriptor| {
+            descriptor
+                .get("about")?
+                .get("@id")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "./".to_string());
+    (graph.iter_mut())
+        .find(|entity| id_of(entity).as_deref() == Some(root.as_str()))
+        .ok_or_else(|| HostError::new(ErrorKind::Invalid, "the crate has no dataset entity"))
+}
+
+/// The fields of a crate's dataset entity, as a plugin reads and patches them.
+pub(crate) fn dataset_of(jsonld: &str) -> Result<String, HostError> {
+    let mut crate_json: Value =
+        serde_json::from_str(jsonld).map_err(|_| unavailable("the stored crate is not JSON"))?;
+    let dataset = dataset_mut(&mut crate_json)?;
+    plain_objects(dataset);
+    Ok(dataset.to_string())
+}
+
+/// The crate with `patch` merged into its dataset entity as a JSON merge patch: other fields
+/// stay, `null` removes one, and the id stays fixed.
+pub(crate) fn merge_dataset(jsonld: &str, patch: &str) -> Result<String, HostError> {
+    let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
+    let patch: Value = serde_json::from_str(patch).map_err(|_| invalid("the patch is not JSON"))?;
+    let Value::Object(changes) = patch else {
+        return Err(invalid("the patch is not a JSON object"));
+    };
+    if changes.contains_key("@id") {
+        return Err(invalid("a patch cannot change the dataset's @id"));
+    }
+    let mut crate_json: Value =
+        serde_json::from_str(jsonld).map_err(|_| unavailable("the stored crate is not JSON"))?;
+    let dataset = dataset_mut(&mut crate_json)?;
+    plain_objects(dataset);
+    merge_into(dataset, Value::Object(changes));
+    literal_objects(dataset);
+    Ok(crate_json.to_string())
+}
+
+/// Turns the dataset's JSON literals back into the objects a plugin wrote.
+fn plain_objects(dataset: &mut Value) {
+    let Value::Object(fields) = dataset else {
+        return;
+    };
+    for value in fields.values_mut() {
+        let literal = (value.get("@type").and_then(Value::as_str))
+            .is_some_and(|kind| kind == "@json" || kind == JSON_LITERAL);
+        let inner = value.get("@value").cloned();
+        if let (true, Some(inner)) = (literal, inner) {
+            *value = match inner {
+                Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+                other => other,
+            };
+        }
+    }
+}
+
+/// Applies a JSON merge patch to `target`.
+fn merge_into(target: &mut Value, patch: Value) {
+    let Value::Object(changes) = patch else {
+        *target = patch;
+        return;
+    };
+    if !target.is_object() {
+        *target = Value::Object(Default::default());
+    }
+    let Value::Object(fields) = target else {
+        return;
+    };
+    for (key, value) in changes {
+        match value {
+            Value::Null => drop(fields.remove(&key)),
+            value => merge_into(fields.entry(key).or_insert(Value::Null), value),
+        }
+    }
+}
+
+/// Stores each plain object field of the dataset, one without JSON-LD keywords, as a JSON
+/// literal, so it stays one value instead of becoming an untyped node.
+fn literal_objects(dataset: &mut Value) {
+    let Value::Object(fields) = dataset else {
+        return;
+    };
+    for value in fields.values_mut() {
+        let plain = value
+            .as_object()
+            .is_some_and(|object| !object.keys().any(|key| key.starts_with('@')));
+        if plain {
+            let json = std::mem::take(value);
+            *value = serde_json::json!({ "@type": "@json", "@value": json });
+        }
     }
 }
 
