@@ -513,7 +513,7 @@ pub const NODE_SECRETS_KEYSPACE: &str = "node_secrets";
 pub const PLUGIN_ARTIFACT_KEYSPACE: &str = "plugin_artifacts";
 /// Source events of plugin triggers this node committed, kept for replay, and those not matched yet.
 pub const EVENT_JOURNAL_KEYSPACE: &str = "event_journal";
-/// Matched events this node still sends to their install's receiver, by install in journal order.
+/// Matched events this node still sends to their install's receiver, by install and journal time.
 pub const PLUGIN_OUTBOX_KEYSPACE: &str = "plugin_outbox";
 /// Counts of plugin events that were not delivered, by install, event kind and reason.
 pub const PLUGIN_GAPS_KEYSPACE: &str = "plugin_gaps";

@@ -657,7 +657,8 @@ pub struct DeliveryView {
     pub gaps: Vec<GapView>,
     /// Declared triggers whose events are not delivered yet.
     pub undelivered: Vec<String>,
-    /// Why the receiver's last replay started at its earliest kept event.
+    /// Why the receiver's last replay started at its earliest kept event. Only the receiver's
+    /// own replay is covered; other nodes do not report theirs.
     pub note: Option<String>,
 }
 
@@ -675,7 +676,8 @@ pub struct DeliveryView {
   every other node relays the call there. Totals are summed over the reporting nodes.
 - While the receiver is drained, gone or no longer a server, the call answers 503 and names
   the receiver and the reason.
-- Sync triggers are listed in `undelivered`: they are not delivered yet."#,
+- Sync triggers are listed in `undelivered`: they are not delivered yet.
+- `note` covers only the receiver's own replay; replays on other nodes are not reported."#,
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 200, description = "The install's event delivery", body = DeliveryView, example = json!({"waiting": 1, "oldest_age_ms": 4200, "gaps": [{"kind": "data_uploaded", "reason": "full", "count": 3, "unknown": false, "earliest_ms": 1762700000000u64, "latest_ms": 1762700060000u64}], "undelivered": ["sync_completed"], "note": null})),

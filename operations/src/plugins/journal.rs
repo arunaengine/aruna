@@ -1,5 +1,5 @@
 //! Reads and prunes this node's plugin event journal: kept rows for replay, ordered by journal
-//! time, and pending rows the matcher has not read yet.
+//! time (rows of one millisecond in no set order), and pending rows the matcher has not read.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

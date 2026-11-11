@@ -286,7 +286,8 @@ impl SourceEvent {
     }
 }
 
-/// Key of a journal row of `kind`: journal time, then a unique suffix.
+/// Key of a journal row of `kind`: journal time, then a random unique suffix, so rows of the
+/// same millisecond have no set order.
 pub fn journal_key(kind: u8, journaled_ms: u64, unique: Ulid) -> Vec<u8> {
     let mut key = vec![kind];
     key.extend_from_slice(&journaled_ms.to_be_bytes());
