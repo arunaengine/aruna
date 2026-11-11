@@ -28,12 +28,14 @@ use ulid::Ulid;
 use super::artifacts::fetch_artifact;
 use super::broker::RunBroker;
 use super::check::{RunScope, check_call};
+use super::clock::probe_clock;
 use super::dispatch::{enqueue_timers, event_trigger};
 use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
 use super::matcher::match_pending;
 use super::receiver::{eligible, lost_reason};
+use super::replay::{plan_replays, run_replays};
 use super::runs::{prune_runs, read_run, save_run, unfinished};
 use super::store::StoreError;
 use crate::driver::DriverContext;
@@ -124,8 +126,15 @@ impl Worker {
         self.revoke(&config);
         let timers = enqueue_timers(&self.ctx, &config, self.local, now_ms).await;
         timers.map_err(|error| error.to_string())?;
+        let probe = |node| probe_clock(&self.ctx, node);
+        if let Err(error) = plan_replays(&self.ctx, &config, self.local, now_ms, probe).await {
+            warn!(%error, "Could not plan plugin event replays");
+        }
         if let Err(error) = match_pending(&self.ctx, &config, self.local, now_ms).await {
             warn!(%error, "Could not match plugin events to installs");
+        }
+        if let Err(error) = run_replays(&self.ctx, now_ms).await {
+            warn!(%error, "Could not replay plugin events");
         }
         let queued = unfinished(&self.ctx)
             .await

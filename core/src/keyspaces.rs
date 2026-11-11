@@ -517,6 +517,8 @@ pub const EVENT_JOURNAL_KEYSPACE: &str = "event_journal";
 pub const PLUGIN_OUTBOX_KEYSPACE: &str = "plugin_outbox";
 /// Counts of plugin events that were not delivered, by install, event kind and reason.
 pub const PLUGIN_GAPS_KEYSPACE: &str = "plugin_gaps";
+/// The event coverage this node matched per install, and the journal replays in progress.
+pub const PLUGIN_REPLAYS_KEYSPACE: &str = "plugin_replays";
 /// Runs of the installs this node receives, by install and run id, and their timer rows.
 pub const PLUGIN_RUNS_KEYSPACE: &str = "plugin_runs";
 /// Unfinished runs of the installs this node receives, by install and run id.
@@ -822,6 +824,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     EVENT_JOURNAL_KEYSPACE,
     PLUGIN_OUTBOX_KEYSPACE,
     PLUGIN_GAPS_KEYSPACE,
+    PLUGIN_REPLAYS_KEYSPACE,
     PLUGIN_RUNS_KEYSPACE,
     PLUGIN_QUEUE_KEYSPACE,
     PLUGIN_INTENTS_KEYSPACE,

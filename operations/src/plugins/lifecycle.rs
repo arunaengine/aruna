@@ -286,7 +286,7 @@ fn widen(
 }
 
 /// Whether a held pattern reaches every path of `pattern`: a subtree only by a subtree.
-fn held_covers(held: &BTreeSet<String>, pattern: &str) -> bool {
+pub(crate) fn held_covers(held: &BTreeSet<String>, pattern: &str) -> bool {
     let (base, subtree) = match pattern.strip_suffix("/**") {
         Some(base) => (base, true),
         None => (pattern, false),
