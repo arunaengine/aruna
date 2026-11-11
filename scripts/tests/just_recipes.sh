@@ -377,6 +377,10 @@ test_argument_flow() {
   output="$(run_recipe local-cluster nodes=2)"
   check_eq "just parameter form reaches the node count" "2" "$(node_dir_count)"
   check_lacks "plain cluster never downloads a portal" "$(cat "$DOCTOR_LOG")" "portal update"
+  check_has "the node env names its database dir" "$(cat "$DEPLOY_ROOT/node-1/.env")" \
+    "DATABASE_DIR='$DEPLOY_ROOT/node-1/storage'"
+  check_has "the node env names its content dir" "$(cat "$DEPLOY_ROOT/node-1/.env")" \
+    "CONTENT_DIR='$DEPLOY_ROOT/node-1/blob'"
 
   output="$(run_recipe local-cluster 2)"
   check_eq "positional node count is honored" "2" "$(node_dir_count)"

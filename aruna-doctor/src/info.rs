@@ -490,12 +490,34 @@ mod tests {
             Some("uploaded-parts")
         );
         assert_eq!(view.metadata_replication_factor, 1);
+        assert_eq!(view.storage_path, "/tmp/aruna-doctor-defaults");
+        assert_eq!(view.blob_root, "/tmp/aruna-doctor-defaults/blobs");
+        assert_eq!(view.storage_path, settings.storage_path);
+        assert_eq!(view.blob_root, settings.blob_root);
         assert_eq!(view.blob_bucket_size, settings.blob_bucket_size);
         assert_eq!(view.blob_multipart_bucket, settings.blob_multipart_bucket);
         assert_eq!(
             view.metadata_replication_factor,
             settings.metadata_replication_factor
         );
+    }
+
+    #[tokio::test]
+    async fn doctor_content_default() {
+        let _env_lock = env_lock().lock().await;
+        // Load the `.env` file first, so it cannot restore CONTENT_DIR after the removal.
+        let _ = dotenvy::var("CONTENT_DIR");
+        let _guard = TestEnvGuard::set(&[
+            ("DATABASE_DIR", "/tmp/aruna-doctor-content".to_string()),
+            ("METADATA_REPLICATION_FACTOR", "0".to_string()),
+        ]);
+        let _unset = TestEnvGuard::remove(&["CONTENT_DIR"]);
+
+        let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
+        let settings = aruna::settings::read_settings().unwrap();
+
+        assert_eq!(view.blob_root, "/tmp/aruna-doctor-content/blobstore");
+        assert_eq!(view.blob_root, settings.blob_root);
     }
 
     #[tokio::test]

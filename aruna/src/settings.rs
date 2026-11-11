@@ -1233,10 +1233,30 @@ mod tests {
     fn missing_path_named() {
         let mut raw = env(&[]);
         raw.remove("DATABASE_DIR");
+        let error = read_settings_from(&raw).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "missing required config value DATABASE_DIR"
+        );
         assert!(matches!(
-            read_settings_from(&raw),
-            Err(SetupError::MissingConfigValue("DATABASE_DIR"))
+            error,
+            SetupError::MissingConfigValue("DATABASE_DIR")
         ));
+    }
+
+    #[test]
+    fn content_dir_default() {
+        let settings = parse(&[]).unwrap();
+        assert_eq!(settings.storage_path, "/tmp/aruna-settings");
+        assert_eq!(settings.blob_root, "/tmp/aruna-settings/blobstore");
+    }
+
+    #[test]
+    fn content_dir_separate() {
+        let settings = parse(&[("CONTENT_DIR", "/srv/aruna-content")]).unwrap();
+        assert_eq!(settings.storage_path, "/tmp/aruna-settings");
+        assert_eq!(settings.blob_root, "/srv/aruna-content");
+        assert_eq!(settings.metadata_storage_path, "/tmp/aruna-settings/craqle");
     }
 
     #[test]
