@@ -36,7 +36,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::{ensure_permission, require_realm_auth, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -168,8 +168,9 @@ pub(crate) fn view_example() -> Value {
     summary = "Install a plugin into a group",
     description = r#"Installs a published plugin into a group, where it acts as its own service account.
 
-**Authentication**: realm bearer token of a group admin. A management node serves the call and
-every other node relays it to one.
+**Authentication**: realm bearer token of a group admin; a session without path restrictions
+when the manifest declares secret slots. A management node serves the call and every other node
+relays it to one.
 
 **Behavior**
 - Checks the version, the settings and the grants. Grants default to everything the manifest
@@ -222,7 +223,14 @@ pub async fn install(
         install_id: body.id.as_deref().map(parse_id).transpose()?,
     };
     let ctx = state.get_ctx();
-    if query.preview.unwrap_or(false) {
+    let preview = query.preview.unwrap_or(false);
+    if !preview {
+        let config = load_config(&state).await?;
+        let chosen = pick_version(&config, &request.plugin, request.version.as_deref()).ok();
+        let digest = chosen.map(|plugin| plugin.digest);
+        secret_session(&state, &auth, (request.install_id, digest.as_deref())).await?;
+    }
+    if preview {
         let prepared = prepare_install(&ctx, &auth, state.get_realm_id(), &request)
             .await
             .map_err(map_error)?;
@@ -345,8 +353,9 @@ pub async fn get_install(
     summary = "Remove a plugin install",
     description = r#"Removes a plugin install, deactivates its account and removes its role.
 
-**Authentication**: realm bearer token of an admin of the install's group. A management node
-serves the call and every other node relays it to one.
+**Authentication**: realm bearer token of an admin of the install's group; a session without
+path restrictions when the install's manifest declares secret slots. A management node serves
+the call and every other node relays it to one.
 
 **Behavior**
 - The install is marked `removing` first, so a retry after a failure finishes the removal.
@@ -367,6 +376,7 @@ pub async fn remove(
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
+    secret_session(&state, &auth, (Some(install_id), None)).await?;
     remove_install(&state.get_ctx(), &actor(&state, &auth), &auth, install_id)
         .await
         .map_err(map_error)?;
@@ -393,6 +403,34 @@ async fn ensure_admin(
 ) -> ServerResult<()> {
     let path = group_admin_path(state.get_realm_id(), group_id);
     ensure_permission(state, auth, path, Permission::WRITE).await
+}
+
+/// A change to an install whose manifest, now or after the change, declares secret slots adds,
+/// changes or removes use rules; like vault management, it needs an unrestricted session.
+pub(crate) async fn secret_session(
+    state: &ServerState,
+    auth: &AuthContext,
+    (install_id, digest): (Option<Ulid>, Option<&str>),
+) -> ServerResult<()> {
+    let config = load_config(state).await?;
+    let install = install_id.and_then(|id| config.installs.iter().find(|i| i.install_id == id));
+    let pinned = install.map(|install| (install.plugin.as_str(), install.digest.as_str()));
+    let named = digest.and_then(|digest| {
+        let plugin = config
+            .plugins
+            .iter()
+            .find(|plugin| plugin.digest == digest)?;
+        Some((plugin.name.as_str(), digest))
+    });
+    let slots = [pinned, named].into_iter().flatten().any(|(name, digest)| {
+        (pick_version(&config, name, Some(digest)).ok())
+            .and_then(|plugin| read_manifest(&plugin).ok())
+            .is_some_and(|manifest| !manifest.secrets.is_empty())
+    });
+    match slots {
+        true => require_unrestricted_auth(state, Some(auth.clone())).map(drop),
+        false => Ok(()),
+    }
 }
 
 /// The caller and install of a change, after the caller proved admin of the install's group.
@@ -584,6 +622,118 @@ pub(crate) async fn refuse_plugin_role(state: &ServerState, role_id: Ulid) -> Se
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::install_changes::{GrantsBody, put_grants};
+    use crate::tests::routes::{
+        seed_group_docs, seed_realm_auth, test_context, test_state, test_storage, write_doc,
+    };
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::plugin_installs::InstallState;
+    use aruna_core::plugins::PublishedPlugin;
+    use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction};
+    use aruna_core::structs::identity::realm::RealmId;
+
+    #[tokio::test]
+    async fn secret_changes_unrestricted() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let ctx = Arc::new(test_context(storage));
+        let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
+        let state = Arc::new(test_state(ctx.clone(), realm_id, node_id, capabilities).await);
+        let admin = UserId::new(Ulid::from_bytes([3u8; 16]), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: admin,
+            realm_id,
+        };
+        seed_realm_auth(&ctx, realm_id, &actor).await;
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        seed_group_docs(&ctx, realm_id, &actor, group_id, "lab", admin).await;
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let manifest = serde_json::json!({
+            "name": "announcer", "version": "0.1.0",
+            "secrets": { "api_key": { "title": "API key" } },
+        });
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.plugins.push(PublishedPlugin {
+            name: "announcer".into(),
+            version: "0.1.0".into(),
+            digest: digest.clone(),
+            size: 10,
+            manifest: manifest.to_string(),
+            published_by: admin,
+            published_at_ms: 1,
+        });
+        let install_id = Ulid::from_parts(7, 7);
+        config.installs.push(PluginInstall {
+            install_id,
+            group_id,
+            plugin: "announcer".into(),
+            version: "0.1.0".into(),
+            digest: digest.clone(),
+            state: InstallState::Active,
+            paused: false,
+            settings: "{}".into(),
+            grants: Default::default(),
+            account: UserId::new(install_id, realm_id),
+            role_id: install_id,
+            receiver: node_id,
+            granted_by: admin,
+            request: digest,
+            revision: 1,
+            active_since_ms: Some(1),
+            failed: None,
+            prerequisites: Vec::new(),
+            activated_by: Some(node_id),
+            widened: None,
+            secrets: Default::default(),
+        });
+        let row = config.to_bytes(&actor).unwrap();
+        write_doc(
+            &ctx,
+            REALM_CONFIG_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            row.into(),
+        )
+        .await;
+        // A session restricted to the group's administration passes the admin check only.
+        let restricted = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: format!("/{realm_id}/g/{group_id}/**"),
+                permission: Permission::WRITE,
+            }]),
+            session: None,
+        };
+        let id = Path(install_id.to_string());
+        let body = Json(GrantsBody {
+            grants: BTreeMap::new(),
+        });
+        let refused = put_grants(
+            State(state.clone()),
+            Extension(Some(restricted.clone())),
+            id,
+            body,
+        );
+        assert!(matches!(refused.await, Err(ServerError::Forbidden)));
+        let after = read_config(&ctx, realm_id).await.unwrap();
+        assert_eq!(after.installs[0].revision, 1);
+        // The rule check itself: slots need an unrestricted session, no slots need none.
+        let target = (Some(install_id), None);
+        let checked = secret_session(&state, &restricted, target).await;
+        assert!(matches!(checked, Err(ServerError::Forbidden)));
+        let open = AuthContext {
+            path_restrictions: None,
+            ..restricted.clone()
+        };
+        assert!(secret_session(&state, &open, target).await.is_ok());
+        assert!(
+            secret_session(&state, &restricted, (None, None))
+                .await
+                .is_ok()
+        );
+    }
 
     #[test]
     fn sync_warnings() {

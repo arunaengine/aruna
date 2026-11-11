@@ -17,7 +17,9 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::plugin_installs::{InstallView, actor, admin_call, map_error, view, view_example};
+use super::plugin_installs::{
+    InstallView, actor, admin_call, map_error, secret_session, view, view_example,
+};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
 
@@ -63,8 +65,9 @@ pub struct UpdateView {
     summary = "Replace plugin grants",
     description = r#"Replaces the grants of a plugin install and recomputes its account role.
 
-**Authentication**: realm bearer token of an admin of the install's group. A management node
-serves the call and every other node relays it to one.
+**Authentication**: realm bearer token of an admin of the install's group; a session without
+path restrictions when the install's manifest declares secret slots. A management node serves
+the call and every other node relays it to one.
 
 **Behavior**
 - A permission left out gets all of the group, an empty list removes an optional one; required
@@ -90,6 +93,7 @@ pub async fn put_grants(
     Json(body): Json<GrantsBody>,
 ) -> ServerResult<Json<InstallView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
+    secret_session(&state, &auth, (Some(install_id), None)).await?;
     let changed = set_grants(
         &state.get_ctx(),
         &actor(&state, &auth),
@@ -109,8 +113,9 @@ pub async fn put_grants(
     summary = "Update a plugin install",
     description = r#"Moves a plugin install to another published version of the same plugin.
 
-**Authentication**: realm bearer token of an admin of the install's group. A management node
-serves the call and every other node relays it to one.
+**Authentication**: realm bearer token of an admin of the install's group; a session without
+path restrictions when the install's manifest declares secret slots. A management node serves
+the call and every other node relays it to one.
 
 **Behavior**
 - Keeps the grants the new version still requests, drops the others, and grants nothing new.
@@ -135,6 +140,8 @@ pub async fn put_version(
     Json(body): Json<VersionBody>,
 ) -> ServerResult<Json<UpdateView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
+    let target = (Some(install_id), Some(body.version.as_str()));
+    secret_session(&state, &auth, target).await?;
     let actor = actor(&state, &auth);
     let settings = body.settings.as_ref();
     let (updated, missing) = update_install(
