@@ -90,3 +90,59 @@ async fn ensure_and_retire() {
     );
     assert_eq!(absent.await, Err(RuleError::Missing));
 }
+
+#[tokio::test]
+async fn install_rules() {
+    let fixture = Fixture::keyed().await;
+    let install = bound(&fixture).await;
+    secret(&fixture, &install).await;
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let plugin =
+        crate::plugins::install::pick_version(&config, &install.plugin, Some(&install.digest));
+    let manifest = crate::plugins::install::read_manifest(&plugin.unwrap()).unwrap();
+    let wanted = wanted_rules(&install, &manifest).unwrap();
+    let name = SecretName::try_from("api-key".to_string()).unwrap();
+    let inject = &wanted[&name][0];
+    assert_eq!(
+        (inject.delivery, inject.response.clone()),
+        (Delivery::Inject, ResponseExposure::Status)
+    );
+    assert_eq!(inject.origins, ["https://catalog.example.org"]);
+    assert_eq!(
+        (inject.paths.clone(), inject.methods.clone()),
+        (vec!["/api".to_string()], vec!["GET".to_string()])
+    );
+    // Ensuring replaces the fixture's broader rule with the computed one.
+    ensure_rules(&fixture.ctx, &fixture.actor, &install, &manifest)
+        .await
+        .unwrap();
+    assert_eq!(
+        rules(&fixture, &install).await,
+        std::slice::from_ref(inject)
+    );
+    // A setting change moves the origin.
+    edit_config(&fixture, |config| {
+        config.installs[0].settings = r#"{"catalog_url":"https://moved.example.org"}"#.into();
+    })
+    .await;
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let moved = config.installs[0].clone();
+    ensure_rules(&fixture.ctx, &fixture.actor, &moved, &manifest)
+        .await
+        .unwrap();
+    let held = rules(&fixture, &moved).await;
+    assert_eq!(held[0].origins, ["https://moved.example.org"]);
+    // Removal takes this install's rules away, and only once it is removing.
+    retire_rules(&fixture.ctx, &fixture.actor, &moved).await;
+    assert_eq!(rules(&fixture, &moved).await.len(), 1);
+    edit_config(&fixture, |config| {
+        config.installs[0].state = aruna_core::plugin_installs::InstallState::Removing
+    })
+    .await;
+    retire_rules(&fixture.ctx, &fixture.actor, &moved).await;
+    assert!(rules(&fixture, &moved).await.is_empty());
+}

@@ -3,14 +3,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use std::collections::BTreeMap;
+
+use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall};
 use aruna_core::secret_registers::{SecretBody, SecretOwner};
-use aruna_core::secrets::{SecretConsumer, SecretName, UseRule};
+use aruna_core::secrets::{Delivery, ResponseExposure, SecretConsumer, SecretName, UseRule};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_plugins::manifest::Manifest;
+use aruna_plugins::permission::Permission;
+use aruna_plugins::trigger::TriggerKind;
+use tracing::warn;
 use ulid::Ulid;
 
+use super::grants::{InstallScope, parse_grants};
 use super::install::read_config;
 use crate::driver::{DriverContext, drive};
 use crate::secrets::SecretChange;
@@ -128,6 +135,127 @@ async fn guard_holds(
             )
         }),
     })
+}
+
+/// The rules the install needs on each group secret it binds, from its manifest, grants and
+/// settings: `inject` for granted connections, `verify` for the webhook.
+pub fn wanted_rules(
+    install: &PluginInstall,
+    manifest: &Manifest,
+) -> Result<BTreeMap<SecretName, Vec<UseRule>>, String> {
+    let settings: serde_json::Value =
+        serde_json::from_str(&install.settings).map_err(|error| error.to_string())?;
+    let scope = InstallScope {
+        realm_id: install.account.realm_id,
+        group_id: install.group_id,
+        install_id: install.install_id,
+    };
+    let granted = parse_grants(&install.grants);
+    let sends = granted.get(&Permission::ConnectionsSend);
+    let group_bound = |slot: &String| {
+        (install.secrets.get(slot)).filter(|binding| binding.scope == BoundScope::Group)
+    };
+    let mut wanted: BTreeMap<SecretName, Vec<UseRule>> = BTreeMap::new();
+    let rule = |delivery| UseRule {
+        consumer: consumer(install),
+        delivery,
+        origins: Vec::new(),
+        paths: Vec::new(),
+        methods: Vec::new(),
+        response: ResponseExposure::Status,
+        groups: Vec::new(),
+    };
+    for (name, connection) in &manifest.connections {
+        let granted = sends.is_some_and(|paths| paths.contains(&scope.connection(name)));
+        let Some(binding) = connection.auth.as_ref().and_then(group_bound) else {
+            continue;
+        };
+        if !granted {
+            continue;
+        }
+        let base = connection
+            .base(&settings)
+            .map_err(|why| format!("`{name}`: {why}"))?;
+        let prefix = base.path().trim_end_matches('/');
+        let response = match connection.response.is_empty() {
+            true => ResponseExposure::Status,
+            false => ResponseExposure::Fields {
+                pointers: connection.response.clone(),
+                headers: Vec::new(),
+            },
+        };
+        wanted
+            .entry(binding.name.clone())
+            .or_default()
+            .push(UseRule {
+                origins: vec![base.origin().ascii_serialization()],
+                paths: (!prefix.is_empty())
+                    .then(|| prefix.to_string())
+                    .into_iter()
+                    .collect(),
+                methods: connection
+                    .methods
+                    .iter()
+                    .map(|m| m.as_str().to_string())
+                    .collect(),
+                response,
+                ..rule(Delivery::Inject)
+            });
+    }
+    let hook = manifest.triggers.get(&TriggerKind::Webhook);
+    if let Some(binding) = hook
+        .and_then(|hook| hook.verify.as_ref())
+        .and_then(group_bound)
+    {
+        wanted
+            .entry(binding.name.clone())
+            .or_default()
+            .push(rule(Delivery::Verify));
+    }
+    Ok(wanted)
+}
+
+/// Ensures the install's rules on every group secret it binds, for its current revision.
+pub async fn ensure_rules(
+    ctx: &DriverContext,
+    actor: &Actor,
+    install: &PluginInstall,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    let mut wanted = wanted_rules(install, manifest)?;
+    let guard = RuleGuard::Revision {
+        install_id: install.install_id,
+        revision: install.revision,
+    };
+    for binding in install.secrets.values() {
+        if binding.scope != BoundScope::Group {
+            continue;
+        }
+        let rules = wanted.remove(&binding.name).unwrap_or_default();
+        let target = (install.group_id, &binding.name);
+        let edited = edit_rules(ctx, actor, target, (&consumer(install), rules), guard).await;
+        edited.map_err(|error| format!("`{binding}`: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Removes the rules of a removing, abandoned or removed install from its group secrets.
+pub async fn retire_rules(ctx: &DriverContext, actor: &Actor, install: &PluginInstall) {
+    let guard = RuleGuard::Retired {
+        install_id: install.install_id,
+    };
+    let ours = consumer(install);
+    for binding in install.secrets.values() {
+        if binding.scope != BoundScope::Group {
+            continue;
+        }
+        let target = (install.group_id, &binding.name);
+        let edited = edit_rules(ctx, actor, target, (&ours, Vec::new()), guard);
+        match edited.await {
+            Ok(_) | Err(RuleError::Missing) => {}
+            Err(error) => warn!(%error, %binding, "Could not remove a plugin install's use rules"),
+        }
+    }
 }
 
 #[cfg(test)]

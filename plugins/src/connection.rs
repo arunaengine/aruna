@@ -104,6 +104,23 @@ impl Connection {
         Ok(Address::Fixed(url))
     }
 
+    /// The base address with its setting filled in: an https origin and the fixed path prefix.
+    /// A setting gives the origin only; its path is ignored.
+    pub fn base(&self, settings: &serde_json::Value) -> Result<Url, &'static str> {
+        let (setting, prefix) = match self.address()? {
+            Address::Fixed(url) => return Ok(url),
+            Address::Setting { setting, prefix } => (setting, prefix),
+        };
+        let origin = (settings.get(setting).and_then(serde_json::Value::as_str))
+            .ok_or("the address setting has no value")?;
+        let origin = Url::parse(origin).map_err(|_| "the address setting is not an address")?;
+        if origin.scheme() != "https" || origin.host_str().is_none() {
+            return Err("the address setting is not an https origin");
+        }
+        let joined = format!("{}{prefix}", origin.origin().ascii_serialization());
+        Url::parse(&joined).map_err(|_| "the address does not parse")
+    }
+
     /// Checks methods and response fields; the address is checked by [`Connection::address`].
     pub fn check_fields(&self) -> Result<(), &'static str> {
         if self.methods.is_empty() {

@@ -33,6 +33,7 @@ use super::grants::{
 };
 use super::receiver::pick_receiver;
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
+use super::rules::{ensure_rules, retire_rules};
 use super::settings::{SettingError, check_settings};
 use crate::auth::permission_rules::permission_rules;
 use crate::auth::request_policy::{PolicyRequestExtras, enforce_policies, policy_request_with};
@@ -263,6 +264,13 @@ pub(crate) async fn settle(
             return Err(InstallError::Step { step, error });
         }
     };
+    if let Err(error) = ensure_rules(ctx, actor, &record, &manifest).await {
+        abandon(ctx, actor, auth, &record, "rules").await;
+        return Err(InstallError::Step {
+            step: "rules",
+            error,
+        });
+    }
     let mut next = record.clone();
     let (_, missing) = carry_grants(&grants, &manifest, &scope);
     next.state = match (missing.is_empty(), record.paused) {
@@ -316,6 +324,8 @@ async fn abandon(
     if let Err(error) = undo.await {
         warn!(%id, %error, "Could not undo a failed plugin install step");
     }
+    // Only an install that never became active loses its rules here.
+    retire_rules(ctx, actor, record).await;
     let mut failed = record.clone();
     failed.failed = Some(step.to_string());
     failed.revision += 1;

@@ -26,6 +26,7 @@ use super::install::{
     read_manifest, scope_of, settle, write_record,
 };
 use super::records::{InstallEntryConfig, InstallEntryOperation};
+use super::rules::retire_rules;
 use super::settings::check_settings;
 use crate::driver::{DriverContext, drive};
 
@@ -193,6 +194,7 @@ pub async fn remove_install(
         step: "remove",
         error,
     })?;
+    retire_rules(ctx, actor, &removing).await;
     let action = AdminAuditAction::PluginRemoved;
     let audit = AdminAuditRecord::for_install(action, actor.user_id, &removing);
     let delete = InstallEntryOperation::new(InstallEntryConfig {
