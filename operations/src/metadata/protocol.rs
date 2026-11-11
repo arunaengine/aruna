@@ -701,6 +701,13 @@ pub enum MetadataTransportMessage {
     ClockProbed {
         result: Result<u64, MetadataReadError>,
     },
+    /// Matched plugin events and gap counts for the install's receiver to decide.
+    ForwardEvents {
+        batch: crate::plugins::forward::EventBatch,
+    },
+    EventsDecided {
+        result: Result<crate::plugins::forward::Decisions, MetadataReadError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.

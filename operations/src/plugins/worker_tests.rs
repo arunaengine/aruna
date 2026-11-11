@@ -108,7 +108,7 @@ async fn admitted(
 }
 
 /// A worker whose guests may spin until they are cancelled, however slow the machine is.
-fn worker(fixture: &Fixture) -> Arc<Worker> {
+pub(crate) fn worker(fixture: &Fixture) -> Arc<Worker> {
     let ctx = Arc::new(fixture.ctx.clone());
     let mut config = RuntimeConfig::default();
     config.ceiling.fuel = u64::MAX;

@@ -29,7 +29,9 @@ use super::artifacts::fetch_artifact;
 use super::broker::RunBroker;
 use super::check::{RunScope, check_call};
 use super::clock::probe_clock;
+use super::decide::decide_batch;
 use super::dispatch::{enqueue_timers, event_trigger};
+use super::forward::{Backoff, Decisions, EventBatch, send_outbox};
 use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
@@ -73,6 +75,8 @@ pub struct Worker {
     running: Mutex<HashMap<Ulid, (Ulid, CancellationToken)>>,
     /// Why a running guest was cancelled, by run.
     reasons: Mutex<HashMap<Ulid, &'static str>>,
+    /// When each receiver of forwarded events is tried again.
+    backoff: tokio::sync::Mutex<Backoff>,
     tasks: TaskTracker,
     stopping: CancellationToken,
 }
@@ -103,6 +107,7 @@ impl Worker {
             limits,
             running: Mutex::new(HashMap::new()),
             reasons: Mutex::new(HashMap::new()),
+            backoff: tokio::sync::Mutex::default(),
             tasks: TaskTracker::new(),
             stopping: CancellationToken::new(),
         }))
@@ -136,6 +141,12 @@ impl Worker {
         if let Err(error) = run_replays(&self.ctx, now_ms).await {
             warn!(%error, "Could not replay plugin events");
         }
+        let mut backoff = self.backoff.lock().await;
+        let send = |node, batch| self.forward(node, batch, (&config, now_ms));
+        if let Err(error) = send_outbox(&self.ctx, &config, now_ms, &mut backoff, send).await {
+            warn!(%error, "Could not forward plugin events");
+        }
+        drop(backoff);
         let queued = unfinished(&self.ctx)
             .await
             .map_err(|error| error.to_string())?;
@@ -177,6 +188,24 @@ impl Worker {
             started += 1;
         }
         Ok(started)
+    }
+
+    /// Hands a batch to its receiver; this node decides the batches of the installs it runs.
+    async fn forward(
+        &self,
+        node: NodeId,
+        batch: EventBatch,
+        (config, now_ms): (&RealmConfigDocument, u64),
+    ) -> Result<Decisions, String> {
+        if node == self.local {
+            let nodes = (self.local, self.local);
+            let decided = decide_batch(&self.ctx, config, nodes, batch, now_ms);
+            return decided.await.map_err(|error| error.to_string());
+        }
+        let handle = self.ctx.metadata_handle.as_ref();
+        let handle = handle.ok_or("the metadata transport is not running")?;
+        let decided = handle.request_forward(node, batch).await;
+        decided.map_err(|error| format!("{error:?}"))
     }
 
     /// Cancels the running guests of installs that were paused or removed, or of every install

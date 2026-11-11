@@ -166,6 +166,10 @@ pub fn timer_key(install_id: Ulid) -> Vec<u8> {
 /// and still counts against the install's limit.
 pub const ATTENTION_ROW: &[u8] = b"a";
 
+/// Value of a queue row that holds the slot of an event waiting on this receiver; its key names
+/// the waiting row instead of a run.
+pub const WAITING_ROW: &[u8] = b"w";
+
 /// Key of an unfinished or unresolved run in the queue keyspace: by install, then by run id.
 pub fn queue_key(install_id: Ulid, run_id: Ulid) -> Vec<u8> {
     let mut key = install_id.to_bytes().to_vec();
@@ -366,6 +370,22 @@ impl GapRow {
 
 /// Row kind of a gap this node counted as a sender.
 pub const SENDER_GAP: u8 = b's';
+
+/// Row kind of the latest gap report a receiver keeps per sender.
+pub const RECEIVER_GAP: u8 = b'r';
+
+/// Key of a reported gap row: by sender, install, event kind and reason.
+pub fn reported_key(
+    sender: NodeId,
+    install_id: Ulid,
+    kind: SourceKind,
+    reason: GapReason,
+) -> Vec<u8> {
+    let mut key = vec![RECEIVER_GAP];
+    key.extend_from_slice(sender.as_bytes());
+    key.extend_from_slice(&gap_key(install_id, kind, reason)[1..]);
+    key
+}
 
 /// Key of a sender's gap row: by install, then event kind and reason.
 pub fn gap_key(install_id: Ulid, kind: SourceKind, reason: GapReason) -> Vec<u8> {

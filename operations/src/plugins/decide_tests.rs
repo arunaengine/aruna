@@ -1,0 +1,174 @@
+//! Tests the receiver: an event runs end to end once, waits for its record or account, is
+//! denied once, shares the queue bound with other runs, and keeps the newest gap reports.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::BTreeMap;
+
+use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
+use aruna_core::plugin_runs::{RECEIVER_GAP, RunState, RunTrigger, SourceEvent};
+use aruna_core::storage_entries::reducer_state_key;
+
+use super::*;
+use crate::plugins::install::tests::Fixture;
+use crate::plugins::lifecycle::set_grants;
+use crate::plugins::matcher::tests::{config, journal};
+use crate::plugins::runs::tests::queued;
+use crate::plugins::runs::{admit, list_runs, unfinished};
+use crate::plugins::worker::tests::{created, installed, worker};
+
+/// A created dataset journaled now, and its forward row for `install`.
+fn event(install: &PluginInstall, resource: &str, now: u64) -> (SourceEvent, ForwardRow) {
+    let mut event = created(install, resource).0;
+    (event.journaled_ms, event.anchor_ms) = (now, now);
+    let row = ForwardRow {
+        install_id: install.install_id,
+        revision: install.revision,
+        event: event.clone(),
+        queued_ms: now,
+    };
+    (event, row)
+}
+
+/// Decides `rows` as one batch from this node.
+async fn decided(fixture: &Fixture, rows: &[ForwardRow]) -> Vec<Outcome> {
+    let batch = EventBatch {
+        events: rows.to_vec(),
+        gaps: Vec::new(),
+    };
+    let nodes = (fixture.actor.node_id, fixture.actor.node_id);
+    let config = config(fixture).await;
+    let now = unix_timestamp_millis();
+    let decisions = decide_batch(&fixture.ctx, &config, nodes, batch, now).await;
+    (decisions.unwrap().events.into_iter())
+        .map(|(.., outcome)| outcome)
+        .collect()
+}
+
+async fn runs(fixture: &Fixture, install: &PluginInstall) -> Vec<PluginRun> {
+    let listed = list_runs(&fixture.ctx, install.install_id, None, 1_000).await;
+    listed.unwrap().0
+}
+
+#[tokio::test]
+async fn end_to_end() {
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let now = unix_timestamp_millis();
+    journal(&fixture, &event(&install, "D1", now).0).await;
+    let worker = worker(&fixture);
+    worker.claim(now).await.unwrap();
+    worker.settle().await;
+    let runs = runs(&fixture, &install).await;
+    assert_eq!(runs.len(), 1);
+    assert!(matches!(&runs[0].trigger, RunTrigger::Event(event) if event.resource == "D1"));
+    assert_eq!(runs[0].state, RunState::Succeeded, "{:?}", runs[0].message);
+    let txn = Txn::direct(&fixture.ctx);
+    assert!(
+        txn.scan(PLUGIN_OUTBOX_KEYSPACE, &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn waits_for_record() {
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let mut newer = event(&install, "D1", unix_timestamp_millis()).1;
+    newer.revision += 1;
+    // The account's writes have not arrived either; the event waits and is never denied.
+    let account = &install.prerequisites[0].target;
+    let key = reducer_state_key(account).to_vec();
+    let txn = Txn::direct(&fixture.ctx);
+    txn.delete(DOCUMENT_STATE_KEYSPACE, vec![key])
+        .await
+        .unwrap();
+    let current = event(&install, "D2", unix_timestamp_millis()).1;
+    let outcomes = decided(&fixture, &[newer.clone(), current]).await;
+    assert_eq!(outcomes, [Outcome::Waiting, Outcome::Waiting]);
+    assert_eq!(decided(&fixture, &[newer]).await, [Outcome::Waiting]);
+    let prefix = install.install_id.to_bytes();
+    let slots = txn.scan(PLUGIN_QUEUE_KEYSPACE, &prefix).await.unwrap();
+    assert_eq!(slots.len(), 2);
+    assert!(unfinished(&fixture.ctx).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn denied_once() {
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let (_, outside) = event(&install, "B/one", unix_timestamp_millis());
+    let base = created(&install, "").1;
+    let narrowed = BTreeMap::from([("metadata.read".into(), vec![format!("{base}/A/**")])]);
+    let auth = fixture.auth();
+    let id = install.install_id;
+    set_grants(&fixture.ctx, &fixture.actor, &auth, id, &narrowed)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let outcomes = decided(&fixture, std::slice::from_ref(&outside)).await;
+        assert!(matches!(&outcomes[0], Outcome::Denied(reason) if reason.contains("not granted")));
+    }
+    assert!(runs(&fixture, &install).await.is_empty());
+}
+
+#[tokio::test]
+async fn shared_bound() {
+    // Timer runs, a waiting event and an event run share one bound; a resend gives no second run.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    for seq in 0..RUNS_QUEUED as u64 - 2 {
+        admit(&fixture.ctx, &queued(install.install_id, seq + 10))
+            .await
+            .unwrap();
+    }
+    let now = unix_timestamp_millis();
+    let mut waiting = event(&install, "D0", now).1;
+    waiting.revision += 1;
+    let (first, second) = (event(&install, "D1", now).1, event(&install, "D2", now).1);
+    let outcomes = decided(&fixture, &[waiting, first.clone(), first, second.clone()]).await;
+    let expected = [
+        Outcome::Waiting,
+        Outcome::Queued,
+        Outcome::Queued,
+        Outcome::Busy,
+    ];
+    assert_eq!(outcomes, expected);
+    assert_eq!(decided(&fixture, &[second]).await, [Outcome::Busy]);
+    assert_eq!(runs(&fixture, &install).await.len(), RUNS_QUEUED - 1);
+}
+
+#[tokio::test]
+async fn newest_reports() {
+    let fixture = Fixture::new().await;
+    let install_id = Ulid::from_parts(1, 1);
+    let report = |sequence, count| {
+        let mut row = GapRow::new(SourceKind::DataUploaded, GapReason::Full);
+        (row.sequence, row.count) = (sequence, count);
+        (install_id, row)
+    };
+    let senders = [1u8, 2].map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public());
+    let sent = [
+        (0, report(2, 5)),
+        (0, report(2, 5)),
+        (0, report(1, 1)),
+        (1, report(1, 3)),
+    ];
+    let mut acked = Vec::new();
+    for (sender, report) in sent {
+        let kept = keep_reports(&fixture.ctx, senders[sender], vec![report]).await;
+        acked.push(kept.unwrap()[0].3);
+    }
+    assert_eq!(acked, [2, 2, 2, 1]);
+    let txn = Txn::direct(&fixture.ctx);
+    let rows = txn
+        .scan(PLUGIN_GAPS_KEYSPACE, &[RECEIVER_GAP])
+        .await
+        .unwrap();
+    let counts: Vec<u64> = (rows.iter())
+        .map(|(_, value)| decode::<GapRow>(value).unwrap().count)
+        .collect();
+    assert_eq!(counts.iter().sum::<u64>(), 8);
+}

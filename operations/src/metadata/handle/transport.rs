@@ -542,6 +542,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::FetchedArtifact { .. } => "fetched_artifact",
         MetadataTransportMessage::ProbeClock => "probe_clock",
         MetadataTransportMessage::ClockProbed { .. } => "clock_probed",
+        MetadataTransportMessage::ForwardEvents { .. } => "forward_events",
+        MetadataTransportMessage::EventsDecided { .. } => "events_decided",
     }
 }
 
@@ -818,6 +820,22 @@ impl MetadataHandle {
             .map_err(|_| MetadataReadError::Unavailable)?
         {
             MetadataTransportMessage::ClockProbed { result } => result,
+            _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// Hands matched plugin events to the install's receiver `node_id` and returns its decisions.
+    pub async fn request_forward(
+        &self,
+        node_id: NodeId,
+        batch: crate::plugins::forward::EventBatch,
+    ) -> Result<crate::plugins::forward::Decisions, MetadataReadError> {
+        let request = MetadataTransportMessage::ForwardEvents { batch };
+        match send_remote_request(&self.inner, &Span::current(), node_id, request)
+            .await
+            .map_err(|_| MetadataReadError::Unavailable)?
+        {
+            MetadataTransportMessage::EventsDecided { result } => result,
             _ => Err(MetadataReadError::Unavailable),
         }
     }

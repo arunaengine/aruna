@@ -8,6 +8,7 @@ pub mod broker;
 pub mod check;
 pub mod clock;
 pub mod copies;
+pub mod decide;
 pub mod dispatch;
 pub mod forward;
 pub mod grants;
