@@ -135,42 +135,93 @@ async fn expired_gaps() {
     assert_eq!(receiver.got.lock().unwrap()[3].gaps.len(), 1);
 }
 
-#[tokio::test]
-async fn metadata_waits() {
-    let fixture = Fixture::new().await;
-    let install = installed(&fixture).await;
-    let now = unix_timestamp_millis();
-    let (document, event_id) = (Ulid::from_parts(now, 1), Ulid::from_parts(now, 2));
+/// Journals and matches the creation of a fresh document; returns its document and event ids.
+async fn creation(fixture: &Fixture, install: &PluginInstall, now: u64) -> (Ulid, Ulid) {
+    let (document, event_id) = (Ulid::generate(), Ulid::generate());
     let event = SourceEvent {
         resource: document.to_string(),
         revision: event_id.to_string(),
         journaled_ms: now,
-        ..created(&install, &document.to_string()).0
+        ..created(install, &document.to_string()).0
     };
-    journal(&fixture, &event).await;
-    let (local, config) = (fixture.actor.node_id, config(&fixture).await);
+    journal(fixture, &event).await;
+    let (local, config) = (fixture.actor.node_id, config(fixture).await);
     match_pending(&fixture.ctx, &config, local, now)
         .await
         .unwrap();
-    let job = (
-        document_job_key(document, event_id).to_vec(),
-        b"job".to_vec(),
+    (document, event_id)
+}
+
+/// Stores the document's materialization status in `state` at `event_id`.
+async fn materialization(fixture: &Fixture, (document, event_id): (Ulid, Ulid), state: State) {
+    let record = MaterializationStatusRecord {
+        document_id: document,
+        event_id,
+        graph_iri: MetadataRegistryRecord::graph_iri_for(document),
+        context_digest: None,
+        dataset_digest: None,
+        state,
+        attempts: 1,
+        failures: 1,
+        last_error: None,
+        updated_at_ms: 1,
+    };
+    let row = (
+        materialization_status_key(document).to_vec(),
+        encode(&record).unwrap(),
     );
     let txn = Txn::direct(&fixture.ctx);
-    txn.write(DOCUMENT_JOB_KEYSPACE, vec![job.clone()])
+    txn.write(MATERIALIZATION_STATUS_KEYSPACE, vec![row])
         .await
         .unwrap();
+}
+
+type State = MaterializationState;
+
+#[tokio::test]
+async fn metadata_waits() {
+    // A parked job holds the creation until its send expiry counts a gap; it is never sent.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let now = unix_timestamp_millis();
+    let parked = creation(&fixture, &install, now).await;
+    let config = config(&fixture).await;
     let receiver = Receiver::default();
     let (mut backoff, send) = (Backoff::default(), receiver.send(|_| Some(Outcome::Queued)));
     send_outbox(&fixture.ctx, &config, now, &mut backoff, &send)
         .await
         .unwrap();
+    materialization(&fixture, parked, State::Failed).await;
+    send_outbox(&fixture.ctx, &config, now, &mut backoff, &send)
+        .await
+        .unwrap();
     assert_eq!(receiver.batches(), 0);
-    txn.delete(DOCUMENT_JOB_KEYSPACE, vec![job.0])
+    let expired = now + SEND_EXPIRY_MS + 1;
+    send_outbox(&fixture.ctx, &config, expired, &mut backoff, &send)
+        .await
+        .unwrap();
+    assert!(receiver.got.lock().unwrap()[0].events.is_empty());
+    let gap = gap(&fixture, &install, GapReason::Expired).await.unwrap();
+    assert_eq!(gap.count, 1);
+
+    // A materialized creation and the creation of a deleted document are sent.
+    let done = creation(&fixture, &install, now).await;
+    materialization(&fixture, done, State::Materialized).await;
+    let deleted = creation(&fixture, &install, now).await;
+    let graph = MetadataRegistryRecord::graph_iri_for(deleted.0);
+    let realm_id = fixture.actor.realm_id;
+    let record =
+        GraphLifecycleRecord::deleted(graph.clone(), realm_id, fixture.group_id, deleted.0, 1);
+    let row = (
+        graph_lifecycle_key(&graph).to_vec(),
+        encode(&record).unwrap(),
+    );
+    let txn = Txn::direct(&fixture.ctx);
+    txn.write(GRAPH_LIFECYCLE_KEYSPACE, vec![row])
         .await
         .unwrap();
     let decided = send_outbox(&fixture.ctx, &config, now, &mut backoff, &send).await;
-    assert_eq!(decided, Ok(1));
+    assert_eq!(decided, Ok(2));
 }
 
 #[tokio::test]

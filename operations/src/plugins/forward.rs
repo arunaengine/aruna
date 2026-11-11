@@ -6,13 +6,20 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::keyspaces::{DOCUMENT_JOB_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
+use aruna_core::keyspaces::{
+    GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE, PLUGIN_GAPS_KEYSPACE,
+    PLUGIN_OUTBOX_KEYSPACE,
+};
+use aruna_core::metadata::{
+    GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord,
+};
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{
     ForwardRow, GapReason, GapRow, SEND_EXPIRY_MS, SENDER_GAP, SourceKind, gap_key,
 };
-use aruna_core::storage_entries::document_job_key;
+use aruna_core::storage_entries::{graph_lifecycle_key, materialization_status_key};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -156,7 +163,7 @@ async fn drop_rows(ctx: &DriverContext, space: &str, prefix: &[u8]) -> Result<()
 }
 
 /// Reads the install's first rows: those past their send expiry become gaps, the others join
-/// `pending` unless their metadata is still materializing here.
+/// `pending` unless their dataset is not readable here yet.
 async fn collect(
     ctx: &DriverContext,
     install_id: Ulid,
@@ -178,7 +185,7 @@ async fn collect(
                     .await?;
                 expired.push(key);
             } else if let Some((batch, keys)) = pending.as_deref_mut()
-                && !materializing(txn, &row).await?
+                && !unreadable(txn, &row).await?
             {
                 keys.insert((install_id, row.event.source.clone()), key);
                 batch.events.push(row);
@@ -190,17 +197,33 @@ async fn collect(
     .await
 }
 
-/// Whether a created dataset's materialization job of its event is still queued here.
-async fn materializing(txn: &Txn<'_>, row: &ForwardRow) -> Result<bool, StoreError> {
+/// Whether a created dataset is not readable here yet: neither its creation is materialized
+/// nor the document deleted. A parked job keeps the row until its send expiry counts a gap.
+async fn unreadable(txn: &Txn<'_>, row: &ForwardRow) -> Result<bool, StoreError> {
     let event = &row.event;
-    let (Ok(document), Ok(event_id)) = (event.resource.parse(), event.revision.parse()) else {
+    let parsed = (
+        event.resource.parse::<Ulid>(),
+        event.revision.parse::<Ulid>(),
+    );
+    let (Ok(document), Ok(event_id)) = parsed else {
         return Ok(false);
     };
     if event.kind != SourceKind::DatasetCreated {
         return Ok(false);
     }
-    let key = document_job_key(document, event_id);
-    Ok(txn.read(DOCUMENT_JOB_KEYSPACE, &key).await?.is_some())
+    let key = materialization_status_key(document);
+    let status = txn.read(MATERIALIZATION_STATUS_KEYSPACE, &key).await?;
+    let status = status.and_then(|bytes| decode::<MaterializationStatusRecord>(&bytes).ok());
+    let materialized = status.is_some_and(|status| {
+        status.state == MaterializationState::Materialized && status.event_id >= event_id
+    });
+    if materialized {
+        return Ok(false);
+    }
+    let key = graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(document));
+    let lifecycle = txn.read(GRAPH_LIFECYCLE_KEYSPACE, &key).await?;
+    let lifecycle = lifecycle.and_then(|bytes| decode::<GraphLifecycleRecord>(&bytes).ok());
+    Ok(!lifecycle.is_some_and(|record| record.is_deleted()))
 }
 
 /// Deletes the decided rows and records the acknowledged gap sequences in one transaction;
