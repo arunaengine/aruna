@@ -9,10 +9,13 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
-use aruna_core::plugin_runs::{MAX_ATTEMPTS, PluginRun, RUNS_PARALLEL, RunState, RunTrigger};
+use aruna_core::plugin_runs::{
+    MAX_ATTEMPTS, PluginRun, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent,
+};
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_plugins::broker::ErrorKind;
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::permission::Permission;
 use aruna_plugins::{
@@ -24,8 +27,8 @@ use ulid::Ulid;
 
 use super::artifacts::fetch_artifact;
 use super::broker::RunBroker;
-use super::check::RunScope;
-use super::dispatch::enqueue_timers;
+use super::check::{RunScope, check_call};
+use super::dispatch::{enqueue_timers, event_trigger};
 use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
@@ -254,6 +257,23 @@ impl Worker {
         self.running().remove(&run.run_id);
     }
 
+    /// The trigger check again for an event run's path before each attempt, so a grant removed
+    /// after admission cancels the run before the guest sees the event.
+    async fn event_allowed(&self, run: &PluginRun, event: &SourceEvent) -> Result<(), Ended> {
+        let scope = RunScope {
+            realm_id: self.realm_id,
+            local: self.local,
+            run: run.clone(),
+        };
+        let needs = event_trigger(event.kind).needs();
+        let target = needs.map(|permission| (permission, event.path.as_str()));
+        match check_call(&self.ctx, &scope, target).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind == ErrorKind::Unavailable => Err(Ended::Retry(error.message)),
+            Err(error) => Err(Ended::Cancelled(error.message)),
+        }
+    }
+
     async fn attempt(
         &self,
         run: &PluginRun,
@@ -271,6 +291,11 @@ impl Worker {
         else {
             return Ended::Cancelled("the install was removed".into());
         };
+        if let RunTrigger::Event(event) = &run.trigger
+            && let Err(refused) = self.event_allowed(run, event).await
+        {
+            return refused;
+        }
         let mut assembled = match fetch_artifact(&self.ctx, &config, &run.digest).await {
             Ok(assembled) => assembled,
             Err(error) => return Ended::Retry(format!("the artifact is not available: {error}")),

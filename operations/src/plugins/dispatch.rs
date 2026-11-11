@@ -136,13 +136,17 @@ pub fn event_run(
     event: &SourceEvent,
     now_ms: u64,
 ) -> Option<PluginRun> {
-    let kind = match event.kind {
-        SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
-        SourceKind::DataUploaded => TriggerKind::DataUploaded,
-    };
-    let handler = handler(config, install, kind)?;
+    let handler = handler(config, install, event_trigger(event.kind))?;
     let trigger = RunTrigger::Event(event.clone());
     Some(new_run(install, handler, trigger, now_ms))
+}
+
+/// The manifest trigger a journaled event kind starts.
+pub fn event_trigger(kind: SourceKind) -> TriggerKind {
+    match kind {
+        SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
+        SourceKind::DataUploaded => TriggerKind::DataUploaded,
+    }
 }
 
 /// Queues the due `every` occurrence of each active install this node receives. Missed
