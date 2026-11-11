@@ -435,3 +435,36 @@ async fn write_only_patches() {
     );
     assert!(writer.metadata_patch(&cx(), change).await.is_ok());
 }
+
+#[tokio::test]
+async fn expected_revision() {
+    // A patch starts only from the revision it expects, and writes no intent otherwise.
+    use crate::plugins::intents::open_intent;
+    let (_fixture, broker, document, _dir) = broker().await;
+    let read = broker
+        .metadata_get(&cx(), &document.to_string())
+        .await
+        .unwrap();
+    let newer = Ulid::generate().to_string();
+    let behind = broker
+        .metadata_patch(&cx(), patch(document, &newer, 0, ENTITY))
+        .await;
+    assert_eq!(behind.unwrap_err().kind, ErrorKind::Unavailable);
+    let older = Ulid::from_parts(1, 1).to_string();
+    let ahead = broker
+        .metadata_patch(&cx(), patch(document, &older, 0, ENTITY))
+        .await;
+    assert_eq!(ahead.unwrap_err().kind, ErrorKind::Conflict);
+    assert_eq!(
+        open_intent(&broker.ctx, broker.scope.run.run_id)
+            .await
+            .unwrap(),
+        None
+    );
+    let now = broker
+        .metadata_get(&cx(), &document.to_string())
+        .await
+        .unwrap();
+    assert_eq!(now.revision, read.revision);
+    assert!(same_revision(Ulid::from_parts(5, 1), Ulid::from_parts(5, 1)).is_ok());
+}

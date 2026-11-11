@@ -90,6 +90,17 @@ pub async fn begin(
     .await
 }
 
+/// Whether an earlier attempt of the run already wrote this call's intent.
+pub async fn written(
+    ctx: &DriverContext,
+    run_id: Ulid,
+    intent: &Intent,
+) -> Result<bool, StoreError> {
+    let key = intent_key(run_id, intent.ordinal);
+    let row = Txn::direct(ctx).read(PLUGIN_INTENTS_KEYSPACE, &key).await?;
+    Ok(row.is_some())
+}
+
 /// Records the call's reply, in the transaction that commits its effect where it has one.
 pub async fn settle_in(
     txn: &Txn<'_>,

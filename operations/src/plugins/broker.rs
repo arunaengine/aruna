@@ -29,7 +29,7 @@ use ulid::Ulid;
 
 use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
 use super::grants::{accesses, parse_grants};
-use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in};
+use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
 use super::rate::take_call;
 use super::state::{PutError, check_key, put_state, read_state};
 use super::store::{StoreError, Txn, transact};
@@ -388,6 +388,12 @@ impl Broker for RunBroker {
         let (record, jsonld) = self.export(document_id, auth, cx.max_bytes).await?;
         let path = &record.permission_path;
         let (install, auth) = self.checked(Permission::MetadataWrite, path).await?;
+        // A new call starts only from the copy it expects; an earlier attempt's intent decides.
+        let run_id = self.scope.run.run_id;
+        let earlier = written(&self.ctx, run_id, &patch.intent).await;
+        if !earlier.map_err(|error| unavailable(error.0))? {
+            same_revision(record.last_event_id, expected)?;
+        }
         if let Some(reply) = self.begun(&patch.intent).await? {
             return Ok(reply);
         }
@@ -673,6 +679,21 @@ fn literal_objects(change: &mut Value) {
             entry if plain(entry) => *entry = literal(entry),
             _ => {}
         }
+    }
+}
+
+/// Refuses a copy at another revision than the patch expects: one behind it is retryable,
+/// one ahead of it is a conflict the plugin resolves by reading again.
+fn same_revision(exported: Ulid, expected: Ulid) -> Result<(), HostError> {
+    match exported.cmp(&expected) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Less => Err(unavailable(format!(
+            "the copy read is at {exported}, before the expected {expected}; try again"
+        ))),
+        std::cmp::Ordering::Greater => Err(HostError::new(
+            ErrorKind::Conflict,
+            format!("the document is at {exported}, not at the expected {expected}"),
+        )),
     }
 }
 
