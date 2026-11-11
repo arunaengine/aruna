@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::metadata::MetadataHandle;
 use crate::metadata::create_document::{
@@ -191,5 +193,45 @@ async fn state_and_log() {
     assert_eq!(
         (lines[0].level.as_str(), lines[0].message.as_str()),
         ("info", "started")
+    );
+}
+
+/// A broker for a run of an install granted `objects.read` on `patterns` only.
+async fn objects_broker(
+    fixture: &Fixture,
+    broker: &RunBroker,
+    patterns: &[String],
+) -> (RunBroker, PluginInstall) {
+    let reads = serde_json::json!({ "permissions": { "required": ["objects.read"] } });
+    let mut request = fixture.request(None);
+    request.version = Some(fixture.publish("0.1.2", "ef", reads).await);
+    let grants = BTreeMap::from([("objects.read".to_string(), patterns.to_vec())]);
+    request.grants = grants;
+    let installed = fixture.install(&request).await.unwrap();
+    let mut scope = broker.scope.clone();
+    scope.run.install_id = installed.install_id;
+    scope.run.digest = installed.digest.clone();
+    (RunBroker::new(broker.ctx.clone(), scope), installed)
+}
+
+#[tokio::test]
+async fn object_paths() {
+    // A key of bucket `data` never passes a grant for bucket `dataset`.
+    let (fixture, broker, _, _dir) = broker().await;
+    let (realm, group, node) = (
+        fixture.actor.realm_id,
+        fixture.group_id,
+        fixture.actor.node_id,
+    );
+    let dataset = format!("/{realm}/g/{group}/data/{node}/dataset/**");
+    let (objects, install) = objects_broker(&fixture, &broker, &[dataset]).await;
+    let listed = vec![("set/private".to_string(), 1, "v1".to_string())];
+    assert!(objects.visible(&install, "data", listed).await.is_empty());
+    let listed = vec![("private".to_string(), 1, "v1".to_string())];
+    let shown = objects.visible(&install, "dataset", listed).await;
+    let path = format!("/{realm}/g/{group}/data/{node}/dataset/private");
+    assert_eq!(
+        shown.iter().map(|object| &object.path).collect::<Vec<_>>(),
+        [&path]
     );
 }

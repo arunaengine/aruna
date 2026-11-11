@@ -15,6 +15,7 @@ use aruna_core::plugin_runs::{LogLine, PluginRun};
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
+use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
@@ -262,6 +263,27 @@ impl RunBroker {
     }
 }
 
+impl RunBroker {
+    /// The listed objects of a local bucket the grants cover, each named by the permission path
+    /// of its own bucket and key, never by the text of the listing prefix.
+    async fn visible(
+        &self,
+        install: &PluginInstall,
+        bucket: &str,
+        objects: Vec<(String, u64, String)>,
+    ) -> Vec<ObjectInfo> {
+        let (realm, group, node) = (self.scope.realm_id, install.group_id, self.scope.local);
+        (objects.into_iter())
+            .map(|(key, size, version)| ObjectInfo {
+                path: object_permission_path(realm, group, node, bucket, &key),
+                size,
+                version,
+            })
+            .filter(|object| matching(install, Permission::ObjectsRead, &object.path).is_ok())
+            .collect()
+    }
+}
+
 /// How a mutating call ended without a reply.
 enum Outcome {
     /// It had no effect.
@@ -403,10 +425,6 @@ impl Broker for RunBroker {
     ) -> Result<ObjectPage, HostError> {
         let (install, _) = self.listing(Permission::ObjectsRead).await?;
         let (bucket, key) = self.object_at(&install, prefix).await?;
-        let bucket_root = prefix
-            .strip_suffix(key.as_str())
-            .unwrap_or(prefix)
-            .to_string();
         let invalid = || HostError::new(ErrorKind::Invalid, "bad cursor");
         let token = match cursor {
             Some(cursor) => Some(
@@ -416,7 +434,7 @@ impl Broker for RunBroker {
             None => None,
         };
         let input = ListBucketInput {
-            bucket,
+            bucket: bucket.clone(),
             group_id: install.group_id,
             continuation_token: token,
             max_keys: Some(PAGE),
@@ -426,14 +444,13 @@ impl Broker for RunBroker {
         };
         let listed = drive(ListBucketOperation::new(input), &self.ctx).await;
         let listed = listed.map_err(|error| unavailable(error.to_string()))?;
-        let objects = (listed.objects.into_iter())
-            .map(|object| ObjectInfo {
-                path: format!("{bucket_root}{}", object.head.key),
-                size: object.location.map_or(0, |location| location.blob_size),
-                version: object.version_id.to_string(),
+        let listed_objects = (listed.objects.into_iter())
+            .map(|object| {
+                let size = object.location.map_or(0, |location| location.blob_size);
+                (object.head.key, size, object.version_id.to_string())
             })
-            .filter(|object| matching(&install, Permission::ObjectsRead, &object.path).is_ok())
             .collect();
+        let objects = self.visible(&install, &bucket, listed_objects).await;
         let cursor = match listed.continuation_token {
             Some(token) => Some(hex::encode(
                 token
