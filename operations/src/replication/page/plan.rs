@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::plugin_runs::{SourceEvent, journal_entries};
+use aruna_core::time::unix_timestamp_millis;
 use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::NodeId;
@@ -337,6 +339,7 @@ pub(super) fn page_rows(
     items: &[PageItem],
     plans: &[Plan],
     (guards, previous): (&PageGuards, Vec<Option<BlobVersion>>),
+    (realm_id, local): (RealmId, NodeId),
 ) -> Result<PageRows, PageError> {
     let mut previous = previous.into_iter();
     let mut rows = PageRows {
@@ -383,6 +386,14 @@ pub(super) fn page_rows(
             version_key.to_bytes()?.into(),
             item.compact.to_bytes()?.into(),
         ));
+        // Each written version is a new upload of the target bucket, journaled with the page.
+        let uploaded = SourceEvent::data_uploaded(
+            (realm_id, guards.group_id, local),
+            (&page.bucket, key),
+            manifest.version_id,
+            unix_timestamp_millis(),
+        );
+        rows.writes.extend(journal_entries(&uploaded)?);
         if let Some(root) = &item.root {
             roots.insert(root.digest()?, root.clone());
         }

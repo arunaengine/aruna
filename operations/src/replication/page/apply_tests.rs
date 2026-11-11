@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE;
+use aruna_core::plugin_runs::SourceEvent;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -170,6 +172,7 @@ async fn apply(member: &Member, page: ReferencePage, sender: u8) -> PageAnswer {
         page,
         publisher: secret(sender).public(),
         realm_id: realm(),
+        local: secret(9).public(),
     };
     page_answer(drive(PageApplyOperation::new(input), &context(&member.handle)).await)
 }
@@ -233,10 +236,38 @@ async fn applies_page_once() {
             .is_some(),
         "the shared source root is stored once by digest"
     );
+    // Each written version is journaled as an upload of the target bucket.
+    assert_eq!(journaled(&member.handle).await, ["a", "b", "c"]);
     // A replay after a lost answer is acknowledged again without counting twice.
     let answer = apply(&member, page(&member, manifests), 1).await;
     assert_eq!(answer, applied);
     assert_eq!(counters(&member.handle).await, counted);
+    assert_eq!(
+        journaled(&member.handle).await.len(),
+        3,
+        "a replay journals nothing"
+    );
+}
+
+/// The object keys of the uploads this node journaled, in journal order.
+async fn journaled(handle: &StorageHandle) -> Vec<String> {
+    let rows =
+        crate::storage_read::scan_all(handle, EVENT_JOURNAL_KEYSPACE, Some(b"j".to_vec().into()))
+            .await
+            .unwrap();
+    let mut keys: Vec<String> = (rows.iter())
+        .map(|(_, value)| SourceEvent::from_bytes(value).unwrap())
+        .map(|event| {
+            event
+                .resource
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    keys.sort();
+    keys
 }
 
 async fn feed_rows(handle: &StorageHandle) -> usize {

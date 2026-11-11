@@ -6,6 +6,7 @@
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
+use crate::plugins::journal::journaled;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
@@ -15,6 +16,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
+use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::structs::execution::offered_directory::{
     OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
 };
@@ -32,6 +34,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::structs::{FolderState, SyncedFolder};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, TxnId};
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
@@ -538,12 +541,21 @@ async fn observe(
     )? {
         apply(context, effect).await?;
     }
+    let uploaded = SourceEvent::data_uploaded(
+        (input.realm_id, input.group_id, input.node_id),
+        (&input.bucket, &entry.path),
+        version_id,
+        unix_timestamp_millis(),
+    );
     apply(
         context,
-        write_version_effect(
-            &VersionKey::new(&input.bucket, &entry.path, version_id),
-            &BlobVersion::reference(binding.clone(), metadata.clone(), now, input.user_id, now),
-            Some(txn_id),
+        journaled(
+            write_version_effect(
+                &VersionKey::new(&input.bucket, &entry.path, version_id),
+                &BlobVersion::reference(binding.clone(), metadata.clone(), now, input.user_id, now),
+                Some(txn_id),
+            )?,
+            &uploaded,
         )?,
     )
     .await?;

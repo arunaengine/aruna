@@ -322,6 +322,7 @@ pub(crate) async fn serve_page(
         page,
         publisher: peer,
         realm_id: *net.realm_id(),
+        local: net.node_id(),
     };
     page_answer(drive(PageApplyOperation::new(input), context).await)
 }

@@ -162,6 +162,7 @@ impl PageSender for Member<'_> {
             page,
             publisher: secret(1).public(),
             realm_id: realm(),
+            local: secret(9).public(),
         };
         let answer =
             page_answer(drive(PageApplyOperation::new(input), &context(self.handle)).await);

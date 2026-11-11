@@ -344,6 +344,20 @@ mod tests {
     }
 
     #[test]
+    fn upload_identity() {
+        // One version copied into two keys of one bucket is two events.
+        let realm_id = crate::structs::identity::realm::RealmId::from_bytes([1u8; 32]);
+        let node = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let scope = (realm_id, Ulid::from_parts(1, 1), node);
+        let version = Ulid::from_parts(3, 3);
+        let first = SourceEvent::data_uploaded(scope, ("b", "x/one"), version, 7);
+        let second = SourceEvent::data_uploaded(scope, ("b", "x/two"), version, 9);
+        assert_ne!(first.source, second.source);
+        assert_eq!((first.anchor_ms, second.anchor_ms), (7, 9));
+        assert!(first.path.ends_with("/b/x/one") && first.resource == first.path);
+    }
+
+    #[test]
     fn journal_rows() {
         let event = SourceEvent {
             kind: SourceKind::DataUploaded,

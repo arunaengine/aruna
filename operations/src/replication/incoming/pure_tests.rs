@@ -2215,8 +2215,16 @@ fn indexes_noncurrent_version() {
         )
     );
 
+    // The version's journal rows commit last in its transaction.
     let effects = op.step(Event::Storage(StorageEvent::WriteResult {
         key: vec![0u8; 4].into(),
+    }));
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        panic!("expected the journal rows, got {effects:?}")
+    };
+    assert!(writes.iter().all(|(space, ..)| space == "event_journal"));
+    let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
     }));
     assert_eq!(op.state, IncomingVersionState::WriteLiveObligation);
     assert!(matches!(
@@ -3492,6 +3500,9 @@ fn materialized_trace() {
     }));
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"copy".to_vec().into(),
+    }));
+    op.step(Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
     }));
     op.step(Event::Storage(StorageEvent::WriteResult {
         key: b"obligation".to_vec().into(),

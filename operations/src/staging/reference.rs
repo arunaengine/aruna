@@ -16,6 +16,7 @@ use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
+use crate::plugins::journal::journaled;
 use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::{build_source_binding, build_source_descriptor};
@@ -30,6 +31,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
 };
+use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{
@@ -46,6 +48,7 @@ use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::usage::UsageDelta;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use std::time::SystemTime;
 use thiserror::Error;
@@ -359,11 +362,14 @@ pub async fn write_reference_version(
         }))
         .with_policies(policies)?;
         let version = stamp_version(version, binding.as_ref(), generation, epoch);
-        apply_storage_effect(
-            context,
-            write_version_effect(&version_key, &version, Some(txn_id))?,
-        )
-        .await?;
+        let uploaded = SourceEvent::data_uploaded(
+            (write.realm_id, write.group_id, write.node_id),
+            (&write.bucket, &write.key),
+            version_id,
+            unix_timestamp_millis(),
+        );
+        let effect = write_version_effect(&version_key, &version, Some(txn_id))?;
+        apply_storage_effect(context, journaled(effect, &uploaded)?).await?;
         for (key_space, key, value) in connector_reference_write(&version, &version_key)? {
             let row = StorageEffect::Write {
                 key_space,
@@ -470,6 +476,7 @@ async fn apply_storage_effect(
 ) -> Result<(), MaterializeReferenceError> {
     match send_storage_effect(context, effect).await? {
         Event::Storage(StorageEvent::WriteResult { .. })
+        | Event::Storage(StorageEvent::BatchWriteResult { .. })
         | Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         _ => Err(StorageError::WriteError("unexpected event".to_string()).into()),
     }
