@@ -251,6 +251,7 @@ fn spooled_state_streams() {
 }
 
 #[test]
+#[cfg(unix)]
 fn scratch_stays_private() {
     // Export working state lives in a folder only this user may open, in files only it may read.
     use std::os::unix::fs::PermissionsExt;
