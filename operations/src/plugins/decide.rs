@@ -44,11 +44,14 @@ pub struct WaitingRow {
     pub received_ms: u64,
 }
 
-/// What a decided event writes besides its dedup record.
-enum Admission {
+/// Whether an event can be decided now, and how.
+pub(crate) enum Verdict {
+    /// The install record or a prerequisite write is not here yet.
+    Unready,
     Run(Box<PluginRun>),
-    Wait,
-    Refuse,
+    Denied(String),
+    /// The check could not read what it needs; nothing is decided.
+    Unavailable,
 }
 
 /// Key of an event's dedup record: install, trigger kind, then the source id.
@@ -105,44 +108,64 @@ async fn decide(
     if let Some(bytes) = Txn::direct(ctx).read(PLUGIN_SEEN_KEYSPACE, &seen).await? {
         return Ok(decode::<SeenRow>(&bytes)?.outcome);
     }
-    let install = (config.installs.iter()).find(|i| i.install_id == row.install_id);
-    let ready = match install {
-        Some(install) if install.revision >= row.revision => {
-            prerequisites_held(ctx, install).await.map_err(StoreError)?
-        }
-        _ => false,
-    };
-    let (outcome, admission) = match install.filter(|_| ready) {
-        None => (Outcome::Waiting, Admission::Wait),
-        Some(install) => match trigger_check(ctx, config, local, install, row, now_ms).await {
-            Ok(run) => (Outcome::Queued, Admission::Run(Box::new(run))),
-            Err(error) if error.kind == ErrorKind::Unavailable => return Ok(Outcome::Busy),
-            Err(error) => (Outcome::Denied(error.message), Admission::Refuse),
-        },
-    };
+    let verdict = judge(ctx, config, local, row, now_ms).await?;
     transact(ctx, async |txn: &Txn<'_>| {
-        let full = match &admission {
-            Admission::Run(run) => match admit_in(txn, run).await {
-                Err(RunError::Full(_)) => true,
+        let outcome = match &verdict {
+            Verdict::Unavailable => return Ok(Outcome::Busy),
+            Verdict::Run(run) => match admit_in(txn, run).await {
+                Err(RunError::Full(_)) => return Ok(Outcome::Busy),
                 Err(RunError::Store(error)) => return Err(error),
-                Ok(()) | Err(RunError::NotFound | RunError::NotWaiting(_)) => false,
+                Ok(()) | Err(RunError::NotFound | RunError::NotWaiting(_)) => Outcome::Queued,
             },
-            Admission::Wait => !hold(txn, row, now_ms).await?,
-            Admission::Refuse => false,
+            Verdict::Unready if !hold(txn, row, now_ms).await? => return Ok(Outcome::Busy),
+            Verdict::Unready => Outcome::Waiting,
+            Verdict::Denied(reason) => Outcome::Denied(reason.clone()),
         };
-        if full {
-            return Ok(Outcome::Busy);
-        }
-        let record = SeenRow {
-            outcome: outcome.clone(),
-            anchor_ms: row.event.anchor_ms,
-            decided_ms: now_ms,
-        };
-        txn.write(PLUGIN_SEEN_KEYSPACE, vec![(seen.clone(), encode(&record)?)])
-            .await?;
+        record(txn, row, &outcome, now_ms).await?;
         Ok(outcome)
     })
     .await
+}
+
+/// Writes the event's dedup record with its outcome.
+pub(crate) async fn record(
+    txn: &Txn<'_>,
+    row: &ForwardRow,
+    outcome: &Outcome,
+    now_ms: u64,
+) -> Result<(), StoreError> {
+    let key = seen_key(row.install_id, row.event.kind, &row.event.source);
+    let record = SeenRow {
+        outcome: outcome.clone(),
+        anchor_ms: row.event.anchor_ms,
+        decided_ms: now_ms,
+    };
+    txn.write(PLUGIN_SEEN_KEYSPACE, vec![(key, encode(&record)?)])
+        .await
+}
+
+/// Whether the local install record and its prerequisite writes are here, then the check.
+pub(crate) async fn judge(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    row: &ForwardRow,
+    now_ms: u64,
+) -> Result<Verdict, StoreError> {
+    let install = (config.installs.iter()).find(|i| i.install_id == row.install_id);
+    let Some(install) = install.filter(|install| install.revision >= row.revision) else {
+        return Ok(Verdict::Unready);
+    };
+    if !prerequisites_held(ctx, install).await.map_err(StoreError)? {
+        return Ok(Verdict::Unready);
+    }
+    Ok(
+        match trigger_check(ctx, config, local, install, row, now_ms).await {
+            Ok(run) => Verdict::Run(Box::new(run)),
+            Err(error) if error.kind == ErrorKind::Unavailable => Verdict::Unavailable,
+            Err(error) => Verdict::Denied(error.message),
+        },
+    )
 }
 
 /// Steps 0 to 4 for the event's path as a new run of the install would pass them.

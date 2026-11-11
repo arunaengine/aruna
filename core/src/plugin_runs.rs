@@ -166,6 +166,9 @@ pub fn timer_key(install_id: Ulid) -> Vec<u8> {
 /// and still counts against the install's limit.
 pub const ATTENTION_ROW: &[u8] = b"a";
 
+/// How long an event waits on the receiver for its install record or account writes.
+pub const WAITING_EXPIRY_MS: u64 = 3 * 24 * 3600 * 1000;
+
 /// Value of a queue row that holds the slot of an event waiting on this receiver; its key names
 /// the waiting row instead of a run.
 pub const WAITING_ROW: &[u8] = b"w";
@@ -330,6 +333,8 @@ pub enum GapReason {
     Pruned,
     /// The forward row was not decided by the receiver before its send expiry.
     Expired,
+    /// The event waited on the receiver for its install record past the waiting expiry.
+    Waited,
 }
 
 /// Undelivered events of one install, kind and reason, as the node that lost them counts them.

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,10 +41,13 @@ use super::receiver::{eligible, lost_reason};
 use super::replay::{plan_replays, run_replays};
 use super::runs::{prune_runs, read_run, save_run, unfinished};
 use super::store::StoreError;
+use super::waiting::recheck_waiting;
 use crate::driver::DriverContext;
 
 /// How often the worker looks for due runs.
 pub const TICK: Duration = Duration::from_secs(1);
+/// How often the worker rechecks the events waiting for their install record or account.
+const RECHECK_MS: u64 = 10 * 1000;
 /// How often the worker prunes runs that ended before the retention period.
 const PRUNE_MS: u64 = 3600 * 1000;
 /// Longest wait before a run that failed in the host starts again.
@@ -77,6 +81,8 @@ pub struct Worker {
     reasons: Mutex<HashMap<Ulid, &'static str>>,
     /// When each receiver of forwarded events is tried again.
     backoff: tokio::sync::Mutex<Backoff>,
+    /// When the waiting events were last rechecked.
+    rechecked: AtomicU64,
     tasks: TaskTracker,
     stopping: CancellationToken,
 }
@@ -108,6 +114,7 @@ impl Worker {
             running: Mutex::new(HashMap::new()),
             reasons: Mutex::new(HashMap::new()),
             backoff: tokio::sync::Mutex::default(),
+            rechecked: AtomicU64::new(0),
             tasks: TaskTracker::new(),
             stopping: CancellationToken::new(),
         }))
@@ -147,6 +154,14 @@ impl Worker {
             warn!(%error, "Could not forward plugin events");
         }
         drop(backoff);
+        let rechecked = self.rechecked.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(rechecked) >= RECHECK_MS {
+            self.rechecked.store(now_ms, Ordering::Relaxed);
+            let waiting = recheck_waiting(&self.ctx, &config, self.local, now_ms).await;
+            if let Err(error) = waiting {
+                warn!(%error, "Could not recheck waiting plugin events");
+            }
+        }
         let queued = unfinished(&self.ctx)
             .await
             .map_err(|error| error.to_string())?;
