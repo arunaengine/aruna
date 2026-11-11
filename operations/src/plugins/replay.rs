@@ -26,7 +26,7 @@ use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
 use crate::realm::mutate_placement::node_kind;
 
-const COVERAGE_ROW: u8 = b'c';
+pub(crate) const COVERAGE_ROW: u8 = b'c';
 const REPLAY_ROW: u8 = b'r';
 
 type Coverage = BTreeMap<TriggerKind, BTreeSet<String>>;
@@ -52,7 +52,7 @@ pub struct ReplayRow {
     pub until: Vec<u8>,
 }
 
-fn row_key(kind: u8, install_id: Ulid) -> Vec<u8> {
+pub(crate) fn row_key(kind: u8, install_id: Ulid) -> Vec<u8> {
     [&[kind][..], &install_id.to_bytes()].concat()
 }
 

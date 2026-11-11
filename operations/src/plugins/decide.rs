@@ -4,13 +4,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use std::collections::BTreeMap;
+
 use aruna_core::keyspaces::{
-    PLUGIN_GAPS_KEYSPACE, PLUGIN_QUEUE_KEYSPACE, PLUGIN_SEEN_KEYSPACE, PLUGIN_WAITING_KEYSPACE,
+    PLUGIN_GAPS_KEYSPACE, PLUGIN_QUEUE_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE, PLUGIN_SEEN_KEYSPACE,
+    PLUGIN_WAITING_KEYSPACE,
 };
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
-    DEDUP_RETENTION_MS, ForwardRow, GapReason, GapRow, PluginRun, RUNS_QUEUED, SourceKind,
-    WAITING_ROW, queue_key, reported_key,
+    DEDUP_RETENTION_MS, ForwardRow, GapReason, GapRow, PluginRun, RECEIVER_GAP, RUNS_QUEUED,
+    SourceKind, WAITING_ROW, queue_key, reported_key,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
@@ -23,6 +26,7 @@ use super::artifacts::local_config;
 use super::check::{RunScope, check_call};
 use super::dispatch::{event_run, event_trigger};
 use super::forward::{Decisions, EventBatch, Outcome};
+use super::replay::{COVERAGE_ROW, CoverageRow, row_key};
 use super::runs::{ADMISSIONS, RunError, admit_in};
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
@@ -281,6 +285,48 @@ async fn keep_reports(
         Ok(acked)
     })
     .await
+}
+
+/// What the receiver holds about an install's event delivery.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Delivery {
+    pub waiting: usize,
+    pub oldest_ms: Option<u64>,
+    /// Undelivered events by kind and reason, summed over the nodes that counted them.
+    pub gaps: Vec<GapRow>,
+    /// Why the last replay here started at the earliest kept event.
+    pub note: Option<String>,
+}
+
+/// The install's waiting events, gap totals and replay note on this receiver.
+pub async fn event_delivery(ctx: &DriverContext, install_id: Ulid) -> Result<Delivery, StoreError> {
+    let txn = Txn::direct(ctx);
+    let prefix = install_id.to_bytes();
+    let waiting = txn.scan(PLUGIN_WAITING_KEYSPACE, &prefix).await?;
+    let received = (waiting.iter())
+        .filter_map(|(_, value)| decode::<WaitingRow>(value).ok())
+        .map(|waiting| waiting.received_ms);
+    let mut totals: BTreeMap<(SourceKind, GapReason), GapRow> = BTreeMap::new();
+    for (key, value) in txn.scan(PLUGIN_GAPS_KEYSPACE, &[RECEIVER_GAP]).await? {
+        if key.get(33..49) != Some(&prefix[..]) {
+            continue;
+        }
+        let row: GapRow = decode(&value)?;
+        let total = (totals.entry((row.kind, row.reason)))
+            .or_insert_with(|| GapRow::new(row.kind, row.reason));
+        total.count += row.count;
+        total.earliest_ms = total.earliest_ms.min(row.earliest_ms);
+        total.latest_ms = total.latest_ms.max(row.latest_ms);
+    }
+    let coverage = row_key(COVERAGE_ROW, install_id);
+    let coverage = txn.read(PLUGIN_REPLAYS_KEYSPACE, &coverage).await?;
+    let coverage = coverage.and_then(|bytes| decode::<CoverageRow>(&bytes).ok());
+    Ok(Delivery {
+        waiting: waiting.len(),
+        oldest_ms: received.min(),
+        gaps: totals.into_values().collect(),
+        note: coverage.and_then(|row| row.note),
+    })
 }
 
 #[cfg(test)]

@@ -238,3 +238,26 @@ async fn late_rows_refused() {
     let gap: GapRow = decode(&gaps[0].1).unwrap();
     assert_eq!((gaps.len(), gap.reason, gap.count), (1, GapReason::Late, 2));
 }
+
+#[tokio::test]
+async fn delivery_totals() {
+    // Gap reports from two senders add up; a waiting event is counted with its age.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    for (seed, count) in [(1u8, 2), (2, 3)] {
+        let mut row = GapRow::new(SourceKind::DataUploaded, GapReason::Full);
+        (row.sequence, row.count, row.latest_ms) = (1, count, u64::from(seed));
+        let sender = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        let kept = keep_reports(&fixture.ctx, sender, vec![(install.install_id, row)]);
+        kept.await.unwrap();
+    }
+    let mut waiting = event(&install, "D0", unix_timestamp_millis()).1;
+    waiting.revision += 1;
+    decided(&fixture, &[waiting]).await;
+    let delivery = event_delivery(&fixture.ctx, install.install_id)
+        .await
+        .unwrap();
+    assert_eq!((delivery.waiting, delivery.gaps.len()), (1, 1));
+    assert_eq!((delivery.gaps[0].count, delivery.gaps[0].latest_ms), (5, 2));
+    assert!(delivery.oldest_ms.is_some());
+}

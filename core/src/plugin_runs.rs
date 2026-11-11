@@ -344,6 +344,18 @@ pub enum GapReason {
     Late,
 }
 
+impl GapReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Pruned => "pruned",
+            Self::Expired => "expired",
+            Self::Waited => "waited",
+            Self::Late => "late",
+        }
+    }
+}
+
 /// Undelivered events of one install, kind and reason, as the node that lost them counts them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GapRow {

@@ -153,6 +153,7 @@ pub async fn plugin(context: &mut Context<'_>, command: PluginCommand) -> Result
             show_run(context, &run)
         }
         PluginCommand::Runs { id, run: None } => runs(context, &id).await,
+        PluginCommand::Delivery { id } => delivery(context, &id).await,
         PluginCommand::Resolve { id, run, done } => {
             let path = format!("plugin-installs/{id}/runs/{run}/resolve");
             let body = serde_json::json!({ "done": done });
@@ -365,6 +366,45 @@ async fn install(
             answer["status"].as_str().unwrap_or_default()
         ),
     });
+    lines.extend(warnings(summary));
+    context.out.line(lines.join("\n"))
+}
+
+/// The summary's warnings, one line each.
+fn warnings(summary: &Value) -> Vec<String> {
+    (summary["warnings"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .map(|warning| format!("warning: {warning}"))
+        .collect()
+}
+
+/// Shows the install's waiting events, its undelivered events and triggers not delivered yet.
+async fn delivery(context: &mut Context<'_>, id: &str) -> Result<(), CliError> {
+    let path = format!("plugin-installs/{id}/delivery");
+    let view: Value = context.api()?.get(&path, &[]).await?;
+    if context.out.json {
+        return context.out.json(&view);
+    }
+    let mut lines = vec![format!(
+        "waiting: {}",
+        view["waiting"].as_u64().unwrap_or(0)
+    )];
+    if let Some(age) = view["oldest_age_ms"].as_u64() {
+        lines.push(format!("oldest waiting: {} s", age / 1000));
+    }
+    for gap in view["gaps"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "not delivered: {} {} ({})",
+            gap["count"].as_u64().unwrap_or(0),
+            gap["kind"].as_str().unwrap_or_default(),
+            gap["reason"].as_str().unwrap_or_default()
+        ));
+    }
+    for kind in view["undelivered"].as_array().into_iter().flatten() {
+        let kind = kind.as_str().unwrap_or_default();
+        lines.push(format!("trigger not delivered yet: {kind}"));
+    }
+    lines.extend(view["note"].as_str().map(|note| format!("note: {note}")));
     context.out.line(lines.join("\n"))
 }
 
@@ -500,7 +540,8 @@ async fn change(
     if !missing.is_empty() {
         line.push_str(&format!("; grant first: {}", missing.join(", ")));
     }
-    context.out.line(line)
+    let lines = [vec![line], warnings(&install["summary"])].concat();
+    context.out.line(lines.join("\n"))
 }
 
 #[derive(Debug, Serialize)]

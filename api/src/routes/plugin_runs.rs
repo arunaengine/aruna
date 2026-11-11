@@ -1,5 +1,5 @@
-//! Serves the runs of a plugin install: start one by hand, list and read runs, and resolve a
-//! run that needs attention. Run data lives on the install's receiver, which answers each call.
+//! Serves the runs of a plugin install: start, list, read and resolve runs, and show how its
+//! events are delivered. Run data lives on the install's receiver, which answers each call.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -12,8 +12,10 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRec
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_operations::plugins::decide::event_delivery;
 use aruna_operations::plugins::dispatch::{StartError, start_run};
-use aruna_operations::plugins::install::{InstallError, read_config};
+use aruna_operations::plugins::install::{InstallError, pick_version, read_config, read_manifest};
+use aruna_operations::plugins::matcher::undelivered;
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::runs::{RunError, list_runs, read_run, resolve_run};
 use aruna_operations::users::service_account::group_admin_path;
@@ -46,6 +48,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(start, list))
         .routes(routes!(get_run))
         .routes(routes!(resolve))
+        .routes(routes!(delivery))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
@@ -629,16 +632,125 @@ pub async fn resolve(
     }
 }
 
+/// Undelivered events of one kind and reason, summed over the nodes that counted them.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GapView {
+    /// `dataset_created` or `data_uploaded`.
+    pub kind: String,
+    /// `full`, `pruned`, `expired`, `waited` or `late`.
+    pub reason: String,
+    pub count: u64,
+    /// Origin times of the earliest and the latest event counted.
+    pub earliest_ms: u64,
+    pub latest_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeliveryView {
+    /// Events waiting on the receiver for the install record or the account's writes.
+    pub waiting: usize,
+    /// How long the oldest waiting event has waited, in milliseconds.
+    pub oldest_age_ms: Option<u64>,
+    /// Events that were not delivered and will not run, by kind and reason.
+    pub gaps: Vec<GapView>,
+    /// Declared triggers whose events are not delivered yet.
+    pub undelivered: Vec<String>,
+    /// Why the receiver's last replay started at its earliest kept event.
+    pub note: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/plugin-installs/{id}/delivery",
+    tag = "plugins",
+    summary = "Show plugin event delivery",
+    description = r#"Shows the install's waiting events and the events that were not delivered.
+
+**Authentication**: realm bearer token of an admin of the install's group.
+
+**Behavior**
+- The install's receiver keeps the waiting events and the gap counts every node reports to it;
+  every other node relays the call there. Totals are summed over the reporting nodes.
+- While the receiver is drained, gone or no longer a server, the call answers 503 and names
+  the receiver and the reason.
+- Sync triggers are listed in `undelivered`: they are not delivered yet."#,
+    params(("id" = String, Path, description = "The install id")),
+    responses(
+        (status = 200, description = "The install's event delivery", body = DeliveryView, example = json!({"waiting": 1, "oldest_age_ms": 4200, "gaps": [{"kind": "data_uploaded", "reason": "full", "count": 3, "earliest_ms": 1762700000000u64, "latest_ms": 1762700060000u64}], "undelivered": ["sync_completed"], "note": null})),
+        (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
+        (status = 404, description = "No install has this id", body = ErrorResponse),
+        (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delivery(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let call = Call {
+        method,
+        uri,
+        headers,
+        body: Bytes::new(),
+    };
+    let install = match serve(&state, auth, &id, None, call).await {
+        Ok(Served {
+            install: Some(install),
+            ..
+        }) => install,
+        Ok(_) => return ServerError::NotFound.into_response(),
+        Err(response) => return response,
+    };
+    let ctx = state.get_ctx();
+    let config = read_config(&ctx, state.get_realm_id()).await.ok();
+    let manifest = (config.as_ref())
+        .and_then(|config| pick_version(config, &install.plugin, Some(&install.digest)).ok())
+        .and_then(|plugin| read_manifest(&plugin).ok());
+    let undelivered = manifest.as_ref().map(undelivered).unwrap_or_default();
+    let delivery = match event_delivery(&ctx, install.install_id).await {
+        Ok(delivery) => delivery,
+        Err(error) => {
+            return ServerError::ServiceUnavailableReason(error.to_string()).into_response();
+        }
+    };
+    let now = unix_timestamp_millis();
+    let gaps = (delivery.gaps.into_iter())
+        .map(|row| GapView {
+            kind: row.kind.name().to_string(),
+            reason: row.reason.as_str().to_string(),
+            count: row.count,
+            earliest_ms: row.earliest_ms,
+            latest_ms: row.latest_ms,
+        })
+        .collect();
+    Json(DeliveryView {
+        waiting: delivery.waiting,
+        oldest_age_ms: delivery.oldest_ms.map(|at| now.saturating_sub(at)),
+        gaps,
+        undelivered: undelivered.into_iter().map(str::to_string).collect(),
+        note: delivery.note,
+    })
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     //! The runs of a removed install stay readable and resolvable for the group's admins.
     use super::*;
     use crate::tests::routes::{
-        seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
+        seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state,
+        test_storage, write_doc,
     };
     use aruna_core::UserId;
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::plugin_installs::InstallState;
     use aruna_core::plugin_runs::RunState;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+    use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_operations::plugins::runs::{admit, save_run};
 
@@ -746,5 +858,75 @@ mod tests {
         )
         .await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delivery_needs_receiver() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let ctx = Arc::new(test_context(storage));
+        let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
+        let state = Arc::new(test_state(ctx.clone(), realm_id, node_id, capabilities).await);
+        let admin = UserId::new(Ulid::from_bytes([3u8; 16]), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: admin,
+            realm_id,
+        };
+        seed_realm_auth(&ctx, realm_id, &actor).await;
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        seed_group_docs(&ctx, realm_id, &actor, group_id, "lab", admin).await;
+        // The install's receiver is not a node of the realm.
+        let install_id = Ulid::from_parts(7, 7);
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.installs.push(PluginInstall {
+            install_id,
+            group_id,
+            plugin: "announcer".into(),
+            version: "0.1.0".into(),
+            digest: digest.clone(),
+            state: InstallState::Active,
+            paused: false,
+            settings: "{}".into(),
+            grants: Default::default(),
+            account: UserId::new(install_id, realm_id),
+            role_id: install_id,
+            receiver: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+            granted_by: admin,
+            request: digest,
+            revision: 1,
+            active_since_ms: Some(1),
+            failed: None,
+            prerequisites: Vec::new(),
+            activated_by: Some(node_id),
+            widened: None,
+        });
+        let row = config.to_bytes(&actor).unwrap();
+        write_doc(
+            &ctx,
+            REALM_CONFIG_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            row.into(),
+        )
+        .await;
+        let auth = AuthContext {
+            user_id: admin,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let path = format!("/api/v1/plugin-installs/{install_id}/delivery");
+        let answer = delivery(
+            State(state),
+            Extension(Some(auth)),
+            Path(install_id.to_string()),
+            OriginalUri(path.parse().unwrap()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

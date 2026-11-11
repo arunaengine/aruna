@@ -19,6 +19,7 @@ use aruna_operations::plugins::install::{
     read_manifest,
 };
 use aruna_operations::plugins::lifecycle::remove_install;
+use aruna_operations::plugins::matcher::{SYNC_WARNING, undelivered};
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::records::RecordError;
 use aruna_operations::users::service_account::group_admin_path;
@@ -106,6 +107,8 @@ pub struct InstallSummary {
     pub connections: Vec<ConnectionLine>,
     /// Trigger kinds, such as `manual` or `dataset_created`.
     pub triggers: Vec<String>,
+    /// What the admin should know before approving, such as triggers not delivered yet.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -152,7 +155,7 @@ pub struct InstallListQuery {
     pub limit: Option<usize>,
 }
 
-const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"]}}"#;
+const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"], "warnings": []}}"#;
 
 pub(crate) fn view_example() -> Value {
     serde_json::from_str(VIEW_EXAMPLE).unwrap_or(Value::Null)
@@ -497,6 +500,10 @@ fn summary(
             .keys()
             .map(|kind| kind.as_str().to_string())
             .collect(),
+        warnings: match undelivered(manifest).is_empty() {
+            true => Vec::new(),
+            false => vec![SYNC_WARNING.to_string()],
+        },
     }
 }
 
@@ -519,6 +526,7 @@ fn bare_summary(install: &PluginInstall) -> InstallSummary {
         permissions,
         connections: Vec::new(),
         triggers: Vec::new(),
+        warnings: Vec::new(),
     }
 }
 
@@ -570,5 +578,35 @@ pub(crate) async fn refuse_plugin_role(state: &ServerState, role_id: Ulid) -> Se
         true => Err(ServerError::Conflict(
             "the role belongs to a plugin install; change its grants instead".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_warnings() {
+        let scope = InstallScope {
+            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
+            group_id: Ulid::from_parts(1, 1),
+            install_id: Ulid::from_parts(2, 2),
+        };
+        let warned = |triggers: Value| {
+            let manifest =
+                serde_json::json!({"name": "p", "version": "0.1.0", "triggers": triggers});
+            let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+            summary(&manifest, "sha256:ab", &scope, &BTreeMap::new()).warnings
+        };
+        let sync_only = warned(serde_json::json!({"sync_failed": {}}));
+        let mixed = warned(serde_json::json!({"sync_completed": {}, "dataset_created": {}}));
+        assert_eq!(
+            (sync_only, mixed),
+            (
+                vec![SYNC_WARNING.to_string()],
+                vec![SYNC_WARNING.to_string()]
+            )
+        );
+        assert!(warned(serde_json::json!({"manual": {}, "data_uploaded": {}})).is_empty());
     }
 }
