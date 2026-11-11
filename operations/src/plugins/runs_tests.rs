@@ -87,3 +87,40 @@ async fn paged_runs() {
     assert_eq!(rest.iter().map(|run| run.due_ms).collect::<Vec<_>>(), [30]);
     assert_eq!(last, None);
 }
+
+#[tokio::test]
+async fn pruned_runs() {
+    use crate::plugins::intents::{begin, open_intent};
+    use aruna_core::plugin_runs::RUN_RETENTION_MS;
+    use aruna_plugins::broker::Intent;
+    let (_dir, ctx) = opened();
+    let install = Ulid::from_parts(1, 1);
+    let mut ended = Vec::new();
+    for (seq, state) in [
+        (1, RunState::Succeeded),
+        (2, RunState::NeedsAttention),
+        (3, RunState::Failed),
+    ] {
+        let mut run = queued(install, seq);
+        admit(&ctx, &run).await.unwrap();
+        let finished = if seq == 3 { 50 * RUN_RETENTION_MS } else { 10 };
+        run.finish(state, None, finished);
+        save_run(&ctx, &run).await.unwrap();
+        begin(&ctx, run.run_id, &Intent::new(0, None, &[b"x"]))
+            .await
+            .unwrap();
+        ended.push(run);
+    }
+    let waiting = queued(install, 4);
+    admit(&ctx, &waiting).await.unwrap();
+    let now = 10 + RUN_RETENTION_MS;
+    assert_eq!(prune_runs(&ctx, now).await.unwrap(), 1);
+    assert_eq!(
+        read_run(&ctx, install, ended[0].run_id).await,
+        Err(RunError::NotFound)
+    );
+    assert_eq!(open_intent(&ctx, ended[0].run_id).await.unwrap(), None);
+    for kept in [&ended[1], &ended[2], &waiting] {
+        assert!(read_run(&ctx, install, kept.run_id).await.is_ok());
+    }
+}

@@ -5,11 +5,13 @@
 
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_RUNS_KEYSPACE};
 use aruna_core::plugin_runs::{
-    PluginRun, RUNS_QUEUED, parse_queue_key, queue_key, run_key, run_prefix,
+    PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState, parse_queue_key, queue_key,
+    run_key, run_prefix,
 };
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
+use super::intents::drop_intents;
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
 
@@ -97,6 +99,32 @@ pub async fn save_in(txn: &Txn<'_>, run: &PluginRun) -> Result<(), RunError> {
         txn.delete(PLUGIN_QUEUE_KEYSPACE, queued).await?;
     }
     Ok(())
+}
+
+/// Removes runs that ended longer than `RUN_RETENTION_MS` ago, with their intents and stored
+/// replies. A run that needs attention stays until a person resolves it.
+pub async fn prune_runs(ctx: &DriverContext, now_ms: u64) -> Result<usize, RunError> {
+    let rows = Txn::direct(ctx)
+        .scan(PLUGIN_RUNS_KEYSPACE, &[RUN_ROW])
+        .await?;
+    let mut pruned = 0;
+    for (_, value) in rows {
+        let run = decode::<PluginRun>(&value)?;
+        let expired = (run.finished_ms)
+            .is_some_and(|finished| finished.saturating_add(RUN_RETENTION_MS) <= now_ms);
+        if !expired || run.state == RunState::NeedsAttention {
+            continue;
+        }
+        transact(ctx, async |txn: &Txn<'_>| {
+            let key = run_key(run.install_id, run.run_id);
+            txn.delete(PLUGIN_RUNS_KEYSPACE, vec![key]).await?;
+            drop_intents(txn, run.run_id).await?;
+            Ok::<_, RunError>(())
+        })
+        .await?;
+        pruned += 1;
+    }
+    Ok(pruned)
 }
 
 #[cfg(test)]

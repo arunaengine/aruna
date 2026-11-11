@@ -27,11 +27,13 @@ use super::dispatch::enqueue_timers;
 use super::install::read_config;
 use super::intents::open_intent;
 use super::receiver::{eligible, lost_reason};
-use super::runs::{read_run, save_run, unfinished};
+use super::runs::{prune_runs, read_run, save_run, unfinished};
 use crate::driver::DriverContext;
 
 /// How often the worker looks for due runs.
 pub const TICK: Duration = Duration::from_secs(1);
+/// How often the worker prunes runs that ended before the retention period.
+const PRUNE_MS: u64 = 3600 * 1000;
 /// Longest wait before a run that failed in the host starts again.
 const MAX_BACKOFF_MS: u64 = 10 * 60 * 1000;
 
@@ -347,9 +349,17 @@ pub fn spawn_worker(
     };
     let token = shutdown.token();
     shutdown.spawn(async move {
+        let mut pruned_at = 0;
         loop {
-            if let Err(error) = worker.claim(unix_timestamp_millis()).await {
+            let now = unix_timestamp_millis();
+            if let Err(error) = worker.claim(now).await {
                 warn!(%error, "Could not start plugin runs");
+            }
+            if now.saturating_sub(pruned_at) >= PRUNE_MS {
+                pruned_at = now;
+                if let Err(error) = prune_runs(&worker.ctx, now).await {
+                    warn!(%error, "Could not prune finished plugin runs");
+                }
             }
             tokio::select! {
                 _ = token.cancelled() => break,

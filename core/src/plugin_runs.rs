@@ -25,7 +25,7 @@ pub const MAX_LOG_BYTES: usize = 64 * 1024;
 pub const MAX_MESSAGE: usize = 4 * 1024;
 
 /// Row kinds in the runs keyspace, before the install id.
-const RUN_ROW: u8 = b'r';
+pub const RUN_ROW: u8 = b'r';
 const TIMER_ROW: u8 = b't';
 
 /// What started a run.
