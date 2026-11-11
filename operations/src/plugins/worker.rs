@@ -11,7 +11,7 @@ use aruna_core::NodeId;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{MAX_ATTEMPTS, PluginRun, RUNS_PARALLEL, RunState, RunTrigger};
 use aruna_core::shutdown::Shutdown;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::permission::Permission;
@@ -26,6 +26,7 @@ use super::check::RunScope;
 use super::dispatch::enqueue_timers;
 use super::install::read_config;
 use super::intents::open_intent;
+use super::receiver::{eligible, lost_reason};
 use super::runs::{read_run, save_run, unfinished};
 use crate::driver::DriverContext;
 
@@ -54,6 +55,8 @@ pub struct Worker {
     runtime: Runtime,
     /// Runs executing now, with their install and cancel token.
     running: Mutex<HashMap<Ulid, (Ulid, CancellationToken)>>,
+    /// Why a running guest was cancelled, by run.
+    reasons: Mutex<HashMap<Ulid, &'static str>>,
     tasks: TaskTracker,
     stopping: CancellationToken,
 }
@@ -71,6 +74,7 @@ impl Worker {
             local,
             runtime,
             running: Mutex::new(HashMap::new()),
+            reasons: Mutex::new(HashMap::new()),
             tasks: TaskTracker::new(),
             stopping: CancellationToken::new(),
         }))
@@ -91,27 +95,29 @@ impl Worker {
         let config = read_config(&self.ctx, self.realm_id)
             .await
             .map_err(|error| error.to_string())?;
-        if !(config.installs.iter()).any(|install| install.receiver == self.local) {
-            return Ok(0);
-        }
+        self.revoke(&config);
         let timers = enqueue_timers(&self.ctx, &config, self.local, now_ms).await;
         timers.map_err(|error| error.to_string())?;
         let queued = unfinished(&self.ctx)
             .await
             .map_err(|error| error.to_string())?;
+        let here = eligible(&config, self.local);
         let mut started = 0;
         for (install_id, run_id) in queued {
-            let busy = self
-                .running()
-                .values()
+            if self.running().contains_key(&run_id) {
+                continue;
+            }
+            let Some(install) =
+                (config.installs.iter()).find(|install| install.install_id == install_id)
+            else {
+                self.drop_run(install_id, run_id, now_ms).await?;
+                continue;
+            };
+            let busy = (self.running().values())
                 .filter(|(install, _)| *install == install_id)
                 .count();
-            let runs_here = (config.installs.iter()).any(|install| {
-                install.install_id == install_id
-                    && install.receiver == self.local
-                    && install.state == InstallState::Active
-            });
-            if !runs_here || busy >= RUNS_PARALLEL || self.running().contains_key(&run_id) {
+            let ready = install.receiver == self.local && install.state == InstallState::Active;
+            if !ready || !here || busy >= RUNS_PARALLEL {
                 continue;
             }
             let mut run = read_run(&self.ctx, install_id, run_id)
@@ -135,13 +141,46 @@ impl Worker {
         Ok(started)
     }
 
-    /// Cancels the running guests of an install.
-    pub fn cancel_install(&self, install_id: Ulid) {
-        for (install, cancel) in self.running().values() {
-            if *install == install_id {
+    /// Cancels the running guests of installs that were paused or removed, or of every install
+    /// while this node can no longer run installs; other changes apply at the next call.
+    fn revoke(&self, config: &RealmConfigDocument) {
+        let lost = lost_reason(config, self.local);
+        let running = self.running();
+        for (run_id, (install_id, cancel)) in running.iter() {
+            let install =
+                (config.installs.iter()).find(|install| install.install_id == *install_id);
+            let reason = match install {
+                None => Some("the install was removed"),
+                Some(install) if install.state == InstallState::Removing => {
+                    Some("the install was removed")
+                }
+                Some(_) if lost.is_some() => lost,
+                Some(install) if install.paused => Some("the install was paused"),
+                Some(_) => None,
+            };
+            if let Some(reason) = reason {
+                self.reasons().insert(*run_id, reason);
                 cancel.cancel();
             }
         }
+    }
+
+    fn reasons(&self) -> std::sync::MutexGuard<'_, HashMap<Ulid, &'static str>> {
+        self.reasons
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Ends a queued run whose install is gone.
+    async fn drop_run(&self, install_id: Ulid, run_id: Ulid, now_ms: u64) -> Result<(), String> {
+        let mut run = read_run(&self.ctx, install_id, run_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let message = "the install was removed".to_string();
+        run.finish(RunState::Cancelled, Some(message), now_ms);
+        save_run(&self.ctx, &run)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Stops claiming, cancels every running guest and waits until each attempt ended.
@@ -189,13 +228,18 @@ impl Worker {
                 run.finish(RunState::Succeeded, None, now);
             }
             (Ended::Failed(message), _) => run.finish(RunState::Failed, Some(message), now),
-            (Ended::Cancelled(message), _) => run.finish(RunState::Cancelled, Some(message), now),
+            (Ended::Cancelled(message), _) => {
+                let reason = self.reasons().remove(&run.run_id);
+                let message = reason.map_or(message, str::to_string);
+                run.finish(RunState::Cancelled, Some(message), now);
+            }
             (Ended::Retry(message), _) => retry(&mut run, message, now),
             (Ended::Stopped, _) => {}
         }
         if let Err(error) = save_run(&self.ctx, &run).await {
             warn!(run = %run.run_id, %error, "Could not save a finished plugin run");
         }
+        self.reasons().remove(&run.run_id);
         self.running().remove(&run.run_id);
     }
 

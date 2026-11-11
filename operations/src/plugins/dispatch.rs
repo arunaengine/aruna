@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::install::{InstallError, check_admin, pick_version, read_config, read_manifest};
+use super::receiver::lost_reason;
 use super::runs::{ADMISSIONS, RunError, admit, admit_in};
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
@@ -24,6 +25,11 @@ pub enum StartError {
     Install(#[from] InstallError),
     #[error("this node does not run the install; its receiver is {0}")]
     Elsewhere(NodeId),
+    #[error("the install is blocked: {reason} ({receiver})")]
+    Lost {
+        receiver: NodeId,
+        reason: &'static str,
+    },
     #[error("the plugin has no {0} trigger")]
     NoTrigger(&'static str),
     #[error("the input is not a JSON value of at most 64 KiB")]
@@ -92,6 +98,10 @@ pub async fn start_run(
         .find(|install| install.install_id == install_id)
         .ok_or(InstallError::NotFound)?;
     check_admin(ctx, auth, install.group_id).await?;
+    if let Some(reason) = lost_reason(&config, install.receiver) {
+        let receiver = install.receiver;
+        return Err(StartError::Lost { receiver, reason });
+    }
     if install.receiver != local {
         return Err(StartError::Elsewhere(install.receiver));
     }
@@ -123,7 +133,8 @@ pub async fn enqueue_timers(
 ) -> Result<usize, StoreError> {
     let mut queued = 0;
     for install in &config.installs {
-        if install.receiver != local || install.state != InstallState::Active {
+        let lost = lost_reason(config, install.receiver).is_some();
+        if install.receiver != local || install.state != InstallState::Active || lost {
             continue;
         }
         let Some(every) = (pick_version(config, &install.plugin, Some(&install.digest)).ok())

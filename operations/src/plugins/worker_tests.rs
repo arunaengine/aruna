@@ -167,3 +167,76 @@ async fn bounded_and_restarted() {
         .unwrap();
     assert_eq!(again.attempts, 2);
 }
+
+/// Marks this node as draining in the realm config.
+async fn drain(fixture: &Fixture) {
+    let mut config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let node = fixture.actor.node_id;
+    let entry = config
+        .placement_map
+        .iter_mut()
+        .find(|entry| entry.node_id == node);
+    entry.unwrap().draining = true;
+    let target = aruna_core::document::DocumentTarget::RealmConfig {
+        realm_id: fixture.actor.realm_id,
+    };
+    let value = config.to_bytes(&fixture.actor).unwrap();
+    let key = target.storage_key().to_vec();
+    fixture
+        .write_row(target.storage_keyspace(), key, value)
+        .await;
+}
+
+#[tokio::test]
+async fn revoked_runs() {
+    use crate::plugins::dispatch::{StartError, start_run};
+    use crate::plugins::lifecycle::{pause_install, remove_install, resume_install};
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let install = installed(&fixture).await;
+    let state = async |run: &PluginRun| {
+        let run = read_run(ctx, install.install_id, run.run_id).await.unwrap();
+        (run.state, run.message.unwrap_or_default())
+    };
+    let worker = worker(&fixture);
+    let paused = admitted(&fixture, &install, 1, "spin").await;
+    assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
+    pause_install(ctx, actor, &auth, install.install_id)
+        .await
+        .unwrap();
+    worker.claim(unix_timestamp_millis()).await.unwrap();
+    worker.settle().await;
+    let cancelled = (RunState::Cancelled, "the install was paused".to_string());
+    assert_eq!(state(&paused).await, cancelled);
+
+    // A draining receiver cancels its guests and refuses new runs, without a record write.
+    resume_install(ctx, actor, &auth, install.install_id)
+        .await
+        .unwrap();
+    let lost = admitted(&fixture, &install, 2, "spin").await;
+    assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
+    drain(&fixture).await;
+    worker.claim(unix_timestamp_millis()).await.unwrap();
+    worker.settle().await;
+    assert_eq!(state(&lost).await.1, "the node that runs it is draining");
+    let (realm, node) = (actor.realm_id, actor.node_id);
+    let refused = start_run(ctx, &auth, realm, node, install.install_id, "{}", 1).await;
+    assert!(matches!(refused, Err(StartError::Lost { receiver, .. }) if receiver == node));
+    let before = read_config(ctx, realm).await.unwrap().installs;
+    assert!(
+        before
+            .iter()
+            .any(|record| record.revision == install.revision + 2)
+    );
+
+    // Queued runs of a removed install end as cancelled.
+    let queued = admitted(&fixture, &install, 3, "echo").await;
+    remove_install(ctx, actor, &auth, install.install_id)
+        .await
+        .unwrap();
+    worker.claim(unix_timestamp_millis()).await.unwrap();
+    assert_eq!(state(&queued).await.0, RunState::Cancelled);
+    assert!(unfinished(ctx).await.unwrap().is_empty());
+}

@@ -19,6 +19,7 @@ use aruna_operations::plugins::install::{
     read_manifest,
 };
 use aruna_operations::plugins::lifecycle::remove_install;
+use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::records::RecordError;
 use aruna_operations::users::service_account::group_admin_path;
 use aruna_plugins::manifest::Manifest;
@@ -120,6 +121,8 @@ pub struct InstallView {
     pub receiver: String,
     /// `preparing`, `active`, `paused`, `blocked` or `removing`.
     pub status: String,
+    /// Why the install is blocked while the node that runs it cannot run it.
+    pub blocked_reason: Option<String>,
     /// An admin paused it; it stays paused through updates and grant changes until resumed.
     pub paused: bool,
     #[schema(value_type = Object)]
@@ -149,7 +152,7 @@ pub struct InstallListQuery {
     pub limit: Option<usize>,
 }
 
-const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"]}}"#;
+const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"]}}"#;
 
 pub(crate) fn view_example() -> Value {
     serde_json::from_str(VIEW_EXAMPLE).unwrap_or(Value::Null)
@@ -428,6 +431,8 @@ fn view_in(config: &RealmConfigDocument, install: PluginInstall) -> InstallView 
         Some(manifest) => summary(&manifest, &install.digest, &scope, &install.grants),
         None => bare_summary(&install),
     };
+    // A lost receiver blocks the install here; its stored state stays as it is.
+    let lost = lost_reason(config, install.receiver);
     InstallView {
         id: install.install_id.to_string(),
         plugin: install.plugin,
@@ -436,7 +441,11 @@ fn view_in(config: &RealmConfigDocument, install: PluginInstall) -> InstallView 
         group: install.group_id.to_string(),
         account: install.account.to_string(),
         receiver: install.receiver.to_string(),
-        status: install.state.as_str().to_string(),
+        status: match lost {
+            Some(_) => "blocked".to_string(),
+            None => install.state.as_str().to_string(),
+        },
+        blocked_reason: lost.map(str::to_string),
         paused: install.paused,
         settings: serde_json::from_str(&install.settings).unwrap_or(Value::Null),
         granted_by: install.granted_by.to_string(),
