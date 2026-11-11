@@ -708,6 +708,13 @@ pub enum MetadataTransportMessage {
     EventsDecided {
         result: Result<crate::plugins::forward::Decisions, MetadataReadError>,
     },
+    /// A plugin install's receiver asks for the secret bound to one of its slots.
+    ReleaseSecret {
+        request: crate::plugins::release::ReleaseRequest,
+    },
+    SecretReleased {
+        result: Result<crate::plugins::release::Released, crate::plugins::release::ReleaseError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.

@@ -1216,6 +1216,15 @@ impl MetadataHandle {
                 let result = Box::pin(decided).await;
                 (MetadataTransportMessage::EventsDecided { result }, None)
             }
+            MetadataTransportMessage::ReleaseSecret { request } => {
+                let keys = crate::plugins::release::ReleaseKeys {
+                    seal: self.realm_seal_key(),
+                    vault: self.realm_vault_key(),
+                };
+                let released = crate::plugins::release::serve_release(context, keys, peer, request);
+                let result = Box::pin(released).await;
+                (MetadataTransportMessage::SecretReleased { result }, None)
+            }
             MetadataTransportMessage::PromotionCheck => {
                 let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
                 let result = Box::pin(ready).await;

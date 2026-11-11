@@ -544,6 +544,8 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::ClockProbed { .. } => "clock_probed",
         MetadataTransportMessage::ForwardEvents { .. } => "forward_events",
         MetadataTransportMessage::EventsDecided { .. } => "events_decided",
+        MetadataTransportMessage::ReleaseSecret { .. } => "release_secret",
+        MetadataTransportMessage::SecretReleased { .. } => "secret_released",
     }
 }
 
@@ -837,6 +839,21 @@ impl MetadataHandle {
         {
             MetadataTransportMessage::EventsDecided { result } => result,
             _ => Err(MetadataReadError::Unavailable),
+        }
+    }
+
+    /// The secret bound to a plugin install's slot, released by the management node `node_id`.
+    pub async fn request_release(
+        &self,
+        node_id: NodeId,
+        request: crate::plugins::release::ReleaseRequest,
+    ) -> Result<crate::plugins::release::Released, crate::plugins::release::ReleaseError> {
+        use crate::plugins::release::ReleaseError;
+        let request = MetadataTransportMessage::ReleaseSecret { request };
+        let unavailable = || ReleaseError::Unavailable(format!("node {node_id} did not answer"));
+        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
+            Ok(MetadataTransportMessage::SecretReleased { result }) => result,
+            _ => Err(unavailable()),
         }
     }
 
