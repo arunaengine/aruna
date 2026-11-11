@@ -313,3 +313,22 @@ async fn removed_with_intents() {
     assert_eq!(state(&open).await, RunState::NeedsAttention);
     assert_eq!(state(&clean).await, RunState::Cancelled);
 }
+
+#[test]
+fn busy_keeps_attempts() {
+    // A full runtime never entered the guest, so the run waits without using an attempt.
+    let busy = ended(Err(InvokeError::Overloaded), false);
+    assert!(matches!(busy, Ended::Busy(_)), "{busy:?}");
+    let mut run = queued(Ulid::from_parts(1, 1), 1);
+    run.attempts = MAX_ATTEMPTS;
+    for _ in 0..3 * MAX_ATTEMPTS {
+        conclude(&mut run, Ended::Busy("busy".into()), false, Ok(None), 9);
+        assert_eq!(run.state, RunState::Queued);
+        run.attempts += 1;
+    }
+    assert_eq!(run.attempts, MAX_ATTEMPTS);
+    assert!(matches!(
+        ended(Err(InvokeError::Cancelled), true),
+        Ended::Stopped
+    ));
+}

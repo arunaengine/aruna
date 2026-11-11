@@ -46,6 +46,8 @@ enum Ended {
     /// A host or infrastructure error: the run starts again later.
     Retry(String),
     Cancelled(String),
+    /// The runtime had no free slot: the run waits without using an attempt.
+    Busy(String),
     /// The node stops; the run starts again from the top at the next start.
     Stopped,
 }
@@ -267,21 +269,26 @@ impl Worker {
             Err(error) => return Ended::Retry(format!("the artifact does not compile: {error}")),
         };
         let call = invocation(run, install, cancel);
-        match self.runtime.invoke(&compiled, call, broker).await {
-            Ok(output) => Ended::Output(output),
-            Err(InvokeError::Guest(failure)) => match failure.kind {
-                FailureKind::Permanent | FailureKind::InvalidInput => {
-                    Ended::Failed(failure.message)
-                }
-                FailureKind::Retryable => Ended::Retry(failure.message),
-            },
-            Err(InvokeError::Cancelled) if self.stopping.is_cancelled() => Ended::Stopped,
-            Err(InvokeError::Cancelled) => Ended::Cancelled("the run was cancelled".into()),
-            Err(error @ (InvokeError::Overloaded | InvokeError::Closed)) => {
-                Ended::Retry(error.to_string())
-            }
-            Err(error) => Ended::Failed(error.to_string()),
+        let invoked = self.runtime.invoke(&compiled, call, broker).await;
+        ended(invoked, self.stopping.is_cancelled())
+    }
+}
+
+/// How an invocation ended. A runtime without a free slot never entered the guest, so the run
+/// waits without using an attempt.
+fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool) -> Ended {
+    match invoked {
+        Ok(output) => Ended::Output(output),
+        Err(InvokeError::Guest(failure)) => match failure.kind {
+            FailureKind::Permanent | FailureKind::InvalidInput => Ended::Failed(failure.message),
+            FailureKind::Retryable => Ended::Retry(failure.message),
+        },
+        Err(InvokeError::Cancelled) if stopping => Ended::Stopped,
+        Err(InvokeError::Cancelled) => Ended::Cancelled("the run was cancelled".into()),
+        Err(error @ (InvokeError::Overloaded | InvokeError::Closed)) => {
+            Ended::Busy(error.to_string())
         }
+        Err(error) => Ended::Failed(error.to_string()),
     }
 }
 
@@ -335,6 +342,7 @@ fn conclude(
         Ended::Failed(message) => run.finish(RunState::Failed, Some(message), now_ms),
         Ended::Cancelled(message) => run.finish(RunState::Cancelled, Some(message), now_ms),
         Ended::Retry(message) => retry(run, message, now_ms),
+        Ended::Busy(message) => hold(run, message, now_ms),
         Ended::Stopped => {}
     }
 }
