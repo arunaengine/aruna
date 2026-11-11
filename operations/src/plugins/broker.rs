@@ -401,8 +401,8 @@ impl Broker for RunBroker {
             "plugin {} install {} run {run}",
             install.plugin, install.install_id
         );
-        let jsonld = merge_dataset(&jsonld, &patch.patch)?;
-        let mutation = UpdateDocumentMutation::ReplaceRoCrate { jsonld };
+        let jsonld = dataset_change(&jsonld, &patch.patch)?;
+        let mutation = UpdateDocumentMutation::UpsertContextualEntity { jsonld };
         let update = route_metadata_update(
             &self.ctx,
             actor,
@@ -581,9 +581,10 @@ pub(crate) fn dataset_of(jsonld: &str) -> Result<String, HostError> {
     Ok(dataset.to_string())
 }
 
-/// The crate with `patch` merged into its dataset entity as a JSON merge patch: other fields
-/// stay, `null` removes one, and the id stays fixed.
-pub(crate) fn merge_dataset(jsonld: &str, patch: &str) -> Result<String, HostError> {
+/// The change a patch makes to a crate's dataset entity: its id, types and name, and each
+/// patched field with its value after a JSON merge patch, `null` removing one. Other fields and
+/// other entities are not part of it, so they stay as they are.
+pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostError> {
     let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
     let patch: Value = serde_json::from_str(patch).map_err(|_| invalid("the patch is not JSON"))?;
     let Value::Object(changes) = patch else {
@@ -596,9 +597,21 @@ pub(crate) fn merge_dataset(jsonld: &str, patch: &str) -> Result<String, HostErr
         serde_json::from_str(jsonld).map_err(|_| unavailable("the stored crate is not JSON"))?;
     let dataset = dataset_mut(&mut crate_json)?;
     plain_objects(dataset);
-    merge_into(dataset, Value::Object(changes));
-    literal_objects(dataset);
-    Ok(crate_json.to_string())
+    let mut merged = dataset.clone();
+    let fields: Vec<String> = changes.keys().cloned().collect();
+    merge_into(&mut merged, Value::Object(changes));
+    let mut change = serde_json::Map::new();
+    for field in ["@id", "@type", "name"]
+        .map(str::to_string)
+        .into_iter()
+        .chain(fields)
+    {
+        let value = merged.get(&field).cloned().unwrap_or(Value::Null);
+        change.insert(field, value);
+    }
+    let mut change = Value::Object(change);
+    literal_objects(&mut change);
+    Ok(change.to_string())
 }
 
 /// Turns the dataset's JSON literals back into the objects a plugin wrote.
@@ -639,19 +652,26 @@ fn merge_into(target: &mut Value, patch: Value) {
     }
 }
 
-/// Stores each plain object field of the dataset, one without JSON-LD keywords, as a JSON
+/// Stores each plain object value of the change, one without JSON-LD keywords, as a JSON
 /// literal, so it stays one value instead of becoming an untyped node.
-fn literal_objects(dataset: &mut Value) {
-    let Value::Object(fields) = dataset else {
+fn literal_objects(change: &mut Value) {
+    let Value::Object(fields) = change else {
         return;
     };
+    let plain = |value: &Value| {
+        (value.as_object()).is_some_and(|object| !object.keys().any(|key| key.starts_with('@')))
+    };
+    let literal =
+        |value: &Value| serde_json::json!({ "@type": JSON_LITERAL, "@value": value.to_string() });
     for value in fields.values_mut() {
-        let plain = value
-            .as_object()
-            .is_some_and(|object| !object.keys().any(|key| key.starts_with('@')));
-        if plain {
-            let json = std::mem::take(value);
-            *value = serde_json::json!({ "@type": "@json", "@value": json });
+        match value {
+            Value::Array(entries) => {
+                for entry in entries.iter_mut().filter(|entry| plain(entry)) {
+                    *entry = literal(entry);
+                }
+            }
+            entry if plain(entry) => *entry = literal(entry),
+            _ => {}
         }
     }
 }

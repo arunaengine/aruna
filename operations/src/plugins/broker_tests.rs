@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::metadata::MetadataHandle;
+use crate::metadata::api::{DocumentQueryRequest, query_metadata_document};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, create_metadata_document,
 };
@@ -319,21 +320,87 @@ async fn dataset_patches() {
 }
 
 #[test]
-fn merge_patch() {
-    let crate_json = r#"{"@graph":[{"@id":"ro-crate-metadata.json","about":{"@id":"./"}},{"@id":"./","name":"a","keywords":["x"],"identifier":{"doi":"d"}}]}"#;
-    let merged = merge_dataset(
-        crate_json,
-        r#"{"identifier":{"catalog":"c"},"keywords":null}"#,
-    );
-    let merged = merged.unwrap();
-    let stored: Value = serde_json::from_str(&merged).unwrap();
-    assert_eq!(stored["@graph"][1]["identifier"]["@type"], "@json");
-    let dataset: Value = serde_json::from_str(&dataset_of(&merged).unwrap()).unwrap();
-    assert_eq!(dataset["name"], "a");
-    let both = serde_json::json!({"doi": "d", "catalog": "c"});
-    assert_eq!(dataset["identifier"], both);
-    assert!(dataset.get("keywords").is_none());
-    assert!(merge_dataset(crate_json, "[1]").is_err());
+fn change_patch() {
+    let crate_json = r#"{"@graph":[{"@id":"ro-crate-metadata.json","about":{"@id":"./"}},{"@id":"./","@type":"Dataset","name":"a","keywords":["x"],"description":"kept","identifier":{"@type":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON","@value":"{\"doi\":\"d\"}"}}]}"#;
+    let patch = r#"{"identifier":{"catalog":"c"},"keywords":null}"#;
+    let change: Value = serde_json::from_str(&dataset_change(crate_json, patch).unwrap()).unwrap();
+    // Only the id, types, name and the patched fields are part of the change.
+    let mut fields: Vec<&str> = change
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort();
+    assert_eq!(fields, ["@id", "@type", "identifier", "keywords", "name"]);
+    assert_eq!(change["keywords"], Value::Null);
+    let identifier = change["identifier"]["@value"].as_str().unwrap();
+    let identifier: Value = serde_json::from_str(identifier).unwrap();
+    assert_eq!(identifier, serde_json::json!({"doi": "d", "catalog": "c"}));
+    assert!(dataset_change(crate_json, "[1]").is_err());
+    assert!(dataset_change(crate_json, r#"{"@id":"./b"}"#).is_err());
+}
+
+#[tokio::test]
+async fn patch_keeps_entities() {
+    // A patch of the dataset leaves nested data entities and unreferenced contextual ones.
+    let (fixture, broker, _, _dir) = broker().await;
+    let jsonld = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.1/context",
+        "@graph": [
+            {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"},
+             "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"}},
+            {"@id": "./", "@type": "Dataset", "name": "two", "description": "d",
+             "datePublished": "2026-01-01", "hasPart": [{"@id": "data/"}]},
+            {"@id": "data/", "@type": "Dataset", "name": "data", "hasPart": [{"@id": "data/file.txt"}]},
+            {"@id": "data/file.txt", "@type": "File", "name": "nested file"},
+            {"@id": "#lab", "@type": "Organization", "name": "unreferenced lab"}
+        ]
+    });
+    let create = CreateDocumentOperation::new(CreateDocumentConfig {
+        actor: fixture.actor.clone(),
+        group_id: fixture.group_id,
+        document_id: Ulid::nil(),
+        document_path: "/docs/two/".to_string(),
+        public: false,
+        payload: CreateDocumentPayload::RoCrate {
+            jsonld: jsonld.to_string(),
+        },
+    });
+    let created = create_metadata_document(create, broker.ctx.clone())
+        .await
+        .unwrap();
+    project(&broker.ctx).await;
+    let document = created.record.document_id;
+    let read = broker
+        .metadata_get(&cx(), &document.to_string())
+        .await
+        .unwrap();
+    let example = r#"{"identifier":{"catalog":"c-1"}}"#;
+    let change = patch(document, &read.revision, 0, example);
+    broker.metadata_patch(&cx(), change).await.unwrap();
+    project(&broker.ctx).await;
+    let request = DocumentQueryRequest {
+        document_id: document,
+        auth: Some(fixture.auth()),
+        bearer_token: None,
+        query: "SELECT ?s ?o WHERE { ?s <http://schema.org/name> ?o }".to_string(),
+        mode: None,
+        allow_partial: false,
+    };
+    let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
+    let names = query_metadata_document(&broker.ctx, realm, node, request)
+        .await
+        .unwrap();
+    let names = format!("{:?}", names.results);
+    for kept in ["nested file", "unreferenced lab", "two"] {
+        assert!(names.contains(kept), "{kept} is gone: {names}");
+    }
+    let after = broker
+        .metadata_get(&cx(), &document.to_string())
+        .await
+        .unwrap();
+    assert!(after.json.contains("c-1"), "{}", after.json);
 }
 
 #[tokio::test]
