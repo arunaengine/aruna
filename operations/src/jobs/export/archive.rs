@@ -169,18 +169,12 @@ pub(super) fn recognize_entities(
     }
 
     let mut entities = Vec::new();
-    for (subject, entity_id, raw_path, texts) in raw_ids {
+    for (subject, entity_id, raw_path) in raw_ids {
         if !files.remove(&subject) {
             continue;
         }
-        // Expansion may resolve a value into an Aruna identifier the crate never stores, such as
-        // a protocol-relative or prefix-compact one; only a value stored as written names objects.
         let urls = content_urls.get(&subject).map_or(&[][..], Vec::as_slice);
-        let urls: Vec<String> = (urls.iter())
-            .filter(|url| texts.contains(*url))
-            .cloned()
-            .collect();
-        let identity = DataIdentity::read(&entity_id, &urls);
+        let identity = DataIdentity::read(&entity_id, urls);
         let storage_key = identity
             .exact
             .as_ref()
@@ -251,11 +245,11 @@ pub(super) fn recognize_entities(
 pub(super) fn raw_entity_ids(
     document: &JsonValue,
     keywords: &JsonLdKeywords,
-) -> Result<Vec<RawEntity>, ExportFailure> {
+) -> Result<Vec<(String, String, Option<String>)>, ExportFailure> {
     fn collect(
         value: &JsonValue,
         keywords: &JsonLdKeywords,
-        entities: &mut Vec<RawEntity>,
+        entities: &mut Vec<(String, String, Option<String>)>,
     ) -> Result<(), ExportFailure> {
         match value {
             JsonValue::Array(values) => {
@@ -268,9 +262,9 @@ pub(super) fn raw_entity_ids(
                     && let Some((_, id)) = keywords.object_id(object)
                 {
                     let expanded = expanded_id(id)?;
-                    if let Some((_, existing_id, _, _)) = entities
+                    if let Some((_, existing_id, _)) = entities
                         .iter()
-                        .find(|(existing, _, _, _)| existing == &expanded)
+                        .find(|(existing, _, _)| existing == &expanded)
                     {
                         if existing_id != id {
                             return Err(ExportFailure::Permanent(format!(
@@ -278,12 +272,7 @@ pub(super) fn raw_entity_ids(
                             )));
                         }
                     } else {
-                        let mut texts = BTreeSet::new();
-                        object
-                            .values()
-                            .for_each(|value| stored_texts(value, &mut texts));
-                        let path = raw_local_path(object, keywords);
-                        entities.push((expanded, id.to_string(), path, texts));
+                        entities.push((expanded, id.to_string(), raw_local_path(object, keywords)));
                     }
                 }
                 for value in object.values() {
@@ -298,20 +287,6 @@ pub(super) fn raw_entity_ids(
     let mut entities = Vec::new();
     collect(document, keywords, &mut entities)?;
     Ok(entities)
-}
-
-/// An entity as written: its expanded and raw id, its raw local path, and every text its values
-/// store.
-pub(super) type RawEntity = (String, String, Option<String>, BTreeSet<String>);
-
-/// Collects every string a stored value holds, in objects and arrays too.
-fn stored_texts(value: &JsonValue, texts: &mut BTreeSet<String>) {
-    match value {
-        JsonValue::String(text) => drop(texts.insert(text.clone())),
-        JsonValue::Array(values) => values.iter().for_each(|value| stored_texts(value, texts)),
-        JsonValue::Object(fields) => fields.values().for_each(|value| stored_texts(value, texts)),
-        _ => {}
-    }
 }
 
 pub(super) fn raw_local_path(
