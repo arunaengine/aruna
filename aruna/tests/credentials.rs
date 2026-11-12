@@ -1,19 +1,27 @@
-//! Tests scoped S3 credentials: inherited, narrowed, read-only and rejected path scopes.
+//! Tests S3 credentials: path scopes, token credentials and lifetimes beyond the issuing token.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::shared;
 
 use aruna_api::routes::credentials::CreatePathRestriction;
+use aruna_core::auth::{MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS};
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::storage::blob::group_permission_path;
+use aruna_core::structs::storage::blob::never_expiry;
+use aruna_operations::driver::drive;
+use aruna_operations::s3::access::cutoff::{CutoffSweepConfig, CutoffSweepOperation};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use base64::engine::general_purpose::STANDARD;
 use reqwest::StatusCode;
 use shared::{
-    TestResult, create_group_http, create_s3_credentials, get_user_access, request_credentials,
-    s3_client, sign_scoped_token, spawn_complete_seed, spawn_seed_node, wait_group_http,
+    S3Credentials, TestResult, WAIT_CAP, create_group_http, create_s3_credentials, get_user_access,
+    request_credentials, revoke_s3_credentials, s3_client, s3_client_once, sign_scoped_token,
+    sign_token, spawn_complete_seed, spawn_seed_node, wait_group_http, wait_until,
 };
+use std::time::{Duration, SystemTime};
+
+const MONTH_SECS: u64 = 30 * 24 * 60 * 60;
 
 async fn create_bearer_token(
     context: &aruna_operations::driver::DriverContext,
@@ -326,6 +334,186 @@ async fn scoped_list_denies() -> TestResult<()> {
     assert_eq!(
         service_error_code(&blocked_list).as_deref(),
         Some("AccessDenied")
+    );
+
+    seed.shutdown().await;
+    Ok(())
+}
+
+/// Requests a credential through `token`, with `seconds` of lifetime or none.
+async fn post_lifetime(
+    base_url: &str,
+    token: &str,
+    group_id: &str,
+    seconds: Option<u64>,
+) -> TestResult<S3Credentials> {
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/api/v1/access/credentials"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "group_id": group_id, "expires_in_seconds": seconds }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created: aruna_api::routes::credentials::CreateS3Response = response.json().await?;
+    Ok(S3Credentials {
+        access_key_id: created.access_key_id,
+        access_secret: created.access_secret,
+    })
+}
+
+async fn put_code(client: &aws_sdk_s3::Client, key: &str) -> Option<String> {
+    let body = aws_sdk_s3::primitives::ByteStream::from_static(b"entry");
+    let put = client.put_object().bucket("lasting").key(key).body(body);
+    service_error_code(&put.send().await)
+}
+
+/// A seed whose admin created a group with the bucket `lasting`, and the admin's token.
+async fn lasting_seed(name: &str) -> TestResult<(shared::SeedNode, String, String)> {
+    let seed = spawn_complete_seed().await?;
+    let (context, realm_id) = (seed.context.as_ref(), seed.realm_id);
+    let admin =
+        create_bearer_token(context, seed.user_id, realm_id, seed.capabilities.clone()).await?;
+    let group = create_group_http(&seed.base_url, &admin, name).await?;
+    let s3 = seed.s3.clone().ok_or("missing s3 endpoint")?;
+    let bootstrap = create_s3_credentials(&seed.base_url, &admin, &group.group_id).await?;
+    let client = s3_client(&s3, &bootstrap);
+    client.create_bucket().bucket("lasting").send().await?;
+    Ok((seed, admin, group.group_id))
+}
+
+#[tokio::test]
+async fn credential_outlives_session() -> TestResult<()> {
+    // The credential keeps its requested lifetime, or none; revocation still ends it.
+    let (seed, admin, group_id) = lasting_seed("credentials-lifetime").await?;
+    let context = seed.context.as_ref();
+    let s3 = seed.s3.clone().ok_or("missing s3 endpoint")?;
+
+    let day = sign_token(&seed, seed.user_id, None, 24 * 60 * 60)?;
+    let issued = post_lifetime(&seed.base_url, &day, &group_id, Some(MONTH_SECS)).await?;
+    let stored = get_user_access(context, &issued.access_key_id).await?;
+    let floor = SystemTime::now() + Duration::from_secs(MONTH_SECS - 3_600);
+    assert!(stored.expiry > floor, "a 24 hour session keeps the 30 days");
+
+    let short = sign_token(&seed, seed.user_id, None, 15)?;
+    let keys = post_lifetime(&seed.base_url, &short, &group_id, None).await?;
+    let stored = get_user_access(context, &keys.access_key_id).await?;
+    assert_eq!(stored.expiry, never_expiry(), "no lifetime means no expiry");
+    let group_path = &format!("{}/api/v1/access/groups/{group_id}", seed.base_url);
+    let short = &short;
+    wait_until(
+        "the issuing token to expire",
+        WAIT_CAP,
+        Duration::from_millis(500),
+        || async move {
+            let response = reqwest::Client::new()
+                .get(group_path)
+                .bearer_auth(short)
+                .send()
+                .await;
+            response.is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
+        },
+    )
+    .await?;
+    let client = s3_client_once(&s3, &keys);
+    assert_eq!(put_code(&client, "after-session.txt").await, None);
+
+    revoke_s3_credentials(&seed.base_url, &admin, &keys.access_key_id).await?;
+    let revoked = put_code(&client, "after-revoke.txt").await;
+    assert_eq!(revoked.as_deref(), Some("InvalidAccessKeyId"));
+
+    seed.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restricted_token_caps() -> TestResult<()> {
+    // A path-restricted token's credential ends no later than that token, asked or not.
+    let (seed, admin, group_id) = lasting_seed("credentials-restricted").await?;
+    let root = group_permission_path(seed.realm_id, group_id.parse()?, seed.net.node_id());
+    let scope = PathRestriction {
+        pattern: format!("{root}/**"),
+        permission: Permission::WRITE,
+    };
+    let scoped = sign_scoped_token(&seed, seed.user_id, vec![scope])?;
+    wait_group_http(&seed.base_url, &admin, &group_id).await?;
+    let token_end = SystemTime::now() + Duration::from_secs(600);
+    for seconds in [Some(MONTH_SECS), None] {
+        let keys = post_lifetime(&seed.base_url, &scoped, &group_id, seconds).await?;
+        let stored = get_user_access(seed.context.as_ref(), &keys.access_key_id).await?;
+        assert!(
+            stored.expiry <= token_end,
+            "capped at the token for {seconds:?}"
+        );
+    }
+
+    seed.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn deactivation_ends_credential() -> TestResult<()> {
+    let (seed, admin, group_id) = lasting_seed("credentials-deactivate").await?;
+    let (context, realm_id) = (seed.context.as_ref(), seed.realm_id);
+    let s3 = seed.s3.clone().ok_or("missing s3 endpoint")?;
+    let member = aruna_core::UserId::local(ulid::Ulid::generate(), realm_id);
+    let member_token =
+        create_bearer_token(context, member, realm_id, seed.capabilities.clone()).await?;
+    reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/access/groups/{group_id}/members",
+            seed.base_url
+        ))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({ "user_id": member.to_string() }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let used = post_lifetime(&seed.base_url, &member_token, &group_id, None).await?;
+    let unused = post_lifetime(&seed.base_url, &member_token, &group_id, None).await?;
+    let client = s3_client_once(&s3, &used);
+    assert_eq!(put_code(&client, "member.txt").await, None);
+
+    let status = reqwest::Client::new()
+        .put(format!(
+            "{}/api/v1/access/users/{member}/status",
+            seed.base_url
+        ))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({ "active": false }))
+        .send()
+        .await?;
+    assert_eq!(status.status(), StatusCode::NO_CONTENT);
+
+    // Judged past the 366 day window the cutoff is gone, so a sweep then finds nothing; the
+    // keys must be deleted before. A refused request deletes its key at once.
+    let now = aruna_core::time::unix_timestamp_secs();
+    let later = now + MAX_TOKEN_LIFETIME + REVOCATION_GRACE_SECS + 1;
+    let node_id = seed.net.node_id();
+    let sweep = |now| {
+        CutoffSweepOperation::new(CutoffSweepConfig {
+            realm_id,
+            node_id,
+            now,
+        })
+    };
+    assert_eq!(drive(sweep(later), context).await?, 0);
+    assert_eq!(
+        put_code(&client, "late.txt").await.as_deref(),
+        Some("AccessDenied")
+    );
+    assert!(get_user_access(context, &used.access_key_id).await.is_err());
+
+    // Inside the window the sweep deletes the key no request has refused yet.
+    assert_eq!(drive(sweep(now), context).await?, 1);
+    assert!(
+        get_user_access(context, &unused.access_key_id)
+            .await
+            .is_err()
+    );
+    let unused = s3_client_once(&s3, &unused);
+    assert_eq!(
+        put_code(&unused, "late.txt").await.as_deref(),
+        Some("InvalidAccessKeyId")
     );
 
     seed.shutdown().await;
