@@ -21,7 +21,7 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_operations::auth::bearer_token::realm_user_cutoff;
+use aruna_operations::auth::bearer_token::{account_deactivated, realm_user_cutoff};
 use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JobRouteError;
@@ -30,6 +30,7 @@ use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
 };
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
+use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
@@ -2083,20 +2084,28 @@ async fn authenticate_tes(
     }
     // A user deactivated in this realm loses every credential issued before the cutoff.
     let issued = Ulid::from_string(&access.access_key).map_or(0, |id| id.timestamp_ms() / 1000);
-    let cutoff = realm_user_cutoff(
-        &state.get_ctx().storage_handle,
-        state.get_realm_id(),
-        &access.user_identity,
-    )
-    .await
-    .map_err(|_| {
+    let unavailable = |_| {
         TesError::coded(
             StatusCode::SERVICE_UNAVAILABLE,
             "Revocation state is unavailable",
             "revocation_unavailable",
         )
-    })?;
-    if cutoff.is_some_and(|cutoff| issued < cutoff) {
+    };
+    let context = state.get_ctx();
+    let (storage, owner) = (&context.storage_handle, &access.user_identity);
+    let cutoff = realm_user_cutoff(storage, state.get_realm_id(), owner)
+        .await
+        .map_err(unavailable)?;
+    let deactivated = account_deactivated(storage, owner)
+        .await
+        .map_err(unavailable)?;
+    if deactivated || cutoff.is_some_and(|cutoff| issued < cutoff) {
+        // Deleted at once, so the key stays refused after its cutoff ages out.
+        let revoke = RevokeUserOperation::new(access.access_key.clone());
+        match drive(revoke, &context).await {
+            Ok(_) | Err(RevokeUserError::NotFound) => {}
+            Err(error) => tracing::warn!(error = %error, "Failed to delete a refused credential"),
+        }
         return Err(TesError::unauthorized());
     }
 
