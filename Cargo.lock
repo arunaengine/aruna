@@ -2534,7 +2534,7 @@ checksum = "4f016b9994e39cad68107f33fa5b8dcee8fb7e38332bde3f97690e5e8abe1b10"
 [[package]]
 name = "craqle"
 version = "0.3.2"
-source = "git+https://github.com/arunaengine/craqle?rev=f4e048550aa6a2fb70d582176e18052e020c5163#f4e048550aa6a2fb70d582176e18052e020c5163"
+source = "git+https://github.com/arunaengine/craqle?rev=d4ac035851529b017418aae01aab29c7246b7c87#d4ac035851529b017418aae01aab29c7246b7c87"
 dependencies = [
  "blake3",
  "chrono",
