@@ -405,7 +405,14 @@ impl RunBroker {
                     None,
                 ));
             } else if identity.is_aruna() {
-                hash = hash.or(identity.hash);
+                // Readers keep one hash of a file, so two different ones are never admitted.
+                if let Some(found) = identity.hash {
+                    if hash.is_some_and(|known| known != found) {
+                        let message = "the file names two different content hashes";
+                        return Err(HostError::new(ErrorKind::Invalid, message));
+                    }
+                    hash = Some(found);
+                }
                 unplaced.get_or_insert(value);
             }
         }

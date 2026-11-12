@@ -1218,3 +1218,20 @@ async fn unverified_hash_refused() {
         .await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
 }
+
+#[tokio::test]
+async fn second_hash_checked() {
+    // A file naming two different content hashes is refused, even when the first one matches.
+    use aruna_core::structs::storage::data::identity::content_id;
+    let (fixture, broker, _, _dir) = broker().await;
+    stored_object(&fixture, ("imports", "run/a.txt"), ([5u8; 32], true)).await;
+    let document = three_files(&fixture, &broker).await;
+    let writer = writer_broker(&fixture, &broker, ("0.1.7", "58")).await;
+    let revision = revision_of(&writer, document).await;
+    let file = serde_json::json!({"@id": content_id([5u8; 32]), "@type": "File", "name": "two",
+        "contentUrl": ["s3://imports/run/a.txt", content_id([6u8; 32])]});
+    let refused = writer
+        .metadata_put_file(&cx(), put(document, &file, &revision, 0))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
+}
