@@ -1494,6 +1494,57 @@ fn recognizes_context_aliases() {
     assert_eq!(entities[0].local_path.as_deref(), Some("data/a.txt"));
 }
 
+/// A crate whose context types `contentUrl` as `@id` and adds `extra`, with one file naming
+/// `url`; returns what export recognizes of that file.
+fn typed_reference(extra: JsonValue, url: &str) -> ExportEntity {
+    let realm_id = RealmId::from_bytes([2; 32]);
+    let mut context =
+        json!({"contentUrl": {"@id": "http://schema.org/contentUrl", "@type": "@id"}});
+    context
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let document = json!({
+        "@context": ["https://w3id.org/ro/crate/1.2/context", context],
+        "@graph": [{"@id": "data/b.txt", "@type": "File", "contentUrl": url}]
+    });
+    let mut entities = recognized_entities(&document, realm_id).unwrap();
+    entities.remove(0)
+}
+
+/// A versioned ARN of a private object, as its W3ID.
+fn private_w3id() -> (VersionedObjectArn, String) {
+    let realm_id = RealmId::from_bytes([2; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+    let version = Ulid::from_bytes([4; 16]);
+    let arn = VersionedObjectArn::new(realm_id, node_id, "private", "secret.bin", version).unwrap();
+    let w3id = arn.to_w3id();
+    (arn, w3id)
+}
+
+// Expansion resolves a protocol-relative value against the base, but only an identifier stored
+// as such names an object; the full W3ID stored as is still does.
+#[test]
+fn relative_names_nothing() {
+    let (arn, w3id) = private_w3id();
+    let relative = typed_reference(json!({}), w3id.strip_prefix("https:").unwrap());
+    assert_eq!((relative.exact, relative.storage_key), (None, None));
+    let stored = typed_reference(json!({}), &w3id);
+    assert_eq!(stored.exact, Some(arn));
+}
+
+// A value compacted through a context prefix expands to an identifier it does not store.
+#[test]
+fn compact_names_nothing() {
+    let (_, w3id) = private_w3id();
+    let compact = format!(
+        "aruna:{}",
+        w3id.strip_prefix("https://w3id.org/aruna/").unwrap()
+    );
+    let prefixed = typed_reference(json!({"aruna": "https://w3id.org/aruna/"}), &compact);
+    assert_eq!((prefixed.exact, prefixed.storage_key), (None, None));
+}
+
 #[test]
 fn keeps_import_path() {
     let realm_id = RealmId::from_bytes([2; 32]);
