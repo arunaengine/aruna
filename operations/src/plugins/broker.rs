@@ -33,7 +33,6 @@ use async_trait::async_trait;
 use base64::Engine;
 use craqle::GraphId;
 use oxrdf::Term;
-use oxttl::NQuadsParser;
 use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
@@ -1102,8 +1101,17 @@ pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostEr
     Ok(change.to_string())
 }
 
-/// The references a reader may take for `file` under the stored `context`. Raw-key readers take
-/// stored texts as they are; export expands the raw entity and renders of the stored values.
+/// Terms of a probe entity that name its values as `contentUrl` in every way a render may: as
+/// text, as an `@id` and as an `@vocab` value.
+const PROBE_TERMS: [(&str, Option<&str>); 3] = [
+    ("aruna-probe-text", None),
+    ("aruna-probe-id", Some("@id")),
+    ("aruna-probe-vocab", Some("@vocab")),
+];
+
+/// The references export would read for `file` under the stored `context`: from the crate holding
+/// the entity as the raw revision stores it, and a probe naming each value the graph stores of it
+/// under each [`PROBE_TERMS`] term, expanded and read as export does.
 fn export_references(context: &Value, file: &Value) -> Result<Vec<String>, HostError> {
     let invalid = |message: String| HostError::new(ErrorKind::Invalid, message);
     let graph = GraphId::new("https://craqle.invalid/");
@@ -1111,25 +1119,38 @@ fn export_references(context: &Value, file: &Value) -> Result<Vec<String>, HostE
     let entity = converted
         .map_err(|error| invalid(error.to_string()))?
         .entity;
-    let text = |object: &Term| match object {
-        Term::NamedNode(node) => Some(node.as_str().to_string()),
-        Term::Literal(literal) => Some(literal.value().to_string()),
-        _ => None,
-    };
-    let own = [&entity.entity_id, &entity.entity_type, &entity.name].map(String::clone);
     let objects = entity
         .additional_triples
         .iter()
-        .filter_map(|(_, object)| text(object));
-    let mut texts: Vec<String> = with_bare(own.into_iter().chain(objects).collect());
-    let urls = (entity.additional_triples.iter())
-        .filter(|(predicate, _)| CONTENT_PREDICATES.contains(&predicate.as_str()))
-        .filter_map(|(_, object)| text(object));
-    let urls = with_bare(urls.collect());
-    if context.is_null() {
-        return Err(unavailable("the stored crate has no context"));
+        .filter_map(|(_, object)| match object {
+            Term::NamedNode(node) => Some(node.as_str().to_string()),
+            Term::Literal(literal) => Some(literal.value().to_string()),
+            _ => None,
+        });
+    let own = [&entity.entity_id, &entity.entity_type, &entity.name].map(String::clone);
+    let stored: Vec<String> = own.into_iter().chain(objects).collect();
+    let bare = stored.iter().filter_map(|value| value.strip_prefix("./"));
+    let bare: Vec<String> = bare.map(str::to_string).collect();
+    let texts: Vec<String> = stored.into_iter().chain(bare).collect();
+
+    let mut terms = serde_json::Map::new();
+    let mut probe = serde_json::json!({
+        "@id": "https://aruna.invalid/probe",
+        "@type": "http://schema.org/MediaObject",
+    });
+    for (term, kind) in PROBE_TERMS {
+        let mut definition = serde_json::json!({"@id": "http://schema.org/contentUrl"});
+        if let Some(kind) = kind {
+            definition["@type"] = kind.into();
+        }
+        terms.insert(term.to_string(), definition);
+        probe[term] = texts.clone().into();
     }
-    // The raw revision keeps the entity as sent; export expands it under the stored context.
+    let context = match context {
+        Value::Null => return Err(unavailable("the stored crate has no context")),
+        Value::Array(entries) => entries.iter().cloned().chain([terms.into()]).collect(),
+        other => Value::Array(vec![other.clone(), terms.into()]),
+    };
     let mut document = serde_json::json!({
         "@context": context,
         "@graph": [
@@ -1140,88 +1161,14 @@ fn export_references(context: &Value, file: &Value) -> Result<Vec<String>, HostE
     let root = file.get("@id").and_then(Value::as_str) == Some("./");
     apply_raw_upsert(&mut document, &file.to_string(), (!root, true))
         .map_err(|error| invalid(error.to_string()))?;
-    // A render shows a stored `contentUrl` value under a stored term for it; only a term that
-    // coerces its value can make export read another identity from the same text.
-    let types = file.get("@type").cloned().unwrap_or(Value::Null);
-    let coercing = coercing_terms(context, &types);
-    if !coercing.is_empty() && !urls.is_empty() {
-        let mut probe = serde_json::json!({"@id": "https://aruna.invalid/probe", "@type": types});
-        coercing
-            .iter()
-            .for_each(|term| probe[term] = urls.clone().into());
-        if let Some(graph) = document["@graph"].as_array_mut() {
-            graph.push(probe);
-        }
+    if let Some(graph) = document["@graph"].as_array_mut() {
+        graph.push(probe);
     }
     let references = crate_references(&document.to_string()).map_err(invalid)?;
-    texts.extend(
-        references
-            .into_iter()
-            .flat_map(|file| std::iter::once(file.entity_id).chain(file.urls)),
-    );
-    Ok(texts)
-}
-
-/// schema.org's `contentUrl`, the predicate export and the identity readers name objects by.
-const CONTENT_PREDICATES: [&str; 2] = [
-    "http://schema.org/contentUrl",
-    "https://schema.org/contentUrl",
-];
-
-/// The values, each also without a leading `./`, as a render may show it.
-fn with_bare(values: Vec<String>) -> Vec<String> {
-    let bare: Vec<String> = values
-        .iter()
-        .filter_map(|value| value.strip_prefix("./"))
-        .map(str::to_string)
-        .collect();
-    values.into_iter().chain(bare).collect()
-}
-
-/// The terms of the stored `context` that name `contentUrl` and coerce a text value into an IRI,
-/// found by expanding a marker under each, for a node of `types`. The built-in RO-Crate contexts
-/// coerce nothing, so the candidates are the terms the crate's own context entries define.
-fn coercing_terms(context: &Value, types: &Value) -> Vec<String> {
-    let mut names = std::collections::BTreeSet::from(["contentUrl".to_string()]);
-    defined_terms(context, &mut names);
-    let marker = "aruna-coercion-marker";
-    names
+    let read = references
         .into_iter()
-        .filter(|term| {
-            let id = "https://aruna.invalid/terms";
-            let node = serde_json::json!({"@id": id, "@type": types, term: marker});
-            let document = serde_json::json!({"@context": context, "@graph": [node]});
-            let Ok(expanded) = craqle::canonicalize_jsonld(&document.to_string()) else {
-                return false;
-            };
-            NQuadsParser::new()
-                .for_slice(expanded.nquads.as_bytes())
-                .flatten()
-                .any(|quad| {
-                    let coerced = match &quad.object {
-                        Term::NamedNode(node) => node.as_str().contains(marker),
-                        _ => false,
-                    };
-                    coerced && CONTENT_PREDICATES.contains(&quad.predicate.as_str())
-                })
-        })
-        .collect()
-}
-
-/// Collects the names a context's own entries define, scoped contexts included.
-fn defined_terms(context: &Value, names: &mut std::collections::BTreeSet<String>) {
-    match context {
-        Value::Array(entries) => entries.iter().for_each(|entry| defined_terms(entry, names)),
-        Value::Object(fields) => {
-            for (key, value) in fields {
-                if !key.starts_with('@') {
-                    names.insert(key.clone());
-                }
-                defined_terms(value, names);
-            }
-        }
-        _ => {}
-    }
+        .flat_map(|file| std::iter::once(file.entity_id).chain(file.urls));
+    Ok(read.collect())
 }
 
 /// File entities one page asks for; a page over the byte bound comes back smaller.
