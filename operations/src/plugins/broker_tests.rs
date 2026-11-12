@@ -655,17 +655,26 @@ fn dataset_crates() {
 
 /// Creates a document with three root-linked files of padded names; returns its id.
 async fn three_files(fixture: &Fixture, broker: &RunBroker) -> Ulid {
-    let file = |name: &str| serde_json::json!({"@id": name, "@type": "File", "name": format!("{name} {}", "x".repeat(300))});
+    files_named(fixture, broker, &["a.txt", "b.txt", "c.txt"]).await
+}
+
+/// Creates a document with root-linked files of the given ids and padded names.
+async fn files_named(fixture: &Fixture, broker: &RunBroker, ids: &[&str]) -> Ulid {
+    let file = |name: &&str| serde_json::json!({"@id": name, "@type": "File", "name": format!("{name} {}", "x".repeat(300))});
+    let links: Vec<Value> = ids
+        .iter()
+        .map(|id| serde_json::json!({"@id": id}))
+        .collect();
+    let mut graph = vec![
+        serde_json::json!({"@id": "ro-crate-metadata.json", "@type": "CreativeWork",
+            "about": {"@id": "./"}, "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"}}),
+        serde_json::json!({"@id": "./", "@type": "Dataset", "name": "files", "description": "d",
+            "datePublished": "2026-01-01", "hasPart": links}),
+    ];
+    graph.extend(ids.iter().map(file));
     let jsonld = serde_json::json!({
         "@context": "https://w3id.org/ro/crate/1.1/context",
-        "@graph": [
-            {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"},
-             "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"}},
-            {"@id": "./", "@type": "Dataset", "name": "files", "description": "d",
-             "datePublished": "2026-01-01",
-             "hasPart": [{"@id": "a.txt"}, {"@id": "b.txt"}, {"@id": "c.txt"}]},
-            file("a.txt"), file("b.txt"), file("c.txt")
-        ]
+        "@graph": graph
     });
     let create = CreateDocumentOperation::new(CreateDocumentConfig {
         actor: fixture.actor.clone(),
@@ -734,6 +743,49 @@ async fn bounded_pages() {
     assert!(matches!(refused, Err(MetadataApiError::TooLarge)));
 }
 
+/// Walks the files of `document` with a reply bound that fits one file page, checking that every
+/// page and its cursor fit; returns the files in order.
+async fn paged(fixture: &Fixture, broker: &RunBroker, document: Ulid) -> Vec<String> {
+    let one = page_of(fixture, broker, (document, None), (1, u64::MAX))
+        .await
+        .unwrap();
+    let cursor = one.next_cursor.as_ref().map_or(0, String::len);
+    let small = CallContext {
+        max_bytes: one.jsonld.len() + cursor + 8,
+        ..cx()
+    };
+    let (resource, mut after, mut seen) = (document.to_string(), None, Vec::new());
+    loop {
+        let page = broker
+            .metadata_files(&small, &resource, after)
+            .await
+            .unwrap();
+        let files: usize = page.files.iter().map(|file| file.len() + 8).sum();
+        let charge = files + page.cursor.as_ref().map_or(0, String::len);
+        assert!(
+            page.files.len() == 1 && charge <= small.max_bytes,
+            "{charge}"
+        );
+        seen.extend(page.files);
+        after = page.cursor;
+        if after.is_none() {
+            return seen;
+        }
+    }
+}
+
+#[tokio::test]
+async fn long_cursors() {
+    // Long ids make long cursors; the holder counts them, so pages still fit the reply bound.
+    let (fixture, broker, _, _dir) = broker().await;
+    let ids: Vec<String> = (0..3)
+        .map(|n| format!("{}{n}.txt", "f".repeat(3000)))
+        .collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let document = files_named(&fixture, &broker, &ids).await;
+    assert_eq!(paged(&fixture, &broker, document).await.len(), 3);
+}
+
 #[tokio::test]
 async fn file_pages() {
     // Files come in pages within the reply bound; the summary leaves the file links out, while
@@ -747,22 +799,7 @@ async fn file_pages() {
         .collect();
     assert_eq!(names, ["./a.txt", "./b.txt", "./c.txt"]);
     assert_eq!(all.cursor, None);
-    let small = CallContext {
-        max_bytes: PAGE_ROOM + all.files[0].len() + 600,
-        ..cx()
-    };
-    let (mut cursor, mut seen) = (None, Vec::new());
-    loop {
-        let page = broker.metadata_files(&small, &resource, cursor).await;
-        let page = page.unwrap();
-        assert!(page.files.len() < 3);
-        seen.extend(page.files);
-        cursor = page.cursor;
-        if cursor.is_none() {
-            break;
-        }
-    }
-    assert_eq!(seen, all.files);
+    assert_eq!(paged(&fixture, &broker, document).await, all.files);
     let summary = broker.metadata_summary(&cx(), &resource).await.unwrap();
     assert!(!summary.json.contains("a.txt"), "{}", summary.json);
     let whole = broker.metadata_get(&cx(), &resource).await.unwrap();

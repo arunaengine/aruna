@@ -45,7 +45,7 @@ use ulid::Ulid;
 pub use self::distributed::{aggregate_query_results, query_form, query_select_limit};
 use self::distributed::{object_search_fingerprint, record_object_result, record_preflight_node};
 use self::export::export_summary_jsonld;
-pub(crate) use self::export::{PAGE_DEFAULT, PAGE_MAX};
+pub(crate) use self::export::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
 pub use self::export::{export_metadata_rocrate, get_visible_document};
 pub use self::fanout::forwarded_bearer;
 pub(crate) use self::fanout::pattern_contains_service;

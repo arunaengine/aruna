@@ -15,7 +15,7 @@ use crate::metadata::api::ensure_record_readable;
 use crate::metadata::api::export_metadata_rocrate;
 use crate::metadata::api::get_visible_document;
 use crate::metadata::api::load_live_record;
-use crate::metadata::api::{PAGE_DEFAULT, PAGE_MAX};
+use crate::metadata::api::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::profile::validation::current_validation_status;
 use crate::metadata::profile::validation::revalidate_current;
@@ -727,7 +727,11 @@ pub(super) fn ensure_export_limit(
     let length = match export {
         ExportMetadataResult::Full { jsonld, .. }
         | ExportMetadataResult::Summary { jsonld, .. } => jsonld.len(),
-        ExportMetadataResult::Page { page, .. } => page.jsonld.len(),
+        // A page is read with its cursor, and a reader adds a few bytes around each entity.
+        ExportMetadataResult::Page { page, .. } => {
+            let cursor = page.next_cursor.as_ref().map_or(0, String::len);
+            page.jsonld.len() + cursor + ENTRY_ROOM * page.returned_data_entities
+        }
         ExportMetadataResult::Raw { raw, .. } => raw.revision.jsonld.len(),
     };
     if u64::try_from(length).unwrap_or(u64::MAX) > metadata_bytes {

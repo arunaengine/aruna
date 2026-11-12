@@ -214,6 +214,8 @@ pub(super) async fn export_summary_jsonld(
 /// Data entities a page holds when the request names no limit, and at most.
 pub(crate) const PAGE_DEFAULT: usize = 100;
 pub(crate) const PAGE_MAX: usize = 1_000;
+/// Bytes a page's reader may add around each entity, which the page's size bound counts.
+pub(crate) const ENTRY_ROOM: usize = 8;
 
 async fn export_rocrate_page(
     context: &DriverContext,

@@ -586,8 +586,8 @@ impl Broker for RunBroker {
             offset: None,
             after: cursor,
         };
-        // The cursor and the list around the entities are charged too; they get their own room.
-        let bound = cx.max_bytes.saturating_sub(PAGE_ROOM) as u64;
+        // The holder counts the cursor and the room around each entity in this bound.
+        let bound = cx.max_bytes as u64;
         let token = Some(AuthToken::Internal(auth));
         let export = export_rocrate_routed(&self.ctx, self.scope.realm_id, request, token, bound);
         let ExportMetadataResult::Page { record, page } = export.await.map_err(api_error)? else {
@@ -1042,8 +1042,6 @@ pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostEr
 
 /// File entities one page asks for; a page over the byte bound comes back smaller.
 const FILE_PAGE: usize = 100;
-/// Bytes kept free of a reply for the cursor and the list around the file entities.
-const PAGE_ROOM: usize = 4096;
 
 /// The `File` entities of an exported page, each as the plain JSON object a plugin writes.
 fn file_entities(jsonld: &str) -> Result<Vec<String>, HostError> {
