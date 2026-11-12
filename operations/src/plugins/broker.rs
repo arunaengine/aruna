@@ -21,9 +21,9 @@ use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
-    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FullResponse, HostError,
-    Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest,
-    StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FilePage, FullResponse,
+    HostError, Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response,
+    SendRequest, StatePut,
 };
 use aruna_plugins::connection::{Readable, relative_path};
 use aruna_plugins::permission::Permission;
@@ -200,14 +200,14 @@ impl RunBroker {
     /// The registry record and JSON-LD of a document the account may read.
     async fn export(
         &self,
-        document_id: Ulid,
+        (document_id, view): (Ulid, RoCrateExportView),
         auth: AuthContext,
         max_bytes: usize,
     ) -> Result<(MetadataRegistryRecord, String), HostError> {
         let request = ExportMetadataRequest {
             document_id,
             auth: Some(auth.clone()),
-            view: RoCrateExportView::Full,
+            view,
             limit: None,
             offset: None,
             after: None,
@@ -221,9 +221,29 @@ impl RunBroker {
             max_bytes as u64,
         );
         match export.await.map_err(api_error)? {
-            ExportMetadataResult::Full { record, jsonld } => Ok((record, jsonld)),
-            _ => Err(unavailable("the document has no full export")),
+            ExportMetadataResult::Full { record, jsonld }
+            | ExportMetadataResult::Summary { record, jsonld } => Ok((record, jsonld)),
+            _ => Err(unavailable("the document has no such export")),
         }
+    }
+
+    /// The dataset entity of a document from the given export view, checked under the read grants.
+    async fn dataset_read(
+        &self,
+        cx: &CallContext,
+        resource: &str,
+        view: RoCrateExportView,
+    ) -> Result<Document, HostError> {
+        let document_id = parse_document(resource)?;
+        let (_, auth) = self.listing(Permission::MetadataRead).await?;
+        let (record, jsonld) = self.export((document_id, view), auth, cx.max_bytes).await?;
+        self.checked(Permission::MetadataRead, &record.permission_path)
+            .await?;
+        Ok(Document {
+            resource: resource.to_string(),
+            revision: record.last_event_id.to_string(),
+            json: dataset_of(&jsonld)?,
+        })
     }
 
     /// Creates the keyed document once: the stored create goes to its stored node with its stored
@@ -416,15 +436,47 @@ impl Broker for RunBroker {
     }
 
     async fn metadata_get(&self, cx: &CallContext, resource: &str) -> Result<Document, HostError> {
+        self.dataset_read(cx, resource, RoCrateExportView::Full)
+            .await
+    }
+
+    async fn metadata_summary(
+        &self,
+        cx: &CallContext,
+        resource: &str,
+    ) -> Result<Document, HostError> {
+        self.dataset_read(cx, resource, RoCrateExportView::Summary)
+            .await
+    }
+
+    async fn metadata_files(
+        &self,
+        cx: &CallContext,
+        resource: &str,
+        cursor: Option<String>,
+    ) -> Result<FilePage, HostError> {
         let document_id = parse_document(resource)?;
         let (_, auth) = self.listing(Permission::MetadataRead).await?;
-        let (record, jsonld) = self.export(document_id, auth, cx.max_bytes).await?;
+        let request = ExportMetadataRequest {
+            document_id,
+            auth: Some(auth.clone()),
+            view: RoCrateExportView::Page,
+            limit: Some(FILE_PAGE),
+            offset: None,
+            after: cursor,
+        };
+        // The cursor and the list around the entities are charged too; they get their own room.
+        let bound = cx.max_bytes.saturating_sub(PAGE_ROOM) as u64;
+        let token = Some(AuthToken::Internal(auth));
+        let export = export_rocrate_routed(&self.ctx, self.scope.realm_id, request, token, bound);
+        let ExportMetadataResult::Page { record, page } = export.await.map_err(api_error)? else {
+            return Err(unavailable("the document has no page export"));
+        };
         self.checked(Permission::MetadataRead, &record.permission_path)
             .await?;
-        Ok(Document {
-            resource: resource.to_string(),
-            revision: record.last_event_id.to_string(),
-            json: dataset_of(&jsonld)?,
+        Ok(FilePage {
+            files: file_entities(&page.jsonld)?,
+            cursor: page.next_cursor,
         })
     }
 
@@ -476,7 +528,9 @@ impl Broker for RunBroker {
             .map_err(|_| HostError::new(ErrorKind::Invalid, "bad revision"))?;
         // The target is resolved under the write grants; the plugin never sees what is read.
         let (_, auth) = self.listing(Permission::MetadataWrite).await?;
-        let (record, jsonld) = self.export(document_id, auth, cx.max_bytes).await?;
+        // The summary has no file links, so a large dataset is not exported whole for a patch.
+        let read = (document_id, RoCrateExportView::Summary);
+        let (record, jsonld) = self.export(read, auth, cx.max_bytes).await?;
         let path = &record.permission_path;
         let (install, auth) = self.checked(Permission::MetadataWrite, path).await?;
         // A new call starts only from the copy it expects; an earlier attempt's intent decides.
@@ -852,6 +906,31 @@ pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostEr
     Ok(change.to_string())
 }
 
+/// File entities one page asks for; a page over the byte bound comes back smaller.
+const FILE_PAGE: usize = 100;
+/// Bytes kept free of a reply for the cursor and the list around the file entities.
+const PAGE_ROOM: usize = 4096;
+
+/// The `File` entities of an exported page, each as the plain JSON object a plugin writes.
+fn file_entities(jsonld: &str) -> Result<Vec<String>, HostError> {
+    let page: Value =
+        serde_json::from_str(jsonld).map_err(|_| unavailable("the stored page is not JSON"))?;
+    let graph = (page.get("@graph").and_then(Value::as_array))
+        .ok_or_else(|| unavailable("the stored page has no graph"))?;
+    // RO-Crate's `File` is `schema:MediaObject`; an export may name it by either term.
+    let named = |kind: &Value| kind == "File" || kind == "MediaObject";
+    let file = |entity: &&Value| match entity.get("@type") {
+        Some(Value::Array(kinds)) => kinds.iter().any(named),
+        Some(kind) => named(kind),
+        None => false,
+    };
+    let files = graph.iter().filter(file).cloned().map(|mut entity| {
+        plain_objects(&mut entity);
+        entity.to_string()
+    });
+    Ok(files.collect())
+}
+
 /// The crate a plugin create stores: the metadata descriptor and the dataset entity as its root.
 /// Plain object values become JSON literals as in a patch; nested entities are refused.
 pub(crate) fn dataset_crate(dataset: &str) -> Result<String, HostError> {
@@ -1041,6 +1120,9 @@ fn parse_document(resource: &str) -> Result<Ulid, HostError> {
 fn api_error(error: MetadataApiError) -> HostError {
     match error {
         MetadataApiError::NotFound => HostError::new(ErrorKind::NotFound, "no such document"),
+        MetadataApiError::TooLarge => {
+            HostError::new(ErrorKind::Limit, "one entity is larger than a reply may be")
+        }
         MetadataApiError::Unauthorized | MetadataApiError::Forbidden => {
             HostError::new(ErrorKind::Denied, "the account may not read this")
         }

@@ -6,9 +6,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::broker::{
-    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FullResponse, HostError,
-    Intent, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo, ObjectPage, Response,
-    SendRequest, StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FilePage, FullResponse,
+    HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo, ObjectPage,
+    Response, SendRequest, StatePut,
 };
 use crate::host::wit::aruna::plugin::{
     connections, grants, log, metadata_create, metadata_read, metadata_write, objects_read,
@@ -153,6 +153,35 @@ impl metadata_read::Host for Session {
                 let names: usize = page.resources.iter().map(String::len).sum();
                 names + page.cursor.as_ref().map_or(0, String::len)
             },
+        )
+        .await
+    }
+
+    async fn files(
+        &mut self,
+        resource: String,
+        cursor: Option<String>,
+    ) -> wasmtime::Result<Result<FilePage, HostError>> {
+        self.brokered(
+            resource.len() + cursor.as_ref().map_or(0, String::len),
+            Effect::Read,
+            Needs::Permission(Permission::MetadataRead),
+            |broker, cx| async move { broker.metadata_files(&cx, &resource, cursor).await },
+            |page: &FilePage| {
+                let files: usize = page.files.iter().map(|file| file.len() + 8).sum();
+                files + page.cursor.as_ref().map_or(0, String::len)
+            },
+        )
+        .await
+    }
+
+    async fn summary(&mut self, resource: String) -> wasmtime::Result<Result<Document, HostError>> {
+        self.brokered(
+            resource.len(),
+            Effect::Read,
+            Needs::Permission(Permission::MetadataRead),
+            |broker, cx| async move { broker.metadata_summary(&cx, &resource).await },
+            |doc: &Document| doc.resource.len() + doc.revision.len() + doc.json.len(),
         )
         .await
     }

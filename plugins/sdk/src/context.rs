@@ -101,6 +101,13 @@ pub struct Listing {
     pub cursor: Option<String>,
 }
 
+/// One page of a dataset's file entities.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilePage {
+    pub files: Vec<Value>,
+    pub cursor: Option<String>,
+}
+
 /// Dataset metadata calls (`metadata.read`, `metadata.write`, `metadata.create`).
 #[derive(Debug, Clone, Copy)]
 pub struct Metadata;
@@ -121,6 +128,28 @@ impl Metadata {
             metadata_read::list(cursor).map_err(|err| Error::host(err, "metadata.read", ""))?;
         Ok(Listing {
             resources: page.resources,
+            cursor: page.cursor,
+        })
+    }
+
+    /// The dataset entity without its file links, cheaper than [`Metadata::get`] for large datasets.
+    pub async fn summary(&self, resource: &str) -> Result<Document> {
+        let doc = metadata_read::summary(resource)
+            .map_err(|err| Error::host(err, "metadata.read", resource))?;
+        Ok(Document {
+            resource: doc.resource,
+            revision: doc.revision,
+            json: serde_json::from_str(&doc.json)?,
+        })
+    }
+
+    /// One page of the dataset's `File` entities, in `@id` order, and the cursor of the next one.
+    pub async fn files(&self, resource: &str, cursor: Option<&str>) -> Result<FilePage> {
+        let page = metadata_read::files(resource, cursor)
+            .map_err(|err| Error::host(err, "metadata.read", resource))?;
+        let files = page.files.iter().map(|file| serde_json::from_str(file));
+        Ok(FilePage {
+            files: files.collect::<std::result::Result<_, _>>()?,
             cursor: page.cursor,
         })
     }

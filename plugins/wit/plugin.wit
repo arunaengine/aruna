@@ -98,8 +98,17 @@ interface metadata-read {
     cursor: option<string>,
   }
 
+  record file-page {
+    files: list<string>,
+    cursor: option<string>,
+  }
+
   get: func(%resource: string) -> result<document, host-error>;
   %list: func(cursor: option<string>) -> result<listing, host-error>;
+  /// One page of the dataset's root-linked `File` entities as JSON objects, in `@id` order.
+  files: func(%resource: string, cursor: option<string>) -> result<file-page, host-error>;
+  /// The dataset entity without its file links.
+  summary: func(%resource: string) -> result<document, host-error>;
 }
 
 /// Changes dataset metadata if its revision is still `expected` (`metadata.write`).

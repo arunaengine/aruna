@@ -11,8 +11,8 @@ use std::future::Future;
 use serde_json::Value;
 
 pub use context::{
-    Context, Document, Entry, Http, Level, Listing, Metadata, Method, ObjectInfo, ObjectPage,
-    Objects, Response, State,
+    Context, Document, Entry, FilePage, Http, Level, Listing, Metadata, Method, ObjectInfo,
+    ObjectPage, Objects, Response, State,
 };
 pub use error::{Error, Result};
 

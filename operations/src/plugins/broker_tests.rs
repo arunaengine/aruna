@@ -726,3 +726,39 @@ async fn bounded_pages() {
     let refused = page_of(&fixture, &broker, (document, None), (3, small)).await;
     assert!(matches!(refused, Err(MetadataApiError::TooLarge)));
 }
+
+#[tokio::test]
+async fn file_pages() {
+    // Files come in pages within the reply bound; the summary leaves the file links out, while
+    // `get` keeps answering the whole dataset entity with them.
+    let (fixture, broker, _, _dir) = broker().await;
+    let document = three_files(&fixture, &broker).await;
+    let resource = document.to_string();
+    let all = broker.metadata_files(&cx(), &resource, None).await.unwrap();
+    let names: Vec<Value> = (all.files.iter())
+        .map(|file| serde_json::from_str::<Value>(file).unwrap()["@id"].clone())
+        .collect();
+    assert_eq!(names, ["./a.txt", "./b.txt", "./c.txt"]);
+    assert_eq!(all.cursor, None);
+    let small = CallContext {
+        max_bytes: PAGE_ROOM + all.files[0].len() + 600,
+        ..cx()
+    };
+    let (mut cursor, mut seen) = (None, Vec::new());
+    loop {
+        let page = broker.metadata_files(&small, &resource, cursor).await;
+        let page = page.unwrap();
+        assert!(page.files.len() < 3);
+        seen.extend(page.files);
+        cursor = page.cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(seen, all.files);
+    let summary = broker.metadata_summary(&cx(), &resource).await.unwrap();
+    assert!(!summary.json.contains("a.txt"), "{}", summary.json);
+    let whole = broker.metadata_get(&cx(), &resource).await.unwrap();
+    assert!(whole.json.contains("a.txt"), "{}", whole.json);
+    assert_eq!(summary.revision, whole.revision);
+}

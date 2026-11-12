@@ -9,7 +9,7 @@ use crate::permission::Permission;
 
 pub use crate::host::wit::aruna::plugin::connections::{FullResponse, Method, Response};
 pub use crate::host::wit::aruna::plugin::metadata_create::Created;
-pub use crate::host::wit::aruna::plugin::metadata_read::{Document, Listing};
+pub use crate::host::wit::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 pub use crate::host::wit::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
 pub use crate::host::wit::aruna::plugin::state::Entry;
 pub use crate::host::wit::aruna::plugin::types::{ErrorKind, Field, HostError};
@@ -104,6 +104,29 @@ pub trait Broker: Send + Sync {
         cx: &CallContext,
         patch: MetadataPatch,
     ) -> Result<String, HostError>;
+    /// One page of a dataset's file entities; a broker that serves none refuses it.
+    async fn metadata_files(
+        &self,
+        _cx: &CallContext,
+        _resource: &str,
+        _cursor: Option<String>,
+    ) -> Result<FilePage, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "file entities are not served here",
+        ))
+    }
+    /// A dataset entity without its file links; a broker that serves none refuses it.
+    async fn metadata_summary(
+        &self,
+        _cx: &CallContext,
+        _resource: &str,
+    ) -> Result<Document, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "dataset summaries are not served here",
+        ))
+    }
     /// Creates a dataset once per key; a broker that serves no creates refuses it.
     async fn metadata_create(
         &self,
