@@ -151,6 +151,16 @@ impl Broker for Recorder {
         Ok(format!("{}+", change.expected))
     }
 
+    async fn metadata_remove_file(
+        &self,
+        _: &CallContext,
+        change: FileChange,
+    ) -> Result<String, HostError> {
+        self.note("metadata_remove_file");
+        self.intents.lock().unwrap().push(change.intent);
+        Ok(format!("{}-", change.expected))
+    }
+
     async fn metadata_create(
         &self,
         _: &CallContext,
@@ -362,11 +372,19 @@ async fn dataset_calls_reach() {
         output(invoke(put, broker.clone()).await),
         serde_json::json!("r1+")
     );
+    let removed = probe(
+        serde_json::json!({"call": "remove_file", "resource": "D1", "id": "a.txt", "expected": "r1"}),
+    );
+    assert_eq!(
+        output(invoke(removed, broker.clone()).await),
+        serde_json::json!("r1-")
+    );
     let calls = [
         "metadata_create",
         "metadata_summary",
         "metadata_files",
         "metadata_put_file",
+        "metadata_remove_file",
     ];
     assert_eq!(broker.calls(), calls);
 

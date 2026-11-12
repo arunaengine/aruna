@@ -70,6 +70,15 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
                     .await?
             )
         }
+        "remove_file" => {
+            let (resource, id, expected) = (text("resource"), text("id"), text("expected"));
+            let metadata = ctx.metadata();
+            json!(
+                metadata
+                    .remove_file(&resource, &id, &expected, None)
+                    .await?
+            )
+        }
         "objects_info" => {
             let info = ctx.objects().info(&text("path")).await?;
             json!({ "path": info.path, "size": info.size, "version": info.version })
