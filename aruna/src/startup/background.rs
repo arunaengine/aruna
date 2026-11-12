@@ -16,6 +16,7 @@ use aruna_operations::metadata::spawn_metadata_warmup;
 use aruna_operations::node::startup::{RecoveryConfig, RecoveryStatus};
 use aruna_operations::plugins::artifacts::spawn_repair;
 use aruna_operations::plugins::worker::spawn_worker;
+use aruna_operations::s3::access::cutoff::spawn_cutoff_sweep;
 use aruna_operations::s3::session::spawn_session_sweep;
 use aruna_operations::tasks::incoming::TaskQueues;
 use aruna_tasks::TaskHandle;
@@ -53,6 +54,7 @@ pub(crate) enum StartupPhase {
     RestoreLifecycleTimers,
     WarmMetadata,
     SweepSessions,
+    SweepCredentials,
     DrainGitMerges,
     RecoverChild,
     FeedIndexes,
@@ -73,6 +75,7 @@ pub(crate) const STARTUP_PHASES: &[StartupPhase] = &[
     StartupPhase::RestoreLifecycleTimers,
     StartupPhase::WarmMetadata,
     StartupPhase::SweepSessions,
+    StartupPhase::SweepCredentials,
     StartupPhase::DrainGitMerges,
     StartupPhase::RecoverChild,
     StartupPhase::FeedIndexes,
@@ -197,6 +200,9 @@ pub(crate) async fn start(
             }
             StartupPhase::WarmMetadata => spawn_metadata_warmup(driver_ctx.clone(), &shutdown),
             StartupPhase::SweepSessions => spawn_session_sweep(driver_ctx.clone(), &shutdown),
+            StartupPhase::SweepCredentials => {
+                spawn_cutoff_sweep(driver_ctx.clone(), &shutdown, realm_id, node_id)
+            }
             StartupPhase::DrainGitMerges => {
                 aruna_operations::git::pending::spawn_drain(driver_ctx.clone(), &shutdown)
             }
@@ -456,7 +462,7 @@ mod tests {
 mod pure_tests {
     use super::*;
 
-    const ALL_PHASES: [StartupPhase; 14] = [
+    const ALL_PHASES: [StartupPhase; 15] = [
         StartupPhase::Ready,
         StartupPhase::CorePublication,
         StartupPhase::RecoverStaleJobs,
@@ -466,6 +472,7 @@ mod pure_tests {
         StartupPhase::RestoreLifecycleTimers,
         StartupPhase::WarmMetadata,
         StartupPhase::SweepSessions,
+        StartupPhase::SweepCredentials,
         StartupPhase::DrainGitMerges,
         StartupPhase::RecoverChild,
         StartupPhase::FeedIndexes,
