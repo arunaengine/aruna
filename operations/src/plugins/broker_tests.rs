@@ -1364,3 +1364,59 @@ async fn sync_style_writes() {
         project(&broker.ctx).await;
     }
 }
+
+#[tokio::test]
+async fn removal_keeps_rest() {
+    // A removal drops one file and its link from the graph and the raw revision; the root, the
+    // descriptor and other entities are refused, and the other files stay.
+    let (fixture, broker, _, _dir) = broker().await;
+    let document = three_files(&fixture, &broker).await;
+    let record = crate::metadata::get_document::load_document_record(&broker.ctx, document).await;
+    let record = record.unwrap().unwrap();
+    let remove = |id: &str, revision| {
+        let mutation = UpdateDocumentMutation::RemoveDataEntity { id: id.to_string() };
+        let token = Some(AuthToken::Internal(fixture.auth()));
+        let (ctx, actor) = (&broker.ctx, fixture.actor.clone());
+        route_metadata_update(
+            ctx,
+            actor,
+            Some(&record),
+            document,
+            None,
+            mutation,
+            revision,
+            token,
+            None,
+        )
+    };
+    let revision = Ulid::from_string(&revision_of(&broker, document).await).unwrap();
+    for refused in ["./", "ro-crate-metadata.json", "./missing.txt"] {
+        assert!(remove(refused, Some(revision)).await.is_err(), "{refused}");
+    }
+    remove("a.txt", Some(revision)).await.unwrap();
+    project(&broker.ctx).await;
+    let ids: Vec<Value> = files_of(&broker, document)
+        .await
+        .iter()
+        .map(|file| file["@id"].clone())
+        .collect();
+    assert_eq!(ids, ["./b.txt", "./c.txt"]);
+    let request = ExportMetadataRequest {
+        document_id: document,
+        auth: Some(fixture.auth()),
+        view: RoCrateExportView::Raw,
+        limit: None,
+        offset: None,
+        after: None,
+    };
+    let raw = export_rocrate_routed(&broker.ctx, fixture.actor.realm_id, request, None, u64::MAX);
+    let ExportMetadataResult::Raw { raw, .. } = raw.await.unwrap() else {
+        panic!("expected the raw revision");
+    };
+    assert!(
+        !raw.revision.jsonld.contains("a.txt x"),
+        "{}",
+        raw.revision.jsonld
+    );
+    assert!(raw.revision.jsonld.contains("b.txt x"));
+}

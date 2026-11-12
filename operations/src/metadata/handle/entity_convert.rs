@@ -13,7 +13,7 @@ use aruna_storage::FjallPersistPolicy;
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleFjallPersistMode, CraqleNode,
     CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, DescribeRequest, Dot,
-    GraphId, GraphPolicy, PatchEntityRequest, RoCrateError, vocab,
+    GraphId, GraphPolicy, PatchEntityRequest, RemoveEntityRequest, RoCrateError, vocab,
 };
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use serde_json::Value;
@@ -682,6 +682,13 @@ pub(super) fn plan_batch(
         }
         MetadataBatchSource::UpsertContextualEntity { jsonld } => {
             node.plan_patch_contextual(auth, &craqle_patch_request(&graph, jsonld)?)
+        }
+        MetadataBatchSource::RemoveDataEntity { id } => {
+            let request = RemoveEntityRequest {
+                graph: graph.clone(),
+                entity_id: id.clone(),
+            };
+            node.plan_remove_data(auth, &request)
         }
         MetadataBatchSource::ReplaceDataEntity { jsonld } => {
             // Every stored predicate of the subject is replaced, so the ones the entity omits go.

@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::{
     EVENT_LIMIT, GraphLifecycleRecord, MaterializationState, MetadataError, MetadataEventPayload,
     MetadataEventRecord, MetadataLifecycleRecord, MetadataMergedRevision, MetadataRawRevision,
-    RAW_BYTES_LIMIT, apply_raw_upsert, raw_context_digest, raw_upsert_entity, resolve_raw_revision,
+    RAW_BYTES_LIMIT, apply_raw_event, raw_context_digest, resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
     document_lifecycle_key, event_log_key, event_log_prefix, graph_lifecycle_key,
@@ -488,10 +488,9 @@ fn advance_raw_state(
             if event.event_id <= base.event_id {
                 continue;
             }
-            let Some((jsonld, mode)) = raw_upsert_entity(&event.payload) else {
+            if !apply_raw_event(&mut document, &event.payload)? {
                 continue;
-            };
-            apply_raw_upsert(&mut document, jsonld, mode)?;
+            }
             revision.winning_event_id = event.event_id;
             changed = true;
         }

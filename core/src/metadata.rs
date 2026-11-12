@@ -235,6 +235,10 @@ pub enum MetadataBatchSource {
     ReplaceDataEntity {
         jsonld: String,
     },
+    /// Removes one root-linked `File` entity and its root link; other entities stay.
+    RemoveDataEntity {
+        id: String,
+    },
 }
 
 impl MetadataBatchSource {
@@ -244,6 +248,7 @@ impl MetadataBatchSource {
             | Self::UpsertDataEntity { jsonld }
             | Self::UpsertContextualEntity { jsonld }
             | Self::ReplaceDataEntity { jsonld } => jsonld,
+            Self::RemoveDataEntity { id } => id,
         }
     }
 
@@ -254,6 +259,7 @@ impl MetadataBatchSource {
                 MetadataAuditOperation::UpsertDataEntity
             }
             Self::UpsertContextualEntity { .. } => MetadataAuditOperation::UpsertContextualEntity,
+            Self::RemoveDataEntity { .. } => MetadataAuditOperation::RemoveDataEntity,
         }
     }
 }
@@ -546,17 +552,17 @@ pub fn resolve_raw_revision(
     let mut updates = events
         .iter()
         .filter(|event| {
-            event.event_id > base.event_id && raw_upsert_entity(&event.payload).is_some()
+            let change = raw_upsert_entity(&event.payload).is_some()
+                || raw_removed_entity(&event.payload).is_some();
+            event.event_id > base.event_id && change
         })
         .collect::<Vec<_>>();
     updates.sort_by_key(|event| event.event_id);
     let mut winning_event_id = base.event_id;
     for event in updates {
-        let Some((jsonld, mode)) = raw_upsert_entity(&event.payload) else {
-            continue;
-        };
-        apply_raw_upsert(&mut document, jsonld, mode)?;
-        winning_event_id = event.event_id;
+        if apply_raw_event(&mut document, &event.payload)? {
+            winning_event_id = event.event_id;
+        }
     }
     let jsonld = serde_json::to_string(&document)
         .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
@@ -570,6 +576,102 @@ pub fn resolve_raw_revision(
         dataset_digest,
         merged: None,
     }))
+}
+
+/// The entity a removal event drops from the raw revision, with its root link.
+pub fn raw_removed_entity(payload: &MetadataEventPayload) -> Option<&str> {
+    match payload {
+        MetadataEventPayload::ApplyBatch {
+            authored: MetadataBatchSource::RemoveDataEntity { id },
+            ..
+        } => Some(id),
+        _ => None,
+    }
+}
+
+/// Applies an event's entity change to a raw revision document; returns whether it had one.
+pub fn apply_raw_event(
+    document: &mut serde_json::Value,
+    payload: &MetadataEventPayload,
+) -> Result<bool, MetadataError> {
+    if let Some((jsonld, mode)) = raw_upsert_entity(payload) {
+        apply_raw_upsert(document, jsonld, mode)?;
+        return Ok(true);
+    }
+    match raw_removed_entity(payload) {
+        Some(id) => apply_raw_remove(document, id).map(|()| true),
+        None => Ok(false),
+    }
+}
+
+/// Drops one entity and the root's `hasPart` link to it; references from other entities stay.
+pub fn apply_raw_remove(document: &mut serde_json::Value, id: &str) -> Result<(), MetadataError> {
+    let terms = RawTerms::new(document);
+    let entity_id = raw_entity_id(&serde_json::json!({ "@id": id }), &terms)
+        .ok_or_else(|| MetadataError::InvalidInput("entity @id is missing".to_string()))?;
+    let graph = document
+        .as_object_mut()
+        .and_then(|object| {
+            object
+                .iter_mut()
+                .find_map(|(key, value)| terms.is_graph(key).then_some(value))
+        })
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            MetadataError::InvalidInput("RO-Crate @graph array is missing".to_string())
+        })?;
+    graph.retain(|entry| raw_entity_id(entry, &terms).as_deref() != Some(entity_id.as_str()));
+    let root_id = raw_root_id(graph, &terms);
+    let root = (graph.iter_mut())
+        .find(|entry| raw_entity_id(entry, &terms).as_deref() == Some(root_id.as_str()))
+        .and_then(serde_json::Value::as_object_mut);
+    for (key, value) in root.into_iter().flatten() {
+        if !terms.expands_to(key, &HAS_PART_KEYS) {
+            continue;
+        }
+        let linked = |value: &serde_json::Value| {
+            raw_entity_id(value, &terms).as_deref() == Some(entity_id.as_str())
+        };
+        match value {
+            serde_json::Value::Array(values) => values.retain(|value| !linked(value)),
+            single if linked(single) => *single = serde_json::Value::Array(Vec::new()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The spellings of the root's `hasPart` key the raw revision recognizes.
+const HAS_PART_KEYS: [&str; 4] = [
+    "hasPart",
+    "schema:hasPart",
+    "http://schema.org/hasPart",
+    "https://schema.org/hasPart",
+];
+
+/// The id of the crate root the metadata descriptor is about, else `./`.
+fn raw_root_id(graph: &[serde_json::Value], terms: &RawTerms) -> String {
+    graph
+        .iter()
+        .find(|entry| raw_entity_id(entry, terms).as_deref() == Some("ro-crate-metadata.json"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|descriptor| {
+            descriptor.iter().find_map(|(key, value)| {
+                terms
+                    .expands_to(
+                        key,
+                        &[
+                            "about",
+                            "schema:about",
+                            "http://schema.org/about",
+                            "https://schema.org/about",
+                        ],
+                    )
+                    .then(|| raw_entity_id(value, terms))
+                    .flatten()
+            })
+        })
+        .unwrap_or_else(|| "./".to_string())
 }
 
 pub fn apply_raw_upsert(
@@ -723,27 +825,7 @@ fn link_raw_entity(
     entity_id: &str,
     terms: &RawTerms,
 ) -> Result<(), MetadataError> {
-    let root_id = graph
-        .iter()
-        .find(|entry| raw_entity_id(entry, terms).as_deref() == Some("ro-crate-metadata.json"))
-        .and_then(serde_json::Value::as_object)
-        .and_then(|descriptor| {
-            descriptor.iter().find_map(|(key, value)| {
-                terms
-                    .expands_to(
-                        key,
-                        &[
-                            "about",
-                            "schema:about",
-                            "http://schema.org/about",
-                            "https://schema.org/about",
-                        ],
-                    )
-                    .then(|| raw_entity_id(value, terms))
-                    .flatten()
-            })
-        })
-        .unwrap_or_else(|| "./".to_string());
+    let root_id = raw_root_id(graph, terms);
     let root = graph
         .iter_mut()
         .find(|entry| raw_entity_id(entry, terms).as_deref() == Some(root_id.as_str()))
@@ -751,17 +833,7 @@ fn link_raw_entity(
         .ok_or_else(|| MetadataError::InvalidInput("RO-Crate root is missing".to_string()))?;
     let has_part = root
         .keys()
-        .find(|key| {
-            terms.expands_to(
-                key,
-                &[
-                    "hasPart",
-                    "schema:hasPart",
-                    "http://schema.org/hasPart",
-                    "https://schema.org/hasPart",
-                ],
-            )
-        })
+        .find(|key| terms.expands_to(key, &HAS_PART_KEYS))
         .cloned()
         .unwrap_or_else(|| {
             if terms.term_matches(
@@ -1448,8 +1520,8 @@ mod tests {
         EVENT_LIMIT, GraphLifecycleRecord, MetadataBearerToken, MetadataClockRelation,
         MetadataDeleteRecord, MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
         MetadataQueryResults, ProfileValidationCompleteness, ProfileValidationSeverity,
-        ProfileValidationState, ProfileValidationStatus, RAW_BYTES_LIMIT, apply_raw_upsert,
-        compare_metadata_clocks, raw_quotas, resolve_raw_revision,
+        ProfileValidationState, ProfileValidationStatus, RAW_BYTES_LIMIT, apply_raw_remove,
+        apply_raw_upsert, compare_metadata_clocks, raw_quotas, resolve_raw_revision,
     };
     use crate::structs::identity::realm::RealmId;
     use crate::structs::placement::record::PlacementRef;
@@ -1786,6 +1858,27 @@ mod tests {
 
         assert_eq!(document["items"][2]["node"], "./data/a.txt");
         assert_eq!(document["items"][1]["parts"][0]["@id"], "./data/a.txt");
+    }
+
+    #[test]
+    fn raw_remove_drops() {
+        // The entity and the root's link go; another entity's reference to it stays.
+        let mut document = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {"@id": "ro-crate-metadata.json", "about": {"@id": "./"}},
+                {"@id": "./", "@type": "Dataset",
+                 "hasPart": [{"@id": "./a.txt"}, {"@id": "./b.txt"}]},
+                {"@id": "./a.txt", "@type": "File", "name": "a"},
+                {"@id": "./b.txt", "@type": "File", "name": "b"},
+                {"@id": "#notes", "@type": "CreativeWork", "about": {"@id": "./a.txt"}}
+            ]
+        });
+        apply_raw_remove(&mut document, "a.txt").unwrap();
+        let graph = document["@graph"].as_array().unwrap();
+        assert!(graph.iter().all(|entity| entity["@id"] != "./a.txt"));
+        assert_eq!(graph[1]["hasPart"], serde_json::json!([{"@id": "./b.txt"}]));
+        assert_eq!(graph[3]["about"]["@id"], "./a.txt");
     }
 
     #[test]

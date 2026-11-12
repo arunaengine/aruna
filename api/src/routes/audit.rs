@@ -87,6 +87,7 @@ fn operation_name(operation: &MetadataAuditOperation) -> &'static str {
         MetadataAuditOperation::PlaceReplicas => "place_replicas",
         MetadataAuditOperation::WithdrawPersistentId => "withdraw_persistent_id",
         MetadataAuditOperation::Checkpoint => "checkpoint",
+        MetadataAuditOperation::RemoveDataEntity => "remove_data_entity",
     }
 }
 
