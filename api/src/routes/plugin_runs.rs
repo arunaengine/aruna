@@ -113,7 +113,7 @@ pub struct RunView {
 /// The source event an event run was started for.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RunEvent {
-    /// `dataset_created` or `data_uploaded`.
+    /// `dataset_created`, `dataset_updated` or `data_uploaded`.
     pub kind: String,
     /// The policy path the install's grants are checked on.
     pub path: String,
@@ -647,7 +647,7 @@ pub async fn resolve(
 /// Undelivered events of one kind and reason, summed over the nodes that counted them.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GapView {
-    /// `dataset_created` or `data_uploaded`.
+    /// `dataset_created`, `dataset_updated` or `data_uploaded`.
     pub kind: String,
     /// `full`, `pruned`, `expired`, `waited` or `late`.
     pub reason: String,
@@ -692,7 +692,7 @@ pub struct DeliveryView {
 - `note` covers only the receiver's own replay; replays on other nodes are not reported."#,
     params(("id" = String, Path, description = "The install id")),
     responses(
-        (status = 200, description = "The install's event delivery", body = DeliveryView, example = json!({"waiting": 1, "oldest_age_ms": 4200, "gaps": [{"kind": "data_uploaded", "reason": "full", "count": 3, "unknown": false, "earliest_ms": 1762700000000u64, "latest_ms": 1762700060000u64}], "undelivered": ["sync_completed"], "note": null})),
+        (status = 200, description = "The install's event delivery", body = DeliveryView, example = json!({"waiting": 1, "oldest_age_ms": 4200, "gaps": [{"kind": "dataset_updated", "reason": "full", "count": 3, "unknown": false, "earliest_ms": 1762700000000u64, "latest_ms": 1762700060000u64}], "undelivered": ["sync_completed"], "note": null})),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
