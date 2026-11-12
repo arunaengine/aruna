@@ -142,16 +142,82 @@ async fn refusals_start_nothing() {
     assert!(runs(&fixture, &install).await.is_empty());
     // A relay keeps `authorization` only for a verify secret that checks it.
     let config = read_config(&fixture.ctx, realm_id).await.unwrap();
-    assert!(!checks_authorization(&fixture.ctx, &config, install.install_id).await);
+    let place = (fixture.actor.node_id, install.install_id);
+    assert_eq!(
+        checks_authorization(&fixture.ctx, &config, place).await,
+        Some(false)
+    );
     hook_secret(&fixture, &install, "Authorization", 3).await;
-    assert!(checks_authorization(&fixture.ctx, &config, install.install_id).await);
-    // A node secret is read on the receiver alone, so the relay keeps the header for it.
-    hook_secret(&fixture, &install, "x-signature", 4).await;
+    assert_eq!(
+        checks_authorization(&fixture.ctx, &config, place).await,
+        Some(true)
+    );
+}
+
+/// Writes the node secret `hook-key` of kind `header` on this node, checking `checked`.
+async fn node_secret(fixture: &Fixture, checked: &str, round: u64) {
+    use crate::driver::drive;
+    use crate::secrets::SecretChange;
+    use crate::secrets::node::{NodeChange, NodeSecretOperation};
+    use aruna_core::compute::Secret;
+    use aruna_core::secrets::{SecretFields, SecretKind, SecretName, SecretSettings};
+    let name = SecretName::try_from("hook-key".to_string()).unwrap();
+    let settings = SecretSettings::from([("header".to_string(), checked.to_string())]);
+    let change = match round {
+        0 => SecretChange::Create {
+            name,
+            kind: SecretKind::parse("header").unwrap(),
+            description: String::new(),
+            settings,
+            uses: Vec::new(),
+            fields: SecretFields::new([("value".to_string(), Secret::new(TOKEN))].into()),
+        },
+        _ => SecretChange::Replace {
+            name,
+            description: String::new(),
+            settings,
+            uses: Vec::new(),
+            expected: None,
+        },
+    };
+    let input = NodeChange {
+        realm_id: fixture.actor.realm_id,
+        node_id: fixture.actor.node_id,
+        actor: fixture.actor.user_id,
+        change,
+        now_ms: 1 + round,
+        write_id: Ulid::from_parts(70 + round, 1),
+    };
+    drive(NodeSecretOperation::new(input), &fixture.ctx)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn node_checks_relay() {
+    let fixture = Fixture::keyed().await;
+    let install = hooked(&fixture).await;
     edit_config(&fixture, |config| {
         let binding = SecretBinding::parse("node:hook-key").unwrap();
         config.installs[0].secrets = BTreeMap::from([("hook_key".to_string(), binding)]);
     })
     .await;
-    let config = read_config(&fixture.ctx, realm_id).await.unwrap();
-    assert!(checks_authorization(&fixture.ctx, &config, install.install_id).await);
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let relay = |local| checks_authorization(&fixture.ctx, &config, (local, install.install_id));
+    let here = fixture.actor.node_id;
+    // The receiver holds no such node secret yet, so the relay cannot tell and forwards nothing.
+    assert_eq!(relay(here).await, None);
+    fixture
+        .ctx
+        .storage_handle
+        .open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    node_secret(&fixture, "x-signature", 0).await;
+    assert_eq!(relay(here).await, Some(false));
+    node_secret(&fixture, "Authorization", 1).await;
+    assert_eq!(relay(here).await, Some(true));
+    // A relaying node that cannot reach the receiver cannot tell either.
+    let elsewhere = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+    assert_eq!(relay(elsewhere).await, None);
 }

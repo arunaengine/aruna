@@ -16,7 +16,7 @@ use aruna_plugins::manifest::SecretKind;
 use aruna_plugins::trigger::TriggerKind;
 use ulid::Ulid;
 
-use super::bound::{delivery_clash, select};
+use super::bound::{check_node_binding, delivery_clash, select, vault_kind};
 use super::dispatch::new_run;
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
@@ -139,41 +139,41 @@ pub async fn admit_hook(
     Ok(admitted.await?)
 }
 
-/// Whether a relay passes `authorization` on: unless this node reads the verify secret and sees
-/// that it checks another header. The receiver removes the header after its check either way.
+/// Whether a relay from `local` passes `authorization` on: only when the install's verify secret
+/// checks that header. A node secret is asked of the receiver; `None` when it cannot be told.
 pub async fn checks_authorization(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
-    install_id: Ulid,
-) -> bool {
-    let install = (config.installs.iter()).find(|install| install.install_id == install_id);
-    let Some(install) = install else {
-        return false;
-    };
+    (local, install_id): (NodeId, Ulid),
+) -> Option<bool> {
+    let install = (config.installs.iter()).find(|install| install.install_id == install_id)?;
     let plugin = pick_version(config, &install.plugin, Some(&install.digest));
-    let Ok(manifest) = plugin.and_then(|plugin| read_manifest(&plugin)) else {
-        return false;
-    };
+    let manifest = plugin.and_then(|plugin| read_manifest(&plugin)).ok()?;
     let hook = manifest.triggers.get(&TriggerKind::Webhook);
     let Some(slot) = hook.and_then(|hook| hook.verify.as_ref()) else {
-        return false;
+        return Some(false);
     };
     let declared = manifest.secrets.get(slot).map(|declared| declared.kind);
     if declared == Some(SecretKind::Bearer) {
-        return true;
+        return Some(true);
     }
     let Some(binding) = install.secrets.get(slot) else {
-        return false;
+        return Some(false);
     };
-    // A node secret's settings live on the receiver only.
-    if binding.scope == BoundScope::Node {
-        return true;
-    }
-    let selected = select(ctx, config, install, binding).await.ok().flatten();
-    selected.is_none_or(|selected| {
-        let header = selected.settings.get("header");
-        header.is_some_and(|header| header.eq_ignore_ascii_case("authorization"))
-    })
+    let header = match binding.scope {
+        BoundScope::Node => {
+            let kind = declared.and_then(vault_kind)?;
+            let place = (local, install.receiver);
+            check_node_binding(ctx, place, &binding.name, &kind)
+                .await
+                .ok()?
+        }
+        BoundScope::Group | BoundScope::Realm => {
+            let selected = select(ctx, config, install, binding).await.ok()??;
+            selected.settings.get("header").cloned()
+        }
+    };
+    Some(header.is_some_and(|header| header.eq_ignore_ascii_case("authorization")))
 }
 
 #[cfg(test)]

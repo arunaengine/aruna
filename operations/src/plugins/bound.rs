@@ -15,7 +15,7 @@ use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
 use aruna_core::realm_vault::{RealmSealKey, RealmSecretRef, RealmVaultKey, RealmVaultRecord};
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
 use aruna_core::secrets::{SecretKind, SecretName, SecretRecord, SecretSettings, UseRule};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_plugins::trigger::TriggerKind;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -23,7 +23,7 @@ use ulid::Ulid;
 use super::install::{pick_version, read_manifest};
 use super::store::Txn;
 use crate::driver::DriverContext;
-use crate::realm::mutate_placement::is_management;
+use crate::realm::mutate_placement::node_kind;
 use crate::secrets::node::{record_key, value_entry};
 use crate::secrets::owner::{EntryReader, open_value};
 
@@ -299,7 +299,7 @@ pub async fn bind_slots(
                     ));
                 };
                 match check_node_binding(ctx, (local, receiver), &binding.name, &kind).await {
-                    Ok(()) => {}
+                    Ok(_) => {}
                     Err(NodeCheckError::Unavailable) => {
                         return Err(BindError::Unavailable("the receiver did not answer".into()));
                     }
@@ -350,18 +350,19 @@ pub enum NodeCheckError {
     Missing,
     #[error("the node secret has another kind than the slot")]
     OtherKind,
-    #[error("only a management node may ask")]
+    #[error("only a server node of the realm may ask")]
     Forbidden,
     #[error("the receiver did not answer")]
     Unavailable,
 }
 
-/// Whether this node holds the node secret `name` with `kind`.
+/// Whether this node holds the node secret `name` with `kind`; answers the header its `header`
+/// setting names, in lowercase. Never the value.
 pub async fn node_secret_fits(
     ctx: &DriverContext,
     name: &SecretName,
     kind: &SecretKind,
-) -> Result<(), NodeCheckError> {
+) -> Result<Option<String>, NodeCheckError> {
     let row = Txn::direct(ctx)
         .read(NODE_SECRETS_KEYSPACE, &record_key(name))
         .await;
@@ -370,17 +371,21 @@ pub async fn node_secret_fits(
     match record {
         None => Err(NodeCheckError::Missing),
         Some(record) if record.kind != *kind => Err(NodeCheckError::OtherKind),
-        Some(_) => Ok(()),
+        Some(record) => Ok(record
+            .settings
+            .get("header")
+            .map(|h| h.to_ascii_lowercase())),
     }
 }
 
-/// Checks a node binding where it lives: on `receiver`, here or over the metadata transport.
+/// Checks a node binding where it lives: on `receiver`, here or over the metadata transport;
+/// answers the secret's checked header as [`node_secret_fits`] does.
 pub async fn check_node_binding(
     ctx: &DriverContext,
     (local, receiver): (NodeId, NodeId),
     name: &SecretName,
     kind: &SecretKind,
-) -> Result<(), NodeCheckError> {
+) -> Result<Option<String>, NodeCheckError> {
     if receiver == local {
         return node_secret_fits(ctx, name, kind).await;
     }
@@ -390,13 +395,14 @@ pub async fn check_node_binding(
     asked.await
 }
 
-/// The receiver side of a node binding check, for a management node that installs.
+/// The receiver side of a node binding check, for a management node that installs or a server
+/// node that relays a webhook.
 pub(crate) async fn serve_node_check(
     ctx: &DriverContext,
     peer: NodeId,
     name: SecretName,
     kind: SecretKind,
-) -> Result<(), NodeCheckError> {
+) -> Result<Option<String>, NodeCheckError> {
     let local = super::artifacts::local_config(ctx).await;
     let (config, _) = local.map_err(|_| NodeCheckError::Unavailable)?;
     node_check_for(ctx, (&config, peer), &name, &kind).await
@@ -407,8 +413,10 @@ async fn node_check_for(
     (config, peer): (&RealmConfigDocument, NodeId),
     name: &SecretName,
     kind: &SecretKind,
-) -> Result<(), NodeCheckError> {
-    if !is_management(config, peer) {
+) -> Result<Option<String>, NodeCheckError> {
+    let server =
+        node_kind(config, peer).is_some_and(|kind| !matches!(kind, RealmNodeKind::User { .. }));
+    if !server {
         return Err(NodeCheckError::Forbidden);
     }
     node_secret_fits(ctx, name, kind).await

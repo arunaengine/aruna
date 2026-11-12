@@ -844,13 +844,14 @@ impl MetadataHandle {
         }
     }
 
-    /// Whether the node `node_id` holds the node secret `name` with `kind`.
+    /// Whether the node `node_id` holds the node secret `name` with `kind`, and the header the
+    /// secret checks.
     pub async fn request_node_check(
         &self,
         node_id: NodeId,
         name: aruna_core::secrets::SecretName,
         kind: aruna_core::secrets::SecretKind,
-    ) -> Result<(), crate::plugins::bound::NodeCheckError> {
+    ) -> Result<Option<String>, crate::plugins::bound::NodeCheckError> {
         use crate::plugins::bound::NodeCheckError;
         let request = MetadataTransportMessage::CheckNodeSecret { name, kind };
         match send_remote_request(&self.inner, &Span::current(), node_id, request).await {

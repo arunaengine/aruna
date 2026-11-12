@@ -202,7 +202,7 @@ async fn node_binding_checks() {
         .unwrap();
     assert_eq!(
         check_node_binding(&fixture.ctx, mine, &name, &bearer).await,
-        Ok(())
+        Ok(None)
     );
     let basic = SecretKind::parse("basic").unwrap();
     let other = check_node_binding(&fixture.ctx, mine, &name, &basic).await;
@@ -218,7 +218,7 @@ async fn node_binding_checks() {
     let served = node_check_for(&fixture.ctx, (&config, receiver), &name, &bearer).await;
     assert_eq!(served, Err(NodeCheckError::Forbidden));
     let asked = node_check_for(&fixture.ctx, (&config, local), &name, &bearer).await;
-    assert_eq!(asked, Ok(()));
+    assert_eq!(asked, Ok(None));
 }
 
 #[tokio::test]

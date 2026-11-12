@@ -78,8 +78,9 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 **Behavior**
 - Any node takes the request and relays its raw body and headers to the install's receiver,
-  without `cookie` and `proxy-authorization`, and without `authorization` when this node sees
-  that the install's secret checks another header.
+  without `cookie` and `proxy-authorization`, and with `authorization` only when the install's
+  secret checks that header. A node secret's header is asked of the receiver first; when it
+  cannot be told, the relay answers 503 and forwards nothing.
 - The receiver checks the request, removes the checked and credential headers and queues a run.
 - With the manifest's delivery id header, a repeated id answers 202 and starts nothing.
 
@@ -204,7 +205,7 @@ fn hook_error(install_id: Ulid, error: HookError) -> Response {
 }
 
 /// The headers a relay passes on: all but hop-by-hop ones, `cookie` and `proxy-authorization`,
-/// and `authorization` unless this node knows the verify secret checks another header.
+/// and `authorization` only when the verify secret checks it.
 fn relayed(headers: &HeaderMap, keep_authorization: bool) -> HeaderMap {
     let mut sent = headers.clone();
     for name in NOT_RELAYED {
@@ -233,12 +234,19 @@ async fn relay(
         return unavailable();
     };
     let ctx = state.get_ctx();
-    let Some(base) = node_urls(&ctx, receiver).await.and_then(|urls| urls.api) else {
+    // Without knowing whether the check needs `authorization`, nothing is forwarded.
+    let keep = match read_config(&ctx, state.get_realm_id()).await {
+        Ok(config) => {
+            let place = (state.get_node_id(), install_id);
+            checks_authorization(&ctx, &config, place).await
+        }
+        Err(_) => None,
+    };
+    let Some(keep) = keep else {
         return unavailable();
     };
-    let keep = match read_config(&ctx, state.get_realm_id()).await {
-        Ok(config) => checks_authorization(&ctx, &config, install_id).await,
-        Err(_) => true,
+    let Some(base) = node_urls(&ctx, receiver).await.and_then(|urls| urls.api) else {
+        return unavailable();
     };
     let mut sent = relayed(headers, keep);
     sent.insert(RELAY_HOP_HEADER, hops);

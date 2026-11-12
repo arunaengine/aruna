@@ -715,13 +715,14 @@ pub enum MetadataTransportMessage {
     SecretReleased {
         result: Result<crate::plugins::release::Released, crate::plugins::release::ReleaseError>,
     },
-    /// A management node asks an install's receiver whether it holds a node secret of a kind.
+    /// A server node asks an install's receiver whether it holds a node secret of a kind, and
+    /// which header the secret checks; never its value.
     CheckNodeSecret {
         name: aruna_core::secrets::SecretName,
         kind: aruna_core::secrets::SecretKind,
     },
     NodeSecretChecked {
-        result: Result<(), crate::plugins::bound::NodeCheckError>,
+        result: Result<Option<String>, crate::plugins::bound::NodeCheckError>,
     },
 }
 

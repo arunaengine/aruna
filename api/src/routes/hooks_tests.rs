@@ -1,5 +1,5 @@
 //! Tests webhook ingress: bounds refuse a request before it is read or relayed, a relay drops
-//! credentials no check reads, and an unknown install or a long body is refused.
+//! credentials no check reads or relays nothing, and an unknown install or long body is refused.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -117,4 +117,34 @@ async fn refuses_unknown_installs() {
     // Without a length header the body is still cut at its bound while it is read.
     let long = vec![b'x'; MAX_WEBHOOK + 1];
     assert_eq!(send(unknown, long).await, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn undetermined_relays_nothing() {
+    let (_dir, storage) = test_storage();
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+    let ctx = Arc::new(test_context(storage));
+    let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
+    let state = test_state(ctx.clone(), realm_id, node_id, capabilities).await;
+    let actor = Actor {
+        node_id,
+        user_id: UserId::new(Ulid::from_bytes([3u8; 16]), realm_id),
+        realm_id,
+    };
+    seed_realm_config(&ctx, realm_id, &actor).await;
+    // No install record here, so whether the check needs `authorization` cannot be told.
+    let receiver = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+    let sent = headers(&[("authorization", "Bearer canary-auth")]);
+    let install = Ulid::from_parts(9, 9);
+    let answer = relay(
+        &state,
+        (receiver, install),
+        "/plugin-hooks/x",
+        &sent,
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(answer.headers().contains_key(header::RETRY_AFTER));
 }
