@@ -624,6 +624,14 @@ async fn keyed_creates() {
     nested.dataset = r##"{"name":"Exp 4","author":{"@id":"#a","name":"A"}}"##.to_string();
     let refused = later.metadata_create(&cx(), nested).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::Invalid);
+    // A dataset naming an object needs `objects.read` on it, whatever the property.
+    let mut linked = create("elabftw/exp-6", "Exp 6", "e6", 5);
+    let arn = private_arn(&fixture);
+    linked.dataset = serde_json::json!({"name": "Exp 6", "description": "d",
+        "datePublished": "2026-01-01", "https://example.org/location": {"@id": arn}})
+    .to_string();
+    let refused = later.metadata_create(&cx(), linked).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::NotGranted, "{}", refused.message);
     let mut incomplete = create("elabftw/exp-5", "Exp 5", "e5", 4);
     incomplete.dataset = r#"{"name":"Exp 5"}"#.to_string();
     let refused = later.metadata_create(&cx(), incomplete).await.unwrap_err();
@@ -1236,16 +1244,10 @@ async fn second_hash_checked() {
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
 }
 
-#[tokio::test]
-async fn context_reference_checked() {
-    // A crate whose context types `contentUrl` as `@id` renders a referenced ARN without the `./`
-    // the converter adds, so the ARN as sent is checked before any write.
-    let (fixture, broker, _, _dir) = broker().await;
+/// Creates a crate whose context adds `term`, with one file; returns the document and revision.
+async fn crate_with_term(fixture: &Fixture, broker: &RunBroker, term: Value) -> (Ulid, String) {
     let jsonld = serde_json::json!({
-        "@context": [
-            "https://w3id.org/ro/crate/1.1/context",
-            {"contentUrl": {"@id": "http://schema.org/contentUrl", "@type": "@id"}}
-        ],
+        "@context": ["https://w3id.org/ro/crate/1.1/context", term],
         "@graph": [
             {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"},
              "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"}},
@@ -1269,7 +1271,11 @@ async fn context_reference_checked() {
         .unwrap();
     let document = document.record.document_id;
     project(&broker.ctx).await;
-    let revision = revision_of(&broker, document).await;
+    (document, revision_of(broker, document).await)
+}
+
+/// A versioned ARN of a private object on the fixture's node.
+fn private_arn(fixture: &Fixture) -> String {
     let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
     let arn = aruna_core::structs::storage::replication::VersionedObjectArn::new(
         realm,
@@ -1278,8 +1284,35 @@ async fn context_reference_checked() {
         "secret.bin",
         Ulid::generate(),
     );
+    arn.unwrap().to_string()
+}
+
+#[tokio::test]
+async fn context_reference_checked() {
+    // A crate whose context types `contentUrl` as `@id` renders a referenced ARN without the `./`
+    // the converter adds, so that rendered form is checked before any write.
+    let (fixture, broker, _, _dir) = broker().await;
+    let term =
+        serde_json::json!({"contentUrl": {"@id": "http://schema.org/contentUrl", "@type": "@id"}});
+    let (document, revision) = crate_with_term(&fixture, &broker, term).await;
     let file = serde_json::json!({"@id": "./b.txt", "@type": "File", "name": "b",
-        "contentUrl": {"@id": arn.unwrap().to_string()}});
+        "contentUrl": {"@id": private_arn(&fixture)}});
+    let refused = broker
+        .metadata_put_file(&cx(), put(document, &file, &revision, 0))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::NotGranted);
+}
+
+#[tokio::test]
+async fn remapped_term_checked() {
+    // A context may name any predicate `contentUrl`; the rendered value is checked whatever the
+    // predicate, so a reference under another IRI is refused as well.
+    let (fixture, broker, _, _dir) = broker().await;
+    let term =
+        serde_json::json!({"contentUrl": {"@id": "https://example.org/location", "@type": "@id"}});
+    let (document, revision) = crate_with_term(&fixture, &broker, term).await;
+    let file = serde_json::json!({"@id": "./b.txt", "@type": "File", "name": "b",
+        "https://example.org/location": {"@id": private_arn(&fixture)}});
     let refused = broker
         .metadata_put_file(&cx(), put(document, &file, &revision, 0))
         .await;

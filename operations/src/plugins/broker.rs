@@ -61,7 +61,7 @@ use crate::metadata::forward::{
     CreateAuthorizedError, PinnedCreate, create_with_id, export_rocrate_routed,
     get_metadata_routed, route_metadata_update,
 };
-use crate::metadata::handle::{craqle_patch_request, property_iri};
+use crate::metadata::handle::craqle_patch_request;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -354,42 +354,33 @@ impl RunBroker {
         }
     }
 
-    /// Checks each Aruna object a file entity names through the plugin's own `objects.read` call
-    /// check and that it lies in a group bucket here. A content hash or global id needs one with it.
+    /// Checks each Aruna object an entity names through the plugin's own `objects.read` call
+    /// check and that it lies in a group bucket here. A content hash or global id needs one too.
     async fn objects_named(
         &self,
         install: &PluginInstall,
         (graph, file): (&str, &Value),
     ) -> Result<(), HostError> {
         let realm_id = self.scope.realm_id;
-        // The write path's own conversion decides what the file names, so no spelling differs.
+        // Export renders each stored value as is, without `./`, or as literal text, under any term
+        // the context gives (craqle `context_value`), so every value of every predicate is checked.
         let converted = craqle_patch_request(&GraphId::new(graph), &file.to_string());
         let converted =
             converted.map_err(|error| HostError::new(ErrorKind::Invalid, error.to_string()))?;
         let entity = converted.entity;
-        let urls = (entity.additional_triples.iter())
-            .filter(|(predicate, _)| content_predicate(predicate.as_str()))
+        let objects = entity
+            .additional_triples
+            .iter()
             .filter_map(|(_, object)| match object {
                 Term::NamedNode(node) => Some(node.as_str().to_string()),
                 Term::Literal(literal) => Some(literal.value().to_string()),
                 _ => None,
             });
-        // A reference renders without the `./` the converter adds, so both forms are checked.
-        let urls = urls.flat_map(|url| {
-            let bare = url.strip_prefix("./").map(str::to_string);
-            std::iter::once(url).chain(bare)
-        });
-        // The values as sent, of every property that converts to `contentUrl`, are checked too.
-        let mut sent: Vec<&str> = (["@id", "id"].iter())
-            .filter_map(|key| file.get(*key)?.as_str())
-            .collect();
-        for (property, value) in file.as_object().into_iter().flatten() {
-            if property_iri(property).is_some_and(|iri| content_predicate(&iri)) {
-                reference_values(value, &mut sent);
-            }
-        }
-        let sent = sent.into_iter().map(str::to_string);
-        let values: Vec<String> = sent.chain([entity.entity_id.clone()]).chain(urls).collect();
+        let own = [&entity.entity_id, &entity.entity_type, &entity.name].map(String::clone);
+        let stored: Vec<String> = own.into_iter().chain(objects).collect();
+        let bare = stored.iter().filter_map(|value| value.strip_prefix("./"));
+        let bare: Vec<String> = bare.map(str::to_string).collect();
+        let values: Vec<String> = stored.into_iter().chain(bare).collect();
         let refused = |what: &str| {
             let message = format!("{what} names no object a plugin may check; use its path");
             HostError::new(ErrorKind::Denied, message)
@@ -789,6 +780,11 @@ impl Broker for RunBroker {
         let (install, auth) = self.checked(Permission::MetadataCreate, &target).await?;
         // An invalid dataset is refused before its intent exists, so it leaves no uncertainty.
         let jsonld = dataset_crate(&create.dataset)?;
+        // The dataset entity is checked as stored, like a file; the new graph's name is not known.
+        let stored: Value = serde_json::from_str(&jsonld).unwrap_or(Value::Null);
+        let graph = MetadataRegistryRecord::graph_iri_for(Ulid::nil());
+        self.objects_named(&install, (&graph, &stored["@graph"][1]))
+            .await?;
         if let Some(reply) = self.begun(&create.intent).await? {
             return stored_created(&reply);
         }
@@ -1114,31 +1110,6 @@ pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostEr
     let mut change = Value::Object(change);
     literal_objects(&mut change);
     Ok(change.to_string())
-}
-
-/// The strings a property value names: itself, each entry, or an object's `@id`, `id` or `@value`.
-fn reference_values<'a>(value: &'a Value, values: &mut Vec<&'a str>) {
-    match value {
-        Value::String(text) => values.push(text),
-        Value::Array(entries) => entries
-            .iter()
-            .for_each(|entry| reference_values(entry, values)),
-        Value::Object(fields) => {
-            let named = ["@id", "id", "@value"]
-                .iter()
-                .filter_map(|key| fields.get(*key));
-            named.for_each(|entry| reference_values(entry, values));
-        }
-        _ => {}
-    }
-}
-
-/// Whether a stored predicate is schema.org's `contentUrl`, under either scheme.
-fn content_predicate(iri: &str) -> bool {
-    matches!(
-        iri,
-        "http://schema.org/contentUrl" | "https://schema.org/contentUrl"
-    )
 }
 
 /// File entities one page asks for; a page over the byte bound comes back smaller.

@@ -171,12 +171,6 @@ fn entity_name(object: &serde_json::Map<String, Value>) -> Result<String, Craqle
         })
 }
 
-/// The predicate IRI a property name of an entity converts to, as the write path resolves it.
-pub(crate) fn property_iri(property: &str) -> Option<String> {
-    let predicate = property_named_node(&normalize_property(property)).ok()?;
-    Some(predicate.as_str().to_string())
-}
-
 fn property_named_node(property: &str) -> Result<NamedNode, CraqleError> {
     match property {
         "@type" | "type" => Ok(vocab::rdf_type()),
