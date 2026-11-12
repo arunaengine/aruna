@@ -349,4 +349,4 @@ pub async fn retire_rules(ctx: &DriverContext, actor: &Actor, install: &PluginIn
 
 #[cfg(test)]
 #[path = "rules_tests.rs"]
-mod tests;
+pub(crate) mod tests;

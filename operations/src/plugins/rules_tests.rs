@@ -148,7 +148,11 @@ async fn install_rules() {
 }
 
 /// The group secret `name` of `kind` with `settings` and one field, without use rules.
-async fn plain_secret(fixture: &Fixture, (name, kind): (&str, &str), settings: &[(&str, &str)]) {
+pub(crate) async fn plain_secret(
+    fixture: &Fixture,
+    (name, kind): (&str, &str),
+    settings: &[(&str, &str)],
+) {
     use crate::driver::drive;
     use crate::secrets::SecretChange;
     use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};

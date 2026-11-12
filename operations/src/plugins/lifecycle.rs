@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::plugin_installs::{InstallState, PluginInstall, Widening};
+use aruna_core::plugin_installs::{InstallState, PluginInstall, SecretBinding, Widening};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -17,6 +17,7 @@ use tracing::info;
 use ulid::Ulid;
 
 use super::account::{Identity, guard_of, teardown};
+use super::bound::{BindError, BindPlace, bind_slots};
 use super::check::covers;
 use super::grants::{
     Grants, carry_grants, check_supported, narrow_grants, parse_grants, stored_grants,
@@ -77,7 +78,9 @@ pub async fn update_install(
     let scope = scope_of(actor.realm_id, &current);
     let (kept, missing) = carry_grants(&parse_grants(&current.grants), &manifest, &scope);
     check_holder(ctx, auth, &scope, &kept).await?;
+    let secrets = rebind(ctx, (&config, &current), &manifest).await?;
     let mut next = preparing(&current, &kept);
+    next.secrets = secrets;
     next.version = plugin.version;
     next.digest = plugin.digest;
     next.settings = settings;
@@ -240,6 +243,31 @@ fn changeable(install: &PluginInstall) -> Result<(), InstallError> {
 }
 
 /// The next record of a role change: inactive, with the new grants, until it is settled.
+/// The bindings of a new version's slots: a kept slot's binding checked again where it lives, an
+/// added slot bound to the group secret of its name, and a dropped slot's binding gone.
+async fn rebind(
+    ctx: &DriverContext,
+    (config, current): (&RealmConfigDocument, &PluginInstall),
+    manifest: &Manifest,
+) -> Result<BTreeMap<String, SecretBinding>, InstallError> {
+    let kept: BTreeMap<String, String> = (current.secrets.iter())
+        .filter(|(slot, _)| manifest.secrets.contains_key(*slot))
+        .map(|(slot, binding)| (slot.clone(), binding.to_string()))
+        .collect();
+    let place = BindPlace {
+        group_id: current.group_id,
+        local: ctx.net_handle.as_ref().map(|net| net.node_id()),
+        receiver: Some(current.receiver),
+    };
+    let bound = bind_slots(ctx, config, place, manifest, &kept).await;
+    bound
+        .map(|(secrets, _)| secrets)
+        .map_err(|error| match error {
+            BindError::Invalid(why) => InstallError::Binding(why),
+            BindError::Unavailable(why) => InstallError::Unavailable(why),
+        })
+}
+
 fn preparing(current: &PluginInstall, grants: &Grants) -> PluginInstall {
     let mut next = current.clone();
     next.state = InstallState::Preparing;
