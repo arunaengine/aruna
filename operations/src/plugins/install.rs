@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
-use aruna_core::plugin_installs::{InstallState, PluginInstall, Prerequisite};
+use aruna_core::plugin_installs::{InstallState, PluginInstall, Prerequisite, SecretBinding};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -26,12 +26,14 @@ use super::account::{
     Identity, account_name, check_ready, ensure_account, ensure_role, guard_of, read_auth,
     read_user, teardown,
 };
+use super::bound::{BindError, BindPlace, bind_slots};
 use super::grants::{
     GrantError, Grants, InstallScope, accesses, carry_grants, check_supported, narrow_grants,
     parse_grants, role_paths, stored_grants,
 };
 use super::receiver::pick_receiver;
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
+use super::rules::{ensure_rules, retire_rules};
 use super::settings::{SettingError, check_settings};
 use crate::auth::permission_rules::permission_rules;
 use crate::auth::request_policy::{PolicyRequestExtras, enforce_policies, policy_request_with};
@@ -66,6 +68,8 @@ pub enum InstallError {
     Step { step: &'static str, error: String },
     #[error("{0}")]
     Unavailable(String),
+    #[error("{0}")]
+    Binding(String),
 }
 
 /// What a group admin asks to install.
@@ -80,6 +84,8 @@ pub struct InstallRequest {
     pub grants: BTreeMap<String, Vec<String>>,
     /// The id a preview answered; installing with it again resumes that install.
     pub install_id: Option<Ulid>,
+    /// `scope:name` of the secret per slot; a slot left out uses the same name in the group.
+    pub secrets: BTreeMap<String, String>,
 }
 
 /// A checked request: what the summary shows and the install then writes.
@@ -90,6 +96,10 @@ pub struct Prepared {
     pub manifest: Manifest,
     pub settings: String,
     pub grants: Grants,
+    /// The secret each slot uses, checked where it lives.
+    pub secrets: BTreeMap<String, SecretBinding>,
+    /// What the admin should know, such as rules only a realm admin can add.
+    pub warnings: Vec<String>,
     /// Digest of the checked request; a retry with the same id must match it.
     pub request: String,
 }
@@ -122,13 +132,28 @@ pub async fn prepare_install(
     };
     let grants = narrow_grants(&manifest, &scope, &request.grants)?;
     check_holder(ctx, auth, &scope, &grants).await?;
-    let request = request_digest(&plugin.digest, &scope, &settings, &grants);
+    // Node secrets are checked on the receiver, so it is chosen first.
+    let receiver = (existing.map(|install| install.receiver))
+        .or_else(|| pick_receiver(&config, realm_id, request.group_id));
+    let place = BindPlace {
+        group_id: request.group_id,
+        local: ctx.net_handle.as_ref().map(|net| net.node_id()),
+        receiver,
+    };
+    let bound = bind_slots(ctx, &config, place, &manifest, &request.secrets).await;
+    let (secrets, warnings) = bound.map_err(|error| match error {
+        BindError::Invalid(why) => InstallError::Binding(why),
+        BindError::Unavailable(why) => InstallError::Unavailable(why),
+    })?;
+    let request = request_digest(&plugin.digest, &scope, &settings, (&grants, &secrets));
     Ok(Prepared {
         scope,
         plugin,
         manifest,
         settings,
         grants,
+        secrets,
+        warnings,
         request,
     })
 }
@@ -210,6 +235,7 @@ fn new_record(actor: &Actor, prepared: &Prepared, receiver: NodeId) -> PluginIns
         prerequisites: Vec::new(),
         activated_by: None,
         widened: None,
+        secrets: prepared.secrets.clone(),
     }
 }
 
@@ -238,6 +264,13 @@ pub(crate) async fn settle(
             return Err(InstallError::Step { step, error });
         }
     };
+    if let Err(error) = ensure_rules(ctx, actor, &record, &manifest).await {
+        abandon(ctx, actor, auth, &record, "rules").await;
+        return Err(InstallError::Step {
+            step: "rules",
+            error,
+        });
+    }
     let mut next = record.clone();
     let (_, missing) = carry_grants(&grants, &manifest, &scope);
     next.state = match (missing.is_empty(), record.paused) {
@@ -291,6 +324,8 @@ async fn abandon(
     if let Err(error) = undo.await {
         warn!(%id, %error, "Could not undo a failed plugin install step");
     }
+    // Only an install that never became active loses its rules here.
+    retire_rules(ctx, actor, record).await;
     let mut failed = record.clone();
     failed.failed = Some(step.to_string());
     failed.revision += 1;
@@ -516,9 +551,21 @@ pub fn read_manifest(plugin: &PublishedPlugin) -> Result<Manifest, InstallError>
         .map_err(|error| InstallError::Manifest(error.to_string()))
 }
 
-fn request_digest(digest: &str, scope: &InstallScope, settings: &str, grants: &Grants) -> String {
+fn request_digest(
+    digest: &str,
+    scope: &InstallScope,
+    settings: &str,
+    (grants, secrets): (&Grants, &BTreeMap<String, SecretBinding>),
+) -> String {
     let group = scope.group_id.to_string();
-    let request = serde_json::json!([digest, group, settings, stored_grants(grants)]);
+    let mut request = serde_json::json!([digest, group, settings, stored_grants(grants)]);
+    // Bindings join the digest only when there are any, so earlier installs keep theirs.
+    if let (false, Some(parts)) = (secrets.is_empty(), request.as_array_mut()) {
+        let bound: BTreeMap<&String, String> = (secrets.iter())
+            .map(|(slot, binding)| (slot, binding.to_string()))
+            .collect();
+        parts.push(serde_json::json!(bound));
+    }
     ArtifactDigest::of(request.to_string().as_bytes()).to_string()
 }
 

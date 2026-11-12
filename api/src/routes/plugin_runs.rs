@@ -86,7 +86,7 @@ pub struct RunView {
     /// `queued`, `running`, `succeeded`, `failed`, `needs-attention` or `cancelled`.
     pub state: String,
     pub handler: String,
-    /// `manual`, `timer` or `event`.
+    /// `manual`, `timer`, `event` or `webhook`.
     pub trigger: String,
     /// Who started a manual run.
     pub started_by: Option<String>,
@@ -96,6 +96,8 @@ pub struct RunView {
     pub occurrence_ms: Option<u64>,
     /// The source event of an event run.
     pub event: Option<RunEvent>,
+    /// The delivery id of a webhook run, when the manifest names its header.
+    pub delivery_id: Option<String>,
     /// The install revision the run was admitted with.
     pub revision: u64,
     pub attempts: u32,
@@ -131,6 +133,10 @@ pub struct RunPage {
 }
 
 fn view(run: PluginRun) -> RunView {
+    let delivery_id = match &run.trigger {
+        RunTrigger::Webhook(hook) => hook.delivery_id.clone(),
+        _ => None,
+    };
     let (trigger, started_by, input, occurrence_ms, event) = match run.trigger {
         RunTrigger::Manual { by, input } => {
             ("manual", Some(by.to_string()), Some(input), None, None)
@@ -146,6 +152,7 @@ fn view(run: PluginRun) -> RunView {
             };
             ("event", None, None, None, Some(event))
         }
+        RunTrigger::Webhook(_) => ("webhook", None, None, None, None),
     };
     RunView {
         id: run.run_id.to_string(),
@@ -157,6 +164,7 @@ fn view(run: PluginRun) -> RunView {
         input,
         occurrence_ms,
         event,
+        delivery_id,
         revision: run.revision,
         attempts: run.attempts,
         due_ms: run.due_ms,
@@ -331,6 +339,7 @@ fn run_example(log: bool) -> Value {
         "input": "{\"dataset\":\"01JBX7Y3S5M3Q8Y1V9K2T4R6P4\"}",
         "occurrence_ms": null,
         "event": null,
+        "delivery_id": null,
         "revision": 2,
         "attempts": 1,
         "due_ms": 1762700000000u64,
@@ -907,6 +916,7 @@ mod tests {
             prerequisites: Vec::new(),
             activated_by: Some(node_id),
             widened: None,
+            secrets: Default::default(),
         });
         let row = config.to_bytes(&actor).unwrap();
         write_doc(

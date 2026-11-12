@@ -135,7 +135,8 @@ impl Broker for Recorder {
         if let Some(intent) = request.intent {
             self.intents.lock().unwrap().push(intent);
         }
-        let answer = r#"{"id":"c-1","secret":"s","meta":{"name":"n","token":"t"},"items":[{"a":1},{"b":2}],"other":[1]}"#;
+        // The broker answers with the exposed fields only, keyed by pointer.
+        let answer = r#"{"/id":"c-1","/meta/name":"n","/items/1":{"b":2}}"#;
         Ok(Response {
             status: 201,
             json: Some(answer.into()),

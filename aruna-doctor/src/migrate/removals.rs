@@ -13,9 +13,11 @@ use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 /// Node removals before the publisher cutoffs, stored with the node id only.
 const REMOVAL: Layout = &[("node_id,cutoffs", 1)];
 
-/// Reads a queued publish in its current shape or as one holding an old node removal.
+/// Reads a queued publish in its current shape or as one holding an old node removal or install.
 pub(super) fn outbox_record(value: &[u8]) -> postcard::Result<DocumentOutboxRecord> {
-    postcard::from_bytes(value).or_else(|_| session_refs::decode(value, REMOVAL))
+    postcard::from_bytes(value)
+        .or_else(|_| session_refs::decode(value, REMOVAL))
+        .or_else(|error| super::installs::queued_install(value).ok_or(error))
 }
 
 /// Queued node removals this node originated, in the current shape. The node signs them when

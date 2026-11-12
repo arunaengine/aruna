@@ -10,7 +10,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
 use aruna_plugins::manifest::Manifest;
 use aruna_plugins::permission::Permission;
-use aruna_plugins::trigger::TriggerKind;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -56,6 +55,7 @@ impl InstallScope {
             Permission::ConnectionsSend => {
                 format!("{group}/plugins/{}/connections", self.install_id)
             }
+            Permission::SecretsValue => format!("{group}/plugins/{}/secrets", self.install_id),
             _ => format!("{group}/data"),
         }
     }
@@ -64,25 +64,17 @@ impl InstallScope {
     pub fn connection(&self, name: &str) -> String {
         format!("{}/{name}", self.root(Permission::ConnectionsSend))
     }
+
+    /// The grant path of one secret slot's value.
+    pub fn secret(&self, slot: &str) -> String {
+        format!("{}/{slot}", self.root(Permission::SecretsValue))
+    }
 }
 
-/// Refuses what this version of Aruna cannot run yet: secrets, webhooks and container work.
+/// Refuses what this version of Aruna cannot run yet: container work.
 pub fn check_supported(manifest: &Manifest) -> Result<(), GrantError> {
-    if !manifest.secrets.is_empty() {
-        return Err(GrantError::Unsupported(
-            "plugins with secret slots cannot be installed yet",
-        ));
-    }
-    if manifest.triggers.contains_key(&TriggerKind::Webhook) {
-        return Err(GrantError::Unsupported(
-            "plugins with webhooks cannot be installed yet",
-        ));
-    }
-    let requested = manifest.requested();
-    if requested.contains(&Permission::SecretsValue) || requested.contains(&Permission::JobsRun) {
-        return Err(GrantError::Unsupported(
-            "secrets.value and jobs.run cannot be granted yet",
-        ));
+    if manifest.requested().contains(&Permission::JobsRun) {
+        return Err(GrantError::Unsupported("jobs.run cannot be granted yet"));
     }
     Ok(())
 }

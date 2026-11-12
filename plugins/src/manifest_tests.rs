@@ -184,6 +184,17 @@ fn rejects_triggers() {
         .triggers
         .insert(TriggerKind::Webhook, hook("hook_key", Some("X-Delivery")));
     assert!(verified.check().is_err());
+    for taken in [
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "host",
+        "x-aruna-relay-hop",
+    ] {
+        let taken = hook("hook_key", Some(taken));
+        verified.triggers.insert(TriggerKind::Webhook, taken);
+        assert!(verified.check().is_err());
+    }
     let missing = with(TriggerKind::DataUploaded, Trigger::default());
     assert_eq!(
         missing,

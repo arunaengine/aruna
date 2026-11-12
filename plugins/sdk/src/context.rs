@@ -7,11 +7,11 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::bindings::aruna::plugin::{
-    connections, grants, log, metadata_read, metadata_write, objects_read, state,
+    connections, grants, log, metadata_read, metadata_write, objects_read, secrets, state,
 };
 use crate::error::{Error, Result};
 
-pub use connections::Method;
+pub use connections::{FullResponse, Method};
 pub use log::Level;
 pub use objects_read::{ObjectInfo, ObjectPage};
 pub use state::Entry;
@@ -69,6 +69,15 @@ impl Context {
 
     pub fn state(&self) -> State {
         State
+    }
+
+    /// The fields of a secret slot granted through `secrets.value`, as name and value pairs.
+    pub async fn secret(&self, slot: &str) -> Result<Vec<(String, String)>> {
+        let fields = secrets::value(slot).map_err(|err| Error::host(err, "secrets.value", slot))?;
+        Ok(fields
+            .into_iter()
+            .map(|field| (field.name, field.value))
+            .collect())
     }
 
     pub fn log(&self, level: Level, message: &str) {
@@ -226,6 +235,29 @@ impl Http {
             status: reply.status,
             fields,
         })
+    }
+}
+
+impl Http {
+    /// The whole answer, for a connection whose manifest says `response = "full"`.
+    pub async fn send_full(
+        &self,
+        method: Method,
+        path: &str,
+        body: Vec<u8>,
+        key: Option<&str>,
+    ) -> Result<FullResponse> {
+        let request = connections::Request {
+            connection: self.name.clone(),
+            method,
+            path: path.to_string(),
+            query: Vec::new(),
+            headers: Vec::new(),
+            body,
+            key: key.map(str::to_string),
+        };
+        let reply = connections::send_full(&request);
+        reply.map_err(|err| Error::host(err, "connections.send", &self.name))
     }
 }
 

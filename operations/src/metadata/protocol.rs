@@ -708,6 +708,22 @@ pub enum MetadataTransportMessage {
     EventsDecided {
         result: Result<crate::plugins::forward::Decisions, MetadataReadError>,
     },
+    /// A plugin install's receiver asks for the secret bound to one of its slots.
+    ReleaseSecret {
+        request: crate::plugins::release::ReleaseRequest,
+    },
+    SecretReleased {
+        result: Result<crate::plugins::release::Released, crate::plugins::release::ReleaseError>,
+    },
+    /// A server node asks an install's receiver whether it holds a node secret of a kind, and
+    /// which header the secret checks; never its value.
+    CheckNodeSecret {
+        name: aruna_core::secrets::SecretName,
+        kind: aruna_core::secrets::SecretKind,
+    },
+    NodeSecretChecked {
+        result: Result<Option<String>, crate::plugins::bound::NodeCheckError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.

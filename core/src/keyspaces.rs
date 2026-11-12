@@ -531,6 +531,9 @@ pub const PLUGIN_QUEUE_KEYSPACE: &str = "plugin_queue";
 pub const PLUGIN_INTENTS_KEYSPACE: &str = "plugin_intents";
 /// Private plugin state by install and key, with each install's byte count.
 pub const PLUGIN_STATE_KEYSPACE: &str = "plugin_state";
+/// Webhook delivery ids this receiver admitted, by install and by receipt time, and where the
+/// prune of secret use audit rows stopped.
+pub const PLUGIN_HOOKS_KEYSPACE: &str = "plugin_hooks";
 /// The one row of `NODE_STATE_KEYSPACE` that holds the node's identity.
 pub const NODE_STATE_KEY: &[u8] = b"node_state";
 /// Realm signing key a promotion handed to this node; its next start moves it into the identity.
@@ -835,6 +838,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     PLUGIN_QUEUE_KEYSPACE,
     PLUGIN_INTENTS_KEYSPACE,
     PLUGIN_STATE_KEYSPACE,
+    PLUGIN_HOOKS_KEYSPACE,
     ONBOARDING_KEYSPACE,
     DHT_KEYSPACE,
     CRAQLE_TERMS_KEYSPACE,

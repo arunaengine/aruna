@@ -20,7 +20,8 @@ use aruna_plugins::broker::ErrorKind;
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::permission::Permission;
 use aruna_plugins::{
-    CancellationToken, FailureKind, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
+    CancellationToken, FailureKind, Field, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
+    WebhookDelivery, WebhookRequest,
 };
 use tokio_util::task::TaskTracker;
 use tracing::warn;
@@ -38,7 +39,10 @@ use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
 use super::matcher::match_pending;
+use super::outbound::Outbound;
+use super::prune::{prune_hooks, prune_uses};
 use super::receiver::{eligible, lost_reason};
+use super::release::ReleaseKeys;
 use super::replay::{plan_replays, run_replays};
 use super::runs::{prune_runs, read_run, save_run, unfinished};
 use super::store::StoreError;
@@ -82,6 +86,10 @@ pub struct Worker {
     reasons: Mutex<HashMap<Ulid, &'static str>>,
     /// When each receiver of forwarded events is tried again.
     backoff: tokio::sync::Mutex<Backoff>,
+    /// Sends connection requests instead of the node's egress client, in tests.
+    outbound: Mutex<Option<Arc<dyn Outbound>>>,
+    /// Releases with these realm keys instead of the node's, in tests.
+    keys: Mutex<Option<ReleaseKeys>>,
     /// When the waiting events were last rechecked.
     rechecked: AtomicU64,
     tasks: TaskTracker,
@@ -115,6 +123,8 @@ impl Worker {
             running: Mutex::new(HashMap::new()),
             reasons: Mutex::new(HashMap::new()),
             backoff: tokio::sync::Mutex::default(),
+            outbound: Mutex::new(None),
+            keys: Mutex::new(None),
             rechecked: AtomicU64::new(0),
             tasks: TaskTracker::new(),
             stopping: CancellationToken::new(),
@@ -210,7 +220,23 @@ impl Worker {
         let config = read_config(&self.ctx, self.realm_id).await;
         let config = config.map_err(|error| error.to_string())?;
         let swept = sweep_events(&self.ctx, &config, now_ms).await;
-        swept.map_err(|error| error.to_string())
+        let swept = swept.map_err(|error| error.to_string())?;
+        let hooks = prune_hooks(&self.ctx, &config, now_ms).await;
+        Ok(swept + hooks.map_err(|error| error.to_string())?)
+    }
+
+    /// Sends connection requests through `outbound` instead of the node's egress client.
+    pub fn use_outbound(&self, outbound: Arc<dyn Outbound>) {
+        if let Ok(mut held) = self.outbound.lock() {
+            *held = Some(outbound);
+        }
+    }
+
+    /// Releases secrets with `keys` instead of the node's realm keys.
+    pub fn use_keys(&self, keys: ReleaseKeys) {
+        if let Ok(mut held) = self.keys.lock() {
+            *held = Some(keys);
+        }
     }
 
     /// Hands a batch to its receiver; this node decides the batches of the installs it runs.
@@ -298,13 +324,22 @@ impl Worker {
             local: self.local,
             run: run.clone(),
         };
-        let broker = Arc::new(RunBroker::new(self.ctx.clone(), scope));
+        let mut broker = RunBroker::new(self.ctx.clone(), scope);
+        let outbound = self.outbound.lock().ok().and_then(|held| held.clone());
+        if let Some(outbound) = outbound {
+            broker = broker.with_outbound(outbound);
+        }
+        if let Some(keys) = self.keys.lock().ok().and_then(|held| held.clone()) {
+            broker = broker.with_keys(keys);
+        }
+        let broker = Arc::new(broker);
         let ended = self.attempt(&run, broker.clone(), cancel).await;
         if matches!(ended, Ended::Stopped) {
             self.running().remove(&run.run_id);
             return;
         }
         run.log = broker.take_log();
+        let ended = scrub_ended(&broker, ended);
         let now = unix_timestamp_millis();
         let open = open_intent(&self.ctx, run.run_id).await;
         let ended = match ended {
@@ -410,6 +445,12 @@ fn invocation(
         .filter(|(_, patterns)| !patterns.is_empty())
         .filter_map(|(name, _)| name.parse().ok())
         .collect();
+    // A `connections.send` grant path ends in the connection's name.
+    let connections = (install.grants.get(Permission::ConnectionsSend.as_str()))
+        .into_iter()
+        .flatten()
+        .filter_map(|path| path.rsplit('/').next().map(str::to_string))
+        .collect();
     let trigger = match &run.trigger {
         RunTrigger::Manual { input, .. } => Trigger::Manual(input.clone()),
         RunTrigger::Timer { occurrence_ms } => Trigger::Timer(*occurrence_ms),
@@ -418,6 +459,20 @@ fn invocation(
             path: event.path.clone(),
             resource: event.resource.clone(),
             revision: event.revision.clone(),
+        }),
+        RunTrigger::Webhook(hook) => Trigger::Webhook(WebhookDelivery {
+            delivery_id: hook.delivery_id.clone(),
+            request: WebhookRequest {
+                method: hook.method.clone(),
+                query: hook.query.clone(),
+                headers: (hook.headers.iter())
+                    .map(|(name, value)| Field {
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                body: hook.body.clone(),
+            },
         }),
     };
     Invocation {
@@ -428,7 +483,7 @@ fn invocation(
         settings: run.settings.clone(),
         trigger,
         permissions,
-        connections: BTreeSet::new(),
+        connections,
         limits,
         cancel,
     }
@@ -436,6 +491,18 @@ fn invocation(
 
 /// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown
 /// makes it need attention, and unreadable intents keep it queued without using an attempt.
+/// The attempt's end with every value handed to the code removed from the text the run keeps.
+fn scrub_ended(broker: &RunBroker, ended: Ended) -> Ended {
+    match ended {
+        Ended::Output(output) => Ended::Output(output.map(|text| broker.scrub(&text))),
+        Ended::Failed(message) => Ended::Failed(broker.scrub(&message)),
+        Ended::Retry(message) => Ended::Retry(broker.scrub(&message)),
+        Ended::Cancelled(message) => Ended::Cancelled(broker.scrub(&message)),
+        Ended::Busy(message) => Ended::Busy(broker.scrub(&message)),
+        Ended::Stopped => Ended::Stopped,
+    }
+}
+
 fn conclude(
     run: &mut PluginRun,
     ended: Ended,
@@ -519,6 +586,9 @@ pub fn spawn_worker(
                 }
                 if let Err(error) = prune_seen(&worker.ctx, now).await {
                     warn!(%error, "Could not prune plugin event dedup records");
+                }
+                if let Err(error) = prune_uses(&worker.ctx, now).await {
+                    warn!(%error, "Could not prune plugin secret use audit rows");
                 }
                 if let Err(error) = worker.sweep(now).await {
                     warn!(%error, "Could not delete stale plugin event rows");

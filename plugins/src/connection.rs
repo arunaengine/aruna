@@ -55,11 +55,47 @@ pub struct Connection {
     /// Secret slot the host injects into every request.
     #[serde(default)]
     pub auth: Option<String>,
-    /// JSON pointers of the answer the code may read; empty means status only.
+    /// What the code may read of the answer: JSON pointers (none means status only), or
+    /// `"full"` for status, headers and body through `send-full`.
     #[serde(default)]
-    pub response: Vec<String>,
+    pub response: Readable,
     #[serde(default)]
     pub optional: bool,
+}
+
+/// What the code may read of a connection's answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Readable {
+    Fields(Vec<String>),
+    Full(Whole),
+}
+
+/// The one word that names a whole answer in a manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Whole {
+    Full,
+}
+
+impl Default for Readable {
+    fn default() -> Self {
+        Self::Fields(Vec::new())
+    }
+}
+
+impl Readable {
+    /// The readable JSON pointers; a whole answer lists none.
+    pub fn fields(&self) -> &[String] {
+        match self {
+            Self::Fields(fields) => fields,
+            Self::Full(_) => &[],
+        }
+    }
+
+    pub fn full(&self) -> bool {
+        matches!(self, Self::Full(_))
+    }
 }
 
 /// The parts of an address template.
@@ -104,22 +140,46 @@ impl Connection {
         Ok(Address::Fixed(url))
     }
 
+    /// The base address with its setting filled in: an https origin and the fixed path prefix.
+    /// A setting gives the origin only; its path is ignored.
+    pub fn base(&self, settings: &serde_json::Value) -> Result<Url, &'static str> {
+        let (setting, prefix) = match self.address()? {
+            Address::Fixed(url) => return Ok(url),
+            Address::Setting { setting, prefix } => (setting, prefix),
+        };
+        let origin = (settings.get(setting).and_then(serde_json::Value::as_str))
+            .ok_or("the address setting has no value")?;
+        let origin = Url::parse(origin).map_err(|_| "the address setting is not an address")?;
+        if origin.scheme() != "https" || origin.host_str().is_none() {
+            return Err("the address setting is not an https origin");
+        }
+        let joined = format!("{}{prefix}", origin.origin().ascii_serialization());
+        Url::parse(&joined).map_err(|_| "the address does not parse")
+    }
+
     /// Checks methods and response fields; the address is checked by [`Connection::address`].
     pub fn check_fields(&self) -> Result<(), &'static str> {
         if self.methods.is_empty() {
             return Err("no method");
         }
-        if self.response.len() > MAX_FIELDS {
+        let fields = self.response.fields();
+        if fields.len() > MAX_FIELDS {
             return Err("too many response fields");
         }
         let pointer = |field: &String| {
             field.starts_with('/') && field.len() <= MAX_POINTER && !field.contains('\0')
         };
-        if !self.response.iter().all(pointer) {
+        if !fields.iter().all(pointer) {
             return Err("a response field is not a JSON pointer");
         }
         Ok(())
     }
+}
+
+/// Whether a request path below a connection's prefix is empty or plain segments, so it can
+/// never leave the prefix.
+pub fn relative_path(path: &str) -> bool {
+    path.is_empty() || (!path.starts_with('/') && valid_prefix(&format!("/{path}")))
 }
 
 /// Whether `path` is empty or `/`-separated plain segments that cannot leave the prefix.
@@ -144,7 +204,7 @@ mod tests {
             url: url.to_string(),
             methods: get_only(),
             auth: None,
-            response: Vec::new(),
+            response: Readable::default(),
             optional: false,
         }
     }
@@ -198,11 +258,15 @@ mod tests {
     fn checks_fields() {
         let mut item = connection("https://catalog.example.org");
         assert!(item.check_fields().is_ok());
-        item.response = vec!["/id".into(), "/meta/name".into()];
+        item.response = Readable::Fields(vec!["/id".into(), "/meta/name".into()]);
         assert!(item.check_fields().is_ok());
-        item.response.push("id".into());
+        item.response = Readable::Fields(vec!["id".into()]);
         assert!(item.check_fields().is_err());
-        item.response.clear();
+        // A manifest reads the whole answer with the one word `full`, nothing else.
+        let full: Readable = serde_json::from_str(r#""full""#).unwrap();
+        assert!(full.full() && full.fields().is_empty());
+        assert!(serde_json::from_str::<Readable>(r#""all""#).is_err());
+        item.response = Readable::default();
         item.methods.clear();
         assert!(item.check_fields().is_err());
         assert!(Method::Post.mutating() && !Method::Head.mutating());

@@ -10,7 +10,7 @@ use crate::UserId;
 use crate::errors::ConversionError;
 use crate::keyspaces::ADMIN_AUDIT_KEYSPACE;
 use crate::plugin_installs::PluginInstall;
-use crate::secrets::{SecretName, SecretScope};
+use crate::secrets::{Delivery, SecretName, SecretScope};
 use crate::types::GroupId;
 
 const REALM_SCOPE: u8 = b'r';
@@ -38,6 +38,19 @@ pub enum AdminAuditAction {
     PluginRemoved,
     /// A person decided the outcome of a plugin run that needed attention.
     PluginRunResolved,
+    /// A secret was released to a plugin install for one use.
+    SecretReleased,
+    /// A use of a secret by a plugin install was refused.
+    SecretRefused,
+}
+
+/// One use of a secret by the install a row names: how it is delivered, the run it is for,
+/// and the check step that refused it, if any. Never a value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretUse {
+    pub delivery: Delivery,
+    pub run_id: Option<Ulid>,
+    pub refused: Option<String>,
 }
 
 /// The plugin install a plugin row is about.
@@ -72,6 +85,7 @@ pub struct AdminAuditRecord {
     pub session_id: Option<String>,
     pub secret: Option<SecretAudit>,
     pub plugin: Option<PluginAudit>,
+    pub secret_use: Option<SecretUse>,
 }
 
 impl AdminAuditRecord {
@@ -85,6 +99,7 @@ impl AdminAuditRecord {
             session_id: None,
             secret: None,
             plugin: None,
+            secret_use: None,
         }
     }
 
@@ -98,6 +113,19 @@ impl AdminAuditRecord {
                 install_id: install.install_id,
             }),
             ..Self::new(action, actor, install.account)
+        }
+    }
+
+    /// A row about one use of a secret by an install, which acts as its account.
+    pub fn for_use(install: &PluginInstall, secret: SecretAudit, used: SecretUse) -> Self {
+        let action = match used.refused {
+            Some(_) => AdminAuditAction::SecretRefused,
+            None => AdminAuditAction::SecretReleased,
+        };
+        Self {
+            secret: Some(secret),
+            secret_use: Some(used),
+            ..Self::for_install(action, install.account, install)
         }
     }
 
@@ -227,5 +255,36 @@ mod tests {
             (admin, Some(Ulid::from_parts(3, 3)))
         );
         assert_eq!(grouped.entries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn use_rows() {
+        let install = crate::plugin_installs::tests::install();
+        let name = SecretName::try_from("catalog-key".to_string()).unwrap();
+        let secret = SecretAudit {
+            scope: SecretScope::Group(install.group_id),
+            name,
+            incarnation: Some(Ulid::from_parts(4, 4)),
+            write_id: Some(Ulid::from_parts(5, 5)),
+        };
+        let used = |refused: Option<&str>| SecretUse {
+            delivery: Delivery::Inject,
+            run_id: Some(Ulid::from_parts(6, 6)),
+            refused: refused.map(str::to_string),
+        };
+        let released = AdminAuditRecord::for_use(&install, secret.clone(), used(None));
+        assert_eq!(released.action, AdminAuditAction::SecretReleased);
+        assert_eq!(
+            (released.actor, released.target),
+            (install.account, install.account)
+        );
+        let entries = released.entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            AdminAuditRecord::from_bytes(&entries[1].2).unwrap(),
+            released
+        );
+        let refused = AdminAuditRecord::for_use(&install, secret, used(Some("rule")));
+        assert_eq!(refused.action, AdminAuditAction::SecretRefused);
     }
 }

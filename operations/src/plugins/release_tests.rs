@@ -1,0 +1,272 @@
+//! Tests the release path: a bound group secret reaches the install's receiver once every check
+//! passes, each failed check refuses at its step with an audit row, and a held value stays home.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::UserId;
+use aruna_core::compute::Secret;
+use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::secrets::{SecretFields, UseRule};
+use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AuditIndex, audit_prefix};
+
+use super::*;
+use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, keys, secret};
+use crate::plugins::install::read_config;
+use crate::plugins::install::tests::Fixture;
+use crate::secrets::SecretChange;
+
+fn request(install: &PluginInstall, url: &str) -> ReleaseRequest {
+    ReleaseRequest {
+        install_id: install.install_id,
+        slot: "api_key".to_string(),
+        delivery: Delivery::Inject,
+        target: Some(("POST".to_string(), url.to_string())),
+        held: None,
+        run_id: Some(Ulid::from_parts(5, 5)),
+    }
+}
+
+async fn released(
+    fixture: &Fixture,
+    peer: NodeId,
+    request: &ReleaseRequest,
+) -> Result<Released, ReleaseError> {
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let local = fixture.actor.node_id;
+    release(&fixture.ctx, &keys(), (&config, local, peer), request).await
+}
+
+/// The use audit actions this node recorded, oldest first.
+async fn audited(fixture: &Fixture) -> Vec<(AdminAuditAction, Option<String>)> {
+    let txn = Txn::direct(&fixture.ctx);
+    let rows = txn
+        .scan(ADMIN_AUDIT_KEYSPACE, &audit_prefix(AuditIndex::Realm))
+        .await
+        .unwrap();
+    (rows.iter())
+        .filter_map(|(_, value)| AdminAuditRecord::from_bytes(value).ok())
+        .filter_map(|record| Some((record.action, record.secret_use?.refused)))
+        .collect()
+}
+
+#[tokio::test]
+async fn releases_bound_secret() {
+    let fixture = Fixture::keyed().await;
+    let install = bound(&fixture).await;
+    secret(&fixture, &install).await;
+    let receiver = install.receiver;
+    let mut asked = request(&install, &format!("{ORIGIN}/api/records"));
+    let answer = released(&fixture, receiver, &asked).await.unwrap();
+    let fields = SecretFields::decode(answer.fields.as_ref().unwrap()).unwrap();
+    assert_eq!(fields.get("token"), Some(TOKEN));
+    assert_eq!(
+        (answer.kind.as_str(), &answer.exposure),
+        ("bearer", &ResponseExposure::Status)
+    );
+    // A receiver that holds this value gets the check and the row, not the bytes again.
+    asked.held = Some(answer.value_id);
+    let again = released(&fixture, receiver, &asked).await.unwrap();
+    assert_eq!((again.fields, again.value_id), (None, answer.value_id));
+    let rows = audited(&fixture).await;
+    let release = (AdminAuditAction::SecretReleased, None);
+    assert_eq!(rows, [release.clone(), release]);
+    assert!(!format!("{answer:?}").contains(TOKEN));
+}
+
+#[tokio::test]
+async fn refusals_per_step() {
+    let fixture = Fixture::keyed().await;
+    let install = bound(&fixture).await;
+    secret(&fixture, &install).await;
+    let receiver = install.receiver;
+    let good = request(&install, &format!("{ORIGIN}/api/records"));
+    let refused = |refusal| Err(ReleaseError::Refused(refusal));
+    let other = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+    assert_eq!(
+        released(&fixture, other, &good).await,
+        refused(Refusal::Peer)
+    );
+    let mut unbound = good.clone();
+    unbound.slot = "other".to_string();
+    assert_eq!(
+        released(&fixture, receiver, &unbound).await,
+        refused(Refusal::Binding)
+    );
+    let elsewhere = request(&install, "https://elsewhere.example.org/api/");
+    assert_eq!(
+        released(&fixture, receiver, &elsewhere).await,
+        refused(Refusal::Rule)
+    );
+    fixture.deny(&["operation == 'secret.use'"]).await;
+    assert_eq!(
+        released(&fixture, receiver, &good).await,
+        refused(Refusal::Policy)
+    );
+    fixture.deny(&[]).await;
+    edit_config(&fixture, |config| {
+        config.installs[0].state = InstallState::Paused
+    })
+    .await;
+    assert_eq!(
+        released(&fixture, receiver, &good).await,
+        refused(Refusal::Authority)
+    );
+    edit_config(&fixture, |config| {
+        config.installs[0].state = InstallState::Active;
+        config.installs[0].account = UserId::local(Ulid::from_parts(9, 9), config.realm_id);
+    })
+    .await;
+    assert_eq!(
+        released(&fixture, receiver, &good).await,
+        refused(Refusal::Authority)
+    );
+    let steps: Vec<Option<String>> = audited(&fixture)
+        .await
+        .into_iter()
+        .map(|row| row.1)
+        .collect();
+    let expected = ["peer", "rule", "policy", "authority", "authority"];
+    assert_eq!(steps, expected.map(|step| Some(step.to_string())));
+}
+
+#[tokio::test]
+async fn node_secrets_local() {
+    use crate::driver::drive;
+    use crate::secrets::node::{NodeChange, NodeSecretOperation};
+    let fixture = Fixture::keyed().await;
+    fixture
+        .ctx
+        .storage_handle
+        .open_vault(NodeVaultKey::random());
+    let install = bound(&fixture).await;
+    let binding = SecretBinding::parse("node:api-key").unwrap();
+    edit_config(&fixture, |config| {
+        config.installs[0]
+            .secrets
+            .insert("api_key".to_string(), binding);
+    })
+    .await;
+    let rule = UseRule {
+        consumer: SecretConsumer::Plugin {
+            plugin_id: install.plugin.clone(),
+            install_id: install.install_id,
+        },
+        delivery: Delivery::Inject,
+        origins: vec![ORIGIN.to_string()],
+        paths: Vec::new(),
+        methods: Vec::new(),
+        response: ResponseExposure::Status,
+        groups: vec![install.group_id],
+    };
+    let change = SecretChange::Create {
+        name: SecretName::try_from("api-key".to_string()).unwrap(),
+        kind: SecretKind::parse("bearer").unwrap(),
+        description: String::new(),
+        settings: SecretSettings::new(),
+        uses: vec![rule],
+        fields: SecretFields::new([("token".to_string(), Secret::new(TOKEN))].into()),
+    };
+    let input = NodeChange {
+        realm_id: fixture.actor.realm_id,
+        node_id: fixture.actor.node_id,
+        actor: fixture.actor.user_id,
+        change,
+        now_ms: 1,
+        write_id: Ulid::from_parts(66, 1),
+    };
+    drive(NodeSecretOperation::new(input), &fixture.ctx)
+        .await
+        .unwrap();
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let asked = request(&install, &format!("{ORIGIN}/api/records"));
+    let receiver = install.receiver;
+    let mine = (&config, receiver, receiver);
+    let answer = release(&fixture.ctx, &ReleaseKeys::default(), mine, &asked).await;
+    let fields = SecretFields::decode(answer.unwrap().fields.as_ref().unwrap()).unwrap();
+    assert_eq!(fields.get("token"), Some(TOKEN));
+    // A management node never serves another node's secret.
+    let elsewhere = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+    let served = release(
+        &fixture.ctx,
+        &keys(),
+        (&config, elsewhere, receiver),
+        &asked,
+    )
+    .await;
+    assert_eq!(served, Err(ReleaseError::Refused(Refusal::Binding)));
+}
+
+/// Applies `change` to the group secret `api-key` of `install`.
+async fn change_secret(
+    fixture: &Fixture,
+    install: &PluginInstall,
+    change: SecretChange,
+    seed: u128,
+) {
+    use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
+    let input = OwnerChange {
+        realm_id: fixture.actor.realm_id,
+        node_id: fixture.actor.node_id,
+        owner: aruna_core::secret_registers::SecretOwner::Group(install.group_id),
+        actor: fixture.actor.user_id,
+        change,
+        readable: false,
+        now_ms: 10 + seed as u64,
+        write_ids: [1, 2, 3].map(|part| Ulid::from_parts(80 + seed as u64, part)),
+        txn_id: None,
+    };
+    crate::driver::drive(OwnerSecretOperation::new(input), &fixture.ctx)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rotated_and_deleted() {
+    let fixture = Fixture::keyed().await;
+    let install = bound(&fixture).await;
+    secret(&fixture, &install).await;
+    let receiver = install.receiver;
+    let mut asked = request(&install, &format!("{ORIGIN}/api/records"));
+    let first = released(&fixture, receiver, &asked).await.unwrap();
+    let name = SecretName::try_from("api-key".to_string()).unwrap();
+    let rotated = "canary-rotated-91c2";
+    let fields = SecretFields::new([("token".to_string(), Secret::new(rotated))].into());
+    let rotate = SecretChange::Rotate {
+        name: name.clone(),
+        fields,
+        expected: None,
+    };
+    change_secret(&fixture, &install, rotate, 1).await;
+    // A receiver still holding the old value gets the new one, never a nod to the old.
+    asked.held = Some(first.value_id);
+    let second = released(&fixture, receiver, &asked).await.unwrap();
+    assert_ne!(second.value_id, first.value_id);
+    let fields = SecretFields::decode(second.fields.as_ref().unwrap()).unwrap();
+    assert_eq!(fields.get("token"), Some(rotated));
+    let delete = SecretChange::Delete {
+        name,
+        expected: None,
+    };
+    change_secret(&fixture, &install, delete, 2).await;
+    let gone = released(&fixture, receiver, &asked).await;
+    assert_eq!(gone, Err(ReleaseError::Refused(Refusal::Entry)));
+    // No value form appears in answers, errors or audit rows.
+    let shown = format!(
+        "{first:?}{second:?}{gone:?}{asked:?}{}",
+        gone.clone().unwrap_err()
+    );
+    let txn = Txn::direct(&fixture.ctx);
+    let rows = txn.scan(ADMIN_AUDIT_KEYSPACE, &[]).await.unwrap();
+    let stored: Vec<u8> = rows.into_iter().flat_map(|(_, value)| value).collect();
+    for canary in [TOKEN, rotated] {
+        assert!(!shown.contains(canary), "{canary} in an answer");
+        let found = stored
+            .windows(canary.len())
+            .any(|window| window == canary.as_bytes());
+        assert!(!found, "{canary} in an audit row");
+    }
+}

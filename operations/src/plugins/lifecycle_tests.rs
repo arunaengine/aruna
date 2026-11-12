@@ -403,3 +403,41 @@ async fn coverage_times() {
     assert_eq!(resumed.activated_by, Some(actor.node_id));
     assert!(resumed.active_since_ms >= installed.active_since_ms);
 }
+
+#[tokio::test]
+async fn updates_bind_slots() {
+    use crate::plugins::bound::tests::{bound, secret};
+    use crate::plugins::rules::tests::plain_secret;
+    let fixture = Fixture::keyed().await;
+    let install = bound(&fixture).await;
+    secret(&fixture, &install).await;
+    let bearer = |title: &str| json!({ "title": title, "kind": "bearer" });
+    let connection = json!({ "catalog": { "url": "{catalog_url}/api/", "auth": "api_key" } });
+    let added = json!({
+        "secrets": { "api_key": bearer("API key"), "extra_key": bearer("Extra key") },
+        "connections": connection.clone()
+    });
+    let wider = fixture.publish("0.3.0", "ee", added).await;
+    let auth = fixture.auth();
+    let update = |digest: String| {
+        let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, &auth);
+        async move { update_install(ctx, actor, auth, install.install_id, &digest, None).await }
+    };
+    // An added slot whose secret does not exist is refused before anything changes.
+    let refused = update(wider.clone()).await;
+    assert!(
+        matches!(refused, Err(InstallError::Binding(_))),
+        "{refused:?}"
+    );
+    assert_eq!(fixture.installs().await[0].digest, install.digest);
+    plain_secret(&fixture, ("extra_key", "bearer"), &[]).await;
+    let (updated, _) = update(wider).await.unwrap();
+    let names: Vec<String> = updated.secrets.values().map(ToString::to_string).collect();
+    assert_eq!(names, ["group:api-key", "group:extra_key"]);
+    // A version without the slot drops its binding and keeps the others.
+    let narrow = json!({ "secrets": { "api_key": bearer("API key") }, "connections": connection });
+    let narrow = fixture.publish("0.4.0", "ef", narrow).await;
+    let (updated, _) = update(narrow).await.unwrap();
+    let names: Vec<String> = updated.secrets.values().map(ToString::to_string).collect();
+    assert_eq!(names, ["group:api-key"]);
+}

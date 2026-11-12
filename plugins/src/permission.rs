@@ -110,6 +110,7 @@ impl Import {
             "metadata-read" => Self::Needs(Permission::MetadataRead),
             "metadata-write" => Self::Needs(Permission::MetadataWrite),
             "objects-read" => Self::Needs(Permission::ObjectsRead),
+            "secrets" => Self::Needs(Permission::SecretsValue),
             "connections" => Self::Connections,
             _ => return None,
         })

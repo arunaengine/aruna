@@ -9,9 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aruna_core::NodeId;
+use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
 use aruna_core::metadata::AuthToken;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun};
+use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields, header_name};
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
@@ -19,18 +21,24 @@ use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    Broker, CallContext, Document, Entry, ErrorKind, Field, FullResponse, HostError, Intent,
+    Listing, MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
 };
+use aruna_plugins::connection::{Readable, relative_path};
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
+use base64::Engine;
 use serde_json::Value;
 use ulid::Ulid;
 
 use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
-use super::grants::{accesses, parse_grants};
+use super::grants::{InstallScope, accesses, parse_grants};
+use super::held::{HeldSecrets, ask_release};
+use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
+use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::rate::take_call;
+use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
 use super::state::{PutError, check_key, put_state, read_state};
 use super::store::{StoreError, Txn, transact};
 use crate::driver::{DriverContext, drive};
@@ -51,6 +59,14 @@ const PAGE: usize = 100;
 /// The host side of one run.
 pub struct RunBroker {
     ctx: Arc<DriverContext>,
+    /// Sends connection requests; the node's screened egress client unless a test replaces it.
+    outbound: Arc<dyn Outbound>,
+    /// The realm keys a management node releases group and realm secrets with.
+    keys: ReleaseKeys,
+    /// The secrets this run holds, reused while their value is unchanged.
+    held: tokio::sync::Mutex<HeldSecrets>,
+    /// The values handed to the code, removed from the text the run keeps.
+    shown: Mutex<Vec<SecretFields>>,
     scope: RunScope,
     /// A call at a known ordinal came with other arguments than before.
     changed: AtomicBool,
@@ -63,11 +79,32 @@ impl RunBroker {
         let mut lines = scope.run.clone();
         lines.log.clear();
         Self {
+            outbound: Arc::new(Egress(ctx.blob_handle.clone())),
+            keys: (ctx.metadata_handle.as_ref())
+                .map(|handle| ReleaseKeys {
+                    seal: handle.realm_seal_key(),
+                    vault: handle.realm_vault_key(),
+                })
+                .unwrap_or_default(),
+            held: tokio::sync::Mutex::default(),
+            shown: Mutex::default(),
             ctx,
             log: Mutex::new(lines),
             scope,
             changed: AtomicBool::new(false),
         }
+    }
+
+    /// The broker with other realm keys for releases.
+    pub fn with_keys(mut self, keys: ReleaseKeys) -> Self {
+        self.keys = keys;
+        self
+    }
+
+    /// The broker with another sender for connection requests.
+    pub fn with_outbound(mut self, outbound: Arc<dyn Outbound>) -> Self {
+        self.outbound = outbound;
+        self
     }
 
     /// The log lines the guest wrote, within the run's bounds.
@@ -497,9 +534,62 @@ impl Broker for RunBroker {
     async fn connection_send(
         &self,
         _cx: &CallContext,
-        _request: SendRequest,
+        request: SendRequest,
     ) -> Result<Response, HostError> {
-        Err(unavailable("connections are not available in this release"))
+        let mut ready = self.ready(request).await?;
+        // A whole answer is only for `send-full`; here the code reads fields at most.
+        if ready.exposure == ResponseExposure::Full {
+            ready.exposure = ResponseExposure::Status;
+        }
+        let Ready {
+            outgoing,
+            exposure,
+            fields,
+            body,
+            intent,
+            ..
+        } = ready;
+        let Some(intent) = intent else {
+            let answer = self.outbound.send(outgoing, body).await;
+            let answer = answer.map_err(|error| unavailable(error.to_string()))?;
+            return Ok(exposed(&exposure, &fields, &answer));
+        };
+        if let Some(reply) = self.begun(&intent).await? {
+            return Ok(kept(stored_reply(&reply)?, &exposure));
+        }
+        let outcome = match self.outbound.send(outgoing, body).await {
+            Ok(answer) => Ok(reply_text(&exposed(&exposure, &fields, &answer))),
+            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
+            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
+        };
+        stored_reply(&self.record(&intent, outcome).await?)
+    }
+
+    async fn connection_send_full(
+        &self,
+        _cx: &CallContext,
+        request: SendRequest,
+    ) -> Result<FullResponse, HostError> {
+        let ready = self.ready(request).await?;
+        // The manifest reads whole answers, and the secret's current rule exposes them.
+        if !ready.whole || ready.exposure != ResponseExposure::Full {
+            let narrower = "this connection does not expose its whole answer";
+            return Err(HostError::new(ErrorKind::Denied, narrower));
+        }
+        let Some(intent) = ready.intent else {
+            let answer = self.outbound.send(ready.outgoing, ready.body).await;
+            let answer = answer.map_err(|error| unavailable(error.to_string()))?;
+            return Ok(whole(&ready.fields, &answer));
+        };
+        if let Some(reply) = self.begun(&intent).await? {
+            return stored_whole(&reply);
+        }
+        let outcome = match self.outbound.send(ready.outgoing, ready.body).await {
+            Ok(answer) => Ok(whole_text(&whole(&ready.fields, &answer))),
+            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
+            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
+        };
+        stored_whole(&self.record(&intent, outcome).await?)
     }
 
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {
@@ -531,7 +621,28 @@ impl Broker for RunBroker {
         }
     }
 
+    async fn secret_value(&self, _cx: &CallContext, slot: &str) -> Result<Vec<Field>, HostError> {
+        let current = self.admitted(None).await?;
+        let path = install_scope(&current).secret(slot);
+        let (install, _) = self.checked(Permission::SecretsValue, &path).await?;
+        let config = read_config(&self.ctx, self.scope.realm_id).await;
+        let config = config.map_err(|error| unavailable(error.to_string()))?;
+        let use_of = (Delivery::Value, None);
+        let (_, fields) = self.obtain(&install, slot, use_of, &config).await?;
+        let values = (fields.names())
+            .filter_map(|name| {
+                let value = fields.get(name)?.to_string();
+                let name = name.to_string();
+                Some(Field { name, value })
+            })
+            .collect();
+        let shown = self.shown.lock();
+        (shown.unwrap_or_else(|poisoned| poisoned.into_inner())).push(fields);
+        Ok(values)
+    }
+
     async fn log(&self, _cx: &CallContext, level: &str, message: &str) {
+        let message = &self.scrub(message);
         if self.admitted(None).await.is_ok() {
             let mut run = self
                 .log
@@ -738,6 +849,318 @@ fn write_outcome(error: MetadataWriteError) -> Outcome {
         | MetadataWriteError::Undeliverable(_) => Outcome::Maybe(error.to_string()),
         other => none(ErrorKind::Invalid, other.to_string()),
     }
+}
+
+/// A checked connection request: the outgoing request with any secret added, the exposure of
+/// its answer, the secret's fields for echo removal, and whether the manifest reads it whole.
+struct Ready {
+    outgoing: OutgoingRequest,
+    exposure: ResponseExposure,
+    fields: SecretFields,
+    body: Vec<u8>,
+    intent: Option<Intent>,
+    whole: bool,
+}
+
+impl RunBroker {
+    /// The per call check, the address below the connection, the guest's own headers, and the
+    /// secret released and added; every use of a secret, a replay included, passes the check.
+    async fn ready(&self, request: SendRequest) -> Result<Ready, HostError> {
+        let current = self.admitted(None).await?;
+        let path = install_scope(&current).connection(&request.connection);
+        let (install, _) = self.checked(Permission::ConnectionsSend, &path).await?;
+        let invalid = |why: &str| HostError::new(ErrorKind::Invalid, why);
+        let config = read_config(&self.ctx, self.scope.realm_id).await;
+        let config = config.map_err(|error| unavailable(error.to_string()))?;
+        let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
+        let manifest = plugin.and_then(|plugin| read_manifest(&plugin));
+        let manifest = manifest.map_err(|error| unavailable(error.to_string()))?;
+        let connection = manifest.connections.get(&request.connection);
+        let connection =
+            connection.ok_or_else(|| invalid("the manifest has no such connection"))?;
+        let method = declared_method(request.method);
+        if !connection.methods.contains(&method) {
+            return Err(invalid("the connection does not allow this method"));
+        }
+        if !relative_path(&request.path) {
+            return Err(invalid("the path must stay below the connection's address"));
+        }
+        // The guest built its request from the settings saved at admission; the address follows
+        // them, while the grant and release checks use the current install.
+        let saved = &self.scope.run.settings;
+        let settings: Value = serde_json::from_str(saved).unwrap_or(Value::Null);
+        let mut url = connection.base(&settings).map_err(invalid)?;
+        let joined = format!("{}/{}", url.path().trim_end_matches('/'), request.path);
+        url.set_path(&joined);
+        if !request.query.is_empty() {
+            let pairs = request
+                .query
+                .iter()
+                .map(|field| (&field.name, &field.value));
+            url.query_pairs_mut().extend_pairs(pairs);
+        }
+        let headers = (request.headers.iter())
+            .filter(|field| header_name(&field.name) && !credential(&field.name))
+            .map(|field| (field.name.to_ascii_lowercase(), field.value.clone()))
+            .collect();
+        let mut outgoing = OutgoingRequest {
+            method: method.as_str().to_string(),
+            url,
+            headers,
+        };
+        let (exposure, fields) = match &connection.auth {
+            None => (manifest_exposure(&connection.response), None),
+            Some(slot) => {
+                let (released, fields) =
+                    self.inject(&install, slot, &config, &mut outgoing).await?;
+                (
+                    narrowed(&released.exposure, &connection.response),
+                    Some(fields),
+                )
+            }
+        };
+        Ok(Ready {
+            outgoing,
+            exposure,
+            fields: fields.unwrap_or_else(|| SecretFields::new(Default::default())),
+            body: request.body,
+            intent: request.intent,
+            whole: connection.response.full(),
+        })
+    }
+
+    /// Releases the slot's secret for this request and adds it as its kind says.
+    async fn inject(
+        &self,
+        install: &PluginInstall,
+        slot: &str,
+        config: &aruna_core::structs::identity::realm::RealmConfigDocument,
+        outgoing: &mut OutgoingRequest,
+    ) -> Result<(Released, SecretFields), HostError> {
+        let target = Some((outgoing.method.clone(), outgoing.url.to_string()));
+        let use_of = (Delivery::Inject, target);
+        let (released, fields) = self.obtain(install, slot, use_of, config).await?;
+        let injected = inject_secret(&released.kind, &released.settings, &fields, outgoing);
+        injected.map_err(|error| HostError::new(ErrorKind::Denied, error.to_string()))?;
+        Ok((released, fields))
+    }
+
+    /// One checked release of the slot's secret for this run, reusing fields it holds.
+    async fn obtain(
+        &self,
+        install: &PluginInstall,
+        slot: &str,
+        (delivery, target): (Delivery, Option<(String, String)>),
+        config: &aruna_core::structs::identity::realm::RealmConfigDocument,
+    ) -> Result<(Released, SecretFields), HostError> {
+        let request = ReleaseRequest {
+            install_id: install.install_id,
+            slot: slot.to_string(),
+            delivery,
+            target,
+            held: None,
+            run_id: Some(self.scope.run.run_id),
+        };
+        let place = (self.scope.local, &self.keys);
+        let ask = |request| ask_release(&self.ctx, config, place, request);
+        let mut held = self.held.lock().await;
+        held.obtain(request, ask)
+            .await
+            .map_err(|error| match error {
+                ReleaseError::Refused(_) => HostError::new(ErrorKind::Denied, error.to_string()),
+                ReleaseError::Unavailable(why) => unavailable(why),
+            })
+    }
+
+    /// Records fields as handed to the code, as `secret_value` does.
+    #[cfg(test)]
+    pub(crate) fn shows(&self, fields: SecretFields) {
+        let shown = self.shown.lock();
+        (shown.unwrap_or_else(|poisoned| poisoned.into_inner())).push(fields);
+    }
+
+    /// Text the run keeps with every form of a value handed to the code removed, as extra
+    /// protection only: the code holds the value and may change it.
+    pub fn scrub(&self, text: &str) -> String {
+        let shown = self.shown.lock();
+        let shown = shown.unwrap_or_else(|poisoned| poisoned.into_inner());
+        (shown.iter()).fold(text.to_string(), |text, fields| scrub(&text, fields))
+    }
+}
+
+/// The scope of an install, for its generated grant paths.
+fn install_scope(install: &PluginInstall) -> InstallScope {
+    InstallScope {
+        realm_id: install.account.realm_id,
+        group_id: install.group_id,
+        install_id: install.install_id,
+    }
+}
+
+/// The manifest's name of a method the guest called.
+fn declared_method(method: aruna_plugins::broker::Method) -> aruna_plugins::connection::Method {
+    use aruna_plugins::broker::Method as Called;
+    use aruna_plugins::connection::Method;
+    match method {
+        Called::Get => Method::Get,
+        Called::Head => Method::Head,
+        Called::Post => Method::Post,
+        Called::Put => Method::Put,
+        Called::Patch => Method::Patch,
+        Called::Delete => Method::Delete,
+    }
+}
+
+/// Headers a guest may never set; the host owns credentials.
+fn credential(name: &str) -> bool {
+    ["authorization", "cookie", "proxy-authorization"].contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// The answer as the guest may see it: the one place an exposure applies to an answer.
+fn exposed(exposure: &ResponseExposure, fields: &SecretFields, answer: &Answer) -> Response {
+    let shown = expose_response(
+        exposure,
+        fields,
+        answer.status,
+        &answer.headers,
+        &answer.body,
+    );
+    Response {
+        status: shown.status,
+        json: shown
+            .body
+            .map(|body| String::from_utf8_lossy(&body).into_owned()),
+    }
+}
+
+/// The exposure of a connection without a secret: what its manifest reads.
+fn manifest_exposure(reads: &Readable) -> ResponseExposure {
+    match reads {
+        Readable::Full(_) => ResponseExposure::Full,
+        Readable::Fields(fields) => fields_exposure(fields.to_vec()),
+    }
+}
+
+fn fields_exposure(pointers: Vec<String>) -> ResponseExposure {
+    match pointers.is_empty() {
+        true => ResponseExposure::Status,
+        false => ResponseExposure::Fields {
+            pointers,
+            headers: Vec::new(),
+        },
+    }
+}
+
+/// The rule's exposure, never wider than what the manifest lets the code read.
+fn narrowed(rule: &ResponseExposure, reads: &Readable) -> ResponseExposure {
+    match (rule, reads) {
+        (ResponseExposure::Status, _) => ResponseExposure::Status,
+        (ResponseExposure::Full, reads) => manifest_exposure(reads),
+        (ResponseExposure::Fields { pointers, .. }, Readable::Full(_)) => {
+            fields_exposure(pointers.clone())
+        }
+        (ResponseExposure::Fields { pointers, .. }, Readable::Fields(fields)) => fields_exposure(
+            pointers
+                .iter()
+                .filter(|p| fields.contains(p))
+                .cloned()
+                .collect(),
+        ),
+    }
+}
+
+/// The whole answer as the code may see it, with echoes of the secret removed.
+fn whole(fields: &SecretFields, answer: &Answer) -> FullResponse {
+    let shown = expose_response(
+        &ResponseExposure::Full,
+        fields,
+        answer.status,
+        &answer.headers,
+        &answer.body,
+    );
+    FullResponse {
+        status: shown.status,
+        headers: (shown.headers.into_iter())
+            .map(|(name, value)| Field { name, value })
+            .collect(),
+        body: shown.body.unwrap_or_default(),
+    }
+}
+
+fn whole_text(reply: &FullResponse) -> String {
+    let headers: Vec<(&str, &str)> = (reply.headers.iter())
+        .map(|field| (field.name.as_str(), field.value.as_str()))
+        .collect();
+    let body = base64::engine::general_purpose::STANDARD.encode(&reply.body);
+    serde_json::json!({ "status": reply.status, "headers": headers, "body": body }).to_string()
+}
+
+fn stored_whole(reply: &str) -> Result<FullResponse, HostError> {
+    let broken = || unavailable("a stored whole answer does not decode");
+    let value: Value = serde_json::from_str(reply).map_err(|_| broken())?;
+    let status = value
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|s| u16::try_from(s).ok());
+    let headers: Vec<(String, String)> =
+        serde_json::from_value(value.get("headers").cloned().unwrap_or(Value::Null))
+            .map_err(|_| broken())?;
+    let body = value
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or_else(broken)?;
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .map_err(|_| broken())?;
+    Ok(FullResponse {
+        status: status.ok_or_else(broken)?,
+        headers: (headers.into_iter())
+            .map(|(name, value)| Field { name, value })
+            .collect(),
+        body,
+    })
+}
+
+/// A stored reply under the current exposure: each stored field stays or goes by its pointer
+/// key, so a replay can only narrow what the guest saw, never widen it.
+fn kept(reply: Response, exposure: &ResponseExposure) -> Response {
+    let json = match exposure {
+        ResponseExposure::Status => None,
+        ResponseExposure::Full => reply.json,
+        ResponseExposure::Fields { pointers, .. } => (reply.json)
+            .and_then(|json| serde_json::from_str::<serde_json::Map<String, Value>>(&json).ok())
+            .map(|stored| {
+                let kept: serde_json::Map<String, Value> = (stored.into_iter())
+                    .filter(|(pointer, _)| pointers.contains(pointer))
+                    .collect();
+                Value::Object(kept).to_string()
+            }),
+    };
+    Response {
+        status: reply.status,
+        json,
+    }
+}
+
+/// The stored reply of a settled send.
+fn reply_text(response: &Response) -> String {
+    serde_json::json!({ "status": response.status, "json": response.json }).to_string()
+}
+
+fn stored_reply(reply: &str) -> Result<Response, HostError> {
+    let value: Value =
+        serde_json::from_str(reply).map_err(|error| unavailable(error.to_string()))?;
+    let status = value
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|s| u16::try_from(s).ok());
+    Ok(Response {
+        status: status.ok_or_else(|| unavailable("a stored reply has no status"))?,
+        json: value
+            .get("json")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 #[cfg(test)]

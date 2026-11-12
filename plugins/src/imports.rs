@@ -6,11 +6,11 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, Field, HostError, Intent, Listing,
-    MetadataPatch, Method, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    Broker, CallContext, Document, Entry, ErrorKind, Field, FullResponse, HostError, Intent,
+    Listing, MetadataPatch, Method, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
 };
 use crate::host::wit::aruna::plugin::{
-    connections, grants, log, metadata_read, metadata_write, objects_read, state, types,
+    connections, grants, log, metadata_read, metadata_write, objects_read, secrets, state, types,
 };
 use crate::host::{Needs, Session};
 use crate::permission::Permission;
@@ -78,19 +78,6 @@ impl Session {
 
 fn unknown(message: &str) -> HostError {
     HostError::new(ErrorKind::UnknownOutcome, message)
-}
-
-/// Keeps only the allowed response fields, as an object keyed by JSON pointer; none means
-/// status only. An answer that is not JSON gives no fields.
-pub(crate) fn project(json: Option<String>, pointers: &[String]) -> Option<String> {
-    if pointers.is_empty() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(json.as_deref()?).ok()?;
-    let fields: serde_json::Map<String, serde_json::Value> = (pointers.iter())
-        .filter_map(|pointer| Some((pointer.clone(), value.pointer(pointer)?.clone())))
-        .collect();
-    serde_json::to_string(&fields).ok()
 }
 
 fn fields_len(fields: &[Field]) -> usize {
@@ -241,6 +228,40 @@ impl connections::Host for Session {
         &mut self,
         request: connections::Request,
     ) -> wasmtime::Result<Result<Response, HostError>> {
+        let (size, effect, outbound) = self.outbound(request);
+        let connection = outbound.connection.clone();
+        self.brokered(
+            size,
+            effect,
+            Needs::Connection(&connection),
+            // The broker applies the exposure; the reply passes through as it answers.
+            |broker, cx| async move { broker.connection_send(&cx, outbound).await },
+            |reply: &Response| reply.json.as_ref().map_or(0, String::len) + 2,
+        )
+        .await
+    }
+
+    async fn send_full(
+        &mut self,
+        request: connections::Request,
+    ) -> wasmtime::Result<Result<FullResponse, HostError>> {
+        let (size, effect, outbound) = self.outbound(request);
+        let connection = outbound.connection.clone();
+        self.brokered(
+            size,
+            effect,
+            Needs::Connection(&connection),
+            |broker, cx| async move { broker.connection_send_full(&cx, outbound).await },
+            |reply: &FullResponse| fields_len(&reply.headers) + reply.body.len() + 2,
+        )
+        .await
+    }
+}
+
+impl Session {
+    /// A connection request as the broker gets it, its size, and its intent when it may
+    /// change remote state.
+    fn outbound(&mut self, request: connections::Request) -> (usize, Effect, SendRequest) {
         let size = request.connection.len()
             + request.path.len()
             + fields_len(&request.query)
@@ -259,8 +280,6 @@ impl connections::Host for Session {
             ];
             Intent::new(self.next_ordinal(), request.key.clone(), &parts)
         });
-        let connection = request.connection.clone();
-        let pointers = self.response_fields(&connection);
         let effect = match &intent {
             Some(intent) => Effect::Write(intent.clone()),
             None => Effect::Read,
@@ -274,18 +293,7 @@ impl connections::Host for Session {
             body: request.body,
             intent,
         };
-        self.brokered(
-            size,
-            effect,
-            Needs::Connection(&connection),
-            |broker, cx| async move {
-                let reply = broker.connection_send(&cx, outbound).await?;
-                let json = project(reply.json, &pointers);
-                Ok(Response { json, ..reply })
-            },
-            |reply: &Response| reply.json.as_ref().map_or(0, String::len) + 2,
-        )
-        .await
+        (size, effect, outbound)
     }
 }
 
@@ -328,6 +336,19 @@ impl state::Host for Session {
             Needs::Free,
             |broker, cx| async move { broker.state_put(&cx, put).await },
             |_| 8,
+        )
+        .await
+    }
+}
+
+impl secrets::Host for Session {
+    async fn value(&mut self, slot: String) -> wasmtime::Result<Result<Vec<Field>, HostError>> {
+        self.brokered(
+            slot.len(),
+            Effect::Read,
+            Needs::Permission(Permission::SecretsValue),
+            |broker, cx| async move { broker.secret_value(&cx, &slot).await },
+            |fields| fields_len(fields),
         )
         .await
     }

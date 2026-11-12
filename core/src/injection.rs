@@ -218,6 +218,11 @@ fn echo_forms(fields: &SecretFields) -> Vec<Vec<u8>> {
     forms
 }
 
+/// `text` with every echo form of the fields replaced, for guest text a run keeps.
+pub fn scrub(text: &str, fields: &SecretFields) -> String {
+    String::from_utf8_lossy(&redact(text.as_bytes(), &echo_forms(fields))).into_owned()
+}
+
 fn redact(text: &[u8], forms: &[Vec<u8>]) -> Vec<u8> {
     let mut text = text.to_vec();
     for form in forms {

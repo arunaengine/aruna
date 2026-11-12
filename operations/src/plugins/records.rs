@@ -196,7 +196,7 @@ impl InstallEntryOperation {
         }
         let operation = AdminDocumentOperation::ConfigInstallSet {
             install_id: self.config.install_id,
-            install: self.config.install.clone(),
+            install: self.config.install.clone().map(Box::new),
         };
         let event = reducer_state.apply_operation(&self.config.actor, operation)?;
         document.installs = reducer_state.materialized_installs();

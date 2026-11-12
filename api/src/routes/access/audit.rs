@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::secrets::SecretScope;
+use aruna_core::secrets::{Delivery, SecretScope};
 use aruna_core::structs::identity::admin_audit::{
     AdminAuditAction, AdminAuditRecord, AuditIndex, SecretAudit,
 };
@@ -66,8 +66,22 @@ pub struct AdminAuditRow {
     /// The plugin install a plugin row is about.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin: Option<AuditPlugin>,
+    /// The use a `secret_released` or `secret_refused` row records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_use: Option<AuditSecretUse>,
     pub result: String,
     pub recorded_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct AuditSecretUse {
+    /// `inject`, `verify` or `value`.
+    pub delivery: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The check step that refused the use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -114,8 +128,8 @@ pub struct AdminAuditPage {
 **Behavior**
 - Recorded changes are account deactivation and reactivation, service account creation, the
   issuance of a token with path restrictions, and the creation, replacement, rotation, deletion
-  and owner read-back of named secrets, and plugin installs, grant changes, updates, pauses,
-  resumes and removals. Each row names the actor, the target account, the owning group when there
+  and owner read-back of named secrets, each release of a secret to a plugin install and each
+  refused use, and plugin installs, grant changes, updates, pauses, resumes and removals. Each row names the actor, the target account, the owning group when there
   is one, the session of an issued token, the secret (scope, owner, name, never its value), the
   plugin install (plugin, version, install id) and the result `succeeded`.
 - A row is written only after its change succeeded on this node; denied or failed attempts and
@@ -230,6 +244,8 @@ fn row(record: AdminAuditRecord) -> AdminAuditRow {
         AdminAuditAction::PluginResumed => "plugin_resumed",
         AdminAuditAction::PluginRemoved => "plugin_removed",
         AdminAuditAction::PluginRunResolved => "plugin_run_resolved",
+        AdminAuditAction::SecretReleased => "secret_released",
+        AdminAuditAction::SecretRefused => "secret_refused",
     };
     AdminAuditRow {
         audit_id: record.audit_id.to_string(),
@@ -243,6 +259,16 @@ fn row(record: AdminAuditRecord) -> AdminAuditRow {
             plugin: plugin.plugin,
             version: plugin.version,
             install_id: plugin.install_id.to_string(),
+        }),
+        secret_use: record.secret_use.map(|used| AuditSecretUse {
+            delivery: match used.delivery {
+                Delivery::Inject => "inject",
+                Delivery::Verify => "verify",
+                Delivery::Value => "value",
+            }
+            .to_string(),
+            run_id: used.run_id.map(|id| id.to_string()),
+            refused: used.refused,
         }),
         result: "succeeded".to_string(),
         recorded_at_ms: record.audit_id.timestamp_ms(),

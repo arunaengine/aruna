@@ -25,7 +25,7 @@ mod runtime;
 pub use host::Limit;
 #[cfg(feature = "runtime")]
 pub use host::wit::aruna::plugin::types::{
-    Failure, FailureKind, Trigger, WatchEvent, WebhookDelivery, WebhookRequest,
+    Failure, FailureKind, Field, Trigger, WatchEvent, WebhookDelivery, WebhookRequest,
 };
 #[cfg(feature = "runtime")]
 pub use runtime::{CompileError, Compiled, Invocation, InvokeError, Runtime};

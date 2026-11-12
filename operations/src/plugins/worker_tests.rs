@@ -36,6 +36,20 @@ fn leb(mut value: usize, out: &mut Vec<u8>) {
 
 /// The fixture without its secret and connection, which installs refuse.
 fn runnable() -> Vec<u8> {
+    artifact(false, false)
+}
+
+/// The fixture whose `api` connection sends without a secret.
+pub(crate) fn connected() -> Vec<u8> {
+    artifact(true, false)
+}
+
+/// The fixture whose `api` connection injects the bearer slot `api_key`.
+pub(crate) fn secured() -> Vec<u8> {
+    artifact(true, true)
+}
+
+fn artifact(connection: bool, secret: bool) -> Vec<u8> {
     let manifest = read_manifest(FIXTURE).unwrap();
     let json = serde_json::to_vec(&manifest).unwrap();
     let mut content = Vec::new();
@@ -47,16 +61,27 @@ fn runnable() -> Vec<u8> {
     section.extend_from_slice(&content);
     let component = FIXTURE.strip_suffix(section.as_slice()).unwrap();
     let mut narrow = manifest;
-    narrow.secrets.clear();
-    narrow.connections.clear();
+    match secret {
+        true => narrow.version = "0.2.1".to_string(),
+        false => narrow.secrets.clear(),
+    }
+    match (connection, secret) {
+        (true, true) => {}
+        (true, false) => (narrow.connections.values_mut()).for_each(|c| c.auth = None),
+        (false, _) => narrow.connections.clear(),
+    }
     attach_manifest(component, &narrow).unwrap()
 }
 
 /// An install of the runnable fixture whose artifact this node keeps.
 pub(crate) async fn installed(fixture: &Fixture) -> PluginInstall {
-    let bytes = runnable();
-    let manifest = read_manifest(&bytes).unwrap();
-    let digest = ArtifactDigest::of(&bytes).to_string();
+    install_artifact(fixture, runnable()).await
+}
+
+/// Publishes the fixture artifact `bytes` and keeps it on this node; answers its digest.
+pub(crate) async fn publish_artifact(fixture: &Fixture, bytes: &[u8]) -> String {
+    let manifest = read_manifest(bytes).unwrap();
+    let digest = ArtifactDigest::of(bytes).to_string();
     let plugin = PublishedPlugin {
         name: manifest.name.clone(),
         version: manifest.version.clone(),
@@ -76,9 +101,16 @@ pub(crate) async fn installed(fixture: &Fixture) -> PluginInstall {
     let config = read_config(&fixture.ctx, fixture.actor.realm_id)
         .await
         .unwrap();
-    store_local(&fixture.ctx, &config, &digest, &bytes, 1)
+    store_local(&fixture.ctx, &config, &digest, bytes, 1)
         .await
         .unwrap();
+    digest
+}
+
+/// An install of the fixture artifact `bytes`, kept on this node.
+pub(crate) async fn install_artifact(fixture: &Fixture, bytes: Vec<u8>) -> PluginInstall {
+    let manifest = read_manifest(&bytes).unwrap();
+    let digest = publish_artifact(fixture, &bytes).await;
     let settings = serde_json::json!({ "api_url": "https://api.example.org" });
     let request = InstallRequest {
         plugin: manifest.name,
@@ -87,6 +119,7 @@ pub(crate) async fn installed(fixture: &Fixture) -> PluginInstall {
         settings: settings.as_object().cloned().unwrap_or_default(),
         grants: BTreeMap::new(),
         install_id: None,
+        secrets: BTreeMap::new(),
     };
     fixture.install(&request).await.unwrap()
 }
@@ -428,4 +461,32 @@ fn busy_keeps_attempts() {
         ended(Err(InvokeError::Cancelled), true),
         Ended::Stopped
     ));
+}
+
+#[tokio::test]
+async fn retries_hide_values() {
+    use crate::plugins::runs::{read_run, save_run};
+    use aruna_core::compute::Secret;
+    use aruna_core::secrets::SecretFields;
+    const VALUE: &str = "canary-value-7b1e";
+    let fixture = Fixture::new().await;
+    let mut run = queued(Ulid::from_parts(3, 3), 1);
+    admit(&fixture.ctx, &run).await.unwrap();
+    let scope = RunScope {
+        realm_id: fixture.actor.realm_id,
+        local: fixture.actor.node_id,
+        run: run.clone(),
+    };
+    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope);
+    broker.shows(SecretFields::new(
+        [("token".to_string(), Secret::new(VALUE))].into(),
+    ));
+    // A retryable error that names a value handed to the code keeps the run without it.
+    let ended = scrub_ended(&broker, Ended::Retry(format!("upstream said {VALUE}")));
+    conclude(&mut run, ended, false, Ok(None), 5);
+    save_run(&fixture.ctx, &run).await.unwrap();
+    let stored = read_run(&fixture.ctx, run.install_id, run.run_id).await;
+    let stored = stored.unwrap();
+    assert_eq!(stored.state, RunState::Queued);
+    assert_eq!(stored.message.as_deref(), Some("upstream said [redacted]"));
 }

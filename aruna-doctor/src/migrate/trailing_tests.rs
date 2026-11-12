@@ -9,7 +9,9 @@ use crate::error::CliError;
 use aruna_core::secrets::{SecretName, SecretScope};
 use aruna_core::structs::execution::harvest::{HarvestSelector, HarvestSource};
 use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord, SecretAudit};
+use aruna_core::structs::identity::admin_audit::{
+    AdminAuditAction, AdminAuditRecord, PluginAudit, SecretAudit,
+};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::replication::ArunaArn;
@@ -79,6 +81,26 @@ fn secret_only() -> Vec<u8> {
     .expect("row before plugin encodes")
 }
 
+/// An admin audit row as alpha.188 stored it: the secret row, then its `plugin`.
+fn plugin_row() -> Vec<u8> {
+    let plugin = PluginAudit {
+        plugin: "announcer".to_string(),
+        version: "0.1.0".to_string(),
+        install_id: Ulid::from_parts(7, 7),
+    };
+    let record = secret_audit(Some(Ulid::from_parts(8, 8)));
+    let head = SecretOnly {
+        audit_id: Ulid::from_parts(9, 9),
+        action: AdminAuditAction::PluginInstalled,
+        actor: record.actor,
+        target: record.target,
+        group_id: record.group_id,
+        session_id: record.session_id,
+        secret: record.secret,
+    };
+    postcard::to_allocvec(&(head, Some(plugin))).expect("row before secret_use encodes")
+}
+
 fn secret_audit(write_id: Option<Ulid>) -> AdminAuditRecord {
     let secret = SecretAudit {
         scope: SecretScope::User(user(1)),
@@ -96,7 +118,7 @@ fn audit_gains_secret() {
         .expect("current row encodes");
     let ended = secret_audit(None).to_bytes().expect("row encodes");
     // A current row cut inside its `secret`, before `write_id`, and one with a byte too many.
-    let cut = ended[..ended.len() - 2].to_vec();
+    let cut = ended[..ended.len() - 3].to_vec();
     let longer = [current.as_slice(), &[0]].concat();
     let temp = tempfile::tempdir().expect("temporary directory");
     let path = temp.path().join("db");
@@ -104,6 +126,7 @@ fn audit_gains_secret() {
     let rows = vec![
         (b"old".as_slice(), old_audit(1)),
         (b"secret".as_slice(), secret_only()),
+        (b"plugin".as_slice(), plugin_row()),
         (b"current".as_slice(), current.clone()),
         (b"cut".as_slice(), cut.clone()),
         (b"longer".as_slice(), longer.clone()),
@@ -112,7 +135,7 @@ fn audit_gains_secret() {
     let output = migrate_output(database).expect("migration runs");
     assert_eq!(
         (output.audit_rows_scanned, output.audit_rows_rewritten),
-        (5, 2)
+        (6, 3)
     );
     assert_eq!(output.unknown_rows.len(), 2);
     assert!(output.unknown_rows[0].starts_with("admin_audit/"));
@@ -126,7 +149,18 @@ fn audit_gains_secret() {
         kept.secret.and_then(|secret| secret.write_id),
         Some(Ulid::from_parts(6, 6))
     );
-    assert_eq!(kept.plugin, None);
+    assert_eq!((kept.plugin, kept.secret_use), (None, None));
+    // An alpha.188 row keeps both its secret and its plugin and gains no use.
+    let both = AdminAuditRecord::from_bytes(&stored[b"plugin".as_slice()]).expect("decodes");
+    assert_eq!(
+        both.plugin.map(|plugin| plugin.install_id),
+        Some(Ulid::from_parts(7, 7))
+    );
+    let write_id = both.secret.and_then(|secret| secret.write_id);
+    assert_eq!(
+        (write_id, both.secret_use),
+        (Some(Ulid::from_parts(8, 8)), None)
+    );
     assert_eq!(stored[b"current".as_slice()], current);
     assert_eq!(
         (&stored[b"cut".as_slice()], &stored[b"longer".as_slice()]),
