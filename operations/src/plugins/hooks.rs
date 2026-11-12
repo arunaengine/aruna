@@ -139,8 +139,8 @@ pub async fn admit_hook(
     Ok(admitted.await?)
 }
 
-/// Whether the install's verify secret checks `authorization`, so a relay passes it on. A node
-/// secret's settings live on the receiver; for one of those the relay drops the header.
+/// Whether a relay passes `authorization` on: unless this node reads the verify secret and sees
+/// that it checks another header. The receiver removes the header after its check either way.
 pub async fn checks_authorization(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
@@ -162,13 +162,18 @@ pub async fn checks_authorization(
     if declared == Some(SecretKind::Bearer) {
         return true;
     }
-    let binding = install.secrets.get(slot);
-    let Some(binding) = binding.filter(|binding| binding.scope != BoundScope::Node) else {
+    let Some(binding) = install.secrets.get(slot) else {
         return false;
     };
+    // A node secret's settings live on the receiver only.
+    if binding.scope == BoundScope::Node {
+        return true;
+    }
     let selected = select(ctx, config, install, binding).await.ok().flatten();
-    let header = selected.and_then(|selected| selected.settings.get("header").cloned());
-    header.is_some_and(|header| header.eq_ignore_ascii_case("authorization"))
+    selected.is_none_or(|selected| {
+        let header = selected.settings.get("header");
+        header.is_some_and(|header| header.eq_ignore_ascii_case("authorization"))
+    })
 }
 
 #[cfg(test)]

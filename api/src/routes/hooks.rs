@@ -78,7 +78,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 **Behavior**
 - Any node takes the request and relays its raw body and headers to the install's receiver,
-  without `cookie`, `proxy-authorization`, and `authorization` unless the secret checks it.
+  without `cookie` and `proxy-authorization`, and without `authorization` when this node sees
+  that the install's secret checks another header.
 - The receiver checks the request, removes the checked and credential headers and queues a run.
 - With the manifest's delivery id header, a repeated id answers 202 and starts nothing.
 
@@ -203,7 +204,7 @@ fn hook_error(install_id: Ulid, error: HookError) -> Response {
 }
 
 /// The headers a relay passes on: all but hop-by-hop ones, `cookie` and `proxy-authorization`,
-/// and `authorization` unless the install's verify secret checks it.
+/// and `authorization` unless this node knows the verify secret checks another header.
 fn relayed(headers: &HeaderMap, keep_authorization: bool) -> HeaderMap {
     let mut sent = headers.clone();
     for name in NOT_RELAYED {
@@ -237,7 +238,7 @@ async fn relay(
     };
     let keep = match read_config(&ctx, state.get_realm_id()).await {
         Ok(config) => checks_authorization(&ctx, &config, install_id).await,
-        Err(_) => false,
+        Err(_) => true,
     };
     let mut sent = relayed(headers, keep);
     sent.insert(RELAY_HOP_HEADER, hops);

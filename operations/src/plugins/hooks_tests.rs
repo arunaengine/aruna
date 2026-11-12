@@ -145,4 +145,13 @@ async fn refusals_start_nothing() {
     assert!(!checks_authorization(&fixture.ctx, &config, install.install_id).await);
     hook_secret(&fixture, &install, "Authorization", 3).await;
     assert!(checks_authorization(&fixture.ctx, &config, install.install_id).await);
+    // A node secret is read on the receiver alone, so the relay keeps the header for it.
+    hook_secret(&fixture, &install, "x-signature", 4).await;
+    edit_config(&fixture, |config| {
+        let binding = SecretBinding::parse("node:hook-key").unwrap();
+        config.installs[0].secrets = BTreeMap::from([("hook_key".to_string(), binding)]);
+    })
+    .await;
+    let config = read_config(&fixture.ctx, realm_id).await.unwrap();
+    assert!(checks_authorization(&fixture.ctx, &config, install.install_id).await);
 }
