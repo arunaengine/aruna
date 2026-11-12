@@ -7,17 +7,18 @@ use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{
-    GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE, PLUGIN_GAPS_KEYSPACE,
-    PLUGIN_OUTBOX_KEYSPACE,
+    EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+    PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE,
 };
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord,
+    GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord, MetadataEventPayload,
+    MetadataEventRecord,
 };
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{
     ForwardRow, GapReason, GapRow, SEND_EXPIRY_MS, SENDER_GAP, SourceKind, gap_key,
 };
-use aruna_core::storage_entries::{graph_lifecycle_key, materialization_status_key};
+use aruna_core::storage_entries::{event_log_key, graph_lifecycle_key, materialization_status_key};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,7 @@ use super::matcher::Outbox;
 use super::receiver::lost_reason;
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
+use crate::metadata::projector::dot_applied;
 
 /// Forward rows of one install read for sending in one pass at most.
 const BATCH: usize = 100;
@@ -239,7 +241,7 @@ async fn collect(
                     .await?;
                 expired.push(key);
             } else if let Some(requests) = pending.as_deref_mut()
-                && !unreadable(txn, &row).await?
+                && !unreadable(ctx, txn, &row).await?
             {
                 let (batch, keys) = requests.room(size);
                 keys.insert((install_id, row.event.source.clone()), key);
@@ -252,9 +254,13 @@ async fn collect(
     .await
 }
 
-/// Whether a created dataset is not readable here yet: neither its creation is materialized
-/// nor the document deleted. A parked job keeps the row until its send expiry counts a gap.
-async fn unreadable(txn: &Txn<'_>, row: &ForwardRow) -> Result<bool, StoreError> {
+/// Whether a dataset event is not readable here yet: its own change is not materialized and the
+/// document is not deleted. A parked job keeps the row until its send expiry counts a gap.
+async fn unreadable(
+    ctx: &DriverContext,
+    txn: &Txn<'_>,
+    row: &ForwardRow,
+) -> Result<bool, StoreError> {
     let event = &row.event;
     let parsed = (
         event.resource.parse::<Ulid>(),
@@ -263,22 +269,53 @@ async fn unreadable(txn: &Txn<'_>, row: &ForwardRow) -> Result<bool, StoreError>
     let (Ok(document), Ok(event_id)) = parsed else {
         return Ok(false);
     };
-    if event.kind != SourceKind::DatasetCreated {
-        return Ok(false);
-    }
-    let key = materialization_status_key(document);
-    let status = txn.read(MATERIALIZATION_STATUS_KEYSPACE, &key).await?;
-    let status = status.and_then(|bytes| decode::<MaterializationStatusRecord>(&bytes).ok());
-    let materialized = status.is_some_and(|status| {
-        status.state == MaterializationState::Materialized && status.event_id >= event_id
-    });
-    if materialized {
+    let applied = match event.kind {
+        SourceKind::DataUploaded => return Ok(false),
+        SourceKind::DatasetCreated => materialized(txn, document, |id| id >= event_id).await?,
+        SourceKind::DatasetUpdated => change_applied(ctx, txn, document, event_id).await?,
+    };
+    if applied {
         return Ok(false);
     }
     let key = graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(document));
     let lifecycle = txn.read(GRAPH_LIFECYCLE_KEYSPACE, &key).await?;
     let lifecycle = lifecycle.and_then(|bytes| decode::<GraphLifecycleRecord>(&bytes).ok());
     Ok(!lifecycle.is_some_and(|record| record.is_deleted()))
+}
+
+/// Whether the document's status is materialized at an event id that `covers` accepts.
+async fn materialized(
+    txn: &Txn<'_>,
+    document: Ulid,
+    covers: impl Fn(Ulid) -> bool,
+) -> Result<bool, StoreError> {
+    let key = materialization_status_key(document);
+    let status = txn.read(MATERIALIZATION_STATUS_KEYSPACE, &key).await?;
+    let status = status.and_then(|bytes| decode::<MaterializationStatusRecord>(&bytes).ok());
+    Ok(status.is_some_and(|status| {
+        status.state == MaterializationState::Materialized && covers(status.event_id)
+    }))
+}
+
+/// Whether a change event was applied here: its batch dot is in the graph, or for a change
+/// without a batch the status names that very event. A newer status alone proves nothing.
+async fn change_applied(
+    ctx: &DriverContext,
+    txn: &Txn<'_>,
+    document: Ulid,
+    event_id: Ulid,
+) -> Result<bool, StoreError> {
+    let key = event_log_key(document, event_id);
+    let Some(bytes) = txn.read(EVENT_LOG_KEYSPACE, &key).await? else {
+        return Ok(false);
+    };
+    let record: MetadataEventRecord = decode(&bytes)?;
+    let MetadataEventPayload::ApplyBatch { batch, .. } = &record.payload else {
+        return materialized(txn, document, |id| id == event_id).await;
+    };
+    dot_applied(ctx, &record.record.graph_iri, batch)
+        .await
+        .map_err(|error| StoreError(error.to_string()))
 }
 
 /// Deletes the decided rows and records the acknowledged gap sequences in one transaction;

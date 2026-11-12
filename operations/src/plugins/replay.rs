@@ -157,7 +157,11 @@ async fn start_replay(
     let kept_from = now_ms.saturating_sub(JOURNAL_RETENTION_MS);
     if start.is_some_and(|start| start < kept_from) {
         let mut outbox = Outbox::new(now_ms);
-        for kind in [SourceKind::DatasetCreated, SourceKind::DataUploaded] {
+        for kind in [
+            SourceKind::DatasetCreated,
+            SourceKind::DataUploaded,
+            SourceKind::DatasetUpdated,
+        ] {
             let trigger = super::dispatch::event_trigger(kind);
             if target.coverage.contains_key(&trigger)
                 && old.get(&trigger) != target.coverage.get(&trigger)

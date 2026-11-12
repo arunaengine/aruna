@@ -20,6 +20,7 @@ pub enum TriggerKind {
     DataUploaded,
     SyncCompleted,
     SyncFailed,
+    DatasetUpdated,
 }
 
 impl TriggerKind {
@@ -32,13 +33,14 @@ impl TriggerKind {
             Self::DataUploaded => "data_uploaded",
             Self::SyncCompleted => "sync_completed",
             Self::SyncFailed => "sync_failed",
+            Self::DatasetUpdated => "dataset_updated",
         }
     }
 
     /// The read permission an event trigger needs before any event is delivered.
     pub fn needs(self) -> Option<Permission> {
         match self {
-            Self::DatasetCreated => Some(Permission::MetadataRead),
+            Self::DatasetCreated | Self::DatasetUpdated => Some(Permission::MetadataRead),
             Self::DataUploaded | Self::SyncCompleted | Self::SyncFailed => {
                 Some(Permission::ObjectsRead)
             }

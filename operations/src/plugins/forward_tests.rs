@@ -280,3 +280,77 @@ async fn bounded_requests() {
     assert_eq!(got.iter().map(|batch| batch.gaps.len()).sum::<usize>(), 1);
     assert!(forwarded(&fixture, &install).await.is_empty());
 }
+
+// A change waits for evidence of its own event: a logged event and a status naming it. A newer
+// status alone does not release it, a deleted document does.
+#[tokio::test]
+async fn update_waits() {
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let (document, event_id) = (Ulid::generate(), Ulid::from_parts(10, 1));
+    let event = SourceEvent {
+        kind: SourceKind::DatasetUpdated,
+        resource: document.to_string(),
+        revision: event_id.to_string(),
+        ..created(&install, &document.to_string()).0
+    };
+    let row = ForwardRow {
+        install_id: install.install_id,
+        revision: 1,
+        event,
+        queued_ms: 1,
+    };
+    let waits = async || unreadable(&fixture.ctx, &Txn::direct(&fixture.ctx), &row).await;
+    let newer = (document, Ulid::from_parts(20, 1));
+    materialization(&fixture, newer, State::Materialized).await;
+    assert_eq!(waits().await, Ok(true));
+
+    let realm_id = fixture.actor.realm_id;
+    let graph_iri = MetadataRegistryRecord::graph_iri_for(document);
+    let record = MetadataRegistryRecord {
+        realm_id,
+        group_id: fixture.group_id,
+        document_id: document,
+        document_path: "datasets/a".into(),
+        graph_iri: graph_iri.clone(),
+        public: false,
+        permission_path: row.event.path.clone(),
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
+        holder_node_ids: Vec::new(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        establishing_event_id: event_id,
+        last_event_id: event_id,
+    };
+    let logged = MetadataEventRecord {
+        event_id,
+        record,
+        user_id: fixture.actor.user_id,
+        node_id: fixture.actor.node_id,
+        payload: MetadataEventPayload::UpsertDataEntity {
+            jsonld: "{}".into(),
+        },
+        occurred_at_ms: 1,
+    };
+    let entry = (
+        event_log_key(document, event_id).to_vec(),
+        encode(&logged).unwrap(),
+    );
+    let txn = Txn::direct(&fixture.ctx);
+    txn.write(EVENT_LOG_KEYSPACE, vec![entry]).await.unwrap();
+    assert_eq!(waits().await, Ok(true));
+    materialization(&fixture, (document, event_id), State::Materialized).await;
+    assert_eq!(waits().await, Ok(false));
+
+    materialization(&fixture, newer, State::Materialized).await;
+    let deleted =
+        GraphLifecycleRecord::deleted(graph_iri.clone(), realm_id, fixture.group_id, document, 1);
+    let lifecycle = (
+        graph_lifecycle_key(&graph_iri).to_vec(),
+        encode(&deleted).unwrap(),
+    );
+    txn.write(GRAPH_LIFECYCLE_KEYSPACE, vec![lifecycle])
+        .await
+        .unwrap();
+    assert_eq!(waits().await, Ok(false));
+}

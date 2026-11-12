@@ -11,7 +11,7 @@ use crate::NodeId;
 use crate::UserId;
 use crate::errors::ConversionError;
 use crate::keyspaces::EVENT_JOURNAL_KEYSPACE;
-use crate::metadata::MetadataEventRecord;
+use crate::metadata::{MetadataEventPayload, MetadataEventRecord};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::object_permission_path;
 use crate::types::GroupId;
@@ -245,6 +245,7 @@ pub fn source_key(source: &str) -> Vec<u8> {
 pub enum SourceKind {
     DatasetCreated,
     DataUploaded,
+    DatasetUpdated,
 }
 
 impl SourceKind {
@@ -253,6 +254,7 @@ impl SourceKind {
         match self {
             Self::DatasetCreated => "dataset_created",
             Self::DataUploaded => "data_uploaded",
+            Self::DatasetUpdated => "dataset_updated",
         }
     }
 }
@@ -291,6 +293,29 @@ impl SourceEvent {
             anchor_ms: event.event_id.timestamp_ms(),
             journaled_ms: now_ms,
             actor: Some(event.user_id),
+        }
+    }
+
+    /// An accepted change of a metadata document, from its update event.
+    pub fn dataset_updated(event: &MetadataEventRecord, now_ms: u64) -> Self {
+        Self {
+            kind: SourceKind::DatasetUpdated,
+            source: format!("dataset_updated/{}", event.event_id),
+            ..Self::dataset_created(event, now_ms)
+        }
+    }
+
+    /// The event a metadata event reports, if any: a create or a content change.
+    pub fn from_metadata(event: &MetadataEventRecord, now_ms: u64) -> Option<Self> {
+        match event.payload {
+            MetadataEventPayload::Scaffold { .. } | MetadataEventPayload::RoCrate { .. } => {
+                Some(Self::dataset_created(event, now_ms))
+            }
+            MetadataEventPayload::ReplaceRoCrate { .. }
+            | MetadataEventPayload::UpsertDataEntity { .. }
+            | MetadataEventPayload::UpsertContextualEntity { .. }
+            | MetadataEventPayload::ApplyBatch { .. } => Some(Self::dataset_updated(event, now_ms)),
+            MetadataEventPayload::Checkpoint { .. } => None,
         }
     }
 

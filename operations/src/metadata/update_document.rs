@@ -14,6 +14,7 @@ use aruna_core::metadata::{
     ProfileValidationStatus, RAW_BYTES_LIMIT, RawOriginBudget, raw_quotas,
 };
 use aruna_core::operation::Operation;
+use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
 use aruna_core::storage_entries::{
     commit_message_entry, create_acceptance_key, document_lifecycle_entry, event_log_key,
     event_log_prefix, metadata_actor_entry, metadata_actor_key, profile_validation_entry,
@@ -439,6 +440,12 @@ impl UpdateDocumentOperation {
         }
         let lifecycle = MetadataLifecycleRecord::for_event(event.clone(), self.message.clone());
         writes.push(document_lifecycle_entry(&lifecycle)?);
+        // The accepting node journals a content change for plugins in its commit batch.
+        if let Some(updated) = SourceEvent::from_metadata(event, now)
+            && updated.kind == SourceKind::DatasetUpdated
+        {
+            writes.extend(journal_entries(&updated)?);
+        }
         if outbox.is_none() {
             let aruna_core::document::DocumentOutboxEvent::Upsert { change, .. } =
                 lifecycle_outbox.event
@@ -2112,6 +2119,45 @@ mod pure_tests {
         let details = audit(&noted).details.unwrap_or_default();
         assert!(details.ends_with("; Add the raw file"), "{details}");
         assert!(!audit(&plain).details.unwrap_or_default().contains(';'));
+    }
+
+    // The accepted batch journals the change once for plugins, with its author.
+    #[test]
+    fn journals_accepted_update() {
+        let actor = actor();
+        let record = record(&actor);
+        let mutation = UpdateDocumentMutation::UpsertDataEntity {
+            jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+        };
+        let mut operation = UpdateDocumentOperation::new(config(actor.clone(), &record, mutation));
+        operation.start();
+        operation.step(registry_read(&record));
+        configured(&mut operation, realm_config_read(&record));
+        operation.step(batch_planned(&record));
+        let txn_id = Ulid::from_parts(9, 9);
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(registry_read(&record));
+        operation.step(no_window());
+        let size = postcard::experimental::serialized_size(&create_event(&record)).unwrap();
+        operation.step(raw_budget_read(&record, 1, size as u64));
+        let effects = operation.step(raw_events(&record));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected update batch write, got {effects:?}");
+        };
+        let journal = aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE;
+        let rows: Vec<SourceEvent> = (writes.iter())
+            .filter(|(keyspace, key, _)| {
+                keyspace == journal && key.first() == Some(&aruna_core::plugin_runs::JOURNAL_ROW)
+            })
+            .map(|(_, _, value)| SourceEvent::from_bytes(value).unwrap())
+            .collect();
+        let [row] = rows.as_slice() else {
+            panic!("expected one journal row, got {rows:?}");
+        };
+        assert_eq!(row.kind, SourceKind::DatasetUpdated);
+        assert_eq!(row.resource, record.document_id.to_string());
+        assert_eq!(row.source, format!("dataset_updated/{}", row.revision));
+        assert_eq!(row.actor, Some(actor.user_id));
     }
 
     #[test]

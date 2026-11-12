@@ -496,6 +496,24 @@ pub async fn project_create_events(
         } else {
             true
         };
+        // Each infrastructure holder journals a create or change once by its source id, also an
+        // older merge, while a receiver could still run it; one that arrives too late counts a gap.
+        if let Some(source) = SourceEvent::from_metadata(&event, now_ms)
+            && now_ms <= source.anchor_ms.saturating_add(DEDUP_RETENTION_MS)
+            && journaled.insert(source.source.clone())
+            && journals(
+                context,
+                &mut realm_configs,
+                event.record.realm_id,
+                local_node_id,
+            )
+            .await?
+            && !source_journaled(context, &source.source).await?
+        {
+            writes.extend(journal_entries(&source)?);
+            // A skipped projection still fences the batch on the document's lifecycle.
+            late_graphs.insert(event.record.graph_iri.clone());
+        }
         // A merge older than the recorded status still has to apply, so it only queues its own
         // job; an equal status means that event's job is already queued.
         let superseded = status_cache
@@ -512,29 +530,6 @@ pub async fn project_create_events(
             late_graphs.insert(event.record.graph_iri.clone());
             needs_materialization_drain = true;
             continue;
-        }
-        // Each infrastructure holder journals a creation once by its source id, whatever came
-        // first, while a receiver could still run it; one that arrives too late counts a gap.
-        let created = SourceEvent::dataset_created(&event, now_ms);
-        let fresh = now_ms <= created.anchor_ms.saturating_add(DEDUP_RETENTION_MS);
-        if fresh
-            && matches!(
-                event.payload,
-                MetadataEventPayload::Scaffold { .. } | MetadataEventPayload::RoCrate { .. }
-            )
-            && journaled.insert(created.source.clone())
-            && journals(
-                context,
-                &mut realm_configs,
-                event.record.realm_id,
-                local_node_id,
-            )
-            .await?
-            && !source_journaled(context, &created.source).await?
-        {
-            writes.extend(journal_entries(&created)?);
-            // A skipped projection still fences the batch on the document's lifecycle.
-            late_graphs.insert(event.record.graph_iri.clone());
         }
         let needs_projection =
             !registry_exists || event_is_newer || holders_changed || needs_materialization;
@@ -1190,7 +1185,7 @@ pub fn create_outbox_record(
     }
 }
 
-async fn dot_applied(
+pub(crate) async fn dot_applied(
     context: &DriverContext,
     graph_iri: &str,
     batch: &aruna_core::metadata::MetadataBatch,
@@ -1972,7 +1967,7 @@ mod tests {
     #[tokio::test]
     async fn journals_first_projection() {
         let journaled = async |local: NodeId, kind: RealmNodeKind, before: Before| {
-            journaled_aged(local, kind, before, 0).await
+            journaled_aged(local, kind, before, 0, None).await
         };
         let holder = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
         let (_, late) = journaled(holder, RealmNodeKind::Server, Before::Registry).await;
@@ -1992,30 +1987,77 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    // A change is journaled once as an update, also as a merge older than the materialized
+    // status; a checkpoint journals nothing.
+    #[tokio::test]
+    async fn journals_projected_update() {
+        let holder = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+        let batch = MetadataEventPayload::ApplyBatch {
+            batch: aruna_core::metadata::MetadataBatch {
+                graph_iri: "urn:graph".to_string(),
+                actor: [7u8; 32],
+                counter: 1,
+                base_clock: craqle::VectorClock::default(),
+                ops: Vec::new(),
+                timestamp_millis: 1,
+            },
+            authored: aruna_core::metadata::MetadataBatchSource::UpsertDataEntity {
+                jsonld: "{}".to_string(),
+            },
+        };
+        for before in [Before::Nothing, Before::Update] {
+            let change = Some(batch.clone());
+            let (event, rows) =
+                journaled_aged(holder, RealmNodeKind::Server, before, 0, change).await;
+            let [row] = rows.as_slice() else {
+                panic!("expected one journal row, got {rows:?}");
+            };
+            let kind = aruna_core::plugin_runs::SourceKind::DatasetUpdated;
+            assert_eq!(row.kind, kind);
+            assert_eq!(row.source, format!("dataset_updated/{}", event.event_id));
+        }
+        let checkpoint = Some(MetadataEventPayload::Checkpoint { snapshot: None });
+        let (_, none) = journaled_aged(
+            holder,
+            RealmNodeKind::Server,
+            Before::Nothing,
+            0,
+            checkpoint,
+        )
+        .await;
+        assert!(none.is_empty());
+    }
+
     // A holder that returns after eight days still journals a create its receivers could run.
     #[tokio::test]
     async fn journals_delayed_create() {
         let holder = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
         let age = 8 * 24 * 3600 * 1000;
         let (event, rows) =
-            journaled_aged(holder, RealmNodeKind::Server, Before::Nothing, age).await;
+            journaled_aged(holder, RealmNodeKind::Server, Before::Nothing, age, None).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].anchor_ms, event.event_id.timestamp_ms());
         let gone = DEDUP_RETENTION_MS + 1;
-        let (_, none) = journaled_aged(holder, RealmNodeKind::Server, Before::Nothing, gone).await;
+        let (_, none) =
+            journaled_aged(holder, RealmNodeKind::Server, Before::Nothing, gone, None).await;
         assert!(none.is_empty());
     }
 
-    /// Projects a create minted `age_ms` ago twice on `local` and returns its journal rows.
+    /// Projects a create, or the given change, minted `age_ms` ago twice on `local` and returns
+    /// its journal rows.
     async fn journaled_aged(
         local: NodeId,
         kind: RealmNodeKind,
         before: Before,
         age_ms: u64,
+        change: Option<MetadataEventPayload>,
     ) -> (MetadataEventRecord, Vec<SourceEvent>) {
         let dir = tempdir().expect("temp dir");
         let storage = FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage");
         let mut event = create_event();
+        if let Some(payload) = change {
+            event.payload = payload;
+        }
         let minted = aruna_core::time::unix_timestamp_millis() - age_ms;
         event.event_id = Ulid::from_parts(minted, event.event_id.random());
         event.record.establishing_event_id = event.event_id;
