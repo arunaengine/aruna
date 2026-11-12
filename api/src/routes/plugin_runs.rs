@@ -123,6 +123,8 @@ pub struct RunEvent {
     pub revision: String,
     /// The event's identity, the same on every node that journaled it.
     pub source: String,
+    /// The account whose change the event reports, for metadata events.
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -149,6 +151,7 @@ fn view(run: PluginRun) -> RunView {
                 resource: event.resource,
                 revision: event.revision,
                 source: event.source,
+                actor: event.actor.map(|actor| actor.to_string()),
             };
             ("event", None, None, None, Some(event))
         }

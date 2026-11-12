@@ -158,6 +158,7 @@ fn sync_matches_nothing() {
             source: "s".into(),
             anchor_ms: 1,
             journaled_ms: 1,
+            actor: None,
         };
         assert!(!target.matches(&event));
     }

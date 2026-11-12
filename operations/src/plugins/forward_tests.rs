@@ -142,6 +142,7 @@ async fn creation(fixture: &Fixture, install: &PluginInstall, now: u64) -> (Ulid
         resource: document.to_string(),
         revision: event_id.to_string(),
         journaled_ms: now,
+        actor: None,
         ..created(install, &document.to_string()).0
     };
     journal(fixture, &event).await;

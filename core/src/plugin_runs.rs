@@ -274,6 +274,8 @@ pub struct SourceEvent {
     pub anchor_ms: u64,
     /// When this node journaled it, by its own clock; orders replay and pruning only.
     pub journaled_ms: u64,
+    /// The account whose change it reports, when the kind knows it.
+    pub actor: Option<UserId>,
 }
 
 impl SourceEvent {
@@ -288,6 +290,7 @@ impl SourceEvent {
             source: format!("dataset_created/{}", event.event_id),
             anchor_ms: event.event_id.timestamp_ms(),
             journaled_ms: now_ms,
+            actor: Some(event.user_id),
         }
     }
 
@@ -308,6 +311,7 @@ impl SourceEvent {
             source: format!("data_uploaded/{node}/{bucket}/{version_id}/{key}"),
             anchor_ms: now_ms,
             journaled_ms: now_ms,
+            actor: None,
         }
     }
 
@@ -555,6 +559,7 @@ mod tests {
             source: "data_uploaded/n/b/k/v".into(),
             anchor_ms: 2,
             journaled_ms: 5,
+            actor: None,
         };
         let entries = journal_entries(&event).unwrap();
         assert_eq!(entries.len(), 3);

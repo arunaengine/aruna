@@ -14,20 +14,25 @@ use aruna_core::git::{GitRecord, LOCAL_OBJECTS, StoredObject};
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BROKEN_VERSION_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
-    COPY_WAIT_KEYSPACE, DEADLINE_INDEX_KEYSPACE, DEDUP_INDEX_KEYSPACE, EVENT_LOG_KEYSPACE,
-    EVENT_SIZE_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
-    FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_STATE_KEYSPACE,
-    NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_STATS_KEYSPACE,
-    NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, QUARANTINE_USAGE_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE,
-    REPLICATION_OBLIGATION_KEYSPACE, ROOT_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE,
-    SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE,
-    STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE, USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
+    COPY_WAIT_KEYSPACE, DEADLINE_INDEX_KEYSPACE, DEDUP_INDEX_KEYSPACE, EVENT_JOURNAL_KEYSPACE,
+    EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
+    FAMILY_OUTBOX_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE,
+    JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
+    NODE_STATS_KEYSPACE, NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, PLAN_EXPLAIN_KEYSPACE,
+    PLUGIN_OUTBOX_KEYSPACE, PLUGIN_RUNS_KEYSPACE, PLUGIN_WAITING_KEYSPACE,
+    QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE,
+    REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, ROOT_RECORD_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
+    SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE,
+    USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::plugin_runs::{
+    ForwardRow, JOURNAL_ROW, PENDING_ROW, PluginRun, RUN_ROW, SourceEvent,
+};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::realm_vault::RealmVaultRecord;
 use aruna_core::secrets::SecretRecord;
@@ -51,6 +56,7 @@ use aruna_core::structs::storage::blob::{BucketInfo, CurrentVersionPointer};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
+use aruna_operations::plugins::decide::WaitingRow;
 use aruna_operations::replication::queue::LiveObligationRecord;
 use aruna_operations::sync::mirror_repair::SyncMirrorRecord;
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
@@ -73,6 +79,7 @@ mod installs;
 mod jobs;
 mod layouts;
 mod mappings;
+mod plugin_events;
 mod removals;
 mod session_refs;
 mod sessions;
@@ -144,6 +151,8 @@ pub struct MigrateOutput {
     pub outbox_removals_rewritten: usize,
     /// Queued plugin install writes of this node from before the install's later fields.
     pub outbox_installs_rewritten: usize,
+    /// Stored plugin events, forward, waiting and run rows from before events named an actor.
+    pub plugin_events_rewritten: usize,
     /// Size rows written for logged metadata events that had none.
     pub event_sizes_written: usize,
     /// S3 sessions in an older format are deleted; their holders mint new ones.
@@ -245,6 +254,10 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let config_rows = db.keyspace(REALM_CONFIG_KEYSPACE, KeyspaceCreateOptions::default)?;
     let mapping_rows = db.keyspace(ID_MAPPING_KEYSPACE, KeyspaceCreateOptions::default)?;
     let outbox_rows = db.keyspace(SYNC_OUTBOX_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let journal_rows = db.keyspace(EVENT_JOURNAL_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let forward_rows = db.keyspace(PLUGIN_OUTBOX_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let waiting_rows = db.keyspace(PLUGIN_WAITING_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let run_rows = db.keyspace(PLUGIN_RUNS_KEYSPACE, KeyspaceCreateOptions::default)?;
     let index_rows = db.keyspace(SECONDARY_ID_KEYSPACE, KeyspaceCreateOptions::default)?;
     let job_rows = db.keyspace(JOB_KEYSPACE, KeyspaceCreateOptions::default)?;
     let git_rows = db.keyspace(GIT_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
@@ -349,6 +362,17 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     )?;
     let removals = removals::removal_rows(&db, &outbox_rows, SYNC_OUTBOX_KEYSPACE)?;
     let install_writes = installs::outbox_rows(&db, &outbox_rows, SYNC_OUTBOX_KEYSPACE)?;
+    let journal_kinds = (EVENT_JOURNAL_KEYSPACE, &[JOURNAL_ROW, PENDING_ROW][..]);
+    let journal_events =
+        plugin_events::event_rows::<SourceEvent>(&db, &journal_rows, journal_kinds)?;
+    let forward_kinds = (PLUGIN_OUTBOX_KEYSPACE, &[][..]);
+    let forward_events =
+        plugin_events::event_rows::<ForwardRow>(&db, &forward_rows, forward_kinds)?;
+    let waiting_kinds = (PLUGIN_WAITING_KEYSPACE, &[][..]);
+    let waiting_events =
+        plugin_events::event_rows::<WaitingRow>(&db, &waiting_rows, waiting_kinds)?;
+    let run_kinds = (PLUGIN_RUNS_KEYSPACE, &[RUN_ROW][..]);
+    let run_events = plugin_events::event_rows::<PluginRun>(&db, &run_rows, run_kinds)?;
     let git_records = rewrite_rows(&db, &git_rows, GIT_RECORD_KEYSPACE, git_record)?;
     let sizes = sizes::missing_sizes(&db, &event_rows, &size_rows)?;
     let stale = sessions::stale_sessions(&db, &session_rows, &expiry_rows, &owner_rows)?;
@@ -495,6 +519,10 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&outbox_rows, &git_outbox.rows),
         (&outbox_rows, &removals.rows),
         (&outbox_rows, &install_writes.rows),
+        (&journal_rows, &journal_events.rows),
+        (&forward_rows, &forward_events.rows),
+        (&waiting_rows, &waiting_events.rows),
+        (&run_rows, &run_events.rows),
         (&git_rows, &git_records.rows),
         (&size_rows, &sizes.rows),
         (&version_rows, &versions.rows),
@@ -627,6 +655,15 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         git_outbox_rewritten: git_outbox.rows.len(),
         outbox_removals_rewritten: removals.rows.len(),
         outbox_installs_rewritten: install_writes.rows.len(),
+        plugin_events_rewritten: [
+            &journal_events,
+            &forward_events,
+            &waiting_events,
+            &run_events,
+        ]
+        .iter()
+        .map(|rewrites| rewrites.rows.len())
+        .sum(),
         event_sizes_written: sizes.rows.len(),
         sessions_scanned: stale.scanned,
         sessions_deleted: stale.sessions.len(),
