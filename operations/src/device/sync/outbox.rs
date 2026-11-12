@@ -229,15 +229,17 @@ async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &
         warn!(relative = %upload.relative, "Failed to encode a synced base");
         return;
     };
-    let mut rows = vec![row];
-    rows.extend(origin_row(upload, ack));
+    let mut rows: Vec<_> = origin_row(upload, ack).into_iter().collect();
     let Some(txn_id) = start_txn(context).await else {
         return;
     };
+    let stored = stored_upload(context, upload, txn_id).await;
+    // Without a row this answer repeats a settled one, and a newer base may already stand.
+    if stored.is_some() {
+        rows.push(row);
+    }
     // A pass may have queued a newer version of the file meanwhile; that row is still owed.
-    let holds = stored_upload(context, upload, txn_id)
-        .await
-        .is_some_and(|stored| same_version(&stored, upload));
+    let holds = stored.is_some_and(|stored| same_version(&stored, upload));
     let settled = write_rows(context, rows, Some(txn_id)).await
         && (!holds
             || super::repository::delete_rows(
@@ -583,9 +585,9 @@ mod tests {
     use crate::device::sync::repository::{base_key, read_value, upload_entry, write_rows};
     use crate::driver::DriverContext;
     use crate::tests::device::context;
-    use aruna_core::keyspaces::SYNC_UPLOAD_KEYSPACE;
+    use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::{FolderState, SyncedFolder};
+    use aruna_core::structs::{FolderState, SyncBase, SyncedFolder};
 
     fn node_id() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[1u8; 32]).public()
@@ -784,6 +786,41 @@ mod tests {
         };
         settle_upload(&context, &older, &ack).await;
         assert_eq!(stored(&context, &newer).await, newer);
+    }
+
+    #[tokio::test]
+    async fn keeps_settled_base() {
+        // A repeated answer for an older version must not replace the base a newer one left.
+        let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
+        let older = upload(Ulid::generate());
+        let newer = SyncUpload {
+            local_version: Some(Ulid::generate()),
+            ..older.clone()
+        };
+        store(&context, &newer).await;
+        let answer = |version_id| SyncPullAck {
+            version_id,
+            already_applied: true,
+        };
+        let newer_version = Ulid::generate();
+        settle_upload(&context, &newer, &answer(newer_version)).await;
+        settle_upload(&context, &older, &answer(Ulid::generate())).await;
+
+        let bytes = read_value(
+            &context,
+            SYNC_BASE_KEYSPACE,
+            base_key(newer.folder_id, &newer.relative),
+            None,
+        )
+        .await
+        .expect("the base row is stored");
+        let base = SyncBase::from_bytes(&bytes).unwrap();
+        assert_eq!(base.local_version_id, newer.local_version);
+        assert_eq!(
+            base.synced.map(|synced| synced.remote_version_id),
+            Some(newer_version)
+        );
     }
 
     #[test]
