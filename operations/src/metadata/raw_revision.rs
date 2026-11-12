@@ -553,19 +553,6 @@ fn event_matches_state(event: &MetadataEventRecord, state: &RawRevisionState) ->
     }
 }
 
-/// The context digest of the document's raw revision here and the last event it covers, if this
-/// node has one.
-pub(crate) async fn stored_context(
-    context: &DriverContext,
-    document_id: Ulid,
-) -> Result<Option<([u8; 32], Ulid)>, RawReadError> {
-    let state = read_raw_state(context, document_id, None).await?;
-    Ok(state.and_then(|state| {
-        let revision = state.revision.as_ref()?;
-        Some((revision.context_digest, state.last_event_id))
-    }))
-}
-
 async fn read_raw_state(
     context: &DriverContext,
     document_id: Ulid,
