@@ -60,6 +60,7 @@ mod effects;
 pub(crate) use self::effects::metadata_read_error;
 pub(crate) use self::transport::transport_message_kind;
 mod entity_convert;
+pub(crate) use self::entity_convert::normalize_property;
 mod ingress;
 mod lifecycle;
 mod peer_auth;

@@ -382,7 +382,8 @@ fn expand_compact_iri(value: &str) -> Result<NamedNode, CraqleError> {
     }
 }
 
-fn normalize_property(property: &str) -> String {
+/// A property name without its `schema:` or schema.org IRI prefix, as entities are stored.
+pub(crate) fn normalize_property(property: &str) -> String {
     property
         .strip_prefix("schema:")
         .or_else(|| property.strip_prefix("http://schema.org/"))

@@ -58,6 +58,7 @@ use crate::metadata::forward::{
     CreateAuthorizedError, PinnedCreate, create_with_id, export_rocrate_routed,
     get_metadata_routed, route_metadata_update,
 };
+use crate::metadata::handle::normalize_property;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -354,22 +355,21 @@ impl RunBroker {
     /// here. Forms that name no single object here (content hashes, global ids) are refused.
     async fn objects_named(&self, install: &PluginInstall, file: &Value) -> Result<(), HostError> {
         let realm_id = self.scope.realm_id;
-        let urls = match file.get(CONTENT_URL) {
-            Some(Value::Array(urls)) => urls.clone(),
-            Some(url) => vec![url.clone()],
-            None => Vec::new(),
-        };
-        let urls: Vec<String> = (urls.iter())
-            .filter_map(|url| url.as_str().or_else(|| url.get("@id")?.as_str()))
-            .map(str::to_string)
+        // Every spelling the write converter stores as the id or as `contentUrl` is checked.
+        let mut values: Vec<&str> = (["@id", "id"].iter())
+            .filter_map(|key| file.get(*key)?.as_str())
             .collect();
-        let id = file.get("@id").and_then(Value::as_str).unwrap_or_default();
+        for (property, value) in file.as_object().into_iter().flatten() {
+            if normalize_property(property) == CONTENT_URL {
+                reference_values(value, &mut values);
+            }
+        }
         let refused = |what: &str| {
             let message = format!("{what} names no object a plugin may check; use its path");
             HostError::new(ErrorKind::Denied, message)
         };
         let group = install.group_id;
-        for value in std::iter::once(id).chain(urls.iter().map(String::as_str)) {
+        for value in values {
             let identity = DataIdentity::read(value, &[]);
             let path = if value.starts_with(&format!("/{realm_id}/g/")) {
                 value.to_string()
@@ -1038,6 +1038,23 @@ pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostEr
     let mut change = Value::Object(change);
     literal_objects(&mut change);
     Ok(change.to_string())
+}
+
+/// The strings a property value names: itself, each entry, or an object's `@id` or `@value`.
+fn reference_values<'a>(value: &'a Value, values: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => values.push(text),
+        Value::Array(entries) => entries
+            .iter()
+            .for_each(|entry| reference_values(entry, values)),
+        Value::Object(fields) => {
+            let named = ["@id", "id", "@value"]
+                .iter()
+                .filter_map(|key| fields.get(*key));
+            named.for_each(|entry| reference_values(entry, values));
+        }
+        _ => {}
+    }
 }
 
 /// File entities one page asks for; a page over the byte bound comes back smaller.

@@ -937,6 +937,26 @@ async fn object_references() {
         let refused = broker.metadata_put_file(&cx(), change).await.unwrap_err();
         assert_eq!(refused.kind, kind, "{file}");
     }
+    // Every spelling the converter stores as `contentUrl` is checked, in every value form.
+    let aliased = |property: &str, url: Value| {
+        let mut file = serde_json::json!({"@id": "./alias.txt", "@type": "File", "name": "o"});
+        file[property] = url;
+        file
+    };
+    let aliases = [
+        aliased("schema:contentUrl", "s3://data/a.txt".into()),
+        aliased("http://schema.org/contentUrl", "s3://data/a.txt".into()),
+        aliased(
+            "https://schema.org/contentUrl",
+            serde_json::json!(["s3://data/a.txt"]),
+        ),
+        aliased("contentUrl", serde_json::json!({"@id": "s3://data/a.txt"})),
+    ];
+    for (n, file) in aliases.iter().enumerate() {
+        let change = put(document, file, &revision, 10 + n as u32);
+        let refused = broker.metadata_put_file(&cx(), change).await.unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::NotGranted, "{file}");
+    }
 
     let reads = serde_json::json!({ "permissions": {
         "required": ["metadata.read", "metadata.write", "objects.read"] } });
