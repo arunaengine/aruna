@@ -21,6 +21,7 @@ pub mod emails;
 pub mod execution;
 pub mod federation;
 pub mod git;
+pub mod hooks;
 pub mod identifiers;
 pub mod info;
 pub mod install_changes;
@@ -137,6 +138,7 @@ fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
         .merge(plugin_installs::router())
         .merge(install_changes::router())
         .merge(plugin_runs::router())
+        .merge(hooks::router())
         .merge(policies::router())
         .merge(portal::router())
         .merge(oidc_providers::router())
@@ -841,6 +843,7 @@ pub(crate) mod tests {
         ("GET", "/plugin-installs/{id}/runs/{run}"),
         ("POST", "/plugin-installs/{id}/runs/{run}/resolve"),
         ("GET", "/plugin-installs/{id}/delivery"),
+        ("POST", "/plugin-hooks/{id}"),
     ];
 
     /// Documented path to the runtime template that serves it. Catch-all ids

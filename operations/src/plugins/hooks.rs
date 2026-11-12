@@ -8,14 +8,15 @@ use std::time::Instant;
 use aruna_core::NodeId;
 use aruna_core::injection::verify_request;
 use aruna_core::keyspaces::PLUGIN_HOOKS_KEYSPACE;
-use aruna_core::plugin_installs::InstallState;
+use aruna_core::plugin_installs::{BoundScope, InstallState};
 use aruna_core::plugin_runs::{HookRequest, RunTrigger, hook_key, hook_time_key};
 use aruna_core::secrets::Delivery;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_plugins::manifest::SecretKind;
 use aruna_plugins::trigger::TriggerKind;
 use ulid::Ulid;
 
-use super::bound::delivery_clash;
+use super::bound::{delivery_clash, select};
 use super::dispatch::new_run;
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
@@ -136,6 +137,38 @@ pub async fn admit_hook(
         Ok::<_, RunError>(true)
     });
     Ok(admitted.await?)
+}
+
+/// Whether the install's verify secret checks `authorization`, so a relay passes it on. A node
+/// secret's settings live on the receiver; for one of those the relay drops the header.
+pub async fn checks_authorization(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    install_id: Ulid,
+) -> bool {
+    let install = (config.installs.iter()).find(|install| install.install_id == install_id);
+    let Some(install) = install else {
+        return false;
+    };
+    let plugin = pick_version(config, &install.plugin, Some(&install.digest));
+    let Ok(manifest) = plugin.and_then(|plugin| read_manifest(&plugin)) else {
+        return false;
+    };
+    let hook = manifest.triggers.get(&TriggerKind::Webhook);
+    let Some(slot) = hook.and_then(|hook| hook.verify.as_ref()) else {
+        return false;
+    };
+    let declared = manifest.secrets.get(slot).map(|declared| declared.kind);
+    if declared == Some(SecretKind::Bearer) {
+        return true;
+    }
+    let binding = install.secrets.get(slot);
+    let Some(binding) = binding.filter(|binding| binding.scope != BoundScope::Node) else {
+        return false;
+    };
+    let selected = select(ctx, config, install, binding).await.ok().flatten();
+    let header = selected.and_then(|selected| selected.settings.get("header").cloned());
+    header.is_some_and(|header| header.eq_ignore_ascii_case("authorization"))
 }
 
 #[cfg(test)]

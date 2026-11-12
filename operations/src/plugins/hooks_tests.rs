@@ -134,4 +134,9 @@ async fn refusals_start_nothing() {
     let paused = admit(install.install_id).await;
     assert_eq!(paused, Err(HookError::Paused("paused")));
     assert!(runs(&fixture, &install).await.is_empty());
+    // A relay keeps `authorization` only for a verify secret that checks it.
+    let config = read_config(&fixture.ctx, realm_id).await.unwrap();
+    assert!(!checks_authorization(&fixture.ctx, &config, install.install_id).await);
+    hook_secret(&fixture, &install, "Authorization", 3).await;
+    assert!(checks_authorization(&fixture.ctx, &config, install.install_id).await);
 }

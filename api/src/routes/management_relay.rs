@@ -254,7 +254,7 @@ async fn coordinator_targets(state: &Arc<ServerState>) -> Result<Option<Vec<Stri
 
 /// The nodes a call passed, this one appended; `None` when the call came through this node or
 /// the target already, which would make it circle.
-fn passed_hops(
+pub(crate) fn passed_hops(
     state: &ServerState,
     headers: &HeaderMap,
     target: Option<NodeId>,
