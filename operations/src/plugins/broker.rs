@@ -61,7 +61,7 @@ use crate::metadata::forward::{
     CreateAuthorizedError, PinnedCreate, create_with_id, export_rocrate_routed,
     get_metadata_routed, route_metadata_update,
 };
-use crate::metadata::handle::craqle_patch_request;
+use crate::metadata::handle::{craqle_patch_request, property_iri};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -374,12 +374,22 @@ impl RunBroker {
                 Term::Literal(literal) => Some(literal.value().to_string()),
                 _ => None,
             });
-        // The id is checked as sent and as stored, since the raw revision keeps it as sent.
-        let sent = ["@id", "id"]
-            .iter()
-            .filter_map(|key| file.get(*key)?.as_str());
-        let sent = sent.map(str::to_string).chain([entity.entity_id.clone()]);
-        let values: Vec<String> = sent.chain(urls).collect();
+        // A reference renders without the `./` the converter adds, so both forms are checked.
+        let urls = urls.flat_map(|url| {
+            let bare = url.strip_prefix("./").map(str::to_string);
+            std::iter::once(url).chain(bare)
+        });
+        // The values as sent, of every property that converts to `contentUrl`, are checked too.
+        let mut sent: Vec<&str> = (["@id", "id"].iter())
+            .filter_map(|key| file.get(*key)?.as_str())
+            .collect();
+        for (property, value) in file.as_object().into_iter().flatten() {
+            if property_iri(property).is_some_and(|iri| content_predicate(&iri)) {
+                reference_values(value, &mut sent);
+            }
+        }
+        let sent = sent.into_iter().map(str::to_string);
+        let values: Vec<String> = sent.chain([entity.entity_id.clone()]).chain(urls).collect();
         let refused = |what: &str| {
             let message = format!("{what} names no object a plugin may check; use its path");
             HostError::new(ErrorKind::Denied, message)
@@ -1104,6 +1114,23 @@ pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostEr
     let mut change = Value::Object(change);
     literal_objects(&mut change);
     Ok(change.to_string())
+}
+
+/// The strings a property value names: itself, each entry, or an object's `@id`, `id` or `@value`.
+fn reference_values<'a>(value: &'a Value, values: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => values.push(text),
+        Value::Array(entries) => entries
+            .iter()
+            .for_each(|entry| reference_values(entry, values)),
+        Value::Object(fields) => {
+            let named = ["@id", "id", "@value"]
+                .iter()
+                .filter_map(|key| fields.get(*key));
+            named.for_each(|entry| reference_values(entry, values));
+        }
+        _ => {}
+    }
 }
 
 /// Whether a stored predicate is schema.org's `contentUrl`, under either scheme.

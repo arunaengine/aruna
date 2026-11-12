@@ -1235,3 +1235,53 @@ async fn second_hash_checked() {
         .await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
 }
+
+#[tokio::test]
+async fn context_reference_checked() {
+    // A crate whose context types `contentUrl` as `@id` renders a referenced ARN without the `./`
+    // the converter adds, so the ARN as sent is checked before any write.
+    let (fixture, broker, _, _dir) = broker().await;
+    let jsonld = serde_json::json!({
+        "@context": [
+            "https://w3id.org/ro/crate/1.1/context",
+            {"contentUrl": {"@id": "http://schema.org/contentUrl", "@type": "@id"}}
+        ],
+        "@graph": [
+            {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"},
+             "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"}},
+            {"@id": "./", "@type": "Dataset", "name": "imported", "description": "d",
+             "datePublished": "2026-01-01", "hasPart": [{"@id": "a.txt"}]},
+            {"@id": "a.txt", "@type": "File", "name": "a.txt"}
+        ]
+    });
+    let create = CreateDocumentOperation::new(CreateDocumentConfig {
+        actor: fixture.actor.clone(),
+        group_id: fixture.group_id,
+        document_id: Ulid::nil(),
+        document_path: "/docs/imported/".to_string(),
+        public: false,
+        payload: CreateDocumentPayload::RoCrate {
+            jsonld: jsonld.to_string(),
+        },
+    });
+    let document = create_metadata_document(create, broker.ctx.clone())
+        .await
+        .unwrap();
+    let document = document.record.document_id;
+    project(&broker.ctx).await;
+    let revision = revision_of(&broker, document).await;
+    let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
+    let arn = aruna_core::structs::storage::replication::VersionedObjectArn::new(
+        realm,
+        node,
+        "private",
+        "secret.bin",
+        Ulid::generate(),
+    );
+    let file = serde_json::json!({"@id": "./b.txt", "@type": "File", "name": "b",
+        "contentUrl": {"@id": arn.unwrap().to_string()}});
+    let refused = broker
+        .metadata_put_file(&cx(), put(document, &file, &revision, 0))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::NotGranted);
+}
