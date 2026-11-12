@@ -422,8 +422,8 @@ impl RunBroker {
         Ok(())
     }
 
-    /// Refuses an object whose stored BLAKE3 digest differs from the hash a file names it by. An
-    /// object stored without one cannot be compared and passes.
+    /// Admits the hash a file names an object by only when the object's verified BLAKE3 digest is
+    /// recorded and equal; a pending upload without one cannot vouch for any hash.
     async fn same_content(
         &self,
         (bucket, key, version_id): (String, String, Option<Ulid>),
@@ -439,12 +439,15 @@ impl RunBroker {
         let stored = head
             .location
             .and_then(|location| location.hashes.get(HASH_BLAKE3).cloned());
+        let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
         match stored {
-            Some(stored) if stored != hash => Err(HostError::new(
-                ErrorKind::Invalid,
+            None => Err(invalid(
+                "the object has no verified digest for the file's hash id yet",
+            )),
+            Some(stored) if stored != hash => Err(invalid(
                 "the object's content does not match the file's hash id",
             )),
-            _ => Ok(()),
+            Some(_) => Ok(()),
         }
     }
 

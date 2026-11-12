@@ -1044,8 +1044,13 @@ async fn superseded_merge_journaled() {
     assert!(journaled.unwrap().is_some());
 }
 
-/// Stores object `key` of a new bucket of the fixture's group, with content digest `hash`.
-async fn stored_object(fixture: &Fixture, (bucket, key): (&str, &str), hash: [u8; 32]) {
+/// Stores object `key` of a new bucket of the fixture's group with content digest `hash`, which
+/// the location records only when `recorded` is set, as a pending encrypted upload leaves it out.
+async fn stored_object(
+    fixture: &Fixture,
+    (bucket, key): (&str, &str),
+    (hash, recorded): ([u8; 32], bool),
+) {
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
@@ -1078,7 +1083,10 @@ async fn stored_object(fixture: &Fixture, (bucket, key): (&str, &str), hash: [u8
         staging: false,
         partial: false,
         blob_size: 5,
-        hashes: std::collections::HashMap::from([(HASH_BLAKE3.to_string(), hash.to_vec())]),
+        hashes: (recorded
+            .then(|| (HASH_BLAKE3.to_string(), hash.to_vec()))
+            .into_iter())
+        .collect(),
     };
     let version_id = Ulid::generate();
     let version = BlobVersion::materialized(
@@ -1125,7 +1133,7 @@ async fn hashed_files_rename() {
     use aruna_core::structs::storage::data::identity::content_id;
     let (fixture, broker, _, _dir) = broker().await;
     let hash = [5u8; 32];
-    stored_object(&fixture, ("imports", "run/a.txt"), hash).await;
+    stored_object(&fixture, ("imports", "run/a.txt"), (hash, true)).await;
     let id = content_id(hash);
     let document = files_named(&fixture, &broker, &[id.as_str()]).await;
     let reads = serde_json::json!({ "permissions": {
@@ -1163,6 +1171,23 @@ async fn hashed_files_rename() {
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Denied);
 }
 
+/// A broker of an install that reads metadata and objects and writes metadata, as `version`.
+async fn writer_broker(
+    fixture: &Fixture,
+    broker: &RunBroker,
+    (version, byte): (&str, &str),
+) -> RunBroker {
+    let reads = serde_json::json!({ "permissions": {
+        "required": ["metadata.read", "metadata.write", "objects.read"] } });
+    let mut request = fixture.request(None);
+    request.version = Some(fixture.publish(version, byte, reads).await);
+    let installed = fixture.install(&request).await.unwrap();
+    let mut scope = broker.scope.clone();
+    scope.run.install_id = installed.install_id;
+    scope.run.digest = installed.digest.clone();
+    RunBroker::new(broker.ctx.clone(), scope)
+}
+
 #[tokio::test]
 async fn compact_alias_checked() {
     // A doubled prefix still resolves to `contentUrl` in the stored entity, so it is checked too.
@@ -1175,4 +1200,21 @@ async fn compact_alias_checked() {
         .metadata_put_file(&cx(), put(document, &file, &revision, 0))
         .await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::NotGranted);
+}
+
+#[tokio::test]
+async fn unverified_hash_refused() {
+    // An object without a recorded digest cannot confirm the hash a file claims for it.
+    use aruna_core::structs::storage::data::identity::content_id;
+    let (fixture, broker, _, _dir) = broker().await;
+    stored_object(&fixture, ("pending", "a.bin"), ([5u8; 32], false)).await;
+    let document = three_files(&fixture, &broker).await;
+    let writer = writer_broker(&fixture, &broker, ("0.1.6", "57")).await;
+    let revision = revision_of(&writer, document).await;
+    let file = serde_json::json!({"@id": content_id([5u8; 32]), "@type": "File", "name": "p",
+        "contentUrl": "s3://pending/a.bin"});
+    let refused = writer
+        .metadata_put_file(&cx(), put(document, &file, &revision, 0))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
 }
