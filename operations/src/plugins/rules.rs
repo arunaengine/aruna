@@ -225,7 +225,81 @@ pub fn wanted_rules(
             rules.push(rule(Delivery::Value));
         }
     }
+    wanted.values_mut().for_each(widen_shared);
     Ok(wanted)
+}
+
+/// A use check takes the first matching rule, so every rule gets the exposure of each rule a
+/// request could match with it, and exact duplicates go. The broker still narrows each answer to
+/// its own connection's fields.
+fn widen_shared(rules: &mut Vec<UseRule>) {
+    let joined: Vec<ResponseExposure> = (rules.iter())
+        .map(|rule| {
+            (rules.iter())
+                .filter(|other| overlaps(rule, other))
+                .fold(rule.response.clone(), |joined, other| {
+                    join(joined, &other.response)
+                })
+        })
+        .collect();
+    let mut kept: Vec<UseRule> = Vec::new();
+    for (mut rule, response) in rules.drain(..).zip(joined) {
+        rule.response = response;
+        if !kept.contains(&rule) {
+            kept.push(rule);
+        }
+    }
+    *rules = kept;
+}
+
+/// Whether one request could match both inject rules.
+fn overlaps(a: &UseRule, b: &UseRule) -> bool {
+    let nested = |p: &String, q: &String| {
+        let within = |path: &str, prefix: &str| {
+            let rest = path.strip_prefix(prefix);
+            rest.is_some_and(|rest| {
+                rest.is_empty() || prefix.ends_with('/') || rest.starts_with('/')
+            })
+        };
+        within(p, q) || within(q, p)
+    };
+    a.delivery == b.delivery
+        && a.origins.iter().any(|origin| b.origins.contains(origin))
+        && (a.methods.is_empty()
+            || b.methods.is_empty()
+            || a.methods.iter().any(|method| b.methods.contains(method)))
+        && (a.paths.is_empty()
+            || b.paths.is_empty()
+            || a.paths.iter().any(|p| b.paths.iter().any(|q| nested(p, q))))
+}
+
+/// The exposure that shows what either shows.
+fn join(joined: ResponseExposure, other: &ResponseExposure) -> ResponseExposure {
+    use ResponseExposure::{Fields, Full, Status};
+    match (joined, other) {
+        (Full, _) | (_, Full) => Full,
+        (Status, other) => other.clone(),
+        (fields, Status) => fields,
+        (
+            Fields { pointers, headers },
+            Fields {
+                pointers: more,
+                headers: added,
+            },
+        ) => {
+            // Sorted, so rules with the same selectors and fields compare equal.
+            let union = |mut list: Vec<String>, more: &[String]| {
+                list.extend_from_slice(more);
+                list.sort_unstable();
+                list.dedup();
+                list
+            };
+            Fields {
+                pointers: union(pointers, more),
+                headers: union(headers, added),
+            }
+        }
+    }
 }
 
 /// Ensures the install's rules on every group secret it binds, for its current revision.

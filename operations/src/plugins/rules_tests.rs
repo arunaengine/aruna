@@ -312,3 +312,54 @@ async fn shared_secret_slots() {
         [vec!["/api".to_string()], vec!["/mirror".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn overlapping_rules_join() {
+    let fixture = Fixture::keyed().await;
+    let (mut install, _) = shared_install(&fixture).await;
+    let fields = |pointers: &[&str]| ResponseExposure::Fields {
+        pointers: pointers.iter().map(|pointer| pointer.to_string()).collect(),
+        headers: Vec::new(),
+    };
+    let manifest: aruna_plugins::manifest::Manifest = serde_json::from_value(serde_json::json!({
+        "name": "announcer", "version": "0.4.0",
+        "settings": { "catalog_url": { "title": "Catalog", "type": "url" } },
+        "secrets": { "api_key": { "title": "API key", "kind": "bearer" } },
+        "connections": {
+            "ids": { "url": "{catalog_url}/api/", "auth": "api_key", "response": ["/id"] },
+            "names": { "url": "{catalog_url}/api/", "auth": "api_key", "response": ["/name"] },
+            "deep": { "url": "{catalog_url}/api/v2/", "auth": "api_key", "response": ["/z"] },
+            "whole": { "url": "{catalog_url}/files/", "auth": "api_key", "response": "full" },
+            "brief": { "url": "{catalog_url}/files/", "auth": "api_key", "response": ["/id"] }
+        }
+    }))
+    .unwrap();
+    let scope = super::super::grants::InstallScope {
+        realm_id: install.account.realm_id,
+        group_id: install.group_id,
+        install_id: install.install_id,
+    };
+    let names = manifest
+        .connections
+        .keys()
+        .map(|name| scope.connection(name));
+    install
+        .grants
+        .insert("connections.send".to_string(), names.collect());
+    let name = SecretName::try_from("api-key".to_string()).unwrap();
+    let wanted = wanted_rules(&install, &manifest).unwrap();
+    let shown: Vec<(Vec<String>, ResponseExposure)> = (wanted[&name].iter())
+        .map(|rule| (rule.paths.clone(), rule.response.clone()))
+        .collect();
+    // Identical selectors join into one rule; a nested prefix shows what the outer one shows,
+    // and the reverse, so the first matching rule never hides a connection's fields.
+    let joined = fields(&["/id", "/name", "/z"]);
+    assert_eq!(
+        shown,
+        [
+            (vec!["/files".to_string()], ResponseExposure::Full),
+            (vec!["/api/v2".to_string()], joined.clone()),
+            (vec!["/api".to_string()], joined),
+        ]
+    );
+}
