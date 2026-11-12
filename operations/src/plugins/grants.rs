@@ -51,7 +51,9 @@ impl InstallScope {
     pub fn root(&self, permission: Permission) -> String {
         let group = format!("/{}/g/{}", self.realm_id, self.group_id);
         match permission {
-            Permission::MetadataRead | Permission::MetadataWrite => format!("{group}/meta"),
+            Permission::MetadataRead | Permission::MetadataWrite | Permission::MetadataCreate => {
+                format!("{group}/meta")
+            }
             Permission::ConnectionsSend => {
                 format!("{group}/plugins/{}/connections", self.install_id)
             }
@@ -193,9 +195,10 @@ pub fn within(pattern: &str, root: &str) -> bool {
 pub fn accesses(permission: Permission) -> &'static [Access] {
     match permission {
         Permission::ObjectsCopy => &[Access::READ, Access::WRITE],
-        Permission::MetadataWrite | Permission::TransfersDownload | Permission::JobsRun => {
-            &[Access::WRITE]
-        }
+        Permission::MetadataWrite
+        | Permission::MetadataCreate
+        | Permission::TransfersDownload
+        | Permission::JobsRun => &[Access::WRITE],
         Permission::MetadataRead
         | Permission::ObjectsRead
         | Permission::TransfersUpload

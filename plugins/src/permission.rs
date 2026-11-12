@@ -14,6 +14,8 @@ use thiserror::Error;
 pub enum Permission {
     MetadataRead,
     MetadataWrite,
+    /// Creates datasets below the granted metadata paths.
+    MetadataCreate,
     ObjectsRead,
     ObjectsCopy,
     TransfersDownload,
@@ -29,9 +31,10 @@ pub enum Permission {
 pub struct UnknownPermission(pub String);
 
 impl Permission {
-    pub const ALL: [Permission; 9] = [
+    pub const ALL: [Permission; 10] = [
         Self::MetadataRead,
         Self::MetadataWrite,
+        Self::MetadataCreate,
         Self::ObjectsRead,
         Self::ObjectsCopy,
         Self::TransfersDownload,
@@ -45,6 +48,7 @@ impl Permission {
         match self {
             Self::MetadataRead => "metadata.read",
             Self::MetadataWrite => "metadata.write",
+            Self::MetadataCreate => "metadata.create",
             Self::ObjectsRead => "objects.read",
             Self::ObjectsCopy => "objects.copy",
             Self::TransfersDownload => "transfers.download",
