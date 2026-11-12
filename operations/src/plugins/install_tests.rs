@@ -460,9 +460,10 @@ async fn refuses_requests() {
         .await;
     let mut secrets = fixture.request(None);
     secrets.version = Some(secret);
+    // A slot whose secret does not exist is refused before anything is written.
     assert!(matches!(
         fixture.install(&secrets).await,
-        Err(InstallError::Grant(_))
+        Err(InstallError::Binding(_))
     ));
     assert!(fixture.installs().await.is_empty());
 }

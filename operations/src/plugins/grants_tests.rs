@@ -128,18 +128,17 @@ fn narrowing_rules() {
 
 #[test]
 fn unsupported_manifests() {
-    assert_eq!(check_supported(&manifest(json!({}))), Ok(()));
     let cases = [
+        json!({}),
         json!({ "secrets": { "key": { "title": "Key" } } }),
         json!({ "triggers": { "webhook": {} } }),
-        json!({ "permissions": { "optional": ["jobs.run"] } }),
+        json!({ "permissions": { "optional": ["secrets.value"] } }),
     ];
     for extra in cases {
-        assert!(
-            check_supported(&manifest(extra.clone())).is_err(),
-            "{extra}"
-        );
+        assert_eq!(check_supported(&manifest(extra.clone())), Ok(()), "{extra}");
     }
+    let jobs = manifest(json!({ "permissions": { "optional": ["jobs.run"] } }));
+    assert!(check_supported(&jobs).is_err());
 }
 
 #[test]

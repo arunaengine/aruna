@@ -208,7 +208,7 @@ relays it to one.
 - Each secret slot binds a secret by `secrets`, the group secret of the slot's name by default.
   A group or realm secret is checked here, a node secret on the receiver; it must exist with the
   slot's kind. A realm or node secret needs its use rule from a realm admin; the summary warns.
-- Plugins with secret slots or webhooks cannot be installed yet.
+- Plugins that request `jobs.run` cannot be installed yet.
 - While any enabled realm or group policy reads the request path, a grant on a subtree is
   refused, even when the policy's guard leaves plugin operations out; exact paths stay usable.
 

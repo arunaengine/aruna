@@ -1,5 +1,5 @@
 //! Tests rule edits: ensuring is idempotent, keeps other consumers' rules, writes nothing for a
-//! stale revision, and removal only runs for a retired install.
+//! stale revision, removal only runs for a retired install, and an install gets every rule.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -145,4 +145,111 @@ async fn install_rules() {
     .await;
     retire_rules(&fixture.ctx, &fixture.actor, &moved).await;
     assert!(rules(&fixture, &moved).await.is_empty());
+}
+
+/// The group secret `name` of `kind` with `settings` and one field, without use rules.
+async fn plain_secret(fixture: &Fixture, (name, kind): (&str, &str), settings: &[(&str, &str)]) {
+    use crate::driver::drive;
+    use crate::secrets::SecretChange;
+    use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
+    use aruna_core::compute::Secret;
+    use aruna_core::secret_registers::SecretOwner;
+    use aruna_core::secrets::{SecretFields, SecretKind};
+    let field = match kind {
+        "bearer" => "token",
+        _ => "value",
+    };
+    let change = SecretChange::Create {
+        name: SecretName::try_from(name.to_string()).unwrap(),
+        kind: SecretKind::parse(kind).unwrap(),
+        description: String::new(),
+        settings: (settings.iter())
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+        uses: Vec::new(),
+        fields: SecretFields::new([(field.to_string(), Secret::new("canary-plain-9d2c"))].into()),
+    };
+    let input = OwnerChange {
+        realm_id: fixture.actor.realm_id,
+        node_id: fixture.actor.node_id,
+        owner: SecretOwner::Group(fixture.group_id),
+        actor: fixture.actor.user_id,
+        change,
+        readable: false,
+        now_ms: 1,
+        write_ids: [1, 2, 3].map(|_| Ulid::generate()),
+        txn_id: None,
+    };
+    drive(OwnerSecretOperation::new(input), &fixture.ctx)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn installs_with_secrets() {
+    use crate::plugins::grants::GrantError;
+    use crate::plugins::install::InstallError;
+    let fixture = Fixture::keyed().await;
+    plain_secret(&fixture, ("api-key", "bearer"), &[]).await;
+    plain_secret(
+        &fixture,
+        ("hook-key", "header"),
+        &[("header", "x-signature")],
+    )
+    .await;
+    let features = serde_json::json!({
+        "secrets": {
+            "api_key": { "title": "API key", "kind": "bearer" },
+            "hook_key": { "title": "Hook key", "kind": "header" }
+        },
+        "connections": { "catalog": { "url": "{catalog_url}/api/", "auth": "api_key" } },
+        "triggers": { "webhook": {
+            "verify": "hook_key", "delivery_id": "x-delivery", "handler": "on_webhook"
+        } },
+        "permissions": { "required": ["metadata.read"], "optional": ["secrets.value"] }
+    });
+    let digest = fixture.publish("0.4.0", "aa", features).await;
+    let mut request = fixture.request(None);
+    request.version = Some(digest);
+    request.secrets = [("api_key", "group:api-key"), ("hook_key", "group:hook-key")]
+        .map(|(slot, secret)| (slot.to_string(), secret.to_string()))
+        .into();
+    let install = fixture.install(&request).await.unwrap();
+    assert_eq!(
+        install.state,
+        aruna_core::plugin_installs::InstallState::Active
+    );
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let delivered = async |slot: &str| {
+        let binding = &install.secrets[slot];
+        let selected = select(&fixture.ctx, &config, &install, binding).await;
+        let rules = selected.unwrap().unwrap().rules;
+        rules
+            .into_iter()
+            .map(|rule| rule.delivery)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        delivered("api_key").await,
+        [Delivery::Inject, Delivery::Value]
+    );
+    assert_eq!(
+        delivered("hook_key").await,
+        [Delivery::Verify, Delivery::Value]
+    );
+    // Container work stays refused.
+    let jobs = serde_json::json!({ "permissions": { "required": ["jobs.run"] } });
+    let digest = fixture.publish("0.5.0", "bb", jobs).await;
+    let mut request = fixture.request(None);
+    request.version = Some(digest);
+    let refused = fixture.install(&request).await;
+    assert!(
+        matches!(
+            refused,
+            Err(InstallError::Grant(GrantError::Unsupported(_)))
+        ),
+        "{refused:?}"
+    );
 }
