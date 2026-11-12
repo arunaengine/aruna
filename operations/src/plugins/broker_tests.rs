@@ -762,3 +762,107 @@ async fn file_pages() {
     assert!(whole.json.contains("a.txt"), "{}", whole.json);
     assert_eq!(summary.revision, whole.revision);
 }
+
+fn put(document: Ulid, file: &Value, expected: &str, ordinal: u32) -> FileChange {
+    let file = file.to_string();
+    let parts: [&[u8]; 2] = [file.as_bytes(), expected.as_bytes()];
+    let intent = Intent::new(ordinal, None, &parts);
+    FileChange {
+        resource: document.to_string(),
+        file,
+        expected: expected.to_string(),
+        intent,
+    }
+}
+
+/// The current revision of a document, read through its summary.
+async fn revision_of(broker: &RunBroker, document: Ulid) -> String {
+    let resource = document.to_string();
+    let summary = broker.metadata_summary(&cx(), &resource).await;
+    summary.unwrap().revision
+}
+
+/// The `@id` and fields of each file entity of a document, in order.
+async fn files_of(broker: &RunBroker, document: Ulid) -> Vec<Value> {
+    let resource = document.to_string();
+    let page = broker.metadata_files(&cx(), &resource, None).await.unwrap();
+    (page.files.iter())
+        .map(|file| serde_json::from_str(file).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn file_puts() {
+    // A put replaces one file by `@id`, so a property it omits goes; others and their links stay.
+    let (fixture, broker, _, _dir) = broker().await;
+    let document = three_files(&fixture, &broker).await;
+    let typed = serde_json::json!({"@id": "./a.txt", "@type": "File", "name": "a", "encodingFormat": "text/plain"});
+    let first = revision_of(&broker, document).await;
+    let after = broker
+        .metadata_put_file(&cx(), put(document, &typed, &first, 0))
+        .await;
+    let after = after.unwrap();
+    project(&broker.ctx).await;
+    assert_eq!(
+        files_of(&broker, document).await[0]["encodingFormat"],
+        "text/plain"
+    );
+    let renamed = serde_json::json!({"@id": "./a.txt", "@type": "File", "name": "renamed"});
+    let again = put(document, &renamed, &after, 1);
+    let latest = broker
+        .metadata_put_file(&cx(), again.clone())
+        .await
+        .unwrap();
+    project(&broker.ctx).await;
+    assert_eq!(
+        broker.metadata_put_file(&cx(), again).await,
+        Ok(latest.clone())
+    );
+    let files = files_of(&broker, document).await;
+    assert_eq!(files.len(), 3);
+    assert_eq!(files[0]["name"], "renamed");
+    assert!(files[0].get("encodingFormat").is_none(), "{}", files[0]);
+    assert!(files[1]["name"].as_str().unwrap().starts_with("b.txt"));
+
+    // A new file is added and linked; a stale revision, the root and a nested entity are refused.
+    let added = serde_json::json!({"@id": "d.txt", "@type": "File", "name": "d"});
+    let current = revision_of(&broker, document).await;
+    assert_eq!(current, latest);
+    broker
+        .metadata_put_file(&cx(), put(document, &added, &current, 2))
+        .await
+        .unwrap();
+    project(&broker.ctx).await;
+    assert_eq!(files_of(&broker, document).await.len(), 4);
+    let stale = broker
+        .metadata_put_file(&cx(), put(document, &added, &first, 3))
+        .await;
+    assert_eq!(stale.unwrap_err().kind, ErrorKind::Conflict);
+    let current = revision_of(&broker, document).await;
+    let root = serde_json::json!({"@id": "./", "@type": "File", "name": "root"});
+    let refused = broker
+        .metadata_put_file(&cx(), put(document, &root, &current, 4))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
+    let nested =
+        serde_json::json!({"@id": "e.txt", "@type": "File", "author": {"@id": "#p", "name": "P"}});
+    let refused = broker
+        .metadata_put_file(&cx(), put(document, &nested, &current, 5))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
+
+    // A file naming an exact object needs `objects.read` on it.
+    let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
+    let arn = aruna_core::structs::storage::replication::VersionedObjectArn::new(
+        realm,
+        node,
+        "bucket",
+        "a.txt",
+        Ulid::generate(),
+    );
+    let object = serde_json::json!({"@id": arn.unwrap().to_string(), "@type": "File", "name": "o"});
+    let refused = broker
+        .metadata_put_file(&cx(), put(document, &object, &current, 6))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::Denied);
+}

@@ -172,6 +172,20 @@ impl Metadata {
         reply.map_err(|err| Error::host(err, "metadata.write", resource))
     }
 
+    /// Adds or replaces one `File` entity by `@id` if the dataset is still at `expected`; the
+    /// properties it omits go. Returns the new revision.
+    pub async fn put_file(
+        &self,
+        resource: &str,
+        file: &Value,
+        expected: &str,
+        key: Option<&str>,
+    ) -> Result<String> {
+        let text = serde_json::to_string(file)?;
+        let reply = metadata_write::put_file(resource, &text, expected, key);
+        reply.map_err(|err| Error::host(err, "metadata.write", resource))
+    }
+
     /// Creates a dataset at `path` from one dataset entity; the same `key` always names the same
     /// document. Returns the document and its first revision.
     pub async fn create(&self, path: &str, dataset: &Value, key: &str) -> Result<(String, String)> {

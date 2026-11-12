@@ -21,9 +21,9 @@ use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
-    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FilePage, FullResponse,
-    HostError, Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response,
-    SendRequest, StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
+    FullResponse, HostError, Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
+    ObjectPage, Response, SendRequest, StatePut,
 };
 use aruna_plugins::connection::{Readable, relative_path};
 use aruna_plugins::permission::Permission;
@@ -47,6 +47,7 @@ use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
+use crate::git::snapshot::unreadable_file;
 use crate::metadata::api::{
     ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, ListVisibleRequest,
     MetadataApiError, MetadataListOrder, RoCrateExportView, list_visible_documents,
@@ -225,6 +226,71 @@ impl RunBroker {
             | ExportMetadataResult::Summary { record, jsonld } => Ok((record, jsonld)),
             _ => Err(unavailable("the document has no such export")),
         }
+    }
+
+    /// Runs a revision-checked change of one file entity under the write grants. A file it names
+    /// must be readable through `objects.read`, as for a restricted REST writer.
+    async fn file_write(
+        &self,
+        cx: &CallContext,
+        change: &FileChange,
+        mutation: UpdateDocumentMutation,
+        file: Option<Value>,
+    ) -> Result<String, HostError> {
+        let document_id = parse_document(&change.resource)?;
+        let expected = Ulid::from_string(&change.expected)
+            .map_err(|_| HostError::new(ErrorKind::Invalid, "bad revision"))?;
+        let (_, auth) = self.listing(Permission::MetadataWrite).await?;
+        let read = (document_id, RoCrateExportView::Summary);
+        let (record, _) = self.export(read, auth, cx.max_bytes).await?;
+        let (install, auth) =
+            (self.checked(Permission::MetadataWrite, &record.permission_path)).await?;
+        if let Some(file) = file {
+            let readable = match self.listing(Permission::ObjectsRead).await {
+                Ok((_, readable)) => readable,
+                Err(_) => AuthContext {
+                    path_restrictions: Some(Vec::new()),
+                    ..auth.clone()
+                },
+            };
+            if let Some(named) = unreadable_file(&self.ctx, &readable, &[file]).await {
+                let message = format!("the plugin may not read the object {named} names");
+                return Err(HostError::new(ErrorKind::Denied, message));
+            }
+        }
+        let run_id = self.scope.run.run_id;
+        let earlier = written(&self.ctx, run_id, &change.intent).await;
+        if !earlier.map_err(|error| unavailable(error.0))? {
+            same_revision(record.last_event_id, expected)?;
+        }
+        if let Some(reply) = self.begun(&change.intent).await? {
+            return Ok(reply);
+        }
+        let actor = Actor {
+            node_id: self.scope.local,
+            user_id: install.account,
+            realm_id: self.scope.realm_id,
+        };
+        let message = format!(
+            "plugin {} install {} run {run_id}",
+            install.plugin, install.install_id
+        );
+        let update = route_metadata_update(
+            &self.ctx,
+            actor,
+            Some(&record),
+            document_id,
+            None,
+            mutation,
+            Some(expected),
+            Some(AuthToken::Internal(auth)),
+            Some(message),
+        );
+        let outcome = update
+            .await
+            .map(|record| record.last_event_id.to_string())
+            .map_err(write_outcome);
+        self.record(&change.intent, outcome).await
     }
 
     /// The dataset entity of a document from the given export view, checked under the read grants.
@@ -619,6 +685,19 @@ impl Broker for RunBroker {
         stored_created(&reply)
     }
 
+    async fn metadata_put_file(
+        &self,
+        cx: &CallContext,
+        change: FileChange,
+    ) -> Result<String, HostError> {
+        let file = file_entity(&change.file)?;
+        let mutation = UpdateDocumentMutation::ReplaceDataEntity {
+            jsonld: file.clone(),
+        };
+        let file: Value = serde_json::from_str(&file).unwrap_or(Value::Null);
+        self.file_write(cx, &change, mutation, Some(file)).await
+    }
+
     async fn objects_info(&self, _cx: &CallContext, path: &str) -> Result<ObjectInfo, HostError> {
         let (install, _) = self.checked(Permission::ObjectsRead, path).await?;
         let (bucket, key) = self.object_at(&install, path).await?;
@@ -931,6 +1010,49 @@ fn file_entities(jsonld: &str) -> Result<Vec<String>, HostError> {
     Ok(files.collect())
 }
 
+/// A file entity as a change stores it: one object with an `@id` that is neither the root nor
+/// the descriptor, typed `File`, naming other entities by `@id` alone.
+fn file_entity(file: &str) -> Result<String, HostError> {
+    let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
+    let file: Value = serde_json::from_str(file).map_err(|_| invalid("the file is not JSON"))?;
+    let Value::Object(fields) = &file else {
+        return Err(invalid("the file is not a JSON object"));
+    };
+    let id = fields
+        .get("@id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(id, "" | "./" | "ro-crate-metadata.json") {
+        return Err(invalid("the file needs its own @id"));
+    }
+    let named = |kind: &Value| kind == "File" || kind == "MediaObject";
+    let typed = match fields.get("@type") {
+        Some(Value::Array(kinds)) => kinds.iter().any(named),
+        Some(kind) => named(kind),
+        None => false,
+    };
+    if !typed || fields.contains_key("@graph") || nested_entity(fields) {
+        return Err(invalid("the file is one File entity naming others by @id"));
+    }
+    let mut file = file;
+    literal_objects(&mut file);
+    Ok(file.to_string())
+}
+
+/// Whether a field holds an entity of its own rather than a reference by `@id` alone.
+fn nested_entity(fields: &serde_json::Map<String, Value>) -> bool {
+    let entity = |value: &Value| {
+        (value.as_object()).is_some_and(|object| {
+            let reference = object.len() == 1 && object.contains_key("@id");
+            object.keys().any(|key| key.starts_with('@')) && !reference
+        })
+    };
+    fields.values().any(|value| match value {
+        Value::Array(entries) => entries.iter().any(entity),
+        value => entity(value),
+    })
+}
+
 /// The crate a plugin create stores: the metadata descriptor and the dataset entity as its root.
 /// Plain object values become JSON literals as in a patch; nested entities are refused.
 pub(crate) fn dataset_crate(dataset: &str) -> Result<String, HostError> {
@@ -955,18 +1077,7 @@ pub(crate) fn dataset_crate(dataset: &str) -> Result<String, HostError> {
     if !dataset_kind {
         return Err(invalid("the dataset's @type is not Dataset"));
     }
-    // A reference names another entity by its @id alone; any other keyword object is an entity.
-    let entity = |value: &Value| {
-        (value.as_object()).is_some_and(|object| {
-            object.keys().any(|key| key.starts_with('@'))
-                && !(object.len() == 1 && object.contains_key("@id"))
-        })
-    };
-    let nested = fields.values().any(|value| match value {
-        Value::Array(entries) => entries.iter().any(entity),
-        value => entity(value),
-    });
-    if nested {
+    if nested_entity(&fields) {
         return Err(invalid("the dataset names other entities only by @id"));
     }
     fields.insert("@id".to_string(), Value::from("./"));

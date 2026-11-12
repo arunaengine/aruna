@@ -6,9 +6,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::broker::{
-    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FilePage, FullResponse,
-    HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo, ObjectPage,
-    Response, SendRequest, StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
+    FullResponse, HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo,
+    ObjectPage, Response, SendRequest, StatePut,
 };
 use crate::host::wit::aruna::plugin::{
     connections, grants, log, metadata_create, metadata_read, metadata_write, objects_read,
@@ -211,6 +211,39 @@ impl metadata_write::Host for Session {
             effect,
             Needs::Permission(Permission::MetadataWrite),
             |broker, cx| async move { broker.metadata_patch(&cx, patch).await },
+            String::len,
+        )
+        .await
+    }
+
+    async fn put_file(
+        &mut self,
+        resource: String,
+        file: String,
+        expected: String,
+        key: Option<String>,
+    ) -> wasmtime::Result<Result<String, HostError>> {
+        let size =
+            resource.len() + file.len() + expected.len() + key.as_ref().map_or(0, String::len);
+        let parts: [&[u8]; 4] = [
+            b"put",
+            resource.as_bytes(),
+            file.as_bytes(),
+            expected.as_bytes(),
+        ];
+        let intent = Intent::new(self.next_ordinal(), key, &parts);
+        let effect = Effect::Write(intent.clone());
+        let change = FileChange {
+            resource,
+            file,
+            expected,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Permission(Permission::MetadataWrite),
+            |broker, cx| async move { broker.metadata_put_file(&cx, change).await },
             String::len,
         )
         .await

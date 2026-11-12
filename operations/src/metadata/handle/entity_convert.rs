@@ -12,8 +12,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_storage::FjallPersistPolicy;
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleFjallPersistMode, CraqleNode,
-    CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, GraphId, GraphPolicy,
-    PatchEntityRequest, RoCrateError, vocab,
+    CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, DescribeRequest, GraphId,
+    GraphPolicy, PatchEntityRequest, RoCrateError, vocab,
 };
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use serde_json::Value;
@@ -667,6 +667,20 @@ pub(super) fn plan_batch(
         }
         MetadataBatchSource::UpsertContextualEntity { jsonld } => {
             node.plan_patch_contextual(auth, &craqle_patch_request(&graph, jsonld)?)
+        }
+        MetadataBatchSource::ReplaceDataEntity { jsonld } => {
+            // Every stored predicate of the subject is replaced, so the ones the entity omits go.
+            let mut request = craqle_patch_request(&graph, jsonld)?;
+            let subject = DescribeRequest {
+                graph: &graph,
+                subject_id: &request.entity.entity_id,
+            };
+            let stored = node.describe_subject(auth, subject)?;
+            let stored = stored
+                .iter()
+                .filter_map(|(predicate, _)| predicate.to_named_node());
+            request.replaced_predicates.extend(stored);
+            node.plan_patch_data(auth, &request)
         }
     };
     // A merge landing mid-plan would let the batch witness dots the plan never saw, so

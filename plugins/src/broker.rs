@@ -57,6 +57,15 @@ pub struct MetadataPatch {
     pub intent: Intent,
 }
 
+/// A revision-checked change of one file entity: its JSON object, or its `@id` for a removal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileChange {
+    pub resource: String,
+    pub file: String,
+    pub expected: String,
+    pub intent: Intent,
+}
+
 /// A keyed dataset create: `path` below the group's metadata root, one dataset entity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetadataCreate {
@@ -125,6 +134,17 @@ pub trait Broker: Send + Sync {
         Err(HostError::new(
             ErrorKind::Unavailable,
             "dataset summaries are not served here",
+        ))
+    }
+    /// Adds or replaces one file entity; a broker that serves no file changes refuses it.
+    async fn metadata_put_file(
+        &self,
+        _cx: &CallContext,
+        _change: FileChange,
+    ) -> Result<String, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "file changes are not served here",
         ))
     }
     /// Creates a dataset once per key; a broker that serves no creates refuses it.

@@ -488,10 +488,10 @@ fn advance_raw_state(
             if event.event_id <= base.event_id {
                 continue;
             }
-            let Some((jsonld, link_root)) = raw_upsert_entity(&event.payload) else {
+            let Some((jsonld, mode)) = raw_upsert_entity(&event.payload) else {
                 continue;
             };
-            apply_raw_upsert(&mut document, jsonld, link_root)?;
+            apply_raw_upsert(&mut document, jsonld, mode)?;
             revision.winning_event_id = event.event_id;
             changed = true;
         }

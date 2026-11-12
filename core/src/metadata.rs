@@ -222,9 +222,19 @@ pub enum MetadataEventPayload {
 /// The author's submission behind a planned batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataBatchSource {
-    ReplaceRoCrate { jsonld: String },
-    UpsertDataEntity { jsonld: String },
-    UpsertContextualEntity { jsonld: String },
+    ReplaceRoCrate {
+        jsonld: String,
+    },
+    UpsertDataEntity {
+        jsonld: String,
+    },
+    UpsertContextualEntity {
+        jsonld: String,
+    },
+    /// Replaces one data entity by `@id`: the properties it omits go, other entities stay.
+    ReplaceDataEntity {
+        jsonld: String,
+    },
 }
 
 impl MetadataBatchSource {
@@ -232,14 +242,17 @@ impl MetadataBatchSource {
         match self {
             Self::ReplaceRoCrate { jsonld }
             | Self::UpsertDataEntity { jsonld }
-            | Self::UpsertContextualEntity { jsonld } => jsonld,
+            | Self::UpsertContextualEntity { jsonld }
+            | Self::ReplaceDataEntity { jsonld } => jsonld,
         }
     }
 
     pub fn audit_operation(&self) -> MetadataAuditOperation {
         match self {
             Self::ReplaceRoCrate { .. } => MetadataAuditOperation::ReplaceRoCrate,
-            Self::UpsertDataEntity { .. } => MetadataAuditOperation::UpsertDataEntity,
+            Self::UpsertDataEntity { .. } | Self::ReplaceDataEntity { .. } => {
+                MetadataAuditOperation::UpsertDataEntity
+            }
             Self::UpsertContextualEntity { .. } => MetadataAuditOperation::UpsertContextualEntity,
         }
     }
@@ -492,19 +505,24 @@ pub fn raw_base_jsonld(payload: &MetadataEventPayload) -> Option<&str> {
     }
 }
 
-/// The entity an event upserts onto the raw base, and whether the root links it.
-pub fn raw_upsert_entity(payload: &MetadataEventPayload) -> Option<(&str, bool)> {
+/// The entity an event upserts onto the raw base, whether the root links it, and whether it
+/// replaces the stored entity instead of patching it.
+pub fn raw_upsert_entity(payload: &MetadataEventPayload) -> Option<(&str, (bool, bool))> {
     match payload {
         MetadataEventPayload::UpsertDataEntity { jsonld }
         | MetadataEventPayload::ApplyBatch {
             authored: MetadataBatchSource::UpsertDataEntity { jsonld },
             ..
-        } => Some((jsonld, true)),
+        } => Some((jsonld, (true, false))),
+        MetadataEventPayload::ApplyBatch {
+            authored: MetadataBatchSource::ReplaceDataEntity { jsonld },
+            ..
+        } => Some((jsonld, (true, true))),
         MetadataEventPayload::UpsertContextualEntity { jsonld }
         | MetadataEventPayload::ApplyBatch {
             authored: MetadataBatchSource::UpsertContextualEntity { jsonld },
             ..
-        } => Some((jsonld, false)),
+        } => Some((jsonld, (false, false))),
         _ => None,
     }
 }
@@ -534,10 +552,10 @@ pub fn resolve_raw_revision(
     updates.sort_by_key(|event| event.event_id);
     let mut winning_event_id = base.event_id;
     for event in updates {
-        let Some((jsonld, link_root)) = raw_upsert_entity(&event.payload) else {
+        let Some((jsonld, mode)) = raw_upsert_entity(&event.payload) else {
             continue;
         };
-        apply_raw_upsert(&mut document, jsonld, link_root)?;
+        apply_raw_upsert(&mut document, jsonld, mode)?;
         winning_event_id = event.event_id;
     }
     let jsonld = serde_json::to_string(&document)
@@ -557,7 +575,7 @@ pub fn resolve_raw_revision(
 pub fn apply_raw_upsert(
     document: &mut serde_json::Value,
     jsonld: &str,
-    link_root: bool,
+    (link_root, replace): (bool, bool),
 ) -> Result<(), MetadataError> {
     let mut entity: serde_json::Value = serde_json::from_str(jsonld)
         .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
@@ -589,6 +607,9 @@ pub fn apply_raw_upsert(
         let existing = existing.as_object_mut().ok_or_else(|| {
             MetadataError::InvalidInput("RO-Crate entity must be an object".to_string())
         })?;
+        if replace {
+            existing.clear();
+        }
         let update = entity.as_object().ok_or_else(|| {
             MetadataError::InvalidInput("entity payload must be an object".to_string())
         })?;
@@ -1761,10 +1782,27 @@ mod tests {
         })
         .to_string();
 
-        apply_raw_upsert(&mut document, &entity, true).unwrap();
+        apply_raw_upsert(&mut document, &entity, (true, false)).unwrap();
 
         assert_eq!(document["items"][2]["node"], "./data/a.txt");
         assert_eq!(document["items"][1]["parts"][0]["@id"], "./data/a.txt");
+    }
+
+    #[test]
+    fn raw_replace_drops() {
+        let mut document = serde_json::json!({
+            "@context": "https://w3id.org/ro/crate/1.2/context",
+            "@graph": [
+                {"@id": "./", "@type": "Dataset", "hasPart": [{"@id": "./a.txt"}]},
+                {"@id": "./a.txt", "@type": "File", "name": "a", "contentSize": "5"}
+            ]
+        });
+        let entity = r#"{"@id":"./a.txt","@type":"File","name":"b"}"#;
+        apply_raw_upsert(&mut document, entity, (true, true)).unwrap();
+        let file = &document["@graph"][1];
+        assert_eq!(file["name"], "b");
+        assert!(file.get("contentSize").is_none());
+        assert_eq!(document["@graph"][0]["hasPart"][0]["@id"], "./a.txt");
     }
 
     #[test]
@@ -1796,7 +1834,7 @@ mod tests {
         })
         .to_string();
 
-        apply_raw_upsert(&mut document, &entity, true).unwrap();
+        apply_raw_upsert(&mut document, &entity, (true, false)).unwrap();
 
         assert_eq!(document["@graph"][1]["hasPart"], "preserved");
         assert_eq!(

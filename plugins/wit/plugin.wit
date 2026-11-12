@@ -121,6 +121,14 @@ interface metadata-write {
     expected: string,
     key: option<string>,
   ) -> result<string, host-error>;
+
+  /// Adds or replaces one `File` entity by `@id`; the properties it omits go.
+  put-file: func(
+    %resource: string,
+    file: string,
+    expected: string,
+    key: option<string>,
+  ) -> result<string, host-error>;
 }
 
 /// Creates datasets of the group (`metadata.create`).

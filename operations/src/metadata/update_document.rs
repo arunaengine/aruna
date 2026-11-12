@@ -74,6 +74,10 @@ pub enum UpdateDocumentMutation {
     UpsertContextualEntity {
         jsonld: String,
     },
+    /// Replaces one data entity by `@id`, so the properties it omits go.
+    ReplaceDataEntity {
+        jsonld: String,
+    },
     /// A batch a device planned against its own replica. It is appended
     /// verbatim, under the device's actor, so both replicas converge on it.
     ApplyBatch {
@@ -189,6 +193,7 @@ impl UpdateDocumentOperation {
             UpdateDocumentMutation::ReplaceRoCrate { .. } => None,
             UpdateDocumentMutation::UpsertDataEntity { .. }
             | UpdateDocumentMutation::UpsertContextualEntity { .. }
+            | UpdateDocumentMutation::ReplaceDataEntity { .. }
             | UpdateDocumentMutation::ApplyBatch { .. }
             | UpdateDocumentMutation::Checkpoint => {
                 Some(stale_status(config.document_id, "dataset_revision_changed"))
@@ -276,6 +281,11 @@ impl UpdateDocumentOperation {
                     jsonld: jsonld.clone(),
                 })
             }
+            UpdateDocumentMutation::ReplaceDataEntity { jsonld } => {
+                Some(MetadataBatchSource::ReplaceDataEntity {
+                    jsonld: jsonld.clone(),
+                })
+            }
             UpdateDocumentMutation::ApplyBatch { authored, .. } => Some(authored.clone()),
             UpdateDocumentMutation::Checkpoint => None,
         }
@@ -348,7 +358,8 @@ impl UpdateDocumentOperation {
             }
             UpdateDocumentMutation::ReplaceRoCrate { .. } => {}
             UpdateDocumentMutation::UpsertDataEntity { jsonld }
-            | UpdateDocumentMutation::UpsertContextualEntity { jsonld } => {
+            | UpdateDocumentMutation::UpsertContextualEntity { jsonld }
+            | UpdateDocumentMutation::ReplaceDataEntity { jsonld } => {
                 validate_entity_jsonld(jsonld)?;
             }
         }
@@ -1216,6 +1227,7 @@ pub fn update_metadata_document(
             }
             UpdateDocumentMutation::UpsertDataEntity { .. }
             | UpdateDocumentMutation::UpsertContextualEntity { .. }
+            | UpdateDocumentMutation::ReplaceDataEntity { .. }
             | UpdateDocumentMutation::ApplyBatch { .. }
             | UpdateDocumentMutation::Checkpoint => {
                 stale_status(operation.config.document_id, "dataset_revision_changed")
