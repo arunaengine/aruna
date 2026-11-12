@@ -50,7 +50,7 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             let created = metadata
                 .create(&text("path"), &dataset, &text("key"))
                 .await?;
-            json!({ "resource": created.0, "revision": created.1 })
+            json!({ "resource": created.resource, "revision": created.revision })
         }
         "metadata_summary" => {
             let doc = ctx.metadata().summary(&text("resource")).await?;

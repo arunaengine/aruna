@@ -14,6 +14,7 @@ use crate::error::{Error, Result};
 
 pub use connections::{FullResponse, Method};
 pub use log::Level;
+pub use metadata_create::Created;
 pub use objects_read::{ObjectInfo, ObjectPage};
 pub use state::Entry;
 
@@ -188,11 +189,10 @@ impl Metadata {
 
     /// Creates a dataset at `path` from one dataset entity; the same `key` always names the same
     /// document. Returns the document and its first revision.
-    pub async fn create(&self, path: &str, dataset: &Value, key: &str) -> Result<(String, String)> {
+    pub async fn create(&self, path: &str, dataset: &Value, key: &str) -> Result<Created> {
         let text = serde_json::to_string(dataset)?;
-        let created = metadata_create::create(path, &text, key)
-            .map_err(|err| Error::host(err, "metadata.create", path))?;
-        Ok((created.resource, created.revision))
+        metadata_create::create(path, &text, key)
+            .map_err(|err| Error::host(err, "metadata.create", path))
     }
 }
 
