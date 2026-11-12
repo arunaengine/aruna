@@ -805,15 +805,16 @@ async fn read_crate(
     })
 }
 
-/// The stored crate export reads of a document, for checks that must see what export expands.
+/// The stored crate export reads of a document and its context digest, for checks that must see
+/// what export expands.
 pub(crate) async fn stored_crate(
     context: &std::sync::Arc<DriverContext>,
     auth: &AuthContext,
     document_id: Ulid,
-) -> Result<String, String> {
+) -> Result<(String, [u8; 32]), String> {
     let limit = aruna_core::metadata::RAW_BYTES_LIMIT;
     let read = read_crate(context, auth, document_id, limit).await;
-    read.map(|(jsonld, _, _)| jsonld)
+    read.map(|(jsonld, _, digest)| (jsonld, digest))
         .map_err(|error| format!("{error:?}"))
 }
 

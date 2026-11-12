@@ -44,6 +44,7 @@ use crate::metadata::profile::validation::{
     submission_profile_tag, validate_submission,
 };
 use crate::metadata::projector::{create_outbox_record, registry_outbox_record};
+use crate::metadata::raw_revision::stored_context;
 use crate::metadata::repository::{
     StorageReadError, event_projection_entries, parse_registry_read, read_registry_effect,
 };
@@ -77,6 +78,9 @@ pub enum UpdateDocumentMutation {
     /// Replaces one data entity by `@id`, so the properties it omits go.
     ReplaceDataEntity {
         jsonld: String,
+        /// The stored context digest the entity was checked under; a holder whose raw revision
+        /// has another context refuses the change, so it is read and checked again.
+        context_digest: Option<[u8; 32]>,
     },
     /// A batch a device planned against its own replica. It is appended
     /// verbatim, under the device's actor, so both replicas converge on it.
@@ -281,7 +285,7 @@ impl UpdateDocumentOperation {
                     jsonld: jsonld.clone(),
                 })
             }
-            UpdateDocumentMutation::ReplaceDataEntity { jsonld } => {
+            UpdateDocumentMutation::ReplaceDataEntity { jsonld, .. } => {
                 Some(MetadataBatchSource::ReplaceDataEntity {
                     jsonld: jsonld.clone(),
                 })
@@ -359,7 +363,7 @@ impl UpdateDocumentOperation {
             UpdateDocumentMutation::ReplaceRoCrate { .. } => {}
             UpdateDocumentMutation::UpsertDataEntity { jsonld }
             | UpdateDocumentMutation::UpsertContextualEntity { jsonld }
-            | UpdateDocumentMutation::ReplaceDataEntity { jsonld } => {
+            | UpdateDocumentMutation::ReplaceDataEntity { jsonld, .. } => {
                 validate_entity_jsonld(jsonld)?;
             }
         }
@@ -1207,6 +1211,26 @@ pub(crate) async fn document_lock(document_id: Ulid) -> tokio::sync::MutexGuard<
 }
 
 /// Type-erased, so futures that await an update do not repeat its whole `Send` proof.
+/// Refuses a change checked under another context than this holder's raw revision has, as a
+/// revision conflict: the change had no effect, and the caller reads and checks it again.
+async fn same_context(
+    context: &DriverContext,
+    config: &UpdateDocumentConfig,
+    checked: [u8; 32],
+) -> Result<(), UpdateDocumentError> {
+    let stored = stored_context(context, config.document_id).await;
+    let stored = stored.map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let expected = config.expected_revision.unwrap_or_default();
+    match stored {
+        Some((digest, _)) if digest == checked => Ok(()),
+        Some((_, current)) => Err(UpdateDocumentError::RevisionConflict { expected, current }),
+        None => Err(UpdateDocumentError::RevisionConflict {
+            expected,
+            current: expected,
+        }),
+    }
+}
+
 pub fn update_metadata_document(
     mut operation: UpdateDocumentOperation,
     context: &DriverContext,
@@ -1215,6 +1239,13 @@ pub fn update_metadata_document(
 > {
     Box::pin(async move {
         let _guard = document_lock(operation.config.document_id).await;
+        if let UpdateDocumentMutation::ReplaceDataEntity {
+            context_digest: Some(checked),
+            ..
+        } = &operation.config.mutation
+        {
+            same_context(context, &operation.config, *checked).await?;
+        }
         operation.route_profile_status = Some(match &operation.config.mutation {
             UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
                 validate_submission(

@@ -241,7 +241,7 @@ impl RunBroker {
         &self,
         cx: &CallContext,
         change: &FileChange,
-        mutation: UpdateDocumentMutation,
+        mut mutation: UpdateDocumentMutation,
         file: Option<Value>,
     ) -> Result<String, HostError> {
         let document_id = parse_document(&change.resource)?;
@@ -255,10 +255,15 @@ impl RunBroker {
         if let Some(file) = file {
             // Export expands the stored crate's context; without it nothing could be checked.
             let stored = stored_crate(&self.ctx, &auth, document_id).await;
-            let stored =
+            let (stored, digest) =
                 stored.map_err(|error| unavailable(format!("the stored crate: {error}")))?;
             let stored: Value = serde_json::from_str(&stored)
                 .map_err(|_| unavailable("the stored crate is not JSON"))?;
+            // The committing holder refuses the change unless its raw context is this one.
+            if let UpdateDocumentMutation::ReplaceDataEntity { context_digest, .. } = &mut mutation
+            {
+                *context_digest = Some(digest);
+            }
             self.objects_named(&install, (&stored["@context"], &file))
                 .await?;
         }
@@ -810,6 +815,7 @@ impl Broker for RunBroker {
         let file = file_entity(&change.file)?;
         let mutation = UpdateDocumentMutation::ReplaceDataEntity {
             jsonld: file.clone(),
+            context_digest: None,
         };
         let file: Value = serde_json::from_str(&file).unwrap_or(Value::Null);
         self.file_write(cx, &change, mutation, Some(file)).await

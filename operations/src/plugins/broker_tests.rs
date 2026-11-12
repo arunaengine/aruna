@@ -1390,6 +1390,49 @@ async fn term_literal_passes() {
 }
 
 #[tokio::test]
+async fn context_fence_refuses() {
+    // A change checked under another context than the holder's raw revision has is refused as a
+    // revision conflict, without an effect; under the stored context it is written.
+    use crate::jobs::export::stored_crate;
+    let (fixture, broker, _, _dir) = broker().await;
+    let document = three_files(&fixture, &broker).await;
+    let revision = Ulid::from_string(&revision_of(&broker, document).await).unwrap();
+    let (_, digest) = stored_crate(&broker.ctx, &fixture.auth(), document)
+        .await
+        .unwrap();
+    let record = crate::metadata::get_document::load_document_record(&broker.ctx, document).await;
+    let record = record.unwrap().unwrap();
+    let update = |context_digest| {
+        let mutation = UpdateDocumentMutation::ReplaceDataEntity {
+            jsonld: r#"{"@id":"./a.txt","@type":"File","name":"fenced"}"#.to_string(),
+            context_digest,
+        };
+        let token = Some(AuthToken::Internal(fixture.auth()));
+        let (ctx, actor) = (&broker.ctx, fixture.actor.clone());
+        route_metadata_update(
+            ctx,
+            actor,
+            Some(&record),
+            document,
+            None,
+            mutation,
+            Some(revision),
+            token,
+            None,
+        )
+    };
+    let refused = update(Some([0u8; 32])).await;
+    let conflict = matches!(
+        refused,
+        Err(MetadataWriteError::Update(
+            UpdateDocumentError::RevisionConflict { .. }
+        ))
+    );
+    assert!(conflict, "{refused:?}");
+    assert!(update(Some(digest)).await.is_ok());
+}
+
+#[tokio::test]
 async fn sync_style_writes() {
     // The writes a file sync makes pass with the grant: an `s3://` or object path `contentUrl`,
     // schema.org properties and plain literals.
