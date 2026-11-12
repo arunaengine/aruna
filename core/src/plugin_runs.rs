@@ -45,6 +45,40 @@ pub enum RunTrigger {
     Timer { occurrence_ms: u64 },
     /// A journaled source event an event trigger of the install matched.
     Event(SourceEvent),
+    /// A verified webhook request.
+    Webhook(HookRequest),
+}
+
+/// A webhook request after its check, without credential, relay and hop-by-hop headers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookRequest {
+    pub delivery_id: Option<String>,
+    pub method: String,
+    pub query: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// How long a receiver keeps a webhook's delivery id, so a repeat starts nothing.
+pub const HOOK_RETENTION_MS: u64 = 7 * 24 * 3600 * 1000;
+/// Row kinds of the webhook keyspace: delivery ids by install, and the same by receipt time.
+pub const HOOK_ROW: u8 = b'd';
+pub const HOOK_TIME_ROW: u8 = b't';
+
+/// Key of a delivery id an install received.
+pub fn hook_key(install_id: Ulid, delivery_id: &str) -> Vec<u8> {
+    let mut key = vec![HOOK_ROW];
+    key.extend_from_slice(&install_id.to_bytes());
+    key.extend_from_slice(delivery_id.as_bytes());
+    key
+}
+
+/// Key of the same delivery id by receipt time, for the prune.
+pub fn hook_time_key(received_ms: u64, install_id: Ulid, delivery_id: &str) -> Vec<u8> {
+    let mut key = vec![HOOK_TIME_ROW];
+    key.extend_from_slice(&received_ms.to_be_bytes());
+    key.extend_from_slice(&hook_key(install_id, delivery_id)[1..]);
+    key
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -15,6 +15,7 @@ pub mod dispatch;
 pub mod forward;
 pub mod grants;
 pub mod held;
+pub mod hooks;
 pub mod install;
 pub mod intents;
 pub mod journal;

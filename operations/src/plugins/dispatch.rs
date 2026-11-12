@@ -59,7 +59,7 @@ fn handler(
 }
 
 /// A queued run of the install's current revision, due at `due_ms`.
-fn new_run(
+pub(super) fn new_run(
     install: &PluginInstall,
     handler: String,
     trigger: RunTrigger,

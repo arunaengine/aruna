@@ -20,7 +20,8 @@ use aruna_plugins::broker::ErrorKind;
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::permission::Permission;
 use aruna_plugins::{
-    CancellationToken, FailureKind, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
+    CancellationToken, FailureKind, Field, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
+    WebhookDelivery, WebhookRequest,
 };
 use tokio_util::task::TaskTracker;
 use tracing::warn;
@@ -454,6 +455,20 @@ fn invocation(
             path: event.path.clone(),
             resource: event.resource.clone(),
             revision: event.revision.clone(),
+        }),
+        RunTrigger::Webhook(hook) => Trigger::Webhook(WebhookDelivery {
+            delivery_id: hook.delivery_id.clone(),
+            request: WebhookRequest {
+                method: hook.method.clone(),
+                query: hook.query.clone(),
+                headers: (hook.headers.iter())
+                    .map(|(name, value)| Field {
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                body: hook.body.clone(),
+            },
         }),
     };
     Invocation {

@@ -295,24 +295,37 @@ async fn slots_bind() {
     );
 }
 
-/// Writes the group secret `hook-key` of kind `header`, checking the header `checked`.
-async fn hook_secret(fixture: &Fixture, install: &PluginInstall, checked: &str, round: u64) {
+/// Writes the group secret `hook-key` of kind `header`, checking the header `checked`, with
+/// the `verify` rule of `install`.
+pub(crate) async fn hook_secret(
+    fixture: &Fixture,
+    install: &PluginInstall,
+    checked: &str,
+    round: u64,
+) {
     let name = SecretName::try_from("hook-key".to_string()).unwrap();
     let settings = SecretSettings::from([("header".to_string(), checked.to_string())]);
+    let uses = vec![UseRule {
+        delivery: Delivery::Verify,
+        origins: Vec::new(),
+        paths: Vec::new(),
+        methods: Vec::new(),
+        ..rule_for(install, ResponseExposure::Status)
+    }];
     let change = match round {
         0 => SecretChange::Create {
             name,
             kind: SecretKind::parse("header").unwrap(),
             description: String::new(),
             settings,
-            uses: Vec::new(),
+            uses,
             fields: SecretFields::new([("value".to_string(), Secret::new(TOKEN))].into()),
         },
         _ => SecretChange::Replace {
             name,
             description: String::new(),
             settings,
-            uses: Vec::new(),
+            uses,
             expected: None,
         },
     };
