@@ -361,10 +361,15 @@ async fn post_lifetime(
     })
 }
 
-async fn put_code(client: &aws_sdk_s3::Client, key: &str) -> Option<String> {
+/// `None` for a stored object, the S3 error code for a refusal; any other failure is an error.
+async fn put_code(client: &aws_sdk_s3::Client, key: &str) -> TestResult<Option<String>> {
     let body = aws_sdk_s3::primitives::ByteStream::from_static(b"entry");
     let put = client.put_object().bucket("lasting").key(key).body(body);
-    service_error_code(&put.send().await)
+    let result = put.send().await;
+    match service_error_code(&result) {
+        Some(code) => Ok(Some(code)),
+        None => result.map(|_| None).map_err(Into::into),
+    }
 }
 
 /// A seed whose admin created a group with the bucket `lasting`, and the admin's token.
@@ -415,10 +420,10 @@ async fn credential_outlives_session() -> TestResult<()> {
     )
     .await?;
     let client = s3_client_once(&s3, &keys);
-    assert_eq!(put_code(&client, "after-session.txt").await, None);
+    assert_eq!(put_code(&client, "after-session.txt").await?, None);
 
     revoke_s3_credentials(&seed.base_url, &admin, &keys.access_key_id).await?;
-    let revoked = put_code(&client, "after-revoke.txt").await;
+    let revoked = put_code(&client, "after-revoke.txt").await?;
     assert_eq!(revoked.as_deref(), Some("InvalidAccessKeyId"));
 
     seed.shutdown().await;
@@ -471,7 +476,7 @@ async fn deactivation_ends_credential() -> TestResult<()> {
     let used = post_lifetime(&seed.base_url, &member_token, &group_id, None).await?;
     let unused = post_lifetime(&seed.base_url, &member_token, &group_id, None).await?;
     let client = s3_client_once(&s3, &used);
-    assert_eq!(put_code(&client, "member.txt").await, None);
+    assert_eq!(put_code(&client, "member.txt").await?, None);
 
     let status = reqwest::Client::new()
         .put(format!(
@@ -498,7 +503,7 @@ async fn deactivation_ends_credential() -> TestResult<()> {
     };
     assert_eq!(drive(sweep(later), context).await?, 0);
     assert_eq!(
-        put_code(&client, "late.txt").await.as_deref(),
+        put_code(&client, "late.txt").await?.as_deref(),
         Some("AccessDenied")
     );
     assert!(get_user_access(context, &used.access_key_id).await.is_err());
@@ -512,7 +517,7 @@ async fn deactivation_ends_credential() -> TestResult<()> {
     );
     let unused = s3_client_once(&s3, &unused);
     assert_eq!(
-        put_code(&unused, "late.txt").await.as_deref(),
+        put_code(&unused, "late.txt").await?.as_deref(),
         Some("InvalidAccessKeyId")
     );
 
