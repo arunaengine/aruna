@@ -177,10 +177,12 @@ pub fn wanted_rules(
             .base(&settings)
             .map_err(|why| format!("`{name}`: {why}"))?;
         let prefix = base.path().trim_end_matches('/');
-        let response = match connection.response.is_empty() {
-            true => ResponseExposure::Status,
-            false => ResponseExposure::Fields {
-                pointers: connection.response.clone(),
+        let fields = connection.response.fields();
+        let response = match (connection.response.full(), fields.is_empty()) {
+            (true, _) => ResponseExposure::Full,
+            (false, true) => ResponseExposure::Status,
+            (false, false) => ResponseExposure::Fields {
+                pointers: fields.to_vec(),
                 headers: Vec::new(),
             },
         };

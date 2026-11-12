@@ -574,11 +574,11 @@ impl Broker for RunBroker {
         let mut outgoing = outgoing;
         // Every use of a secret, a replay included, passes the release check first.
         let (exposure, fields) = match &connection.auth {
-            None => (manifest_exposure(&connection.response), None),
+            None => (manifest_exposure(connection.response.fields()), None),
             Some(slot) => {
                 let (released, fields) =
                     self.inject(&install, slot, &config, &mut outgoing).await?;
-                let exposure = narrowed(&released.exposure, &connection.response);
+                let exposure = narrowed(&released.exposure, connection.response.fields());
                 (exposure, Some(fields))
             }
         };

@@ -11,7 +11,7 @@ use crate::bindings::aruna::plugin::{
 };
 use crate::error::{Error, Result};
 
-pub use connections::Method;
+pub use connections::{FullResponse, Method};
 pub use log::Level;
 pub use objects_read::{ObjectInfo, ObjectPage};
 pub use state::Entry;
@@ -226,6 +226,29 @@ impl Http {
             status: reply.status,
             fields,
         })
+    }
+}
+
+impl Http {
+    /// The whole answer, for a connection whose manifest says `response = "full"`.
+    pub async fn send_full(
+        &self,
+        method: Method,
+        path: &str,
+        body: Vec<u8>,
+        key: Option<&str>,
+    ) -> Result<FullResponse> {
+        let request = connections::Request {
+            connection: self.name.clone(),
+            method,
+            path: path.to_string(),
+            query: Vec::new(),
+            headers: Vec::new(),
+            body,
+            key: key.map(str::to_string),
+        };
+        let reply = connections::send_full(&request);
+        reply.map_err(|err| Error::host(err, "connections.send", &self.name))
     }
 }
 

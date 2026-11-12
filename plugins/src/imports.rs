@@ -6,8 +6,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, Field, HostError, Intent, Listing,
-    MetadataPatch, Method, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    Broker, CallContext, Document, Entry, ErrorKind, Field, FullResponse, HostError, Intent,
+    Listing, MetadataPatch, Method, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
 };
 use crate::host::wit::aruna::plugin::{
     connections, grants, log, metadata_read, metadata_write, objects_read, state, types,
@@ -228,6 +228,40 @@ impl connections::Host for Session {
         &mut self,
         request: connections::Request,
     ) -> wasmtime::Result<Result<Response, HostError>> {
+        let (size, effect, outbound) = self.outbound(request);
+        let connection = outbound.connection.clone();
+        self.brokered(
+            size,
+            effect,
+            Needs::Connection(&connection),
+            // The broker applies the exposure; the reply passes through as it answers.
+            |broker, cx| async move { broker.connection_send(&cx, outbound).await },
+            |reply: &Response| reply.json.as_ref().map_or(0, String::len) + 2,
+        )
+        .await
+    }
+
+    async fn send_full(
+        &mut self,
+        request: connections::Request,
+    ) -> wasmtime::Result<Result<FullResponse, HostError>> {
+        let (size, effect, outbound) = self.outbound(request);
+        let connection = outbound.connection.clone();
+        self.brokered(
+            size,
+            effect,
+            Needs::Connection(&connection),
+            |broker, cx| async move { broker.connection_send_full(&cx, outbound).await },
+            |reply: &FullResponse| fields_len(&reply.headers) + reply.body.len() + 2,
+        )
+        .await
+    }
+}
+
+impl Session {
+    /// A connection request as the broker gets it, its size, and its intent when it may
+    /// change remote state.
+    fn outbound(&mut self, request: connections::Request) -> (usize, Effect, SendRequest) {
         let size = request.connection.len()
             + request.path.len()
             + fields_len(&request.query)
@@ -246,7 +280,6 @@ impl connections::Host for Session {
             ];
             Intent::new(self.next_ordinal(), request.key.clone(), &parts)
         });
-        let connection = request.connection.clone();
         let effect = match &intent {
             Some(intent) => Effect::Write(intent.clone()),
             None => Effect::Read,
@@ -260,15 +293,7 @@ impl connections::Host for Session {
             body: request.body,
             intent,
         };
-        self.brokered(
-            size,
-            effect,
-            Needs::Connection(&connection),
-            // The broker applies the exposure; the reply passes through as it answers.
-            |broker, cx| async move { broker.connection_send(&cx, outbound).await },
-            |reply: &Response| reply.json.as_ref().map_or(0, String::len) + 2,
-        )
-        .await
+        (size, effect, outbound)
     }
 }
 

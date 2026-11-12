@@ -163,7 +163,17 @@ interface connections {
     json: option<string>,
   }
 
+  /// The whole answer, for a connection whose manifest reads it in full.
+  record full-response {
+    status: u16,
+    headers: list<field>,
+    body: list<u8>,
+  }
+
   send: func(request: request) -> result<response, host-error>;
+  /// Only for a connection whose manifest says `response = "full"` and whose secret's rule
+  /// exposes the full answer; any other connection refuses it.
+  send-full: func(request: request) -> result<full-response, host-error>;
 }
 
 /// Small private values of the install, changed by compare and swap.
