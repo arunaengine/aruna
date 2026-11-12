@@ -12,8 +12,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_storage::FjallPersistPolicy;
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleFjallPersistMode, CraqleNode,
-    CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, DescribeRequest, GraphId,
-    GraphPolicy, PatchEntityRequest, RoCrateError, vocab,
+    CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, DescribeRequest, Dot,
+    GraphId, GraphPolicy, PatchEntityRequest, RoCrateError, vocab,
 };
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use serde_json::Value;
@@ -27,6 +27,21 @@ pub(super) fn upsert_data_entity(
 ) -> Result<MetadataBatch, CraqleError> {
     let graph = GraphId::new(&request.graph_iri);
     let actor = request.deterministic_actor.map(ActorId::from_bytes);
+    // An event materializes under its own actor, so a dot of it here means it is applied; a
+    // replay changes nothing, as the re-added type, name and link would take a second dot.
+    if let Some(actor) = actor {
+        let clock = node.vector_clock(&graph)?;
+        if clock.contains(&Dot { actor, counter: 1 }) {
+            return Ok(MetadataBatch {
+                graph_iri: request.graph_iri,
+                actor: *actor.as_bytes(),
+                counter: 0,
+                base_clock: clock,
+                ops: Vec::new(),
+                timestamp_millis: chrono::Utc::now().timestamp_millis(),
+            });
+        }
+    }
     let entity_request = craqle_patch_request(&graph, &request.jsonld)?;
     node.patch_data_with(
         auth,
