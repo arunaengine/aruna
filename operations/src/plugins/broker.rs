@@ -885,7 +885,10 @@ impl RunBroker {
         if !relative_path(&request.path) {
             return Err(invalid("the path must stay below the connection's address"));
         }
-        let settings: Value = serde_json::from_str(&install.settings).unwrap_or(Value::Null);
+        // The guest built its request from the settings saved at admission; the address follows
+        // them, while the grant and release checks use the current install.
+        let saved = &self.scope.run.settings;
+        let settings: Value = serde_json::from_str(saved).unwrap_or(Value::Null);
         let mut url = connection.base(&settings).map_err(invalid)?;
         let joined = format!("{}/{}", url.path().trim_end_matches('/'), request.path);
         url.set_path(&joined);

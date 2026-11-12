@@ -105,6 +105,24 @@ async fn sends_below_connection() {
 }
 
 #[tokio::test]
+async fn sends_to_admitted() {
+    use crate::plugins::bound::tests::edit_config;
+    let fixture = Fixture::new().await;
+    let install = install_artifact(&fixture, connected()).await;
+    // The address setting changes after the run was admitted with the old one.
+    edit_config(&fixture, |config| {
+        config.installs[0].settings = r#"{"api_url":"https://moved.example.org"}"#.into();
+    })
+    .await;
+    let sender = fake(200, "{}");
+    let input = serde_json::json!({"call": "send", "connection": "api", "path": "records"});
+    let done = probe(&fixture, &install, sender.clone(), input).await;
+    assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
+    let (request, _) = sender.asked.lock().unwrap()[0].clone();
+    assert_eq!(request.url.as_str(), "https://api.example.org/v1/records");
+}
+
+#[tokio::test]
 async fn undeclared_method() {
     use crate::plugins::broker::RunBroker;
     use crate::plugins::check::RunScope;
@@ -333,7 +351,7 @@ async fn whole_answers_gated() {
     let send = || {
         let ctx = Arc::new(fixture.ctx.clone());
         let mut run = queued(install.install_id, 1);
-        run.digest = install.digest.clone();
+        (run.digest, run.settings) = (install.digest.clone(), install.settings.clone());
         let scope = RunScope {
             realm_id: fixture.actor.realm_id,
             local: fixture.actor.node_id,
