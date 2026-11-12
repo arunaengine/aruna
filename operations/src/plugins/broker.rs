@@ -21,12 +21,13 @@ use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    Broker, CallContext, Document, Entry, ErrorKind, Field, FullResponse, HostError, Intent,
+    Listing, MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
 };
-use aruna_plugins::connection::relative_path;
+use aruna_plugins::connection::{Readable, relative_path};
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
+use base64::Engine;
 use serde_json::Value;
 use ulid::Ulid;
 
@@ -532,72 +533,60 @@ impl Broker for RunBroker {
         _cx: &CallContext,
         request: SendRequest,
     ) -> Result<Response, HostError> {
-        let current = self.admitted(None).await?;
-        let path = install_scope(&current).connection(&request.connection);
-        let (install, _) = self.checked(Permission::ConnectionsSend, &path).await?;
-        let invalid = |why: &str| HostError::new(ErrorKind::Invalid, why);
-        let config = read_config(&self.ctx, self.scope.realm_id).await;
-        let config = config.map_err(|error| unavailable(error.to_string()))?;
-        let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
-        let manifest = plugin.and_then(|plugin| read_manifest(&plugin));
-        let manifest = manifest.map_err(|error| unavailable(error.to_string()))?;
-        let connection = manifest.connections.get(&request.connection);
-        let connection =
-            connection.ok_or_else(|| invalid("the manifest has no such connection"))?;
-        let method = declared_method(request.method);
-        if !connection.methods.contains(&method) {
-            return Err(invalid("the connection does not allow this method"));
+        let mut ready = self.ready(request).await?;
+        // A whole answer is only for `send-full`; here the code reads fields at most.
+        if ready.exposure == ResponseExposure::Full {
+            ready.exposure = ResponseExposure::Status;
         }
-        if !relative_path(&request.path) {
-            return Err(invalid("the path must stay below the connection's address"));
-        }
-        let settings: Value = serde_json::from_str(&install.settings).unwrap_or(Value::Null);
-        let mut url = connection.base(&settings).map_err(invalid)?;
-        let joined = format!("{}/{}", url.path().trim_end_matches('/'), request.path);
-        url.set_path(&joined);
-        if !request.query.is_empty() {
-            let pairs = request
-                .query
-                .iter()
-                .map(|field| (&field.name, &field.value));
-            url.query_pairs_mut().extend_pairs(pairs);
-        }
-        let headers = (request.headers.iter())
-            .filter(|field| header_name(&field.name) && !credential(&field.name))
-            .map(|field| (field.name.to_ascii_lowercase(), field.value.clone()))
-            .collect();
-        let outgoing = OutgoingRequest {
-            method: method.as_str().to_string(),
-            url,
-            headers,
-        };
-        let mut outgoing = outgoing;
-        // Every use of a secret, a replay included, passes the release check first.
-        let (exposure, fields) = match &connection.auth {
-            None => (manifest_exposure(connection.response.fields()), None),
-            Some(slot) => {
-                let (released, fields) =
-                    self.inject(&install, slot, &config, &mut outgoing).await?;
-                let exposure = narrowed(&released.exposure, connection.response.fields());
-                (exposure, Some(fields))
-            }
-        };
-        let none = SecretFields::new(Default::default());
-        let fields = fields.as_ref().unwrap_or(&none);
-        let Some(intent) = request.intent else {
-            let answer = self.outbound.send(outgoing, request.body).await;
+        let Ready {
+            outgoing,
+            exposure,
+            fields,
+            body,
+            intent,
+            ..
+        } = ready;
+        let Some(intent) = intent else {
+            let answer = self.outbound.send(outgoing, body).await;
             let answer = answer.map_err(|error| unavailable(error.to_string()))?;
-            return Ok(exposed(&exposure, fields, &answer));
+            return Ok(exposed(&exposure, &fields, &answer));
         };
         if let Some(reply) = self.begun(&intent).await? {
             return Ok(kept(stored_reply(&reply)?, &exposure));
         }
-        let outcome = match self.outbound.send(outgoing, request.body).await {
-            Ok(answer) => Ok(reply_text(&exposed(&exposure, fields, &answer))),
+        let outcome = match self.outbound.send(outgoing, body).await {
+            Ok(answer) => Ok(reply_text(&exposed(&exposure, &fields, &answer))),
             Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
             Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
         };
         stored_reply(&self.record(&intent, outcome).await?)
+    }
+
+    async fn connection_send_full(
+        &self,
+        _cx: &CallContext,
+        request: SendRequest,
+    ) -> Result<FullResponse, HostError> {
+        let ready = self.ready(request).await?;
+        // The manifest reads whole answers, and the secret's current rule exposes them.
+        if !ready.whole || ready.exposure != ResponseExposure::Full {
+            let narrower = "this connection does not expose its whole answer";
+            return Err(HostError::new(ErrorKind::Denied, narrower));
+        }
+        let Some(intent) = ready.intent else {
+            let answer = self.outbound.send(ready.outgoing, ready.body).await;
+            let answer = answer.map_err(|error| unavailable(error.to_string()))?;
+            return Ok(whole(&ready.fields, &answer));
+        };
+        if let Some(reply) = self.begun(&intent).await? {
+            return stored_whole(&reply);
+        }
+        let outcome = match self.outbound.send(ready.outgoing, ready.body).await {
+            Ok(answer) => Ok(whole_text(&whole(&ready.fields, &answer))),
+            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
+            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
+        };
+        stored_whole(&self.record(&intent, outcome).await?)
     }
 
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {
@@ -838,7 +827,81 @@ fn write_outcome(error: MetadataWriteError) -> Outcome {
     }
 }
 
+/// A checked connection request: the outgoing request with any secret added, the exposure of
+/// its answer, the secret's fields for echo removal, and whether the manifest reads it whole.
+struct Ready {
+    outgoing: OutgoingRequest,
+    exposure: ResponseExposure,
+    fields: SecretFields,
+    body: Vec<u8>,
+    intent: Option<Intent>,
+    whole: bool,
+}
+
 impl RunBroker {
+    /// The per call check, the address below the connection, the guest's own headers, and the
+    /// secret released and added; every use of a secret, a replay included, passes the check.
+    async fn ready(&self, request: SendRequest) -> Result<Ready, HostError> {
+        let current = self.admitted(None).await?;
+        let path = install_scope(&current).connection(&request.connection);
+        let (install, _) = self.checked(Permission::ConnectionsSend, &path).await?;
+        let invalid = |why: &str| HostError::new(ErrorKind::Invalid, why);
+        let config = read_config(&self.ctx, self.scope.realm_id).await;
+        let config = config.map_err(|error| unavailable(error.to_string()))?;
+        let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
+        let manifest = plugin.and_then(|plugin| read_manifest(&plugin));
+        let manifest = manifest.map_err(|error| unavailable(error.to_string()))?;
+        let connection = manifest.connections.get(&request.connection);
+        let connection =
+            connection.ok_or_else(|| invalid("the manifest has no such connection"))?;
+        let method = declared_method(request.method);
+        if !connection.methods.contains(&method) {
+            return Err(invalid("the connection does not allow this method"));
+        }
+        if !relative_path(&request.path) {
+            return Err(invalid("the path must stay below the connection's address"));
+        }
+        let settings: Value = serde_json::from_str(&install.settings).unwrap_or(Value::Null);
+        let mut url = connection.base(&settings).map_err(invalid)?;
+        let joined = format!("{}/{}", url.path().trim_end_matches('/'), request.path);
+        url.set_path(&joined);
+        if !request.query.is_empty() {
+            let pairs = request
+                .query
+                .iter()
+                .map(|field| (&field.name, &field.value));
+            url.query_pairs_mut().extend_pairs(pairs);
+        }
+        let headers = (request.headers.iter())
+            .filter(|field| header_name(&field.name) && !credential(&field.name))
+            .map(|field| (field.name.to_ascii_lowercase(), field.value.clone()))
+            .collect();
+        let mut outgoing = OutgoingRequest {
+            method: method.as_str().to_string(),
+            url,
+            headers,
+        };
+        let (exposure, fields) = match &connection.auth {
+            None => (manifest_exposure(&connection.response), None),
+            Some(slot) => {
+                let (released, fields) =
+                    self.inject(&install, slot, &config, &mut outgoing).await?;
+                (
+                    narrowed(&released.exposure, &connection.response),
+                    Some(fields),
+                )
+            }
+        };
+        Ok(Ready {
+            outgoing,
+            exposure,
+            fields: fields.unwrap_or_else(|| SecretFields::new(Default::default())),
+            body: request.body,
+            intent: request.intent,
+            whole: connection.response.full(),
+        })
+    }
+
     /// Releases the slot's secret for this request and adds it as its kind says.
     async fn inject(
         &self,
@@ -916,30 +979,92 @@ fn exposed(exposure: &ResponseExposure, fields: &SecretFields, answer: &Answer) 
     }
 }
 
-/// The exposure of a connection without a secret: its manifest fields, or status only.
-fn manifest_exposure(response: &[String]) -> ResponseExposure {
-    match response.is_empty() {
+/// The exposure of a connection without a secret: what its manifest reads.
+fn manifest_exposure(reads: &Readable) -> ResponseExposure {
+    match reads {
+        Readable::Full(_) => ResponseExposure::Full,
+        Readable::Fields(fields) => fields_exposure(fields.to_vec()),
+    }
+}
+
+fn fields_exposure(pointers: Vec<String>) -> ResponseExposure {
+    match pointers.is_empty() {
         true => ResponseExposure::Status,
         false => ResponseExposure::Fields {
-            pointers: response.to_vec(),
+            pointers,
             headers: Vec::new(),
         },
     }
 }
 
-/// The rule's exposure, never wider than the fields the manifest lets the code read.
-fn narrowed(rule: &ResponseExposure, response: &[String]) -> ResponseExposure {
-    match rule {
-        ResponseExposure::Status => ResponseExposure::Status,
-        ResponseExposure::Full => manifest_exposure(response),
-        ResponseExposure::Fields { pointers, .. } => {
-            let both: Vec<String> = (pointers.iter())
-                .filter(|pointer| response.contains(pointer))
-                .cloned()
-                .collect();
-            manifest_exposure(&both)
+/// The rule's exposure, never wider than what the manifest lets the code read.
+fn narrowed(rule: &ResponseExposure, reads: &Readable) -> ResponseExposure {
+    match (rule, reads) {
+        (ResponseExposure::Status, _) => ResponseExposure::Status,
+        (ResponseExposure::Full, reads) => manifest_exposure(reads),
+        (ResponseExposure::Fields { pointers, .. }, Readable::Full(_)) => {
+            fields_exposure(pointers.clone())
         }
+        (ResponseExposure::Fields { pointers, .. }, Readable::Fields(fields)) => fields_exposure(
+            pointers
+                .iter()
+                .filter(|p| fields.contains(p))
+                .cloned()
+                .collect(),
+        ),
     }
+}
+
+/// The whole answer as the code may see it, with echoes of the secret removed.
+fn whole(fields: &SecretFields, answer: &Answer) -> FullResponse {
+    let shown = expose_response(
+        &ResponseExposure::Full,
+        fields,
+        answer.status,
+        &answer.headers,
+        &answer.body,
+    );
+    FullResponse {
+        status: shown.status,
+        headers: (shown.headers.into_iter())
+            .map(|(name, value)| Field { name, value })
+            .collect(),
+        body: shown.body.unwrap_or_default(),
+    }
+}
+
+fn whole_text(reply: &FullResponse) -> String {
+    let headers: Vec<(&str, &str)> = (reply.headers.iter())
+        .map(|field| (field.name.as_str(), field.value.as_str()))
+        .collect();
+    let body = base64::engine::general_purpose::STANDARD.encode(&reply.body);
+    serde_json::json!({ "status": reply.status, "headers": headers, "body": body }).to_string()
+}
+
+fn stored_whole(reply: &str) -> Result<FullResponse, HostError> {
+    let broken = || unavailable("a stored whole answer does not decode");
+    let value: Value = serde_json::from_str(reply).map_err(|_| broken())?;
+    let status = value
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|s| u16::try_from(s).ok());
+    let headers: Vec<(String, String)> =
+        serde_json::from_value(value.get("headers").cloned().unwrap_or(Value::Null))
+            .map_err(|_| broken())?;
+    let body = value
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or_else(broken)?;
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .map_err(|_| broken())?;
+    Ok(FullResponse {
+        status: status.ok_or_else(broken)?,
+        headers: (headers.into_iter())
+            .map(|(name, value)| Field { name, value })
+            .collect(),
+        body,
+    })
 }
 
 /// A stored reply under the current exposure: each stored field stays or goes by its pointer

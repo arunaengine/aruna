@@ -301,3 +301,100 @@ async fn replays_only_narrow() {
         "a settled call is never sent again"
     );
 }
+
+#[tokio::test]
+async fn whole_answers_gated() {
+    use crate::plugins::bound::tests::{bound, edit_config, keys, secret_with};
+    use crate::plugins::broker::RunBroker;
+    use crate::plugins::check::RunScope;
+    use aruna_core::secrets::ResponseExposure;
+    use aruna_plugins::broker::{Broker, CallContext, ErrorKind, Method, SendRequest};
+    let fixture = Fixture::keyed().await;
+    // A connection that reads whole answers with the bearer slot `api_key`.
+    let install = bound(&fixture).await;
+    let whole = serde_json::json!({
+        "secrets": { "api_key": { "title": "API key", "kind": "bearer" } },
+        "connections": { "catalog": { "url": "{catalog_url}/api/", "auth": "api_key", "response": "full" } }
+    });
+    let digest = fixture.publish("0.3.0", "ef", whole).await;
+    edit_config(&fixture, |config| {
+        (config.installs[0].digest, config.installs[0].version) = (digest, "0.3.0".to_string());
+    })
+    .await;
+    let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let install = config
+        .await
+        .unwrap()
+        .installs
+        .into_iter()
+        .find(|i| i.install_id == install.install_id)
+        .unwrap();
+    secret_with(&fixture, &install, ResponseExposure::Status).await;
+    let send = || {
+        let ctx = Arc::new(fixture.ctx.clone());
+        let mut run = queued(install.install_id, 1);
+        run.digest = install.digest.clone();
+        let scope = RunScope {
+            realm_id: fixture.actor.realm_id,
+            local: fixture.actor.node_id,
+            run,
+        };
+        let sender = fake(200, r#"{"id":1}"#);
+        let broker = RunBroker::new(ctx, scope)
+            .with_outbound(sender)
+            .with_keys(keys());
+        let install = &install;
+        async move {
+            let cx = CallContext {
+                run: "run".to_string(),
+                install: install.install_id.to_string(),
+                max_bytes: 1 << 20,
+            };
+            let request = SendRequest {
+                connection: "catalog".to_string(),
+                method: Method::Get,
+                path: "records".to_string(),
+                query: Vec::new(),
+                headers: Vec::new(),
+                body: Vec::new(),
+                intent: None,
+            };
+            broker.connection_send_full(&cx, request).await
+        }
+    };
+    use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
+    let name = aruna_core::secrets::SecretName::try_from("api-key".to_string()).unwrap();
+    let guard = RuleGuard::Revision {
+        install_id: install.install_id,
+        revision: install.revision,
+    };
+    let set_rule = |response| {
+        let mut rule = crate::plugins::bound::tests::rule_for(&install, response);
+        (rule.origins, rule.paths) = (
+            vec!["https://catalog.example.org".into()],
+            vec!["/api".into()],
+        );
+        let (ctx, actor, install, name) = (&fixture.ctx, &fixture.actor, &install, &name);
+        async move {
+            let target = (install.group_id, name);
+            edit_rules(ctx, actor, target, (&consumer(install), vec![rule]), guard)
+                .await
+                .unwrap();
+        }
+    };
+    set_rule(ResponseExposure::Status).await;
+    let narrower = send().await.unwrap_err();
+    assert_eq!(narrower.kind, ErrorKind::Denied);
+    assert!(
+        narrower.message.contains("whole answer"),
+        "{}",
+        narrower.message
+    );
+    // Once the rule exposes the whole answer, it reaches the code.
+    set_rule(ResponseExposure::Full).await;
+    let answer = send().await.unwrap();
+    assert_eq!(
+        (answer.status, answer.body.as_slice()),
+        (200, br#"{"id":1}"#.as_slice())
+    );
+}

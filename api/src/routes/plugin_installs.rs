@@ -97,6 +97,8 @@ pub struct ConnectionLine {
     pub url: String,
     pub required: bool,
     pub granted: bool,
+    /// The code reads whole answers, headers and body, as far as the secret's rule allows.
+    pub full_answer: bool,
 }
 
 /// What an admin approves: the version, the permissions and connections, and the triggers.
@@ -172,7 +174,7 @@ pub struct InstallListQuery {
     pub limit: Option<usize>,
 }
 
-const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"], "secrets": [{"slot": "catalog_key", "kind": "bearer", "secret": "group:catalog-key"}], "warnings": []}}"#;
+const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true, "full_answer": false}], "triggers": ["dataset_created", "manual"], "secrets": [{"slot": "catalog_key", "kind": "bearer", "secret": "group:catalog-key"}], "warnings": []}}"#;
 
 pub(crate) fn view_example() -> Value {
     serde_json::from_str(VIEW_EXAMPLE).unwrap_or(Value::Null)
@@ -553,6 +555,7 @@ fn summary(
             url: connection.url.clone(),
             required: !connection.optional,
             granted: sends.is_some_and(|paths| paths.contains(&scope.connection(name))),
+            full_answer: connection.response.full(),
         })
         .collect();
     InstallSummary {
@@ -796,6 +799,15 @@ mod tests {
             let none = (&BTreeMap::new(), &BTreeMap::new());
             summary(&manifest, "sha256:ab", &scope, none).warnings
         };
+        let manifest = serde_json::json!({
+            "name": "p", "version": "0.1.0",
+            "settings": { "base": { "title": "Base", "type": "url" } },
+            "connections": { "receipts": { "url": "{base}/x", "response": "full" } },
+        });
+        let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+        let none = (&BTreeMap::new(), &BTreeMap::new());
+        let lines = summary(&manifest, "sha256:ab", &scope, none).connections;
+        assert!(lines[0].full_answer);
         let sync_only = warned(serde_json::json!({"sync_failed": {}}));
         let mixed = warned(serde_json::json!({"sync_completed": {}, "dataset_created": {}}));
         assert_eq!(
