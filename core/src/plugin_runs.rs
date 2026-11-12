@@ -512,6 +512,20 @@ pub fn gap_key(install_id: Ulid, kind: SourceKind, reason: GapReason) -> Vec<u8>
 mod tests {
     use super::*;
 
+    // Journal, forward and gap rows store kinds by index; the update kind was appended, so rows
+    // written before it keep their meaning.
+    #[test]
+    fn kind_indexes_kept() {
+        let index = |kind: SourceKind| postcard::to_allocvec(&kind).unwrap();
+        assert_eq!(index(SourceKind::DatasetCreated), [0]);
+        assert_eq!(index(SourceKind::DataUploaded), [1]);
+        assert_eq!(index(SourceKind::DatasetUpdated), [2]);
+        assert_eq!(
+            gap_key(Ulid::nil(), SourceKind::DataUploaded, GapReason::Full)[17],
+            1
+        );
+    }
+
     #[test]
     fn bounded_log() {
         let mut run = PluginRun {

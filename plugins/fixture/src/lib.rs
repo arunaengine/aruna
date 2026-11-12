@@ -44,6 +44,32 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             let second = metadata.patch(&text("resource"), &patch, &first).await?;
             json!([first, second])
         }
+        "metadata_create" => {
+            let dataset = input.get("dataset").cloned().unwrap_or(Value::Null);
+            let metadata = ctx.metadata();
+            let created = metadata
+                .create(&text("path"), &dataset, &text("key"))
+                .await?;
+            json!({ "resource": created.0, "revision": created.1 })
+        }
+        "metadata_summary" => {
+            let doc = ctx.metadata().summary(&text("resource")).await?;
+            json!({ "revision": doc.revision, "json": doc.json })
+        }
+        "metadata_files" => {
+            let cursor = input.get("cursor").and_then(Value::as_str);
+            let page = ctx.metadata().files(&text("resource"), cursor).await?;
+            json!({ "files": page.files, "cursor": page.cursor })
+        }
+        "put_file" => {
+            let file = input.get("file").cloned().unwrap_or(Value::Null);
+            let metadata = ctx.metadata();
+            json!(
+                metadata
+                    .put_file(&text("resource"), &file, &text("expected"), None)
+                    .await?
+            )
+        }
         "objects_info" => {
             let info = ctx.objects().info(&text("path")).await?;
             json!({ "path": info.path, "size": info.size, "version": info.version })
