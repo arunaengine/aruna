@@ -645,3 +645,84 @@ fn dataset_crates() {
         assert!(dataset_crate(refused).is_err(), "{refused}");
     }
 }
+
+/// Creates a document with three root-linked files of padded names; returns its id.
+async fn three_files(fixture: &Fixture, broker: &RunBroker) -> Ulid {
+    let file = |name: &str| serde_json::json!({"@id": name, "@type": "File", "name": format!("{name} {}", "x".repeat(300))});
+    let jsonld = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.1/context",
+        "@graph": [
+            {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"},
+             "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"}},
+            {"@id": "./", "@type": "Dataset", "name": "files", "description": "d",
+             "datePublished": "2026-01-01",
+             "hasPart": [{"@id": "a.txt"}, {"@id": "b.txt"}, {"@id": "c.txt"}]},
+            file("a.txt"), file("b.txt"), file("c.txt")
+        ]
+    });
+    let create = CreateDocumentOperation::new(CreateDocumentConfig {
+        actor: fixture.actor.clone(),
+        group_id: fixture.group_id,
+        document_id: Ulid::nil(),
+        document_path: "/docs/files/".to_string(),
+        public: false,
+        payload: CreateDocumentPayload::RoCrate {
+            jsonld: jsonld.to_string(),
+        },
+    });
+    let created = create_metadata_document(create, broker.ctx.clone());
+    let created = created.await.unwrap();
+    project(&broker.ctx).await;
+    created.record.document_id
+}
+
+/// One page of `document` after `after`, asked with `limit` within `bound` bytes.
+async fn page_of(
+    fixture: &Fixture,
+    broker: &RunBroker,
+    (document, after): (Ulid, Option<String>),
+    (limit, bound): (usize, u64),
+) -> Result<aruna_core::metadata::MetadataRoCratePage, MetadataApiError> {
+    let request = ExportMetadataRequest {
+        document_id: document,
+        auth: Some(fixture.auth()),
+        view: RoCrateExportView::Page,
+        limit: Some(limit),
+        offset: None,
+        after,
+    };
+    let realm = fixture.actor.realm_id;
+    match export_rocrate_routed(&broker.ctx, realm, request, None, bound).await? {
+        ExportMetadataResult::Page { page, .. } => Ok(page),
+        other => panic!("expected a page, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn bounded_pages() {
+    // A page over the bound comes back smaller, and its cursor continues at the next file.
+    let (fixture, broker, _, _dir) = broker().await;
+    let document = three_files(&fixture, &broker).await;
+    let one = page_of(&fixture, &broker, (document, None), (1, u64::MAX)).await;
+    let two = page_of(&fixture, &broker, (document, None), (2, u64::MAX)).await;
+    let bound = two.unwrap().jsonld.len() as u64 - 1;
+    let mut after = None;
+    let mut seen = 0;
+    loop {
+        let page = page_of(&fixture, &broker, (document, after), (3, bound)).await;
+        let page = page.unwrap();
+        assert!(page.jsonld.len() as u64 <= bound);
+        assert_eq!(page.returned_data_entities, 1);
+        let name = ["a.txt", "b.txt", "c.txt"][seen];
+        assert!(page.jsonld.contains(&format!("{name} x")), "{name}");
+        seen += 1;
+        after = page.next_cursor;
+        if after.is_none() {
+            break;
+        }
+    }
+    assert_eq!(seen, 3);
+    let small = one.unwrap().jsonld.len() as u64 - 1;
+    let refused = page_of(&fixture, &broker, (document, None), (3, small)).await;
+    assert!(matches!(refused, Err(MetadataApiError::TooLarge)));
+}

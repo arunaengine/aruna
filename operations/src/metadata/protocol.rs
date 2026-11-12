@@ -876,6 +876,8 @@ pub enum MetadataReadError {
     Forbidden,
     NotFound,
     Unavailable,
+    /// Even the smallest page of the answer is larger than the asked byte bound.
+    TooLarge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

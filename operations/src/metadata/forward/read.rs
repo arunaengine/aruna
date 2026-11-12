@@ -15,6 +15,7 @@ use crate::metadata::api::ensure_record_readable;
 use crate::metadata::api::export_metadata_rocrate;
 use crate::metadata::api::get_visible_document;
 use crate::metadata::api::load_live_record;
+use crate::metadata::api::{PAGE_DEFAULT, PAGE_MAX};
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::profile::validation::current_validation_status;
 use crate::metadata::profile::validation::revalidate_current;
@@ -371,7 +372,7 @@ async fn read_routed(
                 auth_error.get_or_insert(MetadataApiError::Forbidden);
             }
             Err(MetadataReadError::NotFound) => not_found += 1,
-            Err(MetadataReadError::Unavailable) => unavailable = true,
+            Err(MetadataReadError::Unavailable | MetadataReadError::TooLarge) => unavailable = true,
         };
     }
     if let Some(error) = auth_error {
@@ -497,7 +498,7 @@ pub async fn route_profile_status(
                 auth_error.get_or_insert(MetadataApiError::Forbidden);
             }
             Err(MetadataReadError::NotFound) => not_found += 1,
-            Err(MetadataReadError::Unavailable) => unavailable = true,
+            Err(MetadataReadError::Unavailable | MetadataReadError::TooLarge) => unavailable = true,
         }
     }
     if let Some(error) = auth_error {
@@ -540,9 +541,7 @@ pub async fn export_rocrate_routed(
     metadata_bytes: u64,
 ) -> Result<ExportMetadataResult, MetadataApiError> {
     if context.net_handle.is_none() {
-        let export = export_metadata_rocrate(context.as_ref(), realm_id, request).await?;
-        ensure_export_limit(&export, metadata_bytes)?;
-        return Ok(export);
+        return export_within(context.as_ref(), realm_id, request, metadata_bytes).await;
     }
     let config = load_realm_config(context, realm_id)
         .await
@@ -617,10 +616,8 @@ async fn export_routed(
         let forward_token = forward_token.clone();
         Box::pin(async move {
             if Some(holder) == local_node {
-                let export = export_metadata_rocrate(context.as_ref(), realm_id, request).await;
-                let export = export.map_err(read_error)?;
-                ensure_export_limit(&export, metadata_bytes).map_err(read_error)?;
-                Ok(export)
+                let export = export_within(context.as_ref(), realm_id, request, metadata_bytes);
+                export.await.map_err(read_error)
             } else {
                 let Some(metadata) = metadata else {
                     return Err(MetadataReadError::Unavailable);
@@ -651,7 +648,7 @@ async fn export_routed(
     let mut not_found = 0usize;
     let mut success = None;
     let mut auth_error = None;
-    let mut unavailable = timed_out;
+    let (mut unavailable, mut too_large) = (timed_out, false);
     for (_, response) in responses {
         match response {
             Ok(export) => {
@@ -662,6 +659,7 @@ async fn export_routed(
             }
             Err(MetadataReadError::NotFound) => not_found += 1,
             Err(MetadataReadError::Unavailable) => unavailable = true,
+            Err(MetadataReadError::TooLarge) => too_large = true,
         }
     }
     let conflict = success.is_some() && not_found > 0;
@@ -678,6 +676,8 @@ async fn export_routed(
         ReadDecision::NotFound => Err(MetadataApiError::NotFound),
         ReadDecision::Auth(MetadataReadError::Unauthorized) => Err(MetadataApiError::Unauthorized),
         ReadDecision::Auth(MetadataReadError::Forbidden) => Err(MetadataApiError::Forbidden),
+        // A holder that found the page too large answered for every holder of the same graph.
+        ReadDecision::Unavailable if too_large => Err(MetadataApiError::TooLarge),
         ReadDecision::Auth(_) | ReadDecision::Unavailable => {
             Err(MetadataApiError::ServiceUnavailable)
         }
@@ -694,6 +694,30 @@ pub async fn export_rocrate_here(
     let export = export_metadata_rocrate(context, realm_id, request).await?;
     ensure_export_limit(&export, metadata_bytes)?;
     Ok(export)
+}
+
+/// Exports one document here within `metadata_bytes`. A page over the bound is asked again with
+/// half the limit, so its cursor names the last entity it holds; one entity over it is too large.
+async fn export_within(
+    context: &DriverContext,
+    realm_id: RealmId,
+    mut request: ExportMetadataRequest,
+    metadata_bytes: u64,
+) -> Result<ExportMetadataResult, MetadataApiError> {
+    loop {
+        let export = export_metadata_rocrate(context, realm_id, request.clone()).await?;
+        let over = ensure_export_limit(&export, metadata_bytes);
+        let page = matches!(export, ExportMetadataResult::Page { .. });
+        match (
+            over,
+            request.limit.unwrap_or(PAGE_DEFAULT).clamp(1, PAGE_MAX),
+        ) {
+            (Ok(()), _) => return Ok(export),
+            (Err(_), limit) if page && limit > 1 => request.limit = Some(limit / 2),
+            (Err(_), _) if page => return Err(MetadataApiError::TooLarge),
+            (Err(error), _) => return Err(error),
+        }
+    }
 }
 
 pub(super) fn ensure_export_limit(
@@ -799,7 +823,7 @@ pub(super) fn collect_profile_export(
                 auth_error.get_or_insert(error);
             }
             Err(MetadataReadError::NotFound) => not_found += 1,
-            Err(MetadataReadError::Unavailable) => unavailable = true,
+            Err(MetadataReadError::Unavailable | MetadataReadError::TooLarge) => unavailable = true,
         }
     }
     let all_not_found = holder_count > 0 && not_found == holder_count;
@@ -1019,23 +1043,17 @@ pub(crate) async fn apply_forwarded_export(
     if !holds_metadata_id(&config, realm_id, net_handle.node_id(), document_id) {
         return Err(MetadataReadError::Unavailable);
     }
-    let export = export_metadata_rocrate(
-        context.as_ref(),
-        realm_id,
-        ExportMetadataRequest {
-            document_id,
-            auth,
-            view,
-            limit,
-            offset,
-            after,
-        },
-    )
-    .await
-    .map_err(read_error)?;
     let metadata_bytes = metadata_bytes.min(local_limit);
-    ensure_export_limit(&export, metadata_bytes).map_err(read_error)?;
-    Ok((export, metadata_bytes))
+    let request = ExportMetadataRequest {
+        document_id,
+        auth,
+        view,
+        limit,
+        offset,
+        after,
+    };
+    let export = export_within(context.as_ref(), realm_id, request, metadata_bytes);
+    Ok((export.await.map_err(read_error)?, metadata_bytes))
 }
 
 pub(crate) async fn apply_document_query(

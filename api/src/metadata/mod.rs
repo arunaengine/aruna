@@ -311,7 +311,9 @@ pub(crate) fn map_api_error(error: MetadataApiError) -> ServerError {
         MetadataApiError::Unauthorized => ServerError::Unauthorized,
         MetadataApiError::Forbidden => ServerError::Forbidden,
         MetadataApiError::NotFound => ServerError::NotFound,
-        MetadataApiError::ServiceUnavailable => ServerError::ServiceUnavailable,
+        MetadataApiError::ServiceUnavailable | MetadataApiError::TooLarge => {
+            ServerError::ServiceUnavailable
+        }
         MetadataApiError::SearchIncomplete(reason) => ServerError::ServiceUnavailableReason(reason),
         MetadataApiError::PlacementUnavailable(
             aruna_operations::placement::PlacementResolveError::ActivationConflicted(_),

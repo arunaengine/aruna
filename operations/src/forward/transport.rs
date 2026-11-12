@@ -53,6 +53,7 @@ pub(crate) fn read_error(error: MetadataApiError) -> MetadataReadError {
         MetadataApiError::Unauthorized => MetadataReadError::Unauthorized,
         MetadataApiError::Forbidden => MetadataReadError::Forbidden,
         MetadataApiError::NotFound => MetadataReadError::NotFound,
+        MetadataApiError::TooLarge => MetadataReadError::TooLarge,
         MetadataApiError::BadRequest
         | MetadataApiError::ServiceUnavailable
         | MetadataApiError::SearchIncomplete(_)
