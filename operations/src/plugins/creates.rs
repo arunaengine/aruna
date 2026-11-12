@@ -3,7 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::UserId;
 use aruna_core::keyspaces::PLUGIN_CREATES_KEYSPACE;
+use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::store::{StoreError, Txn, decode, encode, transact};
@@ -55,38 +59,110 @@ pub fn next_step(claim: Claim, lookup: Option<Lookup>) -> Step {
     }
 }
 
+/// The stored create of a key and what is known about its attempts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct KeyRow {
+    /// The account of the install that wrote it; a reinstall under the same id has another one.
+    account: UserId,
+    create: PinnedCreate,
+    /// Attempts without a known outcome; one whose outcome stays unknown keeps this above zero.
+    open: u32,
+    /// The last finished attempt was refused for its arguments, so it committed nothing.
+    rejected: bool,
+}
+
 fn create_key(install_id: Ulid, key: &str) -> Vec<u8> {
     [&install_id.to_bytes()[..], key.as_bytes()].concat()
 }
 
-/// Reads the row of `key` and writes `minted` when there is none, in one transaction, so two
-/// concurrent calls with one key adopt the same document before either sends.
+/// Opens an attempt of `key` in one transaction, so concurrent calls adopt one document. A new key
+/// (or a former install's) stores `minted`; a refused one with no open attempt takes its arguments.
 pub async fn claim_key(
     ctx: &DriverContext,
-    (install_id, key): (Ulid, &str),
+    (install, key): (&PluginInstall, &str),
     minted: PinnedCreate,
 ) -> Result<(PinnedCreate, Claim), StoreError> {
-    let row = create_key(install_id, key);
+    let row = create_key(install.install_id, key);
     transact(ctx, async |txn: &Txn<'_>| {
-        if let Some(bytes) = txn.read(PLUGIN_CREATES_KEYSPACE, &row).await? {
-            return Ok((decode(&bytes)?, Claim::Earlier));
-        }
-        let value = encode(&minted)?;
-        txn.write(PLUGIN_CREATES_KEYSPACE, vec![(row.clone(), value)])
-            .await?;
-        Ok((minted.clone(), Claim::Fresh))
+        let stored = match txn.read(PLUGIN_CREATES_KEYSPACE, &row).await? {
+            Some(bytes) => Some(decode::<KeyRow>(&bytes)?),
+            None => None,
+        };
+        let stored = stored.filter(|stored| stored.account == install.account);
+        let (create, claim, open) = match stored {
+            None => (minted.clone(), Claim::Fresh, 1),
+            Some(stored) if stored.rejected && stored.open == 0 => {
+                let corrected = PinnedCreate {
+                    group_id: stored.create.group_id,
+                    document_id: stored.create.document_id,
+                    target: stored.create.target,
+                    ..minted.clone()
+                };
+                (corrected, Claim::Fresh, 1)
+            }
+            Some(stored) => (stored.create, Claim::Earlier, stored.open.saturating_add(1)),
+        };
+        let value = KeyRow {
+            account: install.account,
+            create: create.clone(),
+            open,
+            rejected: false,
+        };
+        txn.write(
+            PLUGIN_CREATES_KEYSPACE,
+            vec![(row.clone(), encode(&value)?)],
+        )
+        .await?;
+        Ok((create, claim))
     })
     .await
 }
 
-/// Deletes the create keys of an install that is being removed; returns how many.
-pub async fn drop_keys(ctx: &DriverContext, install_id: Ulid) -> Result<usize, StoreError> {
+/// Closes one attempt of `key` whose outcome is known: it committed, or it was refused without
+/// an effect, `rejected` when the refusal concerns its arguments.
+pub async fn settle_key(
+    ctx: &DriverContext,
+    (install, key): (&PluginInstall, &str),
+    rejected: bool,
+) -> Result<(), StoreError> {
+    let row = create_key(install.install_id, key);
+    transact(ctx, async |txn: &Txn<'_>| {
+        let Some(bytes) = txn.read(PLUGIN_CREATES_KEYSPACE, &row).await? else {
+            return Ok(());
+        };
+        let mut stored: KeyRow = decode(&bytes)?;
+        if stored.account != install.account {
+            return Ok(());
+        }
+        stored.open = stored.open.saturating_sub(1);
+        stored.rejected = rejected;
+        txn.write(
+            PLUGIN_CREATES_KEYSPACE,
+            vec![(row.clone(), encode(&stored)?)],
+        )
+        .await
+    })
+    .await
+}
+
+/// Deletes the create keys of installs that are being removed or are gone; returns how many.
+/// Keys are written only for installs this receiver ran, so an absent one was removed.
+pub async fn drop_keys(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+) -> Result<usize, StoreError> {
     let txn = Txn::direct(ctx);
-    let keys: Vec<_> = (txn
-        .scan(PLUGIN_CREATES_KEYSPACE, &install_id.to_bytes())
-        .await?)
+    let kept = |key: &[u8]| {
+        let install_id = key.get(..16).and_then(|id| <[u8; 16]>::try_from(id).ok());
+        let install_id = install_id.map(Ulid::from_bytes);
+        (config.installs.iter()).any(|install| {
+            Some(install.install_id) == install_id && install.state != InstallState::Removing
+        })
+    };
+    let keys: Vec<_> = (txn.scan(PLUGIN_CREATES_KEYSPACE, &[]).await?)
         .into_iter()
         .map(|(key, _)| key)
+        .filter(|key| !kept(key))
         .collect();
     let count = keys.len();
     txn.delete(PLUGIN_CREATES_KEYSPACE, keys).await?;

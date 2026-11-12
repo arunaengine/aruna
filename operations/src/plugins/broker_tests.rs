@@ -595,9 +595,17 @@ async fn keyed_creates() {
     let created = creator.metadata_create(&cx(), first.clone()).await.unwrap();
     project(&broker.ctx).await;
     assert_eq!(
-        creator.metadata_create(&cx(), first).await,
+        creator.metadata_create(&cx(), first.clone()).await,
         Ok(created.clone())
     );
+    // A lost reply leaves the call unknown in its run; the next run recovers by the key.
+    let lost = "the reply was lost";
+    mark_unknown(&broker.ctx, scope.run.run_id, &first.intent, lost)
+        .await
+        .unwrap();
+    let unknown = creator.metadata_create(&cx(), first).await.unwrap_err();
+    assert_eq!(unknown.kind, ErrorKind::UnknownOutcome);
+
     scope.run.run_id = Ulid::generate();
     let later = RunBroker::new(broker.ctx.clone(), scope);
     let edited = create("elabftw/exp-1", "Exp 1 edited", "e1", 0);

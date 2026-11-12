@@ -31,10 +31,11 @@ use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
 use base64::Engine;
 use serde_json::Value;
+use tracing::warn;
 use ulid::Ulid;
 
 use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
-use super::creates::{Lookup, Step, claim_key, next_step};
+use super::creates::{Lookup, Step, claim_key, next_step, settle_key};
 use super::grants::{InstallScope, accesses, parse_grants};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
@@ -307,10 +308,10 @@ impl RunBroker {
     async fn keyed_create(
         &self,
         (actor, auth): (Actor, &AuthContext),
-        (install_id, key): (Ulid, &str),
+        (install, key): (&PluginInstall, &str),
         minted: PinnedCreate,
     ) -> Result<String, Outcome> {
-        let stored = claim_key(&self.ctx, (install_id, key), minted).await;
+        let stored = claim_key(&self.ctx, (install, key), minted).await;
         let (pinned, claim) = stored.map_err(|error| Outcome::None(unavailable(error.0)))?;
         let mut lookup = None;
         loop {
@@ -318,14 +319,28 @@ impl RunBroker {
                 Step::Dispatch => {
                     let extras = PolicyRequestExtras::operation("plugin.metadata.create");
                     let created = create_with_id(&self.ctx, actor, (auth, extras), &pinned).await;
-                    let created = created.map_err(create_outcome)?;
+                    let outcome = created.map_err(create_outcome);
+                    // A known outcome closes the attempt; a refusal of the arguments lets a
+                    // later call correct them. An unknown one keeps them fixed.
+                    let rejected = match &outcome {
+                        Ok(_) => Some(false),
+                        Err(Outcome::None(error)) => Some(error.kind == ErrorKind::Invalid),
+                        Err(Outcome::Maybe(_)) => None,
+                    };
+                    if let Some(rejected) = rejected {
+                        self.settle((install, key), rejected).await;
+                    }
+                    let created = outcome?;
                     return Ok(created_text(
                         &created.document_id,
                         &created.establishing_event_id,
                     ));
                 }
                 Step::Lookup => lookup = Some(self.look_up(pinned.document_id, auth).await),
-                Step::Adopt(revision) => return Ok(created_text(&pinned.document_id, &revision)),
+                Step::Adopt(revision) => {
+                    self.settle((install, key), false).await;
+                    return Ok(created_text(&pinned.document_id, &revision));
+                }
                 Step::Unknown => {
                     let reason = "the document of an earlier create with this key is not reachable";
                     return Err(Outcome::Maybe(reason.to_string()));
@@ -375,6 +390,13 @@ impl RunBroker {
             self.object_at(install, &path).await?;
         }
         Ok(())
+    }
+
+    /// Closes an attempt of a create key. A failure only keeps the key's arguments fixed.
+    async fn settle(&self, key: (&PluginInstall, &str), rejected: bool) {
+        if let Err(error) = settle_key(&self.ctx, key, rejected).await {
+            warn!(%error, "A plugin create key could not record its attempt's outcome");
+        }
     }
 
     /// Looks a keyed create's document up on its holders under the account's authority.
@@ -709,7 +731,7 @@ impl Broker for RunBroker {
             PinnedCreate::mint(&self.ctx, &actor, (install.group_id, &path), payload).await;
         let outcome = match minted {
             Ok(minted) => {
-                let key = (install.install_id, create.key.as_str());
+                let key = (&install, create.key.as_str());
                 self.keyed_create((actor, &auth), key, minted).await
             }
             Err(error) => Err(Outcome::None(unavailable(error.to_string()))),

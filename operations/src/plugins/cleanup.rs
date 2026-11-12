@@ -80,10 +80,7 @@ pub async fn sweep_events(
     }
     let counted = gaps.len();
     txn.delete(PLUGIN_GAPS_KEYSPACE, gaps).await?;
-    let mut keys = 0;
-    for install in (config.installs.iter()).filter(|i| i.state == InstallState::Removing) {
-        keys += drop_keys(ctx, install.install_id).await?;
-    }
+    let keys = drop_keys(ctx, config).await?;
     Ok(replays + held + counted + keys)
 }
 
