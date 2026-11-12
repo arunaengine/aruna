@@ -969,6 +969,13 @@ impl RunBroker {
             })
     }
 
+    /// Records fields as handed to the code, as `secret_value` does.
+    #[cfg(test)]
+    pub(crate) fn shows(&self, fields: SecretFields) {
+        let shown = self.shown.lock();
+        (shown.unwrap_or_else(|poisoned| poisoned.into_inner())).push(fields);
+    }
+
     /// Text the run keeps with every form of a value handed to the code removed, as extra
     /// protection only: the code holds the value and may change it.
     pub fn scrub(&self, text: &str) -> String {

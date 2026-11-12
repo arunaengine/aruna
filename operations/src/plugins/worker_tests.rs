@@ -462,3 +462,31 @@ fn busy_keeps_attempts() {
         Ended::Stopped
     ));
 }
+
+#[tokio::test]
+async fn retries_hide_values() {
+    use crate::plugins::runs::{read_run, save_run};
+    use aruna_core::compute::Secret;
+    use aruna_core::secrets::SecretFields;
+    const VALUE: &str = "canary-value-7b1e";
+    let fixture = Fixture::new().await;
+    let mut run = queued(Ulid::from_parts(3, 3), 1);
+    admit(&fixture.ctx, &run).await.unwrap();
+    let scope = RunScope {
+        realm_id: fixture.actor.realm_id,
+        local: fixture.actor.node_id,
+        run: run.clone(),
+    };
+    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope);
+    broker.shows(SecretFields::new(
+        [("token".to_string(), Secret::new(VALUE))].into(),
+    ));
+    // A retryable error that names a value handed to the code keeps the run without it.
+    let ended = scrub_ended(&broker, Ended::Retry(format!("upstream said {VALUE}")));
+    conclude(&mut run, ended, false, Ok(None), 5);
+    save_run(&fixture.ctx, &run).await.unwrap();
+    let stored = read_run(&fixture.ctx, run.install_id, run.run_id).await;
+    let stored = stored.unwrap();
+    assert_eq!(stored.state, RunState::Queued);
+    assert_eq!(stored.message.as_deref(), Some("upstream said [redacted]"));
+}

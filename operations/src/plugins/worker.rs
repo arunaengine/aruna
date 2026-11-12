@@ -339,11 +339,7 @@ impl Worker {
             return;
         }
         run.log = broker.take_log();
-        let ended = match ended {
-            Ended::Output(output) => Ended::Output(output.map(|text| broker.scrub(&text))),
-            Ended::Failed(message) => Ended::Failed(broker.scrub(&message)),
-            other => other,
-        };
+        let ended = scrub_ended(&broker, ended);
         let now = unix_timestamp_millis();
         let open = open_intent(&self.ctx, run.run_id).await;
         let ended = match ended {
@@ -495,6 +491,18 @@ fn invocation(
 
 /// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown
 /// makes it need attention, and unreadable intents keep it queued without using an attempt.
+/// The attempt's end with every value handed to the code removed from the text the run keeps.
+fn scrub_ended(broker: &RunBroker, ended: Ended) -> Ended {
+    match ended {
+        Ended::Output(output) => Ended::Output(output.map(|text| broker.scrub(&text))),
+        Ended::Failed(message) => Ended::Failed(broker.scrub(&message)),
+        Ended::Retry(message) => Ended::Retry(broker.scrub(&message)),
+        Ended::Cancelled(message) => Ended::Cancelled(broker.scrub(&message)),
+        Ended::Busy(message) => Ended::Busy(broker.scrub(&message)),
+        Ended::Stopped => Ended::Stopped,
+    }
+}
+
 fn conclude(
     run: &mut PluginRun,
     ended: Ended,
