@@ -9,11 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aruna_core::NodeId;
-use aruna_core::injection::{OutgoingRequest, expose_response};
+use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret};
 use aruna_core::metadata::AuthToken;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun};
-use aruna_core::secrets::{ResponseExposure, SecretFields, header_name};
+use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields, header_name};
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
@@ -32,10 +32,12 @@ use ulid::Ulid;
 
 use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
 use super::grants::{InstallScope, accesses, parse_grants};
+use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
 use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::rate::take_call;
+use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
 use super::state::{PutError, check_key, put_state, read_state};
 use super::store::{StoreError, Txn, transact};
 use crate::driver::{DriverContext, drive};
@@ -58,6 +60,10 @@ pub struct RunBroker {
     ctx: Arc<DriverContext>,
     /// Sends connection requests; the node's screened egress client unless a test replaces it.
     outbound: Arc<dyn Outbound>,
+    /// The realm keys a management node releases group and realm secrets with.
+    keys: ReleaseKeys,
+    /// The secrets this run holds, reused while their value is unchanged.
+    held: tokio::sync::Mutex<HeldSecrets>,
     scope: RunScope,
     /// A call at a known ordinal came with other arguments than before.
     changed: AtomicBool,
@@ -71,11 +77,24 @@ impl RunBroker {
         lines.log.clear();
         Self {
             outbound: Arc::new(Egress(ctx.blob_handle.clone())),
+            keys: (ctx.metadata_handle.as_ref())
+                .map(|handle| ReleaseKeys {
+                    seal: handle.realm_seal_key(),
+                    vault: handle.realm_vault_key(),
+                })
+                .unwrap_or_default(),
+            held: tokio::sync::Mutex::default(),
             ctx,
             log: Mutex::new(lines),
             scope,
             changed: AtomicBool::new(false),
         }
+    }
+
+    /// The broker with other realm keys for releases.
+    pub fn with_keys(mut self, keys: ReleaseKeys) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// The broker with another sender for connection requests.
@@ -552,23 +571,29 @@ impl Broker for RunBroker {
             url,
             headers,
         };
-        let exposure = match connection.response.is_empty() {
-            true => ResponseExposure::Status,
-            false => ResponseExposure::Fields {
-                pointers: connection.response.clone(),
-                headers: Vec::new(),
-            },
+        let mut outgoing = outgoing;
+        // Every use of a secret, a replay included, passes the release check first.
+        let (exposure, fields) = match &connection.auth {
+            None => (manifest_exposure(&connection.response), None),
+            Some(slot) => {
+                let (released, fields) =
+                    self.inject(&install, slot, &config, &mut outgoing).await?;
+                let exposure = narrowed(&released.exposure, &connection.response);
+                (exposure, Some(fields))
+            }
         };
+        let none = SecretFields::new(Default::default());
+        let fields = fields.as_ref().unwrap_or(&none);
         let Some(intent) = request.intent else {
             let answer = self.outbound.send(outgoing, request.body).await;
             let answer = answer.map_err(|error| unavailable(error.to_string()))?;
-            return Ok(exposed(&exposure, &answer));
+            return Ok(exposed(&exposure, fields, &answer));
         };
         if let Some(reply) = self.begun(&intent).await? {
-            return stored_reply(&reply);
+            return Ok(kept(stored_reply(&reply)?, &exposure));
         }
         let outcome = match self.outbound.send(outgoing, request.body).await {
-            Ok(answer) => Ok(reply_text(&exposed(&exposure, &answer))),
+            Ok(answer) => Ok(reply_text(&exposed(&exposure, fields, &answer))),
             Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
             Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
         };
@@ -813,6 +838,39 @@ fn write_outcome(error: MetadataWriteError) -> Outcome {
     }
 }
 
+impl RunBroker {
+    /// Releases the slot's secret for this request and adds it as its kind says.
+    async fn inject(
+        &self,
+        install: &PluginInstall,
+        slot: &str,
+        config: &aruna_core::structs::identity::realm::RealmConfigDocument,
+        outgoing: &mut OutgoingRequest,
+    ) -> Result<(Released, SecretFields), HostError> {
+        let request = ReleaseRequest {
+            install_id: install.install_id,
+            slot: slot.to_string(),
+            delivery: Delivery::Inject,
+            target: Some((outgoing.method.clone(), outgoing.url.to_string())),
+            held: None,
+            run_id: Some(self.scope.run.run_id),
+        };
+        let place = (self.scope.local, &self.keys);
+        let ask = |request| ask_release(&self.ctx, config, place, request);
+        let mut held = self.held.lock().await;
+        let (released, fields) = held
+            .obtain(request, ask)
+            .await
+            .map_err(|error| match error {
+                ReleaseError::Refused(_) => HostError::new(ErrorKind::Denied, error.to_string()),
+                ReleaseError::Unavailable(why) => unavailable(why),
+            })?;
+        let injected = inject_secret(&released.kind, &released.settings, &fields, outgoing);
+        injected.map_err(|error| HostError::new(ErrorKind::Denied, error.to_string()))?;
+        Ok((released, fields))
+    }
+}
+
 /// The scope of an install, for its generated grant paths.
 fn install_scope(install: &PluginInstall) -> InstallScope {
     InstallScope {
@@ -841,12 +899,11 @@ fn credential(name: &str) -> bool {
     ["authorization", "cookie", "proxy-authorization"].contains(&name.to_ascii_lowercase().as_str())
 }
 
-/// The answer as the guest may see it: the one place an exposure applies.
-fn exposed(exposure: &ResponseExposure, answer: &Answer) -> Response {
-    let none = SecretFields::new(Default::default());
+/// The answer as the guest may see it: the one place an exposure applies to an answer.
+fn exposed(exposure: &ResponseExposure, fields: &SecretFields, answer: &Answer) -> Response {
     let shown = expose_response(
         exposure,
-        &none,
+        fields,
         answer.status,
         &answer.headers,
         &answer.body,
@@ -856,6 +913,53 @@ fn exposed(exposure: &ResponseExposure, answer: &Answer) -> Response {
         json: shown
             .body
             .map(|body| String::from_utf8_lossy(&body).into_owned()),
+    }
+}
+
+/// The exposure of a connection without a secret: its manifest fields, or status only.
+fn manifest_exposure(response: &[String]) -> ResponseExposure {
+    match response.is_empty() {
+        true => ResponseExposure::Status,
+        false => ResponseExposure::Fields {
+            pointers: response.to_vec(),
+            headers: Vec::new(),
+        },
+    }
+}
+
+/// The rule's exposure, never wider than the fields the manifest lets the code read.
+fn narrowed(rule: &ResponseExposure, response: &[String]) -> ResponseExposure {
+    match rule {
+        ResponseExposure::Status => ResponseExposure::Status,
+        ResponseExposure::Full => manifest_exposure(response),
+        ResponseExposure::Fields { pointers, .. } => {
+            let both: Vec<String> = (pointers.iter())
+                .filter(|pointer| response.contains(pointer))
+                .cloned()
+                .collect();
+            manifest_exposure(&both)
+        }
+    }
+}
+
+/// A stored reply under the current exposure: each stored field stays or goes by its pointer
+/// key, so a replay can only narrow what the guest saw, never widen it.
+fn kept(reply: Response, exposure: &ResponseExposure) -> Response {
+    let json = match exposure {
+        ResponseExposure::Status => None,
+        ResponseExposure::Full => reply.json,
+        ResponseExposure::Fields { pointers, .. } => (reply.json)
+            .and_then(|json| serde_json::from_str::<serde_json::Map<String, Value>>(&json).ok())
+            .map(|stored| {
+                let kept: serde_json::Map<String, Value> = (stored.into_iter())
+                    .filter(|(pointer, _)| pointers.contains(pointer))
+                    .collect();
+                Value::Object(kept).to_string()
+            }),
+    };
+    Response {
+        status: reply.status,
+        json,
     }
 }
 

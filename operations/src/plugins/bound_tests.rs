@@ -69,9 +69,9 @@ pub(crate) async fn bound(fixture: &Fixture) -> PluginInstall {
     config.installs.into_iter().next().unwrap()
 }
 
-/// The group secret `api-key` with one `inject` rule for `install` toward `ORIGIN`.
-pub(crate) async fn secret(fixture: &Fixture, install: &PluginInstall) {
-    let rule = UseRule {
+/// The `inject` rule of `install` toward the fixture origins with `response`.
+pub(crate) fn rule_for(install: &PluginInstall, response: ResponseExposure) -> UseRule {
+    UseRule {
         consumer: SecretConsumer::Plugin {
             plugin_id: install.plugin.clone(),
             install_id: install.install_id,
@@ -80,9 +80,23 @@ pub(crate) async fn secret(fixture: &Fixture, install: &PluginInstall) {
         origins: vec![ORIGIN.to_string()],
         paths: Vec::new(),
         methods: Vec::new(),
-        response: ResponseExposure::Status,
+        response,
         groups: Vec::new(),
-    };
+    }
+}
+
+/// The group secret `api-key` with one `inject` rule for `install` toward `ORIGIN`.
+pub(crate) async fn secret(fixture: &Fixture, install: &PluginInstall) {
+    secret_with(fixture, install, ResponseExposure::Status).await;
+}
+
+/// The group secret `api-key` whose one rule for `install` exposes `response`.
+pub(crate) async fn secret_with(
+    fixture: &Fixture,
+    install: &PluginInstall,
+    response: ResponseExposure,
+) {
+    let rule = rule_for(install, response);
     let change = SecretChange::Create {
         name: SecretName::try_from("api-key".to_string()).unwrap(),
         kind: SecretKind::parse("bearer").unwrap(),
