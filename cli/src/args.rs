@@ -301,6 +301,54 @@ pub enum S3Command {
         #[arg(long)]
         show_secret: bool,
     },
+    /// Long-lived S3 credentials of a group's service accounts.
+    #[command(subcommand)]
+    Credential(CredentialCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CredentialCommand {
+    /// Issue a credential for a service account; it works only on the node that issues it.
+    Create {
+        /// The group that owns the service account, by id or name.
+        #[arg(long)]
+        group: String,
+        /// The service account id, in the form <ulid>@<realm>.
+        #[arg(long)]
+        account: String,
+        /// Lifetime such as 365d or 12h, or an RFC 3339 time; at most one year, the default.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Confine the credential to a path such as `bucket/prefix/**`, repeated for more;
+        /// a `read=` or `write=` prefix sets the permission, write by default.
+        #[arg(long = "path", value_name = "[PERMISSION=]PATTERN", value_parser = parse_scope)]
+        paths: Vec<PathScope>,
+    },
+}
+
+/// One path restriction of a credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathScope {
+    pub pattern: String,
+    pub permission: &'static str,
+}
+
+fn parse_scope(raw: &str) -> Result<PathScope, String> {
+    let (permission, pattern) = match raw.split_once('=') {
+        Some((permission, pattern)) if permission.eq_ignore_ascii_case("read") => ("READ", pattern),
+        Some((permission, pattern)) if permission.eq_ignore_ascii_case("write") => {
+            ("WRITE", pattern)
+        }
+        _ => ("WRITE", raw),
+    };
+    if pattern.is_empty() {
+        return Err("the path pattern is empty".to_string());
+    }
+    let pattern = pattern.to_string();
+    Ok(PathScope {
+        pattern,
+        permission,
+    })
 }
 
 #[derive(Debug, Subcommand)]
@@ -602,6 +650,54 @@ mod tests {
         assert_eq!(visibility.choice(), Some(false));
         assert!(parse(&["meta", "update", "id", "f", "--public", "--private"]).is_err());
         assert!(parse(&["meta", "create", "crate"]).is_err());
+    }
+
+    #[test]
+    fn parses_credential_create() {
+        let line = [
+            "s3",
+            "credential",
+            "create",
+            "--group",
+            "lab",
+            "--account",
+            "a@r",
+        ];
+        let Command::S3(S3Command::Credential(command)) = parse(&line).unwrap().command else {
+            panic!("expected s3 credential");
+        };
+        let CredentialCommand::Create {
+            group,
+            account,
+            expires,
+            paths,
+        } = command;
+        assert_eq!(
+            (group.as_str(), account.as_str(), expires),
+            ("lab", "a@r", None)
+        );
+        assert!(paths.is_empty());
+        let longer = [&line[..], &["--expires", "30d"]].concat();
+        assert!(parse(&longer).is_ok());
+        assert!(parse(&line[..5]).is_err(), "the account is required");
+
+        let scoped = [&line[..], &["--path", "shared-bucket/elabftw/**"]].concat();
+        let scoped = [&scoped[..], &["--path", "READ=shared-bucket/a=b"]].concat();
+        let Command::S3(S3Command::Credential(command)) = parse(&scoped).unwrap().command else {
+            panic!("expected s3 credential");
+        };
+        let CredentialCommand::Create { paths, .. } = command;
+        let scope = |pattern: &str, permission| PathScope {
+            pattern: pattern.to_string(),
+            permission,
+        };
+        let expected = [
+            scope("shared-bucket/elabftw/**", "WRITE"),
+            scope("shared-bucket/a=b", "READ"),
+        ];
+        assert_eq!(paths, expected);
+        let empty = [&line[..], &["--path", "write="]].concat();
+        assert!(parse(&empty).is_err(), "an empty pattern is refused");
     }
 
     #[test]

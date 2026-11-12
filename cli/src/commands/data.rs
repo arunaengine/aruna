@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{Context, resolve_group};
-use crate::args::{BucketsCommand, S3Command, ShareArgs, ShareMode};
+use crate::args::{BucketsCommand, CredentialCommand, ShareArgs, ShareMode};
 use crate::client::Api;
 use crate::error::{CliError, s3_error};
 use crate::output::human_size;
@@ -186,8 +186,11 @@ pub async fn search(
     context.out.listing(&answer, &["TYPE", "NAME", "ID"], rows)
 }
 
-pub async fn s3_env(context: &mut Context<'_>, command: S3Command) -> Result<(), CliError> {
-    let S3Command::Env { group, show_secret } = command;
+pub async fn s3_env(
+    context: &mut Context<'_>,
+    group: String,
+    show_secret: bool,
+) -> Result<(), CliError> {
     let api = context.api()?;
     let group_id = resolve_group(&api, &group).await?;
     let node_api = match &context.node {
@@ -316,6 +319,85 @@ async fn share_request(api: &Api, body: &Value) -> Result<ShareDetails, CliError
     api.send(Method::POST, "shares", body).await
 }
 
+#[derive(Deserialize)]
+struct IssuedCredential {
+    access_key_id: String,
+    access_secret: String,
+}
+
+/// Issues a service account credential on the chosen node and prints its secret once.
+pub async fn s3_credential(
+    context: &mut Context<'_>,
+    command: CredentialCommand,
+) -> Result<(), CliError> {
+    let CredentialCommand::Create {
+        group,
+        account,
+        expires,
+        paths,
+    } = command;
+    let api = context.api()?;
+    let group_id = resolve_group(&api, &group).await?;
+    let node_api = match &context.node {
+        Some(node) => api.for_node(node).await?,
+        None => api,
+    };
+    let mut body = serde_json::json!({});
+    if let Some(expires) = &expires {
+        body["expires_in_seconds"] = lifetime_secs(expires, chrono::Utc::now())?.into();
+    }
+    if !paths.is_empty() {
+        let scopes = paths.iter().map(
+            |scope| serde_json::json!({ "pattern": scope.pattern, "permission": scope.permission }),
+        );
+        body["path_restrictions"] = scopes.collect::<Vec<_>>().into();
+    }
+    // Looked up first: once the credential exists, its secret must reach the caller.
+    let fallback = context.s3_endpoint.as_deref();
+    let endpoint = transfer::node_endpoint(&node_api, fallback, node_api.base()).await;
+    let path = format!("access/groups/{group_id}/service-accounts/{account}/credentials");
+    let issued: IssuedCredential = node_api.send(Method::POST, &path, &body).await?;
+    eprintln!("warning: the secret is shown only now; anyone who sees it can use the credential");
+    let endpoint = endpoint.ok();
+    if context.out.json {
+        return context.out.json(&serde_json::json!({
+            "endpoint": endpoint,
+            "region": S3_REGION,
+            "group_id": group_id,
+            "account_id": account,
+            "access_key_id": issued.access_key_id,
+            "secret_access_key": issued.access_secret,
+        }));
+    }
+    let lines = [
+        format!("# S3 credential of {account} in group {group_id}; valid only on this node"),
+        match endpoint {
+            Some(endpoint) => format!("endpoint: {endpoint}"),
+            None => "# this node publishes no S3 endpoint; pass --s3-endpoint".to_string(),
+        },
+        format!("region: {S3_REGION}"),
+        format!("access_key_id: {}", issued.access_key_id),
+        format!("secret_access_key: {}", issued.access_secret),
+    ];
+    for line in lines {
+        context.out.line(line)?;
+    }
+    Ok(())
+}
+
+/// Whole seconds from `now` until `raw`, a lifetime or a time as `parse_expiry` reads them.
+fn lifetime_secs(raw: &str, now: chrono::DateTime<chrono::Utc>) -> Result<i64, CliError> {
+    let now = chrono::SubsecRound::trunc_subsecs(now, 0);
+    let end = parse_expiry(raw, now)?;
+    let end = chrono::DateTime::parse_from_rfc3339(&end)
+        .map_err(|error| CliError::usage(format!("{raw}: {error}")))?;
+    let seconds = (end.with_timezone(&chrono::Utc) - now).num_seconds();
+    if seconds <= 0 {
+        return Err(CliError::usage(format!("{raw} is not in the future")));
+    }
+    Ok(seconds)
+}
+
 /// An RFC 3339 time, or a lifetime such as `7d`, `12h` or `30m` from `now`.
 pub fn parse_expiry(raw: &str, now: chrono::DateTime<chrono::Utc>) -> Result<String, CliError> {
     let invalid = || {
@@ -345,6 +427,18 @@ pub fn parse_expiry(raw: &str, now: chrono::DateTime<chrono::Utc>) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifetime_in_seconds() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(lifetime_secs("365d", now).unwrap(), 31_536_000);
+        assert_eq!(lifetime_secs("2026-11-01T11:00:00Z", now).unwrap(), 3_600);
+        assert!(lifetime_secs("2026-11-01T09:00:00Z", now).is_err());
+        let fractional = now + chrono::Duration::milliseconds(500);
+        assert_eq!(lifetime_secs("1m", fractional).unwrap(), 60);
+    }
 
     #[test]
     fn parses_share_expiry() {

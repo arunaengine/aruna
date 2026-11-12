@@ -104,7 +104,7 @@ async fn request_session(
 }
 
 /// The S3 endpoint `api`'s node publishes, else `fallback`.
-async fn node_endpoint(
+pub(crate) async fn node_endpoint(
     api: &Api,
     fallback: Option<&str>,
     node_id: &str,

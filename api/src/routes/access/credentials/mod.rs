@@ -459,7 +459,7 @@ pub async fn create_s3_credentials(
     let expiry = credential_expiry(
         SystemTime::now(),
         request.expires_in_seconds,
-        bearer.expires_at_secs(),
+        Some(bearer.expires_at_secs()),
     )?;
     let buckets: BTreeSet<String> = request
         .encrypted_buckets
@@ -663,11 +663,11 @@ fn format_node_id(bytes: [u8; 32]) -> String {
         .unwrap_or_else(|_| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// The requested lifetime, ending no later than the bearer that mints the credential.
-fn credential_expiry(
+/// The requested lifetime, ending no later than `bearer_expiry` when the credential is the bearer's.
+pub(crate) fn credential_expiry(
     now: SystemTime,
     expires_in_seconds: Option<u64>,
-    bearer_expiry: u64,
+    bearer_expiry: Option<u64>,
 ) -> ServerResult<SystemTime> {
     const MIN_TTL: u64 = 60;
     const MAX_TTL: u64 = DEFAULT_CREDENTIAL_TTL.as_secs();
@@ -680,8 +680,8 @@ fn credential_expiry(
     let requested = now
         .checked_add(Duration::from_secs(ttl))
         .ok_or(ServerError::BadRequest)?;
-    let expiry = SystemTime::UNIX_EPOCH
-        .checked_add(Duration::from_secs(bearer_expiry))
+    let expiry = bearer_expiry
+        .and_then(|bearer| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(bearer)))
         .map_or(requested, |bearer_end| requested.min(bearer_end));
     if expiry < now + Duration::from_secs(MIN_TTL) {
         return Err(ServerError::BadRequest);
@@ -885,7 +885,7 @@ fn merge_effective_restrictions(
 /// A credential never exceeds the caller's own grant, so any member who may
 /// read part of the group data may take one; only a caller left without an
 /// allowed scope is refused.
-async fn authorize_credential_issuance(
+pub(crate) async fn authorize_credential_issuance(
     auth: &AuthContext,
     state: &ServerState,
     group_id: Ulid,
