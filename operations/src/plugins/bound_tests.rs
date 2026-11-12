@@ -294,3 +294,73 @@ async fn slots_bind() {
         "a basic secret for a bearer slot"
     );
 }
+
+/// Writes the group secret `hook-key` of kind `header`, checking the header `checked`.
+async fn hook_secret(fixture: &Fixture, install: &PluginInstall, checked: &str, round: u64) {
+    let name = SecretName::try_from("hook-key".to_string()).unwrap();
+    let settings = SecretSettings::from([("header".to_string(), checked.to_string())]);
+    let change = match round {
+        0 => SecretChange::Create {
+            name,
+            kind: SecretKind::parse("header").unwrap(),
+            description: String::new(),
+            settings,
+            uses: Vec::new(),
+            fields: SecretFields::new([("value".to_string(), Secret::new(TOKEN))].into()),
+        },
+        _ => SecretChange::Replace {
+            name,
+            description: String::new(),
+            settings,
+            uses: Vec::new(),
+            expected: None,
+        },
+    };
+    let input = OwnerChange {
+        realm_id: fixture.actor.realm_id,
+        node_id: fixture.actor.node_id,
+        owner: SecretOwner::Group(install.group_id),
+        actor: fixture.actor.user_id,
+        change,
+        readable: false,
+        now_ms: 1 + round,
+        write_ids: [1, 2, 3].map(|part| Ulid::from_parts(88 + round, part)),
+        txn_id: None,
+    };
+    drive(OwnerSecretOperation::new(input), &fixture.ctx)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn delivery_clashes() {
+    let fixture = Fixture::keyed().await;
+    let install = bound(&fixture).await;
+    let hook = json!({
+        "secrets": { "hook_key": { "title": "Hook key", "kind": "header" } },
+        "triggers": { "webhook": { "verify": "hook_key", "delivery_id": "x-delivery" } }
+    });
+    let digest = fixture.publish("0.3.0", "ef", hook).await;
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let plugin = pick_version(&config, &install.plugin, Some(&digest)).unwrap();
+    let manifest = read_manifest(&plugin).unwrap();
+    let place = BindPlace {
+        group_id: install.group_id,
+        local: None,
+        receiver: None,
+    };
+    let requested = BTreeMap::from([("hook_key".to_string(), "group:hook-key".to_string())]);
+    let bind = || bind_slots(&fixture.ctx, &config, place, &manifest, &requested);
+    hook_secret(&fixture, &install, "x-signature", 0).await;
+    assert!(bind().await.is_ok());
+    // An edit that makes the checked header the delivery id fails closed at install and receipt.
+    hook_secret(&fixture, &install, "X-Delivery", 1).await;
+    assert!(matches!(bind().await, Err(BindError::Invalid(_))));
+    let binding = SecretBinding::parse("group:hook-key").unwrap();
+    let selected = select(&fixture.ctx, &config, &install, &binding).await;
+    let selected = selected.unwrap().unwrap();
+    assert!(delivery_clash(&manifest, "hook_key", &selected.settings));
+    assert!(!delivery_clash(&manifest, "api_key", &selected.settings));
+}

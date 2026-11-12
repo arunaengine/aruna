@@ -343,6 +343,11 @@ impl Manifest {
             {
                 return Err(invalid("the delivery id must be a lowercase header name"));
             }
+            if trigger.delivery_id.as_deref().is_some_and(reserved_header) {
+                return Err(invalid(
+                    "the delivery id names a credential or reserved header",
+                ));
+            }
         }
         match kind.needs() {
             Some(permission) if !self.requested().contains(&permission) => {
@@ -452,6 +457,25 @@ pub fn valid_header(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_.".contains(&b))
+}
+
+/// Headers a delivery id may not name: credentials, and those the host frames or relays with.
+pub fn reserved_header(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "authorization",
+        "connection",
+        "content-length",
+        "cookie",
+        "host",
+        "keep-alive",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "x-aruna-relay-hop",
+    ];
+    RESERVED.contains(&name.to_ascii_lowercase().as_str())
 }
 
 fn valid_title(title: &str) -> bool {

@@ -16,6 +16,7 @@ use aruna_core::realm_vault::{RealmSealKey, RealmSecretRef, RealmVaultKey, Realm
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
 use aruna_core::secrets::{SecretKind, SecretName, SecretRecord, SecretSettings, UseRule};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_plugins::trigger::TriggerKind;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -264,13 +265,19 @@ pub async fn bind_slots(
         let kind = vault_kind(declared.kind).ok_or_else(invalid)?;
         let shown = kind.as_str();
         let missing = || BindError::Invalid(format!("no {shown} secret `{binding}` for `{slot}`"));
-        match binding.scope {
+        // A node secret's settings live on the receiver, which checks them on every delivery.
+        let settings = match binding.scope {
             BoundScope::Group => {
                 let owner = SecretOwner::Group(place.group_id);
                 let entry = read_entry(ctx, config.realm_id, &owner, &binding.name).await;
                 let entry = entry.map_err(|error| BindError::Unavailable(error.to_string()))?;
-                if !entry.is_some_and(|entry| entry.kind() == Some(&kind)) {
-                    return Err(missing());
+                let entry = entry.filter(|entry| entry.kind() == Some(&kind));
+                match entry.as_ref().and_then(|entry| entry.info.as_ref()) {
+                    Some(info) => match &info.body {
+                        SecretBody::Info(info) => Some(info.settings.clone()),
+                        _ => None,
+                    },
+                    None => return Err(missing()),
                 }
             }
             BoundScope::Realm => {
@@ -278,12 +285,12 @@ pub async fn bind_slots(
                     .secrets
                     .iter()
                     .find(|record| record.name == binding.name);
-                if !record.is_some_and(|record| record.kind == kind) {
-                    return Err(missing());
-                }
+                let record = record.filter(|record| record.kind == kind);
+                let record = record.ok_or_else(missing)?;
                 warnings.push(format!(
                     "a realm admin adds the use rule of `{binding}` for `{slot}`"
                 ));
+                Some(record.settings.clone())
             }
             BoundScope::Node => {
                 let (Some(local), Some(receiver)) = (place.local, place.receiver) else {
@@ -301,11 +308,30 @@ pub async fn bind_slots(
                 warnings.push(format!(
                     "a realm admin adds the use rule of `{binding}` for `{slot}`"
                 ));
+                None
             }
+        };
+        if settings.is_some_and(|settings| delivery_clash(manifest, slot, &settings)) {
+            return Err(BindError::Invalid(format!(
+                "the webhook's delivery id is the header `{binding}` checks"
+            )));
         }
         bindings.insert(slot.clone(), binding);
     }
     Ok((bindings, warnings))
+}
+
+/// Whether the webhook that `slot` verifies reads its delivery id from the header the secret
+/// checks, so the id would carry the credential. Install and receiver both refuse it.
+pub fn delivery_clash(
+    manifest: &aruna_plugins::manifest::Manifest,
+    slot: &str,
+    settings: &SecretSettings,
+) -> bool {
+    let hook = manifest.triggers.get(&TriggerKind::Webhook);
+    let hook = hook.filter(|hook| hook.verify.as_deref() == Some(slot));
+    let id = hook.and_then(|hook| hook.delivery_id.as_deref());
+    (id.zip(settings.get("header"))).is_some_and(|(id, header)| id.eq_ignore_ascii_case(header))
 }
 
 /// Why slots could not be bound.
