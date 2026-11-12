@@ -40,6 +40,7 @@ use super::intents::open_intent;
 use super::journal::prune_journal;
 use super::matcher::match_pending;
 use super::outbound::Outbound;
+use super::prune::{prune_hooks, prune_uses};
 use super::receiver::{eligible, lost_reason};
 use super::release::ReleaseKeys;
 use super::replay::{plan_replays, run_replays};
@@ -219,7 +220,9 @@ impl Worker {
         let config = read_config(&self.ctx, self.realm_id).await;
         let config = config.map_err(|error| error.to_string())?;
         let swept = sweep_events(&self.ctx, &config, now_ms).await;
-        swept.map_err(|error| error.to_string())
+        let swept = swept.map_err(|error| error.to_string())?;
+        let hooks = prune_hooks(&self.ctx, &config, now_ms).await;
+        Ok(swept + hooks.map_err(|error| error.to_string())?)
     }
 
     /// Sends connection requests through `outbound` instead of the node's egress client.
@@ -570,6 +573,9 @@ pub fn spawn_worker(
                 }
                 if let Err(error) = prune_seen(&worker.ctx, now).await {
                     warn!(%error, "Could not prune plugin event dedup records");
+                }
+                if let Err(error) = prune_uses(&worker.ctx, now).await {
+                    warn!(%error, "Could not prune plugin secret use audit rows");
                 }
                 if let Err(error) = worker.sweep(now).await {
                     warn!(%error, "Could not delete stale plugin event rows");

@@ -22,6 +22,7 @@ pub mod journal;
 pub mod lifecycle;
 pub mod matcher;
 pub mod outbound;
+pub mod prune;
 pub mod publish;
 pub mod rate;
 pub mod receiver;
