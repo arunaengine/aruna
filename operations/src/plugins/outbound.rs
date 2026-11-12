@@ -25,6 +25,9 @@ pub enum SendError {
     NotSent(String),
     #[error("the request may have been sent: {0}")]
     Unknown(String),
+    /// The destination answered, but its answer does not fit the bound.
+    #[error("the answer with status {status} is larger than 1 MiB")]
+    TooLarge { status: u16 },
 }
 
 #[async_trait]
@@ -58,9 +61,17 @@ impl Outbound for Egress {
             Err(error) => return Err(SendError::Unknown(error.without_url().to_string())),
         };
         let status = response.status().as_u16();
-        let headers = (response.headers().iter())
+        let headers: Vec<(String, String)> = (response.headers().iter())
             .filter_map(|(name, value)| Some((name.to_string(), value.to_str().ok()?.to_string())))
             .collect();
+        // The bound covers the whole answer the guest may get: headers and body together.
+        let head: usize = headers
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        if head > MAX_RESPONSE {
+            return Err(SendError::TooLarge { status });
+        }
         let mut read = Vec::new();
         loop {
             let chunk = response.chunk().await;
@@ -68,8 +79,8 @@ impl Outbound for Egress {
             let Some(chunk) = chunk else {
                 break;
             };
-            if read.len() + chunk.len() > MAX_RESPONSE {
-                return Err(SendError::Unknown("the answer is larger than 1 MiB".into()));
+            if head + read.len() + chunk.len() > MAX_RESPONSE {
+                return Err(SendError::TooLarge { status });
             }
             read.extend_from_slice(&chunk);
         }

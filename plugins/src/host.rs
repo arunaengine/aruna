@@ -191,6 +191,11 @@ impl Session {
             Needs::Permission(permission) => self.permissions.contains(&permission),
             Needs::Connection(name) => self.connections.contains_key(name),
         };
+        // The reply's charge is held back first, so a call never ends the run on its way back.
+        if granted && !self.meter.reserve() {
+            let message = "the run has too few bytes left for a reply";
+            return Ok(Err(HostError::new(ErrorKind::Limit, message)));
+        }
         if !granted {
             let what = match needs {
                 Needs::Permission(permission) => format!("permission `{permission}`"),
@@ -214,9 +219,22 @@ impl Session {
         }))
     }
 
-    pub(crate) fn finish(&mut self, size: usize) -> wasmtime::Result<()> {
+    /// Ends a started call: releases its reservation, refuses a reply over the per-call bound
+    /// with an error the guest can catch, and charges what the guest gets.
+    pub(crate) fn finish<R>(
+        &mut self,
+        reply: Result<R, HostError>,
+        size: usize,
+    ) -> wasmtime::Result<Result<R, HostError>> {
         self.pending -= 1;
-        self.charge(size)
+        self.meter.release();
+        if size as u64 <= self.meter.per_call {
+            self.charge(size)?;
+            return Ok(reply);
+        }
+        let message = format!("the reply is larger than {} bytes", self.meter.per_call);
+        self.charge(message.len())?;
+        Ok(Err(HostError::new(ErrorKind::Limit, message)))
     }
 }
 
@@ -326,6 +344,8 @@ impl ResourceLimiter for Session {
 pub(crate) struct Meter {
     calls: AtomicU64,
     bytes: AtomicU64,
+    /// Bytes held back for the replies of calls in flight, one per-call bound each.
+    reserved: AtomicU64,
     /// 0 while within budget, else 1 for bytes or 2 for calls.
     exhausted: AtomicU8,
     max_calls: u64,
@@ -338,6 +358,7 @@ impl Meter {
         Self {
             calls: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            reserved: AtomicU64::new(0),
             exhausted: AtomicU8::new(0),
             max_calls: u64::from(limits.calls),
             per_call: limits.call_bytes as u64,
@@ -359,6 +380,34 @@ impl Meter {
             .fetch_add(size, Ordering::Relaxed)
             .saturating_add(size);
         self.within(size <= self.per_call && used <= self.total, 1)
+    }
+
+    /// Holds back one per-call bound for a reply; false, without exhausting the run, when the
+    /// rest of the run's bytes cannot take it.
+    fn reserve(&self) -> bool {
+        let mut reserved = self.reserved.load(Ordering::Relaxed);
+        loop {
+            let used = self.bytes.load(Ordering::Relaxed);
+            let needed = used.saturating_add(reserved).saturating_add(self.per_call);
+            if needed > self.total {
+                return false;
+            }
+            let next = reserved + self.per_call;
+            let swapped = (self.reserved).compare_exchange(
+                reserved,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            match swapped {
+                Ok(_) => return true,
+                Err(current) => reserved = current,
+            }
+        }
+    }
+
+    fn release(&self) {
+        self.reserved.fetch_sub(self.per_call, Ordering::Relaxed);
     }
 
     fn within(&self, within: bool, code: u8) -> bool {

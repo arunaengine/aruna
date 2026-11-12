@@ -71,8 +71,7 @@ impl Session {
             Ok(reply) => reply_size(reply),
             Err(error) => error.message.len(),
         };
-        self.finish(size)?;
-        Ok(reply)
+        self.finish(reply, size)
     }
 }
 

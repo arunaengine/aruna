@@ -65,6 +65,13 @@ impl Broker for Recorder {
         self.note("metadata_get");
         match resource {
             "missing" => return Err(HostError::new(ErrorKind::NotFound, "x".repeat(200))),
+            "huge" => {
+                return Ok(Document {
+                    resource: resource.to_string(),
+                    revision: "r1".into(),
+                    json: format!(r#"{{"name":"{}"}}"#, "x".repeat(8192)),
+                });
+            }
             "slow" => tokio::time::sleep(Duration::from_millis(50)).await,
             "block" => {
                 self.blocked.notify_one();
@@ -478,6 +485,32 @@ async fn error_bytes_bounded() {
         matches!(ended, Err(InvokeError::Limit(Limit::Bytes))),
         "missing grants count: {ended:?}"
     );
+}
+
+#[tokio::test]
+async fn oversized_replies_caught() {
+    // A reply over the per-call bound reaches the guest as an error it returns as a failure,
+    // instead of ending the run on the byte budget.
+    let mut huge = probe(serde_json::json!({"call": "metadata_get", "resource": "huge"}));
+    huge.limits.call_bytes = 4096;
+    let ended = invoke(huge, Arc::default()).await;
+    let Err(InvokeError::Guest(failure)) = ended else {
+        panic!("the guest saw no error: {ended:?}");
+    };
+    assert!(
+        failure.message.contains("larger than 4096 bytes"),
+        "{failure:?}"
+    );
+    // A run whose remaining bytes cannot take a reply is refused before the call is sent.
+    let broker = Arc::new(Recorder::default());
+    let mut short = probe(serde_json::json!({"call": "metadata_get", "resource": "D1"}));
+    (short.limits.call_bytes, short.limits.bytes) = (4096, 4096);
+    let ended = invoke(short, broker.clone()).await;
+    let Err(InvokeError::Guest(failure)) = ended else {
+        panic!("the guest saw no error: {ended:?}");
+    };
+    assert!(failure.message.contains("too few bytes"), "{failure:?}");
+    assert!(broker.calls().is_empty(), "{:?}", broker.calls());
 }
 
 #[tokio::test]

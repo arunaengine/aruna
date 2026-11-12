@@ -533,7 +533,7 @@ impl Broker for RunBroker {
 
     async fn connection_send(
         &self,
-        _cx: &CallContext,
+        cx: &CallContext,
         request: SendRequest,
     ) -> Result<Response, HostError> {
         let mut ready = self.ready(request).await?;
@@ -551,14 +551,24 @@ impl Broker for RunBroker {
         } = ready;
         let Some(intent) = intent else {
             let answer = self.outbound.send(outgoing, body).await;
-            let answer = answer.map_err(|error| unavailable(error.to_string()))?;
+            let answer = answer.map_err(send_refusal)?;
             return Ok(exposed(&exposure, &fields, &answer));
         };
         if let Some(reply) = self.begun(&intent).await? {
             return Ok(kept(stored_reply(&reply)?, &exposure));
         }
+        // A sent request's answer that does not fit is stored as a marker before it is refused,
+        // so a rerun answers the same refusal and never sends again.
         let outcome = match self.outbound.send(outgoing, body).await {
-            Ok(answer) => Ok(reply_text(&exposed(&exposure, &fields, &answer))),
+            Ok(answer) => {
+                let shown = exposed(&exposure, &fields, &answer);
+                let size = shown.json.as_ref().map_or(0, String::len) + 2;
+                Ok(match size > cx.max_bytes {
+                    true => too_large(answer.status),
+                    false => reply_text(&shown),
+                })
+            }
+            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
             Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
             Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
         };
@@ -567,7 +577,7 @@ impl Broker for RunBroker {
 
     async fn connection_send_full(
         &self,
-        _cx: &CallContext,
+        cx: &CallContext,
         request: SendRequest,
     ) -> Result<FullResponse, HostError> {
         let ready = self.ready(request).await?;
@@ -578,14 +588,24 @@ impl Broker for RunBroker {
         }
         let Some(intent) = ready.intent else {
             let answer = self.outbound.send(ready.outgoing, ready.body).await;
-            let answer = answer.map_err(|error| unavailable(error.to_string()))?;
+            let answer = answer.map_err(send_refusal)?;
             return Ok(whole(&ready.fields, &answer));
         };
         if let Some(reply) = self.begun(&intent).await? {
             return stored_whole(&reply);
         }
         let outcome = match self.outbound.send(ready.outgoing, ready.body).await {
-            Ok(answer) => Ok(whole_text(&whole(&ready.fields, &answer))),
+            Ok(answer) => {
+                let shown = whole(&ready.fields, &answer);
+                let head: usize = (shown.headers.iter())
+                    .map(|field| field.name.len() + field.value.len())
+                    .sum();
+                Ok(match head + shown.body.len() + 2 > cx.max_bytes {
+                    true => too_large(answer.status),
+                    false => whole_text(&shown),
+                })
+            }
+            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
             Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
             Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
         };
@@ -1095,9 +1115,36 @@ fn whole_text(reply: &FullResponse) -> String {
     serde_json::json!({ "status": reply.status, "headers": headers, "body": body }).to_string()
 }
 
+/// The stored reply of a sent request whose answer did not fit the call.
+fn too_large(status: u16) -> String {
+    serde_json::json!({ "status": status, "too_large": true }).to_string()
+}
+
+/// The refusal a stored too-large marker answers with, every time it is replayed.
+fn refuse_large(value: &Value) -> Result<(), HostError> {
+    if value.get("too_large").and_then(Value::as_bool) != Some(true) {
+        return Ok(());
+    }
+    let status = value
+        .get("status")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let message = format!("the answer with status {status} is larger than the call allows");
+    Err(HostError::new(ErrorKind::Limit, message))
+}
+
+/// A send that has no stored intent: an answer that does not fit is a limit, others unavailable.
+fn send_refusal(error: SendError) -> HostError {
+    match error {
+        SendError::TooLarge { .. } => HostError::new(ErrorKind::Limit, error.to_string()),
+        error => unavailable(error.to_string()),
+    }
+}
+
 fn stored_whole(reply: &str) -> Result<FullResponse, HostError> {
     let broken = || unavailable("a stored whole answer does not decode");
     let value: Value = serde_json::from_str(reply).map_err(|_| broken())?;
+    refuse_large(&value)?;
     let status = value
         .get("status")
         .and_then(Value::as_u64)
@@ -1150,6 +1197,7 @@ fn reply_text(response: &Response) -> String {
 fn stored_reply(reply: &str) -> Result<Response, HostError> {
     let value: Value =
         serde_json::from_str(reply).map_err(|error| unavailable(error.to_string()))?;
+    refuse_large(&value)?;
     let status = value
         .get("status")
         .and_then(Value::as_u64)
