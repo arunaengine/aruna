@@ -657,6 +657,10 @@ pub(crate) mod tests {
         ("POST", "/access/groups/{id}/service-accounts"),
         (
             "POST",
+            "/access/groups/{id}/service-accounts/{account_id}/credentials",
+        ),
+        (
+            "POST",
             "/access/groups/{id}/service-accounts/{account_id}/tokens",
         ),
         ("POST", "/access/groups/{id}/roles"),

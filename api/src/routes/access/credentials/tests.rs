@@ -197,16 +197,27 @@ async fn create_credential(
 fn bearer_bounds_expiry() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let bearer = 1_000_000 + 3_600;
-    let expiry = credential_expiry(now, None, bearer).unwrap();
+    let expiry = credential_expiry(now, None, Some(bearer)).unwrap();
     assert_eq!(expiry, SystemTime::UNIX_EPOCH + Duration::from_secs(bearer));
-    let shorter = credential_expiry(now, Some(600), bearer).unwrap();
+    let shorter = credential_expiry(now, Some(600), Some(bearer)).unwrap();
     assert_eq!(shorter, now + Duration::from_secs(600));
+}
+
+#[test]
+fn uncapped_keeps_request() {
+    // A credential issued for another account does not end with the issuer's bearer.
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let year = DEFAULT_CREDENTIAL_TTL.as_secs();
+    let expiry = credential_expiry(now, None, None).unwrap();
+    assert_eq!(expiry, now + Duration::from_secs(year));
+    let result = credential_expiry(now, Some(year + 1), None);
+    assert!(matches!(result, Err(ServerError::BadRequest)));
 }
 
 #[test]
 fn ending_bearer_refused() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-    let result = credential_expiry(now, Some(600), 1_000_000 + 30);
+    let result = credential_expiry(now, Some(600), Some(1_000_000 + 30));
     assert!(matches!(result, Err(ServerError::BadRequest)));
 }
 

@@ -1,15 +1,18 @@
-//! Tests service account creation, listing, token issuance and refusals.
+//! Tests service account creation, listing, token and credential issuance, and refusals.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
 use crate::auth::handle_token;
 use crate::routes::access::audit::{AdminAuditQuery, list_admin_audit};
-use crate::tests::routes::{seed_group_docs, test_context, test_state, test_storage};
+use crate::tests::routes::{seed_group_docs, test_context, test_state, test_storage, write_doc};
 use aruna_core::keys::generate_signing_key;
-use aruna_core::structs::identity::auth::NodeCapabilities;
+use aruna_core::keyspaces::AUTH_KEYSPACE;
+use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction, Permission};
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::s3::access::get::GetAccessOperation;
 use aruna_operations::users::account_status::{AccountStatusConfig, AccountStatusOperation};
 use axum::extract::Query;
 use tempfile::TempDir;
@@ -105,6 +108,59 @@ async fn token(
     .map(|(_, Json(created))| created)
 }
 
+async fn credential(
+    fixture: &Fixture,
+    caller: &AuthContext,
+    account: &str,
+    request: ServiceCredentialRequest,
+) -> ServerResult<CreateS3Response> {
+    create_credential(
+        State(fixture.state.clone()),
+        Extension(Some(caller.clone())),
+        Path((fixture.group.clone(), account.to_string())),
+        Json(request),
+    )
+    .await
+    .map(|(_, Json(created))| created)
+}
+
+fn lifetime(seconds: u64) -> ServiceCredentialRequest {
+    ServiceCredentialRequest {
+        expires_in_seconds: Some(seconds),
+        path_restrictions: None,
+    }
+}
+
+fn actor(fixture: &Fixture) -> Actor {
+    Actor {
+        node_id: fixture.state.get_node_id(),
+        user_id: fixture.admin.user_id,
+        realm_id: fixture.admin.realm_id,
+    }
+}
+
+/// Rewrites the group's authorization so that `account` holds the role named `role`.
+async fn assign_role(fixture: &Fixture, account: &str, role: &str) {
+    let (realm_id, group_id) = (
+        fixture.admin.realm_id,
+        Ulid::from_string(&fixture.group).unwrap(),
+    );
+    let mut document =
+        GroupAuthorizationDocument::default_group_doc(fixture.admin.user_id, realm_id, group_id);
+    for entry in document
+        .roles
+        .values_mut()
+        .filter(|entry| entry.name == role)
+    {
+        entry
+            .assigned_users
+            .insert(UserId::from_string(account).unwrap());
+    }
+    let value = document.to_bytes(&actor(fixture)).unwrap();
+    let key = group_id.to_bytes().into();
+    write_doc(&fixture.state.get_ctx(), AUTH_KEYSPACE, key, value.into()).await;
+}
+
 fn as_account(fixture: &Fixture, account: &ServiceAccountResponse) -> AuthContext {
     AuthContext {
         user_id: UserId::from_string(&account.id).unwrap(),
@@ -178,6 +234,9 @@ async fn plugin_account_refused() {
         matches!(refused, Err(ServerError::Conflict(_))),
         "{refused:?}"
     );
+    let admin = fixture.admin.clone();
+    let refused = credential(&fixture, &admin, &account.to_string(), lifetime(600)).await;
+    assert!(matches!(refused, Err(ServerError::Conflict(_))));
 }
 
 #[tokio::test]
@@ -229,6 +288,8 @@ async fn deactivated_gets_nothing() {
         token(&fixture, &account.id, None).await,
         Err(ServerError::Conflict(_))
     ));
+    let refused = credential(&fixture, &fixture.admin, &account.id, lifetime(600)).await;
+    assert!(matches!(refused, Err(ServerError::Conflict(_))));
 }
 
 #[tokio::test]
@@ -290,4 +351,113 @@ async fn audit_rows_scoped() {
         let denied = read(caller, scope, None).await;
         assert!(matches!(denied, Err(ServerError::Forbidden)));
     }
+}
+
+#[tokio::test]
+async fn credential_outlives_tokens() {
+    // A credential far beyond the 24 hour token limit, confined to one prefix and audited.
+    let fixture = fixture().await;
+    let account = create(&fixture, &fixture.admin).await.unwrap();
+    assign_role(&fixture, &account.id, "user").await;
+    let days = 300 * 24 * 60 * 60;
+    let scope = CreatePathRestriction {
+        pattern: "shared-bucket/elabftw/**".to_string(),
+        permission: "WRITE".to_string(),
+    };
+    let request = ServiceCredentialRequest {
+        path_restrictions: Some(vec![scope]),
+        ..lifetime(days)
+    };
+    let before = SystemTime::now();
+    let created = credential(&fixture, &fixture.admin, &account.id, request)
+        .await
+        .unwrap();
+    assert!(created.key_requests.is_empty());
+
+    let get = GetAccessOperation::new(created.access_key_id.clone());
+    let stored = drive(get, &fixture.state.get_ctx()).await.unwrap();
+    assert_eq!(stored.user_identity.to_string(), account.id);
+    assert_eq!(stored.group_id.to_string(), fixture.group);
+    assert_eq!(stored.issued_by, *fixture.state.get_node_id().as_bytes());
+    assert!(stored.expiry >= before + std::time::Duration::from_secs(days));
+    let root = group_permission_path(
+        fixture.admin.realm_id,
+        Ulid::from_string(&fixture.group).unwrap(),
+        fixture.state.get_node_id(),
+    );
+    let confined = PathRestriction {
+        pattern: format!("{root}/shared-bucket/elabftw/**"),
+        permission: Permission::WRITE,
+    };
+    assert_eq!(stored.path_restrictions, Some(vec![confined]));
+
+    let Json(page) = list_admin_audit(
+        State(fixture.state.clone()),
+        Extension(Some(fixture.admin.clone())),
+        Query(AdminAuditQuery {
+            group_id: Some(fixture.group.clone()),
+            cursor: None,
+            limit: Some(10),
+            me: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let row = page.records.last().unwrap();
+    assert_eq!(row.action, "service_credential_issued");
+    assert_eq!(row.actor, fixture.admin.user_id.to_string());
+    assert_eq!(row.target, account.id);
+    assert_eq!(row.session_id, Some(created.access_key_id));
+}
+
+#[tokio::test]
+async fn credential_callers_refused() {
+    let fixture = fixture().await;
+    let account = create(&fixture, &fixture.admin).await.unwrap();
+    // Without usable access to the group's data the account gets no credential.
+    let refused = credential(&fixture, &fixture.admin, &account.id, lifetime(600)).await;
+    assert!(
+        matches!(refused, Err(ServerError::Forbidden)),
+        "{refused:?}"
+    );
+    assign_role(&fixture, &account.id, "user").await;
+
+    let realm_id = fixture.admin.realm_id;
+    let restricted = AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: format!("/{realm_id}/g/{}/**", fixture.group),
+            permission: Permission::WRITE,
+        }]),
+        ..fixture.admin.clone()
+    };
+    // The administrator of another group administers only that group's accounts.
+    let other_admin = AuthContext {
+        user_id: UserId::local(Ulid::generate(), realm_id),
+        ..fixture.admin.clone()
+    };
+    let (context, other_group) = (fixture.state.get_ctx(), Ulid::generate());
+    seed_group_docs(
+        &context,
+        realm_id,
+        &actor(&fixture),
+        other_group,
+        "lab",
+        other_admin.user_id,
+    )
+    .await;
+    let service = as_account(&fixture, &account);
+    for caller in [&restricted, &other_admin, &service] {
+        let refused = credential(&fixture, caller, &account.id, lifetime(600)).await;
+        assert!(
+            matches!(refused, Err(ServerError::Forbidden)),
+            "{refused:?}"
+        );
+    }
+
+    let year = 365 * 24 * 60 * 60;
+    let too_long = credential(&fixture, &fixture.admin, &account.id, lifetime(year + 1)).await;
+    assert!(matches!(too_long, Err(ServerError::BadRequest)));
+    let unknown = UserId::local(Ulid::generate(), realm_id).to_string();
+    let missing = credential(&fixture, &fixture.admin, &unknown, lifetime(600)).await;
+    assert!(matches!(missing, Err(ServerError::NotFound)));
 }
