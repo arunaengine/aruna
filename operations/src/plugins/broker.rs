@@ -18,6 +18,7 @@ use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::data::identity::{CONTENT_URL, DataIdentity};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
@@ -47,7 +48,6 @@ use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
-use crate::git::snapshot::unreadable_file;
 use crate::metadata::api::{
     ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, ListVisibleRequest,
     MetadataApiError, MetadataListOrder, RoCrateExportView, list_visible_documents,
@@ -246,17 +246,7 @@ impl RunBroker {
         let (install, auth) =
             (self.checked(Permission::MetadataWrite, &record.permission_path)).await?;
         if let Some(file) = file {
-            let readable = match self.listing(Permission::ObjectsRead).await {
-                Ok((_, readable)) => readable,
-                Err(_) => AuthContext {
-                    path_restrictions: Some(Vec::new()),
-                    ..auth.clone()
-                },
-            };
-            if let Some(named) = unreadable_file(&self.ctx, &readable, &[file]).await {
-                let message = format!("the plugin may not read the object {named} names");
-                return Err(HostError::new(ErrorKind::Denied, message));
-            }
+            self.objects_named(&install, &file).await?;
         }
         let run_id = self.scope.run.run_id;
         let earlier = written(&self.ctx, run_id, &change.intent).await;
@@ -342,6 +332,49 @@ impl RunBroker {
                 }
             }
         }
+    }
+
+    /// Checks each Aruna object a file entity names through the plugin's own `objects.read` call
+    /// check, grants and policies included, then that it lies in a bucket of the install's group
+    /// here. Forms that name no single object here (content hashes, global ids) are refused.
+    async fn objects_named(&self, install: &PluginInstall, file: &Value) -> Result<(), HostError> {
+        let realm_id = self.scope.realm_id;
+        let urls = match file.get(CONTENT_URL) {
+            Some(Value::Array(urls)) => urls.clone(),
+            Some(url) => vec![url.clone()],
+            None => Vec::new(),
+        };
+        let urls: Vec<String> = (urls.iter())
+            .filter_map(|url| url.as_str().or_else(|| url.get("@id")?.as_str()))
+            .map(str::to_string)
+            .collect();
+        let id = file.get("@id").and_then(Value::as_str).unwrap_or_default();
+        let refused = |what: &str| {
+            let message = format!("{what} names no object a plugin may check; use its path");
+            HostError::new(ErrorKind::Denied, message)
+        };
+        let group = install.group_id;
+        for value in std::iter::once(id).chain(urls.iter().map(String::as_str)) {
+            let identity = DataIdentity::read(value, &[]);
+            let path = if value.starts_with(&format!("/{realm_id}/g/")) {
+                value.to_string()
+            } else if let Some(exact) = identity.exact {
+                if exact.realm_id != realm_id {
+                    return Err(refused(value));
+                }
+                let (bucket, key) = (&exact.bucket, &exact.key);
+                object_permission_path(realm_id, group, exact.node_id, bucket, key)
+            } else if let Some(at) = identity.location {
+                object_permission_path(realm_id, group, self.scope.local, &at.bucket, &at.key)
+            } else if identity.is_aruna() {
+                return Err(refused(value));
+            } else {
+                continue;
+            };
+            self.checked(Permission::ObjectsRead, &path).await?;
+            self.object_at(install, &path).await?;
+        }
+        Ok(())
     }
 
     /// Looks a keyed create's document up on its holders under the account's authority.

@@ -598,7 +598,6 @@ async fn keyed_creates() {
         creator.metadata_create(&cx(), first).await,
         Ok(created.clone())
     );
-
     scope.run.run_id = Ulid::generate();
     let later = RunBroker::new(broker.ctx.clone(), scope);
     let edited = create("elabftw/exp-1", "Exp 1 edited", "e1", 0);
@@ -864,5 +863,54 @@ async fn file_puts() {
     let refused = broker
         .metadata_put_file(&cx(), put(document, &object, &current, 6))
         .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::NotGranted);
+}
+
+#[tokio::test]
+async fn object_references() {
+    // Every object a file names passes the plugin's own `objects.read` check: `s3://` and path
+    // references need the grant and pass its policies, content ids name no object to check.
+    let (fixture, broker, _, _dir) = broker().await;
+    let document = three_files(&fixture, &broker).await;
+    let revision = revision_of(&broker, document).await;
+    let (realm, group, node) = (
+        fixture.actor.realm_id,
+        fixture.group_id,
+        fixture.actor.node_id,
+    );
+    let file = |id: String| serde_json::json!({"@id": id, "@type": "File", "name": "o"});
+    let s3 = file("s3://data/a.txt".to_string());
+    let path = file(format!("/{realm}/g/{group}/data/{node}/data/a.txt"));
+    let hashed = aruna_core::structs::storage::data::identity::content_id([7; 32]);
+    let refusals = [
+        (&s3, ErrorKind::NotGranted),
+        (&path, ErrorKind::NotGranted),
+        (&file(hashed), ErrorKind::Denied),
+    ];
+    for (n, (file, kind)) in refusals.into_iter().enumerate() {
+        let change = put(document, file, &revision, n as u32);
+        let refused = broker.metadata_put_file(&cx(), change).await.unwrap_err();
+        assert_eq!(refused.kind, kind, "{file}");
+    }
+
+    let reads = serde_json::json!({ "permissions": {
+        "required": ["metadata.read", "metadata.write", "objects.read"] } });
+    let mut request = fixture.request(None);
+    request.version = Some(fixture.publish("0.1.4", "34", reads).await);
+    let installed = fixture.install(&request).await.unwrap();
+    let mut scope = broker.scope.clone();
+    scope.run.install_id = installed.install_id;
+    scope.run.digest = installed.digest.clone();
+    let reader = RunBroker::new(broker.ctx.clone(), scope);
+    fixture.deny(&["operation == 'plugin.objects.read'"]).await;
+    let refused = reader
+        .metadata_put_file(&cx(), put(document, &s3, &revision, 0))
+        .await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Denied);
+    // Without the deny the check passes; this fixture has no bucket `data`.
+    fixture.deny(&[]).await;
+    let missing = reader
+        .metadata_put_file(&cx(), put(document, &s3, &revision, 1))
+        .await;
+    assert_eq!(missing.unwrap_err().kind, ErrorKind::NotFound);
 }
