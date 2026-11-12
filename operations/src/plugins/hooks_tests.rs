@@ -12,6 +12,7 @@ use serde_json::json;
 use super::*;
 use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hook_secret, keys};
 use crate::plugins::install::tests::Fixture;
+use crate::plugins::outbound::tests::leaks;
 use crate::plugins::runs::list_runs;
 
 /// An install moved to a version whose webhook the `header` slot `hook_key` verifies, bound to
@@ -98,6 +99,11 @@ async fn admits_verified() {
     let stored = format!("{held:?}");
     for canary in [TOKEN, "canary-cookie", "canary-auth", "canary-wrong"] {
         assert!(!stored.contains(canary), "{canary}");
+        assert_eq!(
+            leaks(&fixture, canary).await,
+            Vec::<&str>::new(),
+            "{canary}"
+        );
     }
 }
 

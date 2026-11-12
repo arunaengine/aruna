@@ -1,5 +1,5 @@
-//! Tests connection sends through the real fixture guest with a fake sender: the URL stays below
-//! the connection, answers are projected once, redirects show their status only.
+//! Tests sends through the real fixture guest with a fake sender: the URL stays below the
+//! connection, answers are projected once, redirects show status only, no row holds the secret.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -397,4 +397,61 @@ async fn whole_answers_gated() {
         (answer.status, answer.body.as_slice()),
         (200, br#"{"id":1}"#.as_slice())
     );
+}
+
+/// The keyspaces with a row that holds `canary` in plain bytes.
+pub(crate) async fn leaks(fixture: &Fixture, canary: &str) -> Vec<&'static str> {
+    use aruna_core::keyspaces::KEYSPACE_CATALOG;
+    let txn = crate::plugins::store::Txn::direct(&fixture.ctx);
+    let held = |bytes: &Vec<u8>| {
+        bytes
+            .windows(canary.len())
+            .any(|part| part == canary.as_bytes())
+    };
+    let mut found = Vec::new();
+    for space in KEYSPACE_CATALOG {
+        let Ok(rows) = txn.scan(space, &[]).await else {
+            continue;
+        };
+        if rows.iter().any(|(key, value)| held(key) || held(value)) {
+            found.push(*space);
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn canaries_stay_hidden() {
+    use crate::plugins::bound::tests::{TOKEN, keys};
+    use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
+    use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+    let fixture = Fixture::keyed().await;
+    let install = secured_install(&fixture, &["/id", "/meta/name"]).await;
+    // The destination echoes the token in a readable field and in a header.
+    let echo = format!(r#"{{"id":7,"meta":{{"name":"Bearer {TOKEN}"}}}}"#);
+    let sender = Arc::new(Fake {
+        answer: Answer {
+            status: 200,
+            headers: vec![("x-echo".to_string(), format!("Bearer {TOKEN}"))],
+            body: echo.into_bytes(),
+        },
+        asked: Mutex::new(Vec::new()),
+    });
+    let input = serde_json::json!({
+        "call": "send", "connection": "api", "method": "POST", "path": "records", "body": {}
+    });
+    let worker = worker(&fixture);
+    worker.use_keys(keys());
+    let done = probe_with(&fixture, &install, (&worker, sender), input).await;
+    assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
+    // Run records, guest log lines, intents and audit rows hold no form of the value; the scan
+    // does find what is stored, such as the plugin's name.
+    assert_eq!(leaks(&fixture, TOKEN).await, Vec::<&str>::new());
+    assert!(!leaks(&fixture, &install.plugin).await.is_empty());
+    let txn = crate::plugins::store::Txn::direct(&fixture.ctx);
+    let audit = txn.scan(ADMIN_AUDIT_KEYSPACE, &[]).await.unwrap();
+    let uses = (audit.iter())
+        .filter_map(|(_, value)| AdminAuditRecord::from_bytes(value).ok())
+        .filter(|record| record.secret_use.is_some());
+    assert!(uses.count() > 0, "the use left no audit row");
 }
