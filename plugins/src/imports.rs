@@ -6,11 +6,13 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, Field, FullResponse, HostError, Intent,
-    Listing, MetadataPatch, Method, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FullResponse, HostError,
+    Intent, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo, ObjectPage, Response,
+    SendRequest, StatePut,
 };
 use crate::host::wit::aruna::plugin::{
-    connections, grants, log, metadata_read, metadata_write, objects_read, secrets, state, types,
+    connections, grants, log, metadata_create, metadata_read, metadata_write, objects_read,
+    secrets, state, types,
 };
 use crate::host::{Needs, Session};
 use crate::permission::Permission;
@@ -181,6 +183,34 @@ impl metadata_write::Host for Session {
             Needs::Permission(Permission::MetadataWrite),
             |broker, cx| async move { broker.metadata_patch(&cx, patch).await },
             String::len,
+        )
+        .await
+    }
+}
+
+impl metadata_create::Host for Session {
+    async fn create(
+        &mut self,
+        path: String,
+        dataset: String,
+        key: String,
+    ) -> wasmtime::Result<Result<Created, HostError>> {
+        let size = path.len() + dataset.len() + key.len();
+        let parts: [&[u8]; 3] = [path.as_bytes(), dataset.as_bytes(), key.as_bytes()];
+        let intent = Intent::new(self.next_ordinal(), Some(key.clone()), &parts);
+        let effect = Effect::Write(intent.clone());
+        let create = MetadataCreate {
+            path,
+            dataset,
+            key,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Permission(Permission::MetadataCreate),
+            |broker, cx| async move { broker.metadata_create(&cx, create).await },
+            |created: &Created| created.resource.len() + created.revision.len(),
         )
         .await
     }

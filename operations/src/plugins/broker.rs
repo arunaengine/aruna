@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use aruna_core::NodeId;
 use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
-use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun};
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields, header_name};
@@ -21,8 +21,9 @@ use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, Field, FullResponse, HostError, Intent,
-    Listing, MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FullResponse, HostError,
+    Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest,
+    StatePut,
 };
 use aruna_plugins::connection::{Readable, relative_path};
 use aruna_plugins::permission::Permission;
@@ -32,6 +33,7 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
+use super::creates::{Lookup, Step, claim_key, next_step};
 use super::grants::{InstallScope, accesses, parse_grants};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
@@ -41,13 +43,19 @@ use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
 use super::state::{PutError, check_key, put_state, read_state};
 use super::store::{StoreError, Txn, transact};
+use crate::auth::request_authorization::AuthorizeError;
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, ListVisibleRequest, MetadataApiError,
-    MetadataListOrder, RoCrateExportView, list_visible_documents,
+    ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, ListVisibleRequest,
+    MetadataApiError, MetadataListOrder, RoCrateExportView, list_visible_documents,
 };
-use crate::metadata::forward::{export_rocrate_routed, route_metadata_update};
+use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
+use crate::metadata::forward::{
+    CreateAuthorizedError, PinnedCreate, create_with_id, export_rocrate_routed,
+    get_metadata_routed, route_metadata_update,
+};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -215,6 +223,52 @@ impl RunBroker {
         match export.await.map_err(api_error)? {
             ExportMetadataResult::Full { record, jsonld } => Ok((record, jsonld)),
             _ => Err(unavailable("the document has no full export")),
+        }
+    }
+
+    /// Creates the keyed document once: the stored create goes to its stored node with its stored
+    /// arguments, and a key from an earlier call is looked up first, so a found one is adopted.
+    async fn keyed_create(
+        &self,
+        (actor, auth): (Actor, &AuthContext),
+        (install_id, key): (Ulid, &str),
+        minted: PinnedCreate,
+    ) -> Result<String, Outcome> {
+        let stored = claim_key(&self.ctx, (install_id, key), minted).await;
+        let (pinned, claim) = stored.map_err(|error| Outcome::None(unavailable(error.0)))?;
+        let mut lookup = None;
+        loop {
+            match next_step(claim, lookup) {
+                Step::Dispatch => {
+                    let extras = PolicyRequestExtras::operation("plugin.metadata.create");
+                    let created = create_with_id(&self.ctx, actor, (auth, extras), &pinned).await;
+                    let created = created.map_err(create_outcome)?;
+                    return Ok(created_text(
+                        &created.document_id,
+                        &created.establishing_event_id,
+                    ));
+                }
+                Step::Lookup => lookup = Some(self.look_up(pinned.document_id, auth).await),
+                Step::Adopt(revision) => return Ok(created_text(&pinned.document_id, &revision)),
+                Step::Unknown => {
+                    let reason = "the document of an earlier create with this key is not reachable";
+                    return Err(Outcome::Maybe(reason.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Looks a keyed create's document up on its holders under the account's authority.
+    async fn look_up(&self, document_id: Ulid, auth: &AuthContext) -> Lookup {
+        let request = GetVisibleRequest {
+            document_id,
+            auth: Some(auth.clone()),
+        };
+        let token = Some(AuthToken::Internal(auth.clone()));
+        match get_metadata_routed(&self.ctx, self.scope.realm_id, request, token).await {
+            Ok(record) => Lookup::Found(record.establishing_event_id),
+            Err(MetadataApiError::NotFound) => Lookup::Missing,
+            Err(_) => Lookup::Unreachable,
         }
     }
 
@@ -463,6 +517,52 @@ impl Broker for RunBroker {
             .map(|record| record.last_event_id.to_string())
             .map_err(write_outcome);
         self.record(&patch.intent, outcome).await
+    }
+
+    async fn metadata_create(
+        &self,
+        _cx: &CallContext,
+        create: MetadataCreate,
+    ) -> Result<Created, HostError> {
+        let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
+        let path = MetadataRegistryRecord::normalize_document_path(&create.path);
+        if path.is_empty() || path.contains('@') {
+            return Err(invalid("a dataset path is not empty and has no @"));
+        }
+        if create.key.is_empty() || create.key.len() > MAX_KEY {
+            return Err(invalid("a create key has 1 to 256 bytes"));
+        }
+        let current = self.admitted(None).await?;
+        let realm_id = self.scope.realm_id;
+        let target = format!("/{realm_id}/g/{}/meta/{path}", current.group_id);
+        let (install, auth) = self.checked(Permission::MetadataCreate, &target).await?;
+        // An invalid dataset is refused before its intent exists, so it leaves no uncertainty.
+        let jsonld = dataset_crate(&create.dataset)?;
+        if let Some(reply) = self.begun(&create.intent).await? {
+            return stored_created(&reply);
+        }
+        let actor = Actor {
+            node_id: self.scope.local,
+            user_id: install.account,
+            realm_id,
+        };
+        let run = self.scope.run.run_id;
+        let message = format!(
+            "plugin {} install {} run {run}",
+            install.plugin, install.install_id
+        );
+        let payload = (CreateDocumentPayload::RoCrate { jsonld }, Some(message));
+        let minted =
+            PinnedCreate::mint(&self.ctx, &actor, (install.group_id, &path), payload).await;
+        let outcome = match minted {
+            Ok(minted) => {
+                let key = (install.install_id, create.key.as_str());
+                self.keyed_create((actor, &auth), key, minted).await
+            }
+            Err(error) => Err(Outcome::None(unavailable(error.to_string()))),
+        };
+        let reply = self.record(&create.intent, outcome).await?;
+        stored_created(&reply)
     }
 
     async fn objects_info(&self, _cx: &CallContext, path: &str) -> Result<ObjectInfo, HostError> {
@@ -750,6 +850,105 @@ pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostEr
     let mut change = Value::Object(change);
     literal_objects(&mut change);
     Ok(change.to_string())
+}
+
+/// The crate a plugin create stores: the metadata descriptor and the dataset entity as its root.
+/// Plain object values become JSON literals as in a patch; nested entities are refused.
+pub(crate) fn dataset_crate(dataset: &str) -> Result<String, HostError> {
+    let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
+    let dataset: Value =
+        serde_json::from_str(dataset).map_err(|_| invalid("the dataset is not JSON"))?;
+    let Value::Object(mut fields) = dataset else {
+        return Err(invalid("the dataset is not a JSON object"));
+    };
+    if fields.get("@id").is_some_and(|id| id != "./") || fields.contains_key("@graph") {
+        return Err(invalid("the dataset is one root entity without @graph"));
+    }
+    let kinds = fields
+        .get("@type")
+        .cloned()
+        .unwrap_or(Value::from("Dataset"));
+    let dataset_kind = match &kinds {
+        Value::String(kind) => kind == "Dataset",
+        Value::Array(kinds) => kinds.iter().any(|kind| kind == "Dataset"),
+        _ => false,
+    };
+    if !dataset_kind {
+        return Err(invalid("the dataset's @type is not Dataset"));
+    }
+    // A reference names another entity by its @id alone; any other keyword object is an entity.
+    let entity = |value: &Value| {
+        (value.as_object()).is_some_and(|object| {
+            object.keys().any(|key| key.starts_with('@'))
+                && !(object.len() == 1 && object.contains_key("@id"))
+        })
+    };
+    let nested = fields.values().any(|value| match value {
+        Value::Array(entries) => entries.iter().any(entity),
+        value => entity(value),
+    });
+    if nested {
+        return Err(invalid("the dataset names other entities only by @id"));
+    }
+    fields.insert("@id".to_string(), Value::from("./"));
+    fields.insert("@type".to_string(), kinds);
+    let mut dataset = Value::Object(fields);
+    literal_objects(&mut dataset);
+    let descriptor = serde_json::json!({
+        "@id": "ro-crate-metadata.json",
+        "@type": "CreativeWork",
+        "about": {"@id": "./"},
+        "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+    });
+    let graph = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [descriptor, dataset],
+    });
+    let graph = graph.to_string();
+    craqle::validate_rocrate_jsonld(&graph).map_err(|error| invalid(&error.to_string()))?;
+    Ok(graph)
+}
+
+/// Bytes of a create key at most.
+const MAX_KEY: usize = 256;
+
+/// The intent reply of a create: the document id and its establishing revision.
+fn created_text(document_id: &Ulid, revision: &Ulid) -> String {
+    format!("{document_id} {revision}")
+}
+
+fn stored_created(reply: &str) -> Result<Created, HostError> {
+    let (resource, revision) = (reply.split_once(' '))
+        .ok_or_else(|| unavailable("the stored create reply is not readable"))?;
+    Ok(Created {
+        resource: resource.to_string(),
+        revision: revision.to_string(),
+    })
+}
+
+/// Whether a failed create had no effect, or may have had one.
+fn create_outcome(error: CreateAuthorizedError) -> Outcome {
+    let none = |kind, message: String| Outcome::None(HostError::new(kind, message));
+    match error {
+        CreateAuthorizedError::EmptyPath => none(ErrorKind::Invalid, error.to_string()),
+        CreateAuthorizedError::Forbidden
+        | CreateAuthorizedError::Authorize(
+            AuthorizeError::PermissionDenied | AuthorizeError::Policy(_),
+        ) => none(ErrorKind::Denied, error.to_string()),
+        CreateAuthorizedError::Authorize(_) | CreateAuthorizedError::Api(_) => {
+            Outcome::None(unavailable(error.to_string()))
+        }
+        CreateAuthorizedError::Create(CreateDocumentError::MetadataError(
+            MetadataError::ProfileValidation(_)
+            | MetadataError::Validation(_)
+            | MetadataError::InvalidInput(_),
+        )) => none(ErrorKind::Invalid, error.to_string()),
+        CreateAuthorizedError::Create(CreateDocumentError::HoldsNoBucket) => {
+            Outcome::None(unavailable(error.to_string()))
+        }
+        CreateAuthorizedError::Create(_) => Outcome::Maybe(error.to_string()),
+        CreateAuthorizedError::Write(error) => write_outcome(error),
+    }
 }
 
 /// Turns the dataset's JSON literals back into the objects a plugin wrote.

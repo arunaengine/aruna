@@ -114,6 +114,20 @@ interface metadata-write {
   ) -> result<string, host-error>;
 }
 
+/// Creates datasets of the group (`metadata.create`).
+interface metadata-create {
+  use types.{host-error};
+
+  record created {
+    %resource: string,
+    revision: string,
+  }
+
+  /// Creates a dataset at `path` below the group's metadata root from one dataset entity; the
+  /// same `key` of one install always names the same document.
+  create: func(path: string, dataset: string, key: string) -> result<created, host-error>;
+}
+
 /// Reads object information and listings of the group, never bytes (`objects.read`).
 interface objects-read {
   use types.{host-error};
@@ -214,6 +228,7 @@ world plugin {
   import grants;
   import metadata-read;
   import metadata-write;
+  import metadata-create;
   import objects-read;
   import connections;
   import state;

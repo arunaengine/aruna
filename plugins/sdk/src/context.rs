@@ -7,7 +7,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::bindings::aruna::plugin::{
-    connections, grants, log, metadata_read, metadata_write, objects_read, secrets, state,
+    connections, grants, log, metadata_create, metadata_read, metadata_write, objects_read,
+    secrets, state,
 };
 use crate::error::{Error, Result};
 
@@ -100,7 +101,7 @@ pub struct Listing {
     pub cursor: Option<String>,
 }
 
-/// Dataset metadata calls (`metadata.read`, `metadata.write`).
+/// Dataset metadata calls (`metadata.read`, `metadata.write`, `metadata.create`).
 #[derive(Debug, Clone, Copy)]
 pub struct Metadata;
 
@@ -140,6 +141,15 @@ impl Metadata {
         let text = serde_json::to_string(patch)?;
         let reply = metadata_write::patch(resource, &text, expected, key);
         reply.map_err(|err| Error::host(err, "metadata.write", resource))
+    }
+
+    /// Creates a dataset at `path` from one dataset entity; the same `key` always names the same
+    /// document. Returns the document and its first revision.
+    pub async fn create(&self, path: &str, dataset: &Value, key: &str) -> Result<(String, String)> {
+        let text = serde_json::to_string(dataset)?;
+        let created = metadata_create::create(path, &text, key)
+            .map_err(|err| Error::host(err, "metadata.create", path))?;
+        Ok((created.resource, created.revision))
     }
 }
 

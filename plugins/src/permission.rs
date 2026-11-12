@@ -113,6 +113,7 @@ impl Import {
             "types" | "log" | "state" | "grants" => Self::Free,
             "metadata-read" => Self::Needs(Permission::MetadataRead),
             "metadata-write" => Self::Needs(Permission::MetadataWrite),
+            "metadata-create" => Self::Needs(Permission::MetadataCreate),
             "objects-read" => Self::Needs(Permission::ObjectsRead),
             "secrets" => Self::Needs(Permission::SecretsValue),
             "connections" => Self::Connections,
@@ -149,6 +150,10 @@ mod tests {
         assert_eq!(
             Import::of("metadata-write"),
             Some(Import::Needs(Permission::MetadataWrite))
+        );
+        assert_eq!(
+            Import::of("metadata-create"),
+            Some(Import::Needs(Permission::MetadataCreate))
         );
         assert_eq!(Import::of("connections"), Some(Import::Connections));
         assert_eq!(Import::of("wasi:cli/environment"), None);

@@ -559,3 +559,89 @@ async fn secret_values_granted() {
     assert_eq!(fields, [("token".to_string(), TOKEN.to_string())]);
     assert_eq!(held.scrub(&format!("got {TOKEN}")), "got [redacted]");
 }
+
+/// A create of a dataset named `name` with the fields RO-Crate requires.
+fn create(path: &str, name: &str, key: &str, ordinal: u32) -> MetadataCreate {
+    let dataset = format!(r#"{{"name":"{name}","description":"d","datePublished":"2026-01-01"}}"#);
+    let dataset = dataset.as_str();
+    let parts: [&[u8]; 3] = [path.as_bytes(), dataset.as_bytes(), key.as_bytes()];
+    MetadataCreate {
+        path: path.to_string(),
+        dataset: dataset.to_string(),
+        key: key.to_string(),
+        intent: Intent::new(ordinal, Some(key.to_string()), &parts),
+    }
+}
+
+#[tokio::test]
+async fn keyed_creates() {
+    // A create below the granted path answers again from its intent, and a later run with the
+    // same key adopts the document instead of making a second one.
+    let (fixture, broker, _, _dir) = broker().await;
+    let meta = format!("/{}/g/{}/meta", fixture.actor.realm_id, fixture.group_id);
+    let creates = serde_json::json!({ "permissions": { "required": ["metadata.create"] } });
+    let mut request = fixture.request(None);
+    request.version = Some(fixture.publish("0.1.3", "12", creates).await);
+    request.grants = BTreeMap::from([(
+        "metadata.create".to_string(),
+        vec![format!("{meta}/elabftw/**")],
+    )]);
+    let installed = fixture.install(&request).await.unwrap();
+    let mut scope = broker.scope.clone();
+    scope.run.install_id = installed.install_id;
+    scope.run.digest = installed.digest.clone();
+    let creator = RunBroker::new(broker.ctx.clone(), scope.clone());
+    let first = create("elabftw/exp-1", "Exp 1", "e1", 0);
+    let created = creator.metadata_create(&cx(), first.clone()).await.unwrap();
+    project(&broker.ctx).await;
+    assert_eq!(
+        creator.metadata_create(&cx(), first).await,
+        Ok(created.clone())
+    );
+
+    scope.run.run_id = Ulid::generate();
+    let later = RunBroker::new(broker.ctx.clone(), scope);
+    let edited = create("elabftw/exp-1", "Exp 1 edited", "e1", 0);
+    assert_eq!(
+        later.metadata_create(&cx(), edited).await,
+        Ok(created.clone())
+    );
+    let other = create("elabftw/exp-2", "Exp 2", "e2", 1);
+    let second = later.metadata_create(&cx(), other).await.unwrap();
+    assert_ne!(second.resource, created.resource);
+
+    let outside = create("other/exp-3", "Exp 3", "e3", 2);
+    let refused = later.metadata_create(&cx(), outside).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::NotGranted);
+    let mut nested = create("elabftw/exp-4", "Exp 4", "e4", 3);
+    nested.dataset = r##"{"name":"Exp 4","author":{"@id":"#a","name":"A"}}"##.to_string();
+    let refused = later.metadata_create(&cx(), nested).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Invalid);
+    let mut incomplete = create("elabftw/exp-5", "Exp 5", "e5", 4);
+    incomplete.dataset = r#"{"name":"Exp 5"}"#.to_string();
+    let refused = later.metadata_create(&cx(), incomplete).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Invalid);
+}
+
+#[test]
+fn dataset_crates() {
+    let dataset = r##"{"name":"a","description":"d","datePublished":"2026-01-01","author":{"@id":"#p"},"extra":{"k":1}}"##;
+    let stored = dataset_crate(dataset).unwrap();
+    let stored: Value = serde_json::from_str(&stored).unwrap();
+    let dataset = &stored["@graph"][1];
+    assert_eq!(dataset["@id"], "./");
+    assert_eq!(dataset["@type"], "Dataset");
+    assert_eq!(dataset["author"], serde_json::json!({"@id": "#p"}));
+    assert_eq!(dataset["extra"]["@type"], JSON_LITERAL);
+    assert_eq!(stored["@graph"][0]["about"]["@id"], "./");
+    for refused in [
+        "[1]",
+        r#"{"@id":"./b"}"#,
+        r#"{"@type":"Person"}"#,
+        r#"{"@graph":[]}"#,
+        r#"{"hasPart":[{"@id":"a.txt","@type":"File"}]}"#,
+        r#"{"name":"a"}"#,
+    ] {
+        assert!(dataset_crate(refused).is_err(), "{refused}");
+    }
+}

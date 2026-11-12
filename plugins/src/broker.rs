@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::permission::Permission;
 
 pub use crate::host::wit::aruna::plugin::connections::{FullResponse, Method, Response};
+pub use crate::host::wit::aruna::plugin::metadata_create::Created;
 pub use crate::host::wit::aruna::plugin::metadata_read::{Document, Listing};
 pub use crate::host::wit::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
 pub use crate::host::wit::aruna::plugin::state::Entry;
@@ -56,6 +57,15 @@ pub struct MetadataPatch {
     pub intent: Intent,
 }
 
+/// A keyed dataset create: `path` below the group's metadata root, one dataset entity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetadataCreate {
+    pub path: String,
+    pub dataset: String,
+    pub key: String,
+    pub intent: Intent,
+}
+
 /// A request through a declared connection; mutating methods carry an intent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SendRequest {
@@ -94,6 +104,17 @@ pub trait Broker: Send + Sync {
         cx: &CallContext,
         patch: MetadataPatch,
     ) -> Result<String, HostError>;
+    /// Creates a dataset once per key; a broker that serves no creates refuses it.
+    async fn metadata_create(
+        &self,
+        _cx: &CallContext,
+        _create: MetadataCreate,
+    ) -> Result<Created, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "dataset creates are not served here",
+        ))
+    }
     async fn objects_info(&self, cx: &CallContext, path: &str) -> Result<ObjectInfo, HostError>;
     async fn objects_list(
         &self,
