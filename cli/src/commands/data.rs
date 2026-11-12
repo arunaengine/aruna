@@ -387,6 +387,7 @@ pub async fn s3_credential(
 
 /// Whole seconds from `now` until `raw`, a lifetime or a time as `parse_expiry` reads them.
 fn lifetime_secs(raw: &str, now: chrono::DateTime<chrono::Utc>) -> Result<i64, CliError> {
+    let now = chrono::SubsecRound::trunc_subsecs(now, 0);
     let end = parse_expiry(raw, now)?;
     let end = chrono::DateTime::parse_from_rfc3339(&end)
         .map_err(|error| CliError::usage(format!("{raw}: {error}")))?;
@@ -435,6 +436,8 @@ mod tests {
         assert_eq!(lifetime_secs("365d", now).unwrap(), 31_536_000);
         assert_eq!(lifetime_secs("2026-11-01T11:00:00Z", now).unwrap(), 3_600);
         assert!(lifetime_secs("2026-11-01T09:00:00Z", now).is_err());
+        let fractional = now + chrono::Duration::milliseconds(500);
+        assert_eq!(lifetime_secs("1m", fractional).unwrap(), 60);
     }
 
     #[test]
