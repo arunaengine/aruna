@@ -376,7 +376,10 @@ to the group data root and can never widen them.
   `*` (`/<realm>/g/<group>/data/*/<bucket>/**`), so the credential applies on every node, also to
   requests forwarded within a distributed bucket.
 - A user holds at most 16 active credentials on this node; one without an expiry counts until it
-  is revoked."#,
+  is revoked.
+- A cutoff stays in the realm's revocation set for 366 days, and each node deletes the credentials
+  it ends within that time. A node offline for all of it keeps accepting such a credential once its
+  owner is active again, until the credential is revoked."#,
     request_body(
         content = CreateS3Request,
         description = "Group the credential is bound to, an optional lifetime in seconds, and optional path restrictions",
