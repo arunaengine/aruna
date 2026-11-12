@@ -531,6 +531,8 @@ pub const PLUGIN_QUEUE_KEYSPACE: &str = "plugin_queue";
 pub const PLUGIN_INTENTS_KEYSPACE: &str = "plugin_intents";
 /// Private plugin state by install and key, with each install's byte count.
 pub const PLUGIN_STATE_KEYSPACE: &str = "plugin_state";
+/// Keyed plugin creates by install and key: the document, its node and the create arguments.
+pub const PLUGIN_CREATES_KEYSPACE: &str = "plugin_creates";
 /// Webhook delivery ids this receiver admitted, by install and by receipt time, and where the
 /// prune of secret use audit rows stopped.
 pub const PLUGIN_HOOKS_KEYSPACE: &str = "plugin_hooks";
@@ -838,6 +840,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     PLUGIN_QUEUE_KEYSPACE,
     PLUGIN_INTENTS_KEYSPACE,
     PLUGIN_STATE_KEYSPACE,
+    PLUGIN_CREATES_KEYSPACE,
     PLUGIN_HOOKS_KEYSPACE,
     ONBOARDING_KEYSPACE,
     DHT_KEYSPACE,
