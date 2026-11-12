@@ -10,7 +10,7 @@ mod meta;
 mod plugin;
 mod realm;
 
-use crate::args::{Cli, Command};
+use crate::args::{Cli, Command, S3Command};
 use crate::client::Api;
 use crate::config::{Config, Profile};
 use crate::error::CliError;
@@ -86,7 +86,10 @@ pub async fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<(), CliError> {
         } => data::search(context, &query, types, limit).await,
         Command::Cp(args) => copy::copy(context, args).await,
         Command::Sync(args) => copy::sync(context, args).await,
-        Command::S3(command) => data::s3_env(context, command).await,
+        Command::S3(S3Command::Env { group, show_secret }) => {
+            data::s3_env(context, group, show_secret).await
+        }
+        Command::S3(S3Command::Credential(command)) => data::s3_credential(context, command).await,
         Command::Jobs(command) => jobs::jobs(context, command).await,
         Command::Meta(command) => meta::meta(context, command).await,
         Command::Share(args) => data::share(context, args).await,
