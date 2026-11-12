@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aruna_core::NodeId;
-use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret};
+use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
 use aruna_core::metadata::AuthToken;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun};
@@ -65,6 +65,8 @@ pub struct RunBroker {
     keys: ReleaseKeys,
     /// The secrets this run holds, reused while their value is unchanged.
     held: tokio::sync::Mutex<HeldSecrets>,
+    /// The values handed to the code, removed from the text the run keeps.
+    shown: Mutex<Vec<SecretFields>>,
     scope: RunScope,
     /// A call at a known ordinal came with other arguments than before.
     changed: AtomicBool,
@@ -85,6 +87,7 @@ impl RunBroker {
                 })
                 .unwrap_or_default(),
             held: tokio::sync::Mutex::default(),
+            shown: Mutex::default(),
             ctx,
             log: Mutex::new(lines),
             scope,
@@ -618,7 +621,28 @@ impl Broker for RunBroker {
         }
     }
 
+    async fn secret_value(&self, _cx: &CallContext, slot: &str) -> Result<Vec<Field>, HostError> {
+        let current = self.admitted(None).await?;
+        let path = install_scope(&current).secret(slot);
+        let (install, _) = self.checked(Permission::SecretsValue, &path).await?;
+        let config = read_config(&self.ctx, self.scope.realm_id).await;
+        let config = config.map_err(|error| unavailable(error.to_string()))?;
+        let use_of = (Delivery::Value, None);
+        let (_, fields) = self.obtain(&install, slot, use_of, &config).await?;
+        let values = (fields.names())
+            .filter_map(|name| {
+                let value = fields.get(name)?.to_string();
+                let name = name.to_string();
+                Some(Field { name, value })
+            })
+            .collect();
+        let shown = self.shown.lock();
+        (shown.unwrap_or_else(|poisoned| poisoned.into_inner())).push(fields);
+        Ok(values)
+    }
+
     async fn log(&self, _cx: &CallContext, level: &str, message: &str) {
+        let message = &self.scrub(message);
         if self.admitted(None).await.is_ok() {
             let mut run = self
                 .log
@@ -910,27 +934,47 @@ impl RunBroker {
         config: &aruna_core::structs::identity::realm::RealmConfigDocument,
         outgoing: &mut OutgoingRequest,
     ) -> Result<(Released, SecretFields), HostError> {
+        let target = Some((outgoing.method.clone(), outgoing.url.to_string()));
+        let use_of = (Delivery::Inject, target);
+        let (released, fields) = self.obtain(install, slot, use_of, config).await?;
+        let injected = inject_secret(&released.kind, &released.settings, &fields, outgoing);
+        injected.map_err(|error| HostError::new(ErrorKind::Denied, error.to_string()))?;
+        Ok((released, fields))
+    }
+
+    /// One checked release of the slot's secret for this run, reusing fields it holds.
+    async fn obtain(
+        &self,
+        install: &PluginInstall,
+        slot: &str,
+        (delivery, target): (Delivery, Option<(String, String)>),
+        config: &aruna_core::structs::identity::realm::RealmConfigDocument,
+    ) -> Result<(Released, SecretFields), HostError> {
         let request = ReleaseRequest {
             install_id: install.install_id,
             slot: slot.to_string(),
-            delivery: Delivery::Inject,
-            target: Some((outgoing.method.clone(), outgoing.url.to_string())),
+            delivery,
+            target,
             held: None,
             run_id: Some(self.scope.run.run_id),
         };
         let place = (self.scope.local, &self.keys);
         let ask = |request| ask_release(&self.ctx, config, place, request);
         let mut held = self.held.lock().await;
-        let (released, fields) = held
-            .obtain(request, ask)
+        held.obtain(request, ask)
             .await
             .map_err(|error| match error {
                 ReleaseError::Refused(_) => HostError::new(ErrorKind::Denied, error.to_string()),
                 ReleaseError::Unavailable(why) => unavailable(why),
-            })?;
-        let injected = inject_secret(&released.kind, &released.settings, &fields, outgoing);
-        injected.map_err(|error| HostError::new(ErrorKind::Denied, error.to_string()))?;
-        Ok((released, fields))
+            })
+    }
+
+    /// Text the run keeps with every form of a value handed to the code removed, as extra
+    /// protection only: the code holds the value and may change it.
+    pub fn scrub(&self, text: &str) -> String {
+        let shown = self.shown.lock();
+        let shown = shown.unwrap_or_else(|poisoned| poisoned.into_inner());
+        (shown.iter()).fold(text.to_string(), |text, fields| scrub(&text, fields))
     }
 }
 

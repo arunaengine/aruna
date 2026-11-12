@@ -14,6 +14,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::GroupId;
 use aruna_operations::plugins::account::plugin_account;
 use aruna_operations::plugins::bound::vault_kind;
+use aruna_operations::plugins::check::covers;
 use aruna_operations::plugins::grants::{GrantError, InstallScope, parse_grants};
 use aruna_operations::plugins::install::{
     InstallError, InstallRequest, install_plugin, pick_version, prepare_install, read_config,
@@ -128,6 +129,8 @@ pub struct SecretLine {
     pub kind: String,
     /// `group:<name>`, `realm:<name>` or `node:<name>`.
     pub secret: String,
+    /// The code may read the secret's value through `secrets.value`.
+    pub value: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -176,7 +179,7 @@ pub struct InstallListQuery {
     pub limit: Option<usize>,
 }
 
-const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "webhook": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true, "full_answer": false}], "triggers": ["dataset_created", "manual"], "secrets": [{"slot": "catalog_key", "kind": "bearer", "secret": "group:catalog-key"}], "warnings": []}}"#;
+const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "webhook": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true, "full_answer": false}], "triggers": ["dataset_created", "manual"], "secrets": [{"slot": "catalog_key", "kind": "bearer", "secret": "group:catalog-key", "value": false}], "warnings": []}}"#;
 
 pub(crate) fn view_example() -> Value {
     serde_json::from_str(VIEW_EXAMPLE).unwrap_or(Value::Null)
@@ -554,6 +557,11 @@ fn summary(
         })
         .collect();
     let sends = granted.get(&Grant::ConnectionsSend);
+    let values = granted.get(&Grant::SecretsValue);
+    let readable = |slot: &str| {
+        let path = scope.secret(slot);
+        values.is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &path)))
+    };
     let connections = (manifest.connections.iter())
         .map(|(name, connection)| ConnectionLine {
             name: name.clone(),
@@ -584,6 +592,7 @@ fn summary(
                     .and_then(|declared| vault_kind(declared.kind))
                     .map_or_else(String::new, |kind| kind.as_str().to_string()),
                 secret: binding.to_string(),
+                value: readable(slot),
             })
             .collect(),
         warnings: (undelivered(manifest)

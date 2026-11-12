@@ -189,6 +189,13 @@ interface state {
   put: func(key: string, value: list<u8>, expected: option<u64>) -> result<u64, host-error>;
 }
 
+/// The fields of a secret slot granted through `secrets.value`; they are the code's data then.
+interface secrets {
+  use types.{field, host-error};
+
+  value: func(slot: string) -> result<list<field>, host-error>;
+}
+
 interface log {
   enum level {
     debug,
@@ -210,6 +217,7 @@ world plugin {
   import objects-read;
   import connections;
   import state;
+  import secrets;
   import log;
 
   export handle: func(handler: string, invocation: invocation) -> result<option<string>, failure>;

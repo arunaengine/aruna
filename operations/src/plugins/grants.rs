@@ -56,6 +56,7 @@ impl InstallScope {
             Permission::ConnectionsSend => {
                 format!("{group}/plugins/{}/connections", self.install_id)
             }
+            Permission::SecretsValue => format!("{group}/plugins/{}/secrets", self.install_id),
             _ => format!("{group}/data"),
         }
     }
@@ -63,6 +64,11 @@ impl InstallScope {
     /// The generated grant path of one declared connection.
     pub fn connection(&self, name: &str) -> String {
         format!("{}/{name}", self.root(Permission::ConnectionsSend))
+    }
+
+    /// The grant path of one secret slot's value.
+    pub fn secret(&self, slot: &str) -> String {
+        format!("{}/{slot}", self.root(Permission::SecretsValue))
     }
 }
 

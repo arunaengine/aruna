@@ -1,5 +1,5 @@
-//! Tests metadata and object calls through the broker: reads, listings, a revision-checked
-//! patch answered again from its intent, a changed call, and objects outside the grants.
+//! Tests metadata, object and secret value calls through the broker: reads, listings, a
+//! revision-checked patch answered again from its intent, a changed call, and missing grants.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -492,4 +492,70 @@ async fn invalid_patches() {
             .unwrap(),
         None
     );
+}
+
+#[tokio::test]
+async fn secret_values_granted() {
+    use crate::plugins::account::{Identity, ensure_role, guard_of};
+    use crate::plugins::bound::tests::{TOKEN, bound, edit_config, keys, secret};
+    use crate::plugins::grants::role_paths;
+    use crate::plugins::rules::ensure_rules;
+    let fixture = Fixture::keyed().await;
+    let install = bound(&fixture).await;
+    secret(&fixture, &install).await;
+    let broker = |install: &PluginInstall| {
+        let mut run = queued(install.install_id, 1);
+        run.digest = install.digest.clone();
+        let scope = RunScope {
+            realm_id: fixture.actor.realm_id,
+            local: fixture.actor.node_id,
+            run,
+        };
+        RunBroker::new(Arc::new(fixture.ctx.clone()), scope).with_keys(keys())
+    };
+    let kind = async |install: &PluginInstall| {
+        let refused = broker(install).secret_value(&cx(), "api_key").await;
+        refused.map(|_| ()).map_err(|error| error.kind)
+    };
+    assert_eq!(kind(&install).await, Err(ErrorKind::NotGranted));
+    let path = install_scope(&install).secret("api_key");
+    edit_config(&fixture, |config| {
+        let grants = &mut config.installs[0].grants;
+        grants.insert("secrets.value".to_string(), vec![path]);
+    })
+    .await;
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id).await;
+    let granted = config.unwrap().installs.remove(0);
+    let (scope, paths) = (
+        install_scope(&granted),
+        role_paths(&parse_grants(&granted.grants)),
+    );
+    let (identity, auth) = ((Identity::of(&granted), guard_of(&granted)), fixture.auth());
+    let role = ensure_role(
+        &fixture.ctx,
+        &fixture.actor,
+        &auth,
+        &scope,
+        identity.0,
+        &paths,
+        identity.1,
+    );
+    role.await.unwrap();
+    // The secret's rules let this install inject it, not read its value.
+    assert_eq!(kind(&granted).await, Err(ErrorKind::Denied));
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let plugin = pick_version(&config, &granted.plugin, Some(&granted.digest)).unwrap();
+    let manifest = read_manifest(&plugin).unwrap();
+    ensure_rules(&fixture.ctx, &fixture.actor, &granted, &manifest)
+        .await
+        .unwrap();
+    let held = broker(&granted);
+    let fields = held.secret_value(&cx(), "api_key").await.unwrap();
+    let fields: Vec<(String, String)> = (fields.into_iter())
+        .map(|field| (field.name, field.value))
+        .collect();
+    assert_eq!(fields, [("token".to_string(), TOKEN.to_string())]);
+    assert_eq!(held.scrub(&format!("got {TOKEN}")), "got [redacted]");
 }

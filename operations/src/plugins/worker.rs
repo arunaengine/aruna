@@ -339,6 +339,11 @@ impl Worker {
             return;
         }
         run.log = broker.take_log();
+        let ended = match ended {
+            Ended::Output(output) => Ended::Output(output.map(|text| broker.scrub(&text))),
+            Ended::Failed(message) => Ended::Failed(broker.scrub(&message)),
+            other => other,
+        };
         let now = unix_timestamp_millis();
         let open = open_intent(&self.ctx, run.run_id).await;
         let ended = match ended {

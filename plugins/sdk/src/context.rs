@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::bindings::aruna::plugin::{
-    connections, grants, log, metadata_read, metadata_write, objects_read, state,
+    connections, grants, log, metadata_read, metadata_write, objects_read, secrets, state,
 };
 use crate::error::{Error, Result};
 
@@ -69,6 +69,15 @@ impl Context {
 
     pub fn state(&self) -> State {
         State
+    }
+
+    /// The fields of a secret slot granted through `secrets.value`, as name and value pairs.
+    pub async fn secret(&self, slot: &str) -> Result<Vec<(String, String)>> {
+        let fields = secrets::value(slot).map_err(|err| Error::host(err, "secrets.value", slot))?;
+        Ok(fields
+            .into_iter()
+            .map(|field| (field.name, field.value))
+            .collect())
     }
 
     pub fn log(&self, level: Level, message: &str) {

@@ -10,7 +10,7 @@ use crate::broker::{
     Listing, MetadataPatch, Method, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
 };
 use crate::host::wit::aruna::plugin::{
-    connections, grants, log, metadata_read, metadata_write, objects_read, state, types,
+    connections, grants, log, metadata_read, metadata_write, objects_read, secrets, state, types,
 };
 use crate::host::{Needs, Session};
 use crate::permission::Permission;
@@ -336,6 +336,19 @@ impl state::Host for Session {
             Needs::Free,
             |broker, cx| async move { broker.state_put(&cx, put).await },
             |_| 8,
+        )
+        .await
+    }
+}
+
+impl secrets::Host for Session {
+    async fn value(&mut self, slot: String) -> wasmtime::Result<Result<Vec<Field>, HostError>> {
+        self.brokered(
+            slot.len(),
+            Effect::Read,
+            Needs::Permission(Permission::SecretsValue),
+            |broker, cx| async move { broker.secret_value(&cx, &slot).await },
+            |fields| fields_len(fields),
         )
         .await
     }

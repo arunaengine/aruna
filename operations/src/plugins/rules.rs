@@ -17,6 +17,7 @@ use aruna_plugins::trigger::TriggerKind;
 use tracing::warn;
 use ulid::Ulid;
 
+use super::check::covers;
 use super::grants::{InstallScope, parse_grants};
 use super::install::read_config;
 use crate::driver::{DriverContext, drive};
@@ -138,7 +139,8 @@ async fn guard_holds(
 }
 
 /// The rules the install needs on each group secret it binds, from its manifest, grants and
-/// settings: `inject` for granted connections, `verify` for the webhook.
+/// settings: `inject` for granted connections, `verify` for the webhook, `value` for a granted
+/// `secrets.value`.
 pub fn wanted_rules(
     install: &PluginInstall,
     manifest: &Manifest,
@@ -213,6 +215,15 @@ pub fn wanted_rules(
             .entry(binding.name.clone())
             .or_default()
             .push(rule(Delivery::Verify));
+    }
+    let values = granted.get(&Permission::SecretsValue);
+    for slot in manifest.secrets.keys() {
+        let path = scope.secret(slot);
+        let shown = values.is_some_and(|patterns| patterns.iter().any(|p| covers(p, &path)));
+        if let Some(binding) = group_bound(slot).filter(|_| shown) {
+            let rules = wanted.entry(binding.name.clone()).or_default();
+            rules.push(rule(Delivery::Value));
+        }
     }
     Ok(wanted)
 }

@@ -120,6 +120,13 @@ pub trait Broker: Send + Sync {
             "whole answers are not served here",
         ))
     }
+    /// The fields of a slot granted through `secrets.value`. A broker that serves none refuses.
+    async fn secret_value(&self, _cx: &CallContext, _slot: &str) -> Result<Vec<Field>, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "secret values are not served here",
+        ))
+    }
     async fn state_get(&self, cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError>;
     async fn state_put(&self, cx: &CallContext, put: StatePut) -> Result<u64, HostError>;
     /// Records that a write did not finish within its deadline, so its outcome is unknown.
