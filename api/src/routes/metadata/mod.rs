@@ -67,7 +67,10 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
             rocrate::replace_metadata_rocrate
         ))
         .routes(routes!(rocrate::submit_rocrate_export))
-        .routes(routes!(rocrate::add_data_entity))
+        .routes(routes!(
+            rocrate::add_data_entity,
+            rocrate::remove_data_entity
+        ))
         .routes(routes!(rocrate::add_contextual_entity))
         .routes(routes!(query::query_metadata_document))
         .routes(routes!(

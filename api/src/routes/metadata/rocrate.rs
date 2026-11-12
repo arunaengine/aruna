@@ -32,8 +32,10 @@ use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
+use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
+use utoipa::IntoParams;
 
 #[utoipa::path(
     get,
@@ -697,6 +699,109 @@ pub async fn add_data_entity(
             jsonld: serialize_jsonld_entity(&with_global_ids(&state, &entity).await?)?,
         },
         None,
+        forwarded_auth_token(bearer_token)?,
+        None,
+    )
+    .await
+    .map_err(map_write_error)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(MetadataDocumentSummary::from(&updated)),
+    ))
+}
+
+/// Which root-linked `File` entity a removal names, and the revision it is based on.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct RemovalQuery {
+    /// The `@id` of the root-linked `File` entity to remove.
+    pub id: String,
+    /// The newest event id the caller read the crate at; a newer edit answers 412.
+    pub expected_revision: String,
+}
+
+#[utoipa::path(
+    delete,
+    path = "/metadata/{document_id}/rocrate/entities/data",
+    tag = "metadata/rocrate",
+    summary = "Remove an RO-Crate data entity",
+    description = r#"Removes one root-linked `File` entity and the root dataset's link to it.
+
+**Authentication**: realm bearer token with WRITE on the document's permission path. A node that
+does not hold the document forwards the write to a holder that re-runs that check under the
+caller's own token.
+
+**Behavior**
+- The removal is checked against `expected_revision`: if a newer edit landed, nothing changes and
+  the call answers 412, so the caller reads the crate again.
+- Only a `File` entity linked from the root dataset is removed, with every property it holds.
+  Other entities stay, also those that still reference it; the root, the metadata descriptor and
+  contextual entities are refused.
+- Acceptance is durable but asynchronous: the revision may not be materialized, queryable,
+  searchable or present on every replica yet."#,
+    params(
+        ("document_id" = String, Path, description = "Metadata document id, a structured document ULID as returned by create or list"),
+        RemovalQuery
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Accepted into the durable event/projection pipeline; not necessarily fully materialized, queryable, searchable or replicated yet",
+            body = MetadataDocumentSummary,
+            examples(
+                (
+                    "UpdatedSummary" = (
+                        summary = "Metadata summary after a data entity removal",
+                        value = json!({
+                            "document_id": "01JMETADATA0123456789ABCDE",
+                            "group_id": "01JABCDEF0123456789ABCDEFG",
+                            "document_path": "datasets/proteomics/run-42",
+                            "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                            "public": true,
+                            "replicas": 3,
+                            "created_at": "2026-04-09T14:23:11.123Z",
+                            "updated_at": "2026-04-09T14:31:02.410Z",
+                            "revision": "01JMETADATA0123456789ABCDF"
+                        })
+                    )
+                )
+            )
+        ),
+        (status = 400, description = "A document id that is not a structured metadata id, an `expected_revision` that is not a ULID, or an `id` that names no root-linked File entity (the root, the descriptor or a contextual entity included)", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token, or a holder rejected the forwarded credential", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another realm, or WRITE is denied on the document", body = ErrorResponse),
+        (status = 404, description = "No holder knows this document", body = ErrorResponse),
+        (status = 412, description = "A newer edit landed after `expected_revision`; nothing was removed", body = ErrorResponse),
+        (status = 503, description = "Realm placement view unreadable, the document has no usable holder, the revision exceeds the stored-document limit, or no holder accepted the forwarded write; the removal was not accepted and may be retried", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn remove_data_entity(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedBearer>>,
+    Path(document_id): Path<String>,
+    Query(query): Query<RemovalQuery>,
+) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let document_id = parse_document_id(&document_id)?;
+    let expected_revision = (query.expected_revision.parse::<ulid::Ulid>())
+        .map_err(|_| ServerError::BadRequestMessage("expected_revision is not a ULID".into()))?;
+    let ctx = state.get_ctx();
+    let record =
+        local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
+    let updated = run_update_metadata_document(
+        &ctx,
+        Actor {
+            node_id: state.get_node_id(),
+            user_id: auth.user_id,
+            realm_id: state.get_realm_id(),
+        },
+        record.as_ref(),
+        document_id,
+        None,
+        UpdateDocumentMutation::RemoveDataEntity { id: query.id },
+        Some(expected_revision),
         forwarded_auth_token(bearer_token)?,
         None,
     )
