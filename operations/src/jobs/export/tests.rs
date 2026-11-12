@@ -3059,3 +3059,22 @@ fn resolved_references_export() {
         assert_eq!(entities[0].omission, None, "{url}");
     }
 }
+
+// A dataset's own context may resolve a plugin's literal into another object; export names it
+// and then checks it against the exporting user per object, as `denies_local_read` shows.
+#[test]
+fn context_trick_resolves() {
+    let realm_id = RealmId::from_bytes([2; 32]);
+    let context = json!({"place": "s3://private/",
+        "contentUrl": {"@id": "http://schema.org/contentUrl", "@type": "@id"}});
+    let document = json!({
+        "@context": ["https://w3id.org/ro/crate/1.2/context", context],
+        "@graph": [{"@id": "data/b.txt", "@type": "File", "contentUrl": "place:secret.bin"}]
+    });
+    let entities = recognized_entities(&document, realm_id).unwrap();
+    let key = entities[0].storage_key.as_ref().unwrap();
+    assert_eq!(
+        (key.bucket.as_str(), key.key.as_str()),
+        ("private", "secret.bin")
+    );
+}

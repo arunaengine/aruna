@@ -356,6 +356,7 @@ impl RunBroker {
 
     /// Checks each Aruna object an entity names through the plugin's own `objects.read` call
     /// check and that it lies in a group bucket here. A content hash or global id needs one too.
+    /// The dataset's own JSON-LD context can make an export name others; it checks the exporter.
     async fn objects_named(
         &self,
         install: &PluginInstall,

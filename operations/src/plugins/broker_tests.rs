@@ -1318,3 +1318,49 @@ async fn remapped_term_checked() {
         .await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::NotGranted);
 }
+
+#[tokio::test]
+async fn context_trick_accepted() {
+    // A dataset's own context can resolve a literal value into another object; the broker
+    // checks the values as sent, so this is accepted. Export checks the object it resolves
+    // against the exporting user (`denies_local_read`), so it grants no access.
+    let (fixture, broker, _, _dir) = broker().await;
+    let term = serde_json::json!({"place": "s3://private/",
+        "contentUrl": {"@id": "http://schema.org/contentUrl", "@type": "@id"}});
+    let (document, revision) = crate_with_term(&fixture, &broker, term).await;
+    let file = serde_json::json!({"@id": "./b.txt", "@type": "File", "name": "b",
+        "contentUrl": "place:secret.bin"});
+    let written = broker
+        .metadata_put_file(&cx(), put(document, &file, &revision, 0))
+        .await;
+    assert!(written.is_ok(), "{written:?}");
+}
+
+#[tokio::test]
+async fn sync_style_writes() {
+    // The writes a file sync makes pass with the grant: an `s3://` or object path `contentUrl`,
+    // schema.org properties and plain literals.
+    let (fixture, broker, _, _dir) = broker().await;
+    stored_object(&fixture, ("imports", "run/a.txt"), ([5u8; 32], true)).await;
+    let document = three_files(&fixture, &broker).await;
+    let writer = writer_broker(&fixture, &broker, ("0.1.9", "5a")).await;
+    let (realm, group, node) = (
+        fixture.actor.realm_id,
+        fixture.group_id,
+        fixture.actor.node_id,
+    );
+    let path = format!("/{realm}/g/{group}/data/{node}/imports/run/a.txt");
+    for (n, url) in ["s3://imports/run/a.txt".to_string(), path]
+        .into_iter()
+        .enumerate()
+    {
+        let revision = revision_of(&writer, document).await;
+        let file = serde_json::json!({"@id": format!("./exp/{n}.txt"), "@type": "File",
+            "name": "a.txt", "contentUrl": url, "contentSize": "5", "encodingFormat": "text/plain",
+            "sha256": "abc", "dateModified": "2026-11-12", "description": "uploaded in eLabFTW"});
+        let change = put(document, &file, &revision, n as u32);
+        let written = writer.metadata_put_file(&cx(), change).await;
+        assert!(written.is_ok(), "{written:?}");
+        project(&broker.ctx).await;
+    }
+}
