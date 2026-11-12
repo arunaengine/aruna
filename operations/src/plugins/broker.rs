@@ -19,7 +19,7 @@ use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_core::structs::storage::data::identity::{CONTENT_URL, DataIdentity};
+use aruna_core::structs::storage::data::identity::DataIdentity;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
@@ -31,6 +31,8 @@ use aruna_plugins::connection::{Readable, relative_path};
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
 use base64::Engine;
+use craqle::GraphId;
+use oxrdf::Term;
 use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
@@ -59,7 +61,7 @@ use crate::metadata::forward::{
     CreateAuthorizedError, PinnedCreate, create_with_id, export_rocrate_routed,
     get_metadata_routed, route_metadata_update,
 };
-use crate::metadata::handle::normalize_property;
+use crate::metadata::handle::craqle_patch_request;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -249,7 +251,8 @@ impl RunBroker {
         let (install, auth) =
             (self.checked(Permission::MetadataWrite, &record.permission_path)).await?;
         if let Some(file) = file {
-            self.objects_named(&install, &file).await?;
+            self.objects_named(&install, (&record.graph_iri, &file))
+                .await?;
         }
         let run_id = self.scope.run.run_id;
         let earlier = written(&self.ctx, run_id, &change.intent).await;
@@ -353,17 +356,30 @@ impl RunBroker {
 
     /// Checks each Aruna object a file entity names through the plugin's own `objects.read` call
     /// check and that it lies in a group bucket here. A content hash or global id needs one with it.
-    async fn objects_named(&self, install: &PluginInstall, file: &Value) -> Result<(), HostError> {
+    async fn objects_named(
+        &self,
+        install: &PluginInstall,
+        (graph, file): (&str, &Value),
+    ) -> Result<(), HostError> {
         let realm_id = self.scope.realm_id;
-        // Every spelling the write converter stores as the id or as `contentUrl` is checked.
-        let mut values: Vec<&str> = (["@id", "id"].iter())
-            .filter_map(|key| file.get(*key)?.as_str())
-            .collect();
-        for (property, value) in file.as_object().into_iter().flatten() {
-            if normalize_property(property) == CONTENT_URL {
-                reference_values(value, &mut values);
-            }
-        }
+        // The write path's own conversion decides what the file names, so no spelling differs.
+        let converted = craqle_patch_request(&GraphId::new(graph), &file.to_string());
+        let converted =
+            converted.map_err(|error| HostError::new(ErrorKind::Invalid, error.to_string()))?;
+        let entity = converted.entity;
+        let urls = (entity.additional_triples.iter())
+            .filter(|(predicate, _)| content_predicate(predicate.as_str()))
+            .filter_map(|(_, object)| match object {
+                Term::NamedNode(node) => Some(node.as_str().to_string()),
+                Term::Literal(literal) => Some(literal.value().to_string()),
+                _ => None,
+            });
+        // The id is checked as sent and as stored, since the raw revision keeps it as sent.
+        let sent = ["@id", "id"]
+            .iter()
+            .filter_map(|key| file.get(*key)?.as_str());
+        let sent = sent.map(str::to_string).chain([entity.entity_id.clone()]);
+        let values: Vec<String> = sent.chain(urls).collect();
         let refused = |what: &str| {
             let message = format!("{what} names no object a plugin may check; use its path");
             HostError::new(ErrorKind::Denied, message)
@@ -371,7 +387,7 @@ impl RunBroker {
         let group = install.group_id;
         // A content hash or global id names no object alone; a concrete one must come with it.
         let (mut objects, mut hash, mut unplaced) = (Vec::new(), None, None);
-        for value in values {
+        for value in values.iter().map(String::as_str) {
             let identity = DataIdentity::read(value, &[]);
             if value.starts_with(&format!("/{realm_id}/g/")) {
                 objects.push((value.to_string(), None));
@@ -1080,21 +1096,12 @@ pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostEr
     Ok(change.to_string())
 }
 
-/// The strings a property value names: itself, each entry, or an object's `@id` or `@value`.
-fn reference_values<'a>(value: &'a Value, values: &mut Vec<&'a str>) {
-    match value {
-        Value::String(text) => values.push(text),
-        Value::Array(entries) => entries
-            .iter()
-            .for_each(|entry| reference_values(entry, values)),
-        Value::Object(fields) => {
-            let named = ["@id", "id", "@value"]
-                .iter()
-                .filter_map(|key| fields.get(*key));
-            named.for_each(|entry| reference_values(entry, values));
-        }
-        _ => {}
-    }
+/// Whether a stored predicate is schema.org's `contentUrl`, under either scheme.
+fn content_predicate(iri: &str) -> bool {
+    matches!(
+        iri,
+        "http://schema.org/contentUrl" | "https://schema.org/contentUrl"
+    )
 }
 
 /// File entities one page asks for; a page over the byte bound comes back smaller.

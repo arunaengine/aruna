@@ -54,7 +54,7 @@ pub(super) fn upsert_contextual_entity(
     .map(batch_from_craqle)
 }
 
-pub(super) fn craqle_patch_request(
+pub(crate) fn craqle_patch_request(
     graph: &GraphId,
     jsonld: &str,
 ) -> Result<PatchEntityRequest, CraqleError> {
@@ -382,8 +382,7 @@ fn expand_compact_iri(value: &str) -> Result<NamedNode, CraqleError> {
     }
 }
 
-/// A property name without its `schema:` or schema.org IRI prefix, as entities are stored.
-pub(crate) fn normalize_property(property: &str) -> String {
+fn normalize_property(property: &str) -> String {
     property
         .strip_prefix("schema:")
         .or_else(|| property.strip_prefix("http://schema.org/"))

@@ -1162,3 +1162,17 @@ async fn hashed_files_rename() {
         .await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Denied);
 }
+
+#[tokio::test]
+async fn compact_alias_checked() {
+    // A doubled prefix still resolves to `contentUrl` in the stored entity, so it is checked too.
+    let (fixture, broker, _, _dir) = broker().await;
+    let document = three_files(&fixture, &broker).await;
+    let revision = revision_of(&broker, document).await;
+    let file = serde_json::json!({"@id": "./alias.txt", "@type": "File", "name": "o",
+        "schema:schema:contentUrl": "s3://private/key"});
+    let refused = broker
+        .metadata_put_file(&cx(), put(document, &file, &revision, 0))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::NotGranted);
+}
