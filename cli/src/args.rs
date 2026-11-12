@@ -316,7 +316,7 @@ pub enum CredentialCommand {
         /// The service account id, in the form <ulid>@<realm>.
         #[arg(long)]
         account: String,
-        /// Lifetime such as 365d or 12h, or an RFC 3339 time; at most one year, the default.
+        /// Lifetime such as 30d or 12h, or an RFC 3339 time; without it the key never expires.
         #[arg(long)]
         expires: Option<String>,
         /// Confine the credential to a path such as `bucket/prefix/**`, repeated for more;

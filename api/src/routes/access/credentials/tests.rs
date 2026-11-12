@@ -205,13 +205,19 @@ fn bearer_bounds_expiry() {
 
 #[test]
 fn uncapped_keeps_request() {
-    // A credential issued for another account does not end with the issuer's bearer.
+    // Without a cap any lifetime from 60 seconds holds, and none at all means never.
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-    let year = DEFAULT_CREDENTIAL_TTL.as_secs();
-    let expiry = credential_expiry(now, None, None).unwrap();
-    assert_eq!(expiry, now + Duration::from_secs(year));
-    let result = credential_expiry(now, Some(year + 1), None);
-    assert!(matches!(result, Err(ServerError::BadRequest)));
+    assert_eq!(credential_expiry(now, None, None).unwrap(), never_expiry());
+    let decade = 10 * 365 * 24 * 60 * 60;
+    let long = credential_expiry(now, Some(decade), None).unwrap();
+    assert_eq!(long, now + Duration::from_secs(decade));
+    assert_eq!(
+        credential_expiry(now, Some(u64::MAX), None).unwrap(),
+        never_expiry()
+    );
+    let short = credential_expiry(now, Some(59), None);
+    assert!(matches!(short, Err(ServerError::BadRequest)));
+    assert_eq!(format_system_time(never_expiry()), "9999-12-31T23:59:59Z");
 }
 
 #[test]
@@ -219,6 +225,28 @@ fn ending_bearer_refused() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let result = credential_expiry(now, Some(600), Some(1_000_000 + 30));
     assert!(matches!(result, Err(ServerError::BadRequest)));
+}
+
+#[tokio::test]
+async fn never_listed_null() {
+    // An unrestricted caller's credential without a lifetime lasts until revoked: no expiry.
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::from_bytes([7u8; 16]);
+    let data = format!("/{realm_id}/g/{group_id}/data/**");
+    let (_dir, state, auth, group_id) = scoped_state(vec![(data, Permission::WRITE)]).await;
+    let (_, Json(created)) = create_credential(&state, &auth, group_id, None)
+        .await
+        .unwrap();
+
+    let (_, Json(listed)) = list_s3_credentials(State(state), Extension(Some(auth)))
+        .await
+        .unwrap();
+    let [entry] = listed.credentials.as_slice() else {
+        panic!("expected one credential, got {:?}", listed.credentials);
+    };
+    assert_eq!(entry.access_key_id, created.access_key_id);
+    assert_eq!(entry.expires_at, None);
+    assert_eq!(entry.status, CredentialStatusResponse::Active);
 }
 
 #[tokio::test]

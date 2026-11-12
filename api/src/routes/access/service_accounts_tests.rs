@@ -454,9 +454,8 @@ async fn credential_callers_refused() {
         );
     }
 
-    let year = 365 * 24 * 60 * 60;
-    let too_long = credential(&fixture, &fixture.admin, &account.id, lifetime(year + 1)).await;
-    assert!(matches!(too_long, Err(ServerError::BadRequest)));
+    let too_short = credential(&fixture, &fixture.admin, &account.id, lifetime(59)).await;
+    assert!(matches!(too_short, Err(ServerError::BadRequest)));
     let unknown = UserId::local(Ulid::generate(), realm_id).to_string();
     let missing = credential(&fixture, &fixture.admin, &unknown, lifetime(600)).await;
     assert!(matches!(missing, Err(ServerError::NotFound)));
