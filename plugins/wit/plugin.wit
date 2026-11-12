@@ -129,6 +129,14 @@ interface metadata-write {
     expected: string,
     key: option<string>,
   ) -> result<string, host-error>;
+
+  /// Removes one root-linked `File` entity by `@id` and the root's link to it.
+  remove-file: func(
+    %resource: string,
+    id: string,
+    expected: string,
+    key: option<string>,
+  ) -> result<string, host-error>;
 }
 
 /// Creates datasets of the group (`metadata.create`).

@@ -147,6 +147,17 @@ pub trait Broker: Send + Sync {
             "file changes are not served here",
         ))
     }
+    /// Removes one file entity by `@id`; a broker that serves no file changes refuses it.
+    async fn metadata_remove_file(
+        &self,
+        _cx: &CallContext,
+        _change: FileChange,
+    ) -> Result<String, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "file changes are not served here",
+        ))
+    }
     /// Creates a dataset once per key; a broker that serves no creates refuses it.
     async fn metadata_create(
         &self,

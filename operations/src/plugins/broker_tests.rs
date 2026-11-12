@@ -1420,3 +1420,40 @@ async fn removal_keeps_rest() {
     );
     assert!(raw.revision.jsonld.contains("b.txt x"));
 }
+
+fn removal(document: Ulid, id: &str, expected: &str, ordinal: u32) -> FileChange {
+    let parts: [&[u8]; 3] = [b"remove", id.as_bytes(), expected.as_bytes()];
+    FileChange {
+        resource: document.to_string(),
+        file: id.to_string(),
+        expected: expected.to_string(),
+        intent: Intent::new(ordinal, None, &parts),
+    }
+}
+
+#[tokio::test]
+async fn file_removals() {
+    // A removal drops one file and answers again from its intent; the root and a stale revision
+    // are refused without an effect.
+    let (fixture, broker, _, _dir) = broker().await;
+    let document = three_files(&fixture, &broker).await;
+    let revision = revision_of(&broker, document).await;
+    let root = broker
+        .metadata_remove_file(&cx(), removal(document, "./", &revision, 0))
+        .await;
+    assert_eq!(root.unwrap_err().kind, ErrorKind::Invalid);
+    let change = removal(document, "./a.txt", &revision, 1);
+    let after = broker
+        .metadata_remove_file(&cx(), change.clone())
+        .await
+        .unwrap();
+    project(&broker.ctx).await;
+    assert_eq!(broker.metadata_remove_file(&cx(), change).await, Ok(after));
+    let ids: Vec<Value> = (files_of(&broker, document).await.iter())
+        .map(|file| file["@id"].clone())
+        .collect();
+    assert_eq!(ids, ["./b.txt", "./c.txt"]);
+    let stale = removal(document, "./b.txt", &revision, 2);
+    let refused = broker.metadata_remove_file(&cx(), stale).await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::Conflict);
+}

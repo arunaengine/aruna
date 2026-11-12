@@ -826,6 +826,19 @@ impl Broker for RunBroker {
         self.file_write(cx, &change, mutation, Some(file)).await
     }
 
+    async fn metadata_remove_file(
+        &self,
+        cx: &CallContext,
+        change: FileChange,
+    ) -> Result<String, HostError> {
+        if change.file.trim().is_empty() {
+            return Err(HostError::new(ErrorKind::Invalid, "a removal names an @id"));
+        }
+        let id = change.file.clone();
+        let mutation = UpdateDocumentMutation::RemoveDataEntity { id };
+        self.file_write(cx, &change, mutation, None).await
+    }
+
     async fn objects_info(&self, _cx: &CallContext, path: &str) -> Result<ObjectInfo, HostError> {
         let (install, _) = self.checked(Permission::ObjectsRead, path).await?;
         let (bucket, key) = self.object_at(&install, path).await?;

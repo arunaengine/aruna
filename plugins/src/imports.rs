@@ -248,6 +248,38 @@ impl metadata_write::Host for Session {
         )
         .await
     }
+
+    async fn remove_file(
+        &mut self,
+        resource: String,
+        id: String,
+        expected: String,
+        key: Option<String>,
+    ) -> wasmtime::Result<Result<String, HostError>> {
+        let size = resource.len() + id.len() + expected.len() + key.as_ref().map_or(0, String::len);
+        let parts: [&[u8]; 4] = [
+            b"remove",
+            resource.as_bytes(),
+            id.as_bytes(),
+            expected.as_bytes(),
+        ];
+        let intent = Intent::new(self.next_ordinal(), key, &parts);
+        let effect = Effect::Write(intent.clone());
+        let change = FileChange {
+            resource,
+            file: id,
+            expected,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Permission(Permission::MetadataWrite),
+            |broker, cx| async move { broker.metadata_remove_file(&cx, change).await },
+            String::len,
+        )
+        .await
+    }
 }
 
 impl metadata_create::Host for Session {

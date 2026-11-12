@@ -187,6 +187,19 @@ impl Metadata {
         reply.map_err(|err| Error::host(err, "metadata.write", resource))
     }
 
+    /// Removes one `File` entity by `@id`, and the dataset's link to it, if the dataset is still
+    /// at `expected`. Returns the new revision.
+    pub async fn remove_file(
+        &self,
+        resource: &str,
+        id: &str,
+        expected: &str,
+        key: Option<&str>,
+    ) -> Result<String> {
+        let reply = metadata_write::remove_file(resource, id, expected, key);
+        reply.map_err(|err| Error::host(err, "metadata.write", resource))
+    }
+
     /// Creates a dataset at `path` from one dataset entity; the same `key` always names the same
     /// document. Returns the document and its first revision.
     pub async fn create(&self, path: &str, dataset: &Value, key: &str) -> Result<Created> {
