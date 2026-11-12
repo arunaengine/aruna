@@ -1,17 +1,27 @@
-//! Rewrites realm configs whose plugin installs predate `activated_by` and `widened` (alpha.184)
-//! or `secrets` (alpha.188): the install list is the config's last field, so it is split off.
+//! Rewrites realm configs and queued install writes whose plugin installs predate `activated_by`
+//! and `widened` (alpha.184) or `secrets` (alpha.188); a relayed queued write stops the migration.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
 
 use aruna_core::UserId;
+use aruna_core::admin_documents::AdminDocumentOperation;
+use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
 use aruna_core::plugin_installs::{InstallState, PluginInstall, Prerequisite, Widening};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{GroupId, RoleId};
+use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use ulid::Ulid;
+
+use super::session_refs::{self, Layout};
+use super::{Rewrites, decode_error, row_note};
+use crate::explorer::ExplorerError;
+
+/// Installs inside queued publishes: alpha.188 stored 20 fields, alpha.184 stored 18.
+const INSTALL_LAYOUTS: [Layout; 2] = [&[("PluginInstall", 20)], &[("PluginInstall", 18)]];
 
 /// An install as alpha.184 stored it.
 #[derive(Deserialize)]
@@ -144,6 +154,56 @@ fn upgraded_from<T: DeserializeOwned + Into<PluginInstall>>(value: &[u8]) -> Opt
     None
 }
 
+/// A queued publish read with an install of an earlier release.
+pub(super) fn queued_install(value: &[u8]) -> Option<DocumentOutboxRecord> {
+    (INSTALL_LAYOUTS.iter()).find_map(|layout| session_refs::decode(value, layout).ok())
+}
+
+/// Queued install writes this node originated, in the current shape. This node signs them when
+/// it publishes; a relayed one keeps the origin signature over its old bytes and stops the run.
+pub(super) fn outbox_rows(
+    db: &OptimisticTxDatabase,
+    keyspace: &OptimisticTxKeyspace,
+    name: &str,
+) -> Result<Rewrites, ExplorerError> {
+    let mut scanned = 0;
+    let mut rows = Vec::new();
+    for entry in db.read_tx().iter(keyspace) {
+        let (key, value) = entry.into_inner()?;
+        scanned += 1;
+        if postcard::from_bytes::<DocumentOutboxRecord>(&value).is_ok() {
+            continue;
+        }
+        let Some(record) = queued_install(&value) else {
+            continue;
+        };
+        let DocumentOutboxEvent::AdminOperation {
+            event,
+            origin_signature,
+        } = &record.event
+        else {
+            continue;
+        };
+        if !matches!(event.op, AdminDocumentOperation::ConfigInstallSet { .. }) {
+            continue;
+        }
+        if origin_signature.is_some() {
+            return Err(ExplorerError::Refused(row_note(
+                name,
+                &key,
+                "a relayed plugin install write from an earlier release waits for publishing, \
+                 and its origin signature covers the old encoding. Start the node with the \
+                 earlier release until its sync outbox has published the row, stop it, then run \
+                 the migration again",
+            )));
+        }
+        let bytes =
+            postcard::to_allocvec(&record).map_err(|error| decode_error(name, &key, error))?;
+        rows.push((key.to_vec(), bytes));
+    }
+    Ok(Rewrites { scanned, rows })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +315,84 @@ mod tests {
         );
         assert!(first.secrets.is_empty());
         assert_eq!(first.prerequisites, olds[0].0.prerequisites);
+    }
+
+    /// A queued install write and its bytes as alpha.188 stored them, without `secrets`.
+    fn queued(origin_signature: Option<iroh::Signature>) -> (DocumentOutboxRecord, Vec<u8>) {
+        use aruna_core::admin_documents::{
+            AdminDocumentClock, AdminDocumentEvent, AdminDocumentTarget,
+        };
+        use aruna_core::document::DocumentTarget;
+        use aruna_core::structs::identity::auth::Actor;
+        use aruna_core::structs::placement::record::PlacementRef;
+        use aruna_operations::sync::document_outbox::new_outbox_record;
+        let realm_id = RealmId::from_bytes([3; 32]);
+        let origin = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let stored = postcard::to_allocvec(&old_install(4, realm_id)).unwrap();
+        let install: PluginInstall = postcard::from_bytes::<StoredInstall>(&stored)
+            .unwrap()
+            .into();
+        let event = AdminDocumentEvent {
+            event_id: Ulid::from(1),
+            target: AdminDocumentTarget::RealmConfig { realm_id },
+            origin_node_id: origin,
+            origin_seq: 1,
+            observed: AdminDocumentClock::default(),
+            actor: Actor {
+                node_id: origin,
+                user_id: UserId::nil(realm_id),
+                realm_id,
+            },
+            op: AdminDocumentOperation::ConfigInstallSet {
+                install_id: install.install_id,
+                install: Some(Box::new(install.clone())),
+            },
+        };
+        let event = DocumentOutboxEvent::AdminOperation {
+            event: Box::new(event),
+            origin_signature,
+        };
+        let target = DocumentTarget::RealmConfig { realm_id };
+        let record = new_outbox_record(origin, target, Vec::new(), event, PlacementRef::NIL, false);
+        let current = postcard::to_allocvec(&record).unwrap();
+        let encoded = postcard::to_allocvec(&install).unwrap();
+        // The empty `secrets` map is the install's last byte.
+        let old = super::super::tests::strip(&current, &encoded, 1);
+        (record, old)
+    }
+
+    #[test]
+    fn rewrites_queued_installs() {
+        use super::super::migrate_output;
+        use super::super::tests::{read, write};
+        use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
+        let (record, old) = queued(None);
+        assert!(postcard::from_bytes::<DocumentOutboxRecord>(&old).is_err());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("db");
+        let database = path.to_str().unwrap();
+        write(&path, SYNC_OUTBOX_KEYSPACE, vec![(b"install", old)]);
+        let output = migrate_output(database).unwrap();
+        assert_eq!(output.outbox_installs_rewritten, 1);
+        let rows = read(&path, SYNC_OUTBOX_KEYSPACE);
+        let migrated: DocumentOutboxRecord =
+            postcard::from_bytes(&rows[b"install".as_slice()]).unwrap();
+        assert_eq!(migrated, record);
+        assert_eq!(
+            migrate_output(database).unwrap().outbox_installs_rewritten,
+            0
+        );
+        // A relayed write keeps its origin's signature over the old bytes, so it stops the run.
+        let signature = iroh::SecretKey::from_bytes(&[1; 32]).sign(b"install");
+        let (_, relayed) = queued(Some(signature));
+        write(
+            &path,
+            SYNC_OUTBOX_KEYSPACE,
+            vec![(b"relayed", relayed.clone())],
+        );
+        let refused = migrate_output(database);
+        assert!(matches!(refused, Err(ExplorerError::Refused(_))));
+        let rows = read(&path, SYNC_OUTBOX_KEYSPACE);
+        assert_eq!(rows[b"relayed".as_slice()], relayed);
     }
 }
