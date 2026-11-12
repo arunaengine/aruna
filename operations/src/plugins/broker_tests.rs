@@ -1043,3 +1043,122 @@ async fn superseded_merge_journaled() {
         .await;
     assert!(journaled.unwrap().is_some());
 }
+
+/// Stores object `key` of a new bucket of the fixture's group, with content digest `hash`.
+async fn stored_object(fixture: &Fixture, (bucket, key): (&str, &str), hash: [u8; 32]) {
+    use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+    };
+    use aruna_core::structs::storage::blob::{
+        BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
+        CurrentVersionPointer, VersionKey,
+    };
+    use aruna_core::structs::storage::format::{Compression, EncodingClass, StoredFormat};
+    let info = BucketInfo {
+        group_id: fixture.group_id,
+        created_at: std::time::UNIX_EPOCH,
+        created_by: fixture.actor.user_id,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: None,
+    };
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/unused".to_string(),
+        storage_bucket: bucket.to_string(),
+        backend_path: key.to_string(),
+        ulid: Ulid::generate(),
+        format: StoredFormat::default(),
+        created_at: std::time::SystemTime::now(),
+        created_by: fixture.actor.user_id,
+        staging: false,
+        partial: false,
+        blob_size: 5,
+        hashes: std::collections::HashMap::from([(HASH_BLAKE3.to_string(), hash.to_vec())]),
+    };
+    let version_id = Ulid::generate();
+    let version = BlobVersion::materialized(
+        hash,
+        BackendRef::node_default(),
+        EncodingClass::Raw,
+        location.created_at,
+        location.created_by,
+        None,
+    );
+    let located = BlobLocationKey::from_blake3(&hash, EncodingClass::Raw, location.backend.clone());
+    let rows = [
+        (
+            S3_BUCKET_KEYSPACE,
+            bucket.as_bytes().to_vec(),
+            info.to_bytes().unwrap(),
+        ),
+        (
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new(bucket, key).to_bytes().unwrap(),
+            CurrentVersionPointer::new(version_id).to_bytes().unwrap(),
+        ),
+        (
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new(bucket, key, version_id).to_bytes().unwrap(),
+            version.to_bytes().unwrap(),
+        ),
+        (
+            BLOB_LOCATIONS_KEYSPACE,
+            located.unwrap().to_bytes(),
+            location.to_bytes().unwrap(),
+        ),
+    ];
+    let txn = Txn::direct(&fixture.ctx);
+    for (space, key, value) in rows {
+        txn.write(space, vec![(key.to_vec(), value)]).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn hashed_files_rename() {
+    // An imported file names its content by hash and its object by `s3://`: with the grant it can
+    // be renamed and keeps its hash id; a hash alone or a hash the object does not match is refused.
+    use aruna_core::structs::storage::data::identity::content_id;
+    let (fixture, broker, _, _dir) = broker().await;
+    let hash = [5u8; 32];
+    stored_object(&fixture, ("imports", "run/a.txt"), hash).await;
+    let id = content_id(hash);
+    let document = files_named(&fixture, &broker, &[id.as_str()]).await;
+    let reads = serde_json::json!({ "permissions": {
+        "required": ["metadata.read", "metadata.write", "objects.read"] } });
+    let mut request = fixture.request(None);
+    request.version = Some(fixture.publish("0.1.5", "56", reads).await);
+    let installed = fixture.install(&request).await.unwrap();
+    let mut scope = broker.scope.clone();
+    scope.run.install_id = installed.install_id;
+    scope.run.digest = installed.digest.clone();
+    let writer = RunBroker::new(broker.ctx.clone(), scope);
+    let revision = revision_of(&writer, document).await;
+    let located = |id: &str, name: &str| {
+        serde_json::json!({"@id": id, "@type": "File", "name": name,
+            "contentUrl": "s3://imports/run/a.txt"})
+    };
+    let renamed = located(&id, "renamed");
+    let change = put(document, &renamed, &revision, 0);
+    writer.metadata_put_file(&cx(), change).await.unwrap();
+    project(&broker.ctx).await;
+    let files = files_of(&writer, document).await;
+    assert_eq!(files[0]["@id"], id.as_str());
+    assert_eq!(files[0]["name"], "renamed");
+
+    let revision = revision_of(&writer, document).await;
+    let other = located(&content_id([6u8; 32]), "other");
+    let refused = writer
+        .metadata_put_file(&cx(), put(document, &other, &revision, 1))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
+    let alone = serde_json::json!({"@id": id, "@type": "File", "name": "alone"});
+    let refused = writer
+        .metadata_put_file(&cx(), put(document, &alone, &revision, 2))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::Denied);
+}

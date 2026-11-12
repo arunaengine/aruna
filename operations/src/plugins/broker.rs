@@ -14,6 +14,7 @@ use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun};
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields, header_name};
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
@@ -351,8 +352,7 @@ impl RunBroker {
     }
 
     /// Checks each Aruna object a file entity names through the plugin's own `objects.read` call
-    /// check, grants and policies included, then that it lies in a bucket of the install's group
-    /// here. Forms that name no single object here (content hashes, global ids) are refused.
+    /// check and that it lies in a group bucket here. A content hash or global id needs one with it.
     async fn objects_named(&self, install: &PluginInstall, file: &Value) -> Result<(), HostError> {
         let realm_id = self.scope.realm_id;
         // Every spelling the write converter stores as the id or as `contentUrl` is checked.
@@ -369,27 +369,67 @@ impl RunBroker {
             HostError::new(ErrorKind::Denied, message)
         };
         let group = install.group_id;
+        // A content hash or global id names no object alone; a concrete one must come with it.
+        let (mut objects, mut hash, mut unplaced) = (Vec::new(), None, None);
         for value in values {
             let identity = DataIdentity::read(value, &[]);
-            let path = if value.starts_with(&format!("/{realm_id}/g/")) {
-                value.to_string()
+            if value.starts_with(&format!("/{realm_id}/g/")) {
+                objects.push((value.to_string(), None));
             } else if let Some(exact) = identity.exact {
                 if exact.realm_id != realm_id {
                     return Err(refused(value));
                 }
-                let (bucket, key) = (&exact.bucket, &exact.key);
-                object_permission_path(realm_id, group, exact.node_id, bucket, key)
+                let (node, bucket, key) = (exact.node_id, &exact.bucket, &exact.key);
+                let path = object_permission_path(realm_id, group, node, bucket, key);
+                objects.push((path, Some(exact.version)));
             } else if let Some(at) = identity.location {
-                object_permission_path(realm_id, group, self.scope.local, &at.bucket, &at.key)
+                let local = self.scope.local;
+                objects.push((
+                    object_permission_path(realm_id, group, local, &at.bucket, &at.key),
+                    None,
+                ));
             } else if identity.is_aruna() {
-                return Err(refused(value));
-            } else {
-                continue;
-            };
+                hash = hash.or(identity.hash);
+                unplaced.get_or_insert(value);
+            }
+        }
+        if let (Some(value), true) = (unplaced, objects.is_empty()) {
+            return Err(refused(value));
+        }
+        for (path, version) in objects {
             self.checked(Permission::ObjectsRead, &path).await?;
-            self.object_at(install, &path).await?;
+            let (bucket, key) = self.object_at(install, &path).await?;
+            if let Some(hash) = hash {
+                self.same_content((bucket, key, version), hash).await?;
+            }
         }
         Ok(())
+    }
+
+    /// Refuses an object whose stored BLAKE3 digest differs from the hash a file names it by. An
+    /// object stored without one cannot be compared and passes.
+    async fn same_content(
+        &self,
+        (bucket, key, version_id): (String, String, Option<Ulid>),
+        hash: [u8; 32],
+    ) -> Result<(), HostError> {
+        let head = HeadObjectInput {
+            bucket,
+            key,
+            version_id,
+        };
+        let head = drive(HeadObjectOperation::new(head), &self.ctx).await;
+        let head = head.map_err(|_| HostError::new(ErrorKind::NotFound, "the object is gone"))?;
+        let stored = head
+            .location
+            .and_then(|location| location.hashes.get(HASH_BLAKE3).cloned());
+        match stored {
+            Some(stored) if stored != hash => Err(HostError::new(
+                ErrorKind::Invalid,
+                "the object's content does not match the file's hash id",
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Closes an attempt of a create key. A failure only keeps the key's arguments fixed.
