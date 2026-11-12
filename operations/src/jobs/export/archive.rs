@@ -128,29 +128,11 @@ pub(super) fn plan_export(
     Ok(())
 }
 
-/// What export reads of one File entity of an expanded crate: its raw id and raw local path, and
-/// the `contentUrl` values and local paths expansion gives it.
-pub(crate) struct FileReference {
-    pub entity_id: String,
-    pub raw_path: Option<String>,
-    pub urls: Vec<String>,
-    pub paths: Vec<String>,
-}
-
-/// The File entities export reads of a crate, by the same expansion: `jsonld` is expanded as
-/// export expands the stored revision, then read by [`file_references`].
-pub(crate) fn crate_references(jsonld: &str) -> Result<Vec<FileReference>, String> {
-    let canonical = craqle::canonicalize_jsonld(jsonld).map_err(|error| error.to_string())?;
-    let document: JsonValue = serde_json::from_str(jsonld).map_err(|error| error.to_string())?;
-    file_references(&document, &canonical.nquads).map_err(|error| format!("{error:?}"))
-}
-
-/// Reads the File entities of a crate from its raw JSON and its expansion `nquads`, as export
-/// does before it names their objects.
-pub(super) fn file_references(
+pub(super) fn recognize_entities(
     document: &JsonValue,
     nquads: &str,
-) -> Result<Vec<FileReference>, ExportFailure> {
+    realm_id: RealmId,
+) -> Result<Vec<ExportEntity>, ExportFailure> {
     let keywords = JsonLdKeywords::new(document);
     let raw_ids = raw_entity_ids(document, &keywords)?;
     let mut files = BTreeSet::new();
@@ -186,41 +168,13 @@ pub(super) fn file_references(
         }
     }
 
-    let mut references = Vec::new();
+    let mut entities = Vec::new();
     for (subject, entity_id, raw_path) in raw_ids {
         if !files.remove(&subject) {
             continue;
         }
-        references.push(FileReference {
-            urls: content_urls.remove(&subject).unwrap_or_default(),
-            paths: local_paths.remove(&subject).unwrap_or_default(),
-            entity_id,
-            raw_path,
-        });
-    }
-    if let Some(subject) = files.into_iter().next() {
-        return Err(ExportFailure::Permanent(format!(
-            "expanded File entity `{subject}` has no raw JSON-LD definition"
-        )));
-    }
-    Ok(references)
-}
-
-pub(super) fn recognize_entities(
-    document: &JsonValue,
-    nquads: &str,
-    realm_id: RealmId,
-) -> Result<Vec<ExportEntity>, ExportFailure> {
-    let mut entities = Vec::new();
-    for reference in file_references(document, nquads)? {
-        let FileReference {
-            entity_id,
-            raw_path,
-            urls,
-            paths,
-            ..
-        } = reference;
-        let identity = DataIdentity::read(&entity_id, &urls);
+        let urls = content_urls.get(&subject).map_or(&[][..], Vec::as_slice);
+        let identity = DataIdentity::read(&entity_id, urls);
         let storage_key = identity
             .exact
             .as_ref()
@@ -247,6 +201,7 @@ pub(super) fn recognize_entities(
         // A web identifier of another realm is a reference, as an export into a realm leaves it.
         let external = !identity.is_aruna() || (foreign && web_entity(&entity_id));
         let unsupported_realm = foreign && !external;
+        let paths = local_paths.remove(&subject).unwrap_or_default();
         let local_path = raw_path
             .filter(|raw_path| paths.contains(raw_path))
             .or_else(|| paths.into_iter().next());
@@ -278,6 +233,11 @@ pub(super) fn recognize_entities(
             path_synthesized: false,
             content: None,
         });
+    }
+    if let Some(subject) = files.into_iter().next() {
+        return Err(ExportFailure::Permanent(format!(
+            "expanded File entity `{subject}` has no raw JSON-LD definition"
+        )));
     }
     Ok(entities)
 }
