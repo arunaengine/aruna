@@ -234,16 +234,21 @@ async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &
     let Some(txn_id) = start_txn(context).await else {
         return;
     };
+    // A pass may have queued a newer version of the file meanwhile; that row is still owed.
+    let holds = stored_upload(context, upload, txn_id)
+        .await
+        .is_some_and(|stored| same_version(&stored, upload));
     let settled = write_rows(context, rows, Some(txn_id)).await
-        && super::repository::delete_rows(
-            context,
-            vec![(
-                SYNC_UPLOAD_KEYSPACE.to_string(),
-                base_key(upload.folder_id, &upload.relative),
-            )],
-            Some(txn_id),
-        )
-        .await;
+        && (!holds
+            || super::repository::delete_rows(
+                context,
+                vec![(
+                    SYNC_UPLOAD_KEYSPACE.to_string(),
+                    base_key(upload.folder_id, &upload.relative),
+                )],
+                Some(txn_id),
+            )
+            .await);
     if !settled {
         abort_txn(context, txn_id).await;
         return;
@@ -461,6 +466,16 @@ async fn store_state(
 }
 
 async fn holds_state(context: &Arc<DriverContext>, upload: &SyncUpload, txn_id: TxnId) -> bool {
+    stored_upload(context, upload, txn_id)
+        .await
+        .is_some_and(|stored| stored.state == upload.state && same_version(&stored, upload))
+}
+
+async fn stored_upload(
+    context: &Arc<DriverContext>,
+    upload: &SyncUpload,
+    txn_id: TxnId,
+) -> Option<SyncUpload> {
     read_value(
         context,
         SYNC_UPLOAD_KEYSPACE,
@@ -469,7 +484,11 @@ async fn holds_state(context: &Arc<DriverContext>, upload: &SyncUpload, txn_id: 
     )
     .await
     .and_then(|bytes| SyncUpload::from_bytes(&bytes).ok())
-    .is_some_and(|stored| stored.state == upload.state)
+}
+
+/// Whether two rows publish the same local version of one file.
+fn same_version(stored: &SyncUpload, upload: &SyncUpload) -> bool {
+    stored.local_version == upload.local_version && stored.deleted == upload.deleted
 }
 
 async fn read_page(
@@ -556,8 +575,8 @@ mod tests {
     use ulid::Ulid;
 
     use super::{
-        ForwardOutcome, QueueDrain, SyncUpload, UploadDrain, UploadState, drain_sync_outbox,
-        requeued,
+        ForwardOutcome, QueueDrain, SyncPullAck, SyncUpload, UploadDrain, UploadState,
+        claim_upload, drain_sync_outbox, requeued, settle_upload,
     };
     use crate::device::drain::DrainOutcome;
     use crate::device::sync::folders::store_folder;
@@ -744,6 +763,27 @@ mod tests {
             ForwardOutcome::Settled
         );
         assert_eq!(stored(&context, &newer).await.state, newer.state);
+    }
+
+    #[tokio::test]
+    async fn keeps_newer_version() {
+        // A late answer for an older version must leave the row a later pass queued untouched.
+        let (_tempdir, context) = context().await;
+        let context = Arc::new(context);
+        let older = upload(Ulid::generate());
+        let newer = SyncUpload {
+            local_version: Some(Ulid::generate()),
+            ..older.clone()
+        };
+        store(&context, &newer).await;
+
+        assert_eq!(claim_upload(&context, &older).await, None);
+        let ack = SyncPullAck {
+            version_id: Ulid::generate(),
+            already_applied: true,
+        };
+        settle_upload(&context, &older, &ack).await;
+        assert_eq!(stored(&context, &newer).await, newer);
     }
 
     #[test]
