@@ -46,15 +46,19 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
+use serde::Deserialize;
+use serde::Serialize;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
 use super::read::device_replica;
+use crate::forward::authorize::CreateScope;
 use crate::forward::authorize::authorize_create;
 use crate::forward::authorize::authorize_forwarded_caller;
 use crate::forward::authorize::authorize_write;
@@ -118,23 +122,46 @@ pub async fn route_metadata_create(
             ))
         })?
     };
-    let (placement, holders) =
-        create_forward_holders(&realm_config, &config, document_id.as_ulid()).ok_or_else(|| {
+    let target = (document_id.as_ulid(), None);
+    forward_create(
+        &context,
+        &realm_config,
+        &config,
+        target,
+        (auth_token, commit_message),
+    )
+    .await
+}
+
+/// Sends the create of `document_id` to the holders of its bucket, or to the `pinned` one only,
+/// and checks the record the answering holder returns.
+async fn forward_create(
+    context: &Arc<DriverContext>,
+    realm_config: &RealmConfigDocument,
+    config: &CreateDocumentConfig,
+    (document_id, pinned): (Ulid, Option<NodeId>),
+    (auth_token, commit_message): (Option<AuthToken>, Option<String>),
+) -> Result<CreateDocumentResult, MetadataWriteError> {
+    let (placement, mut holders) = create_forward_holders(realm_config, config, document_id)
+        .ok_or_else(|| {
             MetadataWriteError::Undeliverable(
                 "document id has no resolvable metadata placement".to_string(),
             )
         })?;
+    if let Some(pinned) = pinned {
+        holders = vec![pinned];
+    }
     let config_digest = realm_config
         .digest()
         .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
     let response = forward_to_holders(
-        &context,
+        context,
         &holders,
         MetadataTransportMessage::ForwardCreateDocument {
             auth_token,
             config_digest,
             group_id: config.group_id,
-            document_id: document_id.as_ulid(),
+            document_id,
             document_path: config.document_path.clone(),
             public: config.public,
             payload: config.payload.clone(),
@@ -146,7 +173,7 @@ pub async fn route_metadata_create(
     .await?;
     match response {
         MetadataTransportMessage::ForwardedRecord { record }
-            if create_record_matches(&config, document_id.as_ulid(), &placement, &record) =>
+            if create_record_matches(config, document_id, &placement, &record) =>
         {
             Ok(CreateDocumentResult {
                 event_id: record.last_event_id,
@@ -234,6 +261,7 @@ pub async fn create_metadata_authorized(
             group_id,
             &path,
             document_id,
+            CreateScope::Group,
         )
         .await?;
     }
@@ -267,6 +295,129 @@ pub async fn create_metadata_authorized(
     )
     .await;
 
+    Ok(record)
+}
+
+/// A create of a given document on one pinned node, kept so that a retry sends the very same
+/// arguments to the very same node.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PinnedCreate {
+    pub group_id: GroupId,
+    /// The normalized document path.
+    pub path: String,
+    pub document_id: Ulid,
+    /// This node, or the holder of the document's bucket chosen when the id was minted.
+    pub target: NodeId,
+    pub payload: CreateDocumentPayload,
+    pub message: Option<String>,
+}
+
+impl PinnedCreate {
+    /// Mints the id of a new private document at `path` and pins the node that creates it: this
+    /// node when it holds the id's bucket, else the first other holder of that bucket.
+    pub async fn mint(
+        context: &Arc<DriverContext>,
+        actor: &Actor,
+        (group_id, path): (GroupId, &str),
+        (payload, message): (CreateDocumentPayload, Option<String>),
+    ) -> Result<Self, CreateAuthorizedError> {
+        let path = MetadataRegistryRecord::normalize_document_path(path);
+        if path.is_empty() {
+            return Err(CreateAuthorizedError::EmptyPath);
+        }
+        let config = load_realm_config(context, actor.realm_id)
+            .await
+            .ok_or(MetadataApiError::ServiceUnavailable)?;
+        let user_origin = is_user_origin(context, actor.realm_id, actor.node_id).await?;
+        let local = match user_origin {
+            true => Err(CreateDocumentError::HoldsNoBucket),
+            false => mint_local_document(&config, actor, group_id, &path),
+        };
+        let (document_id, target) = match local {
+            Ok(id) => (id.as_ulid(), actor.node_id),
+            Err(CreateDocumentError::HoldsNoBucket) => {
+                let id = mint_forward_document(&config, actor, group_id, &path)?.as_ulid();
+                let placement = resolve_metadata_id(&config, actor.realm_id, Some(group_id), id)?;
+                let holders = resolve_shard_holders(&config, &placement);
+                let target = holders.into_iter().find(|holder| *holder != actor.node_id);
+                let target = target.ok_or_else(|| {
+                    MetadataWriteError::Undeliverable("the document has no holder".to_string())
+                })?;
+                (id, target)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Self {
+            group_id,
+            path,
+            document_id,
+            target,
+            payload,
+            message,
+        })
+    }
+}
+
+/// Creates the pinned document on its target only, authorized on the document's own path, so a
+/// retry meets the holder's replay of an accepted create. Emits the watch event like REST.
+pub async fn create_with_id(
+    context: &Arc<DriverContext>,
+    actor: Actor,
+    (auth, extras): (&AuthContext, PolicyRequestExtras),
+    create: &PinnedCreate,
+) -> Result<MetadataRegistryRecord, CreateAuthorizedError> {
+    let realm_id = actor.realm_id;
+    if auth.realm_id != realm_id {
+        return Err(CreateAuthorizedError::Forbidden);
+    }
+    let (group_id, document_id) = (create.group_id, create.document_id);
+    let scope = CreateScope::Document;
+    authorize_create(
+        context,
+        realm_id,
+        auth,
+        extras,
+        group_id,
+        &create.path,
+        document_id,
+        scope,
+    )
+    .await?;
+    let local = create.target == actor.node_id;
+    let config = CreateDocumentConfig {
+        actor,
+        group_id,
+        document_id,
+        document_path: create.path.clone(),
+        public: false,
+        payload: create.payload.clone(),
+    };
+    let created = if local {
+        let operation =
+            CreateDocumentOperation::new_generated_id(config).with_message(create.message.clone());
+        create_metadata_document(operation, context.clone()).await?
+    } else {
+        let realm_config = load_realm_config(context, realm_id)
+            .await
+            .ok_or(MetadataApiError::ServiceUnavailable)?;
+        let token = Some(AuthToken::Internal(auth.clone()));
+        let target = (document_id, Some(create.target));
+        let sent = (token, create.message.clone());
+        forward_create(context, &realm_config, &config, target, sent).await?
+    };
+    let record = created.record;
+    let path = &record.document_path;
+    let (user, group) = (auth.user_id, record.group_id);
+    emit_metadata_created(
+        context,
+        realm_id,
+        user,
+        group,
+        document_id,
+        path,
+        created.event_id,
+    )
+    .await;
     Ok(record)
 }
 
