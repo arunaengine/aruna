@@ -253,3 +253,62 @@ async fn installs_with_secrets() {
         "{refused:?}"
     );
 }
+
+/// The bound install moved to a version whose `catalog` and `mirror` connections inject the
+/// slots `api_key` and `other_key`, both bound to the group secret `api-key`.
+async fn shared_install(fixture: &Fixture) -> (PluginInstall, aruna_plugins::manifest::Manifest) {
+    use aruna_core::plugin_installs::SecretBinding;
+    let install = bound(fixture).await;
+    secret(fixture, &install).await;
+    let slots = serde_json::json!({
+        "secrets": {
+            "api_key": { "title": "API key", "kind": "bearer" },
+            "other_key": { "title": "Mirror key", "kind": "bearer" }
+        },
+        "connections": {
+            "catalog": { "url": "{catalog_url}/api/", "auth": "api_key" },
+            "mirror": { "url": "{catalog_url}/mirror/", "auth": "other_key" }
+        }
+    });
+    let digest = fixture.publish("0.3.0", "ee", slots).await;
+    let scope = super::super::grants::InstallScope {
+        realm_id: install.account.realm_id,
+        group_id: install.group_id,
+        install_id: install.install_id,
+    };
+    edit_config(fixture, |config| {
+        let held = &mut config.installs[0];
+        (held.digest, held.version) = (digest.clone(), "0.3.0".to_string());
+        let binding = SecretBinding::parse("group:api-key").unwrap();
+        held.secrets = [("api_key", &binding), ("other_key", &binding)]
+            .map(|(slot, binding)| (slot.to_string(), binding.clone()))
+            .into();
+        let paths = ["catalog", "mirror"].map(|name| scope.connection(name));
+        held.grants
+            .insert("connections.send".to_string(), paths.to_vec());
+    })
+    .await;
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let plugin = crate::plugins::install::pick_version(&config, &install.plugin, Some(&digest));
+    let manifest = crate::plugins::install::read_manifest(&plugin.unwrap()).unwrap();
+    (config.installs[0].clone(), manifest)
+}
+
+#[tokio::test]
+async fn shared_secret_slots() {
+    let fixture = Fixture::keyed().await;
+    let (install, manifest) = shared_install(&fixture).await;
+    ensure_rules(&fixture.ctx, &fixture.actor, &install, &manifest)
+        .await
+        .unwrap();
+    // Both slots use the one secret, so it keeps the rules of both connections.
+    let paths: Vec<Vec<String>> = (rules(&fixture, &install).await.into_iter())
+        .map(|rule| rule.paths)
+        .collect();
+    assert_eq!(
+        paths,
+        [vec!["/api".to_string()], vec!["/mirror".to_string()]]
+    );
+}

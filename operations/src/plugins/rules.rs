@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall};
 use aruna_core::secret_registers::{SecretBody, SecretOwner};
@@ -240,14 +240,16 @@ pub async fn ensure_rules(
         install_id: install.install_id,
         revision: install.revision,
     };
-    for binding in install.secrets.values() {
-        if binding.scope != BoundScope::Group {
-            continue;
-        }
-        let rules = wanted.remove(&binding.name).unwrap_or_default();
-        let target = (install.group_id, &binding.name);
+    // Slots may share a secret; each secret is edited once with all of its rules.
+    let names: BTreeSet<&SecretName> = (install.secrets.values())
+        .filter(|binding| binding.scope == BoundScope::Group)
+        .map(|binding| &binding.name)
+        .collect();
+    for name in names {
+        let rules = wanted.remove(name).unwrap_or_default();
+        let target = (install.group_id, name);
         let edited = edit_rules(ctx, actor, target, (&consumer(install), rules), guard).await;
-        edited.map_err(|error| format!("`{binding}`: {error}"))?;
+        edited.map_err(|error| format!("`group:{name}`: {error}"))?;
     }
     Ok(())
 }
