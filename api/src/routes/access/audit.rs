@@ -52,7 +52,8 @@ pub struct AdminAuditQuery {
 pub struct AdminAuditRow {
     pub audit_id: String,
     /// `account_deactivated`, `account_reactivated`, `service_account_created`,
-    /// `restricted_token_issued`, a `secret_` action or a `plugin_` action.
+    /// `restricted_token_issued`, `service_credential_issued`, a `secret_` action or a `plugin_`
+    /// action.
     pub action: String,
     pub actor: String,
     pub target: String,
@@ -232,6 +233,7 @@ fn row(record: AdminAuditRecord) -> AdminAuditRow {
         AdminAuditAction::AccountReactivated => "account_reactivated",
         AdminAuditAction::ServiceAccountCreated => "service_account_created",
         AdminAuditAction::RestrictedTokenIssued => "restricted_token_issued",
+        AdminAuditAction::ServiceCredentialIssued => "service_credential_issued",
         AdminAuditAction::SecretCreated => "secret_created",
         AdminAuditAction::SecretReplaced => "secret_replaced",
         AdminAuditAction::SecretRotated => "secret_rotated",

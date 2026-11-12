@@ -16,6 +16,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
+use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
@@ -123,6 +124,8 @@ pub struct CreateUserOperation {
     tokens: Option<TokenPlan>,
     /// Deleted credentials whose token grants still go, and where the current one's scan stands.
     stale_tokens: (Vec<String>, Option<Key>),
+    /// The administrator who issues this credential for another account, audited with it.
+    issuer: Option<UserId>,
 }
 
 /// The encrypted buckets a new credential reads with its token, and the audit rows of each.
@@ -199,7 +202,14 @@ impl CreateUserOperation {
             output: Err(CreateUserError::NotFinished),
             tokens: None,
             stale_tokens: (Vec::new(), None),
+            issuer: None,
         }
+    }
+
+    /// Records the credential in the admin audit as issued by `actor`, in its transaction.
+    pub fn with_issuer(mut self, actor: UserId) -> Self {
+        self.issuer = Some(actor);
+        self
     }
 
     /// Checks that each of `buckets` exists and encrypts, in the credential's transaction. The
@@ -553,6 +563,16 @@ impl CreateUserOperation {
                 index_value,
             ),
         ];
+        if let Some(actor) = self.issuer {
+            let action = AdminAuditAction::ServiceCredentialIssued;
+            let mut audit = AdminAuditRecord::new(action, actor, self.config.user_identity);
+            audit.group_id = Some(self.config.group_id);
+            audit.session_id = Some(access.access_key.clone());
+            match audit.entries() {
+                Ok(entries) => writes.extend(entries),
+                Err(err) => return self.handle_error(err.into()),
+            }
+        }
         if let Some(plan) = self.tokens.as_mut() {
             writes.append(&mut plan.written);
         }
@@ -676,7 +696,9 @@ mod pure_tests {
     use super::*;
     use crate::s3::access::index::owner_key;
     use aruna_core::effects::IterStart;
-    use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, ABE_REQUEST_KEYSPACE, TOKEN_GRANT_KEYSPACE};
+    use aruna_core::keyspaces::{
+        ABE_GRANT_KEYSPACE, ABE_REQUEST_KEYSPACE, ADMIN_AUDIT_KEYSPACE, TOKEN_GRANT_KEYSPACE,
+    };
     use aruna_core::structs::storage::abe_access::token_prefix;
 
     fn owner_read(op: &CreateUserOperation, value: Option<aruna_core::types::Value>) -> Event {
@@ -794,6 +816,54 @@ mod pure_tests {
             returned_access.open_secret(&test_key()).unwrap(),
             plaintext.expose()
         );
+    }
+
+    #[test]
+    fn issuer_is_audited() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let (owner, admin) = (
+            UserId::new(Ulid::from_parts(1, 1), realm_id),
+            UserId::default(),
+        );
+        let group_id = Ulid::from_parts(1, 2);
+        let written = |op: CreateUserOperation| {
+            let mut op = op;
+            op.start();
+            op.step(Event::Storage(StorageEvent::TransactionStarted {
+                txn_id: Ulid::from_parts(2, 2),
+            }));
+            op.step(owner_read(&op, None));
+            let access_key = op.access.as_ref().unwrap().access_key.clone();
+            let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![(access_key.as_bytes().into(), None)],
+            }));
+            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
+            else {
+                panic!("expected the credential writes, got {effects:?}");
+            };
+            (access_key, writes.clone())
+        };
+        let plain = CreateUserOperation::new(make_config(owner, group_id), test_key());
+        let (_, writes) = written(plain);
+        assert!(
+            writes
+                .iter()
+                .all(|(space, _, _)| space != ADMIN_AUDIT_KEYSPACE)
+        );
+
+        let issued =
+            CreateUserOperation::new(make_config(owner, group_id), test_key()).with_issuer(admin);
+        let (access_key, writes) = written(issued);
+        let audit: Vec<_> = writes
+            .iter()
+            .filter(|(space, _, _)| space == ADMIN_AUDIT_KEYSPACE)
+            .collect();
+        assert_eq!(audit.len(), 2, "one realm row and one group row");
+        let record = AdminAuditRecord::from_bytes(&audit[1].2).unwrap();
+        assert_eq!(record.action, AdminAuditAction::ServiceCredentialIssued);
+        assert_eq!((record.actor, record.target), (admin, owner));
+        assert_eq!(record.group_id, Some(group_id));
+        assert_eq!(record.session_id, Some(access_key));
     }
 
     #[test]

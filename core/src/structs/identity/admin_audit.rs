@@ -42,6 +42,8 @@ pub enum AdminAuditAction {
     SecretReleased,
     /// A use of a secret by a plugin install was refused.
     SecretRefused,
+    /// A group administrator issued an S3 credential for a service account.
+    ServiceCredentialIssued,
 }
 
 /// One use of a secret by the install a row names: how it is delivered, the run it is for,
@@ -81,7 +83,8 @@ pub struct AdminAuditRecord {
     pub target: UserId,
     /// The group that owns the target, which lets that group's administrators read the row.
     pub group_id: Option<GroupId>,
-    /// The session a restricted token belongs to; never the token itself.
+    /// The session a restricted token belongs to, or the access key id of a service account
+    /// credential; never the token or secret itself.
     pub session_id: Option<String>,
     pub secret: Option<SecretAudit>,
     pub plugin: Option<PluginAudit>,
