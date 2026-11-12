@@ -29,4 +29,5 @@ mod s3_copy;
 mod s3_operations;
 mod s3_security;
 mod self_service;
+mod service_credentials;
 mod shared;
