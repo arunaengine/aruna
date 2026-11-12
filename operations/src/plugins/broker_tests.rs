@@ -959,3 +959,67 @@ async fn object_references() {
         .await;
     assert_eq!(missing.unwrap_err().kind, ErrorKind::NotFound);
 }
+
+#[tokio::test]
+async fn superseded_merge_journaled() {
+    // A merge older than the materialized status whose change is not applied yet is still
+    // journaled as an update once; the sender holds it until its own dot is applied.
+    use crate::metadata::get_document::load_document_record;
+    use crate::metadata::projector::project_create_event;
+    use aruna_core::events::Event;
+    use aruna_core::metadata::{
+        MetadataBatchSource, MetadataEffect, MetadataEvent, MetadataEventPayload,
+        MetadataEventRecord,
+    };
+    use aruna_core::plugin_runs::source_key;
+    let (fixture, broker, _, _dir) = broker().await;
+    let document = three_files(&fixture, &broker).await;
+    let revision = revision_of(&broker, document).await;
+    let typed = serde_json::json!({"@id": "./a.txt", "@type": "File", "name": "newer"});
+    broker
+        .metadata_put_file(&cx(), put(document, &typed, &revision, 0))
+        .await
+        .unwrap();
+    project(&broker.ctx).await;
+    let record = load_document_record(&broker.ctx, document)
+        .await
+        .unwrap()
+        .unwrap();
+    let source = MetadataBatchSource::UpsertDataEntity {
+        jsonld: r#"{"@id":"./d.txt","@type":"File","name":"d"}"#.to_string(),
+    };
+    let handle = broker.ctx.metadata_handle.as_ref().unwrap();
+    let planned = handle
+        .send_metadata_effect(MetadataEffect::PlanBatch {
+            graph_iri: record.graph_iri.clone(),
+            actor: [9u8; 32],
+            counter: 1,
+            source: source.clone(),
+        })
+        .await;
+    let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) = planned else {
+        panic!("expected a planned batch, got {planned:?}");
+    };
+    let older = record.last_event_id.timestamp_ms() - 1;
+    let event = MetadataEventRecord {
+        event_id: Ulid::from_parts(older, 5),
+        record: record.clone(),
+        user_id: fixture.actor.user_id,
+        node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+        payload: MetadataEventPayload::ApplyBatch {
+            batch,
+            authored: source,
+        },
+        occurred_at_ms: older,
+    };
+    let local = Some(fixture.actor.node_id);
+    project_create_event(&broker.ctx, event.clone(), local)
+        .await
+        .unwrap();
+    let source = source_key(&format!("dataset_updated/{}", event.event_id));
+    let txn = Txn::direct(&broker.ctx);
+    let journaled = txn
+        .read(aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE, &source)
+        .await;
+    assert!(journaled.unwrap().is_some());
+}

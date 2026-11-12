@@ -151,6 +151,48 @@ async fn oversized_answers_kept() {
 }
 
 #[tokio::test]
+async fn oversized_rerun() {
+    // A rerun of a send whose answer was too large answers the stored refusal and sends nothing.
+    use crate::plugins::broker::RunBroker;
+    use crate::plugins::check::RunScope;
+    use aruna_plugins::broker::{Broker, CallContext, ErrorKind, Intent, Method, SendRequest};
+    let fixture = Fixture::new().await;
+    let install = install_artifact(&fixture, connected()).await;
+    let mut run = queued(install.install_id, 1);
+    (run.digest, run.settings) = (install.digest.clone(), install.settings.clone());
+    let scope = RunScope {
+        realm_id: fixture.actor.realm_id,
+        local: fixture.actor.node_id,
+        run,
+    };
+    let sender = Arc::new(Oversized(Mutex::new(0)));
+    let ctx = Arc::new(fixture.ctx.clone());
+    let broker = RunBroker::new(ctx, scope).with_outbound(sender.clone());
+    let cx = CallContext {
+        run: "run".to_string(),
+        install: install.install_id.to_string(),
+        max_bytes: 1 << 20,
+    };
+    let request = SendRequest {
+        connection: "api".to_string(),
+        method: Method::Post,
+        path: "records".to_string(),
+        query: Vec::new(),
+        headers: Vec::new(),
+        body: b"{}".to_vec(),
+        intent: Some(Intent::new(0, None, &[b"records"])),
+    };
+    for _ in 0..2 {
+        let refused = broker
+            .connection_send(&cx, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::Limit, "{}", refused.message);
+    }
+    assert_eq!(*sender.0.lock().unwrap(), 1);
+}
+
+#[tokio::test]
 async fn undeclared_method() {
     use crate::plugins::broker::RunBroker;
     use crate::plugins::check::RunScope;
