@@ -165,9 +165,11 @@ pub struct Scan {
     /// The plugin's own entity changes since the parts were read; `None` is a removal.
     #[serde(default)]
     pub overlay: BTreeMap<String, Option<Value>>,
-    /// Entities read and not stored in a part yet.
+    /// Entities read and not stored in a part yet, and about how many bytes they take.
     #[serde(skip)]
     pub fresh: Part,
+    #[serde(skip)]
+    pub fresh_bytes: usize,
     /// Every entity of a finished scan, once its parts are loaded.
     #[serde(skip)]
     pub all: Part,
@@ -183,31 +185,31 @@ pub struct Part {
 }
 
 impl Part {
-    pub fn add(&mut self, files: Vec<Value>) {
-        for file in files {
-            let id = file
-                .get("@id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            match id.starts_with(UPLOAD_PREFIX) {
-                true => {
-                    self.ours.insert(id, file);
-                }
-                false => {
-                    self.others.insert(id);
-                }
+    pub fn add(&mut self, file: Value) {
+        let id = entity_id(&file).to_string();
+        match id.starts_with(UPLOAD_PREFIX) {
+            true => {
+                self.ours.insert(id, file);
             }
+            false => {
+                self.others.insert(id);
+            }
+        }
+    }
+
+    /// About how many bytes an entity takes in a stored part: the plugin's own in full, the
+    /// others by `@id`.
+    pub fn cost(file: &Value) -> usize {
+        let id = entity_id(file);
+        match id.starts_with(UPLOAD_PREFIX) {
+            true => id.len() + serde_json::to_vec(file).map_or(0, |bytes| bytes.len()) + 4,
+            false => id.len() + 3,
         }
     }
 
     pub fn merge(&mut self, other: Part) {
         self.ours.extend(other.ours);
         self.others.extend(other.others);
-    }
-
-    pub fn size(&self) -> usize {
-        serde_json::to_vec(self).map_or(0, |bytes| bytes.len())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -257,6 +259,10 @@ impl Scan {
         self.overlay.insert(id.to_string(), file);
         self.revision = revision.to_string();
     }
+}
+
+fn entity_id(file: &Value) -> &str {
+    file.get("@id").and_then(Value::as_str).unwrap_or_default()
 }
 
 pub fn part_key(dataset: &str, part: u64) -> String {

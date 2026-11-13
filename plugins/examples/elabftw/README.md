@@ -180,7 +180,9 @@ Marks: `conflict`, `out_of_sync`, `changed_in_storage`, `too_large`, `gone`, `bl
   where the budget ends: the quick pass keeps its listing offset, a dataset's file pages build up
   in state across runs, and a storage check keeps its position.
 - The file pages read across runs are kept in parts of at most 64 KiB, each its own state
-  value, so a dataset's file count has no cap of its own. Every part counts toward the 16 MiB
+  value, so a dataset's file count has no cap of its own. A single file entity larger than a
+  part gets a part of its own; one larger than a state value (256 KiB) marks the link
+  `too_large`. Every part counts toward the 16 MiB
   of plugin state per install.
 - Plugin state holds about 500 bytes per link plus its tag set while that stays below 8 KiB,
   so about 30 000 links fit in the 16 MiB per install.

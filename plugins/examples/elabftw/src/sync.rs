@@ -666,12 +666,18 @@ impl<'a> Sync<'a> {
                 return Err(fault);
             }
             let page = self.host.files(dataset, scan.cursor.as_deref())?;
-            scan.fresh.add(page.files);
+            // A page splits into parts by the size of its entities; one larger than a part
+            // gets a part of its own.
+            for file in page.files {
+                let cost = Part::cost(&file);
+                if !scan.fresh.is_empty() && scan.fresh_bytes + cost > PART_BYTES {
+                    self.save_part(dataset, &mut scan)?;
+                }
+                scan.fresh.add(file);
+                scan.fresh_bytes += cost;
+            }
             scan.done = page.cursor.is_none();
             scan.cursor = page.cursor;
-            if scan.fresh.size() >= PART_BYTES {
-                self.save_part(dataset, &mut scan)?;
-            }
         }
         // A finished scan is kept at once: a later step of the run may still stop it.
         if read {
@@ -700,6 +706,7 @@ impl<'a> Sync<'a> {
         }
         scan.parts += 1;
         scan.fresh = Part::default();
+        scan.fresh_bytes = 0;
         Ok(())
     }
 

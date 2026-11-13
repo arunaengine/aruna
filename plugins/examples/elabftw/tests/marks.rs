@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use aruna_plugins::limits::Limits;
 use elabftw_sync::compare::Snapshot;
 use elabftw_sync::host::{Host, Kind, Meter};
-use elabftw_sync::progress::{DAY_MS, MAX_VALUE, Mark, REPORT_BYTES, Record, store};
+use elabftw_sync::progress::{DAY_MS, MAX_VALUE, Mark, PART_BYTES, REPORT_BYTES, Record, store};
 use elabftw_sync::sync::{Budget, Room, Sync};
 use serde_json::{Value, json};
 use support::{BUCKET, Runner, World, settings};
@@ -265,6 +265,59 @@ fn wide_dataset_scanned() {
         .filter(|key| key.starts_with(&prefix))
         .count();
     assert!(parts >= 3, "{parts} parts");
+}
+
+#[test]
+fn annotated_files_scanned() {
+    // 100 synced files with 3 KiB notes of a person, and one with a 100 KiB note, on one page:
+    // the page splits into parts below the state bound, and every note stays.
+    let runner = Runner::new();
+    let id = runner.world.experiment("Run 7", "", &["aruna"]);
+    for upload in 1..=101 {
+        runner
+            .world
+            .upload(id, upload, &format!("u{upload}.bin"), upload);
+    }
+    while runner.world.lock().datasets.is_empty() || !runner.marks(id).is_null() {
+        runner.poll();
+    }
+    let (dataset, stored) = runner.world.only_dataset();
+    for (n, (_, file)) in stored.files.iter().enumerate() {
+        let mut file = file.clone();
+        let size = if n == 0 { 100 << 10 } else { 3 << 10 };
+        file["note"] = json!("n".repeat(size));
+        runner.world.aruna_file(&dataset, file);
+    }
+    runner.world.lock().file_page = 101;
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "name": "Renamed" }));
+    runner.event(&dataset);
+    assert_eq!(runner.marks(id), Value::Null);
+    assert_eq!(runner.world.get(id)["title"], "Renamed");
+    let files = runner.world.dataset(&dataset).files;
+    assert!(files.values().all(|file| {
+        file["note"]
+            .as_str()
+            .is_some_and(|note| note.len() >= 3 << 10)
+    }));
+    let prefix = format!("files/{dataset}/");
+    let parts: Vec<String> = runner
+        .world
+        .state_keys()
+        .into_iter()
+        .filter(|key| key.starts_with(&prefix))
+        .collect();
+    assert!(parts.len() >= 5, "{} parts", parts.len());
+    // A part stays within 64 KiB unless it holds one larger entity alone.
+    for key in &parts {
+        let part = runner.world.state(key).unwrap();
+        let stored = serde_json::to_vec(&part).unwrap().len();
+        let ours = part["ours"].as_object().map_or(0, |ours| ours.len());
+        let entities = ours + part["others"].as_array().map_or(0, Vec::len);
+        let within = entities == 1 || stored <= PART_BYTES + 64;
+        assert!(within, "{key}: {entities} entities, {stored} bytes");
+    }
 }
 
 #[test]
