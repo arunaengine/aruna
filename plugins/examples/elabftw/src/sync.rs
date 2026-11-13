@@ -665,12 +665,15 @@ impl<'a> Sync<'a> {
         {
             return Ok(());
         }
-        if held.as_ref().is_some_and(|held| held.unknown) {
-            // The first `POST` may still land, so only a found experiment or a person settles it.
+        // An unknown outcome, or a create whose run stopped before it saved the outcome: the
+        // `POST` may have landed, so only a found experiment or a person settles it.
+        if let Some(mut held) = held {
             let found = elab::search(self.host, ID_FIELD, dataset)?;
             if let Some(experiment) = found.first() {
                 return self.adopt(dataset, *experiment);
             }
+            held.unknown = true;
+            record.link.reservation = Some(held);
             let reason = "the experiment create has an unknown outcome; resolve it by hand";
             record
                 .link

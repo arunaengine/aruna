@@ -11,7 +11,9 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 
-use elabftw_sync::host::{Created, Document, Fault, FilePage, Host, Kind, Reply, Request, Result};
+use elabftw_sync::host::{
+    Created, Document, Fault, FilePage, Host, Kind, Method, Reply, Request, Result,
+};
 use elabftw_sync::sync::Sync;
 use elabftw_sync::values::Settings;
 use serde_json::{Value, json};
@@ -73,8 +75,10 @@ pub struct Inner {
     pub race_patch: Option<Value>,
     /// The same, for the next file entity change.
     pub race_file: Option<Value>,
-    /// The first outcome of each keyed request.
-    pub replies: BTreeMap<String, Result<Reply>>,
+    /// The node stops right after the next experiment `POST` lands: state writes fail until
+    /// the test clears `state_down`.
+    pub stop_after_post: bool,
+    pub state_down: bool,
 }
 
 #[derive(Default)]
@@ -188,17 +192,14 @@ impl World {
 
 impl Host for World {
     fn elab(&self, request: &Request) -> Result<Reply> {
+        // Like the host, a key names a request only within its run: a later run sends again.
         let mut inner = self.lock();
-        // Like the host, a keyed request answers its first outcome again and is not sent twice.
-        if let Some(stored) = request.key.as_ref().and_then(|key| inner.replies.get(key)) {
-            return stored.clone();
+        let reply = inner.elab(request)?;
+        let landed =
+            request.method == Method::Post && request.path.is_empty() && reply.status == 201;
+        if landed && std::mem::take(&mut inner.stop_after_post) {
+            inner.state_down = true;
         }
-        let outcome = inner.elab(request);
-        let kept = !matches!(&outcome, Err(fault) if fault.kind == Kind::Unavailable);
-        if let (Some(key), true) = (&request.key, kept) {
-            inner.replies.insert(key.clone(), outcome.clone());
-        }
-        let reply = outcome?;
         inner.spent += reply.body.len() as u64;
         Ok(reply)
     }
@@ -352,6 +353,9 @@ impl Host for World {
 
     fn put(&self, key: &str, value: &[u8], expected: Option<u64>) -> Result<u64> {
         let mut inner = self.lock();
+        if inner.state_down {
+            return Err(fault(Kind::Unavailable, "the node stopped"));
+        }
         if value.len() > MAX_STATE {
             return Err(fault(Kind::Limit, "the state value is too large"));
         }

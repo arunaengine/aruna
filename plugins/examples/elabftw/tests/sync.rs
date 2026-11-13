@@ -448,6 +448,54 @@ fn unknown_post_found() {
 }
 
 #[test]
+fn stopped_create_found() {
+    // The `POST` lands, then the node stops before the outcome is saved.
+    let runner = Runner::new();
+    let dataset = runner
+        .world
+        .aruna_dataset("elabftw/study", json!({ "name": "Study" }));
+    runner.world.lock().stop_after_post = true;
+    let found = runner.world.dataset(&dataset);
+    let path = format!("/r/g/lab/meta/{}@{dataset}", found.path);
+    let stopped = runner.at(|sync| sync.changed(&dataset, &path, &found.revision));
+    assert!(stopped.is_err());
+    runner.world.lock().state_down = false;
+
+    // A later run takes over the abandoned create, finds the experiment and sends no new POST.
+    runner.now.set(runner.now.get() + STALE_MS + 1);
+    runner.event(&dataset);
+    let experiments: Vec<u64> = runner.world.lock().experiments.keys().copied().collect();
+    assert_eq!((experiments.len(), runner.world.lock().posts), (1, 1));
+    let pointer = runner.world.state(&format!("dataset/{dataset}")).unwrap();
+    assert_eq!(pointer["experiment"], experiments[0]);
+}
+
+#[test]
+fn stopped_create_waits() {
+    // A run reserved the create and stopped; whether its `POST` was sent is not known.
+    let runner = Runner::new();
+    let dataset = runner
+        .world
+        .aruna_dataset("elabftw/study", json!({ "name": "Study" }));
+    let held = json!({ "dataset": dataset, "reservation": { "kind": "experiment", "run": "other", "at": START } });
+    runner.world.put_state(&format!("dataset/{dataset}"), &held);
+    runner.now.set(START + STALE_MS + 1);
+    runner.event(&dataset);
+    runner.poll();
+    assert_eq!(
+        runner.world.lock().posts,
+        0,
+        "no POST after a negative lookup"
+    );
+    let pointer = runner.world.state(&format!("dataset/{dataset}")).unwrap();
+    assert_eq!(pointer["reservation"]["unknown"], true);
+    assert!(pointer["marks"]["unknown_create"].is_array(), "{pointer}");
+
+    runner.manual(json!({ "resolve_create": dataset, "experiment": "absent" }));
+    assert_eq!(runner.world.lock().posts, 1);
+}
+
+#[test]
 fn unsent_post_retried() {
     let runner = Runner::new();
     let dataset = runner
