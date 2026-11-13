@@ -557,7 +557,7 @@ async fn guest_marks_problems() {
     assert!(
         guest.marks(id)["failed"]
             .to_string()
-            .contains("exclusive edit mode")
+            .contains("being edited")
     );
     guest.world.lock().edit_mode = false;
     guest.now.fetch_add(20 * 60 * 1000, Ordering::SeqCst);

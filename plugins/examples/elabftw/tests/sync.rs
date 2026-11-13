@@ -206,7 +206,7 @@ fn failed_link_retried() {
         .aruna_edit(&dataset, json!({ "name": "Run 8" }));
     runner.event(&dataset);
     let failed = runner.marks(id)["failed"][0].as_str().unwrap().to_string();
-    assert!(failed.contains("exclusive edit mode"), "{failed}");
+    assert!(failed.contains("being edited"), "{failed}");
     assert!(runner.link(id)["retry_at"].as_u64().is_some());
 
     runner.world.lock().edit_mode = false;
@@ -215,6 +215,31 @@ fn failed_link_retried() {
     runner.now.set(runner.now.get() + 20 * 60 * 1000);
     runner.poll();
     assert_eq!(runner.world.get(id)["title"], "Run 8");
+    assert_eq!(runner.marks(id), Value::Null);
+}
+
+#[test]
+fn edit_mode_not_blocked() {
+    // Exclusive edit mode refuses the link fields of a new link; that is no type clash.
+    let runner = Runner::new();
+    let id = runner.world.experiment("Run 7", "", &["aruna"]);
+    runner.world.lock().edit_mode = true;
+    runner.poll();
+    let marks = runner.marks(id);
+    assert!(marks["blocked"].is_null(), "{marks}");
+    assert!(
+        marks["failed"][0]
+            .as_str()
+            .unwrap()
+            .contains("being edited"),
+        "{marks}"
+    );
+
+    runner.world.lock().edit_mode = false;
+    runner.now.set(runner.now.get() + 20 * 60 * 1000);
+    runner.poll();
+    let (dataset, _) = runner.world.only_dataset();
+    assert_eq!(runner.world.extra(id)["Aruna dataset id"]["value"], dataset);
     assert_eq!(runner.marks(id), Value::Null);
 }
 

@@ -36,7 +36,8 @@ fn checked(reply: Reply) -> Result<Reply> {
         .collect::<String>();
     let kind = match status {
         404 => Kind::NotFound,
-        403 if text.to_lowercase().contains("edit mode") => Kind::Unavailable,
+        // eLabFTW 6.0 refuses with 400 "This entry is being edited by ..." in exclusive edit mode.
+        400 if text.contains("being edited") => Kind::Unavailable,
         401 | 403 => Kind::Denied,
         400..=499 => Kind::Invalid,
         _ => Kind::Unavailable,

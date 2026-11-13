@@ -159,10 +159,10 @@ impl Inner {
             ),
             (Method::Post, []) => self.post(&body),
             (_, _) if self.drop_writes => reply(200, json!({})),
-            (Method::Patch, _) if self.edit_mode => reply(
-                403,
-                json!({ "code": 403, "description": "This entry is in exclusive edit mode" }),
-            ),
+            // Exclusive edit mode refuses changes of the entity itself, not of its tags.
+            (Method::Patch, [_]) if self.edit_mode => {
+                refuse("This entry is being edited by Ada Person.")
+            }
             (Method::Patch, [_]) => self.patch(id.unwrap(), &body),
             (Method::Post, [_, "tags"]) => {
                 let id = id.unwrap();
