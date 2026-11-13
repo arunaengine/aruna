@@ -601,7 +601,11 @@ impl<'a> Sync<'a> {
         next.modified = after.modified.clone();
         next.revision = revision;
         next.pending = false;
-        next.tag_target = None;
+        // A tag target lives until the tags converge or a person settles them: tags not sent,
+        // or in conflict, keep it.
+        if !kept.contains(&Field::Tags) {
+            next.tag_target = None;
+        }
         let link = &mut record.link;
         link.snapshot = Some(next);
         link.force = None;

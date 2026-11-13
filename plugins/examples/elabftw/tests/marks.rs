@@ -539,6 +539,91 @@ fn tag_retry_keeps_restore() {
 }
 
 #[test]
+fn tag_target_waits() {
+    // A clear-to-empty batch stops, then the sync user loses write access for a while: the
+    // target waits, and the batch goes on once access is back.
+    let (runner, id, dataset) = shared_tags();
+    runner.world.aruna_edit(&dataset, json!({ "keywords": [] }));
+    runner.event(&dataset);
+    assert!(
+        runner.marks(id)["unfinished"].is_array(),
+        "{}",
+        runner.marks(id)
+    );
+    let readonly = json!({ "teams": [], "teamgroups": [], "users": [] }).to_string();
+    runner
+        .world
+        .edit(id, |experiment| experiment["canwrite"] = json!(readonly));
+    runner.poll();
+    runner.poll();
+    assert!(
+        runner.marks(id)["no_write"].is_array(),
+        "{}",
+        runner.marks(id)
+    );
+    let shared = json!({ "teams": [], "teamgroups": [], "users": [7] }).to_string();
+    runner
+        .world
+        .edit(id, |experiment| experiment["canwrite"] = json!(shared));
+    settle_runs(&runner, id);
+    assert_eq!(elab_tags(&runner, id), set(&["aruna"]));
+    assert_eq!(keywords(&runner, &dataset), set(&[]));
+}
+
+#[test]
+fn large_tags_wait() {
+    // Tag sets above 8 KiB keep no base sets: a stopped batch is a conflict, and it stays one
+    // through a later eLabFTW tag edit until a person settles it.
+    let runner = Runner::new();
+    let mut tags: Vec<String> = (0..120)
+        .map(|n| format!("tag-{n:03}-{}", "x".repeat(72)))
+        .collect();
+    tags.push("aruna".into());
+    let body = format!("<p>{}</p>", "b".repeat(400 << 10));
+    let id = runner.world.experiment(
+        "Run 7",
+        &body,
+        &tags.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    while runner.world.lock().datasets.is_empty() || !runner.marks(id).is_null() {
+        runner.poll();
+    }
+    let (dataset, _) = runner.world.only_dataset();
+    runner.world.aruna_edit(&dataset, json!({ "keywords": [] }));
+    runner.event(&dataset);
+    runner.poll();
+    assert!(
+        runner.marks(id)["conflict"].is_array(),
+        "{}",
+        runner.marks(id)
+    );
+
+    let mut held: Vec<String> = elab_tags(&runner, id).into_iter().collect();
+    held.push("added".into());
+    runner
+        .world
+        .retag(id, &held.iter().map(String::as_str).collect::<Vec<_>>());
+    runner.world.edit(id, |_| {});
+    runner.poll();
+    assert_eq!(
+        keywords(&runner, &dataset),
+        set(&[]),
+        "the partial set is not copied"
+    );
+    assert!(
+        runner.marks(id)["conflict"].is_array(),
+        "{}",
+        runner.marks(id)
+    );
+
+    runner.manual(json!({ "resolve": id, "keep": "aruna" }));
+    settle_runs(&runner, id);
+    assert_eq!(elab_tags(&runner, id), set(&["aruna"]));
+    assert_eq!(keywords(&runner, &dataset), set(&[]));
+    assert!(runner.link(id)["snapshot"].get("tag_target").is_none());
+}
+
+#[test]
 fn tag_batch_resumes() {
     // Aruna clears its keywords; the 20 removals span runs, and a change of mind halfway goes
     // out too.
