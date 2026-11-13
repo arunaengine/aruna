@@ -62,6 +62,44 @@ fn enrols_tagged_experiment() {
 }
 
 #[test]
+fn link_fields_repaired() {
+    let runner = Runner::new();
+    let id = runner.world.experiment("Run 7", "", &["aruna"]);
+    runner.world.edit(id, |experiment| {
+        let mine = json!({ "extra_fields": { "Sample": { "type": "text", "value": "S1" } } });
+        experiment["metadata"] = json!(mine.to_string());
+    });
+    runner.poll();
+    let (dataset, _) = runner.world.only_dataset();
+    let extra = runner.world.extra(id);
+    assert_eq!(
+        (
+            extra["Sample"]["value"].clone(),
+            extra["Aruna dataset id"]["value"].clone()
+        ),
+        (json!("S1"), json!(dataset))
+    );
+
+    // A person deletes a link field; the next sync of the experiment creates it again.
+    runner.world.edit(id, |experiment| {
+        let mut extra = extra_fields(experiment);
+        extra.remove("Aruna files");
+        experiment["metadata"] = json!(json!({ "extra_fields": extra }).to_string());
+        experiment["title"] = json!("Run 8");
+    });
+    runner.poll();
+    let extra = runner.world.extra(id);
+    assert_eq!(extra["Aruna files"]["value"], json!([]));
+    assert_eq!(extra["Sample"]["value"], "S1");
+    assert_eq!(runner.marks(id), Value::Null);
+}
+
+fn extra_fields(experiment: &Value) -> serde_json::Map<String, Value> {
+    let metadata: Value = serde_json::from_str(experiment["metadata"].as_str().unwrap()).unwrap();
+    metadata["extra_fields"].as_object().unwrap().clone()
+}
+
+#[test]
 fn title_both_ways() {
     let runner = Runner::new();
     let id = runner.world.experiment("Run 7", "<p>x</p>", &["aruna"]);

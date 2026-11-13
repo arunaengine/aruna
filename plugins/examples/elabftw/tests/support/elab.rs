@@ -18,6 +18,14 @@ fn reply(status: u16, body: Value) -> Result<Reply> {
     })
 }
 
+/// An eLabFTW refusal: `ImproperActionException` answers 400 with its message.
+pub(super) fn refuse(message: &str) -> Result<Reply> {
+    reply(
+        400,
+        json!({ "code": 400, "message": message, "description": "" }),
+    )
+}
+
 /// eLabFTW's HTML filter, as far as the tests need it: scripts go, `<br>` becomes `<br />`.
 pub fn purify(html: &str) -> String {
     let mut out = html.replace("<br>", "<br />");
@@ -233,39 +241,56 @@ impl Inner {
                 .filter(|(name, _)| *name != "action")
             {
                 let Some(field) = extra.get_mut(name) else {
-                    return reply(
-                        400,
-                        json!({ "code": 400, "description": "no such extra field" }),
-                    );
+                    return refuse(&format!("Invalid metadata field {name}."));
                 };
+                if value.is_array() && field["allow_multi_values"] != true {
+                    return refuse(&format!("Metadata field {name} expects a single value."));
+                }
                 field["value"] = value.clone();
             }
             Self::set_extra(experiment, extra);
-        } else if let Some(merged) = body.get("metadatamerge") {
-            for (name, field) in merged["extra_fields"].as_object().unwrap() {
-                if extra
-                    .get(name)
-                    .is_some_and(|old| old["type"] != field["type"])
-                {
-                    return reply(
-                        400,
-                        json!({ "code": 400, "description": "the field type does not match" }),
-                    );
-                }
-                extra.insert(name.clone(), field.clone());
-            }
-            Self::set_extra(experiment, extra);
         } else {
-            if let Some(title) = body.get("title") {
-                experiment["title"] = title.clone();
+            // An ordinary update casts every value to a string, as PHP's `(string)` does.
+            let text = |value: &Value| match value {
+                Value::String(text) => text.clone(),
+                Value::Array(_) | Value::Object(_) => "Array".to_string(),
+                Value::Bool(true) => "1".to_string(),
+                Value::Bool(false) | Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            if let Some(merged) = body.get("metadatamerge") {
+                let merged: Value = match serde_json::from_str(&text(merged)) {
+                    Ok(merged @ Value::Object(_)) => merged,
+                    _ => return refuse("Invalid metadata JSON provided."),
+                };
+                let incoming = merged["extra_fields"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                for (name, field) in incoming {
+                    match extra.get_mut(&name) {
+                        // An existing field keeps its schema; only its value changes.
+                        Some(old) if field.get("type").is_some_and(|kind| *kind != old["type"]) => {
+                            let message = format!("Metadata field {name} has incompatible type.");
+                            return refuse(&message);
+                        }
+                        Some(old) => old["value"] = field["value"].clone(),
+                        None => {
+                            extra.insert(name, field);
+                        }
+                    }
+                }
+                Self::set_extra(experiment, extra);
             }
-            if let Some(text) = body.get("body").and_then(Value::as_str) {
-                let html = body
-                    .get("content_type")
-                    .unwrap_or(&experiment["content_type"])
-                    != 2;
+            if let Some(title) = body.get("title") {
+                experiment["title"] = json!(text(title));
+            }
+            if let Some(raw) = body.get("body") {
+                let kind = body.get("content_type").map(text);
+                let html = kind.map_or(experiment["content_type"] != 2, |kind| kind != "2");
+                let raw = text(raw);
                 experiment["content_type"] = json!(if html { 1 } else { 2 });
-                experiment["body"] = json!(if html { purify(text) } else { text.to_string() });
+                experiment["body"] = json!(if html { purify(&raw) } else { raw });
             }
         }
         self.touch(id, SYNC_USER);

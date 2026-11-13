@@ -591,8 +591,10 @@ impl<'a> Sync<'a> {
             match experiment.clashing_field() {
                 Some(name) => blocked = Some(name.to_string()),
                 None => {
-                    let merge =
-                        json!({ "metadatamerge": link_fields(self.settings, dataset, &links) });
+                    // eLabFTW casts each value of an ordinary update to a string, so the
+                    // fields go as JSON text.
+                    let fields = link_fields(self.settings, dataset, &links).to_string();
+                    let merge = json!({ "metadatamerge": fields });
                     match elab::patch(self.host, id, merge) {
                         Err(fault) if fault.kind == Kind::Invalid => blocked = Some(fault.message),
                         other => other?,
