@@ -382,6 +382,25 @@ fn description_starts_body() {
 }
 
 #[test]
+fn other_identifier_kept() {
+    let runner = Runner::new();
+    let doi = json!("https://doi.org/10.1234/study");
+    let entity = json!({ "@id": "./", "@type": "Dataset", "name": "Study", "identifier": doi });
+    let dataset = runner.world.aruna_dataset("elabftw/study", entity);
+    runner.event(&dataset);
+    assert_eq!(runner.world.dataset(&dataset).entity["identifier"], doi);
+    let experiment = *runner.world.lock().experiments.keys().next().unwrap();
+    assert_eq!(runner.link(experiment)["dataset"], dataset);
+    // Later syncs keep it too.
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "name": "Study 2" }));
+    runner.event(&dataset);
+    assert_eq!(runner.world.get(experiment)["title"], "Study 2");
+    assert_eq!(runner.world.dataset(&dataset).entity["identifier"], doi);
+}
+
+#[test]
 fn unknown_post_kept() {
     let runner = Runner::new();
     let dataset = runner

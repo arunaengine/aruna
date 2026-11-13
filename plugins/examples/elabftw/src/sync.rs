@@ -406,9 +406,7 @@ impl<'a> Sync<'a> {
         }
         let mut revision = summary.revision.clone();
         let mut patch = dataset_patch(&target, &fields);
-        // A dataset made in Aruna gets the experiment's identifier, unless it holds another kind.
-        let free = summary.json.get("identifier").is_none_or(Value::is_object);
-        if identified(&summary.json).is_none() && free {
+        if identified(&summary.json).is_none() && free_identifier(&summary.json) {
             patch["identifier"] = identifier(id, self.settings);
         }
         if patch.as_object().is_some_and(|patch| !patch.is_empty()) {
@@ -721,9 +719,10 @@ impl<'a> Sync<'a> {
                 record.link.mark(Mark::UnknownCreate, None);
                 record.link.mark(Mark::Failed, None);
                 record.save(self.host)?;
+                let free = free_identifier(&summary.json);
                 self.write_back(
                     &mut link,
-                    (experiment, dataset),
+                    (experiment, dataset, free),
                     (&values, &summary.revision),
                     snapshot,
                 )
@@ -750,7 +749,7 @@ impl<'a> Sync<'a> {
     fn write_back(
         &self,
         link: &mut Record,
-        (experiment, dataset): (u64, &str),
+        (experiment, dataset, free): (u64, &str, bool),
         (sent, revision): (&Values, &String),
         mut snapshot: Snapshot,
     ) -> Result<()> {
@@ -761,7 +760,9 @@ impl<'a> Sync<'a> {
         let mut target = sent.clone();
         copy(Field::Body, &stored, &mut target);
         let mut patch = dataset_patch(&target, &[Field::Body]);
-        patch["identifier"] = identifier(experiment, self.settings);
+        if free {
+            patch["identifier"] = identifier(experiment, self.settings);
+        }
         snapshot.elab.update(&stored, &[]);
         match self.host.patch(dataset, &patch, revision) {
             Ok(next) => {
@@ -917,6 +918,12 @@ impl<'a> Sync<'a> {
         }
         true
     }
+}
+
+/// Whether the dataset's `identifier` can take the experiment's: absent, or a plain object
+/// that a merge patch extends; another kind, such as a DOI, stays as it is.
+fn free_identifier(json: &Value) -> bool {
+    json.get("identifier").is_none_or(Value::is_object)
 }
 
 /// Takes one field of `from` into `to`.
