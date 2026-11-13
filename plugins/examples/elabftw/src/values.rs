@@ -486,3 +486,126 @@ pub fn field_update(settings: &Settings, dataset: Option<&str>, files: &BTreeSet
         FILES_FIELD: files,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings() -> Settings {
+        let json = json!({
+            "elab_url": "https://elab.example.org/", "sync_user": 7, "writers": "3, group:4, x",
+            "bucket": "/r/g/lab/data/n/b/", "prefix": "", "aruna_url": "https://portal.example.org",
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn experiment(canwrite: Value, metadata: Value) -> Experiment {
+        let json = json!({
+            "id": "12", "title": "T", "body": "*b*", "content_type": 2, "tags": "aruna|pcr",
+            "tags_id": "1, 5", "modified_at": "2026-11-13 10:00:00", "userid": 2,
+            "metadata": metadata.to_string(), "canwrite": canwrite.to_string(),
+        });
+        Experiment::parse(&json).unwrap()
+    }
+
+    #[test]
+    fn experiment_parsed() {
+        let parsed = experiment(
+            json!({ "base": 40 }),
+            json!({ "extra_fields": { ID_FIELD: { "type": "text", "value": "01J" } } }),
+        );
+        assert_eq!(parsed.id, 12);
+        assert_eq!(parsed.body, Body::new("*b*", Format::Markdown));
+        assert_eq!(
+            parsed.tags,
+            BTreeMap::from([("aruna".into(), 1), ("pcr".into(), 5)])
+        );
+        assert_eq!(parsed.linked().as_deref(), Some("01J"));
+        assert!(parsed.missing_fields());
+        let values = parsed.values(None, &settings());
+        assert_eq!(values.tags, BTreeSet::from(["pcr".to_string()]));
+        assert_eq!(values.files, None);
+    }
+
+    #[test]
+    fn write_access() {
+        let refused = experiment(json!({ "base": 40, "users": [3] }), json!({}));
+        assert!(!refused.writable(7));
+        assert!(experiment(json!({ "base": 40, "users": ["7"] }), json!({})).writable(7));
+        assert!(experiment(json!({ "base": 30 }), json!({})).writable(7));
+        assert!(experiment(json!({ "base": 40, "teamgroups": [4] }), json!({})).writable(7));
+        assert_eq!(
+            settings().canwrite(),
+            json!({ "base": 40, "teams": [], "teamgroups": [4], "users": [3] })
+        );
+    }
+
+    #[test]
+    fn clashing_fields() {
+        let clash = json!({ "extra_fields": { FILES_FIELD: { "type": "text", "value": "" } } });
+        assert_eq!(
+            experiment(json!({}), clash).clashing_field(),
+            Some(FILES_FIELD)
+        );
+        let ours = link_fields(&settings(), "01J", &BTreeSet::new());
+        let parsed = experiment(json!({}), ours);
+        assert_eq!(
+            (parsed.clashing_field(), parsed.missing_fields()),
+            (None, false)
+        );
+        let update = field_update(&settings(), None, &BTreeSet::new());
+        assert_eq!(
+            update,
+            json!({ "action": "updatemetadatafield", DATASET_FIELD: "", ID_FIELD: "", FILES_FIELD: [] })
+        );
+    }
+
+    #[test]
+    fn dataset_side() {
+        let settings = settings();
+        let entity = json!({ "name": "N", "keywords": "one", "text": "# t", "encodingFormat": "text/markdown" });
+        let files = [
+            json!({ "@id": "elabftw/uploads/4", "name": "a", "contentUrl": "/p", "contentSize": "3", "sha256": "h" }),
+            json!({ "@id": "raw.csv" }),
+        ];
+        let values = dataset_values(&entity, Some(&files), "01J", &settings);
+        assert_eq!(
+            values.tags,
+            BTreeSet::from(["one".to_string()]),
+            "JSON-LD gives a list of one as a string"
+        );
+        assert_eq!(values.body.format, Format::Markdown);
+        assert_eq!(values.files.unwrap()["elabftw/uploads/4"].size, "3");
+        let link = "https://portal.example.org/datasets/01J/files/raw.csv".to_string();
+        assert_eq!(values.links, Some(BTreeSet::from([link])));
+        assert_eq!(settings.uploads(), "/r/g/lab/data/n/b/");
+        let patch = dataset_patch(&Values::default(), &[Field::Title, Field::Tags]);
+        assert_eq!(
+            patch,
+            json!({ "name": null, "keywords": null }),
+            "empty values remove the field"
+        );
+    }
+
+    #[test]
+    fn file_merge_keeps() {
+        let stored = json!({ "@id": "elabftw/uploads/4", "@type": "File", "name": "old", "license": "CC0", "about": { "@id": "#x" } });
+        let facts = FileFacts {
+            name: "new".into(),
+            url: "/p".into(),
+            size: "5".into(),
+            hash: "h".into(),
+        };
+        let merged = merge_file(Some(&stored), "elabftw/uploads/4", &facts);
+        assert_eq!(merged["license"], "CC0");
+        assert_eq!(merged["about"], json!({ "@id": "#x" }));
+        assert_eq!(
+            (merged["name"].clone(), merged["contentSize"].clone()),
+            (json!("new"), json!("5"))
+        );
+        assert_eq!(
+            merge_file(None, "elabftw/uploads/4", &facts)["@type"],
+            "File"
+        );
+    }
+}
