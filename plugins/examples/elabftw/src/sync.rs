@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 
@@ -13,8 +13,8 @@ use crate::compare::{Decision, Origin, Side, Snapshot, decide, same};
 use crate::elab::{self, MAX_CALL, Order};
 use crate::host::{Fault, Host, Kind, Meter, Result};
 use crate::progress::{
-    Cursor, LINK_PAGE, Link, Listed, Mark, Pass, Phase, Record, Reservation, Reserved, Sent, Visit,
-    dataset_key, failed_page, link_key, link_page, load, report, store,
+    Check, Cursor, LINK_PAGE, Link, Listed, Mark, Pass, Phase, Record, Reservation, Reserved, Scan,
+    Sent, Visit, dataset_key, failed_page, link_key, link_page, load, report, scan_key, store,
 };
 use crate::values::{
     BASE_TEAM, BASE_USER, Experiment, Field, ID_FIELD, Settings, UPLOAD_PREFIX, Upload, Values,
@@ -432,10 +432,11 @@ impl<'a> Sync<'a> {
             .as_ref()
             .and_then(|snapshot| snapshot.elab.files.clone());
         let read_files = mode != Mode::Quick || known.is_none() || known != Side::of(&elab).files;
-        let files = match read_files {
-            true => Some(self.all_files(&dataset)?),
+        let mut scan = match read_files {
+            true => Some(self.scan(&dataset, &summary.revision)?),
             false => None,
         };
+        let files = scan.as_ref().map(Scan::files);
         let aruna = dataset_values(&summary.json, files.as_deref(), &dataset, self.settings);
         let snapshot = (record.link.snapshot.clone()).unwrap_or_else(|| Snapshot::agreed(&aruna));
         let forced = record.link.force.clone();
@@ -465,7 +466,7 @@ impl<'a> Sync<'a> {
             .mark(Mark::Conflict, details(&decision.conflicts));
         if mode == Mode::Full {
             record.link.mark(Mark::OutOfSync, details(&decision.drift));
-            let changed = self.storage(&uploads)?;
+            let changed = self.storage(&mut record.link, &uploads)?;
             record.link.mark(
                 Mark::ChangedInStorage,
                 (!changed.is_empty()).then_some(changed),
@@ -534,7 +535,13 @@ impl<'a> Sync<'a> {
                 ));
             }
             match self.host.patch(&dataset, &patch, &revision) {
-                Ok(next) => revision = next,
+                Ok(next) => {
+                    // Only this write moved the dataset, so the files read still hold.
+                    if let Some(scan) = scan.as_mut() {
+                        scan.revision.clone_from(&next);
+                    }
+                    revision = next;
+                }
                 Err(fault) if fault.kind == Kind::Conflict && written.is_some() => {
                     // eLabFTW holds what was sent; an Aruna edit made since compares with that.
                     // Fields still owed to Aruna keep their eLabFTW base, so they go next round.
@@ -551,11 +558,15 @@ impl<'a> Sync<'a> {
                 Err(fault) => return Err(fault),
             }
         }
-        if decision.to_aruna.contains(&Field::Files)
-            && let Some(files) = &files
-        {
-            revision = self.put_files(&dataset, &elab, files, revision)?;
-            target.files = elab.files.clone();
+        if let Some(scan) = scan.as_mut() {
+            if decision.to_aruna.contains(&Field::Files) {
+                let put = self.put_files(&dataset, &elab, scan, revision.clone());
+                self.save_scan(&dataset, scan)?;
+                revision = put?;
+                target.files = elab.files.clone();
+            } else {
+                self.save_scan(&dataset, scan)?;
+            }
         }
         let mut kept = decision.conflicts.clone();
         if !writable {
@@ -619,36 +630,77 @@ impl<'a> Sync<'a> {
         pointer.save(self.host)
     }
 
-    /// All file entities of the dataset, a page per step of the budget.
-    fn all_files(&self, dataset: &str) -> Result<Vec<Value>> {
-        let mut files = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            self.step()?;
-            let page = self.host.files(dataset, cursor.as_deref())?;
-            files.extend(page.files);
-            match page.cursor {
-                Some(next) => cursor = Some(next),
-                None => return Ok(files),
+    /// The dataset's file entities at `revision`, read a page at a time across runs; the pages
+    /// read so far stay in state when the budget runs out.
+    fn scan(&self, dataset: &str, revision: &str) -> Result<Scan> {
+        let mut scan = match load::<Scan>(self.host, &scan_key(dataset))? {
+            Some((version, scan)) if scan.revision == revision => Scan {
+                version: Some(version),
+                ..scan
+            },
+            stored => Scan {
+                version: stored.map(|(version, _)| version),
+                revision: revision.to_string(),
+                ..Scan::default()
+            },
+        };
+        while !scan.done {
+            if let Err(fault) = self.step() {
+                self.save_scan(dataset, &mut scan)?;
+                return Err(fault);
             }
+            let page = self.host.files(dataset, scan.cursor.as_deref())?;
+            scan.add(page.files);
+            scan.done = page.cursor.is_none();
+            scan.cursor = page.cursor;
         }
+        Ok(scan)
     }
 
-    /// Upload ids whose object size differs from what eLabFTW recorded, or whose object is gone.
-    fn storage(&self, uploads: &[Upload]) -> Result<Vec<String>> {
-        let mut changed = Vec::new();
-        for upload in uploads.iter().filter(|upload| upload.state != 3) {
-            self.step()?;
+    fn save_scan(&self, dataset: &str, scan: &mut Scan) -> Result<()> {
+        let key = scan_key(dataset);
+        let version = match store(self.host, &key, scan, scan.version) {
+            // The scan only saves reads; a newer one stored meanwhile is replaced.
+            Err(fault) if fault.kind == Kind::Conflict => {
+                let stored = load::<Scan>(self.host, &key)?.map(|(version, _)| version);
+                store(self.host, &key, scan, stored)?
+            }
+            other => other?,
+        };
+        scan.version = Some(version);
+        Ok(())
+    }
+
+    /// Upload ids whose object size differs from what eLabFTW recorded, or whose object is gone,
+    /// checked across runs of one full pass from where the budget stopped the last one.
+    fn storage(&self, link: &mut Link, uploads: &[Upload]) -> Result<Vec<String>> {
+        let pass = self.pass.get();
+        let mut check = (link.storage.take())
+            .filter(|check| check.pass == pass)
+            .unwrap_or(Check {
+                pass,
+                ..Check::default()
+            });
+        let mut live: Vec<&Upload> = (uploads.iter())
+            .filter(|upload| upload.state != 3 && upload.id >= check.next)
+            .collect();
+        live.sort_by_key(|upload| upload.id);
+        for upload in live {
+            if let Err(fault) = self.step() {
+                link.storage = Some(check);
+                return Err(fault);
+            }
             match self.host.object_size(&upload.path(self.settings)) {
                 Ok(size) if size == upload.size => {}
-                Ok(_) => changed.push(format!("upload {}", upload.id)),
+                Ok(_) => check.changed.push(format!("upload {}", upload.id)),
                 Err(fault) if fault.kind == Kind::NotFound => {
-                    changed.push(format!("upload {} missing", upload.id));
+                    check.changed.push(format!("upload {} missing", upload.id));
                 }
                 Err(fault) => return Err(fault),
             }
+            check.next = upload.id + 1;
         }
-        Ok(changed)
+        Ok(check.changed)
     }
 
     /// Writes the fields that go to eLabFTW and the link fields, then reads the experiment
@@ -743,25 +795,25 @@ impl<'a> Sync<'a> {
     }
 
     /// Brings the eLabFTW-origin file entities in step with the uploads: each changed one is
-    /// merged into the stored entity, so properties outside the mapping stay.
+    /// merged into the stored entity, so properties outside the mapping stay. The scan follows
+    /// each write, so a run out of budget leaves it right for the next one.
     fn put_files(
         &self,
         dataset: &str,
         elab: &Values,
-        files: &[Value],
+        scan: &mut Scan,
         mut revision: String,
     ) -> Result<String> {
-        let stored: BTreeMap<&str, &Value> = (files.iter())
-            .filter_map(|file| Some((file.get("@id")?.as_str()?, file)))
-            .collect();
-        let current = dataset_values(&Value::Null, Some(files), dataset, self.settings).files;
-        let current = current.unwrap_or_default();
+        let current = dataset_values(&Value::Null, Some(&scan.files()), dataset, self.settings);
+        let current = current.files.unwrap_or_default();
         let wanted = elab.files.clone().unwrap_or_default();
         for (id, facts) in &wanted {
             if current.get(id) != Some(facts) {
                 self.step()?;
-                let file = merge_file(stored.get(id.as_str()).copied(), id, facts);
+                let file = merge_file(scan.ours.get(id), id, facts);
                 revision = self.host.put_file(dataset, &file, &revision)?;
+                scan.ours.insert(id.clone(), file);
+                scan.revision.clone_from(&revision);
             }
         }
         for id in current
@@ -770,6 +822,8 @@ impl<'a> Sync<'a> {
         {
             self.step()?;
             revision = self.host.remove_file(dataset, id, &revision)?;
+            scan.ours.remove(id);
+            scan.revision.clone_from(&revision);
         }
         Ok(revision)
     }
@@ -809,7 +863,7 @@ impl<'a> Sync<'a> {
         }
         // The files are read before the create is reserved, so a run out of budget leaves no
         // reservation that would look like a create with an unknown outcome.
-        let files = match self.all_files(dataset) {
+        let scan = match self.scan(dataset, &summary.revision) {
             Err(fault) if fault.kind == Kind::Spent => {
                 record
                     .link
@@ -826,7 +880,7 @@ impl<'a> Sync<'a> {
             Err(fault) if fault.kind == Kind::Conflict => return Ok(Outcome::Skipped),
             other => other?,
         }
-        let values = dataset_values(&summary.json, Some(&files), dataset, self.settings);
+        let values = dataset_values(&summary.json, Some(&scan.files()), dataset, self.settings);
         let mut tags: Vec<&String> = values.tags.iter().collect();
         tags.push(&self.settings.tag);
         let links = values.links.clone().unwrap_or_default();

@@ -186,6 +186,94 @@ fn backlog_bounded() {
 }
 
 #[test]
+fn file_pages_resume() {
+    let runner = Runner::new();
+    let id = runner.world.experiment("Run 7", "", &["aruna"]);
+    runner.poll();
+    let (dataset, _) = runner.world.only_dataset();
+    for n in 0..240 {
+        runner.world.aruna_file(
+            &dataset,
+            json!({ "@id": format!("raw/{n:03}.csv"), "@type": "File" }),
+        );
+    }
+    // 120 file pages need several runs; each continues the stored scan.
+    runner
+        .budget
+        .set(small((60, 15 << 20), (30, 4 << 20), (15, 1 << 20)));
+    runner.event(&dataset);
+    assert!(
+        runner.marks(id)["unfinished"].is_array(),
+        "{}",
+        runner.marks(id)
+    );
+    let mut runs = 1;
+    while !runner.marks(id).is_null() {
+        runner.poll();
+        runs += 1;
+        assert!(
+            runner.used.get().calls <= 60,
+            "run {runs} made {} calls",
+            runner.used.get().calls
+        );
+        assert!(runs < 40);
+    }
+    let links = runner.world.extra(id)["Aruna files"]["value"].clone();
+    assert_eq!(links.as_array().unwrap().len(), 240);
+    assert!(runs > 2, "{runs} runs");
+}
+
+#[test]
+fn uploads_bounded() {
+    // 80 uploads: the file writes, and later the storage check, go on across runs.
+    let runner = Runner::new();
+    let id = runner.world.experiment("Run 7", "", &["aruna"]);
+    for upload in 1..=80 {
+        runner
+            .world
+            .upload(id, upload, &format!("u{upload}.bin"), upload);
+    }
+    runner
+        .budget
+        .set(small((80, 15 << 20), (30, 4 << 20), (15, 1 << 20)));
+    let mut runs = 0;
+    let files = |runner: &Runner| {
+        let datasets = runner.world.lock().datasets.clone();
+        datasets
+            .values()
+            .next()
+            .map_or(0, |dataset| dataset.files.len())
+    };
+    while files(&runner) < 80 || !runner.marks(id).is_null() {
+        runner.poll();
+        runs += 1;
+        assert!(
+            runner.used.get().calls <= 80,
+            "run {runs} made {} calls",
+            runner.used.get().calls
+        );
+        assert!(runs < 30);
+    }
+    assert!(runs >= 2, "{runs} runs");
+
+    let path = format!("{BUCKET}/elabftw/ab/77-uuid.bin");
+    runner.world.lock().objects.insert(path, 1);
+    runner.manual(json!({ "reconcile": true }));
+    let mut runs = 0;
+    while runner.marks(id)["changed_in_storage"].is_null() {
+        runner.poll();
+        runs += 1;
+        assert!(
+            runner.used.get().calls <= 80,
+            "run {runs} made {} calls",
+            runner.used.get().calls
+        );
+        assert!(runs < 30);
+    }
+    assert_eq!(runner.marks(id)["changed_in_storage"], json!(["upload 77"]));
+}
+
+#[test]
 fn bytes_bounded() {
     // Large bodies: each run stops starting links before its byte budget.
     let runner = Runner::new();

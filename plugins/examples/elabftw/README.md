@@ -165,15 +165,21 @@ Manual runs, with `aruna-cli plugin run <install id> --input '<json>'`:
 | `{"experiment": <id>}` | Syncs one experiment now |
 
 Marks: `conflict`, `out_of_sync`, `changed_in_storage`, `too_large`, `gone`, `blocked`,
-`no_write`, `unknown_create` and `failed` (with the reason; retried after 15 minutes).
+`no_write`, `unknown_create`, `failed` (with the reason; retried after 15 minutes) and
+`unfinished` (the run's budget ran out inside the link; the next run goes on).
 
 ## Limits
 
 - An eLabFTW answer or request, a dataset read or write, must each fit 1 MiB. The eLabFTW answer
   holds the body twice (`body` and `body_html`), so bodies of a few hundred KiB sync; larger
   ones are marked `too_large`. eLabFTW's own limit is far higher.
-- A run syncs at most 20 links and stops starting new ones after 12 MiB; the rest follow in the
-  next run.
+- Every run keeps to one budget of about 900 host calls and 15 MiB, below the runtime's 1000
+  calls and 16 MiB. Failed links, the quick pass and the reconciliation share it, and each stops
+  where the budget ends: the quick pass keeps its listing offset, a dataset's file pages build up
+  in state across runs, and a storage check keeps its position.
+- The file pages read across runs are kept as one state value of at most 256 KiB: the plugin's
+  own file entities and the `@id` of every other file. A dataset with more files is marked
+  `too_large`.
 - Plugin state holds about 500 bytes per link plus its tag set while that stays below 8 KiB,
   so about 30 000 links fit in the 16 MiB per install.
 - `text`, `description`, `encodingFormat`, `creativeWorkStatus`, `dateCreated`, `author` and the

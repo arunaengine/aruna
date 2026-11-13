@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::compare::{Origin, Side, Snapshot};
 use crate::host::{Fault, Host, Kind, Result};
-use crate::values::Field;
+use crate::values::{Field, UPLOAD_PREFIX};
 
 /// Every state value stays below the host's bound of 256 KiB.
 pub const MAX_VALUE: usize = 256 * 1024;
@@ -123,6 +123,65 @@ pub struct Link {
     /// Experiment creates settled as absent; the next `POST` uses a new key.
     #[serde(default)]
     pub attempt: u32,
+    /// A storage size check of the full pass, in progress across runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<Check>,
+}
+
+/// Where a storage size check stands: its full pass, the next upload id, and what differed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Check {
+    pub pass: u64,
+    pub next: u64,
+    pub changed: Vec<String>,
+}
+
+/// A dataset's file entities read across runs, for the revision they belong to: the plugin's
+/// own entities in full, the others by `@id`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Scan {
+    /// The version of the stored value, not part of it.
+    #[serde(skip)]
+    pub version: Option<u64>,
+    pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default)]
+    pub ours: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub others: BTreeSet<String>,
+}
+
+impl Scan {
+    pub fn add(&mut self, files: Vec<Value>) {
+        for file in files {
+            let id = file
+                .get("@id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            match id.starts_with(UPLOAD_PREFIX) {
+                true => {
+                    self.ours.insert(id, file);
+                }
+                false => {
+                    self.others.insert(id);
+                }
+            }
+        }
+    }
+
+    /// The entities as a page holds them; the others with their `@id` only.
+    pub fn files(&self) -> Vec<Value> {
+        let others = self.others.iter().map(|id| json!({ "@id": id }));
+        self.ours.values().cloned().chain(others).collect()
+    }
+}
+
+pub fn scan_key(dataset: &str) -> String {
+    format!("files/{dataset}")
 }
 
 impl Link {
