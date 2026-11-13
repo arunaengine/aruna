@@ -472,3 +472,133 @@ async fn guest_settles_conflicts() {
     guest.poll().await;
     assert_eq!(guest.world.lock().datasets.len(), 2);
 }
+
+#[tokio::test]
+async fn guest_recovers_creates() {
+    let Some(guest) = Guest::new().await else {
+        return;
+    };
+    // A lost create reply, then an edit: the keyed create gives the same dataset.
+    let id = guest.world.experiment("Run 7", "", &["aruna"]);
+    guest.world.lock().create_unknown = true;
+    guest.manual(json!({ "experiment": id })).await;
+    guest
+        .world
+        .edit(id, |experiment| experiment["title"] = json!("Run 7b"));
+    guest.now.fetch_add(20 * 60 * 1000, Ordering::SeqCst);
+    guest.poll().await;
+    let (_, stored) = guest.world.only_dataset();
+    assert_eq!(stored.entity["name"], "Run 7b");
+
+    // An experiment `POST` with an unknown outcome waits for a person; then a new key creates.
+    let dataset = guest
+        .world
+        .aruna_dataset("elabftw/study", json!({ "name": "Study" }));
+    guest.world.lock().post_outcome = Some((Kind::Unknown, false));
+    guest.event(&dataset).await;
+    guest.poll().await;
+    assert_eq!(
+        guest.world.lock().posts,
+        1,
+        "a negative lookup sends no second POST"
+    );
+    guest
+        .manual(json!({ "resolve_create": dataset, "experiment": "absent" }))
+        .await;
+    assert_eq!(guest.world.lock().posts, 2);
+
+    // One that did land is found through the dataset id field and adopted.
+    let landed = guest
+        .world
+        .aruna_dataset("elabftw/landed", json!({ "name": "Landed" }));
+    guest.world.lock().post_outcome = Some((Kind::Unknown, true));
+    guest.event(&landed).await;
+    guest.poll().await;
+    assert_eq!(guest.world.lock().posts, 3);
+    assert!(guest.world.state(&format!("dataset/{landed}")).unwrap()["experiment"].is_u64());
+}
+
+#[tokio::test]
+async fn guest_marks_problems() {
+    let Some(guest) = Guest::new().await else {
+        return;
+    };
+    let big = guest.world.experiment("Big", "", &["aruna"]);
+    let id = guest.world.experiment("Run 7", "", &["aruna"]);
+    guest.world.upload(id, 1, "a.bin", 10);
+    guest.world.lock().huge.insert(big);
+    guest.poll().await;
+    assert!(
+        guest.marks(big)["too_large"].is_array(),
+        "a reply over the call bound is caught"
+    );
+
+    // A person's license on a synced file survives an upload change and a refused revision.
+    let dataset = guest.world.state(&format!("link/{id}")).unwrap()["dataset"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut file = guest.world.dataset(&dataset).files["elabftw/uploads/1"].clone();
+    file["license"] = json!("CC0");
+    guest.world.aruna_file(&dataset, file);
+    guest.world.upload(id, 1, "b.bin", 11);
+    guest.world.lock().race_file = Some(json!({ "keywords": ["k"] }));
+    guest.poll().await;
+    let file = guest.world.dataset(&dataset).files["elabftw/uploads/1"].clone();
+    assert_eq!(
+        (file["license"].clone(), file["name"].clone()),
+        (json!("CC0"), json!("b.bin"))
+    );
+
+    // Exclusive edit mode refuses the write; the link is retried later.
+    guest.world.lock().edit_mode = true;
+    guest.world.aruna_edit(&dataset, json!({ "name": "Run 8" }));
+    guest.event(&dataset).await;
+    assert!(
+        guest.marks(id)["failed"]
+            .to_string()
+            .contains("exclusive edit mode")
+    );
+    guest.world.lock().edit_mode = false;
+    guest.now.fetch_add(20 * 60 * 1000, Ordering::SeqCst);
+    guest.poll().await;
+    assert_eq!(guest.world.get(id)["title"], "Run 8");
+
+    // A write eLabFTW drops shows up as drift in the full reconciliation.
+    guest.world.lock().drop_writes = true;
+    guest.world.aruna_edit(&dataset, json!({ "name": "Run 9" }));
+    guest.event(&dataset).await;
+    guest.world.lock().drop_writes = false;
+    guest.manual(json!({ "reconcile": true })).await;
+    let report = guest.manual(json!({ "report": true })).await;
+    assert_eq!(report["totals"]["out_of_sync"], 1);
+
+    // A user field of another type blocks the link fields.
+    let clash = guest.world.experiment("Clash", "", &["aruna"]);
+    guest.world.edit(clash, |experiment| {
+        let field = json!({ "extra_fields": { "Aruna files": { "type": "text", "value": "" } } });
+        experiment["metadata"] = json!(field.to_string());
+    });
+    guest.manual(json!({ "experiment": clash })).await;
+    assert_eq!(guest.marks(clash)["blocked"][0], "Aruna files");
+}
+
+#[tokio::test]
+async fn guest_checks_bucket() {
+    let Some(guest) = Guest::new().await else {
+        return;
+    };
+    let accepted = guest.invoke("poll", Trigger::Timer(START)).await;
+    assert!(
+        accepted.is_ok(),
+        "an empty bucket on the receiver is fine: {accepted:?}"
+    );
+    let elsewhere = "/r/g/lab/data/elsewhere/shared";
+    let refused = guest
+        .invoke_in("poll", Trigger::Timer(START), elsewhere)
+        .await
+        .unwrap_err();
+    assert!(refused.contains("receiver node"), "{refused}");
+    let wrong = guest.invoke("changed", Trigger::Manual("{}".into())).await;
+    assert!(wrong.is_err(), "the event handler takes events only");
+}
