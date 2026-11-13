@@ -7,12 +7,12 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
-use aruna_core::structs::storage::blob::{UserAccess, group_permission_path};
+use aruna_core::structs::storage::blob::{UserAccess, group_permission_path, never_expiry};
 use aruna_operations::abe::{KeyAction, KeyResult, drive_key};
 use aruna_operations::driver::drive;
 use aruna_operations::driver::now_ms;
 use aruna_operations::s3::access::create::{
-    CreateUserConfig, CreateUserError, CreateUserOperation, DEFAULT_CREDENTIAL_TTL,
+    CreateUserConfig, CreateUserError, CreateUserOperation,
 };
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::list::{ListUserInput, ListUserOperation};
@@ -57,8 +57,8 @@ pub struct CreatePathRestriction {
 #[schema(as = CreateS3CredentialsRequest)]
 pub struct CreateS3Request {
     pub group_id: String,
-    /// Lifetime in seconds; the credential never outlives the bearer token that creates it.
-    #[schema(default = 31536000)]
+    /// Lifetime in seconds, at least 60; without it the credential lasts until it is revoked. A
+    /// path-restricted token's credential ends no later than that token.
     pub expires_in_seconds: Option<u64>,
     pub path_restrictions: Option<Vec<CreatePathRestriction>>,
     /// Encrypted buckets on this node the credential may read while they are locked.
@@ -103,7 +103,8 @@ pub enum CredentialStatusResponse {
 pub struct S3CredentialResponse {
     pub access_key_id: String,
     pub group_id: String,
-    pub expires_at: String,
+    /// When the credential expires; `null` when it lasts until it is revoked.
+    pub expires_at: Option<String>,
     pub revoked_at: Option<String>,
     pub issued_by: String,
     pub path_restrictions: Vec<S3RestrictionResponse>,
@@ -277,6 +278,7 @@ pub(crate) fn serialize_restrictions(
 - Only credentials held by the serving node are listed, so a credential issued on another node of
   the realm does not appear here.
 - `status` is derived from the timestamps as `active`, `expired` or `revoked`.
+- `expires_at` is `null` for a credential that lasts until it is revoked.
 
 **Limits**
 - The listing is not paginated and covers at most 16 active credentials per user, ordered by access
@@ -350,6 +352,10 @@ to the group data root and can never widen them.
   only the access key id, and a lost secret means creating a new credential.
 - The credential is stored on the node that served the request and is accepted by that node's S3
   endpoint.
+- Without `expires_in_seconds` the credential does not expire. It ends when it is revoked here or
+  at the group token routes, or when its owner is deactivated or cut off; the node then deletes
+  it. Its lifetime does not depend on the issuing session, except that a credential created
+  through a path-restricted token ends no later than that token.
 - `encrypted_buckets` names encrypted buckets on this node, with `token_public_key`. The token is an
   X25519 private key the client generates and keeps; the node stores only its public key. After
   the credential commits, the node opens key requests for the token over the caller's read scopes
@@ -362,14 +368,18 @@ to the group data root and can never widen them.
   and grants.
 
 **Limits**
-- The optional lifetime is given in seconds between 60 and 31536000 and defaults to 31536000.
+- The optional lifetime is at least 60 seconds and has no upper bound.
 - `encrypted_buckets` names at most 64 buckets.
 - A restriction pattern is relative to the group data root or an absolute path inside it, may name
   an exact path or a subtree with a trailing `/**`, and takes `READ`, `WRITE` or `DENY` case
   insensitively; at most 50 restrictions are accepted. An absolute pattern may name the node as
   `*` (`/<realm>/g/<group>/data/*/<bucket>/**`), so the credential applies on every node, also to
   requests forwarded within a distributed bucket.
-- A user holds at most 16 active credentials."#,
+- A user holds at most 16 active credentials on this node; one without an expiry counts until it
+  is revoked.
+- A cutoff stays in the realm's revocation set for 366 days, and each node deletes the credentials
+  it ends within that time. A node offline for all of it keeps accepting such a credential once its
+  owner is active again, until the credential is revoked."#,
     request_body(
         content = CreateS3Request,
         description = "Group the credential is bound to, an optional lifetime in seconds, and optional path restrictions",
@@ -399,7 +409,7 @@ to the group data root and can never widen them.
         ),
         (
             status = 400,
-            description = "The group id is not a ULID, the lifetime is out of range or the bearer token ends within 60 seconds, a restriction is malformed or exceeds the count limit, too many encrypted buckets are named, `token_public_key` is missing or malformed, `bucket_not_encrypted` when a named bucket does not encrypt, or `bucket_outside_group` when it belongs to another group",
+            description = "The group id is not a ULID, the lifetime is below 60 seconds or a path-restricted bearer token ends within 60 seconds, a restriction is malformed or exceeds the count limit, too many encrypted buckets are named, `token_public_key` is missing or malformed, `bucket_not_encrypted` when a named bucket does not encrypt, or `bucket_outside_group` when it belongs to another group",
             body = ErrorResponse,
             example = json!({"error": "bucket research-raw is not encrypted", "code": "bucket_not_encrypted"})
         ),
@@ -456,11 +466,12 @@ pub async fn create_s3_credentials(
     {
         return Err(ServerError::BadRequest);
     }
-    let expiry = credential_expiry(
-        SystemTime::now(),
-        request.expires_in_seconds,
-        Some(bearer.expires_at_secs()),
-    )?;
+    // A path-restricted token mints credentials that end with it; an unrestricted one does not.
+    let cap = auth
+        .path_restrictions
+        .is_some()
+        .then(|| bearer.expires_at_secs());
+    let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds, cap)?;
     let buckets: BTreeSet<String> = request
         .encrypted_buckets
         .unwrap_or_default()
@@ -622,7 +633,9 @@ pub async fn revoke_s3_credentials(
 fn map_redacted_access(access: UserAccess) -> S3CredentialResponse {
     let now = SystemTime::now();
     let status = credential_status(&access, now);
-    let expires_at = format_system_time(access.expiry);
+    let expires_at = access
+        .has_expiry()
+        .then(|| format_system_time(access.expiry));
     let revoked_at = access.revoked_at.map(format_system_time);
     S3CredentialResponse {
         access_key_id: access.access_key,
@@ -663,26 +676,26 @@ fn format_node_id(bytes: [u8; 32]) -> String {
         .unwrap_or_else(|_| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// The requested lifetime, ending no later than `bearer_expiry` when the credential is the bearer's.
+/// The requested end, no later than the unix second `cap`; without a request the credential never
+/// expires.
 pub(crate) fn credential_expiry(
     now: SystemTime,
     expires_in_seconds: Option<u64>,
-    bearer_expiry: Option<u64>,
+    cap: Option<u64>,
 ) -> ServerResult<SystemTime> {
     const MIN_TTL: u64 = 60;
-    const MAX_TTL: u64 = DEFAULT_CREDENTIAL_TTL.as_secs();
 
-    let ttl = expires_in_seconds.unwrap_or(MAX_TTL);
-    if !(MIN_TTL..=MAX_TTL).contains(&ttl) {
-        return Err(ServerError::BadRequest);
-    }
-
-    let requested = now
-        .checked_add(Duration::from_secs(ttl))
-        .ok_or(ServerError::BadRequest)?;
-    let expiry = bearer_expiry
-        .and_then(|bearer| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(bearer)))
-        .map_or(requested, |bearer_end| requested.min(bearer_end));
+    let never = never_expiry();
+    let requested = match expires_in_seconds {
+        Some(ttl) if ttl < MIN_TTL => return Err(ServerError::BadRequest),
+        Some(ttl) => now
+            .checked_add(Duration::from_secs(ttl))
+            .map_or(never, |end| end.min(never)),
+        None => never,
+    };
+    let expiry = cap
+        .and_then(|cap| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(cap)))
+        .map_or(requested, |cap_end| requested.min(cap_end));
     if expiry < now + Duration::from_secs(MIN_TTL) {
         return Err(ServerError::BadRequest);
     }

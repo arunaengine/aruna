@@ -11,6 +11,7 @@ use crate::routes::access::sessions::unix_rfc3339;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::storage::blob::NEVER_EXPIRES_SECS;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::revoke_token::RevokeTokenError;
 use aruna_operations::driver::drive;
@@ -51,7 +52,8 @@ pub struct GroupTokenResponse {
     pub id: String,
     pub owner: String,
     pub created_at: Option<String>,
-    pub expires_at: String,
+    /// `null` for an S3 credential that lasts until it is revoked.
+    pub expires_at: Option<String>,
     pub last_used_at: Option<String>,
     /// `active`, `expired` or `revoked`.
     pub status: String,
@@ -120,7 +122,7 @@ fn token_response(token: GroupToken) -> GroupTokenResponse {
         id: token.id,
         owner: token.owner.to_string(),
         created_at: token.created_at.map(unix_rfc3339),
-        expires_at: unix_rfc3339(token.expires_at),
+        expires_at: (token.expires_at < NEVER_EXPIRES_SECS).then(|| unix_rfc3339(token.expires_at)),
         last_used_at: token.last_used_at.map(unix_rfc3339),
         status: match token.status {
             TokenStatus::Active => "active",
@@ -203,6 +205,7 @@ async fn run_revocation(
   `s3_session` entries are S3 keys of any user that are bound to the group.
 - Personal bearer sessions of members are not listed: they are bound to the user, not the group.
 - Tokens issued before their owner's revocation cutoff are listed as `revoked`.
+- `expires_at` is `null` for an S3 credential that lasts until it is revoked.
 - No secret, token or token hash is ever returned.
 - `session` entries cannot be revoked through the group routes, because a service account's
   session may reach other groups.

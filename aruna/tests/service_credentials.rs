@@ -297,8 +297,9 @@ async fn account_changes_apply() -> TestResult<()> {
         || async move { get(service, "shared-bucket", "entry.txt").await.is_err() },
     )
     .await?;
+    // The refused request deleted the key, so it is now unknown.
     let ended = get(service, "shared-bucket", "entry.txt").await;
-    assert_eq!(ended, Err("AccessDenied".to_string()));
+    assert_eq!(ended, Err("InvalidAccessKeyId".to_string()));
 
     seed.shutdown().await;
     Ok(())

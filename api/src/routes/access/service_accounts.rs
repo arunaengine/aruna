@@ -80,8 +80,7 @@ pub struct ServiceTokenRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ServiceCredentialRequest {
-    /// Lifetime in seconds, 60 to 31536000; the issuer's own token does not bound it.
-    #[schema(default = 31536000)]
+    /// Lifetime in seconds, at least 60; without it the credential lasts until it is revoked.
     pub expires_in_seconds: Option<u64>,
     pub path_restrictions: Option<Vec<CreatePathRestriction>>,
 }
@@ -340,18 +339,20 @@ async fn create_token(
   checked against the account's own access.
 - It works only on the node that issued it. Call the node whose S3 endpoint the client will use;
   the group token routes of that node list and revoke it.
-- Its lifetime does not end with the caller's bearer token, so a client that cannot renew a
-  session can keep one static key pair.
+- Without `expires_in_seconds` it does not expire, and its lifetime never depends on the caller's
+  bearer token, so a client that cannot renew a session can keep one static key pair.
 - Removing the account from the group or reducing its roles narrows what the key can do as the
   authorization change reaches this node, but the key itself stays valid. Only revoking it at
   `DELETE /access/groups/{id}/tokens/s3_credential/{access_key_id}` or
-  `DELETE /access/credentials/{access_key_id}`, or deactivating the account, ends it.
+  `DELETE /access/credentials/{access_key_id}`, or deactivating the account, ends it; the node then
+  deletes it.
 - The issuance is recorded in this node's audit as `service_credential_issued`, with the caller as
   actor, the account as target and the access key id as `session_id`.
 
 **Limits**
-- The lifetime is given in seconds between 60 and 31536000 and defaults to 31536000.
-- At most 50 restrictions; the account holds at most 16 active credentials on this node.
+- The optional lifetime is at least 60 seconds and has no upper bound.
+- At most 50 restrictions; the account holds at most 16 active credentials on this node, and one
+  without an expiry counts until it is revoked.
 - Encrypted buckets read while locked need a token credential, which this route does not issue."#,
     params(
         ("id" = String, Path, description = "Group ULID"),
@@ -360,7 +361,6 @@ async fn create_token(
     request_body(
         content = ServiceCredentialRequest,
         example = json!({
-            "expires_in_seconds": 31536000,
             "path_restrictions": [{ "pattern": "shared-bucket/elabftw/**", "permission": "WRITE" }]
         })
     ),
@@ -421,7 +421,6 @@ async fn create_credential(
     {
         return Err(ServerError::BadRequest);
     }
-    // The credential is the account's, so the caller's bearer expiry does not bound it.
     let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds, None)?;
     let operation = CreateUserOperation::new(
         CreateUserConfig {

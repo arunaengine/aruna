@@ -242,6 +242,27 @@ pub async fn realm_user_cutoff(
     }
 }
 
+/// Whether this realm's replicated record of the account marks it deactivated; an account
+/// without a record here, such as a federated one, is not.
+pub async fn account_deactivated(
+    storage: &StorageHandle,
+    user_id: &UserId,
+) -> Result<bool, ArunaBearerError> {
+    let read = StorageEffect::Read {
+        key_space: USER_KEYSPACE.to_string(),
+        key: user_id.to_bytes().into(),
+        txn_id: None,
+    };
+    match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|bytes| User::from_bytes(&bytes))
+            .transpose()
+            .map(|user| user.is_some_and(|user| user.is_deactivated()))
+            .map_err(|_| ArunaBearerError::RevocationUnavailable),
+        _ => Err(ArunaBearerError::RevocationUnavailable),
+    }
+}
+
 pub async fn validate_bearer_token<S>(
     state: &S,
     token: &str,

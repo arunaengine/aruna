@@ -24,7 +24,7 @@ use aruna_core::structs::storage::distribution::delegation::{
 use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::structs::storage::share::SHARE_CREDENTIAL_PREFIX;
 use aruna_core::{NodeId, UserId};
-use aruna_operations::auth::bearer_token::realm_user_cutoff;
+use aruna_operations::auth::bearer_token::{account_deactivated, realm_user_cutoff};
 use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
 use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
@@ -35,6 +35,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::workflow::input_view::view_job;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
+use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::session::{
     GetS3Operation, S3SessionError, TouchS3Config, TouchS3Operation,
@@ -44,7 +45,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, Uri};
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
-use s3s::{S3Result, s3_error};
+use s3s::{S3ErrorCode, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -245,7 +246,8 @@ impl S3Access for AuthProvider {
                 "Credential issuer not in realm"
             ));
         }
-        self.check_cutoff(&access_key_id, &user_access.user_identity)
+        let credential = session_token_hash.is_none();
+        self.admit_owner(&access_key_id, &user_access.user_identity, credential)
             .await?;
 
         // A run's own credential reads its input view; each read is authorized at its source.
@@ -971,6 +973,45 @@ impl AuthProvider {
         Ok(())
     }
 
+    /// Refuses a key whose owner is cut off or deactivated. A refused credential is deleted at
+    /// once, so it stays refused after the cutoff ages out of the realm's revocation set.
+    async fn admit_owner(
+        &self,
+        access_key_id: &str,
+        user_id: &UserId,
+        credential: bool,
+    ) -> S3Result<()> {
+        let admitted = match self.check_cutoff(access_key_id, user_id).await {
+            Ok(()) => self.check_status(user_id).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &admitted
+            && credential
+            && *error.code() == S3ErrorCode::AccessDenied
+        {
+            let revoke = RevokeUserOperation::new(access_key_id.to_string());
+            match drive(revoke, self.driver_ctx.as_ref()).await {
+                Ok(_) | Err(RevokeUserError::NotFound) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "Failed to delete a refused credential")
+                }
+            }
+        }
+        admitted
+    }
+
+    /// Denies every key of an account this realm's replicated record marks deactivated.
+    async fn check_status(&self, user_id: &UserId) -> S3Result<()> {
+        match account_deactivated(&self.driver_ctx.storage_handle, user_id).await {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(s3_error!(AccessDenied, "Account is deactivated")),
+            Err(_) => Err(s3_error!(
+                ServiceUnavailable,
+                "Account state is unavailable"
+            )),
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip(self))]
     async fn query_user_access(&self, access_key_id: &str) -> S3Result<UserAccess> {
         // Legacy-format key ids can never match a stored credential; reject them
@@ -1313,6 +1354,60 @@ mod tests {
         provider.check_cutoff(&later, &user).await.unwrap();
         let other = UserId::local(Ulid::generate(), provider.realm_id);
         provider.check_cutoff(&older, &other).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deactivated_owner_refused() {
+        // With no cutoff stored, as once it left the revocation set after 366 days, a deactivated
+        // owner's credential is still refused and deleted.
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::USER_KEYSPACE;
+        use aruna_core::structs::identity::user::User;
+        use aruna_core::user::validation::DEACTIVATED_ATTRIBUTE;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider(dir.path().to_str().unwrap());
+        let refused = issued_access(&provider, *provider.node_id.as_bytes());
+        let active = issued_access(&provider, *provider.node_id.as_bytes());
+        let owner = refused.user_identity;
+        let user = User {
+            user_id: owner,
+            name: "former".to_string(),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: [(DEACTIVATED_ATTRIBUTE.to_string(), "admin".to_string())].into(),
+        };
+        let write = StorageEffect::Write {
+            key_space: USER_KEYSPACE.to_string(),
+            key: owner.to_bytes().into(),
+            value: postcard::to_allocvec(&user).unwrap().into(),
+            txn_id: None,
+        };
+        provider
+            .driver_ctx
+            .storage_handle
+            .send_storage_effect(write)
+            .await;
+        for access in [&refused, &active] {
+            store_access(&provider, access).await;
+        }
+
+        let error = provider
+            .admit_owner(&refused.access_key, &owner, true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+        let gone = provider.query_user_access(&refused.access_key).await;
+        assert_eq!(
+            gone.unwrap_err().code(),
+            &s3s::S3ErrorCode::InvalidAccessKeyId
+        );
+
+        let owner = active.user_identity;
+        provider
+            .admit_owner(&active.access_key, &owner, true)
+            .await
+            .unwrap();
+        assert!(provider.query_user_access(&active.access_key).await.is_ok());
     }
 
     #[tokio::test]

@@ -1581,6 +1581,14 @@ impl BlobVersionState {
     }
 }
 
+/// Unix seconds of 9999-12-31T23:59:59Z, the stored expiry of a credential without an end.
+pub const NEVER_EXPIRES_SECS: u64 = 253_402_300_799;
+
+/// The stored expiry of a credential that lasts until it is revoked.
+pub fn never_expiry() -> SystemTime {
+    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(NEVER_EXPIRES_SECS)
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UserAccess {
     pub access_key: String,
@@ -1622,6 +1630,11 @@ impl UserAccess {
 
     pub fn is_expired(&self, now: SystemTime) -> bool {
         self.expiry <= now
+    }
+
+    /// Whether the credential ends at a time; one stored with `never_expiry` lasts until revoked.
+    pub fn has_expiry(&self) -> bool {
+        self.expiry < never_expiry()
     }
 
     pub fn is_revoked(&self) -> bool {
