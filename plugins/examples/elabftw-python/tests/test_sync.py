@@ -163,6 +163,20 @@ class LinkTests(unittest.TestCase):
         self.assertIsNone(self.sync())
         self.assertEqual(self.item["title"], "B")
 
+    def test_refused_removal(self):
+        # The second tag removal is refused after the first one landed; a later undo must stay.
+        self.enrolled()
+        self.team.tag(1, "gel")
+        self.sync()
+        self.host.edit(self.dataset, keywords=None)
+        lock = trap("elab", 2, lambda: self.team.locked.add(1), lambda args: args[0] == "PATCH")
+        self.host.trap = lock
+        self.assertEqual(self.sync()["kind"], "failed")
+        self.team.locked.clear()
+        self.host.edit(self.dataset, keywords=["gel", "pcr"])
+        self.assertEqual(self.sync()["kind"], "conflict")
+        self.assertEqual(self.plugin.dataset(1)["keywords"], ["gel", "pcr"])
+
     def test_uploads(self):
         self.enrolled(uploads=[UPLOAD])
         files = self.host.docs[self.dataset]["files"]
