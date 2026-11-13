@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use serde_json::{Value, json};
 
 use crate::body::Body;
-use crate::compare::{Decision, Origin, Side, Snapshot, decide, same};
+use crate::compare::{Decision, Origin, Print, Side, Snapshot, decide, same};
 use crate::elab::{self, MAX_CALL, Order};
 use crate::host::{Fault, Host, Kind, Meter, Result};
 use crate::progress::{
@@ -792,6 +792,7 @@ impl<'a> Sync<'a> {
                 revision: revision.clone(),
                 side: Side::of(aruna),
                 fields: Vec::new(),
+                body: None,
             });
         }
         record.save(self.host)?;
@@ -831,7 +832,15 @@ impl<'a> Sync<'a> {
                     let change =
                         json!({ "body": body.text, "content_type": body.format.content_type() });
                     self.step()?;
-                    elab::patch(self.host, id, change)?;
+                    let stored = elab::patch(self.host, id, change)?.map(|answer| answer.body);
+                    let source = record
+                        .link
+                        .reservation
+                        .as_mut()
+                        .and_then(|held| held.source.as_mut());
+                    if let (Some(sent), Some(stored)) = (source, stored) {
+                        sent.body = Some((Print::body(&stored), Print::raw(&stored)));
+                    }
                 }
                 Field::Props | Field::Files | Field::Links => continue,
             }
@@ -855,7 +864,7 @@ impl<'a> Sync<'a> {
                     self.step()?;
                     match elab::patch(self.host, id, merge) {
                         Err(fault) if fault.kind == Kind::Invalid => blocked = Some(fault.message),
-                        other => other?,
+                        other => drop(other?),
                     }
                 }
             }
@@ -1236,6 +1245,10 @@ fn settle(link: &mut Link, sent: Option<Sent>) {
         .copied()
         .collect();
     snapshot.elab.take(&sent.side, &same);
+    // eLabFTW's stored form of a sent body is its base there, so an Aruna undo is one change.
+    if let (true, Some((body, raw))) = (sent.fields.contains(&Field::Body), sent.body) {
+        (snapshot.elab.body, snapshot.elab.raw) = (body, raw);
+    }
     snapshot.pending |= sent.fields.contains(&Field::Body);
 }
 

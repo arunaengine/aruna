@@ -180,6 +180,32 @@ fn stopped_change_conflicts() {
 }
 
 #[test]
+fn stopped_body_undone() {
+    let (runner, id, dataset) = linked("<p>A</p>");
+    // B goes to eLabFTW; the run stops before it reads the experiment back.
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "text": "<p>B</p>", "description": "B" }));
+    runner.world.lock().fail_read_back = true;
+    runner.event(&dataset);
+    assert_eq!(runner.world.get(id)["body"], "<p>B</p>");
+    assert!(
+        runner.marks(id)["failed"].is_array(),
+        "{}",
+        runner.marks(id)
+    );
+
+    // A person undoes the text in Aruna: one change, which reaches eLabFTW without a conflict.
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "text": "<p>A</p>", "description": "A" }));
+    runner.event(&dataset);
+    assert_eq!(runner.world.get(id)["body"], "<p>A</p>");
+    assert_eq!(text(&runner, &dataset), "<p>A</p>");
+    assert_eq!(runner.marks(id), Value::Null);
+}
+
+#[test]
 fn description_builds_body() {
     let (runner, id, dataset) = linked("<p><b>rich</b></p>");
     runner

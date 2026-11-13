@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::compare::{Origin, Side, Snapshot};
+use crate::compare::{Origin, Print, Side, Snapshot};
 use crate::host::{Fault, Host, Kind, Result};
 use crate::values::{Field, UPLOAD_PREFIX};
 
@@ -74,6 +74,9 @@ pub struct Sent {
     pub revision: String,
     pub side: Side,
     pub fields: Vec<Field>,
+    /// The canonical and stored prints of the body eLabFTW kept, from its answer to the send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<(Print, Print)>,
 }
 
 impl Reservation {

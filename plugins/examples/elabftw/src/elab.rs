@@ -159,8 +159,16 @@ pub fn create(host: &dyn Host, body: Value, key: String) -> Result<u64> {
     id.ok_or_else(|| Fault::new(Kind::Invalid, "eLabFTW answered no experiment location"))
 }
 
-pub fn patch(host: &dyn Host, id: u64, body: Value) -> Result<()> {
-    send(host, Method::Patch, id.to_string(), body, None).map(drop)
+/// Changes an experiment; eLabFTW answers with the whole experiment as it now stores it.
+pub fn patch(host: &dyn Host, id: u64, body: Value) -> Result<Option<Experiment>> {
+    let reply = send(host, Method::Patch, id.to_string(), body, None)?;
+    Ok(answered(&reply))
+}
+
+/// The experiment of a change answer, when it holds one.
+fn answered(reply: &Reply) -> Option<Experiment> {
+    let json: Value = serde_json::from_slice(&reply.body).ok()?;
+    Experiment::parse(&json)
 }
 
 pub fn add_tag(host: &dyn Host, id: u64, tag: &str) -> Result<()> {

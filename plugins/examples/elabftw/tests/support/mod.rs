@@ -82,6 +82,9 @@ pub struct Inner {
     pub stop_after_post: bool,
     /// The same, right after the next change of an experiment lands.
     pub stop_after_patch: bool,
+    /// The read-back after the next change of an experiment fails, so the run stops there.
+    pub fail_read_back: bool,
+    read_back: bool,
     /// Bytes the current run moved, against the host's bound per run.
     pub run_bytes: u64,
     pub state_down: bool,
@@ -324,16 +327,22 @@ impl Host for World {
     fn elab(&self, request: &Request) -> Result<Reply> {
         // Like the host, a key names a request only within its run: a later run sends again.
         let mut inner = self.lock();
+        let read = request.method == Method::Get && request.path.parse::<u64>().is_ok();
+        if read && std::mem::take(&mut inner.read_back) {
+            inner.fail_read_back = false;
+            return Err(fault(Kind::Unavailable, "eLabFTW did not answer"));
+        }
         let reply = inner.elab(request)?;
         let landed =
             request.method == Method::Post && request.path.is_empty() && reply.status == 201;
         if landed && std::mem::take(&mut inner.stop_after_post) {
             inner.state_down = true;
         }
-        if request.method == Method::Patch
-            && reply.status == 200
-            && std::mem::take(&mut inner.stop_after_patch)
-        {
+        let changed = request.method == Method::Patch && reply.status == 200;
+        if changed && inner.fail_read_back {
+            inner.read_back = true;
+        }
+        if changed && std::mem::take(&mut inner.stop_after_patch) {
             inner.state_down = true;
         }
         Ok(reply)
