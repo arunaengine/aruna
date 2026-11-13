@@ -57,8 +57,9 @@ values; `<prefix>` is eLabFTW's path prefix, a folder name without slashes at it
      --secret elab_key=group:elab-key
    ```
 
-   `writers` lists the eLabFTW user ids, and `group:<id>` team groups, that may edit the
-   experiments the plugin creates. The connection reaches only `/api/v2/experiments` of
+   Experiments the plugin creates are readable by the team (`canread_base` Team) and writable
+   by their owner, the sync user (`canwrite_base` User), and by `writers`: eLabFTW user ids,
+   and `group:<id>` for team groups. The connection reaches only `/api/v2/experiments` of
    `elab_url` with GET, POST and PATCH.
 
 3. Read the receiver with `aruna-cli plugin installs --group <group>`. The receiver is the
@@ -82,7 +83,8 @@ values; `<prefix>` is eLabFTW's path prefix, a folder name without slashes at it
    endpoint, path-style requests, the bucket name `<bucket>` and the path prefix `<prefix>`.
    Restart eLabFTW.
 
-6. Share each experiment that should sync with the sync user (`canwrite`), and give it the tag.
+6. Give each experiment that should sync the tag, and write access for the sync user: list it in
+   `canwrite`, or set `canwrite_base` to Team or wider.
    Without write access the plugin syncs only from eLabFTW to Aruna and marks the link
    `no_write`.
 
@@ -114,8 +116,8 @@ hashes.
 - File entities are merged, never rebuilt: properties an Aruna user added, such as a `license`,
   stay when an upload changes.
 - A dataset create is keyed by `elabftw/<experiment id>`, so a retried create gives the same
-  dataset. An experiment create whose outcome is unknown waits until a lookup finds the
-  experiment or a person settles it.
+  dataset. An experiment create whose outcome is unknown, or whose run stopped before it
+  saved the outcome, waits until a lookup finds the experiment or a person settles it.
 
 ## Bodies
 
