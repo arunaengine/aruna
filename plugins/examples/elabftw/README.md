@@ -11,10 +11,13 @@ eLabFTW stores its uploads in an Aruna bucket through Aruna's S3 API, so file by
 - A dataset made in Aruna below `meta/elabftw/` gets an experiment with that tag.
 - Title, tags and body go both ways. Status, date and owner go to the dataset as
   `creativeWorkStatus`, `dateCreated` and `author`. Each upload becomes a `File` entity.
-- Files that reach the dataset another way show up as links in the experiment's
-  "Aruna files" field.
+- Files that reach the dataset another way are not listed in the experiment. The "Aruna
+  dataset" field links to the dataset in the portal, which lists all its files with paging.
+  Everything the plugin writes into an experiment keeps a constant size, however many files
+  the dataset has.
 - The link is kept in the plugin state, in the dataset's `identifier.elabftw` and in the
-  experiment's extra fields "Aruna dataset", "Aruna dataset id" and "Aruna files".
+  experiment's extra fields "Aruna dataset" and "Aruna dataset id". They are written once per
+  link and keep their values; an "Aruna files" field from an earlier build is left as it is.
 
 It needs eLabFTW 6.0 or later. It polls every five minutes; eLabFTW 6.0 has no webhooks.
 
@@ -142,8 +145,7 @@ person's edit that lands between that read and the write can be lost:
 - the body, by the plugin's body write; eLabFTW may keep a revision of the earlier body, but not
   after a small change to a recently changed experiment;
 - every extra field of the experiment, once per link, when the plugin creates its link fields
-  with `metadatamerge`;
-- the plugin's own link fields, by `updatemetadatafield`.
+  with `metadatamerge` (again after a person deleted one).
 
 Tags and other fields are not affected. A person in exclusive edit mode blocks the plugin's
 writes instead; the link is retried later. A user field named like a link field with another
@@ -179,10 +181,10 @@ Marks: `conflict`, `out_of_sync`, `changed_in_storage`, `too_large`, `gone`, `bl
   calls and 16 MiB. Failed links, the quick pass and the reconciliation share it, and each stops
   where the budget ends: the quick pass keeps its listing offset, a dataset's file pages build up
   in state across runs, and a storage check keeps its position.
-- The file pages read across runs are kept in parts of at most 64 KiB, each its own state
-  value, so a dataset's file count has no cap of its own. A single file entity larger than a
-  part gets a part of its own; one larger than a state value (256 KiB) marks the link
-  `too_large`. Every part counts toward the 16 MiB
+- A dataset's file pages are read across runs, and only the plugin's own file entities (one
+  per eLabFTW upload) are kept, in parts of at most 64 KiB, each its own state value; other
+  files are read past. A single own entity larger than a part gets a part of its own; one larger
+  than a state value (256 KiB) marks the link `too_large`. Every part counts toward the 16 MiB
   of plugin state per install.
 - Plugin state holds about 500 bytes per link plus its tag set while that stays below 8 KiB,
   so about 30 000 links fit in the 16 MiB per install.
