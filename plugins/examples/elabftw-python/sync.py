@@ -301,7 +301,7 @@ class Link:
                 self.state["pending"] = None
             raise
         stored = from_experiment(after, self.settings.tag)
-        if stored != ours:
+        if stored != ours or rebody:  # the description follows every body write
             revision = self.host.patch(self.state["dataset"], dataset_patch(stored), revision)
         self.state.update(synced=fingerprint(stored), pending=None)
         return after, revision

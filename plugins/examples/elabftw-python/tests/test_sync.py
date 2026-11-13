@@ -61,6 +61,13 @@ class LinkTests(unittest.TestCase):
         self.assertIsNone(self.sync())
         self.assertEqual((self.host.docs[self.dataset]["revision"], len(self.patches())), (revision, sent))
 
+    def test_body_description(self):
+        # eLabFTW stores the body as sent; the dataset's description still follows it.
+        self.enrolled()
+        self.host.edit(self.dataset, text="<p>b</p>")
+        self.assertIsNone(self.sync())
+        self.assertEqual((self.item["body"], self.plugin.dataset(1)["description"]), ("<p>b</p>", "b"))
+
     def test_both_sides(self):
         self.enrolled()
         self.item["title"] = "B"
