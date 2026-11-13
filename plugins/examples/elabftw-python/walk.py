@@ -21,17 +21,24 @@ def page(host, settings, cursor):
     return [int(row["id"]) for row in rows], (offset + len(rows) if len(rows) == elab.PAGE else None)
 
 
+UNLINKED = {"kind": "unlinked", "reason": "no experiment is linked"}
+
+
 def linked(host, settings, dataset, cycle):
-    """The dataset's document and link, or None when the dataset is gone or not linked."""
+    """The dataset's document and link, or None and why: gone, not linked or too large to read."""
     try:
         revision, doc = read(host, dataset)
     except Fault as fault:
+        if fault.kind == "limit":
+            return None, mark("too_large", f"the dataset cannot be read: {fault.message}")
         if fault.kind == "not_found":
-            return None
+            return None, None
         raise
     number = identified(doc)
     link = Link(host, settings, number, cycle) if number is not None else None
-    return (revision, doc, link) if link and link.state.get("dataset") == dataset else None
+    if link and link.state.get("dataset") == dataset:
+        return (revision, doc, link), None
+    return None, UNLINKED
 
 
 class Walk:
@@ -74,8 +81,10 @@ class Walk:
             raise Stop("the run's time is used up")
         cycle, known = self.cursor["cycle"], None
         if self.cursor["phase"] == "datasets":
-            found = linked(self.host, self.settings, entry, cycle)
+            found, why = linked(self.host, self.settings, entry, cycle)
             if found is None:
+                if why and why["kind"] == "too_large":
+                    self.host.log(f"dataset {entry} is skipped: {why['reason']}")
                 return
             revision, doc, link = found
             known = (revision, doc)
@@ -109,9 +118,9 @@ def poll(host, settings):
 
 
 def changed(host, settings, dataset):
-    found = linked(host, settings, dataset, None)
+    found, why = linked(host, settings, dataset, None)
     if found is None:
-        return {"dataset": dataset, "mark": mark("unlinked", "no experiment is linked")}
+        return {"dataset": dataset, "mark": why or UNLINKED}
     revision, doc, link = found
     return {"experiment": link.number, "mark": link.run((revision, doc))}
 
@@ -132,9 +141,9 @@ def manual(host, settings, given):
 def describe(host, settings, phase, entry):
     """The report line of one listed dataset or experiment, or None when it has nothing to say."""
     if phase == "datasets":
-        found = linked(host, settings, entry, None)
+        found, why = linked(host, settings, entry, None)
         if found is None:
-            return {"dataset": entry, "mark": mark("unlinked", "no experiment is linked")}
+            return {"dataset": entry, "mark": why or UNLINKED}
         link = found[2]
         return {"experiment": link.number, "dataset": entry, "mark": link.state["mark"]} if link.state.get("mark") else None
     _, state = host.load(f"link/{entry}")

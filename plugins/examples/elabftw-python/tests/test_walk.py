@@ -152,6 +152,18 @@ class WalkTests(unittest.TestCase):
         self.assertEqual([(mark["kind"], mark["reason"]) for mark in found], [
             ("gone", "experiment"), ("gone", "experiment"), ("gone", "tag"), ("gone", "dataset")])
 
+    def test_large_dataset(self):
+        # A dataset larger than one host reply is skipped, marked and reported; the walk goes on.
+        self.tagged(1, 2, 3)
+        large = self.dataset(1)
+        self.host.docs[large]["json"]["text"] = "x" * MIB
+        self.team.items[3]["title"] = "B"
+        self.assertEqual(self.plugin.poll()["visits"], 3)
+        self.assertEqual((self.marks(1, 3), self.plugin.dataset(3)["name"]), (["too_large", None], "B"))
+        entries = sum(self.report(), [])
+        self.assertEqual([(entry["dataset"], entry["mark"]["kind"]) for entry in entries], [(large, "too_large")])
+        self.assertEqual(self.plugin.changed(large)["mark"]["kind"], "too_large")
+
     def test_live_offset(self):
         # Review r2: a dataset deleted between listing pages shifts the offset past dataset 4.
         self.tagged(1, 2, 3, 4, 5, 6)
