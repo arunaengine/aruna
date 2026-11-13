@@ -44,10 +44,15 @@ pub struct SetQuotaConfig {
     pub replicas: ReplicaQuota,
 }
 
+/// Commits one quota write may try. Background placement and sync writes change the same
+/// document; the quota replaces wholesale, so re-applying it to the newer document is correct.
+const COMMIT_ATTEMPTS: usize = 3;
+
 #[derive(Debug, PartialEq)]
 pub struct SetQuotaOperation {
     config: SetQuotaConfig,
     txn_id: Option<TxnId>,
+    attempts: usize,
     state: SetQuotaState,
     output: Option<Result<RealmConfigDocument, SetQuotaError>>,
 }
@@ -108,6 +113,7 @@ impl SetQuotaOperation {
         Self {
             config,
             txn_id: None,
+            attempts: 0,
             state: SetQuotaState::Init,
             output: None,
         }
@@ -123,6 +129,14 @@ impl SetQuotaOperation {
         AdminDocumentTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
         }
+    }
+
+    fn start_transaction(&mut self) -> Effects {
+        self.attempts += 1;
+        self.state = SetQuotaState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
@@ -283,12 +297,7 @@ impl Operation for SetQuotaOperation {
             SetQuotaState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
-                        Ok(true) => {
-                            self.state = SetQuotaState::StartTransaction;
-                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                                read: false
-                            })]
-                        }
+                        Ok(true) => self.start_transaction(),
                         Ok(false) => self.fail(SetQuotaError::Unauthorized),
                         Err(error) => {
                             warn!(error = %error, "Realm quota authorization check failed");
@@ -360,6 +369,12 @@ impl Operation for SetQuotaOperation {
                     self.txn_id = None;
                     self.state = SetQuotaState::ScheduleSyncDrain { document };
                     smallvec![schedule_drain_effect()]
+                }
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) if self.attempts < COMMIT_ATTEMPTS => {
+                    self.txn_id = None;
+                    self.start_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -803,6 +818,176 @@ mod tests {
             &[Effect::Storage(StorageEffect::StartTransaction {
                 read: false
             })]
+        );
+    }
+
+    #[test]
+    fn retries_commit_conflict() {
+        // A commit lost to another realm-config writer re-reads and re-applies the quota.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let actor = actor(1, realm_id);
+        let document = management_config(realm_id, &actor)
+            .to_bytes(&actor)
+            .unwrap();
+        let mut operation = SetQuotaOperation::new(quota_config(&actor, custom_quota()));
+        operation.start();
+        let mut effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        for attempt in 1..=COMMIT_ATTEMPTS {
+            assert!(
+                matches!(
+                    effects.as_slice(),
+                    [Effect::Storage(StorageEffect::StartTransaction { .. })]
+                ),
+                "attempt {attempt} starts a fresh transaction"
+            );
+            let txn_id = Ulid::from(attempt as u128);
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+            operation.step(Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![
+                    (Key::from(vec![1]), Some(document.clone().into())),
+                    (Key::from(vec![2]), None),
+                ],
+            }));
+            operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            }));
+            effects = operation.step(Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            }));
+        }
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(SetQuotaError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
+    }
+
+    #[test]
+    fn retry_rereads_config() {
+        // The retry reads in its own transaction and builds its writes from the newer state, so
+        // what another writer committed in between survives and the drain follows the commit.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let owner = actor(1, realm_id);
+        let other = actor(9, realm_id);
+        let first = management_config(realm_id, &owner)
+            .to_bytes(&owner)
+            .unwrap();
+        let mut newer = management_config(realm_id, &owner);
+        newer.description = "changed elsewhere".to_string();
+        newer.ensure_node(other.node_id, RealmNodeKind::Server);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let mut reducer = AdminDocumentState::new(target.clone());
+        let prior = reducer
+            .apply_operation(
+                &other,
+                AdminDocumentOperation::ConfigDescriptionSet {
+                    description: "changed elsewhere".to_string(),
+                },
+            )
+            .unwrap();
+        let (_, _, reducer_value) = reducer_state_entry(&reducer).unwrap();
+        let document_target = DocumentTarget::RealmConfig { realm_id };
+        let document_key = (
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+        );
+        let reducer_key = (
+            DOCUMENT_STATE_KEYSPACE.to_string(),
+            reducer_state_key(&target),
+        );
+
+        let mut operation = SetQuotaOperation::new(quota_config(&owner, custom_quota()));
+        operation.start();
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::from(1u128),
+        }));
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (document_key.1.clone(), Some(first.into())),
+                (reducer_key.1.clone(), None),
+            ],
+        }));
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })],
+            "a lost commit starts over and schedules no drain"
+        );
+
+        let txn_id = Ulid::from(2u128);
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::Storage(StorageEffect::BatchRead {
+                reads: vec![document_key.clone(), reducer_key.clone()],
+                txn_id: Some(txn_id),
+            })]
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (
+                    document_key.1.clone(),
+                    Some(newer.to_bytes(&owner).unwrap().into()),
+                ),
+                (reducer_key.1.clone(), Some(reducer_value)),
+            ],
+        }));
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: write_txn,
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("the retry writes in one batch: {effects:?}");
+        };
+        assert_eq!(*write_txn, Some(txn_id));
+        let value_of = |(space, key): &(String, Key)| {
+            writes
+                .iter()
+                .find(|(write_space, write_key, _)| write_space == space && write_key == key)
+                .map(|(_, _, value)| value.clone())
+                .expect("the retry rewrites this row")
+        };
+        let written = RealmConfigDocument::from_bytes(&value_of(&document_key)).unwrap();
+        assert_eq!(written.description, "changed elsewhere");
+        assert_eq!(
+            crate::realm::mutate_placement::node_kind(&written, other.node_id),
+            Some(RealmNodeKind::Server)
+        );
+        assert_eq!(written.quota, custom_quota());
+        let state = aruna_core::reducer::decode_reducer_state(&value_of(&reducer_key)).unwrap();
+        assert!(state.applied_event_ids.contains(&prior.event_id));
+        assert_eq!(state.applied_event_ids.len(), 3);
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert_eq!(effects.as_slice(), &[schedule_drain_effect()]);
+        assert_eq!(
+            operation.finalize().unwrap().description,
+            "changed elsewhere"
         );
     }
 
