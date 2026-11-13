@@ -6,6 +6,7 @@
 pub mod body;
 pub mod compare;
 pub mod elab;
+mod guest;
 pub mod host;
 pub mod progress;
 pub mod sync;
