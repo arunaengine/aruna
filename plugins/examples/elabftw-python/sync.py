@@ -156,9 +156,11 @@ def dataset_patch(record):
 
 
 def identified(doc):
-    """The experiment id a dataset names in `identifier.elabftw`, if any."""
-    number = ((doc.get("identifier") or {}).get("elabftw") or {}).get("id")
-    return int(number) if str(number or "").isdigit() else None
+    """The experiment id a dataset names in `identifier.elabftw.id`; other shapes name none."""
+    found = doc.get("identifier")
+    for key in ("elabftw", "id"):
+        found = found.get(key) if isinstance(found, dict) else None
+    return int(found) if isinstance(found, str) and found.isdigit() else None
 
 
 def writable(found, user):

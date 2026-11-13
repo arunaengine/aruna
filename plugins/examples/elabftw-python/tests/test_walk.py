@@ -60,6 +60,15 @@ class WalkTests(unittest.TestCase):
         self.host.bucket = False
         self.assertRaises(Fault, self.plugin.poll)
 
+    def test_identifiers(self):
+        # Other identifier shapes mean an unlinked dataset; they never stop the walk.
+        doi = self.host.make({"name": "x", "identifier": "doi:10.1234/example"})
+        bare = self.host.make({"name": "y", "identifier": {"elabftw": "12"}})
+        self.tagged(1)
+        self.assertEqual(self.marks(1), [None])
+        entries = sum(self.report(), [])
+        self.assertEqual([entry["dataset"] for entry in entries], [doi, bare])
+
     def test_cycles(self):
         self.assertEqual(self.tagged(1, 2, 3, 4, 5), {"cycle": 2, "visits": 5})
         self.team.sent.clear()
