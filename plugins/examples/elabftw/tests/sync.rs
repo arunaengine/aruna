@@ -219,7 +219,7 @@ fn failed_link_retried() {
 }
 
 #[test]
-fn edit_mode_not_blocked() {
+fn edit_mode_retried() {
     // Exclusive edit mode refuses the link fields of a new link; that is no type clash.
     let runner = Runner::new();
     let id = runner.world.experiment("Run 7", "", &["aruna"]);

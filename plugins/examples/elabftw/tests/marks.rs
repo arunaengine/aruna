@@ -301,7 +301,7 @@ fn bytes_bounded() {
 }
 
 #[test]
-fn retries_resume_inside_page() {
+fn retry_page_resumes() {
     // 25 failed links on one mark page, all due; each retry fails again as too large.
     let runner = Runner::new();
     let ids: Vec<u64> = (0..25)
@@ -340,7 +340,7 @@ fn retries_resume_inside_page() {
 }
 
 #[test]
-fn not_due_cost_nothing() {
+fn due_links_retried() {
     // The first 20 failed links of the page are not due; the 5 after them are retried at once.
     let runner = Runner::new();
     let ids: Vec<u64> = (0..25)

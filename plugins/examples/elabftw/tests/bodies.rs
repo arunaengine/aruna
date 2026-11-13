@@ -149,7 +149,7 @@ fn refused_create_writeback() {
 }
 
 #[test]
-fn stopped_change_keeps_conflict() {
+fn stopped_change_conflicts() {
     let (runner, id, dataset) = linked("<p>a</p>");
     runner.world.edit(id, |experiment| {
         experiment["body"] = json!("<p>from eLabFTW</p>")
