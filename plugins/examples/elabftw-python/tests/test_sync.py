@@ -69,6 +69,22 @@ class LinkTests(unittest.TestCase):
         self.assertIsNone(self.sync())
         self.assertEqual((self.item["body"], self.plugin.dataset(1)["description"]), ("<p>b</p>", "b"))
 
+    def test_description_resumed(self):
+        # The run stops before the description write-back; the next visit finishes it.
+        self.enrolled()
+        self.host.edit(self.dataset, text="<p>b</p>")
+        self.host.trap = trap("patch", 1, "kill")
+        self.assertEqual(self.plugin.manual({"experiment": 1}), "killed")
+        self.assertEqual(self.item["body"], "<p>b</p>")
+        self.assertIsNone(self.sync())
+        self.assertEqual(self.plugin.dataset(1)["description"], "b")
+        # The same after a revision conflict on the write-back.
+        self.host.edit(self.dataset, text="<p>c</p>")
+        self.host.trap = trap("patch", 1, lambda: self.host.edit(self.dataset, license="CC0"))
+        self.assertEqual(self.sync()["kind"], "failed")
+        self.assertIsNone(self.sync())
+        self.assertEqual(self.plugin.dataset(1)["description"], "c")
+
     def test_both_sides(self):
         self.enrolled()
         self.item["title"] = "B"

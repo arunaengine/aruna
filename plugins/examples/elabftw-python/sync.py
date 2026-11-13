@@ -257,6 +257,10 @@ class Link:
         elif side == "aruna":
             found, revision = self.to_elab(found, theirs, ours, revision)
         elif side == "same":
+            # An interrupted write can leave the description behind the body; finish it first.
+            described = plain(ours["body"], ours["format"])
+            if self.state.get("pending") and (doc.get("description") or "") != described:
+                revision = self.host.patch(self.state["dataset"], {"description": described or None}, revision)
             self.state.update(synced=fingerprint(ours), pending=None)
         else:
             why = "an interrupted write" if self.state.get("pending") else "changes on both sides"
