@@ -3361,11 +3361,14 @@ name = "elabftw-sync"
 version = "0.1.0"
 dependencies = [
  "aruna-plugin",
+ "aruna-plugins",
+ "async-trait",
  "hex",
  "html5ever",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tokio",
 ]
 
 [[package]]
