@@ -85,7 +85,7 @@ impl Side {
     }
 
     /// Takes the prints of `values`, except for `kept` fields and parts this run did not read.
-    pub fn update(&mut self, values: &Values, kept: &[Field]) {
+    fn update(&mut self, values: &Values, kept: &[Field]) {
         let take = |field| !kept.contains(&field);
         if take(Field::Title) {
             self.title = Print::of(values.title.as_bytes());
@@ -112,7 +112,7 @@ impl Side {
     }
 
     /// Takes the prints of `fields` from `other`; every other field keeps its base.
-    pub fn take(&mut self, other: &Side, fields: &[Field]) {
+    fn take(&mut self, other: &Side, fields: &[Field]) {
         for field in fields {
             match field {
                 Field::Title => self.title = other.title.clone(),
@@ -167,6 +167,8 @@ impl Side {
 }
 
 /// What both sides stored after the last sync, and the versions the plugin's own writes made.
+/// The bases change only through its methods: while a tag target is pending, the tag bases and
+/// the target change together, through [`Snapshot::hold_tags`] alone, until the tags converge.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub elab: Side,
@@ -181,7 +183,7 @@ pub struct Snapshot {
     /// The tags a stopped batch was taking both sides to. Then the eLabFTW base is the set
     /// eLabFTW holds and the Aruna base the set Aruna held when the batch was sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tag_target: Option<BTreeSet<String>>,
+    tag_target: Option<BTreeSet<String>>,
 }
 
 impl Snapshot {
@@ -196,9 +198,41 @@ impl Snapshot {
         }
     }
 
+    fn side(&mut self, origin: Origin) -> &mut Side {
+        match origin {
+            Origin::Elabftw => &mut self.elab,
+            Origin::Aruna => &mut self.aruna,
+        }
+    }
+
+    /// The fields whose base may move outside [`Snapshot::hold_tags`]: all of `fields` but the
+    /// tags while a target is pending.
+    fn movable(&self, fields: &[Field]) -> Vec<Field> {
+        let pending = self.tag_target.is_some();
+        (fields.iter())
+            .filter(|field| !pending || **field != Field::Tags)
+            .copied()
+            .collect()
+    }
+
+    /// Takes `values` as one side's base, except `kept` fields and pending tags.
+    pub fn update(&mut self, origin: Origin, values: &Values, kept: &[Field]) {
+        let mut kept = kept.to_vec();
+        if self.tag_target.is_some() {
+            kept.push(Field::Tags);
+        }
+        self.side(origin).update(values, &kept);
+    }
+
+    /// Takes `fields` of `from` as one side's base, except pending tags.
+    pub fn take(&mut self, origin: Origin, from: &Side, fields: &[Field]) {
+        let fields = self.movable(fields);
+        self.side(origin).take(from, &fields);
+    }
+
     /// Tags on their way to `target`: eLabFTW's base is the set it `held` after the plugin's
     /// writes, Aruna's the set on the `source` side, so both reach the target and keep their
-    /// own edits made since.
+    /// own edits made since. The one way tag bases move while a target is pending.
     pub fn hold_tags(&mut self, held: BTreeSet<String>, source: &Side, target: BTreeSet<String>) {
         let held = Side::of(&Values {
             tags: held,
@@ -207,6 +241,18 @@ impl Snapshot {
         self.elab.take(&held, &[Field::Tags]);
         self.aruna.take(source, &[Field::Tags]);
         self.tag_target = Some(target);
+    }
+
+    /// The tags converged or a person settled them: the target ends, and the next update takes
+    /// the tag bases again.
+    pub fn converge_tags(&mut self) {
+        self.tag_target = None;
+    }
+
+    /// Drops the tag sets to keep a record small; a pending target then becomes a conflict.
+    pub fn forget_tag_sets(&mut self) {
+        self.elab.tag_set = None;
+        self.aruna.tag_set = None;
     }
 }
 

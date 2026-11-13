@@ -356,8 +356,7 @@ impl Record {
         let written = match store(host, &self.key, &self.link, self.version) {
             Err(fault) if fault.kind == Kind::Limit => {
                 if let Some(snapshot) = &mut self.link.snapshot {
-                    snapshot.elab.tag_set = None;
-                    snapshot.aruna.tag_set = None;
+                    snapshot.forget_tag_sets();
                 }
                 store(host, &self.key, &self.link, self.version)?
             }

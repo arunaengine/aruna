@@ -564,8 +564,8 @@ impl<'a> Sync<'a> {
                     // Fields still owed to Aruna keep their eLabFTW base, so they go next round.
                     let mut moved = snapshot.clone();
                     let owed = [&decision.conflicts[..], &decision.to_aruna[..]].concat();
-                    moved.elab.update(&elab_after, &owed);
-                    moved.aruna.take(&Side::of(&aruna), &decision.to_elab);
+                    moved.update(Origin::Elabftw, &elab_after, &owed);
+                    moved.take(Origin::Aruna, &Side::of(&aruna), &decision.to_elab);
                     // Tags eLabFTW took in full are its base, with their target still owed to
                     // Aruna; the target, not the read-back, so a person's tag edit since counts.
                     if written.is_some_and(|written| written.contains(&Field::Tags)) {
@@ -596,16 +596,16 @@ impl<'a> Sync<'a> {
             kept.extend(&decision.to_elab);
         }
         let mut next = snapshot;
-        next.elab.update(&elab_after, &kept);
-        next.aruna.update(&target, &kept);
-        next.modified = after.modified.clone();
-        next.revision = revision;
-        next.pending = false;
         // A tag target lives until the tags converge or a person settles them: tags not sent,
         // or in conflict, keep it.
         if !kept.contains(&Field::Tags) {
-            next.tag_target = None;
+            next.converge_tags();
         }
+        next.update(Origin::Elabftw, &elab_after, &kept);
+        next.update(Origin::Aruna, &target, &kept);
+        next.modified = after.modified.clone();
+        next.revision = revision;
+        next.pending = false;
         let link = &mut record.link;
         link.snapshot = Some(next);
         link.force = None;
@@ -1094,10 +1094,10 @@ impl<'a> Sync<'a> {
         if free {
             patch["identifier"] = identifier(experiment, self.settings);
         }
-        snapshot.elab.update(&stored, &[]);
+        snapshot.update(Origin::Elabftw, &stored, &[]);
         match self.host.patch(dataset, &patch, revision) {
             Ok(next) => {
-                snapshot.aruna.update(&target, &[]);
+                snapshot.update(Origin::Aruna, &target, &[]);
                 snapshot.revision = next;
             }
             // An Aruna edit since the read compares with what was sent, and the stored body
@@ -1258,12 +1258,12 @@ fn settle(link: &mut Link, sent: Option<Sent>) {
     let (Some(sent), Some(snapshot)) = (sent, link.snapshot.as_mut()) else {
         return;
     };
-    snapshot.aruna.take(&sent.side, &sent.fields);
+    snapshot.take(Origin::Aruna, &sent.side, &sent.fields);
     let same: Vec<Field> = (sent.fields.iter())
         .filter(|field| **field != Field::Body)
         .copied()
         .collect();
-    snapshot.elab.take(&sent.side, &same);
+    snapshot.take(Origin::Elabftw, &sent.side, &same);
     // eLabFTW's stored form of a sent body is its base there, so an Aruna undo is one change.
     if let (true, Some((body, raw))) = (sent.fields.contains(&Field::Body), sent.body) {
         (snapshot.elab.body, snapshot.elab.raw) = (body, raw);

@@ -538,6 +538,52 @@ fn tag_retry_restores() {
     assert_eq!(runner.world.dataset(&dataset).entity["name"], "Run 8");
 }
 
+/// Sets eLabFTW's tags as a person does, the enrollment tag kept.
+fn person_tags(runner: &Runner, id: u64, tags: &[&str]) {
+    let mut tags: Vec<&str> = tags.to_vec();
+    tags.push("aruna");
+    runner.world.retag(id, &tags);
+}
+
+#[test]
+fn quiet_round_keeps() {
+    // eLabFTW drops t19 and Aruna keeps only t19: the merged clear-to-empty batch stops.
+    let (runner, id, dataset) = shared_tags();
+    let others: Vec<String> = (0..19).map(|n| format!("t{n:02}")).collect();
+    person_tags(
+        &runner,
+        id,
+        &others.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "keywords": ["t19"] }));
+    runner.event(&dataset);
+    assert!(
+        runner.marks(id)["unfinished"].is_array(),
+        "{}",
+        runner.marks(id)
+    );
+    // A person makes both sides agree on t19; a title and a status change then meet a patch an
+    // unrelated Aruna edit refuses, in a round that sends no tags.
+    person_tags(&runner, id, &["t19"]);
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "name": "Renamed" }));
+    runner
+        .world
+        .edit(id, |experiment| experiment["status_title"] = json!("Done"));
+    runner.world.lock().race_patch = Some(json!({ "comment": "unrelated" }));
+    settle_runs(&runner, id);
+    assert_eq!(elab_tags(&runner, id), set(&["aruna", "t19"]));
+    assert_eq!(keywords(&runner, &dataset), set(&["t19"]));
+    assert_eq!(runner.world.get(id)["title"], "Renamed");
+    assert_eq!(
+        runner.world.dataset(&dataset).entity["creativeWorkStatus"],
+        "Done"
+    );
+}
+
 #[test]
 fn tag_target_waits() {
     // A clear-to-empty batch stops, then the sync user loses write access for a while: the
