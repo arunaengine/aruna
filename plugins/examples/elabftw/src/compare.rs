@@ -178,6 +178,10 @@ pub struct Snapshot {
     /// eLabFTW holds a body the plugin sent whose stored form the dataset has not taken yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pending: bool,
+    /// The tags a stopped batch was taking both sides to. Then the eLabFTW base is the set
+    /// eLabFTW holds and the Aruna base the set Aruna held when the batch was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_target: Option<BTreeSet<String>>,
 }
 
 impl Snapshot {
@@ -248,6 +252,9 @@ pub fn decide(
             (_, Some(Origin::Elabftw)) if differ => decision.to_aruna.push(field),
             (_, Some(Origin::Aruna)) if differ => decision.to_elab.push(field),
             (_, Some(_)) => {}
+            (Field::Tags, None) if let Some(target) = &snapshot.tag_target => {
+                pending_tags(target, snapshot, (elab, aruna), &mut decision);
+            }
             (_, None) => two_way(field, snapshot, (elab, aruna), &mut decision),
         }
     }
@@ -286,6 +293,36 @@ fn two_way(
         },
         _ => {}
     }
+}
+
+/// Tags of a stopped batch: its target, with each side's own edits since its base on top, so
+/// neither the plugin's partial writes nor a side that only waited counts as a change.
+fn pending_tags(
+    target: &BTreeSet<String>,
+    snapshot: &Snapshot,
+    (elab, aruna): (&Values, &Values),
+    decision: &mut Decision,
+) {
+    let bases = (
+        snapshot.elab.tag_set.as_ref(),
+        snapshot.aruna.tag_set.as_ref(),
+    );
+    let (Some(held), Some(source)) = bases else {
+        decision.conflicts.push(Field::Tags);
+        return;
+    };
+    let mut tags = target.clone();
+    for (base, now) in [(held, &elab.tags), (source, &aruna.tags)] {
+        tags.extend(now.difference(base).cloned());
+        tags.retain(|tag| !base.contains(tag) || now.contains(tag));
+    }
+    if tags != elab.tags {
+        decision.to_elab.push(Field::Tags);
+    }
+    if tags != aruna.tags {
+        decision.to_aruna.push(Field::Tags);
+    }
+    decision.tags = Some(tags);
 }
 
 /// Tag changes on both sides merge against the base set, when both snapshots still hold it.
@@ -421,6 +458,34 @@ mod tests {
             (decision.to_elab, decision.described),
             (vec![Field::Body], true)
         );
+    }
+
+    #[test]
+    fn pending_tags_resume() {
+        // A batch from {a, b} to {e} stopped with eLabFTW at {b, e}; Aruna held {} when sent.
+        let mut snapshot = base();
+        snapshot.elab = Side::of(&values("T", &["b", "e"], "<p>x</p>"));
+        snapshot.aruna = Side::of(&aruna("T", &[], "<p>x</p>"));
+        snapshot.tag_target = Some(["e".to_string()].into());
+        let waiting = decide(
+            &snapshot,
+            &values("T", &["b", "e"], "<p>x</p>"),
+            &aruna("T", &[], "<p>x</p>"),
+            None,
+        );
+        assert_eq!(waiting.tags, Some(["e".to_string()].into()));
+        assert_eq!(
+            (waiting.to_elab, waiting.to_aruna),
+            (vec![Field::Tags], vec![Field::Tags])
+        );
+        // Edits made since on either side count on top of the target.
+        let edited = decide(
+            &snapshot,
+            &values("T", &["b", "e", "x"], "<p>x</p>"),
+            &aruna("T", &["y"], "<p>x</p>"),
+            None,
+        );
+        assert_eq!(edited.tags, Some(["e", "x", "y"].map(String::from).into()));
     }
 
     #[test]

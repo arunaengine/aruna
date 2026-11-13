@@ -595,6 +595,7 @@ impl<'a> Sync<'a> {
         next.modified = after.modified.clone();
         next.revision = revision;
         next.pending = false;
+        next.tag_target = None;
         let link = &mut record.link;
         link.snapshot = Some(next);
         link.force = None;
@@ -790,6 +791,7 @@ impl<'a> Sync<'a> {
                 fields: Vec::new(),
                 body: None,
                 tags: None,
+                target: None,
             });
         }
         record.save(self.host)?;
@@ -811,6 +813,11 @@ impl<'a> Sync<'a> {
                         .collect();
                     // Each change answers the whole experiment, so each has its own step; the
                     // set eLabFTW holds after it is saved, so a stopped batch goes on from there.
+                    let source =
+                        (record.link.reservation.as_mut()).and_then(|held| held.source.as_mut());
+                    if let Some(sent) = source {
+                        sent.target = Some(wanted.clone());
+                    }
                     let mut held = experiment.values(None, self.settings).tags;
                     for tag in added {
                         self.step()?;
@@ -1252,15 +1259,25 @@ fn settle(link: &mut Link, sent: Option<Sent>) {
         (snapshot.elab.body, snapshot.elab.raw) = (body, raw);
     }
     snapshot.pending |= sent.fields.contains(&Field::Body);
-    // Tags sent in part: what eLabFTW holds is the base of both sides, so the rest of what Aruna
-    // asks for goes next, as does any change of mind made since.
-    if let (false, Some(tags)) = (sent.fields.contains(&Field::Tags), sent.tags) {
-        let held = Side::of(&Values {
-            tags,
-            ..Values::default()
-        });
-        snapshot.elab.take(&held, &[Field::Tags]);
-        snapshot.aruna.take(&held, &[Field::Tags]);
+    // Tags sent in whole or in part: eLabFTW's base is what it holds, Aruna's what it held when
+    // the batch was sent, and the batch's target stays pending, so both sides reach it and keep
+    // their own edits made since.
+    let done = sent.fields.contains(&Field::Tags);
+    if let Some(target) = sent.target {
+        let held = if done {
+            Some(target.clone())
+        } else {
+            sent.tags
+        };
+        if let Some(tags) = held {
+            let held = Side::of(&Values {
+                tags,
+                ..Values::default()
+            });
+            snapshot.elab.take(&held, &[Field::Tags]);
+            snapshot.aruna.take(&sent.side, &[Field::Tags]);
+            snapshot.tag_target = Some(target);
+        }
     }
 }
 

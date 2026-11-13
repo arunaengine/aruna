@@ -464,25 +464,61 @@ fn host_ceiling_kept() {
     assert!(most > 10 << 20, "the runs went to the edge: {most} bytes");
 }
 
-#[test]
-fn tag_batch_resumes() {
-    // 20 tag removals, each answered with the whole experiment and its 400 KiB body: the batch
-    // spans runs within the host's bounds, and a change of mind halfway goes out too.
+/// A linked experiment with 20 shared tags and a 400 KiB body, so each tag change answers with
+/// the whole experiment and 20 of them do not fit one run.
+fn shared_tags() -> (Runner, u64, String) {
     let runner = Runner::new();
-    let tags: Vec<String> = (0..20).map(|n| format!("t{n:02}")).collect();
-    let mut all: Vec<&str> = tags.iter().map(String::as_str).collect();
-    all.push("aruna");
+    let mut tags: Vec<String> = (0..20).map(|n| format!("t{n:02}")).collect();
+    tags.push("aruna".into());
+    let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
     let body = format!("<p>{}</p>", "b".repeat(400 << 10));
-    let id = runner.world.experiment("Run 7", &body, &all);
+    let id = runner.world.experiment("Run 7", &body, &tags);
     runner.poll();
     let (dataset, _) = runner.world.only_dataset();
+    (runner, id, dataset)
+}
+
+fn elab_tags(runner: &Runner, id: u64) -> BTreeSet<String> {
+    let tags = runner.world.get(id)["tags"].as_str().unwrap().to_string();
+    tags.split('|')
+        .filter(|tag| !tag.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn keywords(runner: &Runner, dataset: &str) -> BTreeSet<String> {
+    let keywords = runner.world.dataset(dataset).entity["keywords"].clone();
+    let keywords = keywords.as_array().cloned().unwrap_or_default();
+    keywords
+        .iter()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect()
+}
+
+/// Runs until the link has no marks, each run within the budget.
+fn settle_runs(runner: &Runner, id: u64) {
+    let mut runs = 0;
+    while !runner.marks(id).is_null() {
+        runner.poll();
+        runs += 1;
+        assert!(runs < 20, "{}", runner.marks(id));
+        assert!(runner.used.get().bytes <= Budget::default().total.bytes);
+    }
+}
+
+fn set(tags: &[&str]) -> BTreeSet<String> {
+    tags.iter().map(|tag| tag.to_string()).collect()
+}
+
+#[test]
+fn tag_batch_resumes() {
+    // Aruna clears its keywords; the 20 removals span runs, and a change of mind halfway goes
+    // out too.
+    let (runner, id, dataset) = shared_tags();
     runner.world.aruna_edit(&dataset, json!({ "keywords": [] }));
     runner.event(&dataset);
-    let left = runner.world.get(id)["tags"]
-        .as_str()
-        .unwrap()
-        .split('|')
-        .count();
+    let left = elab_tags(&runner, id).len();
     assert!(
         left > 1 && left < 21,
         "{left} tags left after the first run"
@@ -492,33 +528,41 @@ fn tag_batch_resumes() {
         "{}",
         runner.marks(id)
     );
-
     runner
         .world
         .aruna_edit(&dataset, json!({ "keywords": ["t19", "new"] }));
-    let mut runs = 0;
-    while !runner.marks(id).is_null() {
-        runner.poll();
-        runs += 1;
-        assert!(runs < 20, "{}", runner.marks(id));
-        assert!(runner.used.get().bytes <= Budget::default().total.bytes);
-    }
-    let mut held: Vec<String> = runner.world.get(id)["tags"]
-        .as_str()
-        .unwrap()
-        .split('|')
-        .map(String::from)
-        .collect();
-    held.sort();
-    assert_eq!(held, ["aruna", "new", "t19"]);
-    let keywords = runner.world.dataset(&dataset).entity["keywords"].clone();
-    let keywords: BTreeSet<&str> = keywords
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
-    assert_eq!(keywords, BTreeSet::from(["new", "t19"]));
+    settle_runs(&runner, id);
+    assert_eq!(elab_tags(&runner, id), set(&["aruna", "new", "t19"]));
+    assert_eq!(keywords(&runner, &dataset), set(&["new", "t19"]));
+
+    // Both sides change: eLabFTW adds a tag, Aruna clears its keywords. The merged target keeps
+    // the eLabFTW addition through a stopped batch, and an eLabFTW addition made in the gap too.
+    let (runner, id, dataset) = shared_tags();
+    let mut tags: Vec<String> = elab_tags(&runner, id).into_iter().collect();
+    tags.push("elab-added".into());
+    runner
+        .world
+        .retag(id, &tags.iter().map(String::as_str).collect::<Vec<_>>());
+    runner.world.aruna_edit(&dataset, json!({ "keywords": [] }));
+    runner.event(&dataset);
+    assert!(
+        runner.marks(id)["unfinished"].is_array(),
+        "{}",
+        runner.marks(id)
+    );
+    assert!(elab_tags(&runner, id).contains("elab-added"));
+    let mut tags: Vec<String> = elab_tags(&runner, id).into_iter().collect();
+    tags.push("later".into());
+    runner
+        .world
+        .retag(id, &tags.iter().map(String::as_str).collect::<Vec<_>>());
+    settle_runs(&runner, id);
+    assert_eq!(
+        elab_tags(&runner, id),
+        set(&["aruna", "elab-added", "later"])
+    );
+    assert_eq!(keywords(&runner, &dataset), set(&["elab-added", "later"]));
+    assert_eq!(runner.marks(id), Value::Null);
 }
 
 #[test]
