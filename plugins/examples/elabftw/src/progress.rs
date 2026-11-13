@@ -136,8 +136,11 @@ pub struct Check {
     pub changed: Vec<String>,
 }
 
-/// A dataset's file entities read across runs, for the revision they belong to: the plugin's
-/// own entities in full, the others by `@id`.
+/// A part of a scan stays below this many serialized bytes, far under the state bound.
+pub const PART_BYTES: usize = 64 * 1024;
+
+/// Where a dataset's file scan stands, at `files/<dataset>`: the revision it reads, where the
+/// next page starts, and how many parts at `files/<dataset>/<n>` hold the entities read.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Scan {
     /// The version of the stored value, not part of it.
@@ -149,12 +152,31 @@ pub struct Scan {
     #[serde(default)]
     pub done: bool,
     #[serde(default)]
+    pub parts: u64,
+    /// The state version of every part key written so far, kept when a new scan reuses them.
+    #[serde(default)]
+    pub versions: Vec<u64>,
+    /// The plugin's own entity changes since the parts were read; `None` is a removal.
+    #[serde(default)]
+    pub overlay: BTreeMap<String, Option<Value>>,
+    /// Entities read and not stored in a part yet.
+    #[serde(skip)]
+    pub fresh: Part,
+    /// Every entity of a finished scan, once its parts are loaded.
+    #[serde(skip)]
+    pub all: Part,
+}
+
+/// Entities of a scan: the plugin's own in full, the others by `@id`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Part {
+    #[serde(default)]
     pub ours: BTreeMap<String, Value>,
     #[serde(default)]
     pub others: BTreeSet<String>,
 }
 
-impl Scan {
+impl Part {
     pub fn add(&mut self, files: Vec<Value>) {
         for file in files {
             let id = file
@@ -173,11 +195,66 @@ impl Scan {
         }
     }
 
-    /// The entities as a page holds them; the others with their `@id` only.
-    pub fn files(&self) -> Vec<Value> {
-        let others = self.others.iter().map(|id| json!({ "@id": id }));
-        self.ours.values().cloned().chain(others).collect()
+    pub fn merge(&mut self, other: Part) {
+        self.ours.extend(other.ours);
+        self.others.extend(other.others);
     }
+
+    pub fn size(&self) -> usize {
+        serde_json::to_vec(self).map_or(0, |bytes| bytes.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ours.is_empty() && self.others.is_empty()
+    }
+}
+
+impl Scan {
+    /// A new scan of `revision` that reuses the part keys of `earlier`.
+    pub fn fresh(revision: &str, earlier: Option<(u64, Scan)>) -> Self {
+        let (version, versions) = match earlier {
+            Some((version, earlier)) => (Some(version), earlier.versions),
+            None => (None, Vec::new()),
+        };
+        Self {
+            version,
+            versions,
+            revision: revision.to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// The entities as a page holds them, the plugin's own changes applied; the others with
+    /// their `@id` only.
+    pub fn files(&self) -> Vec<Value> {
+        let mut ours = self.all.ours.clone();
+        for (id, change) in &self.overlay {
+            match change {
+                Some(file) => ours.insert(id.clone(), file.clone()),
+                None => ours.remove(id),
+            };
+        }
+        let others = self.all.others.iter().map(|id| json!({ "@id": id }));
+        ours.into_values().chain(others).collect()
+    }
+
+    /// The plugin's own entity as the dataset now holds it.
+    pub fn own(&self, id: &str) -> Option<&Value> {
+        match self.overlay.get(id) {
+            Some(change) => change.as_ref(),
+            None => self.all.ours.get(id),
+        }
+    }
+
+    /// Records a change the plugin made to its own entity, now at `revision`.
+    pub fn change(&mut self, id: &str, file: Option<Value>, revision: &str) {
+        self.overlay.insert(id.to_string(), file);
+        self.revision = revision.to_string();
+    }
+}
+
+pub fn part_key(dataset: &str, part: u64) -> String {
+    format!("files/{dataset}/{part}")
 }
 
 pub fn scan_key(dataset: &str) -> String {

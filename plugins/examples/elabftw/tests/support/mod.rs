@@ -76,6 +76,8 @@ pub struct Inner {
     pub race_file: Option<Value>,
     /// The node stops right after the next experiment `POST` lands: state writes fail until
     /// the test clears `state_down`.
+    /// File entities per page; the default when 0.
+    pub file_page: usize,
     pub stop_after_post: bool,
     /// The same, right after the next change of an experiment lands.
     pub stop_after_patch: bool,
@@ -230,14 +232,19 @@ impl Host for World {
             .ok_or_else(|| fault(Kind::NotFound, "no such dataset"))?;
         let after =
             (found.files.iter()).filter(|(id, _)| cursor.is_none_or(|cursor| id.as_str() > cursor));
-        let page: Vec<(&String, &Value)> = after.take(FILE_PAGE + 1).collect();
-        let more = page.len() > FILE_PAGE;
+        let size = if inner.file_page == 0 {
+            FILE_PAGE
+        } else {
+            inner.file_page
+        };
+        let page: Vec<(&String, &Value)> = after.take(size + 1).collect();
+        let more = page.len() > size;
         let files: Vec<Value> = page
             .iter()
-            .take(FILE_PAGE)
+            .take(size)
             .map(|(_, file)| (*file).clone())
             .collect();
-        let cursor = more.then(|| page[FILE_PAGE - 1].0.clone());
+        let cursor = more.then(|| page[size - 1].0.clone());
         Ok(FilePage { files, cursor })
     }
 

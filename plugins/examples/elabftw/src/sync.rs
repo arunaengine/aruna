@@ -13,8 +13,9 @@ use crate::compare::{Decision, Origin, Side, Snapshot, decide, same};
 use crate::elab::{self, MAX_CALL, Order};
 use crate::host::{Fault, Host, Kind, Meter, Result};
 use crate::progress::{
-    Check, Cursor, LINK_PAGE, Link, Listed, Mark, Pass, Phase, Record, Reservation, Reserved, Scan,
-    Sent, Visit, dataset_key, failed_page, link_key, link_page, load, report, scan_key, store,
+    Check, Cursor, LINK_PAGE, Link, Listed, Mark, PART_BYTES, Part, Pass, Phase, Record,
+    Reservation, Reserved, Scan, Sent, Visit, dataset_key, failed_page, link_key, link_page, load,
+    part_key, report, scan_key, store,
 };
 use crate::values::{
     BASE_TEAM, BASE_USER, Experiment, Field, ID_FIELD, Settings, UPLOAD_PREFIX, Upload, Values,
@@ -658,19 +659,15 @@ impl<'a> Sync<'a> {
         pointer.save(self.host)
     }
 
-    /// The dataset's file entities at `revision`, read a page at a time across runs; the pages
-    /// read so far stay in state when the budget runs out.
+    /// The dataset's file entities at `revision`, read a page at a time across runs. Pages
+    /// read go into parts of their own state keys, so no dataset is too large to read.
     fn scan(&self, dataset: &str, revision: &str) -> Result<Scan> {
         let mut scan = match load::<Scan>(self.host, &scan_key(dataset))? {
             Some((version, scan)) if scan.revision == revision => Scan {
                 version: Some(version),
                 ..scan
             },
-            stored => Scan {
-                version: stored.map(|(version, _)| version),
-                revision: revision.to_string(),
-                ..Scan::default()
-            },
+            earlier => Scan::fresh(revision, earlier),
         };
         let read = !scan.done;
         while !scan.done {
@@ -679,29 +676,72 @@ impl<'a> Sync<'a> {
                 return Err(fault);
             }
             let page = self.host.files(dataset, scan.cursor.as_deref())?;
-            scan.add(page.files);
+            scan.fresh.add(page.files);
             scan.done = page.cursor.is_none();
             scan.cursor = page.cursor;
+            if scan.fresh.size() >= PART_BYTES {
+                self.save_part(dataset, &mut scan)?;
+            }
         }
         // A finished scan is kept at once: a later step of the run may still stop it.
         if read {
             self.save_scan(dataset, &mut scan)?;
         }
+        for part in 0..scan.parts {
+            self.step()?;
+            let stored = load::<Part>(self.host, &part_key(dataset, part))?;
+            scan.all
+                .merge(stored.map(|(_, part)| part).unwrap_or_default());
+        }
         Ok(scan)
     }
 
-    fn save_scan(&self, dataset: &str, scan: &mut Scan) -> Result<()> {
-        let key = scan_key(dataset);
-        let version = match store(self.host, &key, scan, scan.version) {
-            // The scan only saves reads; a newer one stored meanwhile is replaced.
-            Err(fault) if fault.kind == Kind::Conflict => {
-                let stored = load::<Scan>(self.host, &key)?.map(|(version, _)| version);
-                store(self.host, &key, scan, stored)?
-            }
-            other => other?,
-        };
-        scan.version = Some(version);
+    /// Stores the entities read since the last part as a new part.
+    fn save_part(&self, dataset: &str, scan: &mut Scan) -> Result<()> {
+        if scan.fresh.is_empty() {
+            return Ok(());
+        }
+        let part = scan.parts;
+        let known = scan.versions.get(part as usize).copied();
+        let version = self.put_key(&part_key(dataset, part), &scan.fresh, known)?;
+        match scan.versions.get_mut(part as usize) {
+            Some(slot) => *slot = version,
+            None => scan.versions.push(version),
+        }
+        scan.parts += 1;
+        scan.fresh = Part::default();
         Ok(())
+    }
+
+    /// Stores the scan's new part and its head. Own changes that outgrow a part start the scan
+    /// over, so the head stays small.
+    fn save_scan(&self, dataset: &str, scan: &mut Scan) -> Result<()> {
+        self.save_part(dataset, scan)?;
+        let overlay = serde_json::to_vec(&scan.overlay).map_or(0, |bytes| bytes.len());
+        if overlay >= PART_BYTES {
+            let earlier = std::mem::take(scan);
+            scan.version = earlier.version;
+            scan.versions = earlier.versions;
+        }
+        scan.version = Some(self.put_key(&scan_key(dataset), scan, scan.version)?);
+        Ok(())
+    }
+
+    /// Writes a value the plugin owns alone; a version moved on by an earlier stopped run is
+    /// read again and the write repeated once.
+    fn put_key<T: serde::Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        known: Option<u64>,
+    ) -> Result<u64> {
+        match store(self.host, key, value, known) {
+            Err(fault) if fault.kind == Kind::Conflict => {
+                let stored = self.host.get(key)?.map(|(version, _)| version);
+                store(self.host, key, value, stored)
+            }
+            other => other,
+        }
     }
 
     /// Upload ids whose object size differs from what eLabFTW recorded, or whose object is gone,
@@ -868,10 +908,9 @@ impl<'a> Sync<'a> {
         for (id, facts) in &wanted {
             if current.get(id) != Some(facts) {
                 self.step()?;
-                let file = merge_file(scan.ours.get(id), id, facts);
+                let file = merge_file(scan.own(id), id, facts);
                 revision = self.host.put_file(dataset, &file, &revision)?;
-                scan.ours.insert(id.clone(), file);
-                scan.revision.clone_from(&revision);
+                scan.change(id, Some(file), &revision);
             }
         }
         for id in current
@@ -880,8 +919,7 @@ impl<'a> Sync<'a> {
         {
             self.step()?;
             revision = self.host.remove_file(dataset, id, &revision)?;
-            scan.ours.remove(id);
-            scan.revision.clone_from(&revision);
+            scan.change(id, None, &revision);
         }
         Ok(revision)
     }

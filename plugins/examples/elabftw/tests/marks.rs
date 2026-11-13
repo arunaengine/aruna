@@ -231,6 +231,39 @@ fn file_pages_resume() {
 }
 
 #[test]
+fn wide_dataset_scanned() {
+    // 6000 files with long ids: the scan spreads over several state keys instead of one value.
+    let runner = Runner::new();
+    let id = runner.world.experiment("Run 7", "", &["aruna"]);
+    runner.poll();
+    let (dataset, _) = runner.world.only_dataset();
+    for n in 0..6000 {
+        let file = format!("measurements/run-2026-11-13/sample-{n:05}/raw-data.csv");
+        runner
+            .world
+            .aruna_file(&dataset, json!({ "@id": file, "@type": "File" }));
+    }
+    runner.world.lock().file_page = 200;
+    runner.event(&dataset);
+    let mut runs = 0;
+    while !runner.marks(id).is_null() {
+        runner.poll();
+        runs += 1;
+        assert!(runs < 20, "{}", runner.marks(id));
+    }
+    let links = runner.world.extra(id)["Aruna files"]["value"].clone();
+    assert_eq!(links.as_array().unwrap().len(), 6000);
+    let prefix = format!("files/{dataset}/");
+    let parts = runner
+        .world
+        .state_keys()
+        .iter()
+        .filter(|key| key.starts_with(&prefix))
+        .count();
+    assert!(parts >= 3, "{parts} parts");
+}
+
+#[test]
 fn uploads_bounded() {
     // 80 uploads: the file writes, and later the storage check, go on across runs.
     let runner = Runner::new();
