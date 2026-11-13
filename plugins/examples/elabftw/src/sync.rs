@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::body::Body;
 use crate::compare::{Decision, Origin, Side, Snapshot, decide, same};
 use crate::elab::{self, MAX_CALL, Order};
-use crate::host::{Fault, Host, Kind, Result};
+use crate::host::{Fault, Host, Kind, Meter, Result};
 use crate::progress::{
     Cursor, LINK_PAGE, Link, Listed, Mark, Pass, Phase, Record, Reservation, Reserved, Sent,
     dataset_key, failed_page, link_key, link_page, load, report, store,
@@ -49,7 +49,8 @@ pub enum Mode {
 
 /// One run's sync: its host, settings, run id and time.
 pub struct Sync<'a> {
-    pub host: &'a dyn Host,
+    /// Counts every call, so the run's bounds see all its traffic.
+    pub host: &'a Meter<'a>,
     pub settings: &'a Settings,
     pub run: &'a str,
     pub now: u64,
@@ -58,7 +59,7 @@ pub struct Sync<'a> {
 }
 
 impl<'a> Sync<'a> {
-    pub fn new(host: &'a dyn Host, settings: &'a Settings, run: &'a str, now: u64) -> Self {
+    pub fn new(host: &'a Meter<'a>, settings: &'a Settings, run: &'a str, now: u64) -> Self {
         Self {
             host,
             settings,
@@ -102,7 +103,7 @@ impl<'a> Sync<'a> {
         let tag = &self.settings.tag;
         let entries = cursor.walk(|offset| elab::list(self.host, tag, Order::Changed, offset))?;
         for entry in entries {
-            if done >= RUN_LINKS || self.host.spent() > RUN_BYTES {
+            if done >= RUN_LINKS || self.host.used().1 > RUN_BYTES {
                 break;
             }
             if !self.own_write(&entry)? {
@@ -881,7 +882,7 @@ impl<'a> Sync<'a> {
                 let entries = elab::list(self.host, tag, Order::Id, pass.offset)?;
                 let total = entries.len();
                 for entry in entries.into_iter().take(CHUNK) {
-                    if self.host.spent() > RUN_BYTES {
+                    if self.host.used().1 > RUN_BYTES {
                         break;
                     }
                     if !self.count(&mut pass, self.experiment(entry.id, Mode::Full)) {
@@ -899,7 +900,7 @@ impl<'a> Sync<'a> {
                 let (ids, more) = link_page(self.host, page)?;
                 let start = (pass.offset % LINK_PAGE as u64) as usize;
                 for id in ids.iter().skip(start) {
-                    if checked >= CHUNK || self.host.spent() > RUN_BYTES {
+                    if checked >= CHUNK || self.host.used().1 > RUN_BYTES {
                         break;
                     }
                     let link = load::<Link>(self.host, &link_key(*id))?.map(|(_, link)| link);

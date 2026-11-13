@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 
 use elabftw_sync::host::{
-    Created, Document, Fault, FilePage, Host, Kind, Method, Reply, Request, Result,
+    Created, Document, Fault, FilePage, Host, Kind, Meter, Method, Reply, Request, Result,
 };
 use elabftw_sync::sync::Sync;
 use elabftw_sync::values::Settings;
@@ -60,7 +60,6 @@ pub struct Inner {
     pub objects: BTreeMap<String, u64>,
     pub log: Vec<String>,
     pub posts: u64,
-    pub spent: u64,
     /// eLabFTW answers changing requests but keeps nothing, like a lost write.
     pub drop_writes: bool,
     /// A user holds exclusive edit mode: every `PATCH` is refused.
@@ -208,7 +207,6 @@ impl Host for World {
         {
             inner.state_down = true;
         }
-        inner.spent += reply.body.len() as u64;
         Ok(reply)
     }
 
@@ -381,10 +379,6 @@ impl Host for World {
     fn log(&self, line: &str) {
         self.lock().log.push(line.to_string());
     }
-
-    fn spent(&self) -> u64 {
-        self.lock().spent
-    }
 }
 
 pub const START: u64 = 1_800_000_000_000;
@@ -409,7 +403,8 @@ impl Runner {
         let settings = settings();
         self.runs.set(self.runs.get() + 1);
         let run = format!("run-{}", self.runs.get());
-        let sync = Sync::new(&self.world, &settings, &run, self.now.get());
+        let meter = Meter::new(&self.world);
+        let sync = Sync::new(&meter, &settings, &run, self.now.get());
         step(&sync)
     }
 

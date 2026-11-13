@@ -2,21 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::cell::Cell;
 use std::future::Future;
 use std::task::{Context as Task, Poll, Waker};
 
 use aruna_plugin::{Context, Error, ErrorKind, Event, Level, Method as Verb};
 use serde_json::Value;
 
-use crate::host::{Created, Document, Fault, FilePage, Host, Kind, Method, Reply, Request, Result};
+use crate::host::{
+    Created, Document, Fault, FilePage, Host, Kind, Meter, Method, Reply, Request, Result,
+};
 use crate::sync::Sync;
 use crate::values::Settings;
 
 /// The timer: the quick pass, failed links and a chunk of the full reconciliation.
 async fn poll(ctx: Context, event: Event) -> aruna_plugin::Result<Value> {
     let (guest, settings) = (Guest::new(&ctx), ctx.settings::<Settings>()?);
-    let sync = Sync::new(&guest, &settings, ctx.run(), clock(ctx.run(), &event));
+    let meter = Meter::new(&guest);
+    let sync = Sync::new(&meter, &settings, ctx.run(), clock(ctx.run(), &event));
     sync.poll().map_err(failure)
 }
 
@@ -26,7 +28,8 @@ async fn changed(ctx: Context, event: Event) -> aruna_plugin::Result<()> {
         return Err(Error::Input("expected a dataset event".into()));
     };
     let (guest, settings) = (Guest::new(&ctx), ctx.settings::<Settings>()?);
-    let sync = Sync::new(&guest, &settings, ctx.run(), clock(ctx.run(), &event));
+    let meter = Meter::new(&guest);
+    let sync = Sync::new(&meter, &settings, ctx.run(), clock(ctx.run(), &event));
     (sync.changed(&change.resource, &change.path, &change.revision)).map_err(failure)
 }
 
@@ -36,7 +39,8 @@ async fn manual(ctx: Context, event: Event) -> aruna_plugin::Result<Value> {
         return Err(Error::Input("expected manual input".into()));
     };
     let (guest, settings) = (Guest::new(&ctx), ctx.settings::<Settings>()?);
-    let sync = Sync::new(&guest, &settings, ctx.run(), clock(ctx.run(), &event));
+    let meter = Meter::new(&guest);
+    let sync = Sync::new(&meter, &settings, ctx.run(), clock(ctx.run(), &event));
     sync.manual(input).map_err(failure)
 }
 
@@ -106,20 +110,11 @@ fn ready<T>(future: impl Future<Output = aruna_plugin::Result<T>>) -> Result<T> 
 
 struct Guest<'a> {
     ctx: &'a Context,
-    spent: Cell<u64>,
 }
 
 impl<'a> Guest<'a> {
     fn new(ctx: &'a Context) -> Self {
-        Self {
-            ctx,
-            spent: Cell::new(0),
-        }
-    }
-
-    fn spend(&self, bytes: usize) {
-        self.spent
-            .set(self.spent.get().saturating_add(bytes as u64));
+        Self { ctx }
     }
 }
 
@@ -135,7 +130,6 @@ impl Host for Guest<'_> {
                 .map_err(|error| Fault::new(Kind::Invalid, error.to_string()))?,
             None => Vec::new(),
         };
-        self.spend(body.len());
         let query: Vec<(&str, &str)> = (request.query.iter())
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
@@ -144,7 +138,6 @@ impl Host for Guest<'_> {
         let http = self.ctx.http("elab");
         let key = request.key.as_deref();
         let reply = ready(http.send_full_with(method, &request.path, &query, headers, body, key))?;
-        self.spend(reply.body.len());
         let headers = reply
             .headers
             .into_iter()
@@ -158,7 +151,6 @@ impl Host for Guest<'_> {
 
     fn summary(&self, dataset: &str) -> Result<Document> {
         let doc = ready(self.ctx.metadata().summary(dataset))?;
-        self.spend(doc.json.to_string().len());
         Ok(Document {
             revision: doc.revision,
             json: doc.json,
@@ -167,7 +159,6 @@ impl Host for Guest<'_> {
 
     fn files(&self, dataset: &str, cursor: Option<&str>) -> Result<FilePage> {
         let page = ready(self.ctx.metadata().files(dataset, cursor))?;
-        self.spend(page.files.iter().map(|file| file.to_string().len()).sum());
         Ok(FilePage {
             files: page.files,
             cursor: page.cursor,
@@ -175,7 +166,6 @@ impl Host for Guest<'_> {
     }
 
     fn patch(&self, dataset: &str, patch: &Value, expected: &str) -> Result<String> {
-        self.spend(patch.to_string().len());
         ready(self.ctx.metadata().patch(dataset, patch, expected))
     }
 
@@ -214,9 +204,5 @@ impl Host for Guest<'_> {
 
     fn log(&self, line: &str) {
         self.ctx.log(Level::Info, line);
-    }
-
-    fn spent(&self) -> u64 {
-        self.spent.get()
     }
 }

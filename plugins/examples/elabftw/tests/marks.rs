@@ -8,8 +8,8 @@ mod support;
 use std::collections::BTreeSet;
 
 use elabftw_sync::compare::Snapshot;
-use elabftw_sync::host::{Host, Kind};
-use elabftw_sync::progress::{DAY_MS, MAX_VALUE, Mark, REPORT_BYTES, Record, store};
+use elabftw_sync::host::{Host, Kind, Meter};
+use elabftw_sync::progress::{DAY_MS, MAX_VALUE, Mark, REPORT_BYTES, Record, load, store};
 use elabftw_sync::sync::Sync;
 use serde_json::{Value, json};
 use support::{BUCKET, Runner, World, settings};
@@ -145,18 +145,22 @@ fn too_large_marked() {
 }
 
 #[test]
-fn run_bytes_bounded() {
-    let runner = Runner::new();
-    runner.world.experiment("Run 7", "", &["aruna"]);
-    runner.world.lock().spent = 13 << 20;
-    let done = runner.poll();
-    assert_eq!(done["synced"], 0, "no link starts after 12 MiB");
-    runner.world.lock().spent = 0;
-    assert_eq!(
-        runner.poll()["synced"],
-        1,
-        "the cursor did not pass the link"
-    );
+fn meter_counts_all() {
+    // State, creates and file writes count as much as eLabFTW and dataset reads.
+    let world = World::default();
+    let meter = Meter::new(&world);
+    let value = "v".repeat(1000);
+    let version = store(&meter, "k", &value, None).unwrap();
+    load::<String>(&meter, "k").unwrap();
+    let created = meter
+        .create("elabftw/1", &json!({ "name": "N" }), "elabftw/1")
+        .unwrap();
+    let file = json!({ "@id": "a", "contentUrl": "/missing" });
+    let refused = meter.put_file(&created.resource, &file, &created.revision);
+    assert!(refused.is_err());
+    let (calls, bytes) = meter.used();
+    assert_eq!((version, calls), (1, 4));
+    assert!(bytes > 2000, "{bytes} bytes");
 }
 
 #[test]
@@ -212,13 +216,14 @@ fn bucket_checked() {
     let world = World::default();
     let mut elsewhere = settings();
     elsewhere.bucket = "/r/g/lab/data/other-node/shared".into();
-    let fault = Sync::new(&world, &elsewhere, "run-1", 1)
+    let meter = Meter::new(&world);
+    let fault = Sync::new(&meter, &elsewhere, "run-1", 1)
         .poll()
         .unwrap_err();
     assert_eq!(fault.kind, Kind::NotFound);
     assert!(fault.message.contains("receiver node"), "{}", fault.message);
     assert!(
-        Sync::new(&world, &settings(), "run-1", 1).poll().is_ok(),
+        Sync::new(&meter, &settings(), "run-1", 1).poll().is_ok(),
         "an empty bucket is fine"
     );
 }
@@ -304,7 +309,8 @@ fn report_pages_bounded() {
     cleared.save(&world).unwrap();
 
     let settings = settings();
-    let sync = Sync::new(&world, &settings, "run-1", 1);
+    let meter = Meter::new(&world);
+    let sync = Sync::new(&meter, &settings, "run-1", 1);
     let (mut after, mut seen) = (json!(0), BTreeSet::new());
     while let Some(page) = after.as_u64() {
         let report = sync

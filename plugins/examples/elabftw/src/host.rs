@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::cell::Cell;
+
 use serde_json::Value;
 
 /// Why a host call failed, as the host reports it.
@@ -139,6 +141,113 @@ pub trait Host {
     fn get(&self, key: &str) -> Result<Option<(u64, Vec<u8>)>>;
     fn put(&self, key: &str, value: &[u8], expected: Option<u64>) -> Result<u64>;
     fn log(&self, line: &str);
-    /// Bytes this run has read and written so far, against the run's 16 MiB bound.
-    fn spent(&self) -> u64;
+}
+
+/// Counts every host call of a run and the bytes it moves, for the run's budget.
+pub struct Meter<'a> {
+    inner: &'a dyn Host,
+    calls: Cell<u32>,
+    bytes: Cell<u64>,
+}
+
+impl<'a> Meter<'a> {
+    pub fn new(inner: &'a dyn Host) -> Self {
+        Self {
+            inner,
+            calls: Cell::new(0),
+            bytes: Cell::new(0),
+        }
+    }
+
+    /// Calls made and bytes moved so far.
+    pub fn used(&self) -> (u32, u64) {
+        (self.calls.get(), self.bytes.get())
+    }
+
+    fn count<T>(&self, sent: usize, result: Result<T>, size: impl Fn(&T) -> usize) -> Result<T> {
+        let received = (result.as_ref()).map_or_else(|fault| fault.message.len(), size);
+        self.calls.set(self.calls.get().saturating_add(1));
+        let moved = (sent + received) as u64;
+        self.bytes.set(self.bytes.get().saturating_add(moved));
+        result
+    }
+}
+
+fn json_len(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
+}
+
+impl Host for Meter<'_> {
+    fn elab(&self, request: &Request) -> Result<Reply> {
+        let query: usize = (request.query.iter())
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        let sent = request.path.len() + query + request.body.as_ref().map_or(0, json_len);
+        let headers = |reply: &Reply| -> usize {
+            (reply.headers.iter())
+                .map(|(name, value)| name.len() + value.len())
+                .sum()
+        };
+        let reply = self.inner.elab(request);
+        self.count(sent, reply, |reply| reply.body.len() + headers(reply))
+    }
+
+    fn summary(&self, dataset: &str) -> Result<Document> {
+        let reply = self.inner.summary(dataset);
+        self.count(dataset.len(), reply, |doc| json_len(&doc.json))
+    }
+
+    fn files(&self, dataset: &str, cursor: Option<&str>) -> Result<FilePage> {
+        let sent = dataset.len() + cursor.map_or(0, str::len);
+        let reply = self.inner.files(dataset, cursor);
+        self.count(sent, reply, |page| page.files.iter().map(json_len).sum())
+    }
+
+    fn patch(&self, dataset: &str, patch: &Value, expected: &str) -> Result<String> {
+        let reply = self.inner.patch(dataset, patch, expected);
+        self.count(json_len(patch) + expected.len(), reply, String::len)
+    }
+
+    fn put_file(&self, dataset: &str, file: &Value, expected: &str) -> Result<String> {
+        let reply = self.inner.put_file(dataset, file, expected);
+        self.count(json_len(file) + expected.len(), reply, String::len)
+    }
+
+    fn remove_file(&self, dataset: &str, id: &str, expected: &str) -> Result<String> {
+        let reply = self.inner.remove_file(dataset, id, expected);
+        self.count(id.len() + expected.len(), reply, String::len)
+    }
+
+    fn create(&self, path: &str, dataset: &Value, key: &str) -> Result<Created> {
+        let reply = self.inner.create(path, dataset, key);
+        let sent = path.len() + json_len(dataset) + key.len();
+        self.count(sent, reply, |created| {
+            created.resource.len() + created.revision.len()
+        })
+    }
+
+    fn object_size(&self, path: &str) -> Result<u64> {
+        self.count(path.len(), self.inner.object_size(path), |_| 8)
+    }
+
+    fn objects(&self, prefix: &str) -> Result<()> {
+        self.count(prefix.len(), self.inner.objects(prefix), |_| 0)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<(u64, Vec<u8>)>> {
+        let reply = self.inner.get(key);
+        self.count(key.len(), reply, |entry| {
+            entry.as_ref().map_or(0, |(_, value)| value.len())
+        })
+    }
+
+    fn put(&self, key: &str, value: &[u8], expected: Option<u64>) -> Result<u64> {
+        let reply = self.inner.put(key, value, expected);
+        self.count(key.len() + value.len(), reply, |_| 8)
+    }
+
+    fn log(&self, line: &str) {
+        self.count(line.len(), Ok(()), |_| 0).ok();
+        self.inner.log(line);
+    }
 }
