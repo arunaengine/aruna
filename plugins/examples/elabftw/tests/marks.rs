@@ -512,6 +512,33 @@ fn set(tags: &[&str]) -> BTreeSet<String> {
 }
 
 #[test]
+fn tag_retry_keeps_restore() {
+    // A clear-to-empty batch stops; meanwhile Aruna restores t19 and eLabFTW changes the title.
+    // The resume removes the rest, and an unrelated Aruna edit refuses its patch: the retry
+    // keeps the restored t19 on both sides.
+    let (runner, id, dataset) = shared_tags();
+    runner.world.aruna_edit(&dataset, json!({ "keywords": [] }));
+    runner.event(&dataset);
+    assert!(
+        runner.marks(id)["unfinished"].is_array(),
+        "{}",
+        runner.marks(id)
+    );
+    assert!(elab_tags(&runner, id).contains("t19"));
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "keywords": ["t19"] }));
+    runner
+        .world
+        .edit(id, |experiment| experiment["title"] = json!("Run 8"));
+    runner.world.lock().race_patch = Some(json!({ "creativeWorkStatus": "edited" }));
+    settle_runs(&runner, id);
+    assert_eq!(elab_tags(&runner, id), set(&["aruna", "t19"]));
+    assert_eq!(keywords(&runner, &dataset), set(&["t19"]));
+    assert_eq!(runner.world.dataset(&dataset).entity["name"], "Run 8");
+}
+
+#[test]
 fn tag_batch_resumes() {
     // Aruna clears its keywords; the 20 removals span runs, and a change of mind halfway goes
     // out too.

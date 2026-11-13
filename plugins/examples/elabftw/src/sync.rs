@@ -566,6 +566,12 @@ impl<'a> Sync<'a> {
                     let owed = [&decision.conflicts[..], &decision.to_aruna[..]].concat();
                     moved.elab.update(&elab_after, &owed);
                     moved.aruna.take(&Side::of(&aruna), &decision.to_elab);
+                    // Tags eLabFTW took in full are its base, with their target still owed to
+                    // Aruna; the target, not the read-back, so a person's tag edit since counts.
+                    if written.is_some_and(|written| written.contains(&Field::Tags)) {
+                        let tags = decision.tags.clone().unwrap_or_else(|| aruna.tags.clone());
+                        moved.hold_tags(tags.clone(), &Side::of(&aruna), tags);
+                    }
                     moved.pending |= stored;
                     moved.modified = after.modified.clone();
                     record.link.snapshot = Some(moved);
@@ -1269,14 +1275,8 @@ fn settle(link: &mut Link, sent: Option<Sent>) {
         } else {
             sent.tags
         };
-        if let Some(tags) = held {
-            let held = Side::of(&Values {
-                tags,
-                ..Values::default()
-            });
-            snapshot.elab.take(&held, &[Field::Tags]);
-            snapshot.aruna.take(&sent.side, &[Field::Tags]);
-            snapshot.tag_target = Some(target);
+        if let Some(held) = held {
+            snapshot.hold_tags(held, &sent.side, target);
         }
     }
 }

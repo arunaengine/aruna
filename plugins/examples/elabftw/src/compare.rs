@@ -195,6 +195,19 @@ impl Snapshot {
             ..Self::default()
         }
     }
+
+    /// Tags on their way to `target`: eLabFTW's base is the set it `held` after the plugin's
+    /// writes, Aruna's the set on the `source` side, so both reach the target and keep their
+    /// own edits made since.
+    pub fn hold_tags(&mut self, held: BTreeSet<String>, source: &Side, target: BTreeSet<String>) {
+        let held = Side::of(&Values {
+            tags: held,
+            ..Values::default()
+        });
+        self.elab.take(&held, &[Field::Tags]);
+        self.aruna.take(source, &[Field::Tags]);
+        self.tag_target = Some(target);
+    }
 }
 
 /// The side whose values win, for a settled conflict.
