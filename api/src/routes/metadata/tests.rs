@@ -713,6 +713,115 @@ async fn rocrate_routes_work() {
 }
 
 #[tokio::test]
+async fn data_entity_removal() {
+    // A removal at the read revision drops the file; one at an older revision answers 412, and
+    // the root or a missing entity is refused with nothing changed.
+    let test = setup_state().await;
+    let (group, auth) = (test.group_id, test.auth.clone());
+    let document_id =
+        create_linking_doc(&test, auth, group, "datasets/rm", "Removal", true, &[]).await;
+    drain_metadata_background(test.state.as_ref()).await;
+    let (_, Json(added)) = add_data_entity(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Extension(None),
+        Path(document_id.clone()),
+        Json(json!({"@id": "./data/run-42.raw", "@type": "File", "name": "run-42.raw"})),
+    )
+    .await
+    .unwrap();
+    drain_metadata_background(test.state.as_ref()).await;
+    let revision = added.revision.clone().unwrap();
+    let remove = |id: &str, expected_revision: &str| {
+        let query = RemovalQuery {
+            id: id.to_string(),
+            expected_revision: expected_revision.to_string(),
+        };
+        let (state, auth) = (test.state.clone(), test.auth.clone());
+        remove_data_entity(
+            State(state),
+            Extension(Some(auth)),
+            Extension(None),
+            Path(document_id.clone()),
+            Query(query),
+        )
+    };
+    for refused in ["./", "./data/missing.raw"] {
+        let error = remove(refused, &revision).await.unwrap_err();
+        assert!(
+            matches!(error, ServerError::BadRequestReason(_)),
+            "{refused}: {error:?}"
+        );
+    }
+    let stale = Ulid::from_parts(1, 1).to_string();
+    let error = remove("./data/run-42.raw", &stale).await.unwrap_err();
+    assert!(
+        matches!(error, ServerError::PreconditionFailed(_)),
+        "{error:?}"
+    );
+    let (_, Json(removed)) = remove("./data/run-42.raw", &revision).await.unwrap();
+    assert_ne!(removed.revision, Some(revision));
+    drain_metadata_background(test.state.as_ref()).await;
+    let (_, Json(exported)) = export_metadata_rocrate(
+        State(test.state),
+        Extension(None),
+        Extension(None),
+        Path(document_id),
+        Query(RoCrateExportParams::default()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !projected(exported)
+            .rocrate
+            .to_string()
+            .contains("run-42.raw")
+    );
+}
+
+#[tokio::test]
+async fn stale_removal_conflicts() {
+    // A removal based on an older revision answers 412, also when its entity is already gone.
+    let test = setup_state().await;
+    let (group, auth) = (test.group_id, test.auth.clone());
+    let document_id =
+        create_linking_doc(&test, auth, group, "datasets/st", "Stale", true, &[]).await;
+    drain_metadata_background(test.state.as_ref()).await;
+    let (_, Json(added)) = add_data_entity(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Extension(None),
+        Path(document_id.clone()),
+        Json(json!({"@id": "./data/gone.raw", "@type": "File", "name": "gone.raw"})),
+    )
+    .await
+    .unwrap();
+    drain_metadata_background(test.state.as_ref()).await;
+    let revision = added.revision.clone().unwrap();
+    let remove = || {
+        let query = RemovalQuery {
+            id: "./data/gone.raw".to_string(),
+            expected_revision: revision.clone(),
+        };
+        let (state, auth) = (test.state.clone(), test.auth.clone());
+        remove_data_entity(
+            State(state),
+            Extension(Some(auth)),
+            Extension(None),
+            Path(document_id.clone()),
+            Query(query),
+        )
+    };
+    let (_, Json(_)) = remove().await.unwrap();
+    drain_metadata_background(test.state.as_ref()).await;
+    let error = remove().await.unwrap_err();
+    assert!(
+        matches!(error, ServerError::PreconditionFailed(_)),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn export_here_copy() {
     let test = setup_state().await;
     let document_id = create_linking_doc(

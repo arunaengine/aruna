@@ -6,11 +6,13 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, Field, FullResponse, HostError, Intent,
-    Listing, MetadataPatch, Method, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
+    FullResponse, HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo,
+    ObjectPage, Response, SendRequest, StatePut,
 };
 use crate::host::wit::aruna::plugin::{
-    connections, grants, log, metadata_read, metadata_write, objects_read, secrets, state, types,
+    connections, grants, log, metadata_create, metadata_read, metadata_write, objects_read,
+    secrets, state, types,
 };
 use crate::host::{Needs, Session};
 use crate::permission::Permission;
@@ -71,8 +73,7 @@ impl Session {
             Ok(reply) => reply_size(reply),
             Err(error) => error.message.len(),
         };
-        self.finish(size)?;
-        Ok(reply)
+        self.finish(reply, size)
     }
 }
 
@@ -155,6 +156,35 @@ impl metadata_read::Host for Session {
         )
         .await
     }
+
+    async fn files(
+        &mut self,
+        resource: String,
+        cursor: Option<String>,
+    ) -> wasmtime::Result<Result<FilePage, HostError>> {
+        self.brokered(
+            resource.len() + cursor.as_ref().map_or(0, String::len),
+            Effect::Read,
+            Needs::Permission(Permission::MetadataRead),
+            |broker, cx| async move { broker.metadata_files(&cx, &resource, cursor).await },
+            |page: &FilePage| {
+                let files: usize = page.files.iter().map(|file| file.len() + 8).sum();
+                files + page.cursor.as_ref().map_or(0, String::len)
+            },
+        )
+        .await
+    }
+
+    async fn summary(&mut self, resource: String) -> wasmtime::Result<Result<Document, HostError>> {
+        self.brokered(
+            resource.len(),
+            Effect::Read,
+            Needs::Permission(Permission::MetadataRead),
+            |broker, cx| async move { broker.metadata_summary(&cx, &resource).await },
+            |doc: &Document| doc.resource.len() + doc.revision.len() + doc.json.len(),
+        )
+        .await
+    }
 }
 
 impl metadata_write::Host for Session {
@@ -182,6 +212,99 @@ impl metadata_write::Host for Session {
             Needs::Permission(Permission::MetadataWrite),
             |broker, cx| async move { broker.metadata_patch(&cx, patch).await },
             String::len,
+        )
+        .await
+    }
+
+    async fn put_file(
+        &mut self,
+        resource: String,
+        file: String,
+        expected: String,
+        key: Option<String>,
+    ) -> wasmtime::Result<Result<String, HostError>> {
+        let size =
+            resource.len() + file.len() + expected.len() + key.as_ref().map_or(0, String::len);
+        let parts: [&[u8]; 4] = [
+            b"put",
+            resource.as_bytes(),
+            file.as_bytes(),
+            expected.as_bytes(),
+        ];
+        let intent = Intent::new(self.next_ordinal(), key, &parts);
+        let effect = Effect::Write(intent.clone());
+        let change = FileChange {
+            resource,
+            file,
+            expected,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Permission(Permission::MetadataWrite),
+            |broker, cx| async move { broker.metadata_put_file(&cx, change).await },
+            String::len,
+        )
+        .await
+    }
+
+    async fn remove_file(
+        &mut self,
+        resource: String,
+        id: String,
+        expected: String,
+        key: Option<String>,
+    ) -> wasmtime::Result<Result<String, HostError>> {
+        let size = resource.len() + id.len() + expected.len() + key.as_ref().map_or(0, String::len);
+        let parts: [&[u8]; 4] = [
+            b"remove",
+            resource.as_bytes(),
+            id.as_bytes(),
+            expected.as_bytes(),
+        ];
+        let intent = Intent::new(self.next_ordinal(), key, &parts);
+        let effect = Effect::Write(intent.clone());
+        let change = FileChange {
+            resource,
+            file: id,
+            expected,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Permission(Permission::MetadataWrite),
+            |broker, cx| async move { broker.metadata_remove_file(&cx, change).await },
+            String::len,
+        )
+        .await
+    }
+}
+
+impl metadata_create::Host for Session {
+    async fn create(
+        &mut self,
+        path: String,
+        dataset: String,
+        key: String,
+    ) -> wasmtime::Result<Result<Created, HostError>> {
+        let size = path.len() + dataset.len() + key.len();
+        let parts: [&[u8]; 3] = [path.as_bytes(), dataset.as_bytes(), key.as_bytes()];
+        let intent = Intent::new(self.next_ordinal(), Some(key.clone()), &parts);
+        let effect = Effect::Write(intent.clone());
+        let create = MetadataCreate {
+            path,
+            dataset,
+            key,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Permission(Permission::MetadataCreate),
+            |broker, cx| async move { broker.metadata_create(&cx, create).await },
+            |created: &Created| created.resource.len() + created.revision.len(),
         )
         .await
     }

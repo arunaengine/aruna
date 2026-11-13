@@ -22,9 +22,10 @@ response = ["/id", "/meta/name", "/items/1"]
 manual = { handler = "probe" }
 every = { handler = "chatty", interval = "1h" }
 dataset_created = { handler = "echo" }
+dataset_updated = { handler = "echo" }
 data_uploaded = { handler = "hoard" }
 sync_completed = { handler = "spin" }
 
 [permissions]
 required = ["metadata.read", "objects.read"]
-optional = ["metadata.write"]
+optional = ["metadata.write", "metadata.create"]

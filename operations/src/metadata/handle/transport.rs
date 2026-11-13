@@ -548,6 +548,7 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::SecretReleased { .. } => "secret_released",
         MetadataTransportMessage::CheckNodeSecret { .. } => "check_node_secret",
         MetadataTransportMessage::NodeSecretChecked { .. } => "node_secret_checked",
+        MetadataTransportMessage::ForwardedGraphPending { .. } => "forwarded_graph_pending",
     }
 }
 

@@ -550,7 +550,9 @@ pub(super) async fn forward_pid(
                 MetadataReadError::Unauthorized => MetadataApiError::Unauthorized,
                 MetadataReadError::Forbidden => MetadataApiError::Forbidden,
                 MetadataReadError::NotFound => MetadataApiError::NotFound,
-                MetadataReadError::Unavailable => MetadataApiError::ServiceUnavailable,
+                MetadataReadError::Unavailable | MetadataReadError::TooLarge => {
+                    MetadataApiError::ServiceUnavailable
+                }
             })
         }
         _ => Err(MetadataApiError::ServiceUnavailable),

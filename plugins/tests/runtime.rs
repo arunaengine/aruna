@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use aruna_plugins::artifact::read_manifest;
 use aruna_plugins::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, FileChange, FilePage, HostError,
+    Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest,
+    StatePut,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::manifest::Manifest;
@@ -65,6 +66,13 @@ impl Broker for Recorder {
         self.note("metadata_get");
         match resource {
             "missing" => return Err(HostError::new(ErrorKind::NotFound, "x".repeat(200))),
+            "huge" => {
+                return Ok(Document {
+                    resource: resource.to_string(),
+                    revision: "r1".into(),
+                    json: format!(r#"{{"name":"{}"}}"#, "x".repeat(8192)),
+                });
+            }
             "slow" => tokio::time::sleep(Duration::from_millis(50)).await,
             "block" => {
                 self.blocked.notify_one();
@@ -105,6 +113,66 @@ impl Broker for Recorder {
         }
         self.note("metadata_patch_done");
         Ok(format!("{}+", patch.expected))
+    }
+
+    async fn metadata_summary(
+        &self,
+        _: &CallContext,
+        resource: &str,
+    ) -> Result<Document, HostError> {
+        self.note("metadata_summary");
+        Ok(Document {
+            resource: resource.to_string(),
+            revision: "r1".into(),
+            json: r#"{"name":"Run 7"}"#.into(),
+        })
+    }
+
+    async fn metadata_files(
+        &self,
+        _: &CallContext,
+        _: &str,
+        cursor: Option<String>,
+    ) -> Result<FilePage, HostError> {
+        self.note("metadata_files");
+        Ok(FilePage {
+            files: vec![r#"{"@id":"a.txt","@type":"File"}"#.into()],
+            cursor: cursor.map(|cursor| format!("{cursor}+")),
+        })
+    }
+
+    async fn metadata_put_file(
+        &self,
+        _: &CallContext,
+        change: FileChange,
+    ) -> Result<String, HostError> {
+        self.note("metadata_put_file");
+        self.intents.lock().unwrap().push(change.intent);
+        Ok(format!("{}+", change.expected))
+    }
+
+    async fn metadata_remove_file(
+        &self,
+        _: &CallContext,
+        change: FileChange,
+    ) -> Result<String, HostError> {
+        self.note("metadata_remove_file");
+        self.intents.lock().unwrap().push(change.intent);
+        Ok(format!("{}-", change.expected))
+    }
+
+    async fn metadata_create(
+        &self,
+        _: &CallContext,
+        create: MetadataCreate,
+    ) -> Result<Created, HostError> {
+        self.note("metadata_create");
+        assert_eq!(create.intent.key.as_deref(), Some(create.key.as_str()));
+        self.intents.lock().unwrap().push(create.intent);
+        Ok(Created {
+            resource: format!("{}-doc", create.key),
+            revision: "r0".into(),
+        })
     }
 
     async fn objects_info(&self, _: &CallContext, path: &str) -> Result<ObjectInfo, HostError> {
@@ -268,6 +336,82 @@ async fn calls_reach_broker() {
         "granted",
     ];
     assert_eq!(broker.calls(), calls);
+}
+
+#[tokio::test]
+async fn dataset_calls_reach() {
+    // The rebuilt guest reaches every dataset call; a create needs its own permission.
+    let broker = Arc::new(Recorder::default());
+    let mut create = probe(
+        serde_json::json!({"call": "metadata_create", "path": "eln/1", "dataset": {"name": "E"}, "key": "e1"}),
+    );
+    create.permissions.insert(Permission::MetadataCreate);
+    let created = invoke(create, broker.clone()).await;
+    assert_eq!(
+        output(created),
+        serde_json::json!({"resource": "e1-doc", "revision": "r0"})
+    );
+    let summary = probe(serde_json::json!({"call": "metadata_summary", "resource": "D1"}));
+    let summary = invoke(summary, broker.clone()).await;
+    assert_eq!(
+        output(summary),
+        serde_json::json!({"revision": "r1", "json": {"name": "Run 7"}})
+    );
+    let files =
+        probe(serde_json::json!({"call": "metadata_files", "resource": "D1", "cursor": "c"}));
+    let files = invoke(files, broker.clone()).await;
+    assert_eq!(
+        output(files),
+        serde_json::json!({"files": [{"@id": "a.txt", "@type": "File"}], "cursor": "c+"})
+    );
+    let file = serde_json::json!({"@id": "a.txt", "@type": "File", "name": "a"});
+    let put = probe(
+        serde_json::json!({"call": "put_file", "resource": "D1", "file": file, "expected": "r1"}),
+    );
+    assert_eq!(
+        output(invoke(put, broker.clone()).await),
+        serde_json::json!("r1+")
+    );
+    let removed = probe(
+        serde_json::json!({"call": "remove_file", "resource": "D1", "id": "a.txt", "expected": "r1"}),
+    );
+    assert_eq!(
+        output(invoke(removed, broker.clone()).await),
+        serde_json::json!("r1-")
+    );
+    let calls = [
+        "metadata_create",
+        "metadata_summary",
+        "metadata_files",
+        "metadata_put_file",
+        "metadata_remove_file",
+    ];
+    assert_eq!(broker.calls(), calls);
+
+    let refused = probe(
+        serde_json::json!({"call": "metadata_create", "path": "eln/2", "dataset": {}, "key": "e2"}),
+    );
+    let Err(InvokeError::Guest(failure)) = invoke(refused, broker.clone()).await else {
+        panic!("a create without its permission fails the run");
+    };
+    assert!(
+        failure.message.contains("metadata.create"),
+        "{}",
+        failure.message
+    );
+    let event = WatchEvent {
+        kind: "dataset_updated".into(),
+        path: "meta/group-1/D1".into(),
+        resource: "D1".into(),
+        revision: "r2".into(),
+    };
+    let reply = invoke(call("echo", Trigger::Event(event)), Arc::default()).await;
+    assert!(
+        reply
+            .unwrap()
+            .unwrap()
+            .ends_with("change dataset_updated D1 r2")
+    );
 }
 
 #[tokio::test]
@@ -478,6 +622,32 @@ async fn error_bytes_bounded() {
         matches!(ended, Err(InvokeError::Limit(Limit::Bytes))),
         "missing grants count: {ended:?}"
     );
+}
+
+#[tokio::test]
+async fn oversized_replies_caught() {
+    // A reply over the per-call bound reaches the guest as an error it returns as a failure,
+    // instead of ending the run on the byte budget.
+    let mut huge = probe(serde_json::json!({"call": "metadata_get", "resource": "huge"}));
+    huge.limits.call_bytes = 4096;
+    let ended = invoke(huge, Arc::default()).await;
+    let Err(InvokeError::Guest(failure)) = ended else {
+        panic!("the guest saw no error: {ended:?}");
+    };
+    assert!(
+        failure.message.contains("larger than 4096 bytes"),
+        "{failure:?}"
+    );
+    // A run whose remaining bytes cannot take a reply is refused before the call is sent.
+    let broker = Arc::new(Recorder::default());
+    let mut short = probe(serde_json::json!({"call": "metadata_get", "resource": "D1"}));
+    (short.limits.call_bytes, short.limits.bytes) = (4096, 4096);
+    let ended = invoke(short, broker.clone()).await;
+    let Err(InvokeError::Guest(failure)) = ended else {
+        panic!("the guest saw no error: {ended:?}");
+    };
+    assert!(failure.message.contains("too few bytes"), "{failure:?}");
+    assert!(broker.calls().is_empty(), "{:?}", broker.calls());
 }
 
 #[tokio::test]

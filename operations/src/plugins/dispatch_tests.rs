@@ -1,5 +1,5 @@
-//! Tests starting runs: a manual run with its saved invocation and the refusals before it, and
-//! timer occurrences queued once each, counted from activation and skipped at the bound.
+//! Tests starting runs: a manual run, its saved invocation and refusals, timer occurrences queued
+//! once each and skipped at the bound, and the stored trigger kind indexes.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -104,4 +104,20 @@ async fn timer_occurrences() {
             skipped: 1
         }
     );
+}
+
+// Coverage rows store trigger kinds by index; the update kind was appended, so a row written
+// before it keeps its meaning, and every event kind starts the trigger of its own name.
+#[test]
+fn trigger_indexes_kept() {
+    let index = |kind: TriggerKind| postcard::to_allocvec(&kind).unwrap();
+    assert_eq!(index(TriggerKind::SyncFailed), [6]);
+    assert_eq!(index(TriggerKind::DatasetUpdated), [7]);
+    for kind in [
+        SourceKind::DatasetCreated,
+        SourceKind::DataUploaded,
+        SourceKind::DatasetUpdated,
+    ] {
+        assert_eq!(event_trigger(kind).as_str(), kind.name());
+    }
 }

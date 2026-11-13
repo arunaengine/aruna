@@ -211,6 +211,12 @@ pub(super) async fn export_summary_jsonld(
     Ok(summary)
 }
 
+/// Data entities a page holds when the request names no limit, and at most.
+pub(crate) const PAGE_DEFAULT: usize = 100;
+pub(crate) const PAGE_MAX: usize = 1_000;
+/// Bytes a page's reader may add around each entity, which the page's size bound counts.
+pub(crate) const ENTRY_ROOM: usize = 8;
+
 async fn export_rocrate_page(
     context: &DriverContext,
     graph_iri: &str,
@@ -221,7 +227,7 @@ async fn export_rocrate_page(
     if offset.is_some() && after.is_some() {
         return Err(MetadataApiError::BadRequest);
     }
-    let limit = limit.unwrap_or(100).clamp(1, 1_000);
+    let limit = limit.unwrap_or(PAGE_DEFAULT).clamp(1, PAGE_MAX);
     let handle = context
         .metadata_handle
         .clone()

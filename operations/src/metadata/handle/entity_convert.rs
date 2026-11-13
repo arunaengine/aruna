@@ -12,8 +12,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_storage::FjallPersistPolicy;
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleFjallPersistMode, CraqleNode,
-    CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, GraphId, GraphPolicy,
-    PatchEntityRequest, RoCrateError, vocab,
+    CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, DescribeRequest, Dot,
+    GraphId, GraphPolicy, PatchEntityRequest, RemoveEntityRequest, RoCrateError, vocab,
 };
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use serde_json::Value;
@@ -27,6 +27,21 @@ pub(super) fn upsert_data_entity(
 ) -> Result<MetadataBatch, CraqleError> {
     let graph = GraphId::new(&request.graph_iri);
     let actor = request.deterministic_actor.map(ActorId::from_bytes);
+    // An event materializes under its own actor, so a dot of it here means it is applied; a
+    // replay changes nothing, as the re-added type, name and link would take a second dot.
+    if let Some(actor) = actor {
+        let clock = node.vector_clock(&graph)?;
+        if clock.contains(&Dot { actor, counter: 1 }) {
+            return Ok(MetadataBatch {
+                graph_iri: request.graph_iri,
+                actor: *actor.as_bytes(),
+                counter: 0,
+                base_clock: clock,
+                ops: Vec::new(),
+                timestamp_millis: chrono::Utc::now().timestamp_millis(),
+            });
+        }
+    }
     let entity_request = craqle_patch_request(&graph, &request.jsonld)?;
     node.patch_data_with(
         auth,
@@ -54,7 +69,7 @@ pub(super) fn upsert_contextual_entity(
     .map(batch_from_craqle)
 }
 
-pub(super) fn craqle_patch_request(
+pub(crate) fn craqle_patch_request(
     graph: &GraphId,
     jsonld: &str,
 ) -> Result<PatchEntityRequest, CraqleError> {
@@ -667,6 +682,27 @@ pub(super) fn plan_batch(
         }
         MetadataBatchSource::UpsertContextualEntity { jsonld } => {
             node.plan_patch_contextual(auth, &craqle_patch_request(&graph, jsonld)?)
+        }
+        MetadataBatchSource::RemoveDataEntity { id } => {
+            let request = RemoveEntityRequest {
+                graph: graph.clone(),
+                entity_id: id.clone(),
+            };
+            node.plan_remove_data(auth, &request)
+        }
+        MetadataBatchSource::ReplaceDataEntity { jsonld } => {
+            // Every stored predicate of the subject is replaced, so the ones the entity omits go.
+            let mut request = craqle_patch_request(&graph, jsonld)?;
+            let subject = DescribeRequest {
+                graph: &graph,
+                subject_id: &request.entity.entity_id,
+            };
+            let stored = node.describe_subject(auth, subject)?;
+            let stored = stored
+                .iter()
+                .filter_map(|(predicate, _)| predicate.to_named_node());
+            request.replaced_predicates.extend(stored);
+            node.plan_patch_data(auth, &request)
         }
     };
     // A merge landing mid-plan would let the batch witness dots the plan never saw, so

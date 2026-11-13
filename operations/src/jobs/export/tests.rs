@@ -3025,3 +3025,56 @@ async fn consent_resolves_hashes() {
     assert!(matches!(allowed, Ok(false)));
     node.net.shutdown().await;
 }
+
+// A crate written over REST may name its S3 object through a context prefix or a protocol-relative
+// URL; export resolves it as JSON-LD does and still exports the object's bytes.
+#[test]
+fn resolved_references_export() {
+    let realm_id = RealmId::from_bytes([2; 32]);
+    let typed = json!({"contentUrl": {"@id": "http://schema.org/contentUrl", "@type": "@id"}});
+    let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+    let version = Ulid::from_bytes([4; 16]);
+    let arn = VersionedObjectArn::new(realm_id, node_id, "bucket", "data/b.txt", version).unwrap();
+    let relative = arn.to_w3id().strip_prefix("https:").unwrap().to_string();
+    for (extra, url, key) in [
+        (
+            json!({"store": "s3://bucket/"}),
+            "store:data/a.txt",
+            "data/a.txt",
+        ),
+        (json!({}), relative.as_str(), "data/b.txt"),
+    ] {
+        let mut context = typed.clone();
+        context
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let document = json!({
+            "@context": ["https://w3id.org/ro/crate/1.2/context", context],
+            "@graph": [{"@id": "data/x.txt", "@type": "File", "contentUrl": url}]
+        });
+        let entities = recognized_entities(&document, realm_id).unwrap();
+        let storage = entities[0].storage_key.as_ref().map(|key| key.key.as_str());
+        assert_eq!(storage, Some(key), "{url}");
+        assert_eq!(entities[0].omission, None, "{url}");
+    }
+}
+
+// A dataset's own context may resolve a plugin's literal into another object; export names it
+// and then checks it against the exporting user per object, as `denies_local_read` shows.
+#[test]
+fn context_trick_resolves() {
+    let realm_id = RealmId::from_bytes([2; 32]);
+    let context = json!({"place": "s3://private/",
+        "contentUrl": {"@id": "http://schema.org/contentUrl", "@type": "@id"}});
+    let document = json!({
+        "@context": ["https://w3id.org/ro/crate/1.2/context", context],
+        "@graph": [{"@id": "data/b.txt", "@type": "File", "contentUrl": "place:secret.bin"}]
+    });
+    let entities = recognized_entities(&document, realm_id).unwrap();
+    let key = entities[0].storage_key.as_ref().unwrap();
+    assert_eq!(
+        (key.bucket.as_str(), key.key.as_str()),
+        ("private", "secret.bin")
+    );
+}

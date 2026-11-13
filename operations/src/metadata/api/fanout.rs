@@ -564,7 +564,7 @@ where
                         fanout_stats.failed_partitions.push(node_id);
                         not_found = true;
                     }
-                    Err(MetadataReadError::Unavailable) => {
+                    Err(MetadataReadError::Unavailable | MetadataReadError::TooLarge) => {
                         fanout_stats.nodes_failed += 1;
                         fanout_stats.failed_partitions.push(node_id);
                         warn!(

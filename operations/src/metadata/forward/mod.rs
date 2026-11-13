@@ -15,8 +15,8 @@ pub use self::read::{
 };
 pub(crate) use self::write::apply_forwarded_write;
 pub use self::write::{
-    CreateAuthorizedError, apply_batch_routed, create_metadata_authorized, route_metadata_create,
-    route_metadata_delete, route_metadata_update,
+    CreateAuthorizedError, PinnedCreate, apply_batch_routed, create_metadata_authorized,
+    create_with_id, route_metadata_create, route_metadata_delete, route_metadata_update,
 };
 
 #[cfg(test)]

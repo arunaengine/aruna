@@ -7,12 +7,14 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::bindings::aruna::plugin::{
-    connections, grants, log, metadata_read, metadata_write, objects_read, secrets, state,
+    connections, grants, log, metadata_create, metadata_read, metadata_write, objects_read,
+    secrets, state,
 };
 use crate::error::{Error, Result};
 
 pub use connections::{FullResponse, Method};
 pub use log::Level;
+pub use metadata_create::Created;
 pub use objects_read::{ObjectInfo, ObjectPage};
 pub use state::Entry;
 
@@ -100,7 +102,14 @@ pub struct Listing {
     pub cursor: Option<String>,
 }
 
-/// Dataset metadata calls (`metadata.read`, `metadata.write`).
+/// One page of a dataset's file entities.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilePage {
+    pub files: Vec<Value>,
+    pub cursor: Option<String>,
+}
+
+/// Dataset metadata calls (`metadata.read`, `metadata.write`, `metadata.create`).
 #[derive(Debug, Clone, Copy)]
 pub struct Metadata;
 
@@ -124,6 +133,28 @@ impl Metadata {
         })
     }
 
+    /// The dataset entity without its file links, cheaper than [`Metadata::get`] for large datasets.
+    pub async fn summary(&self, resource: &str) -> Result<Document> {
+        let doc = metadata_read::summary(resource)
+            .map_err(|err| Error::host(err, "metadata.read", resource))?;
+        Ok(Document {
+            resource: doc.resource,
+            revision: doc.revision,
+            json: serde_json::from_str(&doc.json)?,
+        })
+    }
+
+    /// One page of the dataset's `File` entities, in `@id` order, and the cursor of the next one.
+    pub async fn files(&self, resource: &str, cursor: Option<&str>) -> Result<FilePage> {
+        let page = metadata_read::files(resource, cursor)
+            .map_err(|err| Error::host(err, "metadata.read", resource))?;
+        let files = page.files.iter().map(|file| serde_json::from_str(file));
+        Ok(FilePage {
+            files: files.collect::<std::result::Result<_, _>>()?,
+            cursor: page.cursor,
+        })
+    }
+
     /// Applies `patch` if the metadata is still at `expected`; returns the new revision.
     pub async fn patch(&self, resource: &str, patch: &Value, expected: &str) -> Result<String> {
         self.patch_keyed(resource, patch, expected, None).await
@@ -140,6 +171,41 @@ impl Metadata {
         let text = serde_json::to_string(patch)?;
         let reply = metadata_write::patch(resource, &text, expected, key);
         reply.map_err(|err| Error::host(err, "metadata.write", resource))
+    }
+
+    /// Adds or replaces one `File` entity by `@id` if the dataset is still at `expected`; the
+    /// properties it omits go. Returns the new revision.
+    pub async fn put_file(
+        &self,
+        resource: &str,
+        file: &Value,
+        expected: &str,
+        key: Option<&str>,
+    ) -> Result<String> {
+        let text = serde_json::to_string(file)?;
+        let reply = metadata_write::put_file(resource, &text, expected, key);
+        reply.map_err(|err| Error::host(err, "metadata.write", resource))
+    }
+
+    /// Removes one `File` entity by `@id`, and the dataset's link to it, if the dataset is still
+    /// at `expected`. Returns the new revision.
+    pub async fn remove_file(
+        &self,
+        resource: &str,
+        id: &str,
+        expected: &str,
+        key: Option<&str>,
+    ) -> Result<String> {
+        let reply = metadata_write::remove_file(resource, id, expected, key);
+        reply.map_err(|err| Error::host(err, "metadata.write", resource))
+    }
+
+    /// Creates a dataset at `path` from one dataset entity; the same `key` always names the same
+    /// document. Returns the document and its first revision.
+    pub async fn create(&self, path: &str, dataset: &Value, key: &str) -> Result<Created> {
+        let text = serde_json::to_string(dataset)?;
+        metadata_create::create(path, &text, key)
+            .map_err(|err| Error::host(err, "metadata.create", path))
     }
 }
 

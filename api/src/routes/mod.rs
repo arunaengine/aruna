@@ -706,6 +706,7 @@ pub(crate) mod tests {
             "/metadata/{document_id}/rocrate/entities/contextual",
         ),
         ("POST", "/metadata/{document_id}/rocrate/entities/data"),
+        ("DELETE", "/metadata/{document_id}/rocrate/entities/data"),
         ("POST", "/metadata/{document_id}/rocrate/exports"),
         (
             "POST",

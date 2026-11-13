@@ -98,8 +98,17 @@ interface metadata-read {
     cursor: option<string>,
   }
 
+  record file-page {
+    files: list<string>,
+    cursor: option<string>,
+  }
+
   get: func(%resource: string) -> result<document, host-error>;
   %list: func(cursor: option<string>) -> result<listing, host-error>;
+  /// One page of the dataset's root-linked `File` entities as JSON objects, in `@id` order.
+  files: func(%resource: string, cursor: option<string>) -> result<file-page, host-error>;
+  /// The dataset entity without its file links.
+  summary: func(%resource: string) -> result<document, host-error>;
 }
 
 /// Changes dataset metadata if its revision is still `expected` (`metadata.write`).
@@ -112,6 +121,36 @@ interface metadata-write {
     expected: string,
     key: option<string>,
   ) -> result<string, host-error>;
+
+  /// Adds or replaces one `File` entity by `@id`; the properties it omits go.
+  put-file: func(
+    %resource: string,
+    file: string,
+    expected: string,
+    key: option<string>,
+  ) -> result<string, host-error>;
+
+  /// Removes one root-linked `File` entity by `@id` and the root's link to it.
+  remove-file: func(
+    %resource: string,
+    id: string,
+    expected: string,
+    key: option<string>,
+  ) -> result<string, host-error>;
+}
+
+/// Creates datasets of the group (`metadata.create`).
+interface metadata-create {
+  use types.{host-error};
+
+  record created {
+    %resource: string,
+    revision: string,
+  }
+
+  /// Creates a dataset at `path` below the group's metadata root from one dataset entity; the
+  /// same `key` of one install always names the same document.
+  create: func(path: string, dataset: string, key: string) -> result<created, host-error>;
 }
 
 /// Reads object information and listings of the group, never bytes (`objects.read`).
@@ -214,6 +253,7 @@ world plugin {
   import grants;
   import metadata-read;
   import metadata-write;
+  import metadata-create;
   import objects-read;
   import connections;
   import state;

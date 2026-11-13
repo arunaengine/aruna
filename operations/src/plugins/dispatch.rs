@@ -146,6 +146,7 @@ pub fn event_trigger(kind: SourceKind) -> TriggerKind {
     match kind {
         SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
         SourceKind::DataUploaded => TriggerKind::DataUploaded,
+        SourceKind::DatasetUpdated => TriggerKind::DatasetUpdated,
     }
 }
 

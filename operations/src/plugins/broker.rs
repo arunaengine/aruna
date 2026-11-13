@@ -10,28 +10,35 @@ use std::sync::{Arc, Mutex};
 
 use aruna_core::NodeId;
 use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
-use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun};
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields, header_name};
+use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::storage::data::identity::DataIdentity;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, Field, FullResponse, HostError, Intent,
-    Listing, MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
+    FullResponse, HostError, Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
+    ObjectPage, Response, SendRequest, StatePut,
 };
 use aruna_plugins::connection::{Readable, relative_path};
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
 use base64::Engine;
+use craqle::GraphId;
+use oxrdf::Term;
 use serde_json::Value;
+use tracing::warn;
 use ulid::Ulid;
 
 use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
+use super::creates::{Lookup, Step, claim_key, next_step, settle_key};
 use super::grants::{InstallScope, accesses, parse_grants};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
@@ -41,13 +48,20 @@ use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
 use super::state::{PutError, check_key, put_state, read_state};
 use super::store::{StoreError, Txn, transact};
+use crate::auth::request_authorization::AuthorizeError;
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, ListVisibleRequest, MetadataApiError,
-    MetadataListOrder, RoCrateExportView, list_visible_documents,
+    ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, ListVisibleRequest,
+    MetadataApiError, MetadataListOrder, RoCrateExportView, list_visible_documents,
 };
-use crate::metadata::forward::{export_rocrate_routed, route_metadata_update};
+use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
+use crate::metadata::forward::{
+    CreateAuthorizedError, PinnedCreate, create_with_id, export_rocrate_routed,
+    get_metadata_routed, route_metadata_update,
+};
+use crate::metadata::handle::craqle_patch_request;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -192,14 +206,14 @@ impl RunBroker {
     /// The registry record and JSON-LD of a document the account may read.
     async fn export(
         &self,
-        document_id: Ulid,
+        (document_id, view): (Ulid, RoCrateExportView),
         auth: AuthContext,
         max_bytes: usize,
     ) -> Result<(MetadataRegistryRecord, String), HostError> {
         let request = ExportMetadataRequest {
             document_id,
             auth: Some(auth.clone()),
-            view: RoCrateExportView::Full,
+            view,
             limit: None,
             offset: None,
             after: None,
@@ -213,8 +227,257 @@ impl RunBroker {
             max_bytes as u64,
         );
         match export.await.map_err(api_error)? {
-            ExportMetadataResult::Full { record, jsonld } => Ok((record, jsonld)),
-            _ => Err(unavailable("the document has no full export")),
+            ExportMetadataResult::Full { record, jsonld }
+            | ExportMetadataResult::Summary { record, jsonld } => Ok((record, jsonld)),
+            _ => Err(unavailable("the document has no such export")),
+        }
+    }
+
+    /// Runs a revision-checked change of one file entity under the write grants. A file it names
+    /// must be readable through `objects.read`, as for a restricted REST writer.
+    async fn file_write(
+        &self,
+        cx: &CallContext,
+        change: &FileChange,
+        mutation: UpdateDocumentMutation,
+        file: Option<Value>,
+    ) -> Result<String, HostError> {
+        let document_id = parse_document(&change.resource)?;
+        let expected = Ulid::from_string(&change.expected)
+            .map_err(|_| HostError::new(ErrorKind::Invalid, "bad revision"))?;
+        let (_, auth) = self.listing(Permission::MetadataWrite).await?;
+        let read = (document_id, RoCrateExportView::Summary);
+        let (record, _) = self.export(read, auth, cx.max_bytes).await?;
+        let (install, auth) =
+            (self.checked(Permission::MetadataWrite, &record.permission_path)).await?;
+        if let Some(file) = file {
+            self.objects_named(&install, (&record.graph_iri, &file))
+                .await?;
+        }
+        let run_id = self.scope.run.run_id;
+        let earlier = written(&self.ctx, run_id, &change.intent).await;
+        if !earlier.map_err(|error| unavailable(error.0))? {
+            same_revision(record.last_event_id, expected)?;
+        }
+        if let Some(reply) = self.begun(&change.intent).await? {
+            return Ok(reply);
+        }
+        let actor = Actor {
+            node_id: self.scope.local,
+            user_id: install.account,
+            realm_id: self.scope.realm_id,
+        };
+        let message = format!(
+            "plugin {} install {} run {run_id}",
+            install.plugin, install.install_id
+        );
+        let update = route_metadata_update(
+            &self.ctx,
+            actor,
+            Some(&record),
+            document_id,
+            None,
+            mutation,
+            Some(expected),
+            Some(AuthToken::Internal(auth)),
+            Some(message),
+        );
+        let outcome = update
+            .await
+            .map(|record| record.last_event_id.to_string())
+            .map_err(write_outcome);
+        self.record(&change.intent, outcome).await
+    }
+
+    /// The dataset entity of a document from the given export view, checked under the read grants.
+    async fn dataset_read(
+        &self,
+        cx: &CallContext,
+        resource: &str,
+        view: RoCrateExportView,
+    ) -> Result<Document, HostError> {
+        let document_id = parse_document(resource)?;
+        let (_, auth) = self.listing(Permission::MetadataRead).await?;
+        let (record, jsonld) = self.export((document_id, view), auth, cx.max_bytes).await?;
+        self.checked(Permission::MetadataRead, &record.permission_path)
+            .await?;
+        Ok(Document {
+            resource: resource.to_string(),
+            revision: record.last_event_id.to_string(),
+            json: dataset_of(&jsonld)?,
+        })
+    }
+
+    /// Creates the keyed document once: the stored create goes to its stored node with its stored
+    /// arguments, and a key from an earlier call is looked up first, so a found one is adopted.
+    async fn keyed_create(
+        &self,
+        (actor, auth): (Actor, &AuthContext),
+        (install, key): (&PluginInstall, &str),
+        minted: PinnedCreate,
+    ) -> Result<String, Outcome> {
+        let stored = claim_key(&self.ctx, (install, key), minted).await;
+        let (pinned, claim) = stored.map_err(|error| Outcome::None(unavailable(error.0)))?;
+        let mut lookup = None;
+        loop {
+            match next_step(claim, lookup) {
+                Step::Dispatch => {
+                    let extras = PolicyRequestExtras::operation("plugin.metadata.create");
+                    let created = create_with_id(&self.ctx, actor, (auth, extras), &pinned).await;
+                    let outcome = created.map_err(create_outcome);
+                    // A known outcome closes the attempt; a refusal of the arguments lets a
+                    // later call correct them. An unknown one keeps them fixed.
+                    let rejected = match &outcome {
+                        Ok(_) => Some(false),
+                        Err(Outcome::None(error)) => Some(error.kind == ErrorKind::Invalid),
+                        Err(Outcome::Maybe(_)) => None,
+                    };
+                    if let Some(rejected) = rejected {
+                        self.settle((install, key), rejected).await;
+                    }
+                    let created = outcome?;
+                    return Ok(created_text(
+                        &created.document_id,
+                        &created.establishing_event_id,
+                    ));
+                }
+                Step::Lookup => lookup = Some(self.look_up(pinned.document_id, auth).await),
+                Step::Adopt(revision) => {
+                    self.settle((install, key), false).await;
+                    return Ok(created_text(&pinned.document_id, &revision));
+                }
+                Step::Unknown => {
+                    let reason = "the document of an earlier create with this key is not reachable";
+                    return Err(Outcome::Maybe(reason.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Checks each Aruna object an entity names through the plugin's own `objects.read` call
+    /// check and that it lies in a group bucket here. A content hash or global id needs one too.
+    /// The dataset's own JSON-LD context can make an export name others; it checks the exporter.
+    async fn objects_named(
+        &self,
+        install: &PluginInstall,
+        (graph, file): (&str, &Value),
+    ) -> Result<(), HostError> {
+        let realm_id = self.scope.realm_id;
+        // Export renders each stored value as is, without `./`, or as literal text, under any term
+        // the context gives (craqle `context_value`), so every value of every predicate is checked.
+        let converted = craqle_patch_request(&GraphId::new(graph), &file.to_string());
+        let converted =
+            converted.map_err(|error| HostError::new(ErrorKind::Invalid, error.to_string()))?;
+        let entity = converted.entity;
+        let objects = entity
+            .additional_triples
+            .iter()
+            .filter_map(|(_, object)| match object {
+                Term::NamedNode(node) => Some(node.as_str().to_string()),
+                Term::Literal(literal) => Some(literal.value().to_string()),
+                _ => None,
+            });
+        let own = [&entity.entity_id, &entity.entity_type, &entity.name].map(String::clone);
+        let stored: Vec<String> = own.into_iter().chain(objects).collect();
+        let bare = stored.iter().filter_map(|value| value.strip_prefix("./"));
+        let bare: Vec<String> = bare.map(str::to_string).collect();
+        let values: Vec<String> = stored.into_iter().chain(bare).collect();
+        let refused = |what: &str| {
+            let message = format!("{what} names no object a plugin may check; use its path");
+            HostError::new(ErrorKind::Denied, message)
+        };
+        let group = install.group_id;
+        // A content hash or global id names no object alone; a concrete one must come with it.
+        let (mut objects, mut hash, mut unplaced) = (Vec::new(), None, None);
+        for value in values.iter().map(String::as_str) {
+            let identity = DataIdentity::read(value, &[]);
+            if value.starts_with(&format!("/{realm_id}/g/")) {
+                objects.push((value.to_string(), None));
+            } else if let Some(exact) = identity.exact {
+                if exact.realm_id != realm_id {
+                    return Err(refused(value));
+                }
+                let (node, bucket, key) = (exact.node_id, &exact.bucket, &exact.key);
+                let path = object_permission_path(realm_id, group, node, bucket, key);
+                objects.push((path, Some(exact.version)));
+            } else if let Some(at) = identity.location {
+                let local = self.scope.local;
+                objects.push((
+                    object_permission_path(realm_id, group, local, &at.bucket, &at.key),
+                    None,
+                ));
+            } else if identity.is_aruna() {
+                // Readers keep one hash of a file, so two different ones are never admitted.
+                if let Some(found) = identity.hash {
+                    if hash.is_some_and(|known| known != found) {
+                        let message = "the file names two different content hashes";
+                        return Err(HostError::new(ErrorKind::Invalid, message));
+                    }
+                    hash = Some(found);
+                }
+                unplaced.get_or_insert(value);
+            }
+        }
+        if let (Some(value), true) = (unplaced, objects.is_empty()) {
+            return Err(refused(value));
+        }
+        for (path, version) in objects {
+            self.checked(Permission::ObjectsRead, &path).await?;
+            let (bucket, key) = self.object_at(install, &path).await?;
+            if let Some(hash) = hash {
+                self.same_content((bucket, key, version), hash).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Admits the hash a file names an object by only when the object's verified BLAKE3 digest is
+    /// recorded and equal; a pending upload without one cannot vouch for any hash.
+    async fn same_content(
+        &self,
+        (bucket, key, version_id): (String, String, Option<Ulid>),
+        hash: [u8; 32],
+    ) -> Result<(), HostError> {
+        let head = HeadObjectInput {
+            bucket,
+            key,
+            version_id,
+        };
+        let head = drive(HeadObjectOperation::new(head), &self.ctx).await;
+        let head = head.map_err(|_| HostError::new(ErrorKind::NotFound, "the object is gone"))?;
+        let stored = head
+            .location
+            .and_then(|location| location.hashes.get(HASH_BLAKE3).cloned());
+        let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
+        match stored {
+            None => Err(invalid(
+                "the object has no verified digest for the file's hash id yet",
+            )),
+            Some(stored) if stored != hash => Err(invalid(
+                "the object's content does not match the file's hash id",
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Closes an attempt of a create key. A failure only keeps the key's arguments fixed.
+    async fn settle(&self, key: (&PluginInstall, &str), rejected: bool) {
+        if let Err(error) = settle_key(&self.ctx, key, rejected).await {
+            warn!(%error, "A plugin create key could not record its attempt's outcome");
+        }
+    }
+
+    /// Looks a keyed create's document up on its holders under the account's authority.
+    async fn look_up(&self, document_id: Ulid, auth: &AuthContext) -> Lookup {
+        let request = GetVisibleRequest {
+            document_id,
+            auth: Some(auth.clone()),
+        };
+        let token = Some(AuthToken::Internal(auth.clone()));
+        match get_metadata_routed(&self.ctx, self.scope.realm_id, request, token).await {
+            Ok(record) => Lookup::Found(record.establishing_event_id),
+            Err(MetadataApiError::NotFound) => Lookup::Missing,
+            Err(_) => Lookup::Unreachable,
         }
     }
 
@@ -362,15 +625,47 @@ impl Broker for RunBroker {
     }
 
     async fn metadata_get(&self, cx: &CallContext, resource: &str) -> Result<Document, HostError> {
+        self.dataset_read(cx, resource, RoCrateExportView::Full)
+            .await
+    }
+
+    async fn metadata_summary(
+        &self,
+        cx: &CallContext,
+        resource: &str,
+    ) -> Result<Document, HostError> {
+        self.dataset_read(cx, resource, RoCrateExportView::Summary)
+            .await
+    }
+
+    async fn metadata_files(
+        &self,
+        cx: &CallContext,
+        resource: &str,
+        cursor: Option<String>,
+    ) -> Result<FilePage, HostError> {
         let document_id = parse_document(resource)?;
         let (_, auth) = self.listing(Permission::MetadataRead).await?;
-        let (record, jsonld) = self.export(document_id, auth, cx.max_bytes).await?;
+        let request = ExportMetadataRequest {
+            document_id,
+            auth: Some(auth.clone()),
+            view: RoCrateExportView::Page,
+            limit: Some(FILE_PAGE),
+            offset: None,
+            after: cursor,
+        };
+        // The holder counts the cursor and the room around each entity in this bound.
+        let bound = cx.max_bytes as u64;
+        let token = Some(AuthToken::Internal(auth));
+        let export = export_rocrate_routed(&self.ctx, self.scope.realm_id, request, token, bound);
+        let ExportMetadataResult::Page { record, page } = export.await.map_err(api_error)? else {
+            return Err(unavailable("the document has no page export"));
+        };
         self.checked(Permission::MetadataRead, &record.permission_path)
             .await?;
-        Ok(Document {
-            resource: resource.to_string(),
-            revision: record.last_event_id.to_string(),
-            json: dataset_of(&jsonld)?,
+        Ok(FilePage {
+            files: file_entities(&page.jsonld)?,
+            cursor: page.next_cursor,
         })
     }
 
@@ -422,7 +717,9 @@ impl Broker for RunBroker {
             .map_err(|_| HostError::new(ErrorKind::Invalid, "bad revision"))?;
         // The target is resolved under the write grants; the plugin never sees what is read.
         let (_, auth) = self.listing(Permission::MetadataWrite).await?;
-        let (record, jsonld) = self.export(document_id, auth, cx.max_bytes).await?;
+        // The summary has no file links, so a large dataset is not exported whole for a patch.
+        let read = (document_id, RoCrateExportView::Summary);
+        let (record, jsonld) = self.export(read, auth, cx.max_bytes).await?;
         let path = &record.permission_path;
         let (install, auth) = self.checked(Permission::MetadataWrite, path).await?;
         // A new call starts only from the copy it expects; an earlier attempt's intent decides.
@@ -463,6 +760,83 @@ impl Broker for RunBroker {
             .map(|record| record.last_event_id.to_string())
             .map_err(write_outcome);
         self.record(&patch.intent, outcome).await
+    }
+
+    async fn metadata_create(
+        &self,
+        _cx: &CallContext,
+        create: MetadataCreate,
+    ) -> Result<Created, HostError> {
+        let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
+        let path = MetadataRegistryRecord::normalize_document_path(&create.path);
+        if path.is_empty() || path.contains('@') {
+            return Err(invalid("a dataset path is not empty and has no @"));
+        }
+        if create.key.is_empty() || create.key.len() > MAX_KEY {
+            return Err(invalid("a create key has 1 to 256 bytes"));
+        }
+        let current = self.admitted(None).await?;
+        let realm_id = self.scope.realm_id;
+        let target = format!("/{realm_id}/g/{}/meta/{path}", current.group_id);
+        let (install, auth) = self.checked(Permission::MetadataCreate, &target).await?;
+        // An invalid dataset is refused before its intent exists, so it leaves no uncertainty.
+        let jsonld = dataset_crate(&create.dataset)?;
+        // The dataset entity is checked as stored, like a file; the new graph's name is not known.
+        let stored: Value = serde_json::from_str(&jsonld).unwrap_or(Value::Null);
+        let graph = MetadataRegistryRecord::graph_iri_for(Ulid::nil());
+        self.objects_named(&install, (&graph, &stored["@graph"][1]))
+            .await?;
+        if let Some(reply) = self.begun(&create.intent).await? {
+            return stored_created(&reply);
+        }
+        let actor = Actor {
+            node_id: self.scope.local,
+            user_id: install.account,
+            realm_id,
+        };
+        let run = self.scope.run.run_id;
+        let message = format!(
+            "plugin {} install {} run {run}",
+            install.plugin, install.install_id
+        );
+        let payload = (CreateDocumentPayload::RoCrate { jsonld }, Some(message));
+        let minted =
+            PinnedCreate::mint(&self.ctx, &actor, (install.group_id, &path), payload).await;
+        let outcome = match minted {
+            Ok(minted) => {
+                let key = (&install, create.key.as_str());
+                self.keyed_create((actor, &auth), key, minted).await
+            }
+            Err(error) => Err(Outcome::None(unavailable(error.to_string()))),
+        };
+        let reply = self.record(&create.intent, outcome).await?;
+        stored_created(&reply)
+    }
+
+    async fn metadata_put_file(
+        &self,
+        cx: &CallContext,
+        change: FileChange,
+    ) -> Result<String, HostError> {
+        let file = file_entity(&change.file)?;
+        let mutation = UpdateDocumentMutation::ReplaceDataEntity {
+            jsonld: file.clone(),
+        };
+        let file: Value = serde_json::from_str(&file).unwrap_or(Value::Null);
+        self.file_write(cx, &change, mutation, Some(file)).await
+    }
+
+    async fn metadata_remove_file(
+        &self,
+        cx: &CallContext,
+        change: FileChange,
+    ) -> Result<String, HostError> {
+        if change.file.trim().is_empty() {
+            return Err(HostError::new(ErrorKind::Invalid, "a removal names an @id"));
+        }
+        let id = change.file.clone();
+        let mutation = UpdateDocumentMutation::RemoveDataEntity { id };
+        self.file_write(cx, &change, mutation, None).await
     }
 
     async fn objects_info(&self, _cx: &CallContext, path: &str) -> Result<ObjectInfo, HostError> {
@@ -533,7 +907,7 @@ impl Broker for RunBroker {
 
     async fn connection_send(
         &self,
-        _cx: &CallContext,
+        cx: &CallContext,
         request: SendRequest,
     ) -> Result<Response, HostError> {
         let mut ready = self.ready(request).await?;
@@ -551,14 +925,24 @@ impl Broker for RunBroker {
         } = ready;
         let Some(intent) = intent else {
             let answer = self.outbound.send(outgoing, body).await;
-            let answer = answer.map_err(|error| unavailable(error.to_string()))?;
+            let answer = answer.map_err(send_refusal)?;
             return Ok(exposed(&exposure, &fields, &answer));
         };
         if let Some(reply) = self.begun(&intent).await? {
             return Ok(kept(stored_reply(&reply)?, &exposure));
         }
+        // A sent request's answer that does not fit is stored as a marker before it is refused,
+        // so a rerun answers the same refusal and never sends again.
         let outcome = match self.outbound.send(outgoing, body).await {
-            Ok(answer) => Ok(reply_text(&exposed(&exposure, &fields, &answer))),
+            Ok(answer) => {
+                let shown = exposed(&exposure, &fields, &answer);
+                let size = shown.json.as_ref().map_or(0, String::len) + 2;
+                Ok(match size > cx.max_bytes {
+                    true => too_large(answer.status),
+                    false => reply_text(&shown),
+                })
+            }
+            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
             Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
             Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
         };
@@ -567,7 +951,7 @@ impl Broker for RunBroker {
 
     async fn connection_send_full(
         &self,
-        _cx: &CallContext,
+        cx: &CallContext,
         request: SendRequest,
     ) -> Result<FullResponse, HostError> {
         let ready = self.ready(request).await?;
@@ -578,14 +962,24 @@ impl Broker for RunBroker {
         }
         let Some(intent) = ready.intent else {
             let answer = self.outbound.send(ready.outgoing, ready.body).await;
-            let answer = answer.map_err(|error| unavailable(error.to_string()))?;
+            let answer = answer.map_err(send_refusal)?;
             return Ok(whole(&ready.fields, &answer));
         };
         if let Some(reply) = self.begun(&intent).await? {
             return stored_whole(&reply);
         }
         let outcome = match self.outbound.send(ready.outgoing, ready.body).await {
-            Ok(answer) => Ok(whole_text(&whole(&ready.fields, &answer))),
+            Ok(answer) => {
+                let shown = whole(&ready.fields, &answer);
+                let head: usize = (shown.headers.iter())
+                    .map(|field| field.name.len() + field.value.len())
+                    .sum();
+                Ok(match head + shown.body.len() + 2 > cx.max_bytes {
+                    true => too_large(answer.status),
+                    false => whole_text(&shown),
+                })
+            }
+            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
             Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
             Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
         };
@@ -732,6 +1126,160 @@ pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostEr
     Ok(change.to_string())
 }
 
+/// File entities one page asks for; a page over the byte bound comes back smaller.
+const FILE_PAGE: usize = 100;
+
+/// The `File` entities of an exported page, each as the plain JSON object a plugin writes.
+fn file_entities(jsonld: &str) -> Result<Vec<String>, HostError> {
+    let page: Value =
+        serde_json::from_str(jsonld).map_err(|_| unavailable("the stored page is not JSON"))?;
+    let graph = (page.get("@graph").and_then(Value::as_array))
+        .ok_or_else(|| unavailable("the stored page has no graph"))?;
+    // RO-Crate's `File` is `schema:MediaObject`; an export may name it by either term.
+    let named = |kind: &Value| kind == "File" || kind == "MediaObject";
+    let file = |entity: &&Value| match entity.get("@type") {
+        Some(Value::Array(kinds)) => kinds.iter().any(named),
+        Some(kind) => named(kind),
+        None => false,
+    };
+    let files = graph.iter().filter(file).cloned().map(|mut entity| {
+        plain_objects(&mut entity);
+        entity.to_string()
+    });
+    Ok(files.collect())
+}
+
+/// A file entity as a change stores it: one object with an `@id` that is neither the root nor
+/// the descriptor, typed `File`, naming other entities by `@id` alone.
+fn file_entity(file: &str) -> Result<String, HostError> {
+    let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
+    let file: Value = serde_json::from_str(file).map_err(|_| invalid("the file is not JSON"))?;
+    let Value::Object(fields) = &file else {
+        return Err(invalid("the file is not a JSON object"));
+    };
+    let id = fields
+        .get("@id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(id, "" | "./" | "ro-crate-metadata.json") {
+        return Err(invalid("the file needs its own @id"));
+    }
+    let named = |kind: &Value| kind == "File" || kind == "MediaObject";
+    let typed = match fields.get("@type") {
+        Some(Value::Array(kinds)) => kinds.iter().any(named),
+        Some(kind) => named(kind),
+        None => false,
+    };
+    if !typed || fields.contains_key("@graph") || nested_entity(fields) {
+        return Err(invalid("the file is one File entity naming others by @id"));
+    }
+    let mut file = file;
+    literal_objects(&mut file);
+    Ok(file.to_string())
+}
+
+/// Whether a field holds an entity of its own rather than a reference by `@id` alone.
+fn nested_entity(fields: &serde_json::Map<String, Value>) -> bool {
+    let entity = |value: &Value| {
+        (value.as_object()).is_some_and(|object| {
+            let reference = object.len() == 1 && object.contains_key("@id");
+            object.keys().any(|key| key.starts_with('@')) && !reference
+        })
+    };
+    fields.values().any(|value| match value {
+        Value::Array(entries) => entries.iter().any(entity),
+        value => entity(value),
+    })
+}
+
+/// The crate a plugin create stores: the metadata descriptor and the dataset entity as its root.
+/// Plain object values become JSON literals as in a patch; nested entities are refused.
+pub(crate) fn dataset_crate(dataset: &str) -> Result<String, HostError> {
+    let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
+    let dataset: Value =
+        serde_json::from_str(dataset).map_err(|_| invalid("the dataset is not JSON"))?;
+    let Value::Object(mut fields) = dataset else {
+        return Err(invalid("the dataset is not a JSON object"));
+    };
+    if fields.get("@id").is_some_and(|id| id != "./") || fields.contains_key("@graph") {
+        return Err(invalid("the dataset is one root entity without @graph"));
+    }
+    let kinds = fields
+        .get("@type")
+        .cloned()
+        .unwrap_or(Value::from("Dataset"));
+    let dataset_kind = match &kinds {
+        Value::String(kind) => kind == "Dataset",
+        Value::Array(kinds) => kinds.iter().any(|kind| kind == "Dataset"),
+        _ => false,
+    };
+    if !dataset_kind {
+        return Err(invalid("the dataset's @type is not Dataset"));
+    }
+    if nested_entity(&fields) {
+        return Err(invalid("the dataset names other entities only by @id"));
+    }
+    fields.insert("@id".to_string(), Value::from("./"));
+    fields.insert("@type".to_string(), kinds);
+    let mut dataset = Value::Object(fields);
+    literal_objects(&mut dataset);
+    let descriptor = serde_json::json!({
+        "@id": "ro-crate-metadata.json",
+        "@type": "CreativeWork",
+        "about": {"@id": "./"},
+        "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
+    });
+    let graph = serde_json::json!({
+        "@context": "https://w3id.org/ro/crate/1.2/context",
+        "@graph": [descriptor, dataset],
+    });
+    let graph = graph.to_string();
+    craqle::validate_rocrate_jsonld(&graph).map_err(|error| invalid(&error.to_string()))?;
+    Ok(graph)
+}
+
+/// Bytes of a create key at most.
+const MAX_KEY: usize = 256;
+
+/// The intent reply of a create: the document id and its establishing revision.
+fn created_text(document_id: &Ulid, revision: &Ulid) -> String {
+    format!("{document_id} {revision}")
+}
+
+fn stored_created(reply: &str) -> Result<Created, HostError> {
+    let (resource, revision) = (reply.split_once(' '))
+        .ok_or_else(|| unavailable("the stored create reply is not readable"))?;
+    Ok(Created {
+        resource: resource.to_string(),
+        revision: revision.to_string(),
+    })
+}
+
+/// Whether a failed create had no effect, or may have had one.
+fn create_outcome(error: CreateAuthorizedError) -> Outcome {
+    let none = |kind, message: String| Outcome::None(HostError::new(kind, message));
+    match error {
+        CreateAuthorizedError::EmptyPath => none(ErrorKind::Invalid, error.to_string()),
+        CreateAuthorizedError::Forbidden
+        | CreateAuthorizedError::Authorize(
+            AuthorizeError::PermissionDenied | AuthorizeError::Policy(_),
+        ) => none(ErrorKind::Denied, error.to_string()),
+        CreateAuthorizedError::Authorize(_) | CreateAuthorizedError::Api(_) => {
+            Outcome::None(unavailable(error.to_string()))
+        }
+        CreateAuthorizedError::Create(CreateDocumentError::MetadataError(
+            MetadataError::ProfileValidation(_)
+            | MetadataError::Validation(_)
+            | MetadataError::InvalidInput(_),
+        )) => none(ErrorKind::Invalid, error.to_string()),
+        CreateAuthorizedError::Create(CreateDocumentError::HoldsNoBucket) => {
+            Outcome::None(unavailable(error.to_string()))
+        }
+        CreateAuthorizedError::Create(_) => Outcome::Maybe(error.to_string()),
+        CreateAuthorizedError::Write(error) => write_outcome(error),
+    }
+}
+
 /// Turns the dataset's JSON literals back into the objects a plugin wrote.
 fn plain_objects(dataset: &mut Value) {
     let Value::Object(fields) = dataset else {
@@ -822,6 +1370,9 @@ fn parse_document(resource: &str) -> Result<Ulid, HostError> {
 fn api_error(error: MetadataApiError) -> HostError {
     match error {
         MetadataApiError::NotFound => HostError::new(ErrorKind::NotFound, "no such document"),
+        MetadataApiError::TooLarge => {
+            HostError::new(ErrorKind::Limit, "one entity is larger than a reply may be")
+        }
         MetadataApiError::Unauthorized | MetadataApiError::Forbidden => {
             HostError::new(ErrorKind::Denied, "the account may not read this")
         }
@@ -844,6 +1395,9 @@ fn write_outcome(error: MetadataWriteError) -> Outcome {
         MetadataWriteError::NotFound => none(ErrorKind::NotFound, error.to_string()),
         MetadataWriteError::Update(UpdateDocumentError::RevisionConflict { .. }) => {
             none(ErrorKind::Conflict, error.to_string())
+        }
+        MetadataWriteError::Update(UpdateDocumentError::GraphPending { .. }) => {
+            Outcome::None(unavailable(error.to_string()))
         }
         MetadataWriteError::Update(UpdateDocumentError::StorageError(_))
         | MetadataWriteError::Undeliverable(_) => Outcome::Maybe(error.to_string()),
@@ -1095,9 +1649,36 @@ fn whole_text(reply: &FullResponse) -> String {
     serde_json::json!({ "status": reply.status, "headers": headers, "body": body }).to_string()
 }
 
+/// The stored reply of a sent request whose answer did not fit the call.
+fn too_large(status: u16) -> String {
+    serde_json::json!({ "status": status, "too_large": true }).to_string()
+}
+
+/// The refusal a stored too-large marker answers with, every time it is replayed.
+fn refuse_large(value: &Value) -> Result<(), HostError> {
+    if value.get("too_large").and_then(Value::as_bool) != Some(true) {
+        return Ok(());
+    }
+    let status = value
+        .get("status")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let message = format!("the answer with status {status} is larger than the call allows");
+    Err(HostError::new(ErrorKind::Limit, message))
+}
+
+/// A send that has no stored intent: an answer that does not fit is a limit, others unavailable.
+fn send_refusal(error: SendError) -> HostError {
+    match error {
+        SendError::TooLarge { .. } => HostError::new(ErrorKind::Limit, error.to_string()),
+        error => unavailable(error.to_string()),
+    }
+}
+
 fn stored_whole(reply: &str) -> Result<FullResponse, HostError> {
     let broken = || unavailable("a stored whole answer does not decode");
     let value: Value = serde_json::from_str(reply).map_err(|_| broken())?;
+    refuse_large(&value)?;
     let status = value
         .get("status")
         .and_then(Value::as_u64)
@@ -1150,6 +1731,7 @@ fn reply_text(response: &Response) -> String {
 fn stored_reply(reply: &str) -> Result<Response, HostError> {
     let value: Value =
         serde_json::from_str(reply).map_err(|error| unavailable(error.to_string()))?;
+    refuse_large(&value)?;
     let status = value
         .get("status")
         .and_then(Value::as_u64)

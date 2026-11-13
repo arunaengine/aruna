@@ -29,7 +29,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.192"
+version = "3.0.0-alpha.193"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -93,8 +93,8 @@ cel-interpreter = "0.10.0"
 chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
-# Pinned to craqle 0.3.2 main with Irokle 0.3.2; it resolves the irokle below.
-craqle = { git = "https://github.com/arunaengine/craqle", rev = "f4e048550aa6a2fb70d582176e18052e020c5163", features = [
+# Pinned to craqle 0.3.2 main (data entity removal) and Irokle 0.3.2; resolves the irokle below.
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "d4ac035851529b017418aae01aab29c7246b7c87", features = [
     "iroh",
     "shacl-core",
 ] }

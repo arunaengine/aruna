@@ -198,6 +198,7 @@ pub(crate) fn created(install: &PluginInstall, resource: &str) -> (SourceEvent, 
         source: format!("dataset_created/{resource}"),
         anchor_ms: 1,
         journaled_ms: 1,
+        actor: None,
     };
     (event, base)
 }

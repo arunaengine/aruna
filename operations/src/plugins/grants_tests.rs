@@ -59,6 +59,25 @@ fn defaults_cover_group() {
 }
 
 #[test]
+fn creation_below_meta() {
+    let scope = scope();
+    let requested = json!({ "permissions": { "required": ["metadata.create"] } });
+    let manifest = manifest(requested);
+    let meta = format!("/{}/g/{}/meta", scope.realm_id, scope.group_id);
+    assert_eq!(scope.root(Permission::MetadataCreate), meta);
+    let grants = default_grants(&manifest, &scope);
+    let whole = format!("{meta}/**");
+    assert_eq!(grants[&Permission::MetadataCreate], BTreeSet::from([whole]));
+    // An admin narrows creation to one subtree, and the role writes only there.
+    let narrowed = format!("{meta}/elabftw/**");
+    let wanted = choices(&[("metadata.create", &[narrowed.as_str()])]);
+    let grants = narrow_grants(&manifest, &scope, &wanted).unwrap();
+    assert_eq!(role_paths(&grants)[&narrowed], Access::WRITE);
+    let outside = choices(&[("metadata.create", &["/other/g/x/meta/**"])]);
+    assert!(narrow_grants(&manifest, &scope, &outside).is_err());
+}
+
+#[test]
 fn narrowing_rules() {
     let scope = scope();
     let manifest = manifest(json!({}));

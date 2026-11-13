@@ -45,6 +45,7 @@ use ulid::Ulid;
 pub use self::distributed::{aggregate_query_results, query_form, query_select_limit};
 use self::distributed::{object_search_fingerprint, record_object_result, record_preflight_node};
 use self::export::export_summary_jsonld;
+pub(crate) use self::export::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
 pub use self::export::{export_metadata_rocrate, get_visible_document};
 pub use self::fanout::forwarded_bearer;
 pub(crate) use self::fanout::pattern_contains_service;
@@ -202,6 +203,9 @@ pub enum MetadataApiError {
     InvalidQuery(String),
     #[error("{0}")]
     Internal(String),
+    /// Even the smallest page of the answer is larger than the asked byte bound.
+    #[error("the answer is larger than the byte bound")]
+    TooLarge,
 }
 
 fn map_event_error(error: MetadataError) -> MetadataApiError {
@@ -225,6 +229,7 @@ fn map_read_error(error: MetadataReadError) -> MetadataApiError {
         MetadataReadError::NotFound | MetadataReadError::Unavailable => {
             MetadataApiError::ServiceUnavailable
         }
+        MetadataReadError::TooLarge => MetadataApiError::TooLarge,
     }
 }
 

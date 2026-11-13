@@ -124,7 +124,7 @@ pub async fn query_metadata_document(
                 auth_error.get_or_insert(MetadataApiError::Forbidden);
             }
             Err(MetadataReadError::NotFound) => {}
-            Err(MetadataReadError::Unavailable) => {
+            Err(MetadataReadError::Unavailable | MetadataReadError::TooLarge) => {
                 fanout_stats.nodes_failed += 1;
                 fanout_stats.failed_partitions.push(holder);
                 warn!(%holder, "Document query holder unavailable; trying the next replica");

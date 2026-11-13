@@ -110,6 +110,7 @@ mod tests {
             resource: "d".into(),
             revision: "e".into(),
             source: format!("dataset_created/{journaled_ms}"),
+            actor: None,
             anchor_ms: journaled_ms,
             journaled_ms,
         }

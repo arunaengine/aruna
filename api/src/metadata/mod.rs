@@ -282,6 +282,9 @@ pub(crate) fn map_update_error(error: UpdateDocumentError) -> ServerError {
         UpdateDocumentError::RevisionConflict { .. } | UpdateDocumentError::GraphChanged => {
             ServerError::PreconditionFailed(error.to_string())
         }
+        UpdateDocumentError::GraphPending { .. } => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -311,7 +314,9 @@ pub(crate) fn map_api_error(error: MetadataApiError) -> ServerError {
         MetadataApiError::Unauthorized => ServerError::Unauthorized,
         MetadataApiError::Forbidden => ServerError::Forbidden,
         MetadataApiError::NotFound => ServerError::NotFound,
-        MetadataApiError::ServiceUnavailable => ServerError::ServiceUnavailable,
+        MetadataApiError::ServiceUnavailable | MetadataApiError::TooLarge => {
+            ServerError::ServiceUnavailable
+        }
         MetadataApiError::SearchIncomplete(reason) => ServerError::ServiceUnavailableReason(reason),
         MetadataApiError::PlacementUnavailable(
             aruna_operations::placement::PlacementResolveError::ActivationConflicted(_),

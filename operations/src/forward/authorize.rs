@@ -169,6 +169,15 @@ pub(crate) fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMe
     }
 }
 
+/// What a create is checked on besides the document's own permission path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreateScope {
+    /// Write access on the group's whole metadata too, as REST and MCP require.
+    Group,
+    /// The document's own path only, for an account restricted to some paths.
+    Document,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn authorize_create(
     context: &Arc<DriverContext>,
@@ -178,19 +187,22 @@ pub(crate) async fn authorize_create(
     group_id: GroupId,
     path: &str,
     document_id: Ulid,
+    scope: CreateScope,
 ) -> Result<(), AuthorizeError> {
-    time_stage(
-        "permission",
-        authorize(
-            context.as_ref(),
-            realm_id,
-            auth,
-            &format!("/{realm_id}/g/{group_id}/meta/**"),
-            &Permission::WRITE,
-            extras.clone(),
-        ),
-    )
-    .await?;
+    if scope == CreateScope::Group {
+        time_stage(
+            "permission",
+            authorize(
+                context.as_ref(),
+                realm_id,
+                auth,
+                &format!("/{realm_id}/g/{group_id}/meta/**"),
+                &Permission::WRITE,
+                extras.clone(),
+            ),
+        )
+        .await?;
+    }
     time_stage(
         "permission",
         authorize(

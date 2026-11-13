@@ -17,6 +17,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::record::band_start;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
@@ -36,10 +37,11 @@ use aruna_operations::metadata::api::{
 };
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
-    mint_local_document,
+    mint_local_document, resolve_metadata_id,
 };
 use aruna_operations::metadata::forward::{
-    export_rocrate_routed, route_metadata_create, route_metadata_delete, route_metadata_update,
+    PinnedCreate, create_with_id, export_rocrate_routed, route_metadata_create,
+    route_metadata_delete, route_metadata_update,
 };
 use aruna_operations::metadata::get_document::{
     GetDocumentError, GetDocumentOperation, load_document_record,
@@ -1246,4 +1248,53 @@ async fn registry_row_present(node: &TestNode, document_id: Ulid) -> bool {
     load_document_record(node.context.as_ref(), document_id)
         .await
         .is_ok_and(|record| record.is_some())
+}
+
+/// A server mints into a bucket it holds; a create pinned to one holder by a non-holder answers
+/// the same document and event when repeated with the same arguments.
+#[tokio::test]
+async fn pinned_create_repeats() -> TestResult<()> {
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let group_id = realm.seed_group().await?;
+    let path = "datasets/pinned";
+    let payload = CreateDocumentPayload::Scaffold {
+        name: "Pinned".to_string(),
+        description: "Created on one holder".to_string(),
+        date_published: "2026-01-01".to_string(),
+        license: None,
+    };
+    let origin = realm.leading_node(group_id, path);
+    let actor = realm.actor(origin);
+    let minted = (payload.clone(), None);
+    let local = PinnedCreate::mint(&origin.context, &actor, (group_id, path), minted).await?;
+    assert_eq!(local.target, origin.node_id());
+
+    let user = realm.user_node();
+    let document_id =
+        mint_forward_document(&realm.config, &realm.actor(user), group_id, path)?.as_ulid();
+    let placement =
+        resolve_metadata_id(&realm.config, realm.realm_id, Some(group_id), document_id)?;
+    let holders = realm.holders(&placement);
+    let sender = realm.non_holder(&placement);
+    let pinned = PinnedCreate {
+        group_id,
+        path: path.to_string(),
+        document_id,
+        target: holders[0],
+        payload,
+        message: None,
+    };
+    let auth = realm.auth_context();
+    let create = async || {
+        let checks = (&auth, PolicyRequestExtras::default());
+        create_with_id(&sender.context, realm.actor(sender), checks, &pinned).await
+    };
+    let first = create().await?;
+    let again = create().await?;
+    assert_eq!(first.document_id, document_id);
+    assert_eq!(first.placement, placement);
+    assert_eq!(again.document_id, document_id);
+    assert_eq!(again.last_event_id, first.last_event_id);
+    realm.shutdown().await;
+    Ok(())
 }

@@ -5,19 +5,23 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, METADATA_ACTOR_KEYSPACE,
-    METADATA_CHECKPOINT_KEYSPACE, RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
+    MATERIALIZATION_STATUS_KEYSPACE, METADATA_ACTOR_KEYSPACE, METADATA_CHECKPOINT_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE, RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    EVENT_LIMIT, MetadataActor, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError,
-    MetadataEvent, MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
-    ProfileValidationStatus, RAW_BYTES_LIMIT, RawOriginBudget, raw_quotas,
+    EVENT_LIMIT, MaterializationState, MaterializationStatusRecord, MetadataActor, MetadataBatch,
+    MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload,
+    MetadataEventRecord, MetadataLifecycleRecord, ProfileValidationStatus, RAW_BYTES_LIMIT,
+    RawOriginBudget, raw_quotas,
 };
 use aruna_core::operation::Operation;
+use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
 use aruna_core::storage_entries::{
-    commit_message_entry, create_acceptance_key, document_lifecycle_entry, event_log_key,
-    event_log_prefix, metadata_actor_entry, metadata_actor_key, profile_validation_entry,
-    raw_budget_entry, raw_budget_key, sync_revision_entry,
+    commit_message_entry, create_acceptance_key, document_job_prefix, document_lifecycle_entry,
+    event_log_key, event_log_prefix, materialization_status_key, metadata_actor_entry,
+    metadata_actor_key, profile_validation_entry, raw_budget_entry, raw_budget_key,
+    sync_revision_entry,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -42,6 +46,7 @@ use crate::metadata::profile::validation::{
     batch_adds_profile, not_profiled_status, profile_path_rule, stale_status,
     submission_profile_tag, validate_submission,
 };
+use crate::metadata::projector::dot_applied;
 use crate::metadata::projector::{create_outbox_record, registry_outbox_record};
 use crate::metadata::repository::{
     StorageReadError, event_projection_entries, parse_registry_read, read_registry_effect,
@@ -72,6 +77,14 @@ pub enum UpdateDocumentMutation {
     },
     UpsertContextualEntity {
         jsonld: String,
+    },
+    /// Replaces one data entity by `@id`, so the properties it omits go.
+    ReplaceDataEntity {
+        jsonld: String,
+    },
+    /// Removes one root-linked `File` entity by `@id` and the root's link to it.
+    RemoveDataEntity {
+        id: String,
     },
     /// A batch a device planned against its own replica. It is appended
     /// verbatim, under the device's actor, so both replicas converge on it.
@@ -167,6 +180,8 @@ pub enum UpdateDocumentError {
     TopicAnnouncement(String),
     #[error("the document changed since revision {expected}; it is now at {current}")]
     RevisionConflict { expected: Ulid, current: Ulid },
+    #[error("the graph here has not applied revision {expected} yet; retry")]
+    GraphPending { expected: Ulid },
     #[error("the metadata graph changed since the version the update was based on")]
     GraphChanged,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -188,6 +203,8 @@ impl UpdateDocumentOperation {
             UpdateDocumentMutation::ReplaceRoCrate { .. } => None,
             UpdateDocumentMutation::UpsertDataEntity { .. }
             | UpdateDocumentMutation::UpsertContextualEntity { .. }
+            | UpdateDocumentMutation::ReplaceDataEntity { .. }
+            | UpdateDocumentMutation::RemoveDataEntity { .. }
             | UpdateDocumentMutation::ApplyBatch { .. }
             | UpdateDocumentMutation::Checkpoint => {
                 Some(stale_status(config.document_id, "dataset_revision_changed"))
@@ -275,6 +292,14 @@ impl UpdateDocumentOperation {
                     jsonld: jsonld.clone(),
                 })
             }
+            UpdateDocumentMutation::ReplaceDataEntity { jsonld } => {
+                Some(MetadataBatchSource::ReplaceDataEntity {
+                    jsonld: jsonld.clone(),
+                })
+            }
+            UpdateDocumentMutation::RemoveDataEntity { id } => {
+                Some(MetadataBatchSource::RemoveDataEntity { id: id.clone() })
+            }
             UpdateDocumentMutation::ApplyBatch { authored, .. } => Some(authored.clone()),
             UpdateDocumentMutation::Checkpoint => None,
         }
@@ -347,9 +372,16 @@ impl UpdateDocumentOperation {
             }
             UpdateDocumentMutation::ReplaceRoCrate { .. } => {}
             UpdateDocumentMutation::UpsertDataEntity { jsonld }
-            | UpdateDocumentMutation::UpsertContextualEntity { jsonld } => {
+            | UpdateDocumentMutation::UpsertContextualEntity { jsonld }
+            | UpdateDocumentMutation::ReplaceDataEntity { jsonld } => {
                 validate_entity_jsonld(jsonld)?;
             }
+            UpdateDocumentMutation::RemoveDataEntity { id } if id.trim().is_empty() => {
+                return Err(MetadataError::InvalidInput(
+                    "a removal names the entity's @id".to_string(),
+                ));
+            }
+            UpdateDocumentMutation::RemoveDataEntity { .. } => {}
         }
         let Some(actor) = self.actor.as_ref() else {
             return Err(MetadataError::Backend(
@@ -439,6 +471,12 @@ impl UpdateDocumentOperation {
         }
         let lifecycle = MetadataLifecycleRecord::for_event(event.clone(), self.message.clone());
         writes.push(document_lifecycle_entry(&lifecycle)?);
+        // The accepting node journals a content change for plugins in its commit batch.
+        if let Some(updated) = SourceEvent::from_metadata(event, now)
+            && updated.kind == SourceKind::DatasetUpdated
+        {
+            writes.extend(journal_entries(&updated)?);
+        }
         if outbox.is_none() {
             let aruna_core::document::DocumentOutboxEvent::Upsert { change, .. } =
                 lifecycle_outbox.event
@@ -1189,6 +1227,139 @@ pub(crate) async fn document_lock(document_id: Ulid) -> tokio::sync::MutexGuard<
 }
 
 /// Type-erased, so futures that await an update do not repeat its whole `Send` proof.
+/// Whether a mutation is planned against this holder's graph, so its expected revision must be
+/// applied here first.
+fn plans_on_graph(mutation: &UpdateDocumentMutation) -> bool {
+    matches!(
+        mutation,
+        UpdateDocumentMutation::ReplaceRoCrate { .. }
+            | UpdateDocumentMutation::UpsertDataEntity { .. }
+            | UpdateDocumentMutation::UpsertContextualEntity { .. }
+            | UpdateDocumentMutation::ReplaceDataEntity { .. }
+            | UpdateDocumentMutation::RemoveDataEntity { .. }
+    )
+}
+
+/// Refuses a revision-checked change this holder cannot plan yet: a base other than its newest
+/// event is a conflict, and one its graph has not applied (a status short of it or a queued
+/// materialization job) is retryable. The transactional revision check still runs later.
+async fn ready_base(
+    context: &DriverContext,
+    document_id: Ulid,
+    expected: Ulid,
+) -> Result<(), UpdateDocumentError> {
+    let storage = &context.storage_handle;
+    let read = |effect| async move {
+        match storage.send_storage_effect(effect).await {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values),
+            Event::Storage(StorageEvent::Error { error }) => Err(UpdateDocumentError::from(error)),
+            _ => Err(UpdateDocumentError::MissingTransaction),
+        }
+    };
+    let newest = read(StorageEffect::Last {
+        key_space: EVENT_LOG_KEYSPACE.to_string(),
+        prefix: Some(event_log_prefix(document_id)),
+        txn_id: None,
+    })
+    .await?;
+    let current = (newest.first())
+        .and_then(|(key, _)| <[u8; 16]>::try_from(key.get(16..32)?).ok())
+        .map_or(Ulid::nil(), Ulid::from_bytes);
+    if current != expected {
+        return Err(UpdateDocumentError::RevisionConflict { expected, current });
+    }
+    let status = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: MATERIALIZATION_STATUS_KEYSPACE.to_string(),
+            key: materialization_status_key(document_id),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        _ => return Err(UpdateDocumentError::MissingTransaction),
+    };
+    let status =
+        status.and_then(|bytes| postcard::from_bytes::<MaterializationStatusRecord>(&bytes).ok());
+    let applied = status.is_some_and(|status| {
+        status.state == MaterializationState::Materialized && status.event_id >= expected
+    });
+    // A received event keeps its projection marker until the projector has written its
+    // materialization job, so markers read before jobs miss no event moving between them.
+    if !applied || unprojected(context, document_id).await? {
+        return Err(UpdateDocumentError::GraphPending { expected });
+    }
+    let queued = read(StorageEffect::Iter {
+        key_space: DOCUMENT_JOB_KEYSPACE.to_string(),
+        prefix: Some(document_job_prefix(document_id)),
+        start: None,
+        limit: 1,
+        txn_id: None,
+    })
+    .await?;
+    match applied && queued.is_empty() {
+        true => Ok(()),
+        false => Err(UpdateDocumentError::GraphPending { expected }),
+    }
+}
+
+/// Whether the document has a received event the projector has not handed on yet whose own
+/// change is not in the graph: a marker of an applied batch is only a deferred lifecycle mint.
+async fn unprojected(
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<bool, UpdateDocumentError> {
+    let storage = &context.storage_handle;
+    let mut start = None;
+    loop {
+        let page = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
+                prefix: Some(event_log_prefix(document_id)),
+                start: start.clone(),
+                limit: 100,
+                txn_id: None,
+            })
+            .await;
+        let (values, next) = match page {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            _ => return Err(UpdateDocumentError::MissingTransaction),
+        };
+        for (key, _) in values {
+            let read = StorageEffect::Read {
+                key_space: EVENT_LOG_KEYSPACE.to_string(),
+                key: key.clone(),
+                txn_id: None,
+            };
+            let logged = match storage.send_storage_effect(read).await {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+                Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+                _ => return Err(UpdateDocumentError::MissingTransaction),
+            };
+            let event =
+                logged.and_then(|bytes| postcard::from_bytes::<MetadataEventRecord>(&bytes).ok());
+            let Some(MetadataEventPayload::ApplyBatch { batch, .. }) =
+                event.map(|event| event.payload)
+            else {
+                return Ok(true);
+            };
+            let applied = dot_applied(context, &batch.graph_iri, &batch).await;
+            if !applied.map_err(|error| MetadataError::Backend(error.to_string()))? {
+                return Ok(true);
+            }
+        }
+        match next {
+            Some(after) => start = Some(IterStart::After(after)),
+            None => return Ok(false),
+        }
+    }
+}
+
 pub fn update_metadata_document(
     mut operation: UpdateDocumentOperation,
     context: &DriverContext,
@@ -1197,6 +1368,11 @@ pub fn update_metadata_document(
 > {
     Box::pin(async move {
         let _guard = document_lock(operation.config.document_id).await;
+        if let Some(expected) = operation.config.expected_revision
+            && plans_on_graph(&operation.config.mutation)
+        {
+            ready_base(context, operation.config.document_id, expected).await?;
+        }
         operation.route_profile_status = Some(match &operation.config.mutation {
             UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
                 validate_submission(
@@ -1209,6 +1385,8 @@ pub fn update_metadata_document(
             }
             UpdateDocumentMutation::UpsertDataEntity { .. }
             | UpdateDocumentMutation::UpsertContextualEntity { .. }
+            | UpdateDocumentMutation::ReplaceDataEntity { .. }
+            | UpdateDocumentMutation::RemoveDataEntity { .. }
             | UpdateDocumentMutation::ApplyBatch { .. }
             | UpdateDocumentMutation::Checkpoint => {
                 stale_status(operation.config.document_id, "dataset_revision_changed")
@@ -2112,6 +2290,45 @@ mod pure_tests {
         let details = audit(&noted).details.unwrap_or_default();
         assert!(details.ends_with("; Add the raw file"), "{details}");
         assert!(!audit(&plain).details.unwrap_or_default().contains(';'));
+    }
+
+    // The accepted batch journals the change once for plugins, with its author.
+    #[test]
+    fn journals_accepted_update() {
+        let actor = actor();
+        let record = record(&actor);
+        let mutation = UpdateDocumentMutation::UpsertDataEntity {
+            jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+        };
+        let mut operation = UpdateDocumentOperation::new(config(actor.clone(), &record, mutation));
+        operation.start();
+        operation.step(registry_read(&record));
+        configured(&mut operation, realm_config_read(&record));
+        operation.step(batch_planned(&record));
+        let txn_id = Ulid::from_parts(9, 9);
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(registry_read(&record));
+        operation.step(no_window());
+        let size = postcard::experimental::serialized_size(&create_event(&record)).unwrap();
+        operation.step(raw_budget_read(&record, 1, size as u64));
+        let effects = operation.step(raw_events(&record));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected update batch write, got {effects:?}");
+        };
+        let journal = aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE;
+        let rows: Vec<SourceEvent> = (writes.iter())
+            .filter(|(keyspace, key, _)| {
+                keyspace == journal && key.first() == Some(&aruna_core::plugin_runs::JOURNAL_ROW)
+            })
+            .map(|(_, _, value)| SourceEvent::from_bytes(value).unwrap())
+            .collect();
+        let [row] = rows.as_slice() else {
+            panic!("expected one journal row, got {rows:?}");
+        };
+        assert_eq!(row.kind, SourceKind::DatasetUpdated);
+        assert_eq!(row.resource, record.document_id.to_string());
+        assert_eq!(row.source, format!("dataset_updated/{}", row.revision));
+        assert_eq!(row.actor, Some(actor.user_id));
     }
 
     #[test]

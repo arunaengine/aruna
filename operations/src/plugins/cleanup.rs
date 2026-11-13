@@ -1,5 +1,5 @@
-//! Deletes plugin event rows that are no longer needed: gap counts past the dedup retention on
-//! senders and receivers, and the replay, waiting and gap rows of removed installs.
+//! Deletes plugin rows that are no longer needed: gap counts past the dedup retention on senders
+//! and receivers, and the replay, waiting, gap and create key rows of removed installs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -11,6 +11,7 @@ use aruna_core::plugin_runs::{DEDUP_RETENTION_MS, GapRow, RECEIVER_GAP};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use ulid::Ulid;
 
+use super::creates::drop_keys;
 use super::store::{StoreError, Txn, decode};
 use crate::driver::DriverContext;
 
@@ -79,7 +80,8 @@ pub async fn sweep_events(
     }
     let counted = gaps.len();
     txn.delete(PLUGIN_GAPS_KEYSPACE, gaps).await?;
-    Ok(replays + held + counted)
+    let keys = drop_keys(ctx, config).await?;
+    Ok(replays + held + counted + keys)
 }
 
 #[cfg(test)]
