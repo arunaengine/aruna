@@ -257,9 +257,9 @@ class Link:
         elif side == "aruna":
             found, revision = self.to_elab(found, theirs, ours, revision)
         elif side == "same":
-            # An interrupted write can leave the description behind the body; finish it first.
+            # An interrupted body write can leave the description behind the body; finish it.
             described = plain(ours["body"], ours["format"])
-            if self.state.get("pending") and (doc.get("description") or "") != described:
+            if self.state.get("pending") == "body" and (doc.get("description") or "") != described:
                 revision = self.host.patch(self.state["dataset"], {"description": described or None}, revision)
             self.state.update(synced=fingerprint(ours), pending=None)
         else:
@@ -303,7 +303,7 @@ class Link:
             if not self.host.fresh(size, calls):
                 raise Fault("limit", "the experiment's writes do not fit one run")
             raise Stop("the experiment's writes need a fresh run")
-        self.save(pending="write")
+        self.save(pending="body" if rebody else "write")
         try:
             after = self.write(adds, ours if retitle else None, ours if rebody else None, removes)
         except Fault as fault:

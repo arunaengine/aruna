@@ -85,6 +85,15 @@ class LinkTests(unittest.TestCase):
         self.assertIsNone(self.sync())
         self.assertEqual(self.plugin.dataset(1)["description"], "c")
 
+    def test_title_stop(self):
+        # An interrupted title-only write leaves a person's own description alone.
+        self.enrolled()
+        self.host.edit(self.dataset, name="B", description="custom")
+        self.kill_at_save(2)
+        self.assertEqual(self.plugin.manual({"experiment": 1}), "killed")
+        self.assertIsNone(self.sync())
+        self.assertEqual((self.item["title"], self.plugin.dataset(1)["description"]), ("B", "custom"))
+
     def test_both_sides(self):
         self.enrolled()
         self.item["title"] = "B"
@@ -147,7 +156,7 @@ class LinkTests(unittest.TestCase):
         self.enrolled()
         self.host.edit(self.dataset, text="<strong>" * 16 + "<p>x</p>" * 990 + "</strong>" * 16)
         self.assertEqual(self.sync()["kind"], "too_large")
-        self.assertEqual(self.plugin.link(1)["pending"], "write")
+        self.assertEqual(self.plugin.link(1)["pending"], "body")
         self.assertEqual(self.item["body"].count("<strong>"), 16 * 990)
         self.assertEqual(self.sync()["kind"], "too_large")
         self.item["body"] = "<p>short</p>"
@@ -160,7 +169,7 @@ class LinkTests(unittest.TestCase):
         links = "[r]: https://example.org/" + "x" * 1000 + "\n" + "[a][r] " * 1100
         self.host.edit(self.dataset, text=links, encodingFormat="text/markdown")
         self.assertEqual(self.sync()["kind"], "too_large")
-        self.assertEqual(self.plugin.link(1)["pending"], "write")
+        self.assertEqual(self.plugin.link(1)["pending"], "body")
 
     def test_copied_fields(self):
         # A copy of experiment 1 brings its link fields along; they are set to the copy's dataset.
