@@ -170,6 +170,44 @@ jobs:
           --profile ci --run-ignored only --no-tests fail
           -E "package(aruna) & binary(integration) & test(/^git_native::/)"'
 
+  elabftw-python:
+    name: eLabFTW Python example
+    needs: test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-nextest@0.9.140
+
+      - name: Install uv
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: uv@0.11.28
+
+      - name: Download the test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nextest-archive
+
+      # unittest exits with 5 when discovery finds no tests, so an empty run fails the job.
+      - name: Run the Python tests
+        working-directory: plugins/examples/elabftw-python
+        run: uv run --no-project --python 3.12 python -m unittest discover -s tests -t . -p 'test_*.py'
+
+      # Builds the example with componentize-py and runs one timer run in the plugin runtime.
+      - name: Run the example in the plugin runtime
+        env:
+          ARUNA_PLUGIN_LANGUAGES: "1"
+        run: >-
+          cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --no-tests fail -E "package(aruna-plugins) & binary(elabftw_python)"
+
   restart-stress:
     name: Restart scale stress
     needs: test-build

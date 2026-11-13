@@ -1,0 +1,36 @@
+# Example plugin in Python: syncs tagged eLabFTW experiments and their datasets both ways.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "elabftw-python"
+version = "0.1.0"
+title = "Sync eLabFTW experiments (Python)"
+
+[settings]
+elab_url = { title = "eLabFTW address", type = "url" }
+sync_user = { title = "eLabFTW user id of the sync user", type = "integer" }
+bucket = { title = "Bucket path of eLabFTW's uploads on the receiver node", type = "string" }
+prefix = { title = "eLabFTW's path prefix in the bucket", type = "string", default = "elabftw" }
+tag = { title = "Tag of synced experiments", type = "string", default = "aruna" }
+aruna_url = { title = "Aruna portal address", type = "url" }
+
+[secrets]
+elab_key = { title = "eLabFTW API key of the sync user", kind = "header" }
+
+[connections.elab]
+url = "{elab_url}/api/v2/experiments"
+methods = ["GET", "POST", "PATCH"]
+auth = "elab_key"
+response = "full"
+
+[triggers]
+every = { handler = "poll", interval = "5m" }
+dataset_updated = { handler = "changed" }
+manual = { handler = "manual" }
+
+[permissions]
+required = ["metadata.read", "metadata.write", "metadata.create", "objects.read"]
+
+[build]
+command = ["uv", "run", "--no-project", "--with", "componentize-py==0.25.1", "componentize-py", "-d", "../../wit", "-w", "plugin", "componentize", "app", "-o", "plugin.wasm"]
+output = "plugin.wasm"
