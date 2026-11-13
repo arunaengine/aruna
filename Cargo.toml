@@ -18,6 +18,7 @@ members = [
     "aruna-doctor",
     "cli",
     "plugins",
+    "plugins/examples/elabftw",
     "plugins/examples/rust",
     "plugins/fixture",
     "plugins/sdk",
@@ -128,6 +129,7 @@ hpke = { version = "0.14.1", default-features = false, features = [
     "getrandom",
     "x25519",
 ] }
+html5ever = "0.40.1"
 http = "1.5.0"
 http-body = "1.1.0"
 httparse = "1.10.1"

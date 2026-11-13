@@ -1,0 +1,6 @@
+//! Example plugin that links tagged eLabFTW experiments and Aruna datasets and keeps title,
+//! tags, body and files in step both ways.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub mod body;

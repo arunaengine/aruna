@@ -1,0 +1,24 @@
+# Manifest of the example plugin that syncs eLabFTW experiments and Aruna datasets both ways.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "elabftw-sync"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aruna-plugin = { workspace = true }
+hex = { workspace = true }
+html5ever = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
