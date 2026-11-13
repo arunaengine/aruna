@@ -120,7 +120,14 @@ impl<'a> Sync<'a> {
 
     /// Room for one more step inside a link, or `Spent`.
     fn step(&self) -> Result<()> {
-        match self.room(self.budget.step) {
+        self.steps(0)
+    }
+
+    /// Room for a step and `calls` more small calls, or `Spent`.
+    fn steps(&self, calls: u32) -> Result<()> {
+        let mut keep = self.budget.step;
+        keep.calls = keep.calls.saturating_add(calls);
+        match self.room(keep) {
             true => Ok(()),
             false => Err(Fault::new(Kind::Spent, "the run's budget is used")),
         }
@@ -319,12 +326,9 @@ impl<'a> Sync<'a> {
         if mode == Mode::Retry && link.retry_at.is_some_and(|at| at > self.now) {
             return Ok(Outcome::Skipped);
         }
-        // A change to eLabFTW that ended before its write-back: the fields it sent take what was
-        // sent as their base, so a later Aruna edit compares with it; a conflict stays one.
+        // A change to eLabFTW whose run stopped before its write-back.
         let sent = link.reservation.take().and_then(|held| held.source);
-        if let (Some(sent), Some(snapshot)) = (sent, link.snapshot.as_mut()) {
-            snapshot.aruna.take(&sent.side, &sent.fields);
-        }
+        settle(link, sent);
         let kind = if link.dataset.is_none() {
             Reserved::Dataset
         } else {
@@ -338,7 +342,11 @@ impl<'a> Sync<'a> {
         }
         let outcome = self.link(&mut record, id, mode);
         let link = &mut record.link;
-        link.reservation = None;
+        // A round that ended early keeps what it already wrote to eLabFTW as the base.
+        let held = link.reservation.take();
+        if outcome.is_err() {
+            settle(link, held.and_then(|held| held.source));
+        }
         let spent = outcome
             .as_ref()
             .is_err_and(|fault| fault.kind == Kind::Spent);
@@ -713,11 +721,12 @@ impl<'a> Sync<'a> {
         (dataset, fields_missing): (&str, bool),
         (revision, aruna): (&String, &Values),
     ) -> Result<Experiment> {
+        // The fields join the reservation one by one, each once eLabFTW holds it in full.
         if let Some(held) = record.link.reservation.as_mut() {
             held.source = Some(Sent {
                 revision: revision.clone(),
                 side: Side::of(aruna),
-                fields: decision.to_elab.clone(),
+                fields: Vec::new(),
             });
         }
         record.save(self.host)?;
@@ -727,18 +736,20 @@ impl<'a> Sync<'a> {
                 Field::Title => elab::patch(self.host, id, json!({ "title": aruna.title }))?,
                 Field::Tags => {
                     let wanted = decision.tags.as_ref().unwrap_or(&aruna.tags);
-                    for tag in wanted
-                        .iter()
+                    let added: Vec<&String> = (wanted.iter())
                         .filter(|tag| !experiment.tags.contains_key(*tag))
-                    {
-                        self.step()?;
+                        .collect();
+                    let removed: Vec<u64> = (experiment.tags.iter())
+                        .filter(|(tag, _)| !wanted.contains(*tag) && **tag != self.settings.tag)
+                        .map(|(_, tag)| *tag)
+                        .collect();
+                    // All tag calls fit, or none is made, so the tags never stop half-way.
+                    self.steps((added.len() + removed.len()) as u32)?;
+                    for tag in added {
                         elab::add_tag(self.host, id, tag)?;
                     }
-                    let extra = (experiment.tags.iter())
-                        .filter(|(tag, _)| !wanted.contains(*tag) && **tag != self.settings.tag);
-                    for (_, tag) in extra {
-                        self.step()?;
-                        elab::remove_tag(self.host, id, *tag)?;
+                    for tag in removed {
+                        elab::remove_tag(self.host, id, tag)?;
                     }
                 }
                 Field::Body => {
@@ -753,8 +764,9 @@ impl<'a> Sync<'a> {
                         json!({ "body": body.text, "content_type": body.format.content_type() });
                     elab::patch(self.host, id, change)?;
                 }
-                Field::Props | Field::Files | Field::Links => {}
+                Field::Props | Field::Files | Field::Links => continue,
             }
+            self.sent(record, *field)?;
         }
         let links = aruna.links.clone().unwrap_or_else(|| {
             experiment
@@ -783,6 +795,7 @@ impl<'a> Sync<'a> {
                 id,
                 field_update(self.settings, Some(dataset), &links),
             )?;
+            self.sent(record, Field::Links)?;
         }
         let after = elab::experiment(self.host, id)?;
         let after = after.ok_or_else(|| Fault::new(Kind::NotFound, "the experiment is gone"))?;
@@ -792,6 +805,19 @@ impl<'a> Sync<'a> {
                 .mark(Mark::Blocked, Some(vec![reason, after.modified.clone()]));
         }
         Ok(after)
+    }
+
+    /// Records that eLabFTW holds one more sent field, so a stop after it keeps it as the base.
+    fn sent(&self, record: &mut Record, field: Field) -> Result<()> {
+        let source = record
+            .link
+            .reservation
+            .as_mut()
+            .and_then(|held| held.source.as_mut());
+        if let Some(sent) = source {
+            sent.fields.push(field);
+        }
+        record.save(self.host)
     }
 
     /// Brings the eLabFTW-origin file entities in step with the uploads: each changed one is
@@ -1124,6 +1150,21 @@ impl<'a> Sync<'a> {
         }
         true
     }
+}
+
+/// Takes what a stopped change already sent to eLabFTW as the base of those fields: on the Aruna
+/// side, and on the eLabFTW side where both store the same; a sent body still goes back.
+fn settle(link: &mut Link, sent: Option<Sent>) {
+    let (Some(sent), Some(snapshot)) = (sent, link.snapshot.as_mut()) else {
+        return;
+    };
+    snapshot.aruna.take(&sent.side, &sent.fields);
+    let same: Vec<Field> = (sent.fields.iter())
+        .filter(|field| **field != Field::Body)
+        .copied()
+        .collect();
+    snapshot.elab.take(&sent.side, &same);
+    snapshot.pending |= sent.fields.contains(&Field::Body);
 }
 
 /// A manual run's answer: `fields` with the link's marks, or `unfinished` when a later run

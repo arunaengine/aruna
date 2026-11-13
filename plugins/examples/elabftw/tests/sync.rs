@@ -7,7 +7,7 @@ mod support;
 
 use elabftw_sync::host::Kind;
 use elabftw_sync::progress::{DAY_MS, STALE_MS};
-use elabftw_sync::sync::Mode;
+use elabftw_sync::sync::{Budget, Mode, Room};
 use serde_json::{Value, json};
 use support::{BUCKET, Runner, START};
 
@@ -97,6 +97,50 @@ fn link_fields_repaired() {
 fn extra_fields(experiment: &Value) -> serde_json::Map<String, Value> {
     let metadata: Value = serde_json::from_str(experiment["metadata"].as_str().unwrap()).unwrap();
     metadata["extra_fields"].as_object().unwrap().clone()
+}
+
+#[test]
+fn stopped_title_undone() {
+    let runner = Runner::new();
+    let id = runner.world.experiment("Run 7", "", &["aruna"]);
+    runner.poll();
+    let (dataset, _) = runner.world.only_dataset();
+    // The title goes out; the 40 new keywords no longer fit this run's budget.
+    let keywords: Vec<String> = (0..40).map(|n| format!("k{n:02}")).collect();
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "name": "Renamed", "keywords": keywords }));
+    let room = |calls, bytes| Room { calls, bytes };
+    let small = Budget {
+        total: room(60, 15 << 20),
+        link: room(30, 4 << 20),
+        step: room(15, 1 << 20),
+    };
+    runner.budget.set(small);
+    runner.event(&dataset);
+    assert_eq!(runner.world.get(id)["title"], "Renamed");
+    assert_eq!(runner.world.get(id)["tags"], "aruna", "no tag was sent");
+    assert!(
+        runner.marks(id)["unfinished"].is_array(),
+        "{}",
+        runner.marks(id)
+    );
+
+    // A person undoes the title in Aruna; the undo reaches eLabFTW, and nothing conflicts.
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "name": "Run 7" }));
+    runner.budget.set(Budget::default());
+    runner.poll();
+    assert_eq!(runner.world.dataset(&dataset).entity["name"], "Run 7");
+    assert_eq!(runner.world.get(id)["title"], "Run 7");
+    let tags = runner.world.get(id)["tags"]
+        .as_str()
+        .unwrap()
+        .split('|')
+        .count();
+    assert_eq!(tags, 41);
+    assert_eq!(runner.marks(id), Value::Null);
 }
 
 #[test]
