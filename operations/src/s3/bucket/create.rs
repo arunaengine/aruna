@@ -607,7 +607,15 @@ mod mapped_tests {
         operation.step(written());
         operation.step(written());
         operation.step(written());
-        let effects = operation.step(batch(vec![Some(storage.clone()), Some(storage)]));
+        let bucket: Value = info().to_bytes().unwrap().into();
+        let reads = vec![
+            Some(bucket),
+            None,
+            Some(storage.clone()),
+            None,
+            Some(storage),
+        ];
+        let effects = operation.step(batch(reads));
         (operation, effects)
     }
 

@@ -171,30 +171,17 @@ impl CreateImportOperation {
     fn read_backends(&mut self) -> Effects {
         self.state = CreateState::Backends;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    STORAGE_BACKEND_KEYSPACE.to_string(),
-                    backend_key(self.input.backend_id)
-                ),
-                (
-                    STORAGE_BACKEND_KEYSPACE.to_string(),
-                    backend_key(self.write_backend())
-                ),
-            ],
-            txn_id: None,
+            reads: self.reads(),
+            txn_id: self.txn_id,
         })]
     }
 
-    /// Checks both folders before any bucket is touched, then queues the rule buckets of
-    /// storages without a bucket.
+    /// Checks the bucket, the group and both folders before any provider bucket is created,
+    /// then queues the rule buckets of storages without a bucket.
     fn backends_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let [backend, write_backend] = match <[_; 2]>::try_from(values) {
-            Ok(values) => values.map(|(_, value)| value),
-            Err(_) => return self.fail(ImportRuleError::Unexpected("Backends")),
-        };
-        let (backend, write_backend) = match (self.owned(backend), self.owned(write_backend)) {
-            (Ok(backend), Ok(write_backend)) => (backend, write_backend),
-            (Err(error), _) | (_, Err(error)) => return self.fail(error),
+        let (backend, write_backend) = match self.verify(values) {
+            Ok((_, backend, write_backend)) => (backend, write_backend),
+            Err(error) => return self.fail(error),
         };
         if read_only(&write_backend, &self.input.import_roots) {
             return self.invalid(
@@ -253,6 +240,14 @@ impl CreateImportOperation {
     fn read(&mut self, txn_id: TxnId) -> Effects {
         self.txn_id = Some(txn_id);
         self.state = CreateState::Read;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads: self.reads(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    /// The bucket, its encryption, both storages, the group fence and any move rows.
+    fn reads(&self) -> Vec<(String, Key)> {
         let bucket: Key = self.input.bucket.as_bytes().to_vec().into();
         let mut reads = vec![
             (S3_BUCKET_KEYSPACE.to_string(), bucket.clone()),
@@ -270,10 +265,7 @@ impl CreateImportOperation {
         if self.input.move_existing {
             reads.extend(move_reads(&self.input.bucket).into_iter().skip(2));
         }
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        reads
     }
 
     /// The move of the folder's stored copies, from the transition and move rows read last.
@@ -302,60 +294,56 @@ impl CreateImportOperation {
         Ok(())
     }
 
-    fn checked(&mut self, mut values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn checked(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        match self.verify(values) {
+            Ok((routed, backend, write_backend)) => {
+                self.backends = vec![backend, write_backend];
+                self.routed = routed;
+                self.scan(None)
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+
+    /// Checks the rows of `reads`; gives the bucket record with the added routing rule, if
+    /// any, and both storages.
+    fn verify(
+        &mut self,
+        mut values: Vec<(Key, Option<Value>)>,
+    ) -> Result<(Option<BucketInfo>, GroupStorage, GroupStorage), ImportRuleError> {
+        let invalid = |reason: &str| Err(ImportRuleError::Invalid(reason.to_string()));
         let rows = values.split_off(values.len().min(5));
-        if self.input.move_existing
-            && let Err(error) = self.plan_move(values.get(1).and_then(|(_, v)| v.as_deref()), rows)
-        {
-            return self.fail(error);
+        if self.input.move_existing {
+            self.plan_move(values.get(1).and_then(|(_, v)| v.as_deref()), rows)?;
         }
-        let [bucket, encryption, backend, fence, write_backend] = match <[_; 5]>::try_from(values) {
-            Ok(values) => values.map(|(_, value)| value),
-            Err(_) => return self.fail(ImportRuleError::Unexpected("Read")),
+        let Ok(values) = <[_; 5]>::try_from(values) else {
+            return Err(ImportRuleError::Unexpected("Read"));
         };
-        if let Err(error) = check_group_write(fence.as_deref()) {
-            return self.fail(error.into());
-        }
+        let [bucket, encryption, backend, fence, write_backend] = values.map(|(_, value)| value);
+        check_group_write(fence.as_deref())?;
         let bucket = match bucket
             .map(|value| BucketInfo::from_bytes(&value))
-            .transpose()
+            .transpose()?
         {
-            Ok(Some(bucket)) if bucket.group_id == self.input.group_id => bucket,
-            Ok(_) => return self.invalid("the bucket does not exist in this group on this node"),
-            Err(error) => return self.fail(error.into()),
+            Some(bucket) if bucket.group_id == self.input.group_id => bucket,
+            _ => return invalid("the bucket does not exist in this group on this node"),
         };
         if bucket.compression != Compression::Off {
-            return self.invalid("a bucket with compression cannot import objects in place");
+            return invalid("a bucket with compression cannot import objects in place");
         }
-        match BucketEncryption::from_row(encryption.as_deref()) {
-            Ok(settings) if settings.is_encrypted() => {
-                return self.invalid("an encrypted bucket cannot import objects in place");
-            }
-            Ok(_) => {}
-            Err(error) => return self.fail(error.into()),
+        if BucketEncryption::from_row(encryption.as_deref())?.is_encrypted() {
+            return invalid("an encrypted bucket cannot import objects in place");
         }
-        let (backend, write_backend) = match (self.owned(backend), self.owned(write_backend)) {
-            (Ok(backend), Ok(write_backend)) => (backend, write_backend),
-            (Err(error), _) | (_, Err(error)) => return self.fail(error),
-        };
-        let checks = [
-            check_folder(&backend, &self.input.backend_prefix),
-            check_folder(&write_backend, self.write_folder()),
-        ];
-        if let Some(Err(error)) = checks.into_iter().find(Result::is_err) {
-            return self.fail(error);
-        }
+        let (backend, write_backend) = (self.owned(backend)?, self.owned(write_backend)?);
+        check_folder(&backend, &self.input.backend_prefix)?;
+        check_folder(&write_backend, self.write_folder())?;
         if backend.is_reserved(&self.input.backend_prefix) {
-            return self.invalid("backend_prefix lies inside the folder Aruna writes to");
+            return invalid("backend_prefix lies inside the folder Aruna writes to");
         }
         if write_backend.is_reserved(self.write_folder()) {
-            return self.invalid("write_prefix lies inside the folder Aruna writes to");
+            return invalid("write_prefix lies inside the folder Aruna writes to");
         }
-        self.backends = vec![backend, write_backend];
-        if let Err(error) = self.route(bucket) {
-            return self.fail(error);
-        }
-        self.scan(None)
+        Ok((self.route(bucket)?, backend, write_backend))
     }
 
     fn write_backend(&self) -> Ulid {
@@ -402,15 +390,16 @@ impl CreateImportOperation {
             || (rule.write_backend() == read && folders_overlap(rule.write_folder(), prefix))
     }
 
-    /// Adds the folder's routing rule; an existing rule for the same folder must agree.
-    fn route(&mut self, mut bucket: BucketInfo) -> Result<(), ImportRuleError> {
+    /// The bucket with the folder's routing rule added, `None` when it has it already; an
+    /// existing rule for the same folder must agree.
+    fn route(&self, mut bucket: BucketInfo) -> Result<Option<BucketInfo>, ImportRuleError> {
         let target = RoutingTarget::Backend(BackendRef::Group(self.write_backend()));
         let existing = bucket
             .storage_routing
             .iter()
             .find(|rule| !rule.exact && rule.key_prefix == self.input.key_prefix);
         match existing {
-            Some(rule) if rule.target == target => Ok(()),
+            Some(rule) if rule.target == target => Ok(None),
             Some(_) => Err(ImportRuleError::Conflict(
                 "a routing rule for this folder names another target".to_string(),
             )),
@@ -420,8 +409,7 @@ impl CreateImportOperation {
                     exact: false,
                     target,
                 });
-                self.routed = Some(bucket);
-                Ok(())
+                Ok(Some(bucket))
             }
         }
     }
@@ -761,7 +749,7 @@ mod tests {
     ) -> (CreateImportOperation, Effects) {
         let mut operation = CreateImportOperation::new(input);
         operation.start();
-        let effects = operation.step(values(vec![backend(), backend()]));
+        let effects = operation.step(values(first_reads(backend())));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction { .. })]
@@ -781,8 +769,30 @@ mod tests {
         let mut operation = CreateImportOperation::new(input);
         operation.start();
         let record: Option<Value> = Some(record.to_bytes().unwrap().into());
-        let effects = operation.step(values(vec![record.clone(), record]));
+        let effects = operation.step(values(first_reads(record)));
         (operation, effects)
+    }
+
+    /// The first read of a rule on `record` that finds the bucket, as `reads` orders it.
+    fn first_reads(record: Option<Value>) -> Vec<Option<Value>> {
+        vec![bucket_row(), None, record.clone(), None, record]
+    }
+
+    #[test]
+    fn refuses_before_ensure() {
+        // A missing Aruna bucket is refused before the provider bucket is created.
+        let record = storage(&[("endpoint", "https://s3.lab")]);
+        let mut operation = CreateImportOperation::new(input("lab-raw/", "imported/"));
+        operation.start();
+        let record: Option<Value> = Some(record.to_bytes().unwrap().into());
+        let effects = operation.step(values(vec![None, None, record.clone(), None, record]));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(
+            failure(operation),
+            ImportRuleError::Invalid(
+                "the bucket does not exist in this group on this node".to_string()
+            )
+        );
     }
 
     #[test]
@@ -982,7 +992,7 @@ mod tests {
         input.move_existing = true;
         let mut operation = CreateImportOperation::new(input);
         operation.start();
-        operation.step(values(vec![backend(), backend()]));
+        operation.step(values([first_reads(backend()), vec![None, None]].concat()));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
@@ -1030,7 +1040,7 @@ mod tests {
         input.move_existing = true;
         let mut operation = CreateImportOperation::new(input);
         operation.start();
-        operation.step(values(vec![backend(), backend()]));
+        operation.step(values([first_reads(backend()), vec![None, None]].concat()));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
