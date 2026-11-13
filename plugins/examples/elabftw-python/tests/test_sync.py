@@ -2,6 +2,7 @@
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 
+import json
 import unittest
 
 from elab import LIMIT, encoded
@@ -144,6 +145,23 @@ class LinkTests(unittest.TestCase):
         self.host.edit(self.dataset, text=links, encodingFormat="text/markdown")
         self.assertEqual(self.sync()["kind"], "too_large")
         self.assertEqual(self.plugin.link(1)["pending"], "write")
+
+    def test_copied_fields(self):
+        # A copy of experiment 1 brings its link fields along; they are set to the copy's dataset.
+        self.enrolled()
+        self.team.add(2, title="copy", metadata=json.loads(json.dumps(self.item["metadata"])))
+        self.assertIsNone(self.plugin.manual({"experiment": 2})["mark"])
+        fields = self.team.items[2]["metadata"]["extra_fields"]
+        self.assertEqual(fields["Aruna dataset id"]["value"], self.plugin.link(2)["dataset"])
+        self.assertNotEqual(self.plugin.link(2)["dataset"], self.dataset)
+
+    def test_field_types(self):
+        number = {"Aruna dataset id": {"type": "number", "value": "3"}}
+        self.team.add(1, metadata={"extra_fields": number})
+        found = self.plugin.manual({"experiment": 1})["mark"]
+        self.assertEqual(found["kind"], "blocked")
+        self.assertIn("type number, not text", found["reason"])
+        self.assertNotIn("PATCH", [method for method, _ in self.team.sent])
 
     def test_write_access(self):
         self.enrolled()

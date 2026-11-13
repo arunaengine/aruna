@@ -331,13 +331,18 @@ class Link:
         if identified(doc) != self.number:
             revision = self.host.patch(self.state["dataset"], {"identifier": self.identifier()}, revision)
         metadata = found.get("metadata_decoded") or json.loads(found.get("metadata") or "{}")
-        fields = (metadata or {}).get("extra_fields") or {}
-        if DATASET_FIELD in fields and ID_FIELD in fields:
+        fields, wanted = (metadata or {}).get("extra_fields") or {}, self.link_fields()
+        for name, field in wanted["extra_fields"].items():
+            kind = (fields.get(name) or {}).get("type")
+            if kind not in (None, field["type"]):
+                return mark("blocked", f"the field {name} has type {kind}, not {field['type']}")
+        values = [(fields.get(name) or {}).get("value") for name in (DATASET_FIELD, ID_FIELD)]
+        if values == [field["value"] for field in wanted["extra_fields"].values()]:
             return None
         if not writable(found, self.settings.user):
             return mark("no_write", "the sync user may not write the experiment")
         try:
-            elab.patch(self.host, self.number, {"metadatamerge": json.dumps(self.link_fields())})
+            elab.patch(self.host, self.number, {"metadatamerge": json.dumps(wanted)})
         except Fault as fault:
             if fault.kind != "invalid":
                 raise
