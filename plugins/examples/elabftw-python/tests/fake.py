@@ -126,10 +126,11 @@ class Elab:
 
 
 def measure(value):
+    """Bytes as the host counts them: strings as UTF-8, values from state as their JSON text."""
+    if isinstance(value, dict):
+        value = json.dumps(value)
     if isinstance(value, (bytes, str)):
         return len(value.encode() if isinstance(value, str) else value)
-    if isinstance(value, dict):
-        return sum(measure(key) + measure(item) + 2 for key, item in value.items())
     if isinstance(value, (list, tuple)):
         return sum(measure(item) + 1 for item in value)
     return 8
@@ -215,7 +216,7 @@ class Host:
 
     def get(self, resource):
         def work():
-            return self.doc(resource)["revision"], json.loads(json.dumps(self.doc(resource)["json"]))
+            return self.doc(resource)["revision"], json.dumps(self.doc(resource)["json"], ensure_ascii=False)
 
         return self.metered("get", resource, work)
 

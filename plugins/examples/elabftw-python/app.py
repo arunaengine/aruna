@@ -42,7 +42,7 @@ class Host:
     @hosted
     def get(self, resource):
         doc = metadata_read.get(resource)
-        return doc.revision, json.loads(doc.json)
+        return doc.revision, doc.json
 
     @hosted
     def listing(self, cursor):

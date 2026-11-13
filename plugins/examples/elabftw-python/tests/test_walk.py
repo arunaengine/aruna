@@ -188,6 +188,15 @@ class WalkTests(unittest.TestCase):
         self.assertFalse(self.host.broken)
         self.assertLessEqual(self.host.peak, 16 * MIB)
 
+    def test_wide_text(self):
+        # Non-ASCII text costs six bytes per character in the JSON the host receives.
+        for number in range(1, 15):
+            self.team.add(number, body="<p>" + "é" * 60_000 + "</p>")
+        for _ in range(6):
+            self.plugin.poll()
+        self.assertEqual(self.marks(*range(1, 15)), [None] * 14)
+        self.assertFalse(self.host.broken)
+
     def test_budget_fresh(self):
         tags = ("aruna", *(f"t{index}" for index in range(120)))
         self.tagged(1, body="<p>" + "x" * 80_000 + "</p>", tags=tags)

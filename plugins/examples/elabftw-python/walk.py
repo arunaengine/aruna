@@ -6,7 +6,7 @@ import json
 
 import elab
 from elab import Fault, Stop
-from sync import Link, identified, mark
+from sync import Link, identified, mark, read
 
 START = {"phase": "datasets", "page": None, "index": 0, "cycle": 1, "current": None}
 REPORT_BYTES = 48 << 10
@@ -24,7 +24,7 @@ def page(host, settings, cursor):
 def linked(host, settings, dataset, cycle):
     """The dataset's document and link, or None when the dataset is gone or not linked."""
     try:
-        revision, doc = host.get(dataset)
+        revision, doc = read(host, dataset)
     except Fault as fault:
         if fault.kind == "not_found":
             return None

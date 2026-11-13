@@ -21,13 +21,13 @@ BLOCKS = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "pre
 
 
 def weight(value):
-    """Bytes a host call moves: its strings and bytes, also inside lists and dicts."""
+    """Bytes a host call moves, as the adapter sends them: dicts as JSON text."""
+    if isinstance(value, dict):
+        value = json.dumps(value)
     if isinstance(value, str):
         return len(value.encode())
     if isinstance(value, bytes):
         return len(value)
-    if isinstance(value, dict):
-        return sum(weight(key) + weight(item) for key, item in value.items())
     if isinstance(value, (list, tuple)):
         return sum(weight(item) for item in value)
     return 8
@@ -155,6 +155,12 @@ def dataset_patch(record):
     return {key: value or None for key, value in fields.items()}
 
 
+def read(host, dataset):
+    """The dataset's revision and JSON; the host answers JSON text, counted as it arrives."""
+    revision, text = host.get(dataset)
+    return revision, json.loads(text)
+
+
 def identified(doc):
     """The experiment id a dataset names in `identifier.elabftw.id`; other shapes name none."""
     found = doc.get("identifier")
@@ -226,7 +232,7 @@ class Link:
         entity |= {"@type": "Dataset", "identifier": self.identifier()}
         path = f"elabftw/{self.number}"
         dataset = self.host.create(path, entity, path)
-        revision, doc = self.host.get(dataset)
+        revision, doc = read(self.host, dataset)
         same = from_dataset(doc) == record
         self.state.update(dataset=dataset, pending=None, synced=fingerprint(record) if same else None)
         result = self.extras(found, revision, doc)
@@ -236,7 +242,7 @@ class Link:
 
     def sync(self, found, known, keep):
         try:
-            revision, doc = known or self.host.get(self.state["dataset"])
+            revision, doc = known or read(self.host, self.state["dataset"])
         except Fault as fault:
             if fault.kind == "not_found":
                 return mark("gone", "dataset")
