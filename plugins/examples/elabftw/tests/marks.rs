@@ -512,7 +512,7 @@ fn set(tags: &[&str]) -> BTreeSet<String> {
 }
 
 #[test]
-fn tag_retry_keeps_restore() {
+fn tag_retry_restores() {
     // A clear-to-empty batch stops; meanwhile Aruna restores t19 and eLabFTW changes the title.
     // The resume removes the rest, and an unrelated Aruna edit refuses its patch: the retry
     // keeps the restored t19 on both sides.
