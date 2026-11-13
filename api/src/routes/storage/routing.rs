@@ -170,7 +170,7 @@ pub struct BucketRoutingResponse {
     pub bucket: String,
     pub rules: Vec<RoutingRuleRequest>,
     /// Advisory notes about targets this node cannot serve. The rules are
-    /// stored regardless, because the record replicates to other nodes.
+    /// stored regardless and apply on this node only.
     pub warnings: Vec<String>,
 }
 
@@ -445,8 +445,8 @@ pub async fn get_bucket_routing(
   default backend.
 - Rules steer writes made after the change. `POST /data/buckets/{bucket}/storage/move` moves
   stored objects to where the rules send them now.
-- A target this node cannot serve is stored anyway, because the bucket record replicates to nodes
-  that may offer it, and comes back in `warnings`.
+- The rules are kept with the bucket on this node and apply only here. A target this node cannot
+  serve is stored anyway and comes back in `warnings`.
 
 **Limits**
 - Each rule target sets exactly one of `backend_id` or `class`.
@@ -547,8 +547,8 @@ pub async fn put_bucket_routing(
 **Behavior**
 - The default applies to every bucket of the group, ranks below that bucket's own rules and above
   the operator's node rules and the node's default backend.
-- Node-local read of the replicated group routing record; `default_target` is omitted when no
-  default is stored.
+- Reads this node's group routing record, which applies to buckets on this node only;
+  `default_target` is omitted when no default is stored.
 - `warnings` is advisory and is recomputed per request from the storage classes this node offers to
   tenants plus the backends the group registered, so it can differ between nodes for the same
   stored default."#,
@@ -610,8 +610,9 @@ pub async fn get_group_routing(
 - The default is weaker than any matching rule on an individual bucket.
 - It steers writes made after the change. `POST /data/buckets/{bucket}/storage/move` moves
   stored objects of a bucket to where the rules send them now.
-- A target this node cannot serve is stored anyway, because the record replicates to nodes that may
-  offer it, and comes back in `warnings`.
+- The group's storage, this default and its `bucket_template` are kept on the node that receives
+  the request and apply only to buckets created on that node. Other nodes keep their own settings.
+- A target this node cannot serve is stored anyway and comes back in `warnings`.
 - A group storage without a fixed bucket takes Aruna's own layout in `bucket`. The bucket is found or
   created and tested with a write and a delete before anything is stored; the storage then lists it
   as `default_bucket` in its `public_config`. A later request without `bucket` keeps that bucket.
