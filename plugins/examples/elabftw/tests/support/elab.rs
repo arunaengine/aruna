@@ -18,6 +18,17 @@ fn reply(status: u16, body: Value) -> Result<Reply> {
     })
 }
 
+/// An experiment as eLabFTW answers it: the body also as `body_html`, and the metadata decoded.
+fn whole(experiment: &Value) -> Value {
+    let mut answer = experiment.clone();
+    answer["body_html"] = experiment["body"].clone();
+    let metadata = experiment["metadata"]
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok());
+    answer["metadata_decoded"] = metadata.unwrap_or(Value::Null);
+    answer
+}
+
 /// An eLabFTW refusal: `ImproperActionException` answers 400 with its message.
 pub(super) fn refuse(message: &str) -> Result<Reply> {
     reply(
@@ -162,7 +173,7 @@ impl Inner {
                     ));
                 }
                 match self.experiments.get(&id) {
-                    Some(experiment) => reply(200, experiment.clone()),
+                    Some(experiment) => reply(200, whole(experiment)),
                     None => reply(
                         404,
                         json!({ "code": 404, "description": "Nothing to show with this id" }),
@@ -331,7 +342,8 @@ impl Inner {
             }
         }
         self.touch(id, SYNC_USER);
-        reply(200, json!({}))
+        // eLabFTW 6.0 answers a change with the whole experiment, body and metadata included.
+        reply(200, whole(&self.experiments[&id]))
     }
 }
 

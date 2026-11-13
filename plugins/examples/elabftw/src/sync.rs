@@ -57,13 +57,20 @@ pub struct Budget {
     pub step: Room,
 }
 
+/// The most one call moves: a request and a reply of up to 1 MiB each.
+const CALL: Room = Room {
+    calls: 1,
+    bytes: 2 << 20,
+};
+
 impl Default for Budget {
+    // A step keeps one call and about 1 MiB to save progress; a link also its first reads.
     fn default() -> Self {
         let room = |calls, bytes| Room { calls, bytes };
         Self {
             total: room(900, 15 << 20),
-            link: room(60, 5 << 20),
-            step: room(30, 2 << 20),
+            link: room(60, 6 << 20),
+            step: room(30, 3 << 20),
         }
     }
 }
@@ -118,9 +125,22 @@ impl<'a> Sync<'a> {
             && used.bytes.saturating_add(keep.bytes) <= total.bytes
     }
 
-    /// Room for one more step inside a link, or `Spent`.
+    /// Room for one more step inside a link, or `Spent`; checked before each call that may
+    /// move much, so a run always keeps the room to save its progress.
     fn step(&self) -> Result<()> {
         self.steps(0)
+    }
+
+    /// Room for a step and `calls` more calls of up to [`CALL`] each, or `Spent`.
+    fn reserve(&self, calls: u32) -> Result<()> {
+        let keep = Room {
+            calls: self.budget.step.calls.saturating_add(calls),
+            bytes: (self.budget.step.bytes).saturating_add(CALL.bytes * u64::from(calls)),
+        };
+        match self.room(keep) {
+            true => Ok(()),
+            false => Err(Fault::new(Kind::Spent, "the run's budget is used")),
+        }
     }
 
     /// Room for a step and `calls` more small calls, or `Spent`.
@@ -203,11 +223,9 @@ impl<'a> Sync<'a> {
                         return Ok(done);
                     }
                     Visit::Skip => {}
+                    Visit::Sync if !self.room(self.budget.link) => return Ok(done),
                     Visit::Sync if self.own_write(entry)? => {}
                     Visit::Sync => {
-                        if !self.room(self.budget.link) {
-                            return Ok(done);
-                        }
                         match self.experiment(entry.id, Mode::Quick) {
                             // Another run holds it, or the budget ran out: the next run goes on here.
                             Ok(Outcome::Skipped | Outcome::Spent) => return Ok(done),
@@ -542,6 +560,7 @@ impl<'a> Sync<'a> {
                     format!("Aruna write of {size} bytes"),
                 ));
             }
+            self.step()?;
             match self.host.patch(&dataset, &patch, &revision) {
                 Ok(next) => {
                     // Only this write moved the dataset, so the files read still hold.
@@ -613,6 +632,7 @@ impl<'a> Sync<'a> {
                         format!("dataset create of {size} bytes"),
                     ));
                 }
+                self.step()?;
                 self.host.create(&key, &entity, &key)?.resource
             }
         };
@@ -652,6 +672,7 @@ impl<'a> Sync<'a> {
                 ..Scan::default()
             },
         };
+        let read = !scan.done;
         while !scan.done {
             if let Err(fault) = self.step() {
                 self.save_scan(dataset, &mut scan)?;
@@ -661,6 +682,10 @@ impl<'a> Sync<'a> {
             scan.add(page.files);
             scan.done = page.cursor.is_none();
             scan.cursor = page.cursor;
+        }
+        // A finished scan is kept at once: a later step of the run may still stop it.
+        if read {
+            self.save_scan(dataset, &mut scan)?;
         }
         Ok(scan)
     }
@@ -733,7 +758,10 @@ impl<'a> Sync<'a> {
         let id = experiment.id;
         for field in &decision.to_elab {
             match field {
-                Field::Title => elab::patch(self.host, id, json!({ "title": aruna.title }))?,
+                Field::Title => {
+                    self.step()?;
+                    elab::patch(self.host, id, json!({ "title": aruna.title }))?;
+                }
                 Field::Tags => {
                     let wanted = decision.tags.as_ref().unwrap_or(&aruna.tags);
                     let added: Vec<&String> = (wanted.iter())
@@ -762,6 +790,7 @@ impl<'a> Sync<'a> {
                     };
                     let change =
                         json!({ "body": body.text, "content_type": body.format.content_type() });
+                    self.step()?;
                     elab::patch(self.host, id, change)?;
                 }
                 Field::Props | Field::Files | Field::Links => continue,
@@ -783,6 +812,7 @@ impl<'a> Sync<'a> {
                     // fields go as JSON text.
                     let fields = link_fields(self.settings, dataset, &links).to_string();
                     let merge = json!({ "metadatamerge": fields });
+                    self.step()?;
                     match elab::patch(self.host, id, merge) {
                         Err(fault) if fault.kind == Kind::Invalid => blocked = Some(fault.message),
                         other => other?,
@@ -790,6 +820,7 @@ impl<'a> Sync<'a> {
                 }
             }
         } else if decision.to_elab.contains(&Field::Links) {
+            self.step()?;
             elab::patch(
                 self.host,
                 id,
@@ -797,6 +828,7 @@ impl<'a> Sync<'a> {
             )?;
             self.sent(record, Field::Links)?;
         }
+        self.step()?;
         let after = elab::experiment(self.host, id)?;
         let after = after.ok_or_else(|| Fault::new(Kind::NotFound, "the experiment is gone"))?;
         if let Some(reason) = blocked {
@@ -889,7 +921,9 @@ impl<'a> Sync<'a> {
         }
         // The files are read before the create is reserved, so a run out of budget leaves no
         // reservation that would look like a create with an unknown outcome.
-        let scan = match self.scan(dataset, &summary.revision) {
+        // The create, its read-back and its write-back are reserved before the create is.
+        let scanned = self.scan(dataset, &summary.revision);
+        let scan = match scanned.and_then(|scan| self.reserve(3).map(|()| scan)) {
             Err(fault) if fault.kind == Kind::Spent => {
                 record
                     .link

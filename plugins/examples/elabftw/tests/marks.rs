@@ -7,6 +7,7 @@ mod support;
 
 use std::collections::BTreeSet;
 
+use aruna_plugins::limits::Limits;
 use elabftw_sync::compare::Snapshot;
 use elabftw_sync::host::{Host, Kind, Meter};
 use elabftw_sync::progress::{DAY_MS, MAX_VALUE, Mark, REPORT_BYTES, Record, store};
@@ -178,10 +179,16 @@ fn backlog_bounded() {
         assert!(runs < 100);
     }
     assert!(runs > 5, "the backlog took {runs} runs");
-    // The walk ended, so the next runs find nothing new.
-    runner.poll();
-    let cursor = runner.world.state("cursor").unwrap();
-    assert!(cursor.get("walk").is_none(), "{cursor}");
+    // The walk ends within a few more runs, and then the runs find nothing new.
+    let walking = |runner: &Runner| runner.world.state("cursor").unwrap().get("walk").is_some();
+    for _ in 0..10 {
+        if !walking(&runner) {
+            break;
+        }
+        runner.poll();
+        assert!(runner.used.get().calls <= 150);
+    }
+    assert!(!walking(&runner));
     assert_eq!(runner.poll()["synced"], 0);
 }
 
@@ -271,6 +278,51 @@ fn uploads_bounded() {
         assert!(runs < 30);
     }
     assert_eq!(runner.marks(id)["changed_in_storage"], json!(["upload 77"]));
+}
+
+#[test]
+fn host_ceiling_kept() {
+    // A scan of large file pages that ends anywhere near the budget's edge, then body, title and
+    // link writes whose eLabFTW answers hold the whole experiment: no run passes the budget,
+    // let alone the host's byte ceiling.
+    let (budget, ceiling) = (Budget::default(), Limits::default().bytes);
+    let body = |fill: &str| format!("<p>{}</p>", fill.repeat(400 << 10));
+    let note = "n".repeat(150 << 10);
+    let mut most = 0;
+    for files in (40..=100).step_by(4) {
+        let runner = Runner::new();
+        let id = runner.world.experiment("Run 7", &body("b"), &["aruna"]);
+        runner.poll();
+        let (dataset, _) = runner.world.only_dataset();
+        for file in 0..files {
+            let entity =
+                json!({ "@id": format!("raw/{file:03}.csv"), "@type": "File", "note": note });
+            runner.world.aruna_file(&dataset, entity);
+        }
+        runner
+            .world
+            .aruna_edit(&dataset, json!({ "name": "Renamed", "text": body("a") }));
+        runner.event(&dataset);
+        let used = runner.used.get().bytes;
+        assert!(
+            used <= budget.total.bytes && used < ceiling,
+            "{files} files: {used} bytes"
+        );
+        most = most.max(used);
+        let mut runs = 0;
+        while !runner.marks(id).is_null() {
+            runs += 1;
+            assert!(runs < 10, "{files} files: no progress");
+            runner.poll();
+            let used = runner.used.get().bytes;
+            assert!(
+                used <= budget.total.bytes,
+                "{files} files, a later run: {used} bytes"
+            );
+        }
+        assert_eq!(runner.world.get(id)["title"], "Renamed");
+    }
+    assert!(most > 10 << 20, "the runs went to the edge: {most} bytes");
 }
 
 #[test]
