@@ -160,10 +160,12 @@ def report(host, settings, start):
     cursor = dict(start or {"phase": "datasets", "page": None, "index": 0})
     marks, size = [], 2
     try:
-        while True:
+        while not host.late():
             items, after = page(host, settings, cursor)
             for index in range(cursor["index"], len(items)):
                 cursor["index"] = index
+                if host.late():
+                    raise Stop("the run's time is used up")
                 entry = describe(host, settings, cursor["phase"], items[index])
                 if entry is None:
                     continue
@@ -177,5 +179,6 @@ def report(host, settings, start):
                 cursor.update(phase="experiments", page=None, index=0)
             else:
                 return {"marks": marks, "next": None}
+        raise Stop("the run's time is used up")
     except Stop:
         return {"marks": marks, "next": cursor}

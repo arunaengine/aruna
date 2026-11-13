@@ -228,6 +228,21 @@ class WalkTests(unittest.TestCase):
         self.assertGreater(len(pages), 1)
         self.assertEqual(sorted(entry["experiment"] for entry in sum(pages, [])), list(range(1, 401)))
 
+    def test_report_time(self):
+        # Each host call takes a second here: every report page returns before 40 seconds pass.
+        for number in range(60):
+            self.host.make({"name": f"d{number}"})
+        self.host.tick = 1.0
+        entries, after = [], None
+        while True:
+            start = self.host.now
+            found = self.plugin.manual({"report": True, "next": after})
+            self.assertLessEqual(self.host.now - start, 42)
+            entries, after = entries + found["marks"], found["next"]
+            if after is None:
+                break
+        self.assertEqual(len(entries), 60)
+
     def test_report_enrolments(self):
         # Review r4: a create that committed before its ULID was saved, then a removed tag.
         self.team.add(1)
