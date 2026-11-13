@@ -200,7 +200,7 @@ fn blocked_until_changed() {
 fn readonly_one_way() {
     let runner = Runner::new();
     let id = runner.world.experiment("Run 7", "", &["aruna"]);
-    let canwrite = json!({ "base": 40, "users": [] }).to_string();
+    let canwrite = json!({ "teams": [], "teamgroups": [], "users": [] }).to_string();
     runner
         .world
         .edit(id, |experiment| experiment["canwrite"] = json!(canwrite));
@@ -225,6 +225,17 @@ fn readonly_one_way() {
         runner.world.dataset(&dataset).entity["creativeWorkStatus"],
         "Done"
     );
+
+    // Write access for the whole team comes from the top-level base.
+    runner
+        .world
+        .edit(id, |experiment| experiment["canwrite_base"] = json!(30));
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "name": "Team writable" }));
+    runner.event(&dataset);
+    assert_eq!(runner.world.get(id)["title"], "Team writable");
+    assert_eq!(runner.marks(id)["no_write"], Value::Null);
 }
 
 #[test]

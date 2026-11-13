@@ -195,6 +195,26 @@ impl Inner {
         if let Some((kind, false)) = outcome {
             return Err(fault(kind, "the request was not completed"));
         }
+        // `canread` and `canwrite` are typed strings; anything else is a PHP type error.
+        if ["canread", "canwrite"]
+            .iter()
+            .any(|key| body.get(key).is_some_and(|can| !can.is_string()))
+        {
+            let error =
+                json!({ "code": 500, "message": "Unexpected error", "description": "TypeError" });
+            return reply(500, error);
+        }
+        let base = |key: &str, default: u64| match body.get(key) {
+            None => Some(default),
+            Some(value) => value
+                .as_u64()
+                .filter(|base| [10, 20, 30, 40, 50].contains(base)),
+        };
+        let (Some(read_base), Some(write_base)) =
+            (base("canread_base", 30), base("canwrite_base", 20))
+        else {
+            return refuse("Invalid canwrite_base parameter");
+        };
         let id = self.experiments.keys().last().copied().unwrap_or(100) + 1;
         let html = body["content_type"] != 2;
         let text = body["body"].as_str().unwrap_or_default();
@@ -203,7 +223,8 @@ impl Inner {
             "id": id, "title": body["title"], "body": stored, "body_html": stored,
             "content_type": if html { 1 } else { 2 }, "date": "2026-11-13", "status_title": "Running",
             "fullname": "Sync User", "userid": SYNC_USER, "metadata": body["metadata"],
-            "canwrite": body["canwrite"], "state": 1, "is_pinned": 0,
+            "canread": body["canread"], "canread_base": read_base, "canwrite": body["canwrite"],
+            "canwrite_base": write_base, "state": 1, "is_pinned": 0,
         });
         self.experiments.insert(id, experiment);
         let tags: Vec<String> = body["tags"]
@@ -303,12 +324,12 @@ impl World {
     pub fn experiment(&self, title: &str, body: &str, tags: &[&str]) -> u64 {
         let mut inner = self.lock();
         let id = inner.experiments.keys().last().copied().unwrap_or(100) + 1;
-        let canwrite =
-            json!({ "base": 40, "teams": [], "teamgroups": [], "users": [SYNC_USER] }).to_string();
+        let canwrite = json!({ "teams": [], "teamgroups": [], "users": [SYNC_USER] }).to_string();
         let experiment = json!({
             "id": id, "title": title, "body": purify(body), "body_html": purify(body), "content_type": 1,
             "date": "2026-11-12", "status_title": "Running", "fullname": "Ada Person", "userid": PERSON,
-            "metadata": null, "canwrite": canwrite, "state": 1, "is_pinned": 0,
+            "metadata": null, "canread_base": 30, "canwrite": canwrite, "canwrite_base": 20,
+            "state": 1, "is_pinned": 0,
         });
         inner.experiments.insert(id, experiment);
         let tags: Vec<String> = tags.iter().map(|tag| tag.to_string()).collect();

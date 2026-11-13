@@ -302,6 +302,19 @@ fn aruna_dataset_creates() {
         .unwrap();
     let stored = runner.world.get(experiment);
     assert_eq!(stored["title"], "From Aruna");
+    // Read for the team, written by the owner and the configured writers.
+    assert_eq!(
+        (
+            stored["canread_base"].clone(),
+            stored["canwrite_base"].clone()
+        ),
+        (json!(30), json!(20))
+    );
+    let canwrite: Value = serde_json::from_str(stored["canwrite"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        canwrite,
+        json!({ "teams": [], "teamgroups": [4], "users": [3] })
+    );
     assert_eq!(stored["tags"], "x|aruna");
     let extra = runner.world.extra(experiment);
     let file = format!("https://portal.example.org/datasets/{dataset}/files/raw.csv");

@@ -15,6 +15,9 @@ pub const UPLOAD_PREFIX: &str = "elabftw/uploads/";
 pub const DATASET_FIELD: &str = "Aruna dataset";
 pub const ID_FIELD: &str = "Aruna dataset id";
 pub const FILES_FIELD: &str = "Aruna files";
+/// eLabFTW's `BasePermissions`: Full 50, Organization 40, Team 30, User 20, UserOnly 10.
+pub const BASE_TEAM: u64 = 30;
+pub const BASE_USER: u64 = 20;
 
 /// The install's settings; `bucket` is the node-scoped bucket path.
 #[derive(Clone, Debug, Deserialize)]
@@ -61,8 +64,8 @@ impl Settings {
         format!("{base}/experiments.php?mode=view&id={id}")
     }
 
-    /// The `canwrite` of experiments the plugin creates: the owner and the configured writers,
-    /// eLabFTW user ids or `group:<id>` for team groups.
+    /// The `canwrite` list of experiments the plugin creates, beside the base `User` (owner and
+    /// admins): the configured writers, eLabFTW user ids or `group:<id>` for team groups.
     pub fn canwrite(&self) -> Value {
         let entries = self.writers.split(',').map(str::trim);
         let mut users = Vec::new();
@@ -73,7 +76,7 @@ impl Settings {
                 None => users.extend(entry.parse::<u64>()),
             }
         }
-        json!({ "base": 40, "teams": [], "teamgroups": groups, "users": users })
+        json!({ "teams": [], "teamgroups": groups, "users": users })
     }
 }
 
@@ -162,6 +165,8 @@ pub struct Experiment {
     pub changed_by: u64,
     pub extra: Map<String, Value>,
     pub canwrite: Value,
+    /// eLabFTW's top-level `canwrite_base`; older answers keep `base` inside `canwrite`.
+    pub canwrite_base: Option<u64>,
     /// eLabFTW's `state`: 1 normal, 2 archived, 3 deleted.
     pub state: u64,
 }
@@ -247,19 +252,22 @@ impl Experiment {
                 .unwrap_or_default(),
             extra: extra.unwrap_or_default(),
             canwrite: embedded(json.get("canwrite")),
+            canwrite_base: json.get("canwrite_base").and_then(number),
             state: json.get("state").and_then(number).unwrap_or(1),
         })
     }
 
-    /// Whether the sync user may write: owner, a base that includes the team, or listed. A team
-    /// group may include it too, so it counts as allowed and a refused write marks the link.
+    /// Whether the sync user, a team member, may write: owner, a base of team or wider, or listed.
+    /// A team group may include it too, so it counts as allowed and a refused write marks the link.
     pub fn writable(&self, sync_user: u64) -> bool {
         let listed = |key: &str| self.canwrite.get(key).and_then(Value::as_array);
         let user = listed("users")
             .is_some_and(|users| (users.iter()).any(|user| number(user) == Some(sync_user)));
         let group = listed("teamgroups").is_some_and(|groups| !groups.is_empty());
-        let base = self.canwrite.get("base").and_then(number).unwrap_or(40);
-        self.owner_id == sync_user || base <= 30 || user || group
+        let base = (self.canwrite_base)
+            .or_else(|| self.canwrite.get("base").and_then(number))
+            .unwrap_or(BASE_USER);
+        self.owner_id == sync_user || base >= BASE_TEAM || user || group
     }
 
     fn field(&self, name: &str) -> Option<&Value> {
@@ -529,14 +537,44 @@ mod tests {
 
     #[test]
     fn write_access() {
-        let refused = experiment(json!({ "base": 40, "users": [3] }), json!({}));
+        let refused = experiment(json!({ "base": 20, "users": [3] }), json!({}));
         assert!(!refused.writable(7));
-        assert!(experiment(json!({ "base": 40, "users": ["7"] }), json!({})).writable(7));
+        assert!(experiment(json!({ "base": 10, "users": ["7"] }), json!({})).writable(7));
         assert!(experiment(json!({ "base": 30 }), json!({})).writable(7));
-        assert!(experiment(json!({ "base": 40, "teamgroups": [4] }), json!({})).writable(7));
+        assert!(experiment(json!({ "base": 40 }), json!({})).writable(7));
+        assert!(experiment(json!({ "base": 20, "teamgroups": [4] }), json!({})).writable(7));
+        assert!(
+            !experiment(json!({}), json!({})).writable(7),
+            "the default base is User"
+        );
         assert_eq!(
             settings().canwrite(),
-            json!({ "base": 40, "teams": [], "teamgroups": [4], "users": [3] })
+            json!({ "teams": [], "teamgroups": [4], "users": [3] })
+        );
+    }
+
+    #[test]
+    fn current_answer() {
+        // An answer of eLabFTW 6.0.9: the base is the top-level `canwrite_base`.
+        let answer: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/experiment.json")).unwrap();
+        let parsed = Experiment::parse(&answer).unwrap();
+        assert_eq!((parsed.id, parsed.canwrite_base), (12, Some(BASE_TEAM)));
+        assert!(parsed.writable(7), "a team-writable experiment");
+        let mut owner_only = answer.clone();
+        owner_only["canwrite_base"] = json!(BASE_USER);
+        assert!(!Experiment::parse(&owner_only).unwrap().writable(7));
+        assert_eq!(
+            parsed.tags,
+            BTreeMap::from([("aruna".into(), 3), ("pcr".into(), 7)])
+        );
+        assert_eq!(
+            parsed.linked().as_deref(),
+            Some("01JC0000000000000000000001")
+        );
+        assert_eq!(
+            (parsed.status.as_str(), parsed.owner.as_str()),
+            ("Running", "Ada Person")
         );
     }
 

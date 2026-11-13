@@ -17,8 +17,9 @@ use crate::progress::{
     failed_page, link_key, link_page, load, report, store,
 };
 use crate::values::{
-    Experiment, Field, ID_FIELD, Settings, UPLOAD_PREFIX, Upload, Values, dataset_entity,
-    dataset_patch, dataset_values, field_update, identified, identifier, link_fields, merge_file,
+    BASE_TEAM, BASE_USER, Experiment, Field, ID_FIELD, Settings, UPLOAD_PREFIX, Upload, Values,
+    dataset_entity, dataset_patch, dataset_values, field_update, identified, identifier,
+    link_fields, merge_file,
 };
 
 /// Links one run syncs at most, so a run stays well inside 1000 host calls and 60 s.
@@ -695,7 +696,9 @@ impl<'a> Sync<'a> {
             "content_type": values.body.format.content_type(),
             "tags": tags,
             "metadata": link_fields(self.settings, dataset, &links).to_string(),
-            "canread": json!({ "base": 30, "teams": [], "teamgroups": [], "users": [] }).to_string(),
+            "canread_base": BASE_TEAM,
+            "canread": json!({ "teams": [], "teamgroups": [], "users": [] }).to_string(),
+            "canwrite_base": BASE_USER,
             "canwrite": self.settings.canwrite().to_string(),
         });
         let key = format!("experiment/{dataset}/{}", record.link.attempt);
