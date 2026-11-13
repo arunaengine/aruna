@@ -320,6 +320,7 @@ class Link:
             self.wrote = True
         for tag in removes:
             after = elab.remove_tag(self.host, self.number, tag)
+            self.wrote = True
         return after or elab.call(self.host, "GET", str(self.number))
 
     def extras(self, found, revision, doc):
