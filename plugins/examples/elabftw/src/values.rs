@@ -14,7 +14,6 @@ use crate::body::{Body, Format};
 pub const UPLOAD_PREFIX: &str = "elabftw/uploads/";
 pub const DATASET_FIELD: &str = "Aruna dataset";
 pub const ID_FIELD: &str = "Aruna dataset id";
-pub const FILES_FIELD: &str = "Aruna files";
 /// eLabFTW's `BasePermissions`: Full 50, Organization 40, Team 30, User 20, UserOnly 10.
 pub const BASE_TEAM: u64 = 30;
 pub const BASE_USER: u64 = 20;
@@ -55,10 +54,6 @@ impl Settings {
         )
     }
 
-    pub fn file_url(&self, dataset: &str, id: &str) -> String {
-        format!("{}/files/{id}", self.dataset_url(dataset))
-    }
-
     pub fn experiment_url(&self, id: u64) -> String {
         let base = self.elab_url.trim_end_matches('/');
         format!("{base}/experiments.php?mode=view&id={id}")
@@ -81,7 +76,7 @@ impl Settings {
 }
 
 /// The synced fields. Title, tags and body go both ways, properties and files from eLabFTW to
-/// Aruna, and links to Aruna's other files from Aruna to eLabFTW.
+/// Aruna.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Field {
@@ -90,7 +85,6 @@ pub enum Field {
     Body,
     Props,
     Files,
-    Links,
 }
 
 impl Field {
@@ -101,7 +95,6 @@ impl Field {
             Self::Body => "body",
             Self::Props => "props",
             Self::Files => "files",
-            Self::Links => "links",
         }
     }
 
@@ -109,13 +102,12 @@ impl Field {
         Self::ALL.into_iter().find(|field| field.name() == name)
     }
 
-    pub const ALL: [Field; 6] = [
+    pub const ALL: [Field; 5] = [
         Self::Title,
         Self::Tags,
         Self::Body,
         Self::Props,
         Self::Files,
-        Self::Links,
     ];
 }
 
@@ -136,7 +128,7 @@ pub struct FileFacts {
     pub hash: String,
 }
 
-/// One side's values. Files and links are `None` when this run did not read them.
+/// One side's values. Files are `None` when this run did not read them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Values {
     pub title: String,
@@ -146,7 +138,6 @@ pub struct Values {
     pub description: Option<String>,
     pub props: Props,
     pub files: Option<BTreeMap<String, FileFacts>>,
-    pub links: Option<BTreeSet<String>>,
 }
 
 /// One experiment as `GET /experiments/{id}` answers it.
@@ -280,9 +271,9 @@ impl Experiment {
         (!id.is_empty()).then_some(id)
     }
 
-    /// Whether one of the three link fields is gone, so they must be created again.
+    /// Whether one of the two link fields is gone, so they must be created again.
     pub fn missing_fields(&self) -> bool {
-        [DATASET_FIELD, ID_FIELD, FILES_FIELD]
+        [DATASET_FIELD, ID_FIELD]
             .iter()
             .any(|name| !self.extra.contains_key(*name))
     }
@@ -290,14 +281,12 @@ impl Experiment {
     /// A link field name a user field of another type already uses.
     pub fn clashing_field(&self) -> Option<&'static str> {
         let kind = |name: &str| self.extra.get(name).map(|field| text(field.get("type")));
-        [
-            (DATASET_FIELD, "url"),
-            (ID_FIELD, "text"),
-            (FILES_FIELD, "url"),
-        ]
-        .into_iter()
-        .find(|(name, wanted)| kind(name).is_some_and(|kind| !kind.is_empty() && kind != *wanted))
-        .map(|(name, _)| name)
+        [(DATASET_FIELD, "url"), (ID_FIELD, "text")]
+            .into_iter()
+            .find(|(name, wanted)| {
+                kind(name).is_some_and(|kind| !kind.is_empty() && kind != *wanted)
+            })
+            .map(|(name, _)| name)
     }
 
     /// The experiment's values; the sync tag is membership, not a keyword.
@@ -330,7 +319,6 @@ impl Experiment {
                 owner: self.owner.clone(),
             },
             files,
-            links: Some(strings(self.field(FILES_FIELD)).into_iter().collect()),
         }
     }
 }
@@ -362,31 +350,20 @@ impl Upload {
     }
 }
 
-/// The dataset's values from its summary and, when read, all its file entities.
-pub fn dataset_values(
-    json: &Value,
-    files: Option<&[Value]>,
-    dataset: &str,
-    settings: &Settings,
-) -> Values {
+/// The dataset's values from its summary and, when read, the plugin's own file entities.
+pub fn dataset_values(json: &Value, files: Option<&[Value]>) -> Values {
     let format = Format::from_mime(&text(json.get("encodingFormat")));
     let mut ours = BTreeMap::new();
-    let mut links = BTreeSet::new();
     for file in files.unwrap_or_default() {
         let id = text(file.get("@id"));
-        match id.strip_prefix(UPLOAD_PREFIX) {
-            Some(_) => {
-                let facts = FileFacts {
-                    name: text(file.get("name")),
-                    url: text(file.get("contentUrl")),
-                    size: text(file.get("contentSize")),
-                    hash: text(file.get("sha256")),
-                };
-                ours.insert(id, facts);
-            }
-            None => {
-                links.insert(settings.file_url(dataset, &id));
-            }
+        if id.starts_with(UPLOAD_PREFIX) {
+            let facts = FileFacts {
+                name: text(file.get("name")),
+                url: text(file.get("contentUrl")),
+                size: text(file.get("contentSize")),
+                hash: text(file.get("sha256")),
+            };
+            ours.insert(id, facts);
         }
     }
     Values {
@@ -400,7 +377,6 @@ pub fn dataset_values(
             owner: text(json.get("author")),
         },
         files: files.map(|_| ours),
-        links: files.map(|_| links),
     }
 }
 
@@ -450,7 +426,7 @@ pub fn dataset_patch(values: &Values, fields: &[Field]) -> Value {
                 put("dateCreated", json!(values.props.date));
                 put("author", json!(values.props.owner));
             }
-            Field::Files | Field::Links => {}
+            Field::Files => {}
         }
     }
     Value::Object(patch)
@@ -472,8 +448,9 @@ pub fn merge_file(existing: Option<&Value>, id: &str, facts: &FileFacts) -> Valu
     Value::Object(entity)
 }
 
-/// The three link fields, in the form `metadata` or `metadatamerge` creates them.
-pub fn link_fields(settings: &Settings, dataset: &str, files: &BTreeSet<String>) -> Value {
+/// The two link fields, in the form `metadata` or `metadatamerge` creates them. Their size does
+/// not depend on the dataset's files: the dataset's portal page lists those.
+pub fn link_fields(settings: &Settings, dataset: &str) -> Value {
     json!({ "extra_fields": {
         DATASET_FIELD: {
             "type": "url",
@@ -481,18 +458,7 @@ pub fn link_fields(settings: &Settings, dataset: &str, files: &BTreeSet<String>)
             "description": "Set by elabftw-sync",
         },
         ID_FIELD: { "type": "text", "value": dataset },
-        FILES_FIELD: { "type": "url", "allow_multi_values": true, "value": files },
     } })
-}
-
-/// The `updatemetadatafield` request that sets the link values; empty values end a link.
-pub fn field_update(settings: &Settings, dataset: Option<&str>, files: &BTreeSet<String>) -> Value {
-    json!({
-        "action": "updatemetadatafield",
-        DATASET_FIELD: dataset.map(|dataset| settings.dataset_url(dataset)).unwrap_or_default(),
-        ID_FIELD: dataset.unwrap_or_default(),
-        FILES_FIELD: files,
-    })
 }
 
 #[cfg(test)]
@@ -580,22 +546,20 @@ mod tests {
 
     #[test]
     fn clashing_fields() {
-        let clash = json!({ "extra_fields": { FILES_FIELD: { "type": "text", "value": "" } } });
+        let clash = json!({ "extra_fields": { DATASET_FIELD: { "type": "text", "value": "" } } });
         assert_eq!(
             experiment(json!({}), clash).clashing_field(),
-            Some(FILES_FIELD)
+            Some(DATASET_FIELD)
         );
-        let ours = link_fields(&settings(), "01J", &BTreeSet::new());
+        let ours = link_fields(&settings(), "01J");
         let parsed = experiment(json!({}), ours);
         assert_eq!(
             (parsed.clashing_field(), parsed.missing_fields()),
             (None, false)
         );
-        let update = field_update(&settings(), None, &BTreeSet::new());
-        assert_eq!(
-            update,
-            json!({ "action": "updatemetadatafield", DATASET_FIELD: "", ID_FIELD: "", FILES_FIELD: [] })
-        );
+        // A field an earlier build wrote is neither needed nor a clash.
+        let earlier = json!({ "extra_fields": { "Aruna files": { "type": "url", "value": [] } } });
+        assert_eq!(experiment(json!({}), earlier).clashing_field(), None);
     }
 
     #[test]
@@ -606,16 +570,18 @@ mod tests {
             json!({ "@id": "elabftw/uploads/4", "name": "a", "contentUrl": "/p", "contentSize": "3", "sha256": "h" }),
             json!({ "@id": "raw.csv" }),
         ];
-        let values = dataset_values(&entity, Some(&files), "01J", &settings);
+        let values = dataset_values(&entity, Some(&files));
         assert_eq!(
             values.tags,
             BTreeSet::from(["one".to_string()]),
             "JSON-LD gives a list of one as a string"
         );
         assert_eq!(values.body.format, Format::Markdown);
-        assert_eq!(values.files.unwrap()["elabftw/uploads/4"].size, "3");
-        let link = "https://portal.example.org/datasets/01J/files/raw.csv".to_string();
-        assert_eq!(values.links, Some(BTreeSet::from([link])));
+        let files = values.files.unwrap();
+        assert_eq!(
+            (files.len(), files["elabftw/uploads/4"].size.as_str()),
+            (1, "3")
+        );
         assert_eq!(settings.uploads(), "/r/g/lab/data/n/b/");
         let patch = dataset_patch(&Values::default(), &[Field::Title, Field::Tags]);
         assert_eq!(

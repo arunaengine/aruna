@@ -398,8 +398,9 @@ async fn guest_syncs_both() {
         guest.world.dataset(&dataset).entity["text"],
         "<p>b<br />c</p>"
     );
-    let link = format!("https://portal.example.org/datasets/{dataset}/files/raw.csv");
-    assert_eq!(guest.world.extra(id)["Aruna files"]["value"], json!([link]));
+    let extra = guest.world.extra(id);
+    let names: Vec<&String> = extra.keys().collect();
+    assert_eq!(names, ["Aruna dataset", "Aruna dataset id"], "no file list");
 
     // eLabFTW to Aruna; the plugin's own writes are skipped on the way back.
     guest.world.edit(id, |experiment| {
@@ -577,11 +578,11 @@ async fn guest_marks_problems() {
     // A user field of another type blocks the link fields.
     let clash = guest.world.experiment("Clash", "", &["aruna"]);
     guest.world.edit(clash, |experiment| {
-        let field = json!({ "extra_fields": { "Aruna files": { "type": "text", "value": "" } } });
+        let field = json!({ "extra_fields": { "Aruna dataset": { "type": "text", "value": "" } } });
         experiment["metadata"] = json!(field.to_string());
     });
     guest.manual(json!({ "experiment": clash })).await;
-    assert_eq!(guest.marks(clash)["blocked"][0], "Aruna files");
+    assert_eq!(guest.marks(clash)["blocked"][0], "Aruna dataset");
 }
 
 #[tokio::test]

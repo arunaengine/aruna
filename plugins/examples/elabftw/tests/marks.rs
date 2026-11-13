@@ -89,13 +89,7 @@ fn files_merge_annotations() {
         (file["license"].clone(), file["comment"].clone()),
         (json!("CC-BY-4.0"), json!("checked"))
     );
-    let links = runner.world.extra(id)["Aruna files"]["value"].clone();
-    assert_eq!(
-        links,
-        json!([format!(
-            "https://portal.example.org/datasets/{dataset}/files/raw.csv"
-        )])
-    );
+    assert!(runner.world.extra(id).get("Aruna files").is_none());
     assert_eq!(runner.world.get(id)["tags"], "aruna|k");
 
     // A deleted upload leaves the dataset; Aruna's own file stays.
@@ -227,9 +221,52 @@ fn file_pages_resume() {
         );
         assert!(runs < 40);
     }
-    let links = runner.world.extra(id)["Aruna files"]["value"].clone();
-    assert_eq!(links.as_array().unwrap().len(), 240);
+    assert!(runner.world.extra(id).get("Aruna files").is_none());
     assert!(runs > 2, "{runs} runs");
+}
+
+#[test]
+fn experiment_stays_small() {
+    // 6000 other files with long ids: nothing about them goes into the experiment, so every
+    // eLabFTW answer stays far below the per-call bound and title and body keep syncing.
+    let runner = Runner::new();
+    let id = runner.world.experiment("Run 7", "<p>a</p>", &["aruna"]);
+    runner.poll();
+    let (dataset, _) = runner.world.only_dataset();
+    for n in 0..6000 {
+        let file = format!("measurements/run-2026-11-13/sample-{n:05}/raw-data.csv");
+        runner
+            .world
+            .aruna_file(&dataset, json!({ "@id": file, "@type": "File" }));
+    }
+    runner.world.lock().file_page = 200;
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "name": "Renamed", "text": "<p>b</p>" }));
+    runner.event(&dataset);
+    let mut runs = 0;
+    while !runner.marks(id).is_null() {
+        runner.poll();
+        runs += 1;
+        assert!(runs < 20, "{}", runner.marks(id));
+    }
+    let experiment = runner.world.get(id);
+    assert_eq!(
+        (experiment["title"].clone(), experiment["body"].clone()),
+        (json!("Renamed"), json!("<p>b</p>"))
+    );
+    let metadata = experiment["metadata"].as_str().unwrap().len();
+    assert!(metadata < 1024, "the metadata holds {metadata} bytes");
+
+    // Later edits on both sides still sync.
+    runner
+        .world
+        .edit(id, |experiment| experiment["title"] = json!("From eLabFTW"));
+    runner.poll();
+    assert_eq!(
+        runner.world.dataset(&dataset).entity["name"],
+        "From eLabFTW"
+    );
 }
 
 #[test]

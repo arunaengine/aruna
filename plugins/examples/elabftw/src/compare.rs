@@ -75,8 +75,6 @@ pub struct Side {
     pub props: Print,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Print>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub links: Option<Print>,
 }
 
 impl Side {
@@ -111,9 +109,6 @@ impl Side {
         if let (true, Some(files)) = (take(Field::Files), &values.files) {
             self.files = Some(Print::json(files));
         }
-        if let (true, Some(links)) = (take(Field::Links), &values.links) {
-            self.links = Some(Print::json(links));
-        }
     }
 
     /// Takes the prints of `fields` from `other`; every other field keeps its base.
@@ -132,7 +127,6 @@ impl Side {
                 }
                 Field::Props => self.props = other.props.clone(),
                 Field::Files => self.files = other.files.clone(),
-                Field::Links => self.links = other.links.clone(),
             }
         }
     }
@@ -145,7 +139,6 @@ impl Side {
             Field::Body => Some(&self.body),
             Field::Props => Some(&self.props),
             Field::Files => self.files.as_ref(),
-            Field::Links => self.links.as_ref(),
         }
     }
 
@@ -160,10 +153,6 @@ impl Side {
                 .files
                 .as_ref()
                 .is_some_and(|files| self.files != Some(Print::json(files))),
-            Field::Links => values
-                .links
-                .as_ref()
-                .is_some_and(|links| self.links != Some(Print::json(links))),
         }
     }
 
@@ -238,7 +227,6 @@ pub fn same(field: Field, elab: &Values, aruna: &Values) -> bool {
         }
         Field::Props => elab.props == aruna.props,
         Field::Files => elab.files.is_none() || aruna.files.is_none() || elab.files == aruna.files,
-        Field::Links => elab.links.is_none() || aruna.links.is_none() || elab.links == aruna.links,
     }
 }
 
@@ -256,8 +244,7 @@ pub fn decide(
         let force = forced.and_then(|(origin, fields)| fields.contains(&field).then_some(origin));
         match (field, force) {
             (Field::Props | Field::Files, _) if differ => decision.to_aruna.push(field),
-            (Field::Links, _) if differ => decision.to_elab.push(field),
-            (Field::Props | Field::Files | Field::Links, _) => {}
+            (Field::Props | Field::Files, _) => {}
             (_, Some(Origin::Elabftw)) if differ => decision.to_aruna.push(field),
             (_, Some(Origin::Aruna)) if differ => decision.to_elab.push(field),
             (_, Some(_)) => {}
@@ -440,14 +427,12 @@ mod tests {
     fn one_way_fields() {
         let mut elab = values("T", &["a"], "<p>x</p>");
         elab.props.status = "Done".into();
-        elab.links = Some(BTreeSet::new());
         let mut other = aruna("T", &["a"], "<p>x</p>");
-        other.links = Some(["https://p/f".to_string()].into());
         other.props.status = "Edited in Aruna".into();
         let decision = decide(&base(), &elab, &other, None);
         assert_eq!(
             (decision.to_aruna, decision.to_elab),
-            (vec![Field::Props], vec![Field::Links])
+            (vec![Field::Props], vec![])
         );
         assert!(Print::of(b"abc").short().starts_with("3:ba7816bf8f01"));
     }

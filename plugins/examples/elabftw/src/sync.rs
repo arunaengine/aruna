@@ -19,8 +19,7 @@ use crate::progress::{
 };
 use crate::values::{
     BASE_TEAM, BASE_USER, Experiment, Field, ID_FIELD, Settings, UPLOAD_PREFIX, Upload, Values,
-    dataset_entity, dataset_patch, dataset_values, field_update, identified, identifier,
-    link_fields, merge_file,
+    dataset_entity, dataset_patch, dataset_values, identified, identifier, link_fields, merge_file,
 };
 
 const RETRY_MS: u64 = 15 * 60 * 1000;
@@ -454,7 +453,7 @@ impl<'a> Sync<'a> {
             false => None,
         };
         let files = scan.as_ref().map(Scan::files);
-        let aruna = dataset_values(&summary.json, files.as_deref(), &dataset, self.settings);
+        let aruna = dataset_values(&summary.json, files.as_deref());
         let snapshot = (record.link.snapshot.clone()).unwrap_or_else(|| Snapshot::agreed(&aruna));
         let forced = record.link.force.clone();
         let forced = forced
@@ -847,16 +846,10 @@ impl<'a> Sync<'a> {
                         sent.body = Some((Print::body(&stored), Print::raw(&stored)));
                     }
                 }
-                Field::Props | Field::Files | Field::Links => continue,
+                Field::Props | Field::Files => continue,
             }
             self.sent(record, *field)?;
         }
-        let links = aruna.links.clone().unwrap_or_else(|| {
-            experiment
-                .values(None, self.settings)
-                .links
-                .unwrap_or_default()
-        });
         let mut blocked = None;
         if fields_missing {
             match experiment.clashing_field() {
@@ -864,7 +857,7 @@ impl<'a> Sync<'a> {
                 None => {
                     // eLabFTW casts each value of an ordinary update to a string, so the
                     // fields go as JSON text.
-                    let fields = link_fields(self.settings, dataset, &links).to_string();
+                    let fields = link_fields(self.settings, dataset).to_string();
                     let merge = json!({ "metadatamerge": fields });
                     self.step()?;
                     match elab::patch(self.host, id, merge) {
@@ -873,14 +866,6 @@ impl<'a> Sync<'a> {
                     }
                 }
             }
-        } else if decision.to_elab.contains(&Field::Links) {
-            self.step()?;
-            elab::patch(
-                self.host,
-                id,
-                field_update(self.settings, Some(dataset), &links),
-            )?;
-            self.sent(record, Field::Links)?;
         }
         self.step()?;
         let after = elab::experiment(self.host, id)?;
@@ -929,7 +914,7 @@ impl<'a> Sync<'a> {
         scan: &mut Scan,
         mut revision: String,
     ) -> Result<String> {
-        let current = dataset_values(&Value::Null, Some(&scan.files()), dataset, self.settings);
+        let current = dataset_values(&Value::Null, Some(&scan.files()));
         let current = current.files.unwrap_or_default();
         let wanted = elab.files.clone().unwrap_or_default();
         for (id, facts) in &wanted {
@@ -1005,10 +990,9 @@ impl<'a> Sync<'a> {
             Err(fault) if fault.kind == Kind::Conflict => return Ok(Outcome::Skipped),
             other => other?,
         }
-        let values = dataset_values(&summary.json, Some(&scan.files()), dataset, self.settings);
+        let values = dataset_values(&summary.json, Some(&scan.files()));
         let mut tags: Vec<&String> = values.tags.iter().collect();
         tags.push(&self.settings.tag);
-        let links = values.links.clone().unwrap_or_default();
         // A dataset with only a plain text description starts the body from it.
         let text = match (values.body.text.as_str(), values.description.as_deref()) {
             ("", Some(plain)) if !plain.is_empty() => Body::from_plain(plain, values.body.format),
@@ -1019,7 +1003,7 @@ impl<'a> Sync<'a> {
             "body": text.text,
             "content_type": text.format.content_type(),
             "tags": tags,
-            "metadata": link_fields(self.settings, dataset, &links).to_string(),
+            "metadata": link_fields(self.settings, dataset).to_string(),
             "canread_base": BASE_TEAM,
             "canread": json!({ "teams": [], "teamgroups": [], "users": [] }).to_string(),
             "canwrite_base": BASE_USER,
@@ -1310,6 +1294,5 @@ fn copy(field: Field, from: &Values, to: &mut Values) {
         }
         Field::Props => to.props = from.props.clone(),
         Field::Files => to.files = from.files.clone(),
-        Field::Links => to.links = from.links.clone(),
     }
 }

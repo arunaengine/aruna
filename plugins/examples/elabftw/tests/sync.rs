@@ -50,7 +50,8 @@ fn enrols_tagged_experiment() {
         extra["Aruna dataset"]["value"],
         format!("https://portal.example.org/datasets/{dataset}")
     );
-    assert_eq!(extra["Aruna files"]["value"], json!([]));
+    let names: Vec<&String> = extra.keys().collect();
+    assert_eq!(names, ["Aruna dataset", "Aruna dataset id"]);
 
     // Nothing changed, so a second pass writes nothing on either side.
     let (revision, modified) = (stored.revision, runner.world.get(id)["modified_at"].clone());
@@ -83,13 +84,13 @@ fn link_fields_repaired() {
     // A person deletes a link field; the next sync of the experiment creates it again.
     runner.world.edit(id, |experiment| {
         let mut extra = extra_fields(experiment);
-        extra.remove("Aruna files");
+        extra.remove("Aruna dataset id");
         experiment["metadata"] = json!(json!({ "extra_fields": extra }).to_string());
         experiment["title"] = json!("Run 8");
     });
     runner.poll();
     let extra = runner.world.extra(id);
-    assert_eq!(extra["Aruna files"]["value"], json!([]));
+    assert_eq!(extra["Aruna dataset id"]["value"], json!(dataset));
     assert_eq!(extra["Sample"]["value"], "S1");
     assert_eq!(runner.marks(id), Value::Null);
 }
@@ -384,9 +385,14 @@ fn aruna_dataset_creates() {
         json!({ "teams": [], "teamgroups": [4], "users": [3] })
     );
     assert_eq!(stored["tags"], "x|aruna");
+    // The dataset's own file is not listed; the dataset link leads to it.
     let extra = runner.world.extra(experiment);
-    let file = format!("https://portal.example.org/datasets/{dataset}/files/raw.csv");
-    assert_eq!(extra["Aruna files"]["value"], json!([file]));
+    let names: Vec<&String> = extra.keys().collect();
+    assert_eq!(
+        names,
+        ["Aruna dataset", "Aruna dataset id"],
+        "two fields of constant size"
+    );
     // eLabFTW's filtered body comes back as the text, with the description and the identifier.
     let entity = runner.world.dataset(&dataset).entity;
     assert_eq!(entity["text"], "<p>a<br />b</p>");
