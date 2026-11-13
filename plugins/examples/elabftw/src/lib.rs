@@ -5,6 +5,7 @@
 
 pub mod body;
 pub mod compare;
+pub mod elab;
 pub mod host;
 pub mod progress;
 pub mod values;

@@ -1,5 +1,5 @@
 //! Sync progress in plugin state: link records with their reservations and marks, the link and
-//! mark indexes, and the paged mark report.
+//! mark indexes, the quick pass cursor, the full pass position and the paged mark report.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -418,4 +418,191 @@ pub fn report(host: &dyn Host, after: u64) -> Result<Value> {
         }
     }
     Ok(answer)
+}
+
+/// The quick pass cursor: the newest `modified_at` handled and the ids seen at exactly that
+/// time, so equal timestamps are neither skipped nor repeated.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cursor {
+    pub modified: String,
+    pub ids: BTreeSet<u64>,
+    /// The next mark page whose failed links are retried.
+    #[serde(default)]
+    pub retry_page: u64,
+}
+
+/// One entry of an experiment listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listed {
+    pub id: u64,
+    pub modified: String,
+    pub pinned: bool,
+    pub changed_by: u64,
+}
+
+impl Cursor {
+    pub fn newer(&self, modified: &str, id: u64) -> bool {
+        modified > self.modified.as_str() || (modified == self.modified && !self.ids.contains(&id))
+    }
+
+    pub fn advance(&mut self, modified: &str, id: u64) {
+        if modified > self.modified.as_str() {
+            self.modified = modified.to_string();
+            self.ids.clear();
+        }
+        if modified == self.modified {
+            self.ids.insert(id);
+        }
+    }
+
+    /// Walks pages sorted by `modified_at`, newest first, and returns the entries newer than
+    /// the cursor, oldest first. Pinned entries lead every listing, so only an unpinned entry
+    /// that is not newer ends the walk.
+    pub fn walk(&self, mut page: impl FnMut(u64) -> Result<Vec<Listed>>) -> Result<Vec<Listed>> {
+        let mut found: BTreeMap<u64, Listed> = BTreeMap::new();
+        let mut offset = 0;
+        loop {
+            let entries = page(offset)?;
+            if entries.is_empty() {
+                break;
+            }
+            offset += entries.len() as u64;
+            let mut done = false;
+            for entry in entries {
+                if self.newer(&entry.modified, entry.id) {
+                    found.insert(entry.id, entry);
+                } else if !entry.pinned {
+                    done = true;
+                    break;
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        let mut entries: Vec<Listed> = found.into_values().collect();
+        entries.sort_by(|left, right| (&left.modified, left.id).cmp(&(&right.modified, right.id)));
+        Ok(entries)
+    }
+}
+
+/// Where the full reconciliation stands. It walks the tagged experiments by id, then the link
+/// index for links whose experiment lost its tag, a chunk per run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pass {
+    /// The start time of the current or last pass; links it checked carry it.
+    pub id: u64,
+    pub phase: Phase,
+    pub offset: u64,
+    pub counts: BTreeMap<Mark, u64>,
+    pub finished: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    #[default]
+    Idle,
+    Experiments,
+    Links,
+}
+
+impl Pass {
+    pub fn due(&self, now: u64) -> bool {
+        self.phase == Phase::Idle && now >= self.finished.saturating_add(DAY_MS)
+    }
+
+    pub fn start(&mut self, now: u64) {
+        *self = Self {
+            id: now.max(self.id + 1),
+            phase: Phase::Experiments,
+            finished: self.finished,
+            ..Self::default()
+        };
+    }
+
+    /// The one log line of a finished pass: counts per kind.
+    pub fn summary(&self) -> String {
+        let counts = serde_json::to_string(&self.counts).unwrap_or_default();
+        format!("full reconciliation finished, marks found: {counts}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: u64, modified: &str, pinned: bool) -> Listed {
+        Listed {
+            id,
+            modified: modified.into(),
+            pinned,
+            changed_by: 2,
+        }
+    }
+
+    #[test]
+    fn walk_skips_pinned() {
+        let cursor = Cursor {
+            modified: "10:00".into(),
+            ids: [4].into(),
+            retry_page: 0,
+        };
+        let pages = [
+            vec![entry(1, "09:00", true), entry(2, "10:05", false)],
+            vec![
+                entry(3, "10:00", false),
+                entry(4, "10:00", false),
+                entry(5, "09:59", false),
+            ],
+            vec![entry(6, "11:00", false)],
+        ];
+        let mut offsets = Vec::new();
+        let found = cursor.walk(|offset| {
+            offsets.push(offset);
+            Ok(pages.get(offsets.len() - 1).cloned().unwrap_or_default())
+        });
+        let ids: Vec<u64> = found.unwrap().iter().map(|entry| entry.id).collect();
+        // The pinned old entry does not end the walk; id 3 shares the cursor's time but is new.
+        assert_eq!(ids, [3, 2]);
+        assert_eq!(offsets, [0, 2]);
+    }
+
+    #[test]
+    fn walk_shifted_pages() {
+        // An entry edited during the walk moves to the first page and shows up again later.
+        let cursor = Cursor::default();
+        let pages = [
+            vec![entry(1, "10:02", false), entry(2, "10:01", false)],
+            vec![entry(1, "10:03", false), entry(3, "10:00", false)],
+        ];
+        let mut calls = 0;
+        let found = cursor.walk(|_| {
+            calls += 1;
+            Ok(pages.get(calls - 1).cloned().unwrap_or_default())
+        });
+        let ids: Vec<u64> = found.unwrap().iter().map(|entry| entry.id).collect();
+        assert_eq!(ids, [3, 2, 1]);
+        let mut cursor = Cursor::default();
+        cursor.advance("10:00", 3);
+        cursor.advance("10:00", 4);
+        cursor.advance("09:00", 9);
+        assert_eq!((cursor.modified.as_str(), cursor.ids.len()), ("10:00", 2));
+        assert!(!cursor.newer("10:00", 4) && cursor.newer("10:00", 5));
+    }
+
+    #[test]
+    fn reservations_and_passes() {
+        let held = Reservation::new(Reserved::Change, "a", 1_000);
+        assert!(held.busy("b", 1_000 + STALE_MS - 1));
+        assert!(!held.busy("b", 1_000 + STALE_MS));
+        assert!(!held.busy("a", 1_000), "a rerun of the same run continues");
+        let mut pass = Pass::default();
+        assert!(pass.due(DAY_MS));
+        pass.start(DAY_MS);
+        assert!(!pass.due(3 * DAY_MS), "a running pass is never due");
+        pass.phase = Phase::Idle;
+        pass.finished = 3 * DAY_MS;
+        assert!(!pass.due(4 * DAY_MS - 1) && pass.due(4 * DAY_MS));
+    }
 }
