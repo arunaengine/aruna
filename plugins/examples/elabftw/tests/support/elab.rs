@@ -196,7 +196,12 @@ impl Inner {
                 let mut tags = Self::tags_of(&self.experiments[&id]);
                 tags.push(body["tag"].as_str().unwrap().to_string());
                 self.set_tags(id, &tags);
-                reply(201, json!({}))
+                // A create answers 201 with a `Location` and no body.
+                Ok(Reply {
+                    status: 201,
+                    headers: vec![("location".into(), format!("/api/v2/experiments/{id}/tags"))],
+                    body: Vec::new(),
+                })
             }
             (Method::Patch, [_, "tags", tag]) => {
                 let id = id.unwrap();
@@ -210,7 +215,8 @@ impl Inner {
                     .filter(|tag| Some(tag) != name.as_ref())
                     .collect();
                 self.set_tags(id, &tags);
-                reply(200, json!({}))
+                // Removing a tag answers the whole experiment, as `Tags::unreference` does.
+                reply(200, whole(&self.experiments[&id]))
             }
             _ => reply(400, json!({ "code": 400, "description": "unknown route" })),
         }

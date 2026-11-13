@@ -130,12 +130,14 @@ fn too_large_marked() {
         "other links still sync"
     );
 
-    // A body whose write to eLabFTW would pass 1 MiB is marked and not sent.
+    // A body whose write to eLabFTW would pass 1 MiB is marked and not sent: a description edit
+    // whose escaped HTML grows past the bound, while the dataset read stays below it.
     runner.world.lock().huge.clear();
     runner.poll();
     let dataset = runner.link(small)["dataset"].as_str().unwrap().to_string();
-    let text = format!("<p>{}</p>", "x".repeat(1 << 20));
-    runner.world.aruna_edit(&dataset, json!({ "text": text }));
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "description": "<".repeat(270 << 10) }));
     runner.event(&dataset);
     let marked = runner.marks(small)["too_large"][0]
         .as_str()
@@ -232,27 +234,29 @@ fn file_pages_resume() {
 
 #[test]
 fn wide_dataset_scanned() {
-    // 6000 files with long ids: the scan spreads over several state keys instead of one value.
+    // 3000 uploads: the dataset's file entities spread over several scan parts.
     let runner = Runner::new();
     let id = runner.world.experiment("Run 7", "", &["aruna"]);
-    runner.poll();
-    let (dataset, _) = runner.world.only_dataset();
-    for n in 0..6000 {
-        let file = format!("measurements/run-2026-11-13/sample-{n:05}/raw-data.csv");
+    for upload in 1..=3000 {
         runner
             .world
-            .aruna_file(&dataset, json!({ "@id": file, "@type": "File" }));
+            .upload(id, upload, &format!("measurement-{upload:05}.raw"), upload);
     }
     runner.world.lock().file_page = 200;
-    runner.event(&dataset);
     let mut runs = 0;
-    while !runner.marks(id).is_null() {
+    while runner.world.lock().datasets.is_empty() || !runner.marks(id).is_null() {
         runner.poll();
         runs += 1;
-        assert!(runs < 20, "{}", runner.marks(id));
+        assert!(runs < 30, "{}", runner.marks(id));
     }
-    let links = runner.world.extra(id)["Aruna files"]["value"].clone();
-    assert_eq!(links.as_array().unwrap().len(), 6000);
+    // A change in Aruna reads the files again from the stored parts.
+    let (dataset, stored) = runner.world.only_dataset();
+    assert_eq!(stored.files.len(), 3000);
+    runner
+        .world
+        .aruna_edit(&dataset, json!({ "name": "Renamed" }));
+    runner.event(&dataset);
+    assert_eq!(runner.world.get(id)["title"], "Renamed");
     let prefix = format!("files/{dataset}/");
     let parts = runner
         .world

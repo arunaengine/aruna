@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 
+use aruna_plugins::limits::Limits;
 use elabftw_sync::host::{
     Created, Document, Fault, FilePage, Host, Kind, Meter, Method, Reply, Request, Result,
 };
@@ -81,6 +82,8 @@ pub struct Inner {
     pub stop_after_post: bool,
     /// The same, right after the next change of an experiment lands.
     pub stop_after_patch: bool,
+    /// Bytes the current run moved, against the host's bound per run.
+    pub run_bytes: u64,
     pub state_down: bool,
 }
 
@@ -190,6 +193,130 @@ impl World {
             .state
             .get(key)
             .map(|(_, bytes)| serde_json::from_slice(bytes).unwrap())
+    }
+}
+
+/// The world behind the host's bounds of `plugins/src/limits.rs`: a request or a reply of one
+/// call up to `call_bytes`, and a run up to `bytes` in all; anything more is refused.
+pub struct Bounded<'a>(pub &'a World);
+
+impl Bounded<'_> {
+    fn bound<T>(
+        &self,
+        sent: usize,
+        call: impl FnOnce() -> Result<T>,
+        size: impl Fn(&T) -> usize,
+    ) -> Result<T> {
+        let limits = Limits::default();
+        if sent > limits.call_bytes {
+            return Err(fault(
+                Kind::Limit,
+                "the request is larger than the call allows",
+            ));
+        }
+        self.charge(sent)?;
+        let answer = call()?;
+        let received = size(&answer);
+        self.charge(received)?;
+        match received > limits.call_bytes {
+            true => Err(fault(
+                Kind::Limit,
+                "the answer is larger than the call allows",
+            )),
+            false => Ok(answer),
+        }
+    }
+
+    fn charge(&self, bytes: usize) -> Result<()> {
+        let mut inner = self.0.lock();
+        inner.run_bytes += bytes as u64;
+        match inner.run_bytes > Limits::default().bytes {
+            true => Err(fault(Kind::Limit, "the run moved more bytes than it may")),
+            false => Ok(()),
+        }
+    }
+}
+
+fn json_len(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
+}
+
+impl Host for Bounded<'_> {
+    fn elab(&self, request: &Request) -> Result<Reply> {
+        let query: usize = (request.query.iter())
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        let sent = request.path.len() + query + request.body.as_ref().map_or(0, json_len);
+        self.bound(sent, || self.0.elab(request), |reply| reply.body.len())
+    }
+
+    fn summary(&self, dataset: &str) -> Result<Document> {
+        self.bound(
+            dataset.len(),
+            || self.0.summary(dataset),
+            |doc| json_len(&doc.json),
+        )
+    }
+
+    fn files(&self, dataset: &str, cursor: Option<&str>) -> Result<FilePage> {
+        let answer = || self.0.files(dataset, cursor);
+        self.bound(dataset.len(), answer, |page| {
+            page.files.iter().map(json_len).sum()
+        })
+    }
+
+    fn patch(&self, dataset: &str, patch: &Value, expected: &str) -> Result<String> {
+        self.bound(
+            json_len(patch),
+            || self.0.patch(dataset, patch, expected),
+            String::len,
+        )
+    }
+
+    fn put_file(&self, dataset: &str, file: &Value, expected: &str) -> Result<String> {
+        self.bound(
+            json_len(file),
+            || self.0.put_file(dataset, file, expected),
+            String::len,
+        )
+    }
+
+    fn remove_file(&self, dataset: &str, id: &str, expected: &str) -> Result<String> {
+        self.bound(
+            id.len(),
+            || self.0.remove_file(dataset, id, expected),
+            String::len,
+        )
+    }
+
+    fn create(&self, path: &str, dataset: &Value, key: &str) -> Result<Created> {
+        self.bound(
+            json_len(dataset),
+            || self.0.create(path, dataset, key),
+            |_| 64,
+        )
+    }
+
+    fn object_size(&self, path: &str) -> Result<u64> {
+        self.bound(path.len(), || self.0.object_size(path), |_| 8)
+    }
+
+    fn objects(&self, prefix: &str) -> Result<()> {
+        self.bound(prefix.len(), || self.0.objects(prefix), |_| 0)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<(u64, Vec<u8>)>> {
+        let size =
+            |entry: &Option<(u64, Vec<u8>)>| entry.as_ref().map_or(0, |(_, value)| value.len());
+        self.bound(key.len(), || Host::get(self.0, key), size)
+    }
+
+    fn put(&self, key: &str, value: &[u8], expected: Option<u64>) -> Result<u64> {
+        self.bound(value.len(), || self.0.put(key, value, expected), |_| 8)
+    }
+
+    fn log(&self, line: &str) {
+        self.0.log(line);
     }
 }
 
@@ -415,7 +542,9 @@ impl Runner {
         let settings = settings();
         self.runs.set(self.runs.get() + 1);
         let run = format!("run-{}", self.runs.get());
-        let meter = Meter::new(&self.world);
+        self.world.lock().run_bytes = 0;
+        let bounded = Bounded(&self.world);
+        let meter = Meter::new(&bounded);
         let sync = Sync::new(&meter, &settings, &run, self.now.get());
         let sync = sync.with_budget(self.budget.get());
         let answer = step(&sync);
