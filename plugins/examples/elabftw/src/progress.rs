@@ -435,9 +435,11 @@ pub fn report(host: &dyn Host, after: u64) -> Result<Value> {
 pub struct Cursor {
     pub modified: String,
     pub ids: BTreeSet<u64>,
-    /// The next mark page whose failed links are retried.
+    /// The mark page whose failed links are retried next, and the last key retried on it.
     #[serde(default)]
     pub retry_page: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<String>,
 }
 
 /// One entry of an experiment listing.
@@ -555,7 +557,7 @@ mod tests {
         let cursor = Cursor {
             modified: "10:00".into(),
             ids: [4].into(),
-            retry_page: 0,
+            ..Cursor::default()
         };
         let pages = [
             vec![entry(1, "09:00", true), entry(2, "10:05", false)],

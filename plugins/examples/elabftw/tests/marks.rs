@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use elabftw_sync::compare::Snapshot;
 use elabftw_sync::host::{Host, Kind};
-use elabftw_sync::progress::{MAX_VALUE, Mark, REPORT_BYTES, Record, store};
+use elabftw_sync::progress::{DAY_MS, MAX_VALUE, Mark, REPORT_BYTES, Record, store};
 use elabftw_sync::sync::Sync;
 use serde_json::{Value, json};
 use support::{BUCKET, Runner, World, settings};
@@ -157,6 +157,54 @@ fn run_bytes_bounded() {
         1,
         "the cursor did not pass the link"
     );
+}
+
+#[test]
+fn retries_resume_inside_page() {
+    // 25 failed links on one mark page, all due; each retry fails again as too large.
+    let runner = Runner::new();
+    let ids: Vec<u64> = (0..25)
+        .map(|n| runner.world.experiment(&format!("E{n}"), "", &[]))
+        .collect();
+    for id in &ids {
+        runner.world.lock().huge.insert(*id);
+        let mut record = Record::load(&runner.world, &format!("link/{id}")).unwrap();
+        record.link.experiment = Some(*id);
+        record.link.fail("earlier", support::START, 0);
+        record.save(&runner.world).unwrap();
+    }
+    let large = |runner: &Runner| {
+        ids.iter()
+            .filter(|id| runner.marks(**id)["too_large"].is_array())
+            .count()
+    };
+    runner.poll();
+    assert_eq!(large(&runner), 20, "one run retries 20 links");
+    runner.poll();
+    assert_eq!(large(&runner), 25, "the next run goes on inside the page");
+}
+
+#[test]
+fn not_due_cost_nothing() {
+    // The first 20 failed links of the page are not due; the 5 after them are retried at once.
+    let runner = Runner::new();
+    let ids: Vec<u64> = (0..25)
+        .map(|n| runner.world.experiment(&format!("E{n}"), "", &[]))
+        .collect();
+    for (n, id) in ids.iter().enumerate() {
+        runner.world.lock().huge.insert(*id);
+        let mut record = Record::load(&runner.world, &format!("link/{id}")).unwrap();
+        record.link.experiment = Some(*id);
+        let delay = if n < 20 { 365 * DAY_MS } else { 0 };
+        record.link.fail("earlier", support::START, delay);
+        record.save(&runner.world).unwrap();
+    }
+    runner.poll();
+    let large: Vec<bool> = ids
+        .iter()
+        .map(|id| runner.marks(*id)["too_large"].is_array())
+        .collect();
+    assert_eq!(large, [vec![false; 20], vec![true; 5]].concat());
 }
 
 #[test]

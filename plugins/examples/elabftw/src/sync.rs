@@ -77,11 +77,27 @@ impl<'a> Sync<'a> {
             None => (None, Cursor::default()),
         };
         let mut done = 0;
+        // Failed links come first, from where the last run left this mark page; links not due
+        // yet, or held by another run, cost one state read and no work.
         let (keys, more) = failed_page(self.host, cursor.retry_page)?;
-        cursor.retry_page = if more { cursor.retry_page + 1 } else { 0 };
-        for key in keys.iter().take(RUN_LINKS) {
-            self.guard(self.retry(key));
-            done += 1;
+        let after = cursor.retry_after.clone();
+        let mut rest = keys
+            .into_iter()
+            .filter(|key| after.as_ref().is_none_or(|after| key > after));
+        for key in rest.by_ref() {
+            if done >= RUN_LINKS {
+                break;
+            }
+            match self.retry(&key) {
+                Ok(true) => done += 1,
+                Ok(false) => {}
+                Err(fault) => self.guard(Err(fault)),
+            }
+            cursor.retry_after = Some(key);
+        }
+        if rest.next().is_none() {
+            cursor.retry_page = if more { cursor.retry_page + 1 } else { 0 };
+            cursor.retry_after = None;
         }
         let tag = &self.settings.tag;
         let entries = cursor.walk(|offset| elab::list(self.host, tag, Order::Changed, offset))?;
@@ -190,18 +206,20 @@ impl<'a> Sync<'a> {
         Ok(link.and_then(|link| link.written).as_deref() == Some(entry.modified.as_str()))
     }
 
-    fn retry(&self, key: &str) -> Result<()> {
+    /// Retries one failed link; `false` when it was not due or another run held it.
+    fn retry(&self, key: &str) -> Result<bool> {
         if let Some(experiment) = key.strip_prefix("link/").and_then(|id| id.parse().ok()) {
-            return self.experiment(experiment, Mode::Retry).map(drop);
+            return Ok(self.experiment(experiment, Mode::Retry)?.is_some());
         }
         match key.strip_prefix("dataset/") {
-            Some(dataset) => self.dataset(dataset),
-            None => Ok(()),
+            Some(dataset) => self.dataset(dataset).map(|()| true),
+            None => Ok(false),
         }
     }
 
     /// Syncs one experiment's link, creating its dataset first when it has none, and returns
-    /// the link's marks. Problems become marks; a link another run holds gives `None`.
+    /// the link's marks. Problems become marks; a link another run holds, or a failed link
+    /// retried before its time, gives `None`.
     pub fn experiment(&self, id: u64, mode: Mode) -> Result<Option<BTreeSet<Mark>>> {
         let mut record = Record::load(self.host, &link_key(id))?;
         let link = &mut record.link;
@@ -213,7 +231,7 @@ impl<'a> Sync<'a> {
             return Ok(None);
         }
         if mode == Mode::Retry && link.retry_at.is_some_and(|at| at > self.now) {
-            return Ok(Some(link.marks.keys().copied().collect()));
+            return Ok(None);
         }
         // A change to eLabFTW that ended before its write-back: the fields it sent take what was
         // sent as their base, so a later Aruna edit compares with it; a conflict stays one.
