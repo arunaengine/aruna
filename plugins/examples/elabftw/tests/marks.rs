@@ -155,6 +155,37 @@ fn small(total: (u32, u64), link: (u32, u64), step: (u32, u64)) -> Budget {
 }
 
 #[test]
+fn backlog_bounded() {
+    // A large first backlog: every run stays in its budget and saves progress.
+    let runner = Runner::new();
+    let ids: Vec<u64> = (0..120)
+        .map(|n| runner.world.experiment(&format!("E{n}"), "", &["aruna"]))
+        .collect();
+    runner
+        .budget
+        .set(small((150, 15 << 20), (40, 2 << 20), (20, 1 << 20)));
+    let mut runs = 0;
+    while runner.world.lock().datasets.len() < ids.len() {
+        let before = runner.world.lock().datasets.len();
+        runner.poll();
+        runs += 1;
+        let used = runner.used.get();
+        assert!(used.calls <= 150, "run {runs} made {} calls", used.calls);
+        assert!(
+            runner.world.lock().datasets.len() > before,
+            "run {runs} made progress"
+        );
+        assert!(runs < 100);
+    }
+    assert!(runs > 5, "the backlog took {runs} runs");
+    // The walk ended, so the next runs find nothing new.
+    runner.poll();
+    let cursor = runner.world.state("cursor").unwrap();
+    assert!(cursor.get("walk").is_none(), "{cursor}");
+    assert_eq!(runner.poll()["synced"], 0);
+}
+
+#[test]
 fn bytes_bounded() {
     // Large bodies: each run stops starting links before its byte budget.
     let runner = Runner::new();

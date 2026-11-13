@@ -13,7 +13,7 @@ use crate::compare::{Decision, Origin, Side, Snapshot, decide, same};
 use crate::elab::{self, MAX_CALL, Order};
 use crate::host::{Fault, Host, Kind, Meter, Result};
 use crate::progress::{
-    Cursor, LINK_PAGE, Link, Listed, Mark, Pass, Phase, Record, Reservation, Reserved, Sent,
+    Cursor, LINK_PAGE, Link, Listed, Mark, Pass, Phase, Record, Reservation, Reserved, Sent, Visit,
     dataset_key, failed_page, link_key, link_page, load, report, store,
 };
 use crate::values::{
@@ -164,25 +164,7 @@ impl<'a> Sync<'a> {
             cursor.retry_page = if more { cursor.retry_page + 1 } else { 0 };
             cursor.retry_after = None;
         }
-        let tag = &self.settings.tag;
-        let entries = cursor.walk(|offset| {
-            self.step()?;
-            elab::list(self.host, tag, Order::Changed, offset)
-        })?;
-        for entry in entries {
-            if !self.room(self.budget.link) {
-                break;
-            }
-            if !self.own_write(&entry)? {
-                match self.experiment(entry.id, Mode::Quick) {
-                    // Another run holds it, or the budget ran out: the next run goes on here.
-                    Ok(Outcome::Skipped | Outcome::Spent) => break,
-                    Ok(Outcome::Synced(_)) => done += 1,
-                    Err(fault) => self.guard(Err(fault)),
-                }
-            }
-            cursor.advance(&entry.modified, entry.id);
-        }
+        done += self.quick(&mut cursor)?;
         // Another run that moved the cursor meanwhile wins; this run's entries come again.
         match store(self.host, "cursor", &cursor, version) {
             Err(fault) if fault.kind == Kind::Conflict => {}
@@ -190,6 +172,46 @@ impl<'a> Sync<'a> {
         }
         self.full(false)?;
         Ok(json!({ "synced": done }))
+    }
+
+    /// The quick pass: tagged experiments newest first, a listing page at a time, from where
+    /// the last run stopped. Returns the links synced.
+    fn quick(&self, cursor: &mut Cursor) -> Result<u32> {
+        let mut done = 0;
+        loop {
+            if !self.room(self.budget.step) {
+                return Ok(done);
+            }
+            let tag = &self.settings.tag;
+            let entries = elab::list(self.host, tag, Order::Changed, cursor.offset())?;
+            if entries.is_empty() {
+                cursor.finish();
+                return Ok(done);
+            }
+            for entry in &entries {
+                let visit = cursor.visit(entry);
+                match visit {
+                    Visit::End => {
+                        cursor.finish();
+                        return Ok(done);
+                    }
+                    Visit::Skip => {}
+                    Visit::Sync if self.own_write(entry)? => {}
+                    Visit::Sync => {
+                        if !self.room(self.budget.link) {
+                            return Ok(done);
+                        }
+                        match self.experiment(entry.id, Mode::Quick) {
+                            // Another run holds it, or the budget ran out: the next run goes on here.
+                            Ok(Outcome::Skipped | Outcome::Spent) => return Ok(done),
+                            Ok(Outcome::Synced(_)) => done += 1,
+                            Err(fault) => self.guard(Err(fault)),
+                        }
+                    }
+                }
+                cursor.passed(entry, visit == Visit::Sync);
+            }
+        }
     }
 
     /// A dataset event: the linked experiment's sync, or an experiment for a new dataset below

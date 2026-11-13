@@ -438,6 +438,9 @@ pub fn report(host: &dyn Host, after: u64) -> Result<Value> {
 pub struct Cursor {
     pub modified: String,
     pub ids: BTreeSet<u64>,
+    /// The walk in progress, which may take several runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk: Option<Walk>,
     /// The mark page whose failed links are retried next, and the last key retried on it.
     #[serde(default)]
     pub retry_page: u64,
@@ -454,49 +457,75 @@ pub struct Listed {
     pub changed_by: u64,
 }
 
+/// A quick pass walk, newest first: where the next listing page starts, and the newest entry
+/// it handled with the ids at exactly that time.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Walk {
+    pub offset: u64,
+    pub modified: String,
+    pub ids: BTreeSet<u64>,
+}
+
+/// What the walk does with one listed entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Visit {
+    Sync,
+    /// A pinned entry not newer than the cursor; pinned entries lead every listing.
+    Skip,
+    /// An unpinned entry not newer than the cursor: everything after it is older.
+    End,
+}
+
+/// Raises a mark of the newest `modified_at` and the ids seen at exactly that time.
+fn raise(modified: &mut String, ids: &mut BTreeSet<u64>, at: &str, id: u64) {
+    if at > modified.as_str() {
+        *modified = at.to_string();
+        ids.clear();
+    }
+    if at == modified.as_str() {
+        ids.insert(id);
+    }
+}
+
 impl Cursor {
     pub fn newer(&self, modified: &str, id: u64) -> bool {
         modified > self.modified.as_str() || (modified == self.modified && !self.ids.contains(&id))
     }
 
     pub fn advance(&mut self, modified: &str, id: u64) {
-        if modified > self.modified.as_str() {
-            self.modified = modified.to_string();
-            self.ids.clear();
-        }
-        if modified == self.modified {
-            self.ids.insert(id);
+        raise(&mut self.modified, &mut self.ids, modified, id);
+    }
+
+    pub fn visit(&self, entry: &Listed) -> Visit {
+        match (self.newer(&entry.modified, entry.id), entry.pinned) {
+            (true, _) => Visit::Sync,
+            (false, true) => Visit::Skip,
+            (false, false) => Visit::End,
         }
     }
 
-    /// Walks pages sorted by `modified_at`, newest first, and returns the entries newer than
-    /// the cursor, oldest first. Pinned entries lead every listing, so only an unpinned entry
-    /// that is not newer ends the walk.
-    pub fn walk(&self, mut page: impl FnMut(u64) -> Result<Vec<Listed>>) -> Result<Vec<Listed>> {
-        let mut found: BTreeMap<u64, Listed> = BTreeMap::new();
-        let mut offset = 0;
-        loop {
-            let entries = page(offset)?;
-            if entries.is_empty() {
-                break;
-            }
-            offset += entries.len() as u64;
-            let mut done = false;
-            for entry in entries {
-                if self.newer(&entry.modified, entry.id) {
-                    found.insert(entry.id, entry);
-                } else if !entry.pinned {
-                    done = true;
-                    break;
-                }
-            }
-            if done {
-                break;
+    /// Where the walk's next listing page starts.
+    pub fn offset(&self) -> u64 {
+        self.walk.as_ref().map_or(0, |walk| walk.offset)
+    }
+
+    /// Moves the walk past an entry; a synced one raises the walk's newest mark.
+    pub fn passed(&mut self, entry: &Listed, synced: bool) {
+        let walk = self.walk.get_or_insert_default();
+        walk.offset += 1;
+        if synced {
+            raise(&mut walk.modified, &mut walk.ids, &entry.modified, entry.id);
+        }
+    }
+
+    /// Ends the walk: the cursor moves to the newest entry it handled. An entry changed
+    /// meanwhile is newer than that, so the next walk finds it.
+    pub fn finish(&mut self) {
+        if let Some(walk) = self.walk.take() {
+            for id in walk.ids {
+                self.advance(&walk.modified, id);
             }
         }
-        let mut entries: Vec<Listed> = found.into_values().collect();
-        entries.sort_by(|left, right| (&left.modified, left.id).cmp(&(&right.modified, right.id)));
-        Ok(entries)
     }
 }
 
@@ -557,52 +586,47 @@ mod tests {
 
     #[test]
     fn walk_skips_pinned() {
-        let cursor = Cursor {
+        let mut cursor = Cursor {
             modified: "10:00".into(),
             ids: [4].into(),
             ..Cursor::default()
         };
-        let pages = [
-            vec![entry(1, "09:00", true), entry(2, "10:05", false)],
-            vec![
-                entry(3, "10:00", false),
-                entry(4, "10:00", false),
-                entry(5, "09:59", false),
-            ],
-            vec![entry(6, "11:00", false)],
+        let entries = [
+            entry(1, "09:00", true),
+            entry(2, "10:05", false),
+            entry(3, "10:00", false),
+            entry(4, "10:00", false),
         ];
-        let mut offsets = Vec::new();
-        let found = cursor.walk(|offset| {
-            offsets.push(offset);
-            Ok(pages.get(offsets.len() - 1).cloned().unwrap_or_default())
-        });
-        let ids: Vec<u64> = found.unwrap().iter().map(|entry| entry.id).collect();
+        let visits: Vec<Visit> = entries.iter().map(|entry| cursor.visit(entry)).collect();
         // The pinned old entry does not end the walk; id 3 shares the cursor's time but is new.
-        assert_eq!(ids, [3, 2]);
-        assert_eq!(offsets, [0, 2]);
+        assert_eq!(visits, [Visit::Skip, Visit::Sync, Visit::Sync, Visit::End]);
+        for (entry, visit) in entries.iter().zip(&visits).take(3) {
+            cursor.passed(entry, *visit == Visit::Sync);
+        }
+        assert_eq!(cursor.offset(), 3);
+        cursor.finish();
+        assert_eq!((cursor.modified.as_str(), cursor.offset()), ("10:05", 0));
+        assert_eq!(cursor.ids, [2].into());
     }
 
     #[test]
-    fn walk_shifted_pages() {
-        // An entry edited during the walk moves to the first page and shows up again later.
-        let cursor = Cursor::default();
-        let pages = [
-            vec![entry(1, "10:02", false), entry(2, "10:01", false)],
-            vec![entry(1, "10:03", false), entry(3, "10:00", false)],
-        ];
-        let mut calls = 0;
-        let found = cursor.walk(|_| {
-            calls += 1;
-            Ok(pages.get(calls - 1).cloned().unwrap_or_default())
-        });
-        let ids: Vec<u64> = found.unwrap().iter().map(|entry| entry.id).collect();
-        assert_eq!(ids, [3, 2, 1]);
+    fn walk_spans_runs() {
+        // A walk stopped by the budget keeps its offset; the low mark moves only at the end.
         let mut cursor = Cursor::default();
-        cursor.advance("10:00", 3);
-        cursor.advance("10:00", 4);
-        cursor.advance("09:00", 9);
-        assert_eq!((cursor.modified.as_str(), cursor.ids.len()), ("10:00", 2));
-        assert!(!cursor.newer("10:00", 4) && cursor.newer("10:00", 5));
+        cursor.passed(&entry(7, "10:02", false), true);
+        cursor.passed(&entry(8, "10:02", false), true);
+        let stored: Cursor =
+            serde_json::from_value(serde_json::to_value(&cursor).unwrap()).unwrap();
+        assert_eq!((stored.offset(), stored.modified.as_str()), (2, ""));
+        let mut cursor = stored;
+        cursor.passed(&entry(9, "10:01", false), true);
+        cursor.finish();
+        assert_eq!((cursor.modified.as_str(), cursor.ids.len()), ("10:02", 2));
+        assert!(!cursor.newer("10:02", 8) && cursor.newer("10:02", 10));
+        assert!(
+            cursor.newer("10:03", 7),
+            "an entry changed during the walk comes again"
+        );
     }
 
     #[test]
