@@ -585,6 +585,95 @@ fn quiet_round_keeps() {
 }
 
 #[test]
+fn tag_edits_survive() {
+    // Stopped tag batches meet a person's edits on either side, rounds that send no tags, and
+    // refused patches: a tag both sides hold after the person's last edit is never deleted
+    // without a conflict mark, and the sides end equal.
+    let starts = ["aruna clears", "merge to empty", "merge to x"];
+    let edits = ["none", "elab only t19", "aruna t19 and y", "both add z"];
+    for start in starts {
+        for edit in edits {
+            for refuse in [false, true] {
+                let case = format!("{start}, {edit}, refused {refuse}");
+                let (runner, id, dataset) = shared_tags();
+                let all: Vec<String> = (0..20).map(|n| format!("t{n:02}")).collect();
+                let all: Vec<&str> = all.iter().map(String::as_str).collect();
+                match start {
+                    "aruna clears" => {}
+                    "merge to empty" => person_tags(&runner, id, &all[..19]),
+                    _ => person_tags(&runner, id, &[&all[..], &["x"]].concat()),
+                }
+                let first = if start == "merge to empty" {
+                    json!(["t19"])
+                } else {
+                    json!([])
+                };
+                runner
+                    .world
+                    .aruna_edit(&dataset, json!({ "keywords": first }));
+                runner.event(&dataset);
+                assert!(runner.marks(id)["unfinished"].is_array(), "{case}: no stop");
+
+                let held: Vec<String> = elab_tags(&runner, id)
+                    .into_iter()
+                    .filter(|tag| tag != "aruna")
+                    .collect();
+                let held: Vec<&str> = held.iter().map(String::as_str).collect();
+                match edit {
+                    "elab only t19" => person_tags(&runner, id, &["t19"]),
+                    "aruna t19 and y" => {
+                        runner
+                            .world
+                            .aruna_edit(&dataset, json!({ "keywords": ["t19", "y"] }));
+                    }
+                    "both add z" => {
+                        person_tags(&runner, id, &[&held[..], &["z"]].concat());
+                        let mut words: Vec<String> =
+                            keywords(&runner, &dataset).into_iter().collect();
+                        words.push("z".into());
+                        runner
+                            .world
+                            .aruna_edit(&dataset, json!({ "keywords": words }));
+                    }
+                    _ => {}
+                }
+                let mut shared = elab_tags(&runner, id);
+                shared.retain(|tag| keywords(&runner, &dataset).contains(tag));
+
+                runner
+                    .world
+                    .aruna_edit(&dataset, json!({ "name": "Renamed" }));
+                runner
+                    .world
+                    .edit(id, |experiment| experiment["status_title"] = json!("Done"));
+                if refuse {
+                    runner.world.lock().race_patch = Some(json!({ "comment": "unrelated" }));
+                }
+                let mut runs = 0;
+                while !runner.marks(id).is_null() && runner.marks(id)["conflict"].is_null() {
+                    runner.poll();
+                    runs += 1;
+                    assert!(runs < 20, "{case}: {}", runner.marks(id));
+                }
+                if runner.marks(id)["conflict"].is_array() {
+                    continue;
+                }
+                let (tags, words) = (elab_tags(&runner, id), keywords(&runner, &dataset));
+                for tag in &shared {
+                    assert!(
+                        tags.contains(tag) && words.contains(tag),
+                        "{case}: {tag} deleted"
+                    );
+                }
+                let tags: BTreeSet<String> =
+                    tags.into_iter().filter(|tag| tag != "aruna").collect();
+                assert_eq!(tags, words, "{case}: the sides differ");
+            }
+        }
+    }
+}
+
+#[test]
 fn tag_target_waits() {
     // A clear-to-empty batch stops, then the sync user loses write access for a while: the
     // target waits, and the batch goes on once access is back.
