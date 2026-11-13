@@ -96,6 +96,7 @@ impl NetHandle {
                 accept_shutdown: background.accept_shutdown,
                 shutdown: runtime.shutdown,
                 teardown: tokio::sync::OnceCell::new(),
+                endpoint_close: Mutex::new(None),
                 tasks: Mutex::new(background.tasks),
             }),
             monitor: runtime.monitor,

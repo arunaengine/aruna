@@ -1082,6 +1082,35 @@ async fn shutdown_resumes_children() -> Result<()> {
     Ok(())
 }
 
+// A close no peer acknowledges must not hold the shutdown: the join is bounded,
+// the owner keeps the close task, and a resumed shutdown joins it.
+#[tokio::test]
+async fn bounds_endpoint_close() -> Result<()> {
+    use tokio::sync::Semaphore;
+
+    let (handle, _dir) = test_net_handle().await?;
+    let release = Arc::new(Semaphore::new(0));
+    let held = release.clone();
+    let endpoint = handle.inner.endpoint.clone();
+    *handle.inner.endpoint_close.lock().await = Some(tokio::spawn(async move {
+        endpoint.close().await;
+        let _ = held.acquire().await;
+    }));
+
+    let cut_short = handle.shutdown_with_drain(Duration::from_millis(10)).await;
+
+    assert!(cut_short.endpoint_pending);
+    assert!(!cut_short.complete());
+    assert!(handle.inner.endpoint_close.lock().await.is_some());
+
+    release.add_permits(1);
+    let complete = handle.shutdown_with_drain(Duration::from_millis(10)).await;
+
+    assert!(complete.complete(), "the resumed shutdown joins the close");
+    assert!(handle.inner.endpoint_close.lock().await.is_none());
+    Ok(())
+}
+
 // Repeated shutdown after the first returned incomplete still makes progress:
 // the retained owners are joined by the later call instead of being abandoned.
 #[tokio::test]
