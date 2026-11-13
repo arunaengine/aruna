@@ -61,6 +61,8 @@ pub struct CreateImportInput {
 enum CreateState {
     Init,
     Backends,
+    /// The group's other rules, read before a provider bucket is created.
+    Overlaps,
     Ensure,
     Start,
     Read,
@@ -203,7 +205,11 @@ impl CreateImportOperation {
                 Err(error) => return self.fail(error),
             }
         }
-        self.ensure_next()
+        if self.pending.is_empty() {
+            return self.ensure_next();
+        }
+        self.state = CreateState::Overlaps;
+        self.scan(None)
     }
 
     fn ensure_next(&mut self) -> Effects {
@@ -299,6 +305,7 @@ impl CreateImportOperation {
             Ok((routed, backend, write_backend)) => {
                 self.backends = vec![backend, write_backend];
                 self.routed = routed;
+                self.state = CreateState::Scan;
                 self.scan(None)
             }
             Err(error) => self.fail(error),
@@ -414,8 +421,8 @@ impl CreateImportOperation {
         }
     }
 
+    /// Reads one page of the group's rules; the state says what follows the last page.
     fn scan(&mut self, start_after: Option<Key>) -> Effects {
-        self.state = CreateState::Scan;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
             prefix: Some(self.input.group_id.to_bytes().to_vec().into()),
@@ -446,10 +453,11 @@ impl CreateImportOperation {
                 )));
             }
         }
-        if next.is_some() {
-            return self.scan(next);
+        match (next, self.state) {
+            (Some(next), _) => self.scan(Some(next)),
+            (None, CreateState::Overlaps) => self.ensure_next(),
+            (None, _) => self.write(),
         }
-        self.write()
     }
 
     fn write(&mut self) -> Effects {
@@ -612,7 +620,7 @@ impl Operation for CreateImportOperation {
                 self.checked(values)
             }
             (
-                CreateState::Scan,
+                CreateState::Overlaps | CreateState::Scan,
                 Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -770,7 +778,14 @@ mod tests {
         operation.start();
         let record: Option<Value> = Some(record.to_bytes().unwrap().into());
         let effects = operation.step(values(first_reads(record)));
-        (operation, effects)
+        // A rule bucket to check first reads the group's other rules; none overlap here.
+        match effects.as_slice() {
+            [Effect::Storage(StorageEffect::Iter { .. })] => {
+                let effects = scan_page(&mut operation, &[]);
+                (operation, effects)
+            }
+            _ => (operation, effects),
+        }
     }
 
     /// The first read of a rule on `record` that finds the bucket, as `reads` orders it.
@@ -783,7 +798,24 @@ mod tests {
         // A missing Aruna bucket is refused before the provider bucket is created.
         let record = storage(&[("endpoint", "https://s3.lab")]);
         let mut operation = CreateImportOperation::new(input("lab-raw/", "imported/"));
-        operation.start();
+        let effects = operation.start();
+        let [Effect::Storage(StorageEffect::BatchRead { reads, txn_id })] = effects.as_slice()
+        else {
+            panic!("expected one read, got {effects:?}");
+        };
+        let bucket: Key = b"bucket".to_vec().into();
+        let storage_row = (
+            STORAGE_BACKEND_KEYSPACE.to_string(),
+            backend_key(backend_id()),
+        );
+        let expected = vec![
+            (S3_BUCKET_KEYSPACE.to_string(), bucket.clone()),
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket),
+            storage_row.clone(),
+            group_fence_key(group()),
+            storage_row,
+        ];
+        assert_eq!((reads, txn_id), (&expected, &None));
         let record: Option<Value> = Some(record.to_bytes().unwrap().into());
         let effects = operation.step(values(vec![None, None, record.clone(), None, record]));
         assert!(effects.is_empty(), "{effects:?}");
@@ -792,6 +824,34 @@ mod tests {
             ImportRuleError::Invalid(
                 "the bucket does not exist in this group on this node".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn overlap_skips_ensure() {
+        // A rule into a linked folder is refused before its new provider bucket is created.
+        let record = storage(&[("endpoint", "https://s3.lab")]);
+        let mut operation = CreateImportOperation::new(input("lab-new/", "data/new/"));
+        operation.start();
+        let stored: Option<Value> = Some(record.to_bytes().unwrap().into());
+        let effects = operation.step(values(first_reads(stored)));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Iter { txn_id: None, .. })]
+            ),
+            "{effects:?}"
+        );
+        let mut linked = operation.record();
+        (linked.key_prefix, linked.backend_prefix) = ("data/".to_string(), "lab-old/".to_string());
+        let effects = scan_page(&mut operation, std::slice::from_ref(&linked));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(
+            failure(operation),
+            ImportRuleError::Conflict(format!(
+                "import {} already imports into this folder",
+                linked.import_id
+            ))
         );
     }
 

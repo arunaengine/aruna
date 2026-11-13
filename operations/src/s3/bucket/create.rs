@@ -615,7 +615,11 @@ mod mapped_tests {
             None,
             Some(storage),
         ];
-        let effects = operation.step(batch(reads));
+        operation.step(batch(reads));
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
         (operation, effects)
     }
 
