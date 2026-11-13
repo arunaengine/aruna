@@ -57,12 +57,21 @@ pub struct Reservation {
     pub kind: Reserved,
     pub run: String,
     pub at: u64,
-    /// The Aruna revision a change to eLabFTW was sent from, and the prints of what was sent.
+    /// What a change to eLabFTW was sent from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<(String, Side)>,
+    pub source: Option<Sent>,
     /// The `POST` outcome is unknown, so no new create follows until it is settled.
     #[serde(default)]
     pub unknown: bool,
+}
+
+/// The Aruna revision a change to eLabFTW was sent from, the prints of its values, and the
+/// fields that went; the other fields keep their earlier base.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sent {
+    pub revision: String,
+    pub side: Side,
+    pub fields: Vec<Field>,
 }
 
 impl Reservation {

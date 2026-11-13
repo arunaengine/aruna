@@ -13,8 +13,8 @@ use crate::compare::{Decision, Origin, Side, Snapshot, decide, same};
 use crate::elab::{self, MAX_CALL, Order};
 use crate::host::{Fault, Host, Kind, Result};
 use crate::progress::{
-    Cursor, LINK_PAGE, Link, Listed, Mark, Pass, Phase, Record, Reservation, Reserved, dataset_key,
-    failed_page, link_key, link_page, load, report, store,
+    Cursor, LINK_PAGE, Link, Listed, Mark, Pass, Phase, Record, Reservation, Reserved, Sent,
+    dataset_key, failed_page, link_key, link_page, load, report, store,
 };
 use crate::values::{
     BASE_TEAM, BASE_USER, Experiment, Field, ID_FIELD, Settings, UPLOAD_PREFIX, Upload, Values,
@@ -215,11 +215,11 @@ impl<'a> Sync<'a> {
         if mode == Mode::Retry && link.retry_at.is_some_and(|at| at > self.now) {
             return Ok(Some(link.marks.keys().copied().collect()));
         }
-        // A change to eLabFTW that ended before its write-back: what was sent is the base, so
-        // a later Aruna edit compares with it.
+        // A change to eLabFTW that ended before its write-back: the fields it sent take what was
+        // sent as their base, so a later Aruna edit compares with it; a conflict stays one.
         let sent = link.reservation.take().and_then(|held| held.source);
-        if let (Some((_, side)), Some(snapshot)) = (sent, link.snapshot.as_mut()) {
-            snapshot.aruna = side;
+        if let (Some(sent), Some(snapshot)) = (sent, link.snapshot.as_mut()) {
+            snapshot.aruna.take(&sent.side, &sent.fields);
         }
         let kind = if link.dataset.is_none() {
             Reserved::Dataset
@@ -425,7 +425,7 @@ impl<'a> Sync<'a> {
                     let mut moved = snapshot.clone();
                     let owed = [&decision.conflicts[..], &decision.to_aruna[..]].concat();
                     moved.elab.update(&elab_after, &owed);
-                    moved.aruna.update(&aruna, &decision.conflicts);
+                    moved.aruna.take(&Side::of(&aruna), &decision.to_elab);
                     moved.pending |= stored;
                     moved.modified = after.modified.clone();
                     record.link.snapshot = Some(moved);
@@ -543,7 +543,11 @@ impl<'a> Sync<'a> {
         (revision, aruna): (&String, &Values),
     ) -> Result<Experiment> {
         if let Some(held) = record.link.reservation.as_mut() {
-            held.source = Some((revision.clone(), Side::of(aruna)));
+            held.source = Some(Sent {
+                revision: revision.clone(),
+                side: Side::of(aruna),
+                fields: decision.to_elab.clone(),
+            });
         }
         record.save(self.host)?;
         let id = experiment.id;

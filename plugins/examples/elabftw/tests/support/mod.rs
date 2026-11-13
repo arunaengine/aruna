@@ -78,6 +78,8 @@ pub struct Inner {
     /// The node stops right after the next experiment `POST` lands: state writes fail until
     /// the test clears `state_down`.
     pub stop_after_post: bool,
+    /// The same, right after the next change of an experiment lands.
+    pub stop_after_patch: bool,
     pub state_down: bool,
 }
 
@@ -198,6 +200,12 @@ impl Host for World {
         let landed =
             request.method == Method::Post && request.path.is_empty() && reply.status == 201;
         if landed && std::mem::take(&mut inner.stop_after_post) {
+            inner.state_down = true;
+        }
+        if request.method == Method::Patch
+            && reply.status == 200
+            && std::mem::take(&mut inner.stop_after_patch)
+        {
             inner.state_down = true;
         }
         inner.spent += reply.body.len() as u64;

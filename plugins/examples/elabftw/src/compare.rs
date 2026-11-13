@@ -116,6 +116,27 @@ impl Side {
         }
     }
 
+    /// Takes the prints of `fields` from `other`; every other field keeps its base.
+    pub fn take(&mut self, other: &Side, fields: &[Field]) {
+        for field in fields {
+            match field {
+                Field::Title => self.title = other.title.clone(),
+                Field::Tags => {
+                    self.tags = other.tags.clone();
+                    self.tag_set = other.tag_set.clone();
+                }
+                Field::Body => {
+                    self.body = other.body.clone();
+                    self.raw = other.raw.clone();
+                    self.description = other.description.clone();
+                }
+                Field::Props => self.props = other.props.clone(),
+                Field::Files => self.files = other.files.clone(),
+                Field::Links => self.links = other.links.clone(),
+            }
+        }
+    }
+
     /// The print of one field; for the body, its canonical form.
     pub fn print(&self, field: Field) -> Option<&Print> {
         match field {

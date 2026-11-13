@@ -5,6 +5,7 @@
 
 mod support;
 
+use elabftw_sync::progress::STALE_MS;
 use serde_json::{Value, json};
 use support::Runner;
 
@@ -145,6 +146,37 @@ fn refused_create_writeback() {
     assert_eq!(text(&runner, &dataset), "<p>a<br />b</p>");
     assert_eq!(runner.world.dataset(&dataset).entity["description"], "a\nb");
     assert_eq!(runner.marks(id), Value::Null);
+}
+
+#[test]
+fn stopped_change_keeps_conflict() {
+    let (runner, id, dataset) = linked("<p>a</p>");
+    runner.world.edit(id, |experiment| {
+        experiment["body"] = json!("<p>from eLabFTW</p>")
+    });
+    runner.world.aruna_edit(
+        &dataset,
+        json!({ "text": "<p>from Aruna</p>", "name": "Renamed" }),
+    );
+    // The title goes to eLabFTW, then the node stops before the link is saved.
+    runner.world.lock().stop_after_patch = true;
+    let found = runner.world.dataset(&dataset);
+    let path = format!("/r/g/lab/meta/{}@{dataset}", found.path);
+    let stopped = runner.at(|sync| sync.changed(&dataset, &path, &found.revision));
+    assert!(stopped.is_err());
+    assert_eq!(runner.world.get(id)["title"], "Renamed");
+    runner.world.lock().state_down = false;
+
+    // The recovered run takes over only the sent title; the bodies still conflict.
+    runner.now.set(runner.now.get() + STALE_MS + 1);
+    runner.poll();
+    assert_eq!(text(&runner, &dataset), "<p>from Aruna</p>");
+    assert_eq!(runner.world.get(id)["body"], "<p>from eLabFTW</p>");
+    let conflict = runner.marks(id)["conflict"].clone();
+    assert!(
+        conflict[0].as_str().unwrap().starts_with("body "),
+        "{conflict}"
+    );
 }
 
 #[test]
