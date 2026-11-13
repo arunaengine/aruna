@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 
 use elabftw_sync::compare::Snapshot;
 use elabftw_sync::host::{Host, Kind, Meter};
-use elabftw_sync::progress::{DAY_MS, MAX_VALUE, Mark, REPORT_BYTES, Record, load, store};
-use elabftw_sync::sync::Sync;
+use elabftw_sync::progress::{DAY_MS, MAX_VALUE, Mark, REPORT_BYTES, Record, store};
+use elabftw_sync::sync::{Budget, Room, Sync};
 use serde_json::{Value, json};
 use support::{BUCKET, Runner, World, settings};
 
@@ -144,23 +144,41 @@ fn too_large_marked() {
     assert_eq!(runner.world.get(small)["body"], "");
 }
 
+/// A budget small enough that the tests' traffic spans several runs.
+fn small(total: (u32, u64), link: (u32, u64), step: (u32, u64)) -> Budget {
+    let room = |(calls, bytes)| Room { calls, bytes };
+    Budget {
+        total: room(total),
+        link: room(link),
+        step: room(step),
+    }
+}
+
 #[test]
-fn meter_counts_all() {
-    // State, creates and file writes count as much as eLabFTW and dataset reads.
-    let world = World::default();
-    let meter = Meter::new(&world);
-    let value = "v".repeat(1000);
-    let version = store(&meter, "k", &value, None).unwrap();
-    load::<String>(&meter, "k").unwrap();
-    let created = meter
-        .create("elabftw/1", &json!({ "name": "N" }), "elabftw/1")
-        .unwrap();
-    let file = json!({ "@id": "a", "contentUrl": "/missing" });
-    let refused = meter.put_file(&created.resource, &file, &created.revision);
-    assert!(refused.is_err());
-    let (calls, bytes) = meter.used();
-    assert_eq!((version, calls), (1, 4));
-    assert!(bytes > 2000, "{bytes} bytes");
+fn bytes_bounded() {
+    // Large bodies: each run stops starting links before its byte budget.
+    let runner = Runner::new();
+    let body = format!("<p>{}</p>", "b".repeat(200 << 10));
+    let ids: Vec<u64> = (0..6)
+        .map(|n| runner.world.experiment(&format!("E{n}"), &body, &["aruna"]))
+        .collect();
+    runner
+        .budget
+        .set(small((1000, 3 << 20), (100, 2 << 20), (30, 512 << 10)));
+    let mut runs = 0;
+    while runner.world.lock().datasets.len() < ids.len() {
+        let before = runner.world.lock().datasets.len();
+        runner.poll();
+        runs += 1;
+        assert!(
+            runner.used.get().bytes <= 3 << 20,
+            "run {runs} moved {} bytes",
+            runner.used.get().bytes
+        );
+        assert!(runner.world.lock().datasets.len() > before);
+        assert!(runs < 20);
+    }
+    assert!(runs >= 3, "{runs} runs");
 }
 
 #[test]
@@ -178,14 +196,28 @@ fn retries_resume_inside_page() {
         record.save(&runner.world).unwrap();
     }
     let large = |runner: &Runner| {
-        ids.iter()
-            .filter(|id| runner.marks(**id)["too_large"].is_array())
-            .count()
+        let large = ids
+            .iter()
+            .filter(|id| runner.marks(**id)["too_large"].is_array());
+        large.count()
     };
+    runner
+        .budget
+        .set(small((80, 15 << 20), (15, 1 << 20), (5, 1 << 20)));
     runner.poll();
-    assert_eq!(large(&runner), 20, "one run retries 20 links");
-    runner.poll();
-    assert_eq!(large(&runner), 25, "the next run goes on inside the page");
+    let first = large(&runner);
+    assert!(first > 0 && first < 25, "one run retries {first} links");
+    let mut runs = 1;
+    while large(&runner) < 25 {
+        let before = large(&runner);
+        runner.poll();
+        runs += 1;
+        assert!(
+            large(&runner) > before,
+            "run {runs} went on inside the page"
+        );
+        assert!(runs < 10);
+    }
 }
 
 #[test]

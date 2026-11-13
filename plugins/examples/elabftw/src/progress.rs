@@ -38,6 +38,8 @@ pub enum Mark {
     NoWrite,
     UnknownCreate,
     Failed,
+    /// The run's budget ran out inside the link; a later run goes on from where it stopped.
+    Unfinished,
 }
 
 /// What a reservation is for.
@@ -386,7 +388,8 @@ pub fn failed_page(host: &dyn Host, page: u64) -> Result<(Vec<String>, bool)> {
         .unwrap_or_default()
         .into_iter())
     .filter(|(_, entry)| {
-        entry.marks.contains_key(&Mark::Failed) || entry.marks.contains_key(&Mark::UnknownCreate)
+        let retried = [Mark::Failed, Mark::UnknownCreate, Mark::Unfinished];
+        retried.iter().any(|mark| entry.marks.contains_key(mark))
     })
     .map(|(key, _)| key)
     .collect();

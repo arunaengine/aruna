@@ -22,12 +22,6 @@ use crate::values::{
     link_fields, merge_file,
 };
 
-/// Links one run syncs at most, so a run stays well inside 1000 host calls and 60 s.
-const RUN_LINKS: usize = 20;
-/// Links a full pass checks per run.
-const CHUNK: usize = 10;
-/// Bytes a run takes on before it stops starting links, below the run bound of 16 MiB.
-const RUN_BYTES: u64 = 12 << 20;
 const RETRY_MS: u64 = 15 * 60 * 1000;
 /// Rounds of read, compare and write per link while the dataset moves on in between.
 const ROUNDS: usize = 3;
@@ -47,10 +41,47 @@ pub enum Mode {
     Manual,
 }
 
-/// One run's sync: its host, settings, run id and time.
+/// Host calls and bytes, as a run spends them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Room {
+    pub calls: u32,
+    pub bytes: u64,
+}
+
+/// What one run may spend, below the runtime's 1000 calls and 16 MiB, and the room a link and
+/// one step inside it need: a link starts, and a step goes on, only while that room is left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub total: Room,
+    pub link: Room,
+    pub step: Room,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        let room = |calls, bytes| Room { calls, bytes };
+        Self {
+            total: room(900, 15 << 20),
+            link: room(60, 5 << 20),
+            step: room(30, 2 << 20),
+        }
+    }
+}
+
+/// How one link's sync ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Synced(BTreeSet<Mark>),
+    /// Another run holds the link, or a failed link is not due yet.
+    Skipped,
+    /// The run's budget ran out inside the link; a later run goes on from there.
+    Spent,
+}
+
+/// One run's sync: its metered host, budget, settings, run id and time.
 pub struct Sync<'a> {
-    /// Counts every call, so the run's bounds see all its traffic.
     pub host: &'a Meter<'a>,
+    budget: Budget,
     pub settings: &'a Settings,
     pub run: &'a str,
     pub now: u64,
@@ -62,10 +93,36 @@ impl<'a> Sync<'a> {
     pub fn new(host: &'a Meter<'a>, settings: &'a Settings, run: &'a str, now: u64) -> Self {
         Self {
             host,
+            budget: Budget::default(),
             settings,
             run,
             now,
             pass: Cell::new(0),
+        }
+    }
+
+    pub fn with_budget(self, budget: Budget) -> Self {
+        Self { budget, ..self }
+    }
+
+    /// Calls made and bytes moved by this run so far.
+    pub fn used(&self) -> Room {
+        let (calls, bytes) = self.host.used();
+        Room { calls, bytes }
+    }
+
+    /// Whether `keep` is still left of the run's budget.
+    fn room(&self, keep: Room) -> bool {
+        let (used, total) = (self.used(), self.budget.total);
+        used.calls.saturating_add(keep.calls) <= total.calls
+            && used.bytes.saturating_add(keep.bytes) <= total.bytes
+    }
+
+    /// Room for one more step inside a link, or `Spent`.
+    fn step(&self) -> Result<()> {
+        match self.room(self.budget.step) {
+            true => Ok(()),
+            false => Err(Fault::new(Kind::Spent, "the run's budget is used")),
         }
     }
 
@@ -82,37 +139,47 @@ impl<'a> Sync<'a> {
         // yet, or held by another run, cost one state read and no work.
         let (keys, more) = failed_page(self.host, cursor.retry_page)?;
         let after = cursor.retry_after.clone();
-        let mut rest = keys
-            .into_iter()
-            .filter(|key| after.as_ref().is_none_or(|after| key > after));
-        for key in rest.by_ref() {
-            if done >= RUN_LINKS {
+        let mut rest = (keys.into_iter())
+            .filter(|key| after.as_ref().is_none_or(|after| key > after))
+            .peekable();
+        let mut stopped = false;
+        while let Some(key) = rest.peek().cloned() {
+            if !self.room(self.budget.link) {
+                stopped = true;
                 break;
             }
             match self.retry(&key) {
-                Ok(true) => done += 1,
-                Ok(false) => {}
+                Ok(Outcome::Synced(_)) => done += 1,
+                Ok(Outcome::Skipped) => {}
+                Ok(Outcome::Spent) => {
+                    stopped = true;
+                    break;
+                }
                 Err(fault) => self.guard(Err(fault)),
             }
             cursor.retry_after = Some(key);
+            rest.next();
         }
-        if rest.next().is_none() {
+        if !stopped {
             cursor.retry_page = if more { cursor.retry_page + 1 } else { 0 };
             cursor.retry_after = None;
         }
         let tag = &self.settings.tag;
-        let entries = cursor.walk(|offset| elab::list(self.host, tag, Order::Changed, offset))?;
+        let entries = cursor.walk(|offset| {
+            self.step()?;
+            elab::list(self.host, tag, Order::Changed, offset)
+        })?;
         for entry in entries {
-            if done >= RUN_LINKS || self.host.used().1 > RUN_BYTES {
+            if !self.room(self.budget.link) {
                 break;
             }
             if !self.own_write(&entry)? {
-                // A link another run holds stops the pass here, so the next run sees it again.
                 match self.experiment(entry.id, Mode::Quick) {
-                    Ok(None) => break,
-                    other => self.guard(other.map(drop)),
+                    // Another run holds it, or the budget ran out: the next run goes on here.
+                    Ok(Outcome::Skipped | Outcome::Spent) => break,
+                    Ok(Outcome::Synced(_)) => done += 1,
+                    Err(fault) => self.guard(Err(fault)),
                 }
-                done += 1;
             }
             cursor.advance(&entry.modified, entry.id);
         }
@@ -145,7 +212,7 @@ impl<'a> Sync<'a> {
         if below != Some(true) {
             return Ok(());
         }
-        self.dataset(dataset)
+        self.dataset(dataset).map(drop)
     }
 
     /// A manual run: a report page, a settled conflict or create, a full pass, or one link.
@@ -170,10 +237,8 @@ impl<'a> Sync<'a> {
             return Ok(json!({ "reconcile": "started" }));
         }
         if let Some(experiment) = input.get("experiment").and_then(Value::as_u64) {
-            let marks = self.experiment(experiment, Mode::Manual)?;
-            let marks =
-                marks.ok_or_else(|| Fault::new(Kind::Unavailable, "another run holds the link"))?;
-            return Ok(json!({ "experiment": experiment, "marks": marks }));
+            let outcome = self.experiment(experiment, Mode::Manual)?;
+            return shown(json!({ "experiment": experiment }), outcome);
         }
         let usage = "expected report, resolve, resolve_create, reconcile or experiment";
         Err(Fault::new(Kind::Invalid, usage))
@@ -207,21 +272,19 @@ impl<'a> Sync<'a> {
         Ok(link.and_then(|link| link.written).as_deref() == Some(entry.modified.as_str()))
     }
 
-    /// Retries one failed link; `false` when it was not due or another run held it.
-    fn retry(&self, key: &str) -> Result<bool> {
+    fn retry(&self, key: &str) -> Result<Outcome> {
         if let Some(experiment) = key.strip_prefix("link/").and_then(|id| id.parse().ok()) {
-            return Ok(self.experiment(experiment, Mode::Retry)?.is_some());
+            return self.experiment(experiment, Mode::Retry);
         }
         match key.strip_prefix("dataset/") {
-            Some(dataset) => self.dataset(dataset).map(|()| true),
-            None => Ok(false),
+            Some(dataset) => self.dataset(dataset),
+            None => Ok(Outcome::Skipped),
         }
     }
 
     /// Syncs one experiment's link, creating its dataset first when it has none, and returns
-    /// the link's marks. Problems become marks; a link another run holds, or a failed link
-    /// retried before its time, gives `None`.
-    pub fn experiment(&self, id: u64, mode: Mode) -> Result<Option<BTreeSet<Mark>>> {
+    /// the link's marks. Problems become marks.
+    pub fn experiment(&self, id: u64, mode: Mode) -> Result<Outcome> {
         let mut record = Record::load(self.host, &link_key(id))?;
         let link = &mut record.link;
         if link
@@ -229,10 +292,10 @@ impl<'a> Sync<'a> {
             .as_ref()
             .is_some_and(|held| held.busy(self.run, self.now))
         {
-            return Ok(None);
+            return Ok(Outcome::Skipped);
         }
         if mode == Mode::Retry && link.retry_at.is_some_and(|at| at > self.now) {
-            return Ok(None);
+            return Ok(Outcome::Skipped);
         }
         // A change to eLabFTW that ended before its write-back: the fields it sent take what was
         // sent as their base, so a later Aruna edit compares with it; a conflict stays one.
@@ -248,29 +311,42 @@ impl<'a> Sync<'a> {
         link.experiment = Some(id);
         link.reservation = Some(Reservation::new(kind, self.run, self.now));
         match record.save(self.host) {
-            Err(fault) if fault.kind == Kind::Conflict => return Ok(None),
+            Err(fault) if fault.kind == Kind::Conflict => return Ok(Outcome::Skipped),
             other => other?,
         }
         let outcome = self.link(&mut record, id, mode);
         let link = &mut record.link;
         link.reservation = None;
+        let spent = outcome
+            .as_ref()
+            .is_err_and(|fault| fault.kind == Kind::Spent);
         match outcome {
             Ok(()) => {
-                link.mark(Mark::Failed, None);
-                link.mark(Mark::TooLarge, None);
+                for mark in [Mark::Failed, Mark::TooLarge, Mark::Unfinished] {
+                    link.mark(mark, None);
+                }
                 link.retry_at = None;
+            }
+            // The retries of the next run go on from the progress this one saved.
+            Err(fault) if fault.kind == Kind::Spent => {
+                link.mark(Mark::Unfinished, Some(vec![fault.message]));
+                link.retry_at = Some(self.now);
             }
             Err(fault) if fault.kind == Kind::Limit => {
                 link.mark(Mark::TooLarge, Some(vec![fault.message]));
             }
             Err(fault) => link.fail(&fault.message, self.now, RETRY_MS),
         }
-        if mode == Mode::Full {
+        if mode == Mode::Full && !spent {
             link.pass = self.pass.get();
         }
         let marks = link.marks.keys().copied().collect();
         record.save(self.host)?;
-        Ok(Some(marks))
+        Ok(if spent {
+            Outcome::Spent
+        } else {
+            Outcome::Synced(marks)
+        })
     }
 
     fn link(&self, record: &mut Record, id: u64, mode: Mode) -> Result<()> {
@@ -334,10 +410,9 @@ impl<'a> Sync<'a> {
             .as_ref()
             .and_then(|snapshot| snapshot.elab.files.clone());
         let read_files = mode != Mode::Quick || known.is_none() || known != Side::of(&elab).files;
-        let files = if read_files {
-            Some(self.all_files(&dataset)?)
-        } else {
-            None
+        let files = match read_files {
+            true => Some(self.all_files(&dataset)?),
+            false => None,
         };
         let aruna = dataset_values(&summary.json, files.as_deref(), &dataset, self.settings);
         let snapshot = (record.link.snapshot.clone()).unwrap_or_else(|| Snapshot::agreed(&aruna));
@@ -522,10 +597,12 @@ impl<'a> Sync<'a> {
         pointer.save(self.host)
     }
 
+    /// All file entities of the dataset, a page per step of the budget.
     fn all_files(&self, dataset: &str) -> Result<Vec<Value>> {
         let mut files = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
+            self.step()?;
             let page = self.host.files(dataset, cursor.as_deref())?;
             files.extend(page.files);
             match page.cursor {
@@ -539,6 +616,7 @@ impl<'a> Sync<'a> {
     fn storage(&self, uploads: &[Upload]) -> Result<Vec<String>> {
         let mut changed = Vec::new();
         for upload in uploads.iter().filter(|upload| upload.state != 3) {
+            self.step()?;
             match self.host.object_size(&upload.path(self.settings)) {
                 Ok(size) if size == upload.size => {}
                 Ok(_) => changed.push(format!("upload {}", upload.id)),
@@ -579,11 +657,13 @@ impl<'a> Sync<'a> {
                         .iter()
                         .filter(|tag| !experiment.tags.contains_key(*tag))
                     {
+                        self.step()?;
                         elab::add_tag(self.host, id, tag)?;
                     }
                     let extra = (experiment.tags.iter())
                         .filter(|(tag, _)| !wanted.contains(*tag) && **tag != self.settings.tag);
                     for (_, tag) in extra {
+                        self.step()?;
                         elab::remove_tag(self.host, id, *tag)?;
                     }
                 }
@@ -657,6 +737,7 @@ impl<'a> Sync<'a> {
         let wanted = elab.files.clone().unwrap_or_default();
         for (id, facts) in &wanted {
             if current.get(id) != Some(facts) {
+                self.step()?;
                 let file = merge_file(stored.get(id.as_str()).copied(), id, facts);
                 revision = self.host.put_file(dataset, &file, &revision)?;
             }
@@ -665,6 +746,7 @@ impl<'a> Sync<'a> {
             .keys()
             .filter(|id| id.starts_with(UPLOAD_PREFIX) && !wanted.contains_key(*id))
         {
+            self.step()?;
             revision = self.host.remove_file(dataset, id, &revision)?;
         }
         Ok(revision)
@@ -672,21 +754,21 @@ impl<'a> Sync<'a> {
 
     /// A dataset below `meta/elabftw/` without a linked experiment: adopted when its identifier
     /// names one, else an experiment is created for it once.
-    fn dataset(&self, dataset: &str) -> Result<()> {
+    fn dataset(&self, dataset: &str) -> Result<Outcome> {
         let summary = self.host.summary(dataset)?;
         if let Some(experiment) = identified(&summary.json) {
             return self.adopt(dataset, experiment);
         }
         let mut record = Record::load(self.host, &dataset_key(dataset))?;
         if let Some(experiment) = record.link.experiment {
-            return self.experiment(experiment, Mode::Event).map(drop);
+            return self.experiment(experiment, Mode::Event);
         }
         let held = record.link.reservation.clone();
         if held
             .as_ref()
             .is_some_and(|held| held.busy(self.run, self.now) && !held.unknown)
         {
-            return Ok(());
+            return Ok(Outcome::Skipped);
         }
         // An unknown outcome, or a create whose run stopped before it saved the outcome: the
         // `POST` may have landed, so only a found experiment or a person settles it.
@@ -701,15 +783,27 @@ impl<'a> Sync<'a> {
             record
                 .link
                 .mark(Mark::UnknownCreate, Some(vec![reason.into()]));
-            return record.save(self.host);
+            return self.saved(record);
         }
+        // The files are read before the create is reserved, so a run out of budget leaves no
+        // reservation that would look like a create with an unknown outcome.
+        let files = match self.all_files(dataset) {
+            Err(fault) if fault.kind == Kind::Spent => {
+                record
+                    .link
+                    .mark(Mark::Unfinished, Some(vec![fault.message]));
+                record.link.retry_at = Some(self.now);
+                record.save(self.host)?;
+                return Ok(Outcome::Spent);
+            }
+            other => other?,
+        };
         record.link.dataset = Some(dataset.to_string());
         record.link.reservation = Some(Reservation::new(Reserved::Experiment, self.run, self.now));
         match record.save(self.host) {
-            Err(fault) if fault.kind == Kind::Conflict => return Ok(()),
+            Err(fault) if fault.kind == Kind::Conflict => return Ok(Outcome::Skipped),
             other => other?,
         }
-        let files = self.all_files(dataset)?;
         let values = dataset_values(&summary.json, Some(&files), dataset, self.settings);
         let mut tags: Vec<&String> = values.tags.iter().collect();
         tags.push(&self.settings.tag);
@@ -742,8 +836,10 @@ impl<'a> Sync<'a> {
                 link.save(self.host)?;
                 record.link.reservation = None;
                 record.link.experiment = Some(experiment);
-                record.link.mark(Mark::UnknownCreate, None);
-                record.link.mark(Mark::Failed, None);
+                for mark in [Mark::UnknownCreate, Mark::Failed, Mark::Unfinished] {
+                    record.link.mark(mark, None);
+                }
+                record.link.retry_at = None;
                 record.save(self.host)?;
                 let free = free_identifier(&summary.json);
                 self.write_back(
@@ -751,7 +847,8 @@ impl<'a> Sync<'a> {
                     (experiment, dataset, free),
                     (&values, &summary.revision),
                     snapshot,
-                )
+                )?;
+                Ok(Outcome::Synced(link.link.marks.keys().copied().collect()))
             }
             Err(fault) if fault.kind == Kind::Unknown => {
                 if let Some(held) = record.link.reservation.as_mut() {
@@ -760,14 +857,20 @@ impl<'a> Sync<'a> {
                 record
                     .link
                     .mark(Mark::UnknownCreate, Some(vec![fault.message]));
-                record.save(self.host)
+                self.saved(record)
             }
             Err(fault) => {
                 record.link.reservation = None;
                 record.link.fail(&fault.message, self.now, RETRY_MS);
-                record.save(self.host)
+                self.saved(record)
             }
         }
+    }
+
+    /// Saves a dataset's record and answers its marks.
+    fn saved(&self, mut record: Record) -> Result<Outcome> {
+        record.save(self.host)?;
+        Ok(Outcome::Synced(record.link.marks.keys().copied().collect()))
     }
 
     /// After an experiment create: eLabFTW's stored body and the identifier go to the dataset,
@@ -807,7 +910,7 @@ impl<'a> Sync<'a> {
     }
 
     /// Links a dataset to an existing experiment, as a found lookup or a person decides.
-    fn adopt(&self, dataset: &str, experiment: u64) -> Result<()> {
+    fn adopt(&self, dataset: &str, experiment: u64) -> Result<Outcome> {
         let mut link = Record::load(self.host, &link_key(experiment))?;
         if link.link.dataset.as_deref() != Some(dataset) {
             link.link.experiment = Some(experiment);
@@ -821,7 +924,7 @@ impl<'a> Sync<'a> {
         pointer.link.mark(Mark::UnknownCreate, None);
         pointer.link.mark(Mark::Failed, None);
         pointer.save(self.host)?;
-        self.experiment(experiment, Mode::Manual).map(drop)
+        self.experiment(experiment, Mode::Manual)
     }
 
     /// Settles a conflict or drift: the marked fields take the values of `keep` next.
@@ -838,16 +941,16 @@ impl<'a> Sync<'a> {
         record.link.mark(Mark::Conflict, None);
         record.link.mark(Mark::OutOfSync, None);
         record.save(self.host)?;
-        let marks = self.experiment(experiment, Mode::Manual)?;
-        Ok(json!({ "resolved": experiment, "marks": marks }))
+        let outcome = self.experiment(experiment, Mode::Manual)?;
+        shown(json!({ "resolved": experiment }), outcome)
     }
 
     /// Settles an experiment create with an unknown outcome: the experiment a person found, or
     /// `"absent"` to allow a new create under a new key.
     fn resolve_create(&self, dataset: &str, experiment: &Value) -> Result<Value> {
         if let Some(experiment) = experiment.as_u64() {
-            self.adopt(dataset, experiment)?;
-            return Ok(json!({ "adopted": experiment }));
+            let outcome = self.adopt(dataset, experiment)?;
+            return shown(json!({ "adopted": experiment }), outcome);
         }
         if experiment.as_str() != Some("absent") {
             return Err(Fault::new(
@@ -860,11 +963,11 @@ impl<'a> Sync<'a> {
         record.link.attempt += 1;
         record.link.mark(Mark::UnknownCreate, None);
         record.save(self.host)?;
-        self.dataset(dataset)?;
-        Ok(json!({ "created_again": dataset }))
+        let outcome = self.dataset(dataset)?;
+        shown(json!({ "created_again": dataset }), outcome)
     }
 
-    /// A chunk of the full reconciliation; `start` begins a new pass now.
+    /// The full reconciliation, as far as the run's budget goes; `start` begins a new pass now.
     fn full(&self, start: bool) -> Result<()> {
         let (version, mut pass) = match load::<Pass>(self.host, "full")? {
             Some((version, pass)) => (Some(version), pass),
@@ -877,12 +980,13 @@ impl<'a> Sync<'a> {
         let mut checked = 0;
         match pass.phase {
             Phase::Idle => return Ok(()),
+            _ if !self.room(self.budget.step) => {}
             Phase::Experiments => {
                 let tag = &self.settings.tag;
                 let entries = elab::list(self.host, tag, Order::Id, pass.offset)?;
                 let total = entries.len();
-                for entry in entries.into_iter().take(CHUNK) {
-                    if self.host.used().1 > RUN_BYTES {
+                for entry in entries {
+                    if !self.room(self.budget.link) {
                         break;
                     }
                     if !self.count(&mut pass, self.experiment(entry.id, Mode::Full)) {
@@ -900,15 +1004,13 @@ impl<'a> Sync<'a> {
                 let (ids, more) = link_page(self.host, page)?;
                 let start = (pass.offset % LINK_PAGE as u64) as usize;
                 for id in ids.iter().skip(start) {
-                    if checked >= CHUNK || self.host.used().1 > RUN_BYTES {
+                    if !self.room(self.budget.link) {
                         break;
                     }
                     let link = load::<Link>(self.host, &link_key(*id))?.map(|(_, link)| link);
-                    if link.is_some_and(|link| link.pass != pass.id) {
-                        if !self.count(&mut pass, self.experiment(*id, Mode::Full)) {
-                            break;
-                        }
-                        checked += 1;
+                    let unchecked = link.is_some_and(|link| link.pass != pass.id);
+                    if unchecked && !self.count(&mut pass, self.experiment(*id, Mode::Full)) {
+                        break;
                     }
                     pass.offset += 1;
                 }
@@ -932,11 +1034,12 @@ impl<'a> Sync<'a> {
         }
     }
 
-    /// Adds a checked link's marks to the pass; `false` when another run holds the link.
-    fn count(&self, pass: &mut Pass, marks: Result<Option<BTreeSet<Mark>>>) -> bool {
-        match marks {
-            Ok(None) => return false,
-            Ok(Some(marks)) => {
+    /// Adds a checked link's marks to the pass; `false` when another run holds the link or
+    /// the budget ran out in it, so the pass goes on there next time.
+    fn count(&self, pass: &mut Pass, outcome: Result<Outcome>) -> bool {
+        match outcome {
+            Ok(Outcome::Skipped | Outcome::Spent) => return false,
+            Ok(Outcome::Synced(marks)) => {
                 for mark in marks {
                     *pass.counts.entry(mark).or_default() += 1;
                 }
@@ -945,6 +1048,19 @@ impl<'a> Sync<'a> {
         }
         true
     }
+}
+
+/// A manual run's answer: `fields` with the link's marks, or `unfinished` when a later run
+/// goes on with it.
+fn shown(mut fields: Value, outcome: Outcome) -> Result<Value> {
+    match outcome {
+        Outcome::Synced(marks) => fields["marks"] = json!(marks),
+        Outcome::Spent => fields["unfinished"] = json!(true),
+        Outcome::Skipped => {
+            return Err(Fault::new(Kind::Unavailable, "another run holds the link"));
+        }
+    }
+    Ok(fields)
 }
 
 /// Whether the dataset's `identifier` can take the experiment's: absent, or a plain object

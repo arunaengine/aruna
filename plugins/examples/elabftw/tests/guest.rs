@@ -37,6 +37,7 @@ fn refusal(fault: Fault) -> HostError {
         Kind::Unknown => ErrorKind::UnknownOutcome,
         Kind::Unavailable => ErrorKind::Unavailable,
         Kind::NotFound => ErrorKind::NotFound,
+        Kind::Spent => ErrorKind::Unavailable,
     };
     HostError::new(kind, fault.message)
 }

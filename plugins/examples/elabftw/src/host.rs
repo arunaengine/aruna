@@ -22,6 +22,8 @@ pub enum Kind {
     /// Not done; try again later.
     Unavailable,
     NotFound,
+    /// This run's budget is used; the work goes on in a later run. The sync's own kind.
+    Spent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

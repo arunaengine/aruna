@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard};
 use elabftw_sync::host::{
     Created, Document, Fault, FilePage, Host, Kind, Meter, Method, Reply, Request, Result,
 };
-use elabftw_sync::sync::Sync;
+use elabftw_sync::sync::{Budget, Room, Sync};
 use elabftw_sync::values::Settings;
 use serde_json::{Value, json};
 
@@ -388,6 +388,9 @@ pub struct Runner {
     pub world: World,
     pub now: Cell<u64>,
     runs: Cell<u64>,
+    /// The budget of each run, and what the last run used of it.
+    pub budget: Cell<Budget>,
+    pub used: Cell<Room>,
 }
 
 impl Runner {
@@ -396,6 +399,8 @@ impl Runner {
             world: World::default(),
             now: Cell::new(START),
             runs: Cell::new(0),
+            budget: Cell::new(Budget::default()),
+            used: Cell::new(Room { calls: 0, bytes: 0 }),
         }
     }
 
@@ -405,7 +410,10 @@ impl Runner {
         let run = format!("run-{}", self.runs.get());
         let meter = Meter::new(&self.world);
         let sync = Sync::new(&meter, &settings, &run, self.now.get());
-        step(&sync)
+        let sync = sync.with_budget(self.budget.get());
+        let answer = step(&sync);
+        self.used.set(sync.used());
+        answer
     }
 
     pub fn poll(&self) -> Value {

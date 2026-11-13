@@ -117,11 +117,27 @@ impl Inner {
             .get("limit")
             .and_then(|limit| limit.parse().ok())
             .unwrap_or(15);
+        // A listing holds the columns of eLabFTW's show mode, never the body.
+        let columns = [
+            "id",
+            "title",
+            "modified_at",
+            "lastchangeby",
+            "is_pinned",
+            "state",
+            "tags",
+        ];
+        let shown = |experiment: &Value| -> Value {
+            let fields = columns
+                .iter()
+                .map(|key| (key.to_string(), experiment[*key].clone()));
+            Value::Object(fields.collect())
+        };
         let page: Vec<Value> = entries
             .into_iter()
             .skip(offset)
             .take(limit)
-            .cloned()
+            .map(shown)
             .collect();
         json!(page)
     }
