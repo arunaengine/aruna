@@ -363,6 +363,25 @@ fn aruna_dataset_creates() {
 }
 
 #[test]
+fn description_starts_body() {
+    let runner = Runner::new();
+    let entity = json!({ "@id": "./", "@type": "Dataset", "name": "Plain", "description": "line one\n\nline <two>" });
+    let dataset = runner.world.aruna_dataset("elabftw/plain", entity);
+    runner.event(&dataset);
+    let experiment = *runner.world.lock().experiments.keys().next().unwrap();
+    assert_eq!(
+        runner.world.get(experiment)["body"],
+        "<p>line one</p><p>line &lt;two&gt;</p>"
+    );
+    let entity = runner.world.dataset(&dataset).entity;
+    assert_eq!(
+        entity["description"], "line one\n\nline <two>",
+        "the description stays"
+    );
+    assert_eq!(entity["text"], "<p>line one</p><p>line &lt;two&gt;</p>");
+}
+
+#[test]
 fn unknown_post_kept() {
     let runner = Runner::new();
     let dataset = runner

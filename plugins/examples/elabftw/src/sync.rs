@@ -690,10 +690,15 @@ impl<'a> Sync<'a> {
         let mut tags: Vec<&String> = values.tags.iter().collect();
         tags.push(&self.settings.tag);
         let links = values.links.clone().unwrap_or_default();
+        // A dataset with only a plain text description starts the body from it.
+        let text = match (values.body.text.as_str(), values.description.as_deref()) {
+            ("", Some(plain)) if !plain.is_empty() => Body::from_plain(plain, values.body.format),
+            _ => values.body.clone(),
+        };
         let body = json!({
             "title": values.title,
-            "body": values.body.text,
-            "content_type": values.body.format.content_type(),
+            "body": text.text,
+            "content_type": text.format.content_type(),
             "tags": tags,
             "metadata": link_fields(self.settings, dataset, &links).to_string(),
             "canread_base": BASE_TEAM,
