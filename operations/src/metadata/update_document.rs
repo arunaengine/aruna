@@ -5,20 +5,23 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    CREATE_ACCEPTANCE_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, METADATA_ACTOR_KEYSPACE,
-    METADATA_CHECKPOINT_KEYSPACE, RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
+    MATERIALIZATION_STATUS_KEYSPACE, METADATA_ACTOR_KEYSPACE, METADATA_CHECKPOINT_KEYSPACE,
+    RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    EVENT_LIMIT, MetadataActor, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError,
-    MetadataEvent, MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
-    ProfileValidationStatus, RAW_BYTES_LIMIT, RawOriginBudget, raw_quotas,
+    EVENT_LIMIT, MaterializationState, MaterializationStatusRecord, MetadataActor, MetadataBatch,
+    MetadataBatchSource, MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload,
+    MetadataEventRecord, MetadataLifecycleRecord, ProfileValidationStatus, RAW_BYTES_LIMIT,
+    RawOriginBudget, raw_quotas,
 };
 use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
 use aruna_core::storage_entries::{
-    commit_message_entry, create_acceptance_key, document_lifecycle_entry, event_log_key,
-    event_log_prefix, metadata_actor_entry, metadata_actor_key, profile_validation_entry,
-    raw_budget_entry, raw_budget_key, sync_revision_entry,
+    commit_message_entry, create_acceptance_key, document_job_prefix, document_lifecycle_entry,
+    event_log_key, event_log_prefix, materialization_status_key, metadata_actor_entry,
+    metadata_actor_key, profile_validation_entry, raw_budget_entry, raw_budget_key,
+    sync_revision_entry,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -176,6 +179,8 @@ pub enum UpdateDocumentError {
     TopicAnnouncement(String),
     #[error("the document changed since revision {expected}; it is now at {current}")]
     RevisionConflict { expected: Ulid, current: Ulid },
+    #[error("the graph here has not applied revision {expected} yet; retry")]
+    GraphPending { expected: Ulid },
     #[error("the metadata graph changed since the version the update was based on")]
     GraphChanged,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -1221,6 +1226,78 @@ pub(crate) async fn document_lock(document_id: Ulid) -> tokio::sync::MutexGuard<
 }
 
 /// Type-erased, so futures that await an update do not repeat its whole `Send` proof.
+/// Whether a mutation is planned against this holder's graph, so its expected revision must be
+/// applied here first.
+fn plans_on_graph(mutation: &UpdateDocumentMutation) -> bool {
+    matches!(
+        mutation,
+        UpdateDocumentMutation::ReplaceRoCrate { .. }
+            | UpdateDocumentMutation::UpsertDataEntity { .. }
+            | UpdateDocumentMutation::UpsertContextualEntity { .. }
+            | UpdateDocumentMutation::ReplaceDataEntity { .. }
+            | UpdateDocumentMutation::RemoveDataEntity { .. }
+    )
+}
+
+/// Refuses a revision-checked change this holder cannot plan yet: a base other than its newest
+/// event is a conflict, and one its graph has not applied (a status short of it or a queued
+/// materialization job) is retryable. The transactional revision check still runs later.
+async fn ready_base(
+    context: &DriverContext,
+    document_id: Ulid,
+    expected: Ulid,
+) -> Result<(), UpdateDocumentError> {
+    let storage = &context.storage_handle;
+    let read = |effect| async move {
+        match storage.send_storage_effect(effect).await {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values),
+            Event::Storage(StorageEvent::Error { error }) => Err(UpdateDocumentError::from(error)),
+            _ => Err(UpdateDocumentError::MissingTransaction),
+        }
+    };
+    let newest = read(StorageEffect::Last {
+        key_space: EVENT_LOG_KEYSPACE.to_string(),
+        prefix: Some(event_log_prefix(document_id)),
+        txn_id: None,
+    })
+    .await?;
+    let current = (newest.first())
+        .and_then(|(key, _)| <[u8; 16]>::try_from(key.get(16..32)?).ok())
+        .map_or(Ulid::nil(), Ulid::from_bytes);
+    if current != expected {
+        return Err(UpdateDocumentError::RevisionConflict { expected, current });
+    }
+    let status = match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: MATERIALIZATION_STATUS_KEYSPACE.to_string(),
+            key: materialization_status_key(document_id),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        _ => return Err(UpdateDocumentError::MissingTransaction),
+    };
+    let status =
+        status.and_then(|bytes| postcard::from_bytes::<MaterializationStatusRecord>(&bytes).ok());
+    let applied = status.is_some_and(|status| {
+        status.state == MaterializationState::Materialized && status.event_id >= expected
+    });
+    let queued = read(StorageEffect::Iter {
+        key_space: DOCUMENT_JOB_KEYSPACE.to_string(),
+        prefix: Some(document_job_prefix(document_id)),
+        start: None,
+        limit: 1,
+        txn_id: None,
+    })
+    .await?;
+    match applied && queued.is_empty() {
+        true => Ok(()),
+        false => Err(UpdateDocumentError::GraphPending { expected }),
+    }
+}
+
 pub fn update_metadata_document(
     mut operation: UpdateDocumentOperation,
     context: &DriverContext,
@@ -1229,6 +1306,11 @@ pub fn update_metadata_document(
 > {
     Box::pin(async move {
         let _guard = document_lock(operation.config.document_id).await;
+        if let Some(expected) = operation.config.expected_revision
+            && plans_on_graph(&operation.config.mutation)
+        {
+            ready_base(context, operation.config.document_id, expected).await?;
+        }
         operation.route_profile_status = Some(match &operation.config.mutation {
             UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
                 validate_submission(

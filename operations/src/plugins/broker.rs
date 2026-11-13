@@ -1396,6 +1396,9 @@ fn write_outcome(error: MetadataWriteError) -> Outcome {
         MetadataWriteError::Update(UpdateDocumentError::RevisionConflict { .. }) => {
             none(ErrorKind::Conflict, error.to_string())
         }
+        MetadataWriteError::Update(UpdateDocumentError::GraphPending { .. }) => {
+            Outcome::None(unavailable(error.to_string()))
+        }
         MetadataWriteError::Update(UpdateDocumentError::StorageError(_))
         | MetadataWriteError::Undeliverable(_) => Outcome::Maybe(error.to_string()),
         other => none(ErrorKind::Invalid, other.to_string()),

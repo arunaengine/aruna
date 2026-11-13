@@ -780,6 +780,48 @@ async fn data_entity_removal() {
 }
 
 #[tokio::test]
+async fn stale_removal_conflicts() {
+    // A removal based on an older revision answers 412, also when its entity is already gone.
+    let test = setup_state().await;
+    let (group, auth) = (test.group_id, test.auth.clone());
+    let document_id =
+        create_linking_doc(&test, auth, group, "datasets/st", "Stale", true, &[]).await;
+    drain_metadata_background(test.state.as_ref()).await;
+    let (_, Json(added)) = add_data_entity(
+        State(test.state.clone()),
+        Extension(Some(test.auth.clone())),
+        Extension(None),
+        Path(document_id.clone()),
+        Json(json!({"@id": "./data/gone.raw", "@type": "File", "name": "gone.raw"})),
+    )
+    .await
+    .unwrap();
+    drain_metadata_background(test.state.as_ref()).await;
+    let revision = added.revision.clone().unwrap();
+    let remove = || {
+        let query = RemovalQuery {
+            id: "./data/gone.raw".to_string(),
+            expected_revision: revision.clone(),
+        };
+        let (state, auth) = (test.state.clone(), test.auth.clone());
+        remove_data_entity(
+            State(state),
+            Extension(Some(auth)),
+            Extension(None),
+            Path(document_id.clone()),
+            Query(query),
+        )
+    };
+    let (_, Json(_)) = remove().await.unwrap();
+    drain_metadata_background(test.state.as_ref()).await;
+    let error = remove().await.unwrap_err();
+    assert!(
+        matches!(error, ServerError::PreconditionFailed(_)),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn export_here_copy() {
     let test = setup_state().await;
     let document_id = create_linking_doc(

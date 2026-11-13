@@ -1457,3 +1457,50 @@ async fn file_removals() {
     let refused = broker.metadata_remove_file(&cx(), stale).await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Conflict);
 }
+
+#[tokio::test]
+async fn pending_graph_refused() {
+    // A change that history and registry already hold, but the graph does not yet, cannot be the
+    // base of a revision-checked removal: it is refused as retryable, then succeeds once applied.
+    let (fixture, broker, _, _dir) = broker().await;
+    let document = three_files(&fixture, &broker).await;
+    let revision = revision_of(&broker, document).await;
+    let renamed = serde_json::json!({"@id": "./a.txt", "@type": "File", "name": "renamed"});
+    let pending = broker
+        .metadata_put_file(&cx(), put(document, &renamed, &revision, 0))
+        .await;
+    let pending = pending.unwrap();
+    let refused = broker
+        .metadata_remove_file(&cx(), removal(document, "./a.txt", &pending, 1))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, ErrorKind::Unavailable);
+    let record = crate::metadata::get_document::load_document_record(&broker.ctx, document).await;
+    let record = record.unwrap().unwrap();
+    let remove = || {
+        let mutation = UpdateDocumentMutation::RemoveDataEntity {
+            id: "./a.txt".to_string(),
+        };
+        let token = Some(AuthToken::Internal(fixture.auth()));
+        let (ctx, actor) = (&broker.ctx, fixture.actor.clone());
+        let expected = Some(Ulid::from_string(&pending).unwrap());
+        route_metadata_update(
+            ctx,
+            actor,
+            Some(&record),
+            document,
+            None,
+            mutation,
+            expected,
+            token,
+            None,
+        )
+    };
+    assert!(remove().await.is_err());
+    project(&broker.ctx).await;
+    remove().await.unwrap();
+    project(&broker.ctx).await;
+    let ids: Vec<Value> = (files_of(&broker, document).await.iter())
+        .map(|file| file["@id"].clone())
+        .collect();
+    assert_eq!(ids, ["./b.txt", "./c.txt"]);
+}

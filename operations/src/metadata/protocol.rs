@@ -724,6 +724,11 @@ pub enum MetadataTransportMessage {
     NodeSecretChecked {
         result: Result<Option<String>, crate::plugins::bound::NodeCheckError>,
     },
+    /// A forwarded update refused, without an effect, because the holder's graph has not applied
+    /// its expected revision yet; the caller retries.
+    ForwardedGraphPending {
+        expected: Ulid,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.

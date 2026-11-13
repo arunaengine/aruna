@@ -553,6 +553,9 @@ pub async fn route_metadata_update(
         MetadataTransportMessage::ForwardedRevisionConflict { expected, current } => {
             Err(UpdateDocumentError::RevisionConflict { expected, current }.into())
         }
+        MetadataTransportMessage::ForwardedGraphPending { expected } => {
+            Err(UpdateDocumentError::GraphPending { expected }.into())
+        }
         other => Err(unexpected_response(other)),
     }
 }
@@ -962,6 +965,9 @@ pub(crate) async fn apply_forwarded_write(
                     }
                     Err(UpdateDocumentError::RevisionConflict { expected, current }) => {
                         MetadataTransportMessage::ForwardedRevisionConflict { expected, current }
+                    }
+                    Err(UpdateDocumentError::GraphPending { expected }) => {
+                        MetadataTransportMessage::ForwardedGraphPending { expected }
                     }
                     Err(UpdateDocumentError::MetadataError(MetadataError::InvalidInput(
                         message,

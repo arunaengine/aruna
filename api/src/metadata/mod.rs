@@ -282,6 +282,9 @@ pub(crate) fn map_update_error(error: UpdateDocumentError) -> ServerError {
         UpdateDocumentError::RevisionConflict { .. } | UpdateDocumentError::GraphChanged => {
             ServerError::PreconditionFailed(error.to_string())
         }
+        UpdateDocumentError::GraphPending { .. } => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
         other => ServerError::InternalError(other.to_string()),
     }
 }
