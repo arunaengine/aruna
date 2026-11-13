@@ -3100,10 +3100,14 @@ async fn email_vault_replicate() {
                 .await
                 .expect("event applies");
         }
-        let configs = [
+        let mut configs = [
             stored_realm_config(&first, realm_id).await,
             stored_realm_config(&second, realm_id).await,
         ];
+        // Each node stamps the revocation floor with its own clock at merge time.
+        for config in &mut configs {
+            config.revocation_floor = 0;
+        }
         assert_eq!(configs[0], configs[1]);
         seen.push((configs[1].email.clone(), configs[1].vault.clone()));
     }
