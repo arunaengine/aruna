@@ -769,8 +769,9 @@ impl<'a> Sync<'a> {
                 snapshot.aruna.update(&target, &[]);
                 snapshot.revision = next;
             }
-            // An Aruna edit since the read compares with what was sent, in the next sync.
-            Err(fault) if fault.kind == Kind::Conflict => {}
+            // An Aruna edit since the read compares with what was sent, and the stored body
+            // still goes back in the next sync.
+            Err(fault) if fault.kind == Kind::Conflict => snapshot.pending = true,
             Err(fault) => return Err(fault),
         }
         snapshot.modified = after.modified.clone();

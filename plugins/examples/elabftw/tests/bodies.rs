@@ -125,6 +125,29 @@ fn refused_round_keeps() {
 }
 
 #[test]
+fn refused_create_writeback() {
+    // A rename lands while the new experiment's filtered body goes back to the dataset.
+    let runner = Runner::new();
+    let entity =
+        json!({ "@id": "./", "@type": "Dataset", "name": "Made", "text": "<p>a<br>b</p>" });
+    let dataset = runner.world.aruna_dataset("elabftw/made", entity);
+    runner.world.lock().race_patch = Some(json!({ "name": "Renamed" }));
+    runner.event(&dataset);
+    assert_eq!(
+        text(&runner, &dataset),
+        "<p>a<br>b</p>",
+        "the write-back was refused"
+    );
+
+    runner.event(&dataset);
+    let id = *runner.world.lock().experiments.keys().next().unwrap();
+    assert_eq!(runner.world.get(id)["title"], "Renamed");
+    assert_eq!(text(&runner, &dataset), "<p>a<br />b</p>");
+    assert_eq!(runner.world.dataset(&dataset).entity["description"], "a\nb");
+    assert_eq!(runner.marks(id), Value::Null);
+}
+
+#[test]
 fn description_builds_body() {
     let (runner, id, dataset) = linked("<p><b>rich</b></p>");
     runner
