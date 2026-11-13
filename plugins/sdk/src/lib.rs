@@ -11,8 +11,8 @@ use std::future::Future;
 use serde_json::Value;
 
 pub use context::{
-    Context, Created, Document, Entry, FilePage, Http, Level, Listing, Metadata, Method,
-    ObjectInfo, ObjectPage, Objects, Response, State,
+    Context, Created, Document, Entry, FilePage, FullResponse, Http, Level, Listing, Metadata,
+    Method, ObjectInfo, ObjectPage, Objects, Response, State,
 };
 pub use error::{Error, Result};
 
@@ -29,8 +29,8 @@ pub mod bindings {
     });
 }
 
+pub use bindings::aruna::plugin::types::{ErrorKind, Field, WatchEvent, WebhookRequest};
 use bindings::aruna::plugin::types::{Failure, FailureKind, Invocation, Trigger};
-pub use bindings::aruna::plugin::types::{Field, WatchEvent, WebhookRequest};
 
 /// Why the host started a handler.
 #[derive(Debug, Clone, PartialEq)]

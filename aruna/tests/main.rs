@@ -12,6 +12,7 @@ mod compute_execution;
 mod cors;
 mod credentials;
 mod drs;
+mod elabftw_storage;
 mod git_native;
 mod groups;
 mod https;

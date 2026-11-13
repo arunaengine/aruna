@@ -18,6 +18,7 @@ members = [
     "aruna-doctor",
     "cli",
     "plugins",
+    "plugins/examples/elabftw",
     "plugins/examples/rust",
     "plugins/fixture",
     "plugins/sdk",
@@ -29,7 +30,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.199"
+version = "3.0.0-alpha.200"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -128,6 +129,7 @@ hpke = { version = "0.14.1", default-features = false, features = [
     "getrandom",
     "x25519",
 ] }
+html5ever = "0.40.1"
 http = "1.5.0"
 http-body = "1.1.0"
 httparse = "1.10.1"

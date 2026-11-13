@@ -313,12 +313,33 @@ impl Http {
         body: Vec<u8>,
         key: Option<&str>,
     ) -> Result<FullResponse> {
+        self.send_full_with(method, path, &[], &[], body, key).await
+    }
+
+    /// Like [`Http::send_full`], with query pairs and request headers such as `content-type`.
+    pub async fn send_full_with(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+        key: Option<&str>,
+    ) -> Result<FullResponse> {
+        let fields = |pairs: &[(&str, &str)]| {
+            (pairs.iter())
+                .map(|(name, value)| connections::Field {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                })
+                .collect()
+        };
         let request = connections::Request {
             connection: self.name.clone(),
             method,
             path: path.to_string(),
-            query: Vec::new(),
-            headers: Vec::new(),
+            query: fields(query),
+            headers: fields(headers),
             body,
             key: key.map(str::to_string),
         };

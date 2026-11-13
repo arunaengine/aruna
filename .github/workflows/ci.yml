@@ -371,6 +371,33 @@ jobs:
           set -euo pipefail
           ${{ matrix.run }}
 
+  # Builds the eLabFTW example for WASM and runs it in the plugin runtime against fakes.
+  elabftw-example:
+    name: eLabFTW example
+    runs-on: ubuntu-latest
+    # Hang cap for the example's build and tests, not a performance budget.
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: elabftw-example
+
+      - name: Add the WASM target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Build the plugin module
+        run: cargo build -p elabftw-sync --release --locked --target wasm32-unknown-unknown
+
+      - name: Run the example's tests with the built module
+        env:
+          ELABFTW_MODULE: ${{ github.workspace }}/target/wasm32-unknown-unknown/release/elabftw_sync.wasm
+        run: cargo test -p elabftw-sync --locked
+
   # Quick checks share one runner, so one push does not occupy a slot per check.
   static-checks:
     runs-on: ubuntu-latest
