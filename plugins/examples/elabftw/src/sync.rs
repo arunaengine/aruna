@@ -1,5 +1,5 @@
-//! The sync of one link: under a reservation, read both sides, compare, write each side and
-//! keep the snapshot, creating the dataset of a new experiment first.
+//! The sync of one install: links one at a time under a reservation, the timer's quick pass and
+//! full reconciliation, dataset events, and the manual run's report and resolutions.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -9,15 +9,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
 
 use crate::body::Body;
-use crate::compare::{Decision, Side, Snapshot, decide, same};
-use crate::elab::{self, MAX_CALL};
+use crate::compare::{Decision, Origin, Side, Snapshot, decide, same};
+use crate::elab::{self, MAX_CALL, Order};
 use crate::host::{Fault, Host, Kind, Result};
-use crate::progress::{Link, Mark, Record, Reservation, Reserved, dataset_key, link_key};
+use crate::progress::{
+    Cursor, LINK_PAGE, Link, Listed, Mark, Pass, Phase, Record, Reservation, Reserved, dataset_key,
+    failed_page, link_key, link_page, load, report, store,
+};
 use crate::values::{
-    Experiment, Field, Settings, UPLOAD_PREFIX, Upload, Values, dataset_entity, dataset_patch,
-    dataset_values, field_update, identified, identifier, link_fields, merge_file,
+    Experiment, Field, ID_FIELD, Settings, UPLOAD_PREFIX, Upload, Values, dataset_entity,
+    dataset_patch, dataset_values, field_update, identified, identifier, link_fields, merge_file,
 };
 
+/// Links one run syncs at most, so a run stays well inside 1000 host calls and 60 s.
+const RUN_LINKS: usize = 20;
+/// Links a full pass checks per run.
+const CHUNK: usize = 10;
+/// Bytes a run takes on before it stops starting links, below the run bound of 16 MiB.
+const RUN_BYTES: u64 = 12 << 20;
 const RETRY_MS: u64 = 15 * 60 * 1000;
 /// Rounds of read, compare and write per link while the dataset moves on in between.
 const ROUNDS: usize = 3;
@@ -55,6 +64,138 @@ impl<'a> Sync<'a> {
             run,
             now,
             pass: Cell::new(0),
+        }
+    }
+
+    /// The timer run: the bucket check, due failed links, the quick pass, then a chunk of the
+    /// full reconciliation.
+    pub fn poll(&self) -> Result<Value> {
+        self.check_bucket()?;
+        let (version, mut cursor) = match load::<Cursor>(self.host, "cursor")? {
+            Some((version, cursor)) => (Some(version), cursor),
+            None => (None, Cursor::default()),
+        };
+        let mut done = 0;
+        let (keys, more) = failed_page(self.host, cursor.retry_page)?;
+        cursor.retry_page = if more { cursor.retry_page + 1 } else { 0 };
+        for key in keys.iter().take(RUN_LINKS) {
+            self.guard(self.retry(key));
+            done += 1;
+        }
+        let tag = &self.settings.tag;
+        let entries = cursor.walk(|offset| elab::list(self.host, tag, Order::Changed, offset))?;
+        for entry in entries {
+            if done >= RUN_LINKS || self.host.spent() > RUN_BYTES {
+                break;
+            }
+            if !self.own_write(&entry)? {
+                // A link another run holds stops the pass here, so the next run sees it again.
+                match self.experiment(entry.id, Mode::Quick) {
+                    Ok(None) => break,
+                    other => self.guard(other.map(drop)),
+                }
+                done += 1;
+            }
+            cursor.advance(&entry.modified, entry.id);
+        }
+        // Another run that moved the cursor meanwhile wins; this run's entries come again.
+        match store(self.host, "cursor", &cursor, version) {
+            Err(fault) if fault.kind == Kind::Conflict => {}
+            other => drop(other?),
+        }
+        self.full(false)?;
+        Ok(json!({ "synced": done }))
+    }
+
+    /// A dataset event: the linked experiment's sync, or an experiment for a new dataset below
+    /// `meta/elabftw/`. An event the plugin's own write caused is skipped.
+    pub fn changed(&self, dataset: &str, path: &str, revision: &str) -> Result<()> {
+        let pointer = load::<Link>(self.host, &dataset_key(dataset))?.map(|(_, link)| link);
+        if let Some(experiment) = pointer.and_then(|link| link.experiment) {
+            let link = load::<Link>(self.host, &link_key(experiment))?.map(|(_, link)| link);
+            let seen = link
+                .and_then(|link| link.snapshot)
+                .map(|snapshot| snapshot.revision);
+            if seen.is_some_and(|seen| revision <= seen.as_str()) {
+                return Ok(());
+            }
+            return self.experiment(experiment, Mode::Event).map(drop);
+        }
+        let below = path
+            .split_once("/meta/")
+            .map(|(_, rest)| rest.starts_with("elabftw/"));
+        if below != Some(true) {
+            return Ok(());
+        }
+        self.dataset(dataset)
+    }
+
+    /// A manual run: a report page, a settled conflict or create, a full pass, or one link.
+    pub fn manual(&self, input: &Value) -> Result<Value> {
+        if input.get("report").and_then(Value::as_bool) == Some(true) {
+            let after = input
+                .get("after")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            return report(self.host, after);
+        }
+        if let Some(experiment) = input.get("resolve").and_then(Value::as_u64) {
+            let keep: Origin = serde_json::from_value(input["keep"].clone())
+                .map_err(|_| Fault::new(Kind::Invalid, "keep is \"elabftw\" or \"aruna\""))?;
+            return self.resolve(experiment, keep);
+        }
+        if let Some(dataset) = input.get("resolve_create").and_then(Value::as_str) {
+            return self.resolve_create(dataset, &input["experiment"]);
+        }
+        if input.get("reconcile").and_then(Value::as_bool) == Some(true) {
+            self.full(true)?;
+            return Ok(json!({ "reconcile": "started" }));
+        }
+        if let Some(experiment) = input.get("experiment").and_then(Value::as_u64) {
+            let marks = self.experiment(experiment, Mode::Manual)?;
+            let marks =
+                marks.ok_or_else(|| Fault::new(Kind::Unavailable, "another run holds the link"))?;
+            return Ok(json!({ "experiment": experiment, "marks": marks }));
+        }
+        let usage = "expected report, resolve, resolve_create, reconcile or experiment";
+        Err(Fault::new(Kind::Invalid, usage))
+    }
+
+    fn check_bucket(&self) -> Result<()> {
+        let uploads = self.settings.uploads();
+        self.host.objects(&uploads).map_err(|fault| {
+            let hint = "create the bucket on the install's receiver node";
+            Fault::new(
+                fault.kind,
+                format!("{uploads} cannot be listed ({hint}): {}", fault.message),
+            )
+        })
+    }
+
+    /// Logs a link's error without failing the run; the link keeps its marks.
+    fn guard(&self, result: Result<()>) {
+        if let Err(fault) = result {
+            self.host
+                .log(&format!("a link was left for a later run: {fault}"));
+        }
+    }
+
+    /// Whether the entry is the plugin's own last write, seen right after it.
+    fn own_write(&self, entry: &Listed) -> Result<bool> {
+        if entry.changed_by != self.settings.sync_user {
+            return Ok(false);
+        }
+        let link = load::<Link>(self.host, &link_key(entry.id))?.map(|(_, link)| link);
+        Ok(link.and_then(|link| link.written).as_deref() == Some(entry.modified.as_str()))
+    }
+
+    fn retry(&self, key: &str) -> Result<()> {
+        if let Some(experiment) = key.strip_prefix("link/").and_then(|id| id.parse().ok()) {
+            return self.experiment(experiment, Mode::Retry).map(drop);
+        }
+        match key.strip_prefix("dataset/") {
+            Some(dataset) => self.dataset(dataset),
+            None => Ok(()),
         }
     }
 
@@ -503,6 +644,268 @@ impl<'a> Sync<'a> {
             revision = self.host.remove_file(dataset, id, &revision)?;
         }
         Ok(revision)
+    }
+
+    /// A dataset below `meta/elabftw/` without a linked experiment: adopted when its identifier
+    /// names one, else an experiment is created for it once.
+    fn dataset(&self, dataset: &str) -> Result<()> {
+        let summary = self.host.summary(dataset)?;
+        if let Some(experiment) = identified(&summary.json) {
+            return self.adopt(dataset, experiment);
+        }
+        let mut record = Record::load(self.host, &dataset_key(dataset))?;
+        if let Some(experiment) = record.link.experiment {
+            return self.experiment(experiment, Mode::Event).map(drop);
+        }
+        let held = record.link.reservation.clone();
+        if held
+            .as_ref()
+            .is_some_and(|held| held.busy(self.run, self.now) && !held.unknown)
+        {
+            return Ok(());
+        }
+        if held.as_ref().is_some_and(|held| held.unknown) {
+            // The first `POST` may still land, so only a found experiment or a person settles it.
+            let found = elab::search(self.host, ID_FIELD, dataset)?;
+            if let Some(experiment) = found.first() {
+                return self.adopt(dataset, *experiment);
+            }
+            let reason = "the experiment create has an unknown outcome; resolve it by hand";
+            record
+                .link
+                .mark(Mark::UnknownCreate, Some(vec![reason.into()]));
+            return record.save(self.host);
+        }
+        record.link.dataset = Some(dataset.to_string());
+        record.link.reservation = Some(Reservation::new(Reserved::Experiment, self.run, self.now));
+        match record.save(self.host) {
+            Err(fault) if fault.kind == Kind::Conflict => return Ok(()),
+            other => other?,
+        }
+        let files = self.all_files(dataset)?;
+        let values = dataset_values(&summary.json, Some(&files), dataset, self.settings);
+        let mut tags: Vec<&String> = values.tags.iter().collect();
+        tags.push(&self.settings.tag);
+        let links = values.links.clone().unwrap_or_default();
+        let body = json!({
+            "title": values.title,
+            "body": values.body.text,
+            "content_type": values.body.format.content_type(),
+            "tags": tags,
+            "metadata": link_fields(self.settings, dataset, &links).to_string(),
+            "canread": json!({ "base": 30, "teams": [], "teamgroups": [], "users": [] }).to_string(),
+            "canwrite": self.settings.canwrite().to_string(),
+        });
+        let key = format!("experiment/{dataset}/{}", record.link.attempt);
+        match elab::create(self.host, body, key) {
+            Ok(experiment) => {
+                let mut link = Record::load(self.host, &link_key(experiment))?;
+                link.link.experiment = Some(experiment);
+                link.link.dataset = Some(dataset.to_string());
+                let mut snapshot = Snapshot::agreed(&values);
+                snapshot.revision = summary.revision.clone();
+                link.link.snapshot = Some(snapshot.clone());
+                link.save(self.host)?;
+                record.link.reservation = None;
+                record.link.experiment = Some(experiment);
+                record.link.mark(Mark::UnknownCreate, None);
+                record.link.mark(Mark::Failed, None);
+                record.save(self.host)?;
+                self.write_back(
+                    &mut link,
+                    (experiment, dataset),
+                    (&values, &summary.revision),
+                    snapshot,
+                )
+            }
+            Err(fault) if fault.kind == Kind::Unknown => {
+                if let Some(held) = record.link.reservation.as_mut() {
+                    held.unknown = true;
+                }
+                record
+                    .link
+                    .mark(Mark::UnknownCreate, Some(vec![fault.message]));
+                record.save(self.host)
+            }
+            Err(fault) => {
+                record.link.reservation = None;
+                record.link.fail(&fault.message, self.now, RETRY_MS);
+                record.save(self.host)
+            }
+        }
+    }
+
+    /// After an experiment create: eLabFTW's stored body and the identifier go to the dataset,
+    /// against the revision the experiment was made from.
+    fn write_back(
+        &self,
+        link: &mut Record,
+        (experiment, dataset): (u64, &str),
+        (sent, revision): (&Values, &String),
+        mut snapshot: Snapshot,
+    ) -> Result<()> {
+        let after = elab::experiment(self.host, experiment)?;
+        let after =
+            after.ok_or_else(|| Fault::new(Kind::NotFound, "the new experiment is gone"))?;
+        let stored = after.values(None, self.settings);
+        let mut target = sent.clone();
+        copy(Field::Body, &stored, &mut target);
+        let mut patch = dataset_patch(&target, &[Field::Body]);
+        patch["identifier"] = identifier(experiment, self.settings);
+        snapshot.elab.update(&stored, &[]);
+        match self.host.patch(dataset, &patch, revision) {
+            Ok(next) => {
+                snapshot.aruna.update(&target, &[]);
+                snapshot.revision = next;
+            }
+            // An Aruna edit since the read compares with what was sent, in the next sync.
+            Err(fault) if fault.kind == Kind::Conflict => {}
+            Err(fault) => return Err(fault),
+        }
+        snapshot.modified = after.modified.clone();
+        link.link.snapshot = Some(snapshot);
+        link.link.written = Some(after.modified);
+        link.save(self.host)
+    }
+
+    /// Links a dataset to an existing experiment, as a found lookup or a person decides.
+    fn adopt(&self, dataset: &str, experiment: u64) -> Result<()> {
+        let mut link = Record::load(self.host, &link_key(experiment))?;
+        if link.link.dataset.as_deref() != Some(dataset) {
+            link.link.experiment = Some(experiment);
+            link.link.dataset = Some(dataset.to_string());
+            link.link.snapshot = None;
+            link.save(self.host)?;
+        }
+        let mut pointer = Record::load(self.host, &dataset_key(dataset))?;
+        pointer.link.reservation = None;
+        pointer.link.experiment = Some(experiment);
+        pointer.link.mark(Mark::UnknownCreate, None);
+        pointer.link.mark(Mark::Failed, None);
+        pointer.save(self.host)?;
+        self.experiment(experiment, Mode::Manual).map(drop)
+    }
+
+    /// Settles a conflict or drift: the marked fields take the values of `keep` next.
+    fn resolve(&self, experiment: u64, keep: Origin) -> Result<Value> {
+        let mut record = Record::load(self.host, &link_key(experiment))?;
+        let marked = [Mark::Conflict, Mark::OutOfSync]
+            .iter()
+            .filter_map(|mark| record.link.marks.get(mark));
+        let names = marked
+            .flatten()
+            .filter_map(|detail| detail.split(' ').next());
+        let fields: BTreeSet<Field> = names.filter_map(Field::named).collect();
+        record.link.force = Some((keep, fields.into_iter().collect()));
+        record.link.mark(Mark::Conflict, None);
+        record.link.mark(Mark::OutOfSync, None);
+        record.save(self.host)?;
+        let marks = self.experiment(experiment, Mode::Manual)?;
+        Ok(json!({ "resolved": experiment, "marks": marks }))
+    }
+
+    /// Settles an experiment create with an unknown outcome: the experiment a person found, or
+    /// `"absent"` to allow a new create under a new key.
+    fn resolve_create(&self, dataset: &str, experiment: &Value) -> Result<Value> {
+        if let Some(experiment) = experiment.as_u64() {
+            self.adopt(dataset, experiment)?;
+            return Ok(json!({ "adopted": experiment }));
+        }
+        if experiment.as_str() != Some("absent") {
+            return Err(Fault::new(
+                Kind::Invalid,
+                "experiment is an id or \"absent\"",
+            ));
+        }
+        let mut record = Record::load(self.host, &dataset_key(dataset))?;
+        record.link.reservation = None;
+        record.link.attempt += 1;
+        record.link.mark(Mark::UnknownCreate, None);
+        record.save(self.host)?;
+        self.dataset(dataset)?;
+        Ok(json!({ "created_again": dataset }))
+    }
+
+    /// A chunk of the full reconciliation; `start` begins a new pass now.
+    fn full(&self, start: bool) -> Result<()> {
+        let (version, mut pass) = match load::<Pass>(self.host, "full")? {
+            Some((version, pass)) => (Some(version), pass),
+            None => (None, Pass::default()),
+        };
+        if start || pass.due(self.now) {
+            pass.start(self.now);
+        }
+        self.pass.set(pass.id);
+        let mut checked = 0;
+        match pass.phase {
+            Phase::Idle => return Ok(()),
+            Phase::Experiments => {
+                let tag = &self.settings.tag;
+                let entries = elab::list(self.host, tag, Order::Id, pass.offset)?;
+                let total = entries.len();
+                for entry in entries.into_iter().take(CHUNK) {
+                    if self.host.spent() > RUN_BYTES {
+                        break;
+                    }
+                    if !self.count(&mut pass, self.experiment(entry.id, Mode::Full)) {
+                        break;
+                    }
+                    pass.offset += 1;
+                    checked += 1;
+                }
+                if checked == total && total < elab::PAGE as usize {
+                    (pass.phase, pass.offset) = (Phase::Links, 0);
+                }
+            }
+            Phase::Links => {
+                let page = pass.offset / LINK_PAGE as u64;
+                let (ids, more) = link_page(self.host, page)?;
+                let start = (pass.offset % LINK_PAGE as u64) as usize;
+                for id in ids.iter().skip(start) {
+                    if checked >= CHUNK || self.host.spent() > RUN_BYTES {
+                        break;
+                    }
+                    let link = load::<Link>(self.host, &link_key(*id))?.map(|(_, link)| link);
+                    if link.is_some_and(|link| link.pass != pass.id) {
+                        if !self.count(&mut pass, self.experiment(*id, Mode::Full)) {
+                            break;
+                        }
+                        checked += 1;
+                    }
+                    pass.offset += 1;
+                }
+                let next = (page + 1) * LINK_PAGE as u64;
+                let page_done =
+                    pass.offset >= next || (pass.offset % LINK_PAGE as u64) as usize >= ids.len();
+                match (page_done, more) {
+                    (true, true) => pass.offset = next,
+                    (true, false) => pass.phase = Phase::Idle,
+                    (false, _) => {}
+                }
+                if pass.phase == Phase::Idle {
+                    pass.finished = self.now;
+                    self.host.log(&pass.summary());
+                }
+            }
+        }
+        match store(self.host, "full", &pass, version) {
+            Err(fault) if fault.kind == Kind::Conflict => Ok(()),
+            other => other.map(drop),
+        }
+    }
+
+    /// Adds a checked link's marks to the pass; `false` when another run holds the link.
+    fn count(&self, pass: &mut Pass, marks: Result<Option<BTreeSet<Mark>>>) -> bool {
+        match marks {
+            Ok(None) => return false,
+            Ok(Some(marks)) => {
+                for mark in marks {
+                    *pass.counts.entry(mark).or_default() += 1;
+                }
+            }
+            Err(fault) => self.guard(Err(fault)),
+        }
+        true
     }
 }
 
