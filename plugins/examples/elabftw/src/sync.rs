@@ -129,7 +129,7 @@ impl<'a> Sync<'a> {
     /// Room for one more step inside a link, or `Spent`; checked before each call that may
     /// move much, so a run always keeps the room to save its progress.
     fn step(&self) -> Result<()> {
-        self.steps(0)
+        self.reserve(0)
     }
 
     /// Room for a step and `calls` more calls of up to [`CALL`] each, or `Spent`.
@@ -138,16 +138,6 @@ impl<'a> Sync<'a> {
             calls: self.budget.step.calls.saturating_add(calls),
             bytes: (self.budget.step.bytes).saturating_add(CALL.bytes * u64::from(calls)),
         };
-        match self.room(keep) {
-            true => Ok(()),
-            false => Err(Fault::new(Kind::Spent, "the run's budget is used")),
-        }
-    }
-
-    /// Room for a step and `calls` more small calls, or `Spent`.
-    fn steps(&self, calls: u32) -> Result<()> {
-        let mut keep = self.budget.step;
-        keep.calls = keep.calls.saturating_add(calls);
         match self.room(keep) {
             true => Ok(()),
             false => Err(Fault::new(Kind::Spent, "the run's budget is used")),
@@ -793,6 +783,7 @@ impl<'a> Sync<'a> {
                 side: Side::of(aruna),
                 fields: Vec::new(),
                 body: None,
+                tags: None,
             });
         }
         record.save(self.host)?;
@@ -808,17 +799,24 @@ impl<'a> Sync<'a> {
                     let added: Vec<&String> = (wanted.iter())
                         .filter(|tag| !experiment.tags.contains_key(*tag))
                         .collect();
-                    let removed: Vec<u64> = (experiment.tags.iter())
+                    let removed: Vec<(&String, u64)> = (experiment.tags.iter())
                         .filter(|(tag, _)| !wanted.contains(*tag) && **tag != self.settings.tag)
-                        .map(|(_, tag)| *tag)
+                        .map(|(name, tag)| (name, *tag))
                         .collect();
-                    // All tag calls fit, or none is made, so the tags never stop half-way.
-                    self.steps((added.len() + removed.len()) as u32)?;
+                    // Each change answers the whole experiment, so each has its own step; the
+                    // set eLabFTW holds after it is saved, so a stopped batch goes on from there.
+                    let mut held = experiment.values(None, self.settings).tags;
                     for tag in added {
+                        self.step()?;
                         elab::add_tag(self.host, id, tag)?;
+                        held.insert(tag.clone());
+                        self.tagged(record, &held)?;
                     }
-                    for tag in removed {
+                    for (name, tag) in removed {
+                        self.step()?;
                         elab::remove_tag(self.host, id, tag)?;
+                        held.remove(name);
+                        self.tagged(record, &held)?;
                     }
                 }
                 Field::Body => {
@@ -886,6 +884,19 @@ impl<'a> Sync<'a> {
                 .mark(Mark::Blocked, Some(vec![reason, after.modified.clone()]));
         }
         Ok(after)
+    }
+
+    /// Records the tags eLabFTW holds in the middle of a batch of tag changes.
+    fn tagged(&self, record: &mut Record, held: &BTreeSet<String>) -> Result<()> {
+        let source = record
+            .link
+            .reservation
+            .as_mut()
+            .and_then(|held| held.source.as_mut());
+        if let Some(sent) = source {
+            sent.tags = Some(held.clone());
+        }
+        record.save(self.host)
     }
 
     /// Records that eLabFTW holds one more sent field, so a stop after it keeps it as the base.
@@ -1250,6 +1261,16 @@ fn settle(link: &mut Link, sent: Option<Sent>) {
         (snapshot.elab.body, snapshot.elab.raw) = (body, raw);
     }
     snapshot.pending |= sent.fields.contains(&Field::Body);
+    // Tags sent in part: what eLabFTW holds is the base of both sides, so the rest of what Aruna
+    // asks for goes next, as does any change of mind made since.
+    if let (false, Some(tags)) = (sent.fields.contains(&Field::Tags), sent.tags) {
+        let held = Side::of(&Values {
+            tags,
+            ..Values::default()
+        });
+        snapshot.elab.take(&held, &[Field::Tags]);
+        snapshot.aruna.take(&held, &[Field::Tags]);
+    }
 }
 
 /// A manual run's answer: `fields` with the link's marks, or `unfinished` when a later run

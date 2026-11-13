@@ -119,7 +119,6 @@ fn stopped_title_undone() {
     runner.budget.set(small);
     runner.event(&dataset);
     assert_eq!(runner.world.get(id)["title"], "Renamed");
-    assert_eq!(runner.world.get(id)["tags"], "aruna", "no tag was sent");
     assert!(
         runner.marks(id)["unfinished"].is_array(),
         "{}",

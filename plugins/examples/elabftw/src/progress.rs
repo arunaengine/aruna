@@ -77,6 +77,9 @@ pub struct Sent {
     /// The canonical and stored prints of the body eLabFTW kept, from its answer to the send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<(Print, Print)>,
+    /// The tags eLabFTW holds while a batch of tag changes is under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<BTreeSet<String>>,
 }
 
 impl Reservation {
