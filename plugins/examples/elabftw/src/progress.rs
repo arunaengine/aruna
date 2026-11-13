@@ -146,7 +146,8 @@ pub struct Check {
 pub const PART_BYTES: usize = 64 * 1024;
 
 /// Where a dataset's file scan stands, at `files/<dataset>`: the revision it reads, where the
-/// next page starts, and how many parts at `files/<dataset>/<n>` hold the entities read.
+/// next page starts, and how many parts at `files/<dataset>/<n>` hold the plugin's own entities
+/// read. Other files are read past and not kept.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Scan {
     /// The version of the stored value, not part of it.
@@ -175,45 +176,34 @@ pub struct Scan {
     pub all: Part,
 }
 
-/// Entities of a scan: the plugin's own in full, the others by `@id`.
+/// The plugin's own file entities of a scan, in full.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Part {
     #[serde(default)]
     pub ours: BTreeMap<String, Value>,
-    #[serde(default)]
-    pub others: BTreeSet<String>,
 }
 
 impl Part {
-    pub fn add(&mut self, file: Value) {
-        let id = entity_id(&file).to_string();
-        match id.starts_with(UPLOAD_PREFIX) {
-            true => {
-                self.ours.insert(id, file);
-            }
-            false => {
-                self.others.insert(id);
-            }
-        }
+    /// Whether a file entity is one of the plugin's own, from an eLabFTW upload.
+    pub fn owned(file: &Value) -> bool {
+        entity_id(file).starts_with(UPLOAD_PREFIX)
     }
 
-    /// About how many bytes an entity takes in a stored part: the plugin's own in full, the
-    /// others by `@id`.
+    pub fn add(&mut self, file: Value) {
+        self.ours.insert(entity_id(&file).to_string(), file);
+    }
+
+    /// About how many bytes an entity takes in a stored part.
     pub fn cost(file: &Value) -> usize {
-        let id = entity_id(file);
-        match id.starts_with(UPLOAD_PREFIX) {
-            true => id.len() + serde_json::to_vec(file).map_or(0, |bytes| bytes.len()) + 4,
-            false => id.len() + 3,
-        }
+        entity_id(file).len() + serde_json::to_vec(file).map_or(0, |bytes| bytes.len()) + 4
     }
 
     pub fn merge(&mut self, other: Part) {
         self.ours.extend(other.ours);
-        self.others.extend(other.others);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ours.is_empty() && self.others.is_empty()
+        self.ours.is_empty()
     }
 }
 
@@ -232,8 +222,7 @@ impl Scan {
         }
     }
 
-    /// The entities as a page holds them, the plugin's own changes applied; the others with
-    /// their `@id` only.
+    /// The plugin's own entities as the dataset now holds them, its own changes applied.
     pub fn files(&self) -> Vec<Value> {
         let mut ours = self.all.ours.clone();
         for (id, change) in &self.overlay {
@@ -242,8 +231,7 @@ impl Scan {
                 None => ours.remove(id),
             };
         }
-        let others = self.all.others.iter().map(|id| json!({ "@id": id }));
-        ours.into_values().chain(others).collect()
+        ours.into_values().collect()
     }
 
     /// The plugin's own entity as the dataset now holds it.

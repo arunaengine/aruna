@@ -665,9 +665,9 @@ impl<'a> Sync<'a> {
                 return Err(fault);
             }
             let page = self.host.files(dataset, scan.cursor.as_deref())?;
-            // A page splits into parts by the size of its entities; one larger than a part
-            // gets a part of its own.
-            for file in page.files {
+            // Only the plugin's own entities are kept. They split into parts by their size; one
+            // larger than a part gets a part of its own.
+            for file in page.files.into_iter().filter(Part::owned) {
                 let cost = Part::cost(&file);
                 if !scan.fresh.is_empty() && scan.fresh_bytes + cost > PART_BYTES {
                     self.save_part(dataset, &mut scan)?;

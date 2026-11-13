@@ -258,6 +258,18 @@ fn experiment_stays_small() {
     let metadata = experiment["metadata"].as_str().unwrap().len();
     assert!(metadata < 1024, "the metadata holds {metadata} bytes");
 
+    // The scan reads past the other files and keeps none of them in state.
+    let prefix = format!("files/{dataset}/");
+    assert!(
+        runner
+            .world
+            .state_keys()
+            .iter()
+            .all(|key| !key.starts_with(&prefix))
+    );
+    let head = serde_json::to_vec(&runner.world.state(&format!("files/{dataset}")).unwrap());
+    assert!(head.unwrap().len() < 1024);
+
     // Later edits on both sides still sync.
     runner
         .world
