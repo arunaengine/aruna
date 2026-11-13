@@ -7,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
     MATERIALIZATION_STATUS_KEYSPACE, METADATA_ACTOR_KEYSPACE, METADATA_CHECKPOINT_KEYSPACE,
-    RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE, RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
     EVENT_LIMIT, MaterializationState, MaterializationStatusRecord, MetadataActor, MetadataBatch,
@@ -46,6 +46,7 @@ use crate::metadata::profile::validation::{
     batch_adds_profile, not_profiled_status, profile_path_rule, stale_status,
     submission_profile_tag, validate_submission,
 };
+use crate::metadata::projector::dot_applied;
 use crate::metadata::projector::{create_outbox_record, registry_outbox_record};
 use crate::metadata::repository::{
     StorageReadError, event_projection_entries, parse_registry_read, read_registry_effect,
@@ -1284,6 +1285,11 @@ async fn ready_base(
     let applied = status.is_some_and(|status| {
         status.state == MaterializationState::Materialized && status.event_id >= expected
     });
+    // A received event keeps its projection marker until the projector has written its
+    // materialization job, so markers read before jobs miss no event moving between them.
+    if !applied || unprojected(context, document_id).await? {
+        return Err(UpdateDocumentError::GraphPending { expected });
+    }
     let queued = read(StorageEffect::Iter {
         key_space: DOCUMENT_JOB_KEYSPACE.to_string(),
         prefix: Some(document_job_prefix(document_id)),
@@ -1295,6 +1301,62 @@ async fn ready_base(
     match applied && queued.is_empty() {
         true => Ok(()),
         false => Err(UpdateDocumentError::GraphPending { expected }),
+    }
+}
+
+/// Whether the document has a received event the projector has not handed on yet whose own
+/// change is not in the graph: a marker of an applied batch is only a deferred lifecycle mint.
+async fn unprojected(
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<bool, UpdateDocumentError> {
+    let storage = &context.storage_handle;
+    let mut start = None;
+    loop {
+        let page = storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
+                prefix: Some(event_log_prefix(document_id)),
+                start: start.clone(),
+                limit: 100,
+                txn_id: None,
+            })
+            .await;
+        let (values, next) = match page {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            _ => return Err(UpdateDocumentError::MissingTransaction),
+        };
+        for (key, _) in values {
+            let read = StorageEffect::Read {
+                key_space: EVENT_LOG_KEYSPACE.to_string(),
+                key: key.clone(),
+                txn_id: None,
+            };
+            let logged = match storage.send_storage_effect(read).await {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+                Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+                _ => return Err(UpdateDocumentError::MissingTransaction),
+            };
+            let event =
+                logged.and_then(|bytes| postcard::from_bytes::<MetadataEventRecord>(&bytes).ok());
+            let Some(MetadataEventPayload::ApplyBatch { batch, .. }) =
+                event.map(|event| event.payload)
+            else {
+                return Ok(true);
+            };
+            let applied = dot_applied(context, &batch.graph_iri, &batch).await;
+            if !applied.map_err(|error| MetadataError::Backend(error.to_string()))? {
+                return Ok(true);
+            }
+        }
+        match next {
+            Some(after) => start = Some(IterStart::After(after)),
+            None => return Ok(false),
+        }
     }
 }
 

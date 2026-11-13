@@ -1504,3 +1504,93 @@ async fn pending_graph_refused() {
         .collect();
     assert_eq!(ids, ["./b.txt", "./c.txt"]);
 }
+
+#[tokio::test]
+async fn unprojected_event_refused() {
+    // An older event logged with its projection marker but not projected yet may still add to
+    // the file; a removal expecting the newest revision is refused as retryable until it is.
+    use aruna_core::events::Event;
+    use aruna_core::keyspaces::{EVENT_LOG_KEYSPACE, PENDING_PROJECTION_KEYSPACE};
+    use aruna_core::metadata::{
+        MetadataBatchSource, MetadataEffect, MetadataEvent, MetadataEventPayload,
+        MetadataEventRecord,
+    };
+    use aruna_core::storage_entries::{event_log_key, pending_projection_key};
+    let (fixture, broker, _, _dir) = broker().await;
+    let document = three_files(&fixture, &broker).await;
+    let record = crate::metadata::get_document::load_document_record(&broker.ctx, document).await;
+    let record = record.unwrap().unwrap();
+    let source = MetadataBatchSource::UpsertDataEntity {
+        jsonld: r#"{"@id":"./a.txt","@type":"File","name":"older"}"#.to_string(),
+    };
+    let handle = broker.ctx.metadata_handle.as_ref().unwrap();
+    let plan = MetadataEffect::PlanBatch {
+        graph_iri: record.graph_iri.clone(),
+        actor: [9u8; 32],
+        counter: 1,
+        source: source.clone(),
+    };
+    let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) =
+        handle.send_metadata_effect(plan).await
+    else {
+        panic!("expected a planned batch");
+    };
+    let older = record.last_event_id.timestamp_ms() - 1;
+    let event = MetadataEventRecord {
+        event_id: Ulid::from_parts(older, 5),
+        record: record.clone(),
+        user_id: fixture.actor.user_id,
+        node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+        payload: MetadataEventPayload::ApplyBatch {
+            batch,
+            authored: source,
+        },
+        occurred_at_ms: older,
+    };
+    let txn = Txn::direct(&broker.ctx);
+    let logged = (
+        event_log_key(document, event.event_id).to_vec(),
+        crate::plugins::store::encode(&event).unwrap(),
+    );
+    txn.write(EVENT_LOG_KEYSPACE, vec![logged]).await.unwrap();
+    let marker = (
+        pending_projection_key(document, event.event_id).to_vec(),
+        Vec::new(),
+    );
+    txn.write(PENDING_PROJECTION_KEYSPACE, vec![marker])
+        .await
+        .unwrap();
+    let remove = || {
+        let mutation = UpdateDocumentMutation::RemoveDataEntity {
+            id: "./a.txt".to_string(),
+        };
+        let token = Some(AuthToken::Internal(fixture.auth()));
+        let (ctx, actor, expected) = (
+            &broker.ctx,
+            fixture.actor.clone(),
+            Some(record.last_event_id),
+        );
+        route_metadata_update(
+            ctx,
+            actor,
+            Some(&record),
+            document,
+            None,
+            mutation,
+            expected,
+            token,
+            None,
+        )
+    };
+    let refused = remove().await;
+    let pending = matches!(
+        refused,
+        Err(MetadataWriteError::Update(
+            UpdateDocumentError::GraphPending { .. }
+        ))
+    );
+    assert!(pending, "{refused:?}");
+    // Once the older event is projected and applied, the same removal is planned on it.
+    project(&broker.ctx).await;
+    remove().await.unwrap();
+}
