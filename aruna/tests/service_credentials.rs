@@ -22,7 +22,11 @@ use tokio::time::sleep;
 const YEAR_SECS: u64 = 365 * 24 * 60 * 60;
 
 /// Creates a service account of the group and makes it a member with the group's `user` role.
-async fn create_account(base_url: &str, token: &str, group_id: &str) -> TestResult<String> {
+pub(crate) async fn create_account(
+    base_url: &str,
+    token: &str,
+    group_id: &str,
+) -> TestResult<String> {
     let client = reqwest::Client::new();
     let created: Value = client
         .post(format!(
@@ -48,7 +52,7 @@ async fn create_account(base_url: &str, token: &str, group_id: &str) -> TestResu
     Ok(account)
 }
 
-async fn issue(
+pub(crate) async fn issue(
     base_url: &str,
     token: &str,
     group_id: &str,
@@ -65,7 +69,7 @@ async fn issue(
         .await?)
 }
 
-fn as_credentials(created: CreateS3Response) -> S3Credentials {
+pub(crate) fn as_credentials(created: CreateS3Response) -> S3Credentials {
     S3Credentials {
         access_key_id: created.access_key_id,
         access_secret: created.access_secret,
