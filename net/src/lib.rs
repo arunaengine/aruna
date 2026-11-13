@@ -153,6 +153,8 @@ struct NetInner {
     /// previous attempt dropped part-way leaves the cell uninitialized, so a
     /// later shutdown call retries it instead of assuming it completed.
     teardown: tokio::sync::OnceCell<()>,
+    /// The endpoint close teardown starts; kept until joined, so a cut-short join is retried.
+    endpoint_close: Mutex<Option<tokio::task::JoinHandle<()>>>,
     tasks: Mutex<BackgroundTasks>,
 }
 
@@ -175,12 +177,14 @@ pub struct NetShutdownOutcome {
     pub effects_pending: usize,
     /// Inbound handlers that did not finish before the final join.
     pub inbound_pending: usize,
+    /// The endpoint close still waits for peers to acknowledge it.
+    pub endpoint_pending: bool,
 }
 
 impl NetShutdownOutcome {
     /// True only when the endpoint closed and every tracked child joined.
     pub fn complete(&self) -> bool {
-        self.effects_pending == 0 && self.inbound_pending == 0
+        self.effects_pending == 0 && self.inbound_pending == 0 && !self.endpoint_pending
     }
 }
 
@@ -929,12 +933,14 @@ impl NetHandle {
                 if let Err(err) = self.inner.dht.shutdown().await {
                     warn!(error = %err, "DHT shutdown returned error");
                 }
+                // Document sync closes the same endpoint and would wait unbounded for close
+                // acknowledgements a departed peer never sends; once started, its close returns.
+                self.start_close().await;
                 self.inner.document_sync.shutdown().await;
                 self.inner.eviction_shutdown.cancel();
                 if let Err(err) = self.inner.connection_pool.shutdown().await {
                     warn!(error = %err, "Connection pool shutdown returned error");
                 }
-                self.inner.endpoint.close().await;
             })
             .await;
 
@@ -947,9 +953,10 @@ impl NetHandle {
         // The endpoint is closed, so surviving handlers and accepted effects now
         // fail their stream IO instead of blocking; join both before the caller
         // closes storage.
-        let (effects_drained, inbound_drained) = tokio::join!(
+        let (effects_drained, inbound_drained, endpoint_closed) = tokio::join!(
             tokio::time::timeout(FORCED_INBOUND_DRAIN, self.inner.effect_tasks.wait()),
             tokio::time::timeout(FORCED_INBOUND_DRAIN, self.inner.inbound_tasks.wait()),
+            tokio::time::timeout(FORCED_INBOUND_DRAIN, self.join_close()),
         );
         let effects_pending = self.inner.effect_tasks.len();
         if effects_drained.is_err() {
@@ -965,12 +972,39 @@ impl NetHandle {
                 "Gave up joining inbound stream handlers during shutdown"
             );
         }
+        let endpoint_pending = endpoint_closed.is_err();
+        if endpoint_pending {
+            warn!("Gave up waiting for peers to acknowledge the endpoint close during shutdown");
+        }
         // The handler holds the node context, which holds this handle; release the cycle.
         self.clear_inbound_handler();
         NetShutdownOutcome {
             inbound_pending_deadline,
             effects_pending,
             inbound_pending,
+            endpoint_pending,
+        }
+    }
+
+    /// Starts the endpoint close in an owned task and returns once closing began, which
+    /// ends every connection.
+    async fn start_close(&self) {
+        let started = self.inner.endpoint.closed();
+        let mut close = self.inner.endpoint_close.lock().await;
+        if close.is_none() {
+            let endpoint = self.inner.endpoint.clone();
+            *close = Some(tokio::spawn(async move { endpoint.close().await }));
+        }
+        drop(close);
+        started.await;
+    }
+
+    /// Joins the endpoint close; a join cut short keeps the task for a resumed shutdown.
+    async fn join_close(&self) {
+        let mut close = self.inner.endpoint_close.lock().await;
+        if let Some(task) = close.as_mut() {
+            let _ = task.await;
+            *close = None;
         }
     }
 
