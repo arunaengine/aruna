@@ -741,6 +741,7 @@ mod tests {
         assert_eq!(parked.due_at_ms, PARKED_DUE);
         assert_eq!(parked.attempts, 2);
         assert_eq!(parked.last_error, None);
+        assert_eq!(parked.job_id, record.job_id);
         assert_eq!(awaiting_jobs(&context, relationship).await.unwrap(), 1);
         // The drain neither runs a parked job nor times a wake for it.
         assert_eq!(next_blob_timer(&storage).await.unwrap(), None);
@@ -751,7 +752,7 @@ mod tests {
         assert_eq!(wake_parked(&context, locked, 5_000).await.unwrap(), 1);
         let woken = read_job(&storage, &key, None).await.unwrap().unwrap();
         assert_eq!(woken.due_at_ms, 5_000);
-        assert_eq!(woken.attempts, 2);
+        assert_eq!((woken.attempts, woken.job_id), (2, record.job_id));
         assert_eq!(awaiting_jobs(&context, relationship).await.unwrap(), 0);
         assert_eq!(wake_parked(&context, locked, 6_000).await.unwrap(), 0);
     }

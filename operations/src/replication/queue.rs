@@ -88,6 +88,9 @@ pub struct BlobJobRecord {
     pub reference_advance: Option<ReferenceAdvance>,
     /// A coordinator's publication to one member of a distributed bucket.
     pub distribution: Option<MemberTarget>,
+    /// Names this queued job until it retires: kept by retries and parking, new when an enqueue
+    /// writes the row again. Not part of the job key.
+    pub job_id: Ulid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +226,7 @@ impl BlobJobRecord {
             writer_auth_context,
             reference_advance: None,
             distribution: None,
+            job_id: Ulid::generate(),
         }
     }
 
@@ -3090,6 +3094,7 @@ async fn reschedule_blob_job(
         writer_auth_context: job.writer_auth_context.clone(),
         reference_advance: job.reference_advance,
         distribution: job.distribution.clone(),
+        job_id: job.job_id,
     };
     match storage
         .send_storage_effect(StorageEffect::Write {
@@ -3642,6 +3647,33 @@ mod tests {
         assert_eq!(read_jobs(&storage).await.len(), 1);
     }
 
+    #[tokio::test]
+    async fn enqueue_renews_id() {
+        // Jobs built in one millisecond differ by id; an enqueue that writes the row again gets
+        // a new one, while a preferred queued job keeps its own (`duplicate_preserves_retry`).
+        let first = BlobJobRecord::new(on_demand_input(), None, 7);
+        let second = BlobJobRecord::new(on_demand_input(), None, 7);
+        assert_ne!(first.job_id, second.job_id);
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let queue = || drive(QueueBlobOperation::new(on_demand_input(), None), &context);
+        queue().await.expect("first queue succeeds");
+        let queued = read_jobs(&storage).await[0].1.job_id;
+        queue().await.expect("second queue succeeds");
+        let jobs = read_jobs(&storage).await;
+        assert_eq!(jobs.len(), 1);
+        assert_ne!(jobs[0].1.job_id, queued);
+    }
+
     #[test]
     fn queue_rejects_event() {
         let mut operation = QueueBlobOperation::new(on_demand_input(), None);
@@ -3681,7 +3713,7 @@ mod tests {
         )
         .await
         .expect("queue succeeds");
-        let enqueued_at_ms = read_jobs(&storage).await[0].1.enqueued_at_ms;
+        let queued = read_jobs(&storage).await[0].1.clone();
 
         let result = process_blob_batch(&context)
             .await
@@ -3691,7 +3723,8 @@ mod tests {
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].1.relationship_id, Some(relationship_id));
-        assert_eq!(jobs[0].1.enqueued_at_ms, enqueued_at_ms);
+        assert_eq!(jobs[0].1.enqueued_at_ms, queued.enqueued_at_ms);
+        assert_eq!(jobs[0].1.job_id, queued.job_id);
         assert_eq!(jobs[0].1.attempts, 1);
         let stored = read_relationships(&storage, "bucket")
             .await
@@ -4034,6 +4067,7 @@ mod tests {
             writer_auth_context: Some(auth_context()),
             reference_advance: None,
             distribution: None,
+            job_id: Ulid::generate(),
         };
         let (key_space, key, value) = blob_job_entry(&future_job).unwrap();
         match storage

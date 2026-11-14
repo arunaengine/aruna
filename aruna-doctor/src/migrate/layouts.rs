@@ -1,5 +1,5 @@
 //! Rows stored before distributed buckets: shapes that gained trailing fields, replication jobs
-//! whose key gained the member target, and queue and index rows a new key layout replaced.
+//! whose key gained the member target or that lack a job id, and replaced queue and index rows.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,12 +8,18 @@ use super::vault::Moves;
 use super::{Rewrites, decode_error, relaid, rewrite_rows};
 use crate::explorer::ExplorerError;
 use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BlobCleanupWork;
+use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::storage::usage::{
     NodeUsageSnapshot, USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX, USAGE_PROGRESS_KEY, UsageCounters,
 };
+use aruna_operations::replication::members::MemberTarget;
+use aruna_operations::replication::protocol::{ReferenceAdvance, SyncOrigin};
 use aruna_operations::replication::queue::{BlobJobRecord, blob_job_key};
+use aruna_operations::replication::version_replication::ReplicateScopeInput;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use ulid::Ulid;
 
@@ -58,7 +64,55 @@ pub(super) const CONSENTS: (&[u8], usize) = (b"j", 1);
 /// Old to new keys of the replication jobs that moved.
 pub(super) type Renamed = BTreeMap<Vec<u8>, Vec<u8>>;
 
-/// Replication jobs before the member target, moved to the key their record now has.
+/// A replication job as alpha.200 stored it, without its job id; before the member target it
+/// lacked `distribution` too.
+#[derive(Deserialize)]
+#[serde(rename = "BlobJobRecord")]
+struct StoredJob {
+    input: ReplicateScopeInput,
+    source_delete_marker: Option<bool>,
+    due_at_ms: u64,
+    attempts: u32,
+    last_error: Option<String>,
+    relationship_id: Option<Ulid>,
+    enqueued_at_ms: u64,
+    origin: Option<SyncOrigin>,
+    upstream_sources: Vec<ArunaArn>,
+    writer_auth_context: Option<AuthContext>,
+    reference_advance: Option<ReferenceAdvance>,
+    distribution: Option<MemberTarget>,
+}
+
+impl From<StoredJob> for BlobJobRecord {
+    fn from(job: StoredJob) -> Self {
+        Self {
+            input: job.input,
+            source_delete_marker: job.source_delete_marker,
+            due_at_ms: job.due_at_ms,
+            attempts: job.attempts,
+            last_error: job.last_error,
+            relationship_id: job.relationship_id,
+            enqueued_at_ms: job.enqueued_at_ms,
+            origin: job.origin,
+            upstream_sources: job.upstream_sources,
+            writer_auth_context: job.writer_auth_context,
+            reference_advance: job.reference_advance,
+            distribution: job.distribution,
+            job_id: Ulid::generate(),
+        }
+    }
+}
+
+/// An older job row: the alpha.200 shape, else the shape before the member target.
+fn stored_job(value: &[u8]) -> postcard::Result<StoredJob> {
+    match postcard::take_from_bytes::<StoredJob>(value) {
+        Ok((job, [])) => Ok(job),
+        _ => session_refs::decode::<StoredJob>(value, REPLICATION_JOB),
+    }
+}
+
+/// Replication jobs stored before the job id, each with a fresh one, in one pass: an alpha.200
+/// row keeps its key, a row from before the member target moves to the key its record now has.
 pub(super) fn replication_jobs(
     db: &OptimisticTxDatabase,
     keyspace: &OptimisticTxKeyspace,
@@ -76,8 +130,9 @@ pub(super) fn replication_jobs(
         if BlobJobRecord::from_bytes(&value).is_ok() {
             continue;
         }
-        let record = session_refs::decode::<BlobJobRecord>(&value, REPLICATION_JOB)
-            .map_err(|error| decode_error(name, &key, error))?;
+        let record: BlobJobRecord = stored_job(&value)
+            .map_err(|error| decode_error(name, &key, error))?
+            .into();
         let moved = blob_job_key(&record).map_err(|error| decode_error(name, &key, error))?;
         let bytes =
             postcard::to_allocvec(&record).map_err(|error| decode_error(name, &key, error))?;
@@ -242,25 +297,9 @@ mod tests {
         let head = CurrentVersionPointer::new(Ulid::from(1))
             .to_bytes()
             .unwrap();
-        let job = BlobJobRecord::new(
-            ReplicateScopeInput {
-                bucket: "data".to_string(),
-                target: ReplicateScopeTarget::Bucket,
-                target_node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
-                auth_context: AuthContext {
-                    user_id: UserId::nil(realm_id),
-                    realm_id,
-                    path_restrictions: None,
-                    session: None,
-                },
-                replicate_delete_markers: true,
-                mode: ReplicationMode::Live,
-            },
-            None,
-            5,
-        );
+        let job = job(ReplicateScopeTarget::Bucket);
         let job_key = blob_job_key(&job).unwrap().to_vec();
-        let job_bytes = job.to_bytes().unwrap();
+        let job_bytes = stored(&job);
         let work = BlobCleanupWork::ReconcileWrite {
             location: BackendLocation {
                 backend: BackendRef::node_default(),
@@ -327,10 +366,8 @@ mod tests {
 
         assert_eq!(read(&path, BLOB_HEAD_KEYSPACE)[b"head".as_slice()], head);
         let jobs = read(&path, REPLICATION_JOB_KEYSPACE);
-        assert_eq!(
-            jobs.into_iter().collect::<Vec<_>>(),
-            vec![(job_key.clone(), job_bytes)]
-        );
+        assert_eq!(jobs.keys().collect::<Vec<_>>(), vec![&job_key]);
+        assert_eq!(migrated(&jobs[&job_key], &job), job);
         assert_eq!(read(&path, BLOB_CLEANUP_KEYSPACE)[b"work".as_slice()], work);
         let refreshes = read(&path, REFRESH_JOB_KEYSPACE);
         assert_eq!(refreshes.keys().collect::<Vec<_>>(), vec![b"v2job"]);
@@ -348,6 +385,81 @@ mod tests {
         assert_eq!(output.stale_rows_deleted.values().sum::<usize>(), 5);
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert!(again.relaid_rows.is_empty() && again.stale_rows_deleted.is_empty());
+    }
+
+    /// A live replication job of `target`.
+    fn job(target: ReplicateScopeTarget) -> BlobJobRecord {
+        let realm_id = RealmId([2; 32]);
+        let input = ReplicateScopeInput {
+            bucket: "data".to_string(),
+            target,
+            target_node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            auth_context: AuthContext {
+                user_id: UserId::nil(realm_id),
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            replicate_delete_markers: true,
+            mode: ReplicationMode::Live,
+        };
+        BlobJobRecord::new(input, None, 5)
+    }
+
+    /// The bytes alpha.200 stored for `job`: the record without its trailing job id.
+    fn stored(job: &BlobJobRecord) -> Vec<u8> {
+        let bytes = job.to_bytes().unwrap();
+        let id = postcard::to_allocvec(&job.job_id).unwrap().len();
+        bytes[..bytes.len() - id].to_vec()
+    }
+
+    /// A migrated row with the original's job id, after checking that it got a fresh one.
+    fn migrated(bytes: &[u8], original: &BlobJobRecord) -> BlobJobRecord {
+        let record = BlobJobRecord::from_bytes(bytes).unwrap();
+        assert_ne!(record.job_id, original.job_id);
+        BlobJobRecord {
+            job_id: original.job_id,
+            ..record
+        }
+    }
+
+    #[test]
+    fn mints_job_ids() {
+        // In one database, a current job stays, an alpha.200 job keeps its key, and a job from
+        // before the member target moves with its wait row; both older ones get distinct ids.
+        let current = job(ReplicateScopeTarget::Prefix("a/".to_string()));
+        let recent = job(ReplicateScopeTarget::Prefix("b/".to_string()));
+        let oldest = job(ReplicateScopeTarget::Prefix("c/".to_string()));
+        let key = |job: &BlobJobRecord| blob_job_key(job).unwrap().to_vec();
+        let old_key = key(&oldest)[..key(&oldest).len() - 1].to_vec();
+        let old_bytes = stored(&oldest)[..stored(&oldest).len() - 1].to_vec();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("db");
+        let rows = vec![
+            (key(&current), current.to_bytes().unwrap()),
+            (key(&recent), stored(&recent)),
+            (old_key.clone(), old_bytes),
+        ];
+        let rows = (rows.iter()).map(|(key, value)| (key.as_slice(), value.clone()));
+        write(&path, REPLICATION_JOB_KEYSPACE, rows.collect());
+        let wait = |job: &[u8]| [[5; 24].as_slice(), job].concat();
+        write(&path, COPY_WAIT_KEYSPACE, vec![(&wait(&old_key), vec![0])]);
+
+        migrate_output(path.to_str().unwrap()).unwrap();
+
+        let jobs = read(&path, REPLICATION_JOB_KEYSPACE);
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[&key(&current)], current.to_bytes().unwrap());
+        assert_eq!(migrated(&jobs[&key(&recent)], &recent), recent);
+        assert_eq!(migrated(&jobs[&key(&oldest)], &oldest), oldest);
+        let ids = [&key(&recent), &key(&oldest)]
+            .map(|key| BlobJobRecord::from_bytes(&jobs[key]).unwrap().job_id);
+        assert_ne!(ids[0], ids[1]);
+        let waits = read(&path, COPY_WAIT_KEYSPACE);
+        assert_eq!(waits.keys().collect::<Vec<_>>(), vec![&wait(&key(&oldest))]);
+        let again = migrate_output(path.to_str().unwrap()).unwrap();
+        assert!(again.relaid_rows.is_empty() && again.stale_rows_deleted.is_empty());
+        assert_eq!(read(&path, REPLICATION_JOB_KEYSPACE), jobs);
     }
 
     #[test]
