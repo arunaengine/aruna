@@ -34,6 +34,7 @@ use super::cleanup::sweep_events;
 use super::clock::probe_clock;
 use super::decide::{decide_batch, prune_seen};
 use super::dispatch::{enqueue_timers, event_trigger};
+use super::finished::notify_work;
 use super::forward::{Backoff, Decisions, EventBatch, send_outbox};
 use super::grants::{parse_grants, patterns_for};
 use super::install::read_config;
@@ -218,6 +219,14 @@ impl Worker {
             started += 1;
         }
         Ok(started)
+    }
+
+    /// Delivers the ends of jobs whose starting run succeeded as `job_finished` runs.
+    async fn notify(&self, now_ms: u64) -> Result<usize, String> {
+        let config = read_config(&self.ctx, self.realm_id).await;
+        let config = config.map_err(|error| error.to_string())?;
+        let notified = notify_work(&self.ctx, &config, self.local, now_ms).await;
+        notified.map_err(|error| error.to_string())
     }
 
     async fn sweep(&self, now_ms: u64) -> Result<usize, String> {
@@ -584,6 +593,9 @@ pub fn spawn_worker(
                 settled_at = now;
                 if let Err(error) = settle_work(&worker.ctx, now).await {
                     warn!(%error, "Could not keep the summaries of finished plugin work");
+                }
+                if let Err(error) = worker.notify(now).await {
+                    warn!(%error, "Could not deliver finished plugin jobs");
                 }
             }
             if now.saturating_sub(pruned_at) >= PRUNE_MS {

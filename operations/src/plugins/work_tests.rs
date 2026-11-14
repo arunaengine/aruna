@@ -267,6 +267,13 @@ async fn prunes_settled_rows() {
     }
     assert_eq!(settle_work(ctx, 1).await, Ok(2));
     assert_eq!(prune_job_batch(ctx).await.unwrap().pruned, 2);
+    // Delivered as `job_finished`; an undelivered row is never pruned.
+    for (_, row) in &rows {
+        let delivered = update_work(ctx, (install.install_id, row.work_id), |row| {
+            row.notified = true;
+        });
+        delivered.await.unwrap();
+    }
     let late = 1 + RUN_RETENTION_MS;
     assert_eq!(prune_work(ctx, late - 1).await, Ok(0));
     // Both runs still exist, so a rerun could ask for the work again.

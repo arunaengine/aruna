@@ -599,6 +599,7 @@ async fn narrow_requests_compile() {
         "data_uploaded",
         "dataset_created",
         "dataset_updated",
+        "job_finished",
         "manual",
     ];
     assert_eq!(

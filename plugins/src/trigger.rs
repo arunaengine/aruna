@@ -24,10 +24,12 @@ pub enum TriggerKind {
     SyncCompleted,
     SyncFailed,
     DatasetUpdated,
+    /// A job the install started ended, after the run that started it succeeded.
+    JobFinished,
 }
 
 impl TriggerKind {
-    pub const ALL: [TriggerKind; 8] = [
+    pub const ALL: [TriggerKind; 9] = [
         Self::Manual,
         Self::Every,
         Self::Webhook,
@@ -36,6 +38,7 @@ impl TriggerKind {
         Self::SyncCompleted,
         Self::SyncFailed,
         Self::DatasetUpdated,
+        Self::JobFinished,
     ];
 
     /// The kind an author names in `on`, such as `timer` for [`TriggerKind::Every`].
@@ -53,6 +56,7 @@ impl TriggerKind {
             Self::SyncCompleted => "sync_completed",
             Self::SyncFailed => "sync_failed",
             Self::DatasetUpdated => "dataset_updated",
+            Self::JobFinished => "job_finished",
         }
     }
 
@@ -63,7 +67,7 @@ impl TriggerKind {
             Self::DataUploaded | Self::SyncCompleted | Self::SyncFailed => {
                 Some(Permission::ObjectsRead)
             }
-            Self::Manual | Self::Every | Self::Webhook => None,
+            Self::Manual | Self::Every | Self::Webhook | Self::JobFinished => None,
         }
     }
 }

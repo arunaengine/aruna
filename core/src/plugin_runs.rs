@@ -249,6 +249,8 @@ pub enum SourceKind {
     DatasetUpdated,
     SyncCompleted,
     SyncFailed,
+    /// A job of the install ended; made on the receiver, never journaled.
+    JobFinished,
 }
 
 impl SourceKind {
@@ -260,6 +262,7 @@ impl SourceKind {
             Self::DatasetUpdated => "dataset_updated",
             Self::SyncCompleted => "sync_completed",
             Self::SyncFailed => "sync_failed",
+            Self::JobFinished => "job_finished",
         }
     }
 }

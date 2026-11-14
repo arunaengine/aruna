@@ -166,6 +166,7 @@ pub fn event_trigger(kind: SourceKind) -> TriggerKind {
         SourceKind::DatasetUpdated => TriggerKind::DatasetUpdated,
         SourceKind::SyncCompleted => TriggerKind::SyncCompleted,
         SourceKind::SyncFailed => TriggerKind::SyncFailed,
+        SourceKind::JobFinished => TriggerKind::JobFinished,
     }
 }
 

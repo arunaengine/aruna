@@ -185,6 +185,16 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
 }
 
 /// Returns the run identity, settings and trigger it was called with.
+/// A finished job with the mapping the run that started it kept under `job/<id>`.
+async fn finished(ctx: Context, event: Event) -> Result<Value> {
+    let Event::Change(change) = event else {
+        return Err(Error::Input("job_finished needs a job".into()));
+    };
+    let mapping = ctx.state().get(&format!("job/{}", change.resource)).await?;
+    let mapping = mapping.map(|entry| String::from_utf8_lossy(&entry.value).into_owned());
+    Ok(json!({ "job": change.resource, "state": change.revision, "mapping": mapping }))
+}
+
 async fn echo(ctx: Context, event: Event) -> Result<String> {
     let trigger = match event {
         Event::Change(change) => format!(
@@ -228,4 +238,5 @@ aruna_plugin::export! {
     data_uploaded => hoard,
     sync_completed => echo,
     sync_failed => echo,
+    job_finished => finished,
 }
