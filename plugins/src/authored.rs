@@ -85,14 +85,21 @@ struct Service {
 
 /// A secret: its title alone, which takes the slot's default kind, or a table.
 #[derive(Deserialize)]
-#[serde(untagged)]
+#[serde(
+    untagged,
+    expecting = "a secret title, or a table with `title` and `kind`"
+)]
 enum Secret {
     Title(String),
-    Table {
-        title: String,
-        #[serde(default)]
-        kind: Option<SecretKind>,
-    },
+    Table(SecretTable),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretTable {
+    title: String,
+    #[serde(default)]
+    kind: Option<SecretKind>,
 }
 
 #[derive(Deserialize)]
@@ -209,7 +216,7 @@ fn slot(
 ) -> Result<String, ManifestError> {
     let (title, kind) = match secret {
         Secret::Title(title) => (title, default),
-        Secret::Table { title, kind } => (title, kind.unwrap_or(default)),
+        Secret::Table(table) => (table.title, table.kind.unwrap_or(default)),
     };
     let slot = SecretSlot {
         title,

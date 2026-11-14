@@ -111,6 +111,11 @@ fn author_errors() {
         ),
         ("on = [\"manual\"]\ntitel = \"x\"\n", "unknown field"),
         (
+            "on = [\"manual\"]\n[services.catalog]\nurl = \"https://x.example\"\n\
+             [services.catalog.secret]\ntitle = \"Key\"\nmethods = [\"GET\"]\n",
+            "a secret title, or a table with `title` and `kind`",
+        ),
+        (
             "on = [\"manual\"]\n[build]\noutput = \"x\"\n",
             "unknown field `build`",
         ),
