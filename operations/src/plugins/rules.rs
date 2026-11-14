@@ -12,7 +12,7 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::Permission;
+use aruna_plugins::permission::Grant;
 use aruna_plugins::trigger::TriggerKind;
 use tracing::warn;
 use ulid::Ulid;
@@ -153,7 +153,7 @@ pub fn wanted_rules(
         install_id: install.install_id,
     };
     let granted = parse_grants(&install.grants);
-    let sends = granted.get(&Permission::ConnectionsSend);
+    let sends = granted.get(&Grant::Services);
     let group_bound = |slot: &String| {
         (install.secrets.get(slot)).filter(|binding| binding.scope == BoundScope::Group)
     };
@@ -207,7 +207,7 @@ pub fn wanted_rules(
             .or_default()
             .push(rule(Delivery::Verify));
     }
-    let values = granted.get(&Permission::SecretsValue);
+    let values = granted.get(&Grant::Secrets);
     for slot in manifest.secrets.keys() {
         let path = scope.secret(slot);
         let shown = values.is_some_and(|patterns| patterns.iter().any(|p| covers(p, &path)));

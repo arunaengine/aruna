@@ -15,7 +15,7 @@ use aruna_core::types::GroupId;
 use aruna_operations::plugins::account::plugin_account;
 use aruna_operations::plugins::bound::vault_kind;
 use aruna_operations::plugins::check::covers;
-use aruna_operations::plugins::grants::{GrantError, InstallScope, parse_grants};
+use aruna_operations::plugins::grants::{GrantError, InstallScope, parse_grants, writes};
 use aruna_operations::plugins::install::{
     InstallError, InstallRequest, install_plugin, pick_version, prepare_install, read_config,
     read_manifest,
@@ -25,7 +25,7 @@ use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::records::RecordError;
 use aruna_operations::users::service_account::group_admin_path;
 use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::Permission as Grant;
+use aruna_plugins::permission::Grant;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -543,18 +543,20 @@ fn summary(
     ),
 ) -> InstallSummary {
     let granted = parse_grants(grants);
-    let required = &manifest.permissions.required;
-    let permissions = (manifest.requested().into_iter())
-        .map(|permission| PermissionLine {
-            permission: permission.to_string(),
-            required: required.contains(&permission),
-            granted: (granted.get(&permission).into_iter().flatten())
+    let requested = [Grant::Read]
+        .into_iter()
+        .chain(writes(manifest).then_some(Grant::Write));
+    let permissions = requested
+        .map(|grant| PermissionLine {
+            permission: grant.to_string(),
+            required: true,
+            granted: (granted.get(&grant).into_iter().flatten())
                 .cloned()
                 .collect(),
         })
         .collect();
-    let sends = granted.get(&Grant::ConnectionsSend);
-    let values = granted.get(&Grant::SecretsValue);
+    let sends = granted.get(&Grant::Services);
+    let values = granted.get(&Grant::Secrets);
     let readable = |slot: &str| {
         let path = scope.secret(slot);
         values.is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &path)))

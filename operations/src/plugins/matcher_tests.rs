@@ -10,7 +10,7 @@ use super::*;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::lifecycle::set_grants;
-use crate::plugins::worker::tests::{created, installed, synced};
+use crate::plugins::worker::tests::{created, installed, scoped, synced};
 
 /// Journals `event` on this node as a committing transaction would.
 pub(crate) async fn journal(fixture: &Fixture, event: &SourceEvent) {
@@ -64,7 +64,7 @@ async fn narrowed_grants() {
     let install = installed(&fixture).await;
     let (_, base) = created(&install, "A");
     let (inside, outside) = (created(&install, "A/one").0, created(&install, "B/two").0);
-    let narrowed = BTreeMap::from([("metadata.read".into(), vec![format!("{base}/A/**")])]);
+    let narrowed = scoped(vec![format!("{base}/A/**")]);
     let auth = fixture.auth();
     let install = set_grants(
         &fixture.ctx,
@@ -89,10 +89,8 @@ async fn narrowed_sync() {
     // A sync event under the granted prefix is matched; one under another prefix is not.
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
-    let base = install.grants["objects.read"][0]
-        .strip_suffix("/**")
-        .unwrap();
-    let narrowed = BTreeMap::from([("objects.read".into(), vec![format!("{base}/raw/**")])]);
+    let base = install.grants["read"][0].strip_suffix("/**").unwrap();
+    let narrowed = scoped(vec![format!("{base}/data/raw/**")]);
     let (inside, outside) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
     let events = [
         synced(&install, "raw/runs/", inside),

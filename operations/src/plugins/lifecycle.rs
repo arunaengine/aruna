@@ -20,7 +20,7 @@ use super::account::{Identity, guard_of, teardown};
 use super::bound::{BindError, BindPlace, bind_slots};
 use super::check::covers;
 use super::grants::{
-    Grants, carry_grants, check_supported, narrow_grants, parse_grants, stored_grants,
+    Grants, carry_grants, check_supported, narrow_grants, parse_grants, patterns_for, stored_grants,
 };
 use super::install::{
     InstallError, check_admin, check_holder, lock_install, pick_version, read_config,
@@ -286,8 +286,10 @@ pub(crate) fn coverage(
     (manifest.triggers.keys())
         .filter(|kind| kind.needs().is_some())
         .map(|kind| {
-            let needed = kind.needs().and_then(|permission| grants.get(&permission));
-            (*kind, needed.cloned().unwrap_or_default())
+            let needed = kind
+                .needs()
+                .map(|permission| patterns_for(grants, permission));
+            (*kind, needed.unwrap_or_default())
         })
         .collect()
 }

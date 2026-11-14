@@ -202,10 +202,18 @@ async fn finishes_runs() {
     assert!(unfinished(&fixture.ctx).await.unwrap().is_empty());
 }
 
-/// A created dataset `resource` under the install's whole metadata grant, and that grant's base.
+/// Grant choices that scope both `read` and `write` to `patterns`.
+pub(crate) fn scoped(patterns: Vec<String>) -> BTreeMap<String, Vec<String>> {
+    BTreeMap::from([
+        ("read".into(), patterns.clone()),
+        ("write".into(), patterns),
+    ])
+}
+
+/// A created dataset `resource` under the install's group metadata, and that metadata's base.
 pub(crate) fn created(install: &PluginInstall, resource: &str) -> (SourceEvent, String) {
-    let whole = &install.grants["metadata.read"][0];
-    let base = whole.strip_suffix("/**").unwrap().to_string();
+    let whole = &install.grants["read"][0];
+    let base = format!("{}/meta", whole.strip_suffix("/**").unwrap());
     let event = SourceEvent {
         kind: SourceKind::DatasetCreated,
         group_id: install.group_id,
@@ -256,8 +264,8 @@ async fn event_input() {
 
 /// A completed sync job of the relationship `relationship` under `prefix` of the install's data.
 pub(crate) fn synced(install: &PluginInstall, prefix: &str, relationship: Ulid) -> SourceEvent {
-    let whole = &install.grants["objects.read"][0];
-    let path = format!("{}/{prefix}", whole.strip_suffix("/**").unwrap());
+    let whole = &install.grants["read"][0];
+    let path = format!("{}/data/{prefix}", whole.strip_suffix("/**").unwrap());
     let creator = install.account;
     let kind = SourceKind::SyncCompleted;
     let node = iroh::SecretKey::from_bytes(&[9; 32]).public();
@@ -316,7 +324,7 @@ async fn event_rechecked() {
     admit(&fixture.ctx, &run).await.unwrap();
     (run.state, run.attempts) = (RunState::Running, 1);
     save_run(&fixture.ctx, &run).await.unwrap();
-    let narrowed = BTreeMap::from([("metadata.read".into(), vec![format!("{base}/D2/**")])]);
+    let narrowed = scoped(vec![format!("{base}/D2/**")]);
     let auth = fixture.auth();
     set_grants(
         &fixture.ctx,

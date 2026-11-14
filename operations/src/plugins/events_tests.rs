@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
-
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{ForwardRow, RunTrigger, SourceEvent};
@@ -22,7 +20,7 @@ use crate::plugins::replay::plan_replays;
 use crate::plugins::runs::list_runs;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::{
-    created, echoed_sync, install_artifact, installed, synced, worker,
+    created, echoed_sync, install_artifact, installed, scoped, synced, worker,
 };
 use crate::replication::protocol::ReplicationMode;
 use crate::replication::queue::{QueueBlobOperation, process_blob_batch};
@@ -134,7 +132,7 @@ async fn narrowed_grant_stops() {
         .await
         .unwrap();
     let base = created(&install, "").1;
-    let narrowed = BTreeMap::from([("metadata.read".into(), vec![format!("{base}/A/**")])]);
+    let narrowed = scoped(vec![format!("{base}/A/**")]);
     let (auth, id) = (fixture.auth(), install.install_id);
     set_grants(&fixture.ctx, &fixture.actor, &auth, id, &narrowed)
         .await

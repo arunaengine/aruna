@@ -39,7 +39,7 @@ use ulid::Ulid;
 
 use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
 use super::creates::{Lookup, Step, claim_key, next_step, settle_key};
-use super::grants::{InstallScope, accesses, parse_grants};
+use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
@@ -171,7 +171,7 @@ impl RunBroker {
     ) -> Result<(PluginInstall, AuthContext), HostError> {
         let install = self.admitted(None).await?;
         let grants = parse_grants(&install.grants);
-        let patterns = grants.get(&permission).cloned().unwrap_or_default();
+        let patterns = patterns_for(&grants, permission);
         Ok((
             install.clone(),
             self.account(&install, &patterns, permission),

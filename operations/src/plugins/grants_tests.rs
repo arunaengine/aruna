@@ -21,6 +21,10 @@ fn manifest(extra: serde_json::Value) -> Manifest {
     serde_json::from_value(value).unwrap()
 }
 
+fn reader() -> Manifest {
+    manifest(json!({ "permissions": { "required": ["metadata.read", "objects.read"] } }))
+}
+
 fn scope() -> InstallScope {
     InstallScope {
         realm_id: RealmId::from_bytes([1u8; 32]),
@@ -44,100 +48,94 @@ fn choices(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
 fn defaults_cover_group() {
     let scope = scope();
     let grants = default_grants(&manifest(json!({})), &scope);
-    let meta = format!("/{}/g/{}/meta/**", scope.realm_id, scope.group_id);
-    assert_eq!(
-        grants[&Permission::MetadataRead],
-        BTreeSet::from([meta.clone()])
-    );
-    assert_eq!(grants[&Permission::MetadataWrite], BTreeSet::from([meta]));
-    let sends = &grants[&Permission::ConnectionsSend];
+    let whole = BTreeSet::from([format!("{}/**", scope.group())]);
+    assert_eq!(grants[&Grant::Read], whole);
+    assert_eq!(grants[&Grant::Write], whole);
+    let sends = &grants[&Grant::Services];
     assert_eq!(sends.len(), 2);
     assert!(sends.contains(&scope.connection("mirror")));
     let paths = role_paths(&grants);
     assert_eq!(role_name(&paths), WRITE_ROLE);
     assert_eq!(paths[&scope.connection("catalog")], Access::READ);
+
+    let grants = default_grants(&reader(), &scope);
+    assert!(!grants.contains_key(&Grant::Write));
+    assert_eq!(role_name(&role_paths(&grants)), READ_ROLE);
+    let objects = patterns_for(&grants, Permission::ObjectsRead);
+    assert_eq!(objects, whole);
+    assert!(patterns_for(&grants, Permission::MetadataCreate).is_empty());
 }
 
 #[test]
-fn creation_below_meta() {
+fn readable_secrets_granted() {
     let scope = scope();
-    let requested = json!({ "permissions": { "required": ["metadata.create"] } });
-    let manifest = manifest(requested);
-    let meta = format!("/{}/g/{}/meta", scope.realm_id, scope.group_id);
-    assert_eq!(scope.root(Permission::MetadataCreate), meta);
+    let manifest = manifest(json!({ "secrets": {
+        "signing": { "title": "Signing key", "readable": true },
+        "api": { "title": "API key" }
+    } }));
     let grants = default_grants(&manifest, &scope);
-    let whole = format!("{meta}/**");
-    assert_eq!(grants[&Permission::MetadataCreate], BTreeSet::from([whole]));
-    // An admin narrows creation to one subtree, and the role writes only there.
-    let narrowed = format!("{meta}/elabftw/**");
-    let wanted = choices(&[("metadata.create", &[narrowed.as_str()])]);
-    let grants = narrow_grants(&manifest, &scope, &wanted).unwrap();
-    assert_eq!(role_paths(&grants)[&narrowed], Access::WRITE);
-    let outside = choices(&[("metadata.create", &["/other/g/x/meta/**"])]);
-    assert!(narrow_grants(&manifest, &scope, &outside).is_err());
+    assert_eq!(
+        grants[&Grant::Secrets],
+        BTreeSet::from([scope.secret("signing")])
+    );
 }
 
 #[test]
 fn narrowing_rules() {
     let scope = scope();
     let manifest = manifest(json!({}));
-    let meta = scope.root(Permission::MetadataRead);
+    let meta = format!("{}/meta", scope.group());
     let dataset = format!("{meta}/runs/7/**");
+    let data = format!("{}/data/results/**", scope.group());
     let narrowed = narrow_grants(
         &manifest,
         &scope,
-        &choices(&[
-            ("metadata.write", &[]),
-            ("metadata.read", &[&dataset]),
-            ("connections.send", &["catalog"]),
-        ]),
+        &choices(&[("write", &[]), ("read", &[&dataset, &data])]),
     )
     .unwrap();
     assert_eq!(
-        narrowed[&Permission::MetadataRead],
-        BTreeSet::from([dataset])
+        narrowed[&Grant::Read],
+        BTreeSet::from([data, dataset.clone()])
     );
-    assert!(!narrowed.contains_key(&Permission::MetadataWrite));
+    assert!(!narrowed.contains_key(&Grant::Write));
+    assert_eq!(narrowed[&Grant::Services].len(), 2);
     assert_eq!(role_name(&role_paths(&narrowed)), READ_ROLE);
 
-    let other_group = format!("/{}/g/{}/meta/**", scope.realm_id, Ulid::from_parts(5, 5));
     let refusals = [
         (
+            &manifest,
+            choices(&[("connections.send", &["catalog"])]),
+            GrantError::Unknown("connections.send".into()),
+        ),
+        (
+            &manifest,
             choices(&[("metadata.read", &[])]),
-            GrantError::Required("metadata.read".into()),
+            GrantError::Unknown("metadata.read".into()),
         ),
         (
-            choices(&[("objects.read", &["x"])]),
-            GrantError::NotRequested(Permission::ObjectsRead),
+            &reader(),
+            choices(&[("write", &[&dataset])]),
+            GrantError::NotRequested(Grant::Write),
         ),
         (
-            choices(&[("metadata.delete", &[])]),
-            GrantError::Unknown("metadata.delete".into()),
-        ),
-        (
-            choices(&[("connections.send", &["mirror"])]),
-            GrantError::Required("connection `catalog`".into()),
-        ),
-        (
-            choices(&[("connections.send", &["catalog", "evil"])]),
-            GrantError::UnknownConnection("evil".into()),
+            &reader(),
+            choices(&[("read", &[])]),
+            GrantError::Required(Grant::Read),
         ),
     ];
-    for (choice, expected) in refusals {
-        assert_eq!(narrow_grants(&manifest, &scope, &choice), Err(expected));
+    for (manifest, choice, expected) in refusals {
+        assert_eq!(narrow_grants(manifest, &scope, &choice), Err(expected));
     }
+    let other_group = format!("/{}/g/{}/meta/**", scope.realm_id, Ulid::from_parts(5, 5));
     for pattern in [
         other_group,
+        format!("{}/plugins/**", scope.group()),
         format!("{meta}/../admin"),
         format!("{meta}/a*/b"),
         format!("{meta}/**/x"),
         meta.clone(),
     ] {
-        let result = narrow_grants(
-            &manifest,
-            &scope,
-            &choices(&[("metadata.read", &[&pattern])]),
-        );
+        let result = narrow_grants(&manifest, &scope, &choices(&[("read", &[&pattern])]));
         assert!(
             matches!(result, Err(GrantError::Outside { .. })),
             "{pattern}: {result:?}"
@@ -164,26 +162,23 @@ fn unsupported_manifests() {
 fn update_keeps_grants() {
     let scope = scope();
     let old = manifest(json!({}));
-    let dataset = format!("{}/runs/7/**", scope.root(Permission::MetadataRead));
-    let granted =
-        narrow_grants(&old, &scope, &choices(&[("metadata.write", &[&dataset])])).unwrap();
+    let dataset = format!("{}/meta/runs/7/**", scope.group());
+    let granted = narrow_grants(&old, &scope, &choices(&[("write", &[&dataset])])).unwrap();
     let new = manifest(json!({
-        "permissions": { "required": ["metadata.read", "objects.read"], "optional": ["metadata.write"] },
         "connections": { "catalog": { "url": "https://catalog.example.org/api/" }, "archive": { "url": "https://a.example.org/" } }
     }));
     let (kept, missing) = carry_grants(&granted, &new, &scope);
-    assert_eq!(kept[&Permission::MetadataWrite], BTreeSet::from([dataset]));
-    assert!(!kept.contains_key(&Permission::ObjectsRead));
-    assert_eq!(
-        kept[&Permission::ConnectionsSend],
-        BTreeSet::from([scope.connection("catalog")])
-    );
-    assert_eq!(
-        missing,
-        vec![
-            "objects.read".to_string(),
-            "connection `archive`".to_string()
-        ]
-    );
+    assert_eq!(kept[&Grant::Write], BTreeSet::from([dataset]));
+    assert_eq!(kept[&Grant::Read], granted[&Grant::Read]);
+    let services = [scope.connection("archive"), scope.connection("catalog")];
+    assert_eq!(kept[&Grant::Services], BTreeSet::from(services));
+    assert!(missing.is_empty());
     assert_eq!(parse_grants(&stored_grants(&kept)), kept);
+
+    // A read-only version drops write; one that requires writing again needs a new grant.
+    let (kept, _) = carry_grants(&granted, &reader(), &scope);
+    assert!(!kept.contains_key(&Grant::Write));
+    let writer = manifest(json!({ "permissions": { "required": ["metadata.write"] } }));
+    let (_, missing) = carry_grants(&kept, &writer, &scope);
+    assert_eq!(missing, vec!["write".to_string()]);
 }

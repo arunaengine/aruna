@@ -26,10 +26,16 @@ async fn project(ctx: &DriverContext) {
 
 const ENTITY: &str = r#"{"description":"first"}"#;
 
-/// A broker for a run of a fresh install, and a document of the install's group.
+/// A broker for a run of a fresh install granted the group's metadata, and a document of it.
 async fn broker() -> (Fixture, RunBroker, Ulid, tempfile::TempDir) {
     let fixture = Fixture::new().await;
-    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let meta = format!("/{}/g/{}/meta/**", fixture.actor.realm_id, fixture.group_id);
+    let mut request = fixture.request(None);
+    request.grants = BTreeMap::from([
+        ("read".into(), vec![meta.clone()]),
+        ("write".into(), vec![meta]),
+    ]);
+    let installed = fixture.install(&request).await.unwrap();
     let mut ctx = fixture.ctx.clone();
     let dir = tempfile::tempdir().unwrap();
     let metadata = MetadataHandle::new(
@@ -146,7 +152,7 @@ async fn object_calls() {
             .is_err()
     );
 
-    // With `objects.read`, objects of other nodes and buckets outside the group are refused.
+    // With `read` on the whole group, objects of other nodes and buckets outside it are refused.
     let reads = serde_json::json!({ "permissions": { "required": ["objects.read"] } });
     let mut request = fixture.request(None);
     request.version = Some(fixture.publish("0.1.1", "cd", reads).await);
@@ -202,7 +208,7 @@ async fn state_and_log() {
     );
 }
 
-/// A broker for a run of an install granted `objects.read` on `patterns` only.
+/// A broker for a run of an install granted `read` on `patterns` only.
 async fn objects_broker(
     fixture: &Fixture,
     broker: &RunBroker,
@@ -211,7 +217,7 @@ async fn objects_broker(
     let reads = serde_json::json!({ "permissions": { "required": ["objects.read"] } });
     let mut request = fixture.request(None);
     request.version = Some(fixture.publish("0.1.2", "ef", reads).await);
-    let grants = BTreeMap::from([("objects.read".to_string(), patterns.to_vec())]);
+    let grants = BTreeMap::from([("read".to_string(), patterns.to_vec())]);
     request.grants = grants;
     let installed = fixture.install(&request).await.unwrap();
     let mut scope = broker.scope.clone();
@@ -415,8 +421,8 @@ async fn patch_keeps_entities() {
 }
 
 #[tokio::test]
-async fn write_only_patches() {
-    // A plugin that may write a document but not read it patches it at a revision it was given.
+async fn write_includes_read() {
+    // A plugin that may write a document also reads it, though its `read` names another path.
     let (fixture, broker, document, _dir) = broker().await;
     let read = broker
         .metadata_get(&cx(), &document.to_string())
@@ -425,19 +431,16 @@ async fn write_only_patches() {
     let meta = format!("/{}/g/{}/meta", fixture.actor.realm_id, fixture.group_id);
     let mut request = fixture.request(None);
     request.grants = BTreeMap::from([
-        (
-            "metadata.read".to_string(),
-            vec![format!("{meta}/other/**")],
-        ),
-        ("metadata.write".to_string(), vec![format!("{meta}/**")]),
+        ("read".to_string(), vec![format!("{meta}/other/**")]),
+        ("write".to_string(), vec![format!("{meta}/**")]),
     ]);
     let installed = fixture.install(&request).await.unwrap();
     let mut scope = broker.scope.clone();
     scope.run.install_id = installed.install_id;
     scope.run.digest = installed.digest.clone();
     let writer = RunBroker::new(broker.ctx.clone(), scope);
-    let unread = writer.metadata_get(&cx(), &document.to_string()).await;
-    assert!(unread.is_err());
+    let seen = writer.metadata_get(&cx(), &document.to_string()).await;
+    assert_eq!(seen.unwrap().revision, read.revision);
     let change = patch(
         document,
         &read.revision,
@@ -593,10 +596,9 @@ async fn keyed_creates() {
     let creates = serde_json::json!({ "permissions": { "required": ["metadata.create"] } });
     let mut request = fixture.request(None);
     request.version = Some(fixture.publish("0.1.3", "12", creates).await);
-    request.grants = BTreeMap::from([(
-        "metadata.create".to_string(),
-        vec![format!("{meta}/elabftw/**")],
-    )]);
+    let read = ("read".to_string(), vec![format!("{meta}/**")]);
+    let write = ("write".to_string(), vec![format!("{meta}/elabftw/**")]);
+    request.grants = BTreeMap::from([read, write]);
     let installed = fixture.install(&request).await.unwrap();
     let mut scope = broker.scope.clone();
     scope.run.install_id = installed.install_id;
@@ -635,7 +637,7 @@ async fn keyed_creates() {
     nested.dataset = r##"{"name":"Exp 4","author":{"@id":"#a","name":"A"}}"##.to_string();
     let refused = later.metadata_create(&cx(), nested).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::Invalid);
-    // A dataset naming an object needs `objects.read` on it, whatever the property.
+    // A dataset naming an object needs `read` on it, whatever the property.
     let mut linked = create("elabftw/exp-6", "Exp 6", "e6", 5);
     let arn = private_arn(&fixture);
     linked.dataset = serde_json::json!({"name": "Exp 6", "description": "d",
@@ -914,7 +916,7 @@ async fn file_puts() {
         .await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
 
-    // A file naming an exact object needs `objects.read` on it.
+    // A file naming an exact object needs `read` on it.
     let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
     let arn = aruna_core::structs::storage::replication::VersionedObjectArn::new(
         realm,
@@ -932,7 +934,7 @@ async fn file_puts() {
 
 #[tokio::test]
 async fn object_references() {
-    // Every object a file names passes the plugin's own `objects.read` check: `s3://` and path
+    // Every object a file names passes the plugin's own `read` check: `s3://` and path
     // references need the grant and pass its policies, content ids name no object to check.
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;

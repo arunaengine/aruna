@@ -8,7 +8,9 @@ use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::match_pending;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::store::decode;
-use crate::plugins::worker::tests::{created, echoed_sync, install_artifact, installed, synced};
+use crate::plugins::worker::tests::{
+    created, echoed_sync, install_artifact, installed, scoped, synced,
+};
 use aruna_core::keyspaces::PLUGIN_GAPS_KEYSPACE;
 use aruna_core::plugin_installs::Widening;
 use aruna_core::plugin_runs::{GapRow, gap_key};
@@ -68,17 +70,13 @@ async fn widened_grant() {
         unix_timestamp_millis(),
         fixture.auth(),
     );
-    let (whole, base) = (
-        install.grants["metadata.read"].clone(),
-        created(&install, "").1,
-    );
+    let (whole, base) = (install.grants["read"].clone(), created(&install, "").1);
     let (inside, outside) = (
         dataset(&install, "A/one", now - 1),
         dataset(&install, "B/two", now),
     );
-    let grant = |patterns| BTreeMap::from([("metadata.read".to_string(), patterns)]);
     let id = install.install_id;
-    let narrow = grant(vec![format!("{base}/A/**")]);
+    let narrow = scoped(vec![format!("{base}/A/**")]);
     set_grants(&fixture.ctx, &fixture.actor, &auth, id, &narrow)
         .await
         .unwrap();
@@ -94,7 +92,7 @@ async fn widened_grant() {
         .unwrap();
     assert_eq!(forwarded(&fixture, &install).await, ["A/one"]);
 
-    let wide = grant(whole);
+    let wide = scoped(whole);
     let widened = set_grants(&fixture.ctx, &fixture.actor, &auth, id, &wide);
     assert!(widened.await.unwrap().widened.is_some());
     let config = config(&fixture).await;
@@ -121,12 +119,11 @@ async fn widened_sync() {
         unix_timestamp_millis(),
         fixture.auth(),
     );
-    let whole = install.grants["objects.read"].clone();
+    let whole = install.grants["read"].clone();
     let base = whole[0].strip_suffix("/**").unwrap().to_string();
     let (inside, outside) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
-    let grant = |patterns| BTreeMap::from([("objects.read".to_string(), patterns)]);
     let id = install.install_id;
-    let narrow = grant(vec![format!("{base}/raw/**")]);
+    let narrow = scoped(vec![format!("{base}/data/raw/**")]);
     (set_grants(&fixture.ctx, &fixture.actor, &auth, id, &narrow).await).unwrap();
     let narrowed = config(&fixture).await;
     plan_replays(&fixture.ctx, &narrowed, local, now, no_clock)
@@ -143,7 +140,7 @@ async fn widened_sync() {
         .unwrap();
     assert_eq!(forwarded(&fixture, &install).await, [inside.to_string()]);
 
-    let wide = grant(whole);
+    let wide = scoped(whole);
     let widened = set_grants(&fixture.ctx, &fixture.actor, &auth, id, &wide);
     assert!(widened.await.unwrap().widened.is_some());
     let config = config(&fixture).await;

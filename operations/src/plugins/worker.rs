@@ -18,7 +18,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::ErrorKind;
 use aruna_plugins::limits::{Limits, RuntimeConfig};
-use aruna_plugins::permission::Permission;
+use aruna_plugins::permission::{Grant, Permission};
 use aruna_plugins::{
     CancellationToken, FailureKind, Field, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
     WebhookDelivery, WebhookRequest,
@@ -35,6 +35,7 @@ use super::clock::probe_clock;
 use super::decide::{decide_batch, prune_seen};
 use super::dispatch::{enqueue_timers, event_trigger};
 use super::forward::{Backoff, Decisions, EventBatch, send_outbox};
+use super::grants::{parse_grants, patterns_for};
 use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
@@ -447,14 +448,12 @@ fn invocation(
     limits: Limits,
     cancel: CancellationToken,
 ) -> Invocation {
-    let permissions: BTreeSet<Permission> = (install.grants.iter())
-        .filter(|(_, patterns)| !patterns.is_empty())
-        .filter_map(|(name, _)| name.parse().ok())
+    let grants = parse_grants(&install.grants);
+    let permissions: BTreeSet<Permission> = (Permission::ALL.into_iter())
+        .filter(|permission| !patterns_for(&grants, *permission).is_empty())
         .collect();
-    // A `connections.send` grant path ends in the connection's name.
-    let connections = (install.grants.get(Permission::ConnectionsSend.as_str()))
-        .into_iter()
-        .flatten()
+    // A service's grant path ends in the connection's name.
+    let connections = (grants.get(&Grant::Services).into_iter().flatten())
         .filter_map(|path| path.rsplit('/').next().map(str::to_string))
         .collect();
     let trigger = match &run.trigger {

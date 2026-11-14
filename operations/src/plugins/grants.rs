@@ -9,31 +9,27 @@ use aruna_core::structs::identity::auth::Permission as Access;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
 use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::Permission;
+use aruna_plugins::permission::{Grant, Permission};
 use thiserror::Error;
 use ulid::Ulid;
 
-/// Granted resource patterns by permission.
-pub type Grants = BTreeMap<Permission, BTreeSet<String>>;
+/// Granted resource patterns: `read` and `write` as the installer scoped them, and the paths of
+/// the services and readable secrets the manifest declares.
+pub type Grants = BTreeMap<Grant, BTreeSet<String>>;
 
 pub const READ_ROLE: &str = "plugin-read";
 pub const WRITE_ROLE: &str = "plugin-write";
 
 #[derive(Debug, Error, PartialEq)]
 pub enum GrantError {
-    #[error("`{0}` is not a plugin permission")]
+    #[error("`{0}` is not a grant an installer chooses; choose `read` or `write`")]
     Unknown(String),
     #[error("{0} is not requested by this plugin version")]
-    NotRequested(Permission),
-    #[error("{0} is required and cannot be removed")]
-    Required(String),
-    #[error("`{pattern}` is not a {permission} resource of this group")]
-    Outside {
-        permission: Permission,
-        pattern: String,
-    },
-    #[error("connection `{0}` is not declared by this plugin version")]
-    UnknownConnection(String),
+    NotRequested(Grant),
+    #[error("{0} is required by this plugin version")]
+    Required(Grant),
+    #[error("`{pattern}` is not a {grant} resource of this group")]
+    Outside { grant: Grant, pattern: String },
     #[error("{0}")]
     Unsupported(&'static str),
 }
@@ -47,29 +43,21 @@ pub struct InstallScope {
 }
 
 impl InstallScope {
-    /// The policy path below which a permission's resources live.
-    pub fn root(&self, permission: Permission) -> String {
-        let group = format!("/{}/g/{}", self.realm_id, self.group_id);
-        match permission {
-            Permission::MetadataRead | Permission::MetadataWrite | Permission::MetadataCreate => {
-                format!("{group}/meta")
-            }
-            Permission::ConnectionsSend => {
-                format!("{group}/plugins/{}/connections", self.install_id)
-            }
-            Permission::SecretsValue => format!("{group}/plugins/{}/secrets", self.install_id),
-            _ => format!("{group}/data"),
-        }
+    /// The group's policy path; `read` and `write` patterns lie in its `meta` or `data` subtree.
+    pub fn group(&self) -> String {
+        format!("/{}/g/{}", self.realm_id, self.group_id)
     }
 
     /// The generated grant path of one declared connection.
     pub fn connection(&self, name: &str) -> String {
-        format!("{}/{name}", self.root(Permission::ConnectionsSend))
+        let group = self.group();
+        format!("{group}/plugins/{}/connections/{name}", self.install_id)
     }
 
     /// The grant path of one secret slot's value.
     pub fn secret(&self, slot: &str) -> String {
-        format!("{}/{slot}", self.root(Permission::SecretsValue))
+        let group = self.group();
+        format!("{group}/plugins/{}/secrets/{slot}", self.install_id)
     }
 }
 
@@ -81,23 +69,40 @@ pub fn check_supported(manifest: &Manifest) -> Result<(), GrantError> {
     Ok(())
 }
 
-/// Everything requested, on the whole group, and every declared connection.
+/// Whether the manifest asks to change anything: a requested permission only `write` covers.
+pub fn writes(manifest: &Manifest) -> bool {
+    (manifest.requested().into_iter()).any(|permission| permission.grants() == [Grant::Write])
+}
+
+/// `read`, and `write` when requested, on the whole group, and every declared service and
+/// readable secret.
 pub fn default_grants(manifest: &Manifest, scope: &InstallScope) -> Grants {
-    let mut grants: Grants = (manifest.requested().into_iter())
-        .map(|permission| (permission, BTreeSet::from([whole(scope, permission)])))
-        .collect();
-    if !manifest.connections.is_empty() {
-        let paths = manifest
-            .connections
-            .keys()
-            .map(|name| scope.connection(name));
-        grants.insert(Permission::ConnectionsSend, paths.collect());
+    let whole = BTreeSet::from([format!("{}/**", scope.group())]);
+    let mut grants = Grants::from([(Grant::Read, whole.clone())]);
+    if writes(manifest) {
+        grants.insert(Grant::Write, whole);
     }
+    grants.extend(declared(manifest, scope));
     grants
 }
 
-/// The default grants with the admin's choices applied. A listed permission keeps only the
-/// listed patterns; an empty list removes an optional one. Connections are listed by name.
+/// The service and readable secret paths the manifest declares; nobody chooses them.
+fn declared(manifest: &Manifest, scope: &InstallScope) -> Grants {
+    let services: BTreeSet<String> = (manifest.connections.keys())
+        .map(|name| scope.connection(name))
+        .collect();
+    let secrets: BTreeSet<String> = (manifest.secrets.iter())
+        .filter(|(_, slot)| slot.readable)
+        .map(|(name, _)| scope.secret(name))
+        .collect();
+    [(Grant::Services, services), (Grant::Secrets, secrets)]
+        .into_iter()
+        .filter(|(_, paths)| !paths.is_empty())
+        .collect()
+}
+
+/// The default grants with the admin's choices applied: `read` or `write` keeps only the listed
+/// patterns, and an empty list removes it.
 pub fn narrow_grants(
     manifest: &Manifest,
     scope: &InstallScope,
@@ -105,69 +110,63 @@ pub fn narrow_grants(
 ) -> Result<Grants, GrantError> {
     let mut grants = default_grants(manifest, scope);
     for (name, chosen) in choices {
-        let permission: Permission =
-            (name.parse()).map_err(|_| GrantError::Unknown(name.clone()))?;
-        let granted = match permission {
-            Permission::ConnectionsSend => connection_grants(manifest, scope, chosen)?,
-            _ => resource_grants(manifest, scope, permission, chosen)?,
-        };
+        let grant = (name.parse::<Grant>().ok())
+            .filter(|grant| grant.scoped())
+            .ok_or_else(|| GrantError::Unknown(name.clone()))?;
+        if grant == Grant::Write && !writes(manifest) {
+            return Err(GrantError::NotRequested(grant));
+        }
+        let granted = resource_grants(scope, grant, chosen)?;
         match granted.is_empty() {
-            true => grants.remove(&permission),
-            false => grants.insert(permission, granted),
+            true => grants.remove(&grant),
+            false => grants.insert(grant, granted),
         };
     }
-    Ok(grants)
+    match unmet(manifest, &grants).into_iter().next() {
+        Some(grant) => Err(GrantError::Required(grant)),
+        None => Ok(grants),
+    }
+}
+
+/// The scoped grants a required permission of the manifest needs but `grants` lacks.
+fn unmet(manifest: &Manifest, grants: &Grants) -> BTreeSet<Grant> {
+    (manifest.permissions.required.iter())
+        .filter(|permission| permission.grants().iter().all(|grant| grant.scoped()))
+        .filter(|permission| patterns_for(grants, **permission).is_empty())
+        .map(|permission| permission.grants()[0])
+        .collect()
 }
 
 fn resource_grants(
-    manifest: &Manifest,
     scope: &InstallScope,
-    permission: Permission,
+    grant: Grant,
     chosen: &[String],
 ) -> Result<BTreeSet<String>, GrantError> {
-    if !manifest.requested().contains(&permission) {
-        return Err(GrantError::NotRequested(permission));
-    }
-    if chosen.is_empty() && manifest.permissions.required.contains(&permission) {
-        return Err(GrantError::Required(permission.to_string()));
-    }
-    let root = scope.root(permission);
-    let outside = |pattern: &String| GrantError::Outside {
-        permission,
-        pattern: pattern.clone(),
+    let group = scope.group();
+    let inside = |pattern: &String| {
+        pattern == &format!("{group}/**")
+            || ["meta", "data"]
+                .iter()
+                .any(|tree| within(pattern, &format!("{group}/{tree}")))
     };
     (chosen.iter())
-        .map(|pattern| {
-            within(pattern, &root)
-                .then(|| pattern.clone())
-                .ok_or_else(|| outside(pattern))
+        .map(|pattern| match inside(pattern) {
+            true => Ok(pattern.clone()),
+            false => Err(GrantError::Outside {
+                grant,
+                pattern: pattern.clone(),
+            }),
         })
         .collect()
 }
 
-fn connection_grants(
-    manifest: &Manifest,
-    scope: &InstallScope,
-    chosen: &[String],
-) -> Result<BTreeSet<String>, GrantError> {
-    if let Some(unknown) = chosen
-        .iter()
-        .find(|name| !manifest.connections.contains_key(*name))
-    {
-        return Err(GrantError::UnknownConnection(unknown.clone()));
-    }
-    let required = (manifest.connections.iter()).find(|(name, connection)| {
-        !connection.optional && !chosen.iter().any(|chosen| chosen == *name)
-    });
-    if let Some((name, _)) = required {
-        return Err(GrantError::Required(format!("connection `{name}`")));
-    }
-    Ok(chosen.iter().map(|name| scope.connection(name)).collect())
-}
-
-/// The whole subtree of a permission's resources in this group.
-fn whole(scope: &InstallScope, permission: Permission) -> String {
-    format!("{}/**", scope.root(permission))
+/// The granted patterns a call of `permission` may use.
+pub fn patterns_for(grants: &Grants, permission: Permission) -> BTreeSet<String> {
+    (permission.grants().iter())
+        .filter_map(|grant| grants.get(grant))
+        .flatten()
+        .cloned()
+        .collect()
 }
 
 /// Whether `pattern` names `root/**` or a path or subtree below `root`: clean segments, and
@@ -207,13 +206,21 @@ pub fn accesses(permission: Permission) -> &'static [Access] {
     }
 }
 
-/// The account role's paths: each granted pattern with the access its permissions need.
+/// The access the role needs on a grant's patterns.
+pub fn grant_access(grant: Grant) -> Access {
+    match grant {
+        Grant::Write => Access::WRITE,
+        Grant::Read | Grant::Services | Grant::Secrets => Access::READ,
+    }
+}
+
+/// The account role's paths: each granted pattern with the access its grant needs.
 pub fn role_paths(grants: &Grants) -> HashMap<String, Access> {
     let mut paths = HashMap::new();
-    for (permission, patterns) in grants {
+    for (grant, patterns) in grants {
         for pattern in patterns {
             let held = paths.entry(pattern.clone()).or_insert(Access::READ);
-            if accesses(*permission).contains(&Access::WRITE) {
+            if grant_access(*grant) == Access::WRITE {
                 *held = Access::WRITE;
             }
         }
@@ -229,50 +236,31 @@ pub fn role_name(paths: &HashMap<String, Access>) -> &'static str {
     }
 }
 
-/// What an update to `manifest` keeps of `granted`: grants the new version still requests and
-/// connections it still declares. It grants nothing new; the second value lists what the new
-/// version requires but nobody granted yet.
+/// What an update to `manifest` keeps of `granted`: `read`, `write` while the new version still
+/// writes, and the services and secrets it declares. It grants nothing new; the second value
+/// lists what the new version requires but nobody granted yet.
 pub fn carry_grants(
     granted: &Grants,
     manifest: &Manifest,
     scope: &InstallScope,
 ) -> (Grants, Vec<String>) {
-    let requested = manifest.requested();
-    let declared: BTreeSet<String> = manifest
-        .connections
-        .keys()
-        .map(|n| scope.connection(n))
+    let mut kept: Grants = (granted.iter())
+        .filter(|(grant, _)| {
+            **grant == Grant::Read || (**grant == Grant::Write && writes(manifest))
+        })
+        .map(|(grant, patterns)| (*grant, patterns.clone()))
         .collect();
-    let mut kept = Grants::new();
-    for (permission, patterns) in granted {
-        let patterns: BTreeSet<String> = match permission {
-            Permission::ConnectionsSend => patterns.intersection(&declared).cloned().collect(),
-            _ if requested.contains(permission) => patterns.clone(),
-            _ => BTreeSet::new(),
-        };
-        if !patterns.is_empty() {
-            kept.insert(*permission, patterns);
-        }
-    }
-    let mut missing: Vec<String> = (manifest.permissions.required.iter())
-        .filter(|permission| !kept.contains_key(*permission))
-        .map(|permission| permission.to_string())
+    kept.extend(declared(manifest, scope));
+    let missing = (unmet(manifest, &kept).iter())
+        .map(|grant| grant.to_string())
         .collect();
-    let sends = kept.get(&Permission::ConnectionsSend);
-    for (name, connection) in &manifest.connections {
-        if !connection.optional
-            && !sends.is_some_and(|paths| paths.contains(&scope.connection(name)))
-        {
-            missing.push(format!("connection `{name}`"));
-        }
-    }
     (kept, missing)
 }
 
 /// Grants as stored in the install record.
 pub fn stored_grants(grants: &Grants) -> BTreeMap<String, Vec<String>> {
     (grants.iter())
-        .map(|(permission, patterns)| (permission.to_string(), patterns.iter().cloned().collect()))
+        .map(|(grant, patterns)| (grant.to_string(), patterns.iter().cloned().collect()))
         .collect()
 }
 

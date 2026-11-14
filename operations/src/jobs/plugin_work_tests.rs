@@ -30,12 +30,17 @@ pub(crate) fn job_context(ctx: &DriverContext, fixture: &Fixture) -> JobContext 
     }
 }
 
-/// An active install of a version that requests `objects.copy`, granted on the whole group.
+/// An active install of a version that requests `objects.copy`, granted the group's data.
 pub(crate) async fn copier(fixture: &Fixture) -> PluginInstall {
     let copy = json!({ "permissions": { "required": ["objects.copy"] } });
     let digest = fixture.publish("0.2.0", "cd", copy).await;
     let mut request = fixture.request(None);
     request.version = Some(digest);
+    let data = format!("/{}/g/{}/data/**", fixture.actor.realm_id, fixture.group_id);
+    request.grants = std::collections::BTreeMap::from([
+        ("read".into(), vec![data.clone()]),
+        ("write".into(), vec![data]),
+    ]);
     fixture.install(&request).await.unwrap()
 }
 
@@ -144,7 +149,7 @@ async fn narrowed_grant_refuses() {
     let only_source = vec![source.clone()];
     edit_config(&fixture, |config| {
         let grants = &mut config.installs[0].grants;
-        grants.insert("objects.copy".into(), only_source);
+        grants.insert("write".into(), only_source);
     })
     .await;
     let (kind, message) = failure(run_plugin_work(&ctx, &spec).await);

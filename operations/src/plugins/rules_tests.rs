@@ -203,8 +203,8 @@ async fn installs_with_secrets() {
     .await;
     let features = serde_json::json!({
         "secrets": {
-            "api_key": { "title": "API key", "kind": "bearer" },
-            "hook_key": { "title": "Hook key", "kind": "header" }
+            "api_key": { "title": "API key", "kind": "bearer", "readable": true },
+            "hook_key": { "title": "Hook key", "kind": "header", "readable": true }
         },
         "connections": { "catalog": { "url": "{catalog_url}/api/", "auth": "api_key" } },
         "triggers": { "webhook": {
