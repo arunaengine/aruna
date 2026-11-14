@@ -13,7 +13,9 @@ use ulid::Ulid;
 
 use super::broker::local_object;
 use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
-use super::work::{Identity, WorkError, WorkKind, WorkRow, WorkState, dispatched, reserve};
+use super::work::{
+    Identity, WorkError, WorkKind, WorkRow, WorkState, dedup_key, dispatched, reserve,
+};
 use crate::driver::DriverContext;
 use crate::jobs::service::{mint_local_job, submit_local_job};
 use crate::jobs::submit::{SubmitJobError, SubmitJobSpec};
@@ -101,7 +103,7 @@ async fn submit(
     (account, spec): (&aruna_core::UserId, PluginWorkSpec),
 ) -> Result<Ulid, HostError> {
     let (install_id, work_id) = (spec.install_id, spec.work_id);
-    let dedup = [&b"plugin-work/"[..], &work_id.to_bytes()].concat();
+    let dedup = dedup_key(work_id);
     let job_id = mint_local_job(ctx, scope.realm_id, scope.local, Some(&dedup)).await;
     let job_id = job_id.map_err(submit_error)?;
     let submitted = SubmitJobSpec {

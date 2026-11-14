@@ -47,7 +47,7 @@ use super::replay::{plan_replays, run_replays};
 use super::runs::{prune_runs, read_run, save_run, unfinished};
 use super::store::StoreError;
 use super::waiting::recheck_waiting;
-use super::work::{prune_work, settle_work};
+use super::work::{prune_work, retire_work, settle_work};
 use crate::driver::DriverContext;
 
 /// How often the worker looks for due runs.
@@ -225,7 +225,9 @@ impl Worker {
         let swept = sweep_events(&self.ctx, &config, now_ms).await;
         let swept = swept.map_err(|error| error.to_string())?;
         let hooks = prune_hooks(&self.ctx, &config, now_ms).await;
-        Ok(swept + hooks.map_err(|error| error.to_string())?)
+        let hooks = hooks.map_err(|error| error.to_string())?;
+        let retired = retire_work(&self.ctx, &config, now_ms).await;
+        Ok(swept + hooks + retired.map_err(|error| error.to_string())?)
     }
 
     /// Sends connection requests through `outbound` instead of the node's egress client.

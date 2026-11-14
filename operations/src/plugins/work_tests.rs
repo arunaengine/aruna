@@ -1,5 +1,5 @@
-//! Tests work rows: adoption, conflicts and dispatch; settlement before the job is pruned; and
-//! the lifetime of unkeyed rows.
+//! Tests work rows: adoption, conflicts and dispatch; settlement before the job is pruned; the
+//! lifetime of unkeyed rows; and the cancel a removed install's work gets first.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -231,4 +231,50 @@ async fn prunes_unkeyed_rows() {
     let read = |row: &WorkRow| read_work(ctx, install.install_id, row.work_id);
     assert_eq!(read(&rows[0]).await, Ok(None));
     assert!(read(&rows[1]).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn removal_cancels_first() {
+    // A removed install's running work is cancelled and its row stays until the job settled;
+    // settled rows and work that never got a job go at once.
+    use crate::jobs::store::{insert_job, read_job_record};
+    use crate::plugins::bound::tests::edit_config;
+    use aruna_core::plugin_installs::InstallState;
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let ctx = &fixture.ctx;
+    let mut rows = Vec::new();
+    for name in ["running", "settled", "reserved"] {
+        let row = proposed(&install, 1);
+        let identity = Identity::Key(name.into());
+        reserve(ctx, (&install, &identity), row.clone())
+            .await
+            .unwrap();
+        rows.push(row);
+    }
+    let ids = |row: &WorkRow| (install.install_id, row.work_id);
+    dispatched(ctx, ids(&rows[0]), job(1)).await.unwrap();
+    let job_record = record(spec_of(&install, &rows[0]), job(1), JobState::Queued);
+    insert_job(&ctx.storage_handle, &job_record).await.unwrap();
+    let settle = |row: &mut WorkRow| row.state = WorkState::Settled;
+    update_work(ctx, ids(&rows[1]), settle).await.unwrap();
+    let removing = |config: &mut RealmConfigDocument| {
+        config.installs[0].state = InstallState::Removing;
+    };
+    edit_config(&fixture, removing).await;
+    let config = crate::plugins::install::read_config(ctx, fixture.actor.realm_id);
+    let config = config.await.unwrap();
+    assert_eq!(retire_work(ctx, &config, 5).await, Ok(2));
+    let kept = read_work(ctx, ids(&rows[0]).0, ids(&rows[0]).1).await;
+    assert!(kept.unwrap().unwrap().cancel);
+    let cancelled = read_job_record(&ctx.storage_handle, job(1), None).await;
+    assert_eq!(cancelled.unwrap().unwrap().state, JobState::Cancelled);
+    // The job settled; its summary is kept, then the row goes.
+    assert_eq!(retire_work(ctx, &config, 6).await, Ok(0));
+    assert_eq!(settle_work(ctx, 7).await, Ok(1));
+    assert_eq!(retire_work(ctx, &config, 8).await, Ok(1));
+    assert_eq!(
+        read_work(ctx, ids(&rows[0]).0, ids(&rows[0]).1).await,
+        Ok(None)
+    );
 }

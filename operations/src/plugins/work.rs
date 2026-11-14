@@ -5,17 +5,20 @@
 
 use aruna_core::UserId;
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
-use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{RUN_RETENTION_MS, run_key};
 use aruna_core::structs::execution::job::{
     JobId, JobRecord, JobResultPayload, JobState, OutputObject, PluginWorkSpec,
 };
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use ulid::Ulid;
 
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
-use crate::jobs::store::read_job_record;
+use crate::jobs::service::find_dedup_job;
+use crate::jobs::store::{JobMutationError, read_job_record, set_cancel_requested};
 
 /// Row kinds of the work keyspace: the work by install and identity, and its identity by work id.
 pub const WORK_ROW: u8 = b'w';
@@ -377,6 +380,81 @@ pub async fn prune_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, Store
 pub async fn holds_job(ctx: &DriverContext, spec: &PluginWorkSpec) -> Result<bool, StoreError> {
     let row = read_work(ctx, spec.install_id, spec.work_id).await?;
     Ok(row.is_some_and(|row| row.state != WorkState::Settled))
+}
+
+/// Asks the jobs of removed installs to cancel and deletes their rows once each job is settled
+/// and kept; a row stays as long as its cancel was not accepted. Answers how many rows went.
+pub async fn retire_work(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    now_ms: u64,
+) -> Result<usize, StoreError> {
+    let storage = &ctx.storage_handle;
+    let txn = Txn::direct(ctx);
+    let mut dropped = Vec::new();
+    for (key, value) in txn.scan(PLUGIN_WORK_KEYSPACE, &[WORK_ROW]).await? {
+        let Some(install_id) = install_at(&key) else {
+            continue;
+        };
+        let kept = (config.installs.iter()).any(|install| {
+            install.install_id == install_id && install.state != InstallState::Removing
+        });
+        if kept {
+            continue;
+        }
+        let mut row: WorkRow = decode(&value)?;
+        if row.state == WorkState::Reserved {
+            // A submission whose answer was lost still has its job under the work's dedup key.
+            let found = find_dedup_job(ctx, row.account, &dedup_key(row.work_id)).await;
+            match found.map_err(|error| StoreError(error.to_string()))? {
+                Some((job, _)) => row.job = Some(job),
+                None => {
+                    dropped.extend([index_key(install_id, row.work_id), key]);
+                    continue;
+                }
+            }
+        }
+        let Some(job) = row.job.filter(|_| row.state != WorkState::Settled) else {
+            dropped.extend([index_key(install_id, row.work_id), key]);
+            continue;
+        };
+        let record = read_job_record(storage, job, None)
+            .await
+            .map_err(StoreError)?;
+        let Some(record) = record else {
+            dropped.extend([index_key(install_id, row.work_id), key]);
+            continue;
+        };
+        // A settled job keeps its outcome; the settle step stores it before the row goes.
+        if row.cancel || record.is_settled() {
+            continue;
+        }
+        match set_cancel_requested(storage, job, now_ms).await {
+            Ok(_) => {
+                let accepted = update_work(ctx, (install_id, row.work_id), |row| {
+                    row.job = Some(job);
+                    row.state = WorkState::Dispatched;
+                    row.cancel = true;
+                });
+                accepted.await?;
+            }
+            Err(JobMutationError::NotFound) => {
+                dropped.extend([index_key(install_id, row.work_id), key]);
+            }
+            Err(error) => warn!(%error, "A removed install's plugin work did not accept a cancel"),
+        }
+    }
+    let count = dropped.len() / 2;
+    transact(ctx, async |txn: &Txn<'_>| {
+        txn.delete(PLUGIN_WORK_KEYSPACE, dropped).await
+    })
+    .await?;
+    Ok(count)
+}
+
+/// The job dedup key of a work: its id, so a repeated submission finds the same job.
+pub fn dedup_key(work_id: Ulid) -> Vec<u8> {
+    [&b"plugin-work/"[..], &work_id.to_bytes()].concat()
 }
 
 fn install_at(key: &[u8]) -> Option<Ulid> {
