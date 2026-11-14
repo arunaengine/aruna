@@ -322,22 +322,27 @@ impl Summary {
     }
 }
 
-/// Keeps the summary of every dispatched work whose job finished, so its status outlives the
-/// job record; answers how many settled.
+/// Keeps the summary of every work whose job finished, so its status outlives the job record;
+/// a reserved work first takes the job its dedup key names. Answers how many settled.
 pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
     let txn = Txn::direct(ctx);
     let mut settled = 0;
     for (key, value) in txn.scan(PLUGIN_WORK_KEYSPACE, &[WORK_ROW]).await? {
         let row: WorkRow = decode(&value)?;
-        let (WorkState::Dispatched, Some(job)) = (row.state, row.job) else {
+        let Some(install_id) = install_at(&key) else {
             continue;
+        };
+        let job = match (row.state, row.job) {
+            (WorkState::Dispatched, Some(job)) => job,
+            (WorkState::Reserved, _) => match reconcile(ctx, install_id, &row).await? {
+                Some(job) => job,
+                None => continue,
+            },
+            _ => continue,
         };
         let record = read_job_record(&ctx.storage_handle, job, None).await;
         let record = record.map_err(StoreError)?;
         let Some(summary) = summary_of(record.as_ref()) else {
-            continue;
-        };
-        let Some(install_id) = install_at(&key) else {
             continue;
         };
         let changed = update_work(ctx, (install_id, row.work_id), |row| {
@@ -352,6 +357,21 @@ pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, Stor
         }
     }
     Ok(settled)
+}
+
+/// Records the job of a reserved work whose submission committed but whose answer was lost; the
+/// job is found by the work's dedup key. `None` while no job was submitted.
+async fn reconcile(
+    ctx: &DriverContext,
+    install_id: Ulid,
+    row: &WorkRow,
+) -> Result<Option<JobId>, StoreError> {
+    let found = find_dedup_job(ctx, row.account, &dedup_key(row.work_id)).await;
+    let Some((job, _)) = found.map_err(|error| StoreError(error.to_string()))? else {
+        return Ok(None);
+    };
+    dispatched(ctx, (install_id, row.work_id), job).await?;
+    Ok(Some(job))
 }
 
 /// Deletes the unkeyed rows nobody can ask for again: settled, no cancel open, kept past the run
@@ -413,10 +433,8 @@ pub async fn retire_work(
         }
         let mut row: WorkRow = decode(&value)?;
         if row.state == WorkState::Reserved {
-            // A submission whose answer was lost still has its job under the work's dedup key.
-            let found = find_dedup_job(ctx, row.account, &dedup_key(row.work_id)).await;
-            match found.map_err(|error| StoreError(error.to_string()))? {
-                Some((job, _)) => row.job = Some(job),
+            match reconcile(ctx, install_id, &row).await? {
+                Some(job) => (row.job, row.state) = (Some(job), WorkState::Dispatched),
                 None => {
                     dropped.extend([index_key(install_id, row.work_id), key]);
                     continue;

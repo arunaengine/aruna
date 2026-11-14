@@ -302,3 +302,73 @@ async fn removal_cancels_first() {
         Ok(None)
     );
 }
+
+fn finished(install: &PluginInstall, row: &WorkRow, job_id: JobId) -> JobRecord {
+    let mut job_record = record(spec_of(install, row), job_id, JobState::Succeeded);
+    job_record.created_by = install.account;
+    job_record.dedup_key = Some(dedup_key(row.work_id));
+    job_record
+}
+
+#[tokio::test]
+async fn reserved_work_settles() {
+    // The submission committed but its answer was lost, so the row stayed reserved; settling
+    // finds the job by its dedup key without the call being repeated.
+    use crate::jobs::store::insert_job;
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let row = proposed(&install, 1);
+    let identity = Identity::Key("copy-1".into());
+    reserve(&fixture.ctx, (&install, &identity), row.clone())
+        .await
+        .unwrap();
+    let job_record = finished(&install, &row, job(1));
+    insert_job(&fixture.ctx.storage_handle, &job_record)
+        .await
+        .unwrap();
+    let spec = spec_of(&install, &row);
+    assert_eq!(holds_job(&fixture.ctx, &spec).await, Ok(true));
+    assert_eq!(settle_work(&fixture.ctx, 5).await, Ok(1));
+    let settled = read_work(&fixture.ctx, install.install_id, row.work_id).await;
+    let settled = settled.unwrap().unwrap();
+    assert_eq!(
+        (settled.state, settled.job),
+        (WorkState::Settled, Some(job(1)))
+    );
+    assert_eq!(holds_job(&fixture.ctx, &spec).await, Ok(false));
+}
+
+#[tokio::test]
+async fn removal_keeps_finished() {
+    // A removed install's reserved work whose job already finished keeps the job, settles, and
+    // only then goes.
+    use crate::jobs::store::insert_job;
+    use crate::plugins::bound::tests::edit_config;
+    use aruna_core::plugin_installs::InstallState;
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let ctx = &fixture.ctx;
+    let row = proposed(&install, 1);
+    let identity = Identity::Key("copy-1".into());
+    reserve(ctx, (&install, &identity), row.clone())
+        .await
+        .unwrap();
+    insert_job(&ctx.storage_handle, &finished(&install, &row, job(1)))
+        .await
+        .unwrap();
+    let removing = |config: &mut RealmConfigDocument| {
+        config.installs[0].state = InstallState::Removing;
+    };
+    edit_config(&fixture, removing).await;
+    let config = crate::plugins::install::read_config(ctx, fixture.actor.realm_id);
+    let config = config.await.unwrap();
+    assert_eq!(retire_work(ctx, &config, 5).await, Ok(0));
+    let kept = read_work(ctx, install.install_id, row.work_id).await;
+    let kept = kept.unwrap().unwrap();
+    assert_eq!(
+        (kept.state, kept.job),
+        (WorkState::Dispatched, Some(job(1)))
+    );
+    assert_eq!(settle_work(ctx, 6).await, Ok(1));
+    assert_eq!(retire_work(ctx, &config, 7).await, Ok(1));
+}
