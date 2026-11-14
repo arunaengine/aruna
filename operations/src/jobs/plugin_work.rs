@@ -8,24 +8,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use aruna_core::errors::ConversionError;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::structs::execution::job::{
     JobError, JobResultPayload, PluginWorkAction, PluginWorkSpec,
 };
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::storage::blob::VersionKey;
+use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_plugins::broker::{ErrorKind, HostError};
 use aruna_plugins::permission::Permission;
 
 use super::executor::{JobContext, JobRunOutcome};
+use super::key_wake::version_wait;
+use crate::driver::drive;
 use crate::plugins::account::read_user;
 use crate::plugins::broker::local_object;
 use crate::plugins::check::{authorize_call, check_identity, matching};
 use crate::plugins::install::read_config;
 use crate::plugins::work::read_work;
 use crate::s3::object::copy::{
-    CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_at,
+    CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_at,
 };
+use crate::s3::object::get::GetObjectError;
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 
 /// How often the bytes moved so far reach the job's progress.
 const PROGRESS_TICK: Duration = Duration::from_secs(1);
@@ -119,6 +126,7 @@ async fn copy_work(
         Err(error) => return refused(error),
     };
     let auth = account(install, &patterns);
+    let read = (source_bucket.clone(), source_key.clone(), *source_version);
     let input = CopyObjectInput {
         source_bucket,
         source_key,
@@ -159,7 +167,43 @@ async fn copy_work(
                 version_id: Some(copied.version_id),
             })
         }
+        Err(error) if source_locked(&error) => key_wait(ctx, install, read).await,
         Err(error) => JobRunOutcome::Failed(super::copy::copy_error(error)),
+    }
+}
+
+fn source_locked(error: &CopyObjectError) -> bool {
+    matches!(
+        error,
+        CopyObjectError::Get(GetObjectError::ConversionError(ConversionError::BucketKey(
+            BucketKeyError::Locked(_)
+        )))
+    )
+}
+
+/// Parks the work on the key of the source version it reads, so it runs again once that key is
+/// unlocked; a key unlocked meanwhile is tried again at once.
+async fn key_wait(
+    ctx: &JobContext,
+    install: &PluginInstall,
+    (bucket, key, version_id): (String, String, Option<ulid::Ulid>),
+) -> JobRunOutcome {
+    let deferred = |message: String| JobRunOutcome::Deferred(JobError::retryable(message));
+    let head = HeadObjectInput {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id,
+    };
+    let head = drive(HeadObjectOperation::new(head), &ctx.driver).await;
+    let Some(version_id) = head.ok().and_then(|head| head.resolved_version_id) else {
+        return deferred("the locked source version could not be described".into());
+    };
+    let version = VersionKey::new(bucket, key, version_id);
+    let place = (ctx.owner_node_id, install.group_id);
+    match version_wait(&ctx.driver, place, &version).await {
+        Ok(Some(wait)) => JobRunOutcome::AwaitingKey(vec![wait]),
+        Ok(None) => deferred("the source bucket was unlocked meanwhile".into()),
+        Err(error) => deferred(error),
     }
 }
 

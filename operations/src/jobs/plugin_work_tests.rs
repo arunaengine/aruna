@@ -1,5 +1,5 @@
-//! Tests plugin work attempts: a missing or rebound work ends, a paused install waits, a narrowed
-//! grant refuses before any byte moves, and a copy writes its minted version once.
+//! Tests plugin work attempts: a missing or rebound work ends, a paused install or locked source
+//! waits, a narrowed grant refuses before any byte moves, and a copy writes its version once.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -200,4 +200,57 @@ async fn copies_once() {
             outcome_name(&outcome)
         );
     }
+}
+
+#[tokio::test]
+async fn locked_source_waits() {
+    // A locked source parks the work on its key; once unlocked, the same work copies.
+    use aruna_core::compute::{SecretBytes, SharedSecret};
+    use aruna_core::effects::{BlobEffect, StorageEffect};
+    use aruna_core::events::{BlobEvent, Event};
+    use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
+    use aruna_core::structs::storage::encryption::{
+        BucketEncryption, BucketKeyRef, EncryptionMode, public_key_of,
+    };
+    let fixture = Fixture::new().await;
+    let (_root, blob, _, spec) = ready_copy(&fixture).await;
+    let ctx = job_context(&blob, &fixture);
+    let key = BucketKeyRef::new(Ulid::from_bytes([115; 16]), 1);
+    let settings = BucketEncryption {
+        mode: EncryptionMode::VaultLocked,
+        bucket_id: Some(key.bucket_id),
+        key_generation: key.generation,
+        ..Default::default()
+    };
+    let write = StorageEffect::Write {
+        key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+        key: b"in".to_vec().into(),
+        value: settings.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    blob.storage_handle.send_storage_effect(write).await;
+    let outcome = run_plugin_work(&ctx, &spec).await;
+    let JobRunOutcome::AwaitingKey(waits) = outcome else {
+        panic!("a locked source must wait, got {}", outcome_name(&outcome));
+    };
+    assert_eq!(waits.len(), 1);
+    assert_eq!((waits[0].key, waits[0].bucket.as_str()), (key, "in"));
+    let private = || SecretBytes::new(vec![9; 32]);
+    let prepare = BlobEffect::PrepareKey {
+        key,
+        public_key: public_key_of(&private()).unwrap(),
+        private_key: SharedSecret::new(private()),
+        duration: None,
+        max: None,
+    };
+    let handle = blob.blob_handle.as_ref().unwrap();
+    let Event::Blob(BlobEvent::KeyPrepared { ticket }) = handle.send_blob_effect(prepare).await
+    else {
+        panic!("prepare failed")
+    };
+    handle
+        .send_blob_effect(BlobEffect::ActivateKey { ticket })
+        .await;
+    let outcome = run_plugin_work(&ctx, &spec).await;
+    assert!(copied(&outcome, &spec), "{}", outcome_name(&outcome));
 }
