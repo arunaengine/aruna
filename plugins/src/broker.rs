@@ -12,6 +12,16 @@ pub use crate::host::wit::aruna::plugin::services::{Method, Response};
 pub use crate::host::wit::aruna::plugin::state::Entry;
 pub use crate::host::wit::aruna::plugin::types::{ErrorKind, Field, HostError};
 
+/// A copy a run starts: object paths as the plugin gave them, the source pinned when a version
+/// is given. The ordinal names the job across reruns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobCopy {
+    pub source: String,
+    pub version: Option<String>,
+    pub target: String,
+    pub intent: Intent,
+}
+
 /// Identity of the run that issued a host call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallContext {
@@ -182,6 +192,13 @@ pub trait Broker: Send + Sync {
         Err(HostError::new(
             ErrorKind::Unavailable,
             "secret values are not served here",
+        ))
+    }
+    /// Starts a copy and answers its job id; a broker that runs no jobs refuses it.
+    async fn jobs_copy(&self, _cx: &CallContext, _copy: JobCopy) -> Result<String, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "jobs are not run here",
         ))
     }
     async fn state_get(&self, cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError>;

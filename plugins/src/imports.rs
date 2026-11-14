@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use crate::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo, ObjectPage,
-    Response, SendRequest, StatePut,
+    HostError, Intent, JobCopy, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo,
+    ObjectPage, Response, SendRequest, StatePut,
 };
 use crate::host::wit::aruna::plugin::{
-    log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services, state,
-    types,
+    jobs, log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services,
+    state, types,
 };
 use crate::host::{Needs, Session};
 use crate::permission::Permission;
@@ -315,6 +315,35 @@ impl objects_read::Host for Session {
                     .sum();
                 items + page.cursor.as_ref().map_or(0, String::len)
             },
+        )
+        .await
+    }
+}
+
+impl jobs::Host for Session {
+    async fn copy(
+        &mut self,
+        source: String,
+        version: Option<String>,
+        target: String,
+    ) -> wasmtime::Result<Result<String, HostError>> {
+        let size = source.len() + version.as_ref().map_or(0, String::len) + target.len();
+        let pinned = version.as_deref().unwrap_or_default().as_bytes();
+        let parts: [&[u8]; 4] = [b"copy", source.as_bytes(), pinned, target.as_bytes()];
+        let intent = Intent::new(self.next_ordinal(), &parts);
+        let effect = Effect::Write(intent.clone());
+        let copy = JobCopy {
+            source,
+            version,
+            target,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Permission(Permission::ObjectsCopy),
+            |broker, cx| async move { broker.jobs_copy(&cx, copy).await },
+            String::len,
         )
         .await
     }

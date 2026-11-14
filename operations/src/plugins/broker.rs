@@ -24,8 +24,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response,
-    SendRequest, StatePut,
+    HostError, Intent, JobCopy, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage,
+    Response, SendRequest, StatePut,
 };
 use aruna_plugins::connection::relative_path;
 use aruna_plugins::permission::Permission;
@@ -48,6 +48,7 @@ use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
 use super::state::{PutError, check_key, put_state, read_state};
 use super::store::{StoreError, Txn, transact};
+use super::submit::{CopyRequest, start_copy};
 use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
@@ -979,6 +980,32 @@ impl Broker for RunBroker {
     ) -> Result<Response, HostError> {
         let ready = self.ready(request).await?;
         self.send_whole(cx, ready).await
+    }
+
+    async fn jobs_copy(&self, _cx: &CallContext, copy: JobCopy) -> Result<String, HostError> {
+        self.admitted(None).await?;
+        let version = (copy.version.as_deref())
+            .map(|text| {
+                Ulid::from_string(text).map_err(|_| {
+                    HostError::new(ErrorKind::Invalid, format!("`{text}` is not a version id"))
+                })
+            })
+            .transpose()?;
+        let request = CopyRequest {
+            source: self.expand(&copy.source)?,
+            source_version: version,
+            target: self.expand(&copy.target)?,
+            ordinal: copy.intent.ordinal,
+        };
+        // The work row names the copy by run and ordinal, so a rerun gets the same id back.
+        match start_copy(&self.ctx, &self.scope, request).await {
+            Ok(work_id) => Ok(work_id.to_string()),
+            Err(error) if error.kind == ErrorKind::Conflict => {
+                self.changed.store(true, Ordering::Relaxed);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {

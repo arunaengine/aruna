@@ -188,7 +188,8 @@ impl Import {
     /// The requirement of an interface name such as `metadata-read`, if the host provides it.
     pub fn of(interface: &str) -> Option<Self> {
         Some(match interface {
-            "types" | "log" | "state" => Self::Free,
+            // Each job call checks the grants of what it reads and writes.
+            "types" | "log" | "state" | "jobs" => Self::Free,
             "metadata-read" => Self::Needs(Permission::MetadataRead),
             "metadata-write" => Self::Needs(Permission::MetadataWrite),
             "metadata-create" => Self::Needs(Permission::MetadataCreate),

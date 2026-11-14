@@ -15,7 +15,7 @@ use crate::s3::object::copy::test::seed_bucket;
 
 fn scope(fixture: &Fixture, install: &PluginInstall) -> RunScope {
     let mut run = queued(install.install_id, 1);
-    run.digest = install.digest.clone();
+    (run.digest, run.group_id) = (install.digest.clone(), install.group_id);
     RunScope {
         realm_id: fixture.actor.realm_id,
         local: fixture.actor.node_id,
@@ -97,4 +97,67 @@ async fn refusals_start_nothing() {
     edit_config(&fixture, |config| config.installs[0].paused = true).await;
     let paused = request(&fixture, &install, "out/a.txt");
     assert_eq!(kind(paused).await, Err(ErrorKind::Denied));
+}
+
+#[tokio::test]
+async fn read_source_suffices() {
+    // A copy reads its source and writes its target: read on the source is enough, and the
+    // target needs write.
+    use crate::plugins::lifecycle::set_grants;
+    let fixture = Fixture::new().await;
+    let install = ready(&fixture).await;
+    let (incoming, outgoing) = (
+        path(&fixture, &install, "in/**"),
+        path(&fixture, &install, "out/**"),
+    );
+    let choices = std::collections::BTreeMap::from([
+        ("read".to_string(), vec![incoming.clone()]),
+        ("write".to_string(), vec![outgoing]),
+    ]);
+    let (actor, auth) = (&fixture.actor, fixture.auth());
+    set_grants(&fixture.ctx, actor, &auth, install.install_id, &choices)
+        .await
+        .unwrap();
+    let scope = scope(&fixture, &install);
+    let copy = request(&fixture, &install, "out/a.txt");
+    assert!(start_copy(&fixture.ctx, &scope, copy).await.is_ok());
+    let mut back = request(&fixture, &install, "in/b.txt");
+    back.source = path(&fixture, &install, "out/a.txt");
+    let refused = start_copy(&fixture.ctx, &scope, back).await;
+    assert_eq!(
+        refused.map_err(|error| error.kind),
+        Err(ErrorKind::NotGranted)
+    );
+}
+
+#[tokio::test]
+async fn broker_starts_copies() {
+    // A run names objects by bucket path; the broker expands them, pins a given version, and a
+    // rerun of the call gets the same job id.
+    use std::sync::Arc;
+
+    use aruna_plugins::broker::{Broker, CallContext, Intent, JobCopy};
+
+    use crate::plugins::broker::RunBroker;
+    let fixture = Fixture::new().await;
+    let install = ready(&fixture).await;
+    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope(&fixture, &install));
+    let cx = CallContext {
+        run: "run".into(),
+        install: install.install_id.to_string(),
+        max_bytes: 1 << 20,
+    };
+    let copy = |version: Option<&str>| JobCopy {
+        source: "in/a.txt".into(),
+        version: version.map(str::to_string),
+        target: "out/a.txt".into(),
+        intent: Intent::new(3, &[b"copy"]),
+    };
+    let id = broker.jobs_copy(&cx, copy(None)).await.unwrap();
+    assert_eq!(broker.jobs_copy(&cx, copy(None)).await.unwrap(), id);
+    let row = read_work(&fixture.ctx, install.install_id, id.parse().unwrap()).await;
+    let row = row.unwrap().unwrap();
+    assert_eq!(row.source, Some(path(&fixture, &install, "in/a.txt")));
+    let bad = broker.jobs_copy(&cx, copy(Some("v1"))).await;
+    assert_eq!(bad.map_err(|error| error.kind), Err(ErrorKind::Invalid));
 }

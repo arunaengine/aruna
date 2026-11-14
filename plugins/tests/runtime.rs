@@ -11,8 +11,8 @@ use std::time::Duration;
 use aruna_plugins::artifact::read_manifest;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, FileChange, FilePage, HostError,
-    Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest,
-    StatePut,
+    Intent, JobCopy, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response,
+    SendRequest, StatePut,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::manifest::Manifest;
@@ -219,6 +219,13 @@ impl Broker for Recorder {
         self.note("state_put");
         self.intents.lock().unwrap().push(put.intent);
         Ok(1)
+    }
+
+    async fn jobs_copy(&self, _: &CallContext, copy: JobCopy) -> Result<String, HostError> {
+        let version = copy.version.unwrap_or_default();
+        self.note(&format!("copy {} {version} {}", copy.source, copy.target));
+        self.intents.lock().unwrap().push(copy.intent);
+        Ok("job-1".into())
     }
 
     async fn abandoned(&self, _: &CallContext, intent: &Intent) {
@@ -602,6 +609,22 @@ async fn state_put_ordinal() {
     let intents = broker.intents();
     assert_eq!(intents.iter().map(|i| i.ordinal).collect::<Vec<_>>(), [1]);
     assert_eq!(rerun.intents(), intents, "a rerun asks for the same write");
+}
+
+#[tokio::test]
+async fn copy_answers_id() {
+    // A copy reaches the broker with its paths and pinned version, as a write with an ordinal,
+    // and needs the copy permission.
+    let input =
+        serde_json::json!({"call": "copy", "source": "in/a", "version": "V1", "target": "out/a"});
+    let mut copy = probe(input.clone());
+    copy.permissions.insert(Permission::ObjectsCopy);
+    let broker = Arc::new(Recorder::default());
+    assert_eq!(output(invoke(copy, broker.clone()).await), "job-1");
+    assert_eq!(broker.calls(), ["copy in/a V1 out/a"]);
+    assert_eq!(broker.intents()[0].ordinal, 1);
+    let refused = invoke(probe(input), Arc::default()).await;
+    assert!(matches!(refused, Err(InvokeError::Guest(_))), "{refused:?}");
 }
 
 #[tokio::test]

@@ -94,6 +94,18 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             let fields = reply.json::<Value>().unwrap_or_else(|_| json!({}));
             json!({ "status": reply.status, "fields": fields })
         }
+        "copy" => {
+            let version = input.get("version").and_then(Value::as_str);
+            let copied = aruna_plugin::bindings::aruna::plugin::jobs::copy(
+                &text("source"),
+                version,
+                &text("target"),
+            );
+            json!(copied.map_err(|error| Error::Host {
+                kind: error.kind,
+                message: error.message,
+            })?)
+        }
         "random" => {
             let len = input.get("len").and_then(Value::as_u64).unwrap_or_default();
             json!(wasi::wasi::random::random::get_random_bytes(len).len())

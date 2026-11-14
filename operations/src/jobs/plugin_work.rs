@@ -18,14 +18,13 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::VersionKey;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_plugins::broker::{ErrorKind, HostError};
-use aruna_plugins::permission::Permission;
 
 use super::executor::{JobContext, JobRunOutcome};
 use super::key_wake::version_wait;
 use crate::driver::drive;
 use crate::plugins::account::read_user;
 use crate::plugins::broker::local_object;
-use crate::plugins::check::{authorize_call, check_identity, matching};
+use crate::plugins::check::{check_identity, copy_grants};
 use crate::plugins::install::read_config;
 use crate::plugins::work::read_work;
 use crate::s3::object::copy::{
@@ -84,19 +83,8 @@ async fn admit_work(
     }
 }
 
-/// Checks `permission` on `target` with the current grants, as a plugin call does.
-async fn granted(
-    ctx: &JobContext,
-    install: &PluginInstall,
-    (permission, target): (Permission, &str),
-) -> Result<BTreeSet<String>, JobRunOutcome> {
-    let patterns = matching(install, permission, target).map_err(refused)?;
-    let authorized = authorize_call(&ctx.driver, install, permission, target, &patterns).await;
-    authorized.map_err(refused)?;
-    Ok(patterns)
-}
-
-/// Copies one object as the account, restricted to its current `objects.copy` patterns.
+/// Copies one object as the account, restricted to its current read patterns of the source and
+/// write patterns of the target.
 async fn copy_work(
     ctx: &JobContext,
     spec: &PluginWorkSpec,
@@ -108,13 +96,10 @@ async fn copy_work(
         target,
         version_id,
     } = &spec.action;
-    let mut patterns = BTreeSet::new();
-    for path in [source, target] {
-        match granted(ctx, install, (Permission::ObjectsCopy, path)).await {
-            Ok(found) => patterns.extend(found),
-            Err(outcome) => return outcome,
-        }
-    }
+    let patterns = match copy_grants(&ctx.driver, install, (source, target)).await {
+        Ok(found) => found,
+        Err(error) => return refused(error),
+    };
     let place = (spec.realm_id, ctx.owner_node_id);
     let (source_bucket, source_key) = match local_object(&ctx.driver, place, install, source).await
     {

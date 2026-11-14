@@ -217,6 +217,16 @@ interface secrets {
   value: func(slot: string) -> result<list<field>, host-error>;
 }
 
+/// Native work of the install that runs without the run; each start answers the job's id at once,
+/// and a rerun of the same call gets the same id.
+interface jobs {
+  use types.{host-error};
+
+  /// Copies an object, pinned to `version` when given, to `target`; needs read on the source and
+  /// write on the target.
+  copy: func(source: string, version: option<string>, target: string) -> result<string, host-error>;
+}
+
 interface log {
   enum level {
     debug,
@@ -239,6 +249,7 @@ world plugin {
   import services;
   import state;
   import secrets;
+  import jobs;
   import log;
 
   export handle: func(invocation: invocation) -> result<option<string>, failure>;
