@@ -35,6 +35,36 @@ fn config(target: UserId, admin: bool) -> SetAdminConfig {
     }
 }
 
+#[test]
+fn retry_rereads_config() {
+    // A commit lost to a background config write reads again and keeps an admin granted elsewhere.
+    let mut operation = SetAdminOperation::new(config(user(5), true));
+    let actor = operation.config.actor.clone();
+    let mut realm_config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+    realm_config.ensure_node(actor.node_id, RealmNodeKind::Management);
+    let realm_config = realm_config.to_bytes(&actor).unwrap();
+    let admins = |users: &[UserId]| {
+        let mut document = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
+        for role in document.roles.values_mut() {
+            role.assigned_users.extend(users.iter().copied());
+        }
+        Some(document.to_bytes(&actor).unwrap())
+    };
+    let writes = crate::realm::commit_retry::conflict_then_write(
+        &mut operation,
+        vec![Some(realm_config.clone()), admins(&[user(1)]), None],
+        vec![Some(realm_config), admins(&[user(1), user(9)]), None],
+    );
+    let (_, _, value) = writes
+        .iter()
+        .find(|(space, _, _)| space == AUTH_KEYSPACE)
+        .expect("the retry rewrites the realm authorization");
+    let written = RealmAuthorizationDocument::from_bytes(value).unwrap();
+    let stored = written.roles.into_values().next().unwrap().assigned_users;
+    assert_eq!(stored, HashSet::from([user(1), user(9), user(5)]));
+    assert_eq!(operation.finalize(), Ok(stored));
+}
+
 /// Steps an allowed caller to the read result of a realm with these admins.
 fn step_to_write(operation: &mut SetAdminOperation, admins: &[UserId]) -> Effects {
     let actor = operation.config.actor.clone();

@@ -163,6 +163,40 @@ fn admin_sets_name() {
 }
 
 #[test]
+fn retry_rereads_config() {
+    // A commit lost to a background config write reads again and keeps a name set elsewhere.
+    let document = document_bytes(RealmNodeKind::Management).to_vec();
+    let target = aruna_core::admin_documents::AdminDocumentTarget::RealmConfig { realm_id: REALM };
+    let mut elsewhere = aruna_core::reducer::AdminDocumentState::new(target);
+    let laptop = AdminDocumentOperation::NodeNameSet {
+        node_id: node(3),
+        display_name: Some("laptop".to_string()),
+    };
+    elsewhere.apply_operation(&actor(), laptop).unwrap();
+    let (_, _, state) = reducer_state_entry(&elsewhere).unwrap();
+    let mut operation = NodeNameOperation::new(config(
+        node(2),
+        Some("store"),
+        NameScope::RealmAdmin,
+        user(1),
+    ));
+    let writes = crate::realm::commit_retry::conflict_then_write(
+        &mut operation,
+        vec![Some(document.clone()), None],
+        vec![Some(document), Some(state.to_vec())],
+    );
+    let (_, _, written) = writes
+        .iter()
+        .find(|(space, _, _)| space == aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE)
+        .expect("the retry rewrites the reducer state");
+    let names = decode_reducer_state(written)
+        .unwrap()
+        .materialized_node_names();
+    assert_eq!(names.get(&node(3)).map(String::as_str), Some("laptop"));
+    assert_eq!(names.get(&node(2)).map(String::as_str), Some("store"));
+}
+
+#[test]
 fn admin_clears_name() {
     // A clear must replace the stored name, not leave it behind.
     let mut first =

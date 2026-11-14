@@ -31,7 +31,28 @@ pub(super) fn conflict_then_commit<O: Operation>(
     let mut newer = first.clone();
     newer.description = ELSEWHERE.to_string();
     newer.ensure_node(other, RealmNodeKind::Server);
+    let writes = conflict_then_write(
+        operation,
+        vec![Some(first.to_bytes(actor).unwrap()), None],
+        vec![Some(newer.to_bytes(actor).unwrap()), None],
+    );
+    let (_, _, value) = writes
+        .iter()
+        .find(|(space, _, _)| space == REALM_CONFIG_KEYSPACE)
+        .expect("the retry rewrites the realm config");
+    let written = RealmConfigDocument::from_bytes(value).unwrap();
+    assert_eq!(written.description, ELSEWHERE);
+    assert_eq!(node_kind(&written, other), Some(RealmNodeKind::Server));
+    written
+}
 
+/// Lets `operation` read `first` and lose its commit, then read `newer` in a fresh transaction
+/// and commit; returns the rows the retry wrote. Each read answers the keys in request order.
+pub(super) fn conflict_then_write<O: Operation>(
+    operation: &mut O,
+    first: Vec<Option<Vec<u8>>>,
+    newer: Vec<Option<Vec<u8>>>,
+) -> Vec<(KeySpace, Key, Value)> {
     assert!(matches!(
         operation.start().as_slice(),
         [Effect::SubOperation(_)]
@@ -39,7 +60,7 @@ pub(super) fn conflict_then_commit<O: Operation>(
     let effects = operation.step(Event::SubOperation(
         SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
     ));
-    let effects = read_in(operation, effects, 1, first.to_bytes(actor).unwrap());
+    let effects = read_in(operation, effects, 1, first);
     until_commit(operation, effects, 1);
     let effects = operation.step(Event::Storage(StorageEvent::Error {
         error: StorageError::TransactionConflict,
@@ -52,16 +73,8 @@ pub(super) fn conflict_then_commit<O: Operation>(
         "a lost commit starts over and schedules no drain"
     );
 
-    let effects = read_in(operation, effects, 2, newer.to_bytes(actor).unwrap());
+    let effects = read_in(operation, effects, 2, newer);
     let writes = until_commit(operation, effects, 2);
-    let (_, _, value) = writes
-        .iter()
-        .find(|(space, _, _)| space == REALM_CONFIG_KEYSPACE)
-        .expect("the retry rewrites the realm config");
-    let written = RealmConfigDocument::from_bytes(value).unwrap();
-    assert_eq!(written.description, ELSEWHERE);
-    assert_eq!(node_kind(&written, other), Some(RealmNodeKind::Server));
-
     let txn_id = Ulid::from(2u128);
     let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
         txn_id,
@@ -72,16 +85,16 @@ pub(super) fn conflict_then_commit<O: Operation>(
         after: Duration::ZERO,
     }));
     assert!(operation.is_complete());
-    written
+    writes
 }
 
-/// Starts attempt `attempt`, answers its read with `document` and no reducer state, and returns
-/// what the operation asks next.
+/// Starts attempt `attempt`, answers its read with `values` in request order, and returns what
+/// the operation asks next.
 fn read_in<O: Operation>(
     operation: &mut O,
     effects: Effects,
     attempt: u128,
-    document: Vec<u8>,
+    values: Vec<Option<Vec<u8>>>,
 ) -> Effects {
     assert!(matches!(
         effects.as_slice(),
@@ -103,13 +116,13 @@ fn read_in<O: Operation>(
         Some(txn_id),
         "attempt {attempt} reads in its own transaction"
     );
-    assert_eq!(reads.len(), 2);
-    operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (reads[0].1.clone(), Some(document.into())),
-            (reads[1].1.clone(), None),
-        ],
-    }))
+    assert_eq!(reads.len(), values.len());
+    let values = reads
+        .iter()
+        .zip(values)
+        .map(|((_, key), value)| (key.clone(), value.map(Value::from)))
+        .collect();
+    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
 }
 
 /// Answers the writes of attempt `attempt` until it asks to commit, and returns those writes.
