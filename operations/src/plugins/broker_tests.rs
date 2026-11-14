@@ -244,7 +244,8 @@ async fn object_paths() {
         .visible(&install, "dataset", listed.clone())
         .await
         .unwrap();
-    let path = format!("/{realm}/g/{group}/data/{node}/dataset/private");
+    // Listed objects of this node come back by their short bucket path.
+    let path = "dataset/private".to_string();
     assert_eq!(
         shown.iter().map(|object| &object.path).collect::<Vec<_>>(),
         [&path]
@@ -1603,4 +1604,43 @@ async fn unprojected_event_refused() {
     // Once the older event is projected and applied, the same removal is planned on it.
     project(&broker.ctx).await;
     remove().await.unwrap();
+}
+
+#[test]
+fn short_object_paths() {
+    let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]);
+    let node = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+    let group = Ulid::from_parts(1, 1);
+    let expand = |text: &str| object_path((realm, node), group, text);
+    let root = format!("/{realm}/g/{group}/data/{node}");
+    let cases = [
+        ("raw/run-7/a.fq", format!("{root}/raw/run-7/a.fq")),
+        ("raw/run-7/", format!("{root}/raw/run-7/")),
+        ("raw", format!("{root}/raw/")),
+    ];
+    for (text, full) in cases {
+        assert_eq!(expand(text).unwrap(), full, "{text}");
+    }
+    let full = format!("{root}/raw/a");
+    assert_eq!(expand(&full).unwrap(), full, "a full path stays as it is");
+    for bad in ["", "raw/../x", "raw/./x", "raw//x", "../x"] {
+        let refused = expand(bad).unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::Invalid, "{bad}");
+    }
+}
+
+#[test]
+fn content_url_rule() {
+    let named = |url: Value| content_urls(&serde_json::json!({ "contentUrl": url }));
+    for url in [
+        "s3://raw/a.fq",
+        "https://example.org/a",
+        "/r/g/x/data/n/raw/a.fq",
+    ] {
+        assert!(named(url.into()).is_ok(), "{url}");
+    }
+    assert!(named(serde_json::json!(["s3://raw/a", "https://x.example/a"])).is_ok());
+    let refused = named("raw/a.fq".into()).unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Invalid);
+    assert!(content_urls(&serde_json::json!({ "name": "a" })).is_ok());
 }

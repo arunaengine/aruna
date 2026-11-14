@@ -251,6 +251,7 @@ impl RunBroker {
         let (install, auth) =
             (self.checked(Permission::MetadataWrite, &record.permission_path)).await?;
         if let Some(file) = file {
+            content_urls(&file)?;
             self.objects_named(&install, (&record.graph_iri, &file))
                 .await?;
         }
@@ -531,6 +532,12 @@ impl RunBroker {
         }
     }
 
+    /// The full permission path of an object path the plugin gave; see [`object_path`].
+    fn expand(&self, text: &str) -> Result<String, HostError> {
+        let place = (self.scope.realm_id, self.scope.local);
+        object_path(place, self.scope.run.group_id, text)
+    }
+
     /// The local bucket and key of an object path below the install's group data.
     async fn object_at(
         &self,
@@ -578,7 +585,7 @@ impl RunBroker {
                 .await?
             {
                 visible.push(ObjectInfo {
-                    path,
+                    path: format!("{bucket}/{key}"),
                     size,
                     version,
                 });
@@ -586,6 +593,57 @@ impl RunBroker {
         }
         Ok(visible)
     }
+}
+
+/// The full permission path of an object path a plugin gives: a path below the realm as it is,
+/// or `bucket/key` (a prefix ends in `/`) on this node. Expanded before any grant check, so a
+/// path the plugin did not mean is never checked.
+pub(crate) fn object_path(
+    (realm_id, local): (aruna_core::structs::identity::realm::RealmId, NodeId),
+    group: aruna_core::types::GroupId,
+    text: &str,
+) -> Result<String, HostError> {
+    if text.starts_with('/') {
+        return Ok(text.to_string());
+    }
+    let invalid = || {
+        let message = format!("`{text}` is not a bucket path such as `bucket/key`");
+        HostError::new(ErrorKind::Invalid, message)
+    };
+    let (bucket, key) = text.split_once('/').unwrap_or((text, ""));
+    let segments: Vec<&str> = key.split('/').collect();
+    let last = segments.len() - 1;
+    let plain = (segments.iter().enumerate()).all(|(index, segment)| {
+        !matches!(*segment, "." | "..") && (index == last || !segment.is_empty())
+    });
+    if matches!(bucket, "" | "." | "..") || !plain {
+        return Err(invalid());
+    }
+    Ok(object_permission_path(realm_id, group, local, bucket, key))
+}
+
+/// Refuses a `contentUrl` that names nothing readers can resolve, such as a short bucket path:
+/// it must be an absolute IRI such as an `s3://` address, an object path below the realm, or a
+/// reference inside the crate.
+fn content_urls(file: &Value) -> Result<(), HostError> {
+    let urls = match file.get("contentUrl") {
+        Some(Value::Array(urls)) => urls.iter().collect(),
+        Some(url) => vec![url],
+        None => Vec::new(),
+    };
+    for url in urls {
+        let text = (url.get("@id").unwrap_or(url).as_str()).unwrap_or_default();
+        let scheme = text
+            .split_once(':')
+            .is_some_and(|(scheme, _)| !scheme.is_empty() && !scheme.contains('/'));
+        if !(scheme || text.starts_with('/') || text.starts_with("./")) {
+            let message = format!(
+                "the contentUrl `{text}` names no object; use the object's s3:// address or path"
+            );
+            return Err(HostError::new(ErrorKind::Invalid, message));
+        }
+    }
+    Ok(())
 }
 
 /// The bucket and key on `local` of an object path below the install's group data; a bucket of
@@ -846,9 +904,11 @@ impl Broker for RunBroker {
         self.file_write(cx, &change, mutation, None).await
     }
 
-    async fn objects_info(&self, _cx: &CallContext, path: &str) -> Result<ObjectInfo, HostError> {
-        let (install, _) = self.checked(Permission::ObjectsRead, path).await?;
-        let (bucket, key) = self.object_at(&install, path).await?;
+    async fn objects_info(&self, _cx: &CallContext, text: &str) -> Result<ObjectInfo, HostError> {
+        let path = self.expand(text)?;
+        let (install, _) = self.checked(Permission::ObjectsRead, &path).await?;
+        let (bucket, key) = self.object_at(&install, &path).await?;
+        let short = format!("{bucket}/{key}");
         let head = HeadObjectInput {
             bucket,
             key,
@@ -858,7 +918,7 @@ impl Broker for RunBroker {
         let head =
             head.map_err(|_| HostError::new(ErrorKind::NotFound, format!("no object at {path}")))?;
         Ok(ObjectInfo {
-            path: path.to_string(),
+            path: short,
             size: head.location.map_or(0, |location| location.blob_size),
             version: head
                 .resolved_version_id
@@ -874,7 +934,7 @@ impl Broker for RunBroker {
         cursor: Option<String>,
     ) -> Result<ObjectPage, HostError> {
         let (install, _) = self.listing(Permission::ObjectsRead).await?;
-        let (bucket, key) = self.object_at(&install, prefix).await?;
+        let (bucket, key) = self.object_at(&install, &self.expand(prefix)?).await?;
         let invalid = || HostError::new(ErrorKind::Invalid, "bad cursor");
         let token = match cursor {
             Some(cursor) => Some(

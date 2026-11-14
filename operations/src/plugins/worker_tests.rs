@@ -230,7 +230,12 @@ async fn event_input() {
     let (event, _) = created(&install, "D1");
     let run = event_run(&config, &install, &event, 0).unwrap();
     assert_eq!(run.handler, "dataset_created");
-    let call = invocation(&run, &install, Limits::default(), CancellationToken::new());
+    let call = invocation(
+        &run,
+        (&install, fixture.actor.node_id),
+        Limits::default(),
+        CancellationToken::new(),
+    );
     let Trigger::Event(given) = call.trigger else {
         panic!("an event run calls its handler with the event")
     };
@@ -278,7 +283,12 @@ async fn sync_input() {
     let event = synced(&install, "raw/", Ulid::from_parts(3, 3));
     let run = event_run(&config, &install, &event, 0).unwrap();
     assert_eq!(run.handler, "sync_completed");
-    let call = invocation(&run, &install, Limits::default(), CancellationToken::new());
+    let call = invocation(
+        &run,
+        (&install, fixture.actor.node_id),
+        Limits::default(),
+        CancellationToken::new(),
+    );
     let Trigger::Event(given) = call.trigger else {
         panic!("an event run calls its handler with the event")
     };
@@ -551,4 +561,19 @@ async fn retries_hide_values() {
     let stored = stored.unwrap();
     assert_eq!(stored.state, RunState::Queued);
     assert_eq!(stored.message.as_deref(), Some("upstream said [redacted]"));
+}
+
+#[tokio::test]
+async fn event_paths_shortened() {
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let local = fixture.actor.node_id;
+    let realm = fixture.actor.realm_id;
+    let full = format!("/{realm}/g/{}/data/{local}/raw/a.fq", install.group_id);
+    assert_eq!(short_path(&full, (&install, local)), "raw/a.fq");
+    // An object of another node keeps its full path, so the plugin never names it ambiguously.
+    let other = iroh::SecretKey::from_bytes(&[9; 32]).public();
+    let remote = full.replace(&local.to_string(), &other.to_string());
+    assert_eq!(short_path(&remote, (&install, local)), remote);
+    assert_eq!(short_path("D1", (&install, local)), "D1");
 }

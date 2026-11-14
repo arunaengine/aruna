@@ -415,7 +415,7 @@ impl Worker {
             Ok(compiled) => compiled,
             Err(error) => return Ended::Retry(format!("the artifact does not compile: {error}")),
         };
-        let call = invocation(run, install, self.limits, cancel);
+        let call = invocation(run, (install, self.local), self.limits, cancel);
         let invoked = self.runtime.invoke(&compiled, call, broker).await;
         ended(invoked, self.stopping.is_cancelled())
     }
@@ -439,10 +439,11 @@ fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool) -> Ended 
     }
 }
 
-/// The handler call of a run: its saved invocation and the install's grants.
+/// The handler call of a run: its saved invocation and the install's grants. An event's object on
+/// this node is named by its short `bucket/key` path; `path` keeps the permission path.
 fn invocation(
     run: &PluginRun,
-    install: &PluginInstall,
+    (install, local): (&PluginInstall, NodeId),
     limits: Limits,
     cancel: CancellationToken,
 ) -> Invocation {
@@ -462,7 +463,7 @@ fn invocation(
         RunTrigger::Event(event) => Trigger::Event(WatchEvent {
             kind: event.kind.name().into(),
             path: event.path.clone(),
-            resource: event.resource.clone(),
+            resource: short_path(&event.resource, (install, local)),
             revision: event.revision.clone(),
         }),
         RunTrigger::Webhook(hook) => Trigger::Webhook(WebhookDelivery {
@@ -491,6 +492,14 @@ fn invocation(
         limits,
         cancel,
     }
+}
+
+/// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
+/// text stays as it is.
+fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
+    let realm = install.account.realm_id;
+    let root = format!("/{realm}/g/{}/data/{local}/", install.group_id);
+    path.strip_prefix(&root).unwrap_or(path).to_string()
 }
 
 /// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown
