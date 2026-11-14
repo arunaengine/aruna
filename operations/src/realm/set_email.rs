@@ -31,6 +31,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 use ulid::Ulid;
 
+use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
@@ -63,6 +64,7 @@ pub struct SetEmailConfig {
 pub struct SetEmailOperation {
     config: SetEmailConfig,
     txn_id: Option<TxnId>,
+    attempts: usize,
     state: SetEmailState,
     output: Option<Result<Option<RealmEmailProfile>, SetEmailError>>,
 }
@@ -120,6 +122,7 @@ impl SetEmailOperation {
         Self {
             config,
             txn_id: None,
+            attempts: 0,
             state: SetEmailState::Init,
             output: None,
         }
@@ -340,6 +343,15 @@ impl SetEmailOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
+    /// Opens a transaction that reads, validates and applies the change from the start.
+    fn start_transaction(&mut self) -> Effects {
+        self.attempts += 1;
+        self.state = SetEmailState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
     fn fail(&mut self, error: SetEmailError) -> Effects {
         let cleanup = self.abort();
         self.state = SetEmailState::Error;
@@ -381,12 +393,7 @@ impl Operation for SetEmailOperation {
             SetEmailState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
-                        Ok(true) => {
-                            self.state = SetEmailState::StartTransaction;
-                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                                read: false
-                            })]
-                        }
+                        Ok(true) => self.start_transaction(),
                         Ok(false) => self.fail(SetEmailError::Unauthorized),
                         Err(AuthorizationError::StorageError(error)) => self.fail(error.into()),
                         Err(error) => {
@@ -453,6 +460,12 @@ impl Operation for SetEmailOperation {
                     self.txn_id = None;
                     self.state = SetEmailState::ScheduleSyncDrain;
                     smallvec![schedule_drain_effect()]
+                }
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) if self.attempts < COMMIT_ATTEMPTS => {
+                    self.txn_id = None;
+                    self.start_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;

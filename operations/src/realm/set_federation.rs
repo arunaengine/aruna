@@ -29,6 +29,7 @@ use thiserror::Error;
 use tracing::warn;
 use url::Url;
 
+use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::federation::publish::PUBLISH_SOON;
 use crate::placement::target_placement_ref;
@@ -67,6 +68,7 @@ pub struct SetFederationConfig {
 pub struct SetFederationOperation {
     config: SetFederationConfig,
     txn_id: Option<TxnId>,
+    attempts: usize,
     state: SetFederationState,
     output: Option<Result<RealmConfigDocument, SetFederationError>>,
 }
@@ -130,6 +132,7 @@ impl SetFederationOperation {
         Self {
             config,
             txn_id: None,
+            attempts: 0,
             state: SetFederationState::Init,
             output: None,
         }
@@ -357,6 +360,15 @@ impl SetFederationOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
+    /// Opens a transaction that reads, validates and applies the change from the start.
+    fn start_transaction(&mut self) -> Effects {
+        self.attempts += 1;
+        self.state = SetFederationState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
     fn fail(&mut self, error: SetFederationError) -> Effects {
         let cleanup = self.abort();
         self.state = SetFederationState::Error;
@@ -380,10 +392,7 @@ impl Operation for SetFederationOperation {
 
     fn start(&mut self) -> Effects {
         let Some(auth_context) = self.config.auth_context.clone() else {
-            self.state = SetFederationState::StartTransaction;
-            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })];
+            return self.start_transaction();
         };
         if auth_context.realm_id != self.config.actor.realm_id {
             return self.fail(SetFederationError::Unauthorized);
@@ -404,12 +413,7 @@ impl Operation for SetFederationOperation {
             SetFederationState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
-                        Ok(true) => {
-                            self.state = SetFederationState::StartTransaction;
-                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                                read: false
-                            })]
-                        }
+                        Ok(true) => self.start_transaction(),
                         Ok(false) => self.fail(SetFederationError::Unauthorized),
                         Err(error) => {
                             warn!(error = %error, "Realm federation authorization check failed");
@@ -481,6 +485,12 @@ impl Operation for SetFederationOperation {
                     self.txn_id = None;
                     self.state = SetFederationState::ScheduleSyncDrain { document };
                     smallvec![schedule_drain_effect()]
+                }
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) if self.attempts < COMMIT_ATTEMPTS => {
+                    self.txn_id = None;
+                    self.start_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
