@@ -28,6 +28,10 @@ pub enum SettingKind {
     Boolean,
     Url,
     Choice,
+    /// A form field only: a dataset the person picks.
+    Dataset,
+    /// A form field only: an object the person picks.
+    Object,
 }
 
 /// One value the installer fills in. The form is generated from these.
@@ -196,8 +200,13 @@ impl Manifest {
             return Err(ManifestError::InvalidName(name.clone()));
         }
         for (name, setting) in &self.settings {
-            check_setting(setting)
-                .map_err(|why| ManifestError::InvalidSetting(name.clone(), why))?;
+            let picked = matches!(setting.kind, SettingKind::Dataset | SettingKind::Object);
+            let why = if picked {
+                Err("only a form field picks a dataset or object")
+            } else {
+                check_setting(setting)
+            };
+            why.map_err(|why| ManifestError::InvalidSetting(name.clone(), why))?;
         }
         if self.secrets.values().any(|slot| !valid_title(&slot.title)) {
             return Err(ManifestError::InvalidTitle);
@@ -282,8 +291,15 @@ impl Manifest {
         let invalid = |why| ManifestError::InvalidTrigger(kind, why);
         let timer = kind == TriggerKind::Every;
         let webhook = kind == TriggerKind::Webhook;
-        if trigger.input.is_some() && kind != TriggerKind::Manual {
-            return Err(invalid("only a manual trigger takes input"));
+        if !trigger.form.is_empty() && kind != TriggerKind::Manual {
+            return Err(invalid("only a manual trigger has a form"));
+        }
+        bounded("form fields", trigger.form.len())?;
+        for (name, field) in &trigger.form {
+            if !valid_name(name) {
+                return Err(ManifestError::InvalidName(name.clone()));
+            }
+            check_setting(field).map_err(|why| ManifestError::InvalidSetting(name.clone(), why))?;
         }
         if timer != trigger.interval.is_some() || (timer && trigger.interval_secs().is_none()) {
             return Err(invalid(
@@ -356,6 +372,7 @@ fn check_setting(setting: &Setting) -> Result<(), &'static str> {
         SettingKind::Choice => default
             .as_str()
             .is_some_and(|d| setting.choices.iter().any(|c| c == d)),
+        SettingKind::Dataset | SettingKind::Object => default.is_string(),
     };
     if !fits {
         return Err("the default does not fit the type");

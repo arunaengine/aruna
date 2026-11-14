@@ -22,7 +22,7 @@ auth = "catalog_key"
 
 [triggers]
 dataset_created = {}
-manual = { input = "dataset" }
+manual = {}
 
 [permissions]
 required = ["metadata.read"]
@@ -277,5 +277,39 @@ fn parse_bounds() {
     assert!(matches!(
         Manifest::parse(b"{"),
         Err(ManifestError::Malformed(_))
+    ));
+}
+
+#[test]
+fn manual_forms() {
+    let field = |kind| Setting {
+        title: "Dataset".into(),
+        kind,
+        default: None,
+        choices: Vec::new(),
+    };
+    let with_form = |kind: TriggerKind| {
+        let mut manifest = example();
+        let trigger = manifest.triggers.get_mut(&kind).unwrap();
+        trigger
+            .form
+            .insert("dataset".into(), field(SettingKind::Dataset));
+        manifest.check()
+    };
+    assert_eq!(with_form(TriggerKind::Manual), Ok(()));
+    assert!(matches!(
+        with_form(TriggerKind::DatasetCreated),
+        Err(ManifestError::InvalidTrigger(
+            TriggerKind::DatasetCreated,
+            _
+        ))
+    ));
+    let mut picked = example();
+    picked
+        .settings
+        .insert("dataset".into(), field(SettingKind::Dataset));
+    assert!(matches!(
+        picked.check(),
+        Err(ManifestError::InvalidSetting(name, _)) if name == "dataset"
     ));
 }

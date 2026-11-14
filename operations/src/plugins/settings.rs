@@ -42,6 +42,8 @@ pub fn check_settings(
             SettingKind::Choice => value
                 .as_str()
                 .is_some_and(|value| setting.choices.iter().any(|choice| choice == value)),
+            // A form field names a dataset or object by its id or path.
+            SettingKind::Dataset | SettingKind::Object => value.is_string(),
         };
         if !valid {
             return Err(SettingError::Invalid(name.clone()));
