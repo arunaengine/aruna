@@ -1,4 +1,5 @@
-//! Answers a run's calls about its install's jobs from their work rows: status and outputs.
+//! Answers a run's calls about its install's jobs from their work rows: status, outputs and
+//! cancel.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -9,9 +10,11 @@ use ulid::Ulid;
 
 use super::broker::short_path;
 use super::check::unavailable;
-use super::work::{Summary, WorkKind, WorkRow, read_work, summary_of, work_state};
+use super::work::{
+    Summary, WorkKind, WorkRow, WorkState, read_work, reconcile, summary_of, work_state,
+};
 use crate::driver::DriverContext;
-use crate::jobs::store::read_job_record;
+use crate::jobs::store::{JobMutationError, read_job_record, set_cancel_requested};
 
 /// Outputs of one page.
 const PAGE: usize = 100;
@@ -103,6 +106,31 @@ pub async fn job_outputs(
     let next = start + PAGE;
     let cursor = (next < outputs.len()).then(|| next.to_string());
     Ok(ObjectPage { objects, cursor })
+}
+
+/// Asks the job of `id` to stop. A job that ended, or whose record is gone, has nothing left to
+/// stop; a work whose job is not known yet cannot be stopped yet.
+pub async fn cancel_job(
+    ctx: &DriverContext,
+    install: &PluginInstall,
+    id: &str,
+    now_ms: u64,
+) -> Result<(), HostError> {
+    let row = job_row(ctx, install, id).await?;
+    let job = match (row.state, row.job) {
+        (WorkState::Settled, _) => return Ok(()),
+        (_, Some(job)) => job,
+        (_, None) => match reconcile(ctx, install.install_id, &row).await {
+            Ok(Some(job)) => job,
+            Ok(None) => return Err(unavailable("the job is not submitted yet")),
+            Err(error) => return Err(unavailable(error.0)),
+        },
+    };
+    // A running job sees the request at its next lease renewal and stops.
+    match set_cancel_requested(&ctx.storage_handle, job, now_ms).await {
+        Ok(_) | Err(JobMutationError::NotFound) => Ok(()),
+        Err(error) => Err(unavailable(error.to_string())),
+    }
 }
 
 fn fill(status: &mut JobStatus, summary: Summary) {

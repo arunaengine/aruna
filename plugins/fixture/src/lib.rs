@@ -109,6 +109,10 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             let copied = jobs::copy(&text("source"), version, &text("target"));
             json!(copied.map_err(host)?)
         }
+        "cancel" => {
+            jobs::cancel(&text("id")).map_err(host)?;
+            json!(true)
+        }
         "job" => {
             let status = jobs::get(&text("id")).map_err(host)?;
             let page = jobs::outputs(&text("id"), None).map_err(host)?;

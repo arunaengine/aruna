@@ -209,6 +209,18 @@ pub trait Broker: Send + Sync {
             "jobs are not run here",
         ))
     }
+    /// Asks a job of the install to stop; a broker that runs no jobs refuses it.
+    async fn jobs_cancel(
+        &self,
+        _cx: &CallContext,
+        _id: &str,
+        _intent: Intent,
+    ) -> Result<(), HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "jobs are not run here",
+        ))
+    }
     /// One page of the objects a task of the install wrote.
     async fn jobs_outputs(
         &self,

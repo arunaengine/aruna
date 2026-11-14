@@ -367,6 +367,20 @@ impl jobs::Host for Session {
         )
         .await
     }
+
+    /// A cancel changes the job, so it takes its ordinal in the run.
+    async fn cancel(&mut self, id: String) -> wasmtime::Result<Result<(), HostError>> {
+        let parts: [&[u8]; 2] = [b"cancel", id.as_bytes()];
+        let intent = Intent::new(self.next_ordinal(), &parts);
+        self.brokered(
+            id.len(),
+            Effect::Write(intent.clone()),
+            Needs::Free,
+            |broker, cx| async move { broker.jobs_cancel(&cx, &id, intent).await },
+            |_| 0,
+        )
+        .await
+    }
 }
 
 fn status_size(status: &JobStatus) -> usize {

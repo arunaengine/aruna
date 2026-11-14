@@ -43,7 +43,7 @@ use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
-use super::jobs::{job_outputs, job_status};
+use super::jobs::{cancel_job, job_outputs, job_status};
 use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
@@ -1030,6 +1030,17 @@ impl Broker for RunBroker {
     ) -> Result<ObjectPage, HostError> {
         let install = self.admitted(None).await?;
         job_outputs(&self.ctx, (&install, self.scope.local), id, cursor).await
+    }
+
+    async fn jobs_cancel(
+        &self,
+        _cx: &CallContext,
+        id: &str,
+        _intent: Intent,
+    ) -> Result<(), HostError> {
+        // Asking again changes nothing, so a rerun cancels again instead of reading an intent.
+        let install = self.admitted(None).await?;
+        cancel_job(&self.ctx, &install, id, unix_timestamp_millis()).await
     }
 
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {

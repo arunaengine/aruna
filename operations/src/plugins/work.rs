@@ -379,7 +379,7 @@ pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, Stor
 
 /// Records the job of a reserved work whose submission committed but whose answer was lost; the
 /// job is found by the work's dedup key. `None` while no job was submitted.
-async fn reconcile(
+pub(crate) async fn reconcile(
     ctx: &DriverContext,
     install_id: Ulid,
     row: &WorkRow,

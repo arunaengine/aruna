@@ -248,6 +248,8 @@ interface jobs {
   get: func(id: string) -> result<status, host-error>;
   /// One page of the objects a task wrote.
   outputs: func(id: string, cursor: option<string>) -> result<object-page, host-error>;
+  /// Asks a job of the install to stop; a job that already ended stays as it ended.
+  cancel: func(id: string) -> result<_, host-error>;
 }
 
 interface log {

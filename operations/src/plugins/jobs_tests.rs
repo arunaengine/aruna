@@ -1,5 +1,5 @@
-//! Tests job status and outputs: a queued copy, its kept summary, outputs on this node only, and
-//! ids the install does not own.
+//! Tests job status, outputs and cancel: a queued copy, its kept summary, outputs on this node
+//! only, a cancel before the copy ran, and ids the install does not own.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -87,4 +87,22 @@ async fn status_from_row() {
         foreign.map(drop).map_err(|e| e.kind),
         Err(ErrorKind::NotFound)
     );
+}
+
+#[tokio::test]
+async fn cancel_stops_job() {
+    // A queued copy that never ran ends cancelled; asking again, or after it ended, is no error.
+    let fixture = Fixture::new().await;
+    let install = ready(&fixture).await;
+    let copy = request(&fixture, &install, "out/a.txt");
+    let id = start_copy(&fixture.ctx, &scope(&fixture, &install), copy).await;
+    let id = id.unwrap().to_string();
+    let place = (&install, fixture.actor.node_id);
+    for _ in 0..2 {
+        cancel_job(&fixture.ctx, &install, &id, 5).await.unwrap();
+    }
+    let status = job_status(&fixture.ctx, place, &id).await.unwrap();
+    assert_eq!(status.state, "cancelled");
+    let missing = cancel_job(&fixture.ctx, &install, "nope", 5).await;
+    assert_eq!(missing.map_err(|e| e.kind), Err(ErrorKind::NotFound));
 }

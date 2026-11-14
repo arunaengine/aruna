@@ -246,6 +246,17 @@ impl Broker for Recorder {
         })
     }
 
+    async fn jobs_cancel(
+        &self,
+        _: &CallContext,
+        id: &str,
+        intent: Intent,
+    ) -> Result<(), HostError> {
+        self.note(&format!("cancel {id}"));
+        self.intents.lock().unwrap().push(intent);
+        Ok(())
+    }
+
     async fn jobs_outputs(
         &self,
         _: &CallContext,
@@ -661,6 +672,18 @@ async fn copy_answers_id() {
     assert_eq!(broker.intents()[0].ordinal, 1);
     let refused = invoke(probe(input), Arc::default()).await;
     assert!(matches!(refused, Err(InvokeError::Guest(_))), "{refused:?}");
+}
+
+#[tokio::test]
+async fn cancel_takes_ordinal() {
+    let broker = Arc::new(Recorder::default());
+    let reply = invoke(
+        probe(serde_json::json!({"call": "cancel", "id": "j1"})),
+        broker.clone(),
+    );
+    assert_eq!(output(reply.await), true);
+    assert_eq!(broker.calls(), ["cancel j1"]);
+    assert_eq!(broker.intents()[0].ordinal, 1);
 }
 
 #[tokio::test]
