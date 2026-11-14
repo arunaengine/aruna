@@ -1,6 +1,5 @@
-//! Tests event delivery across its stages: a restart with rows at every stage ends with one run
-//! per event, also for sync events, a narrowed grant stops delivery, and pause and removal deny
-//! or drop pending rows; a completed sync job and a remote holder's sync row each run once.
+//! Tests event delivery: a restart with rows at every stage runs each event once, also sync ones;
+//! grants, pause and removal stop delivery; sync jobs and remote sync rows run once.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

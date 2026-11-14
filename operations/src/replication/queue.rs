@@ -3093,10 +3093,9 @@ async fn retire_job(
     .await
 }
 
-/// The plugin event of a retired sync job, from the relationship and source bucket rows as the
-/// retiring transaction reads them: a completed job while its relationship exists and is not
-/// detached, a failed one only while its relationship is enabled, neither once the bucket is
-/// gone. A failure that stopped the relationship reports through its status instead.
+/// The plugin event of a retired sync job, from the relationship and bucket rows its transaction
+/// reads: a completed job while the relationship exists and is not detached, a failed one only
+/// while it is enabled (a stopped one reports through its status), neither without the bucket.
 async fn sync_event(
     txn: &Txn<'_>,
     job: &BlobJobRecord,
