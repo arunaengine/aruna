@@ -53,6 +53,7 @@ use super::version_replication::{
 };
 use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
 use crate::notifications::watch::emit::emit_watch_event;
+use crate::plugins::store::{StoreError, Txn, transact};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
@@ -118,6 +119,8 @@ pub enum BlobQueueError {
     Replication(#[from] ReplicateScopeError),
     #[error("unexpected event while processing blob replication queue: {0}")]
     UnexpectedEvent(String),
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 #[derive(Serialize)]
@@ -190,9 +193,14 @@ struct ReplicationScanCursor {
     next_due_ms: Option<u64>,
 }
 
+/// How a processed job ends. The first three retire it; only `Completed` and `Failed` report.
 enum BlobJobOutcome {
-    Succeeded,
-    TerminalFailure,
+    /// The run copied or confirmed every version.
+    Completed,
+    /// A permanent failure; a member publication retries instead.
+    Failed,
+    /// Nothing to report: the relationship was not enabled or is gone, or nothing was owed.
+    Retired,
     /// The job waits, parked, for one of these locked source keys.
     AwaitingKey(Vec<BucketKeyRef>),
 }
@@ -1306,21 +1314,21 @@ pub(crate) async fn drain_batch(
                 .cloned()
         });
         match process_blob_job(context, &job, relationship, &mut relationships).await {
-            Ok(BlobJobOutcome::Succeeded) => {
-                delete_blob_job(&context.storage_handle, job_key).await?;
+            Ok(BlobJobOutcome::Completed | BlobJobOutcome::Retired) => {
+                retire_job(context, job_key, &job).await?;
                 succeeded = succeeded.saturating_add(1);
             }
             // A member job ends only once delivered or no longer owed: a bootstrap counts a
             // deleted job as delivered, so a refusal retries instead.
-            Ok(BlobJobOutcome::TerminalFailure) if job.distribution.is_some() => {
+            Ok(BlobJobOutcome::Failed) if job.distribution.is_some() => {
                 let refused = "the member did not take the version".to_string();
                 let retry_due_at =
                     reschedule_blob_job(&context.storage_handle, job_key, &job, refused).await?;
                 next_due_ms = min_due_at(next_due_ms, retry_due_at);
                 failed = failed.saturating_add(1);
             }
-            Ok(BlobJobOutcome::TerminalFailure) => {
-                delete_blob_job(&context.storage_handle, job_key).await?;
+            Ok(BlobJobOutcome::Failed) => {
+                retire_job(context, job_key, &job).await?;
                 failed = failed.saturating_add(1);
             }
             // No attempt, no error: the next unlock of a key makes the job due again.
@@ -1521,18 +1529,15 @@ fn relationship_bucket<'a>(
             state = ?relationship.state,
             "Skipping replication job for disabled sync relationship"
         );
-        return Err(BlobJobOutcome::Succeeded);
+        return Err(BlobJobOutcome::Retired);
     }
     if job.reference_advance.is_some()
         && relationship.mode != SyncMode::Reference
         && relationship.reference_handling != ReferenceHandling::Preserve
     {
-        return Err(BlobJobOutcome::TerminalFailure);
+        return Err(BlobJobOutcome::Failed);
     }
-    relationship
-        .source
-        .bucket()
-        .ok_or(BlobJobOutcome::TerminalFailure)
+    relationship.source.bucket().ok_or(BlobJobOutcome::Failed)
 }
 
 async fn process_blob_job(
@@ -1542,7 +1547,7 @@ async fn process_blob_job(
     relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
 ) -> Result<BlobJobOutcome, String> {
     if job.reference_advance.is_some() && job.relationship_id.is_none() {
-        return Ok(BlobJobOutcome::TerminalFailure);
+        return Ok(BlobJobOutcome::Failed);
     }
     let routing = match quota_marked_routing(context).await {
         Ok(routing) => routing,
@@ -1550,7 +1555,7 @@ async fn process_blob_job(
         // backoff ceiling; the drain repair re-enqueues once it is repaired.
         Err(error) if error.storage().is_none() => {
             error!(error = %error, "Dropping blob replication job with undecodable routing inputs");
-            return Ok(BlobJobOutcome::TerminalFailure);
+            return Ok(BlobJobOutcome::Failed);
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -1574,7 +1579,7 @@ async fn process_blob_job(
                 relationship_id = %relationship_id,
                 "Skipping replication job for missing sync relationship"
             );
-            return Ok(BlobJobOutcome::Succeeded);
+            return Ok(BlobJobOutcome::Retired);
         };
         let bucket = match relationship_bucket(job, &relationship, relationship_id) {
             Ok(bucket) => bucket,
@@ -1601,7 +1606,7 @@ async fn process_blob_job(
             }
             Err((SourceAuthorizationError::Denied, group_id)) => {
                 if job.reference_advance.is_some() {
-                    return Ok(BlobJobOutcome::TerminalFailure);
+                    return Ok(BlobJobOutcome::Failed);
                 }
                 let mut relationship = relationship;
                 relationship.state = SyncState::Failed {
@@ -1614,7 +1619,7 @@ async fn process_blob_job(
                     emit_sync_watch(context, &relationship, group_id, 0, Some("access_denied"))
                         .await;
                 }
-                return Ok(BlobJobOutcome::TerminalFailure);
+                return Ok(BlobJobOutcome::Failed);
             }
             Err((SourceAuthorizationError::Unavailable(error), group_id)) => {
                 let mut relationship = relationship;
@@ -1655,7 +1660,7 @@ async fn process_blob_job(
                 bucket = %job.input.bucket,
                 "Dropping replication job without durable source writer"
             );
-            return Ok(BlobJobOutcome::TerminalFailure);
+            return Ok(BlobJobOutcome::Failed);
         };
         let Some(source_node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
             return Err("source node identity unavailable".to_string());
@@ -1670,7 +1675,7 @@ async fn process_blob_job(
         {
             Ok(authorization) => authorization,
             Err((SourceAuthorizationError::Denied, _)) => {
-                return Ok(BlobJobOutcome::TerminalFailure);
+                return Ok(BlobJobOutcome::Failed);
             }
             Err((SourceAuthorizationError::Unavailable(error), _)) => return Err(error),
         };
@@ -1705,7 +1710,7 @@ async fn publish_member(
     relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
 ) -> Result<BlobJobOutcome, String> {
     let ReplicateScopeTarget::Version { key, .. } = &job.input.target else {
-        return Ok(BlobJobOutcome::TerminalFailure);
+        return Ok(BlobJobOutcome::Failed);
     };
     let Some(local) = context.net_handle.as_ref().map(|net| net.node_id()) else {
         return Err("source node identity unavailable".to_string());
@@ -1720,7 +1725,7 @@ async fn publish_member(
             member_id = %target.member_id,
             "Dropping a publication this node no longer owes"
         );
-        return Ok(BlobJobOutcome::Succeeded);
+        return Ok(BlobJobOutcome::Retired);
     };
     let operation = operation.with_distribution(publication, local);
     finish_blob_job(context, job, operation, None, None, relationships).await
@@ -1755,17 +1760,17 @@ async fn finish_blob_job(
                     emit_sync_watch(context, relationship, group_id, result.replicated, None).await;
                 }
             }
-            return Ok(BlobJobOutcome::Succeeded);
+            return Ok(BlobJobOutcome::Completed);
         }
         Ok(result) => {
             failure = result.failure;
             if failure.is_some_and(ReplicationFailure::is_writer_denied) {
-                return Ok(BlobJobOutcome::TerminalFailure);
+                return Ok(BlobJobOutcome::Failed);
             }
             if job.reference_advance.is_some()
                 && failure.is_some_and(ReplicationFailure::is_access_denied)
             {
-                return Ok(BlobJobOutcome::TerminalFailure);
+                return Ok(BlobJobOutcome::Failed);
             }
             if result.replicated > 0
                 && let Some(relationship) = relationship.as_mut()
@@ -1795,7 +1800,7 @@ async fn finish_blob_job(
                     emit_sync_watch(context, relationship, group_id, 0, Some("access_denied"))
                         .await;
                 }
-                return Ok(BlobJobOutcome::TerminalFailure);
+                return Ok(BlobJobOutcome::Failed);
             }
             error
         }
@@ -1819,7 +1824,7 @@ async fn finish_blob_job(
         }
     }
     if failure.is_some_and(ReplicationFailure::is_denied) {
-        return Ok(BlobJobOutcome::TerminalFailure);
+        return Ok(BlobJobOutcome::Failed);
     }
     if let Some(relationship) = relationship.as_mut() {
         mark_failure(relationship, &error);
@@ -3058,6 +3063,25 @@ async fn write_blob_job(
     }
 }
 
+/// Retires a processed job in one transaction: its row goes only while it still holds this job,
+/// so an enqueue that wrote the row again during the run keeps its own run.
+async fn retire_job(
+    context: &DriverContext,
+    key: Vec<u8>,
+    job: &BlobJobRecord,
+) -> Result<(), BlobQueueError> {
+    transact(context, async |txn: &Txn<'_>| {
+        let stored = txn.read(REPLICATION_JOB_KEYSPACE, &key).await?;
+        let stored = stored.and_then(|value| BlobJobRecord::from_bytes(&value).ok());
+        if stored.is_some_and(|stored| stored.job_id == job.job_id) {
+            txn.delete(REPLICATION_JOB_KEYSPACE, vec![key.clone()])
+                .await?;
+        }
+        Ok::<_, BlobQueueError>(())
+    })
+    .await
+}
+
 async fn delete_blob_job(storage: &StorageHandle, key: Vec<u8>) -> Result<(), BlobQueueError> {
     match storage
         .send_storage_effect(StorageEffect::Delete {
@@ -3672,6 +3696,44 @@ mod tests {
         let jobs = read_jobs(&storage).await;
         assert_eq!(jobs.len(), 1);
         assert_ne!(jobs[0].1.job_id, queued);
+    }
+
+    #[tokio::test]
+    async fn retire_keeps_replaced() {
+        // A retirement deletes the row only while it holds the retired job: a row an enqueue
+        // wrote again during the run stays for its own run.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let retired = BlobJobRecord::new(on_demand_input(), None, 7);
+        let replaced = BlobJobRecord::new(on_demand_input(), None, 7);
+        let key = blob_job_key(&retired).unwrap().to_vec();
+        write_queue_record(
+            &storage,
+            REPLICATION_JOB_KEYSPACE,
+            key.clone(),
+            replaced.to_bytes().unwrap(),
+        )
+        .await;
+
+        retire_job(&context, key.clone(), &retired)
+            .await
+            .expect("retires");
+        assert_eq!(
+            read_jobs(&storage).await,
+            vec![(key.clone(), replaced.clone())]
+        );
+
+        retire_job(&context, key, &replaced).await.expect("retires");
+        assert!(read_jobs(&storage).await.is_empty());
     }
 
     #[test]
