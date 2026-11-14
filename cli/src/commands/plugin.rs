@@ -285,12 +285,12 @@ fn setting_values(pairs: &[String]) -> Result<serde_json::Map<String, Value>, Cl
     Ok(values)
 }
 
-/// `permission=pattern` pairs grouped by permission; `permission=` keeps an empty list.
+/// `read=pattern` and `write=pattern` pairs grouped by access; `write=` keeps an empty list.
 fn grant_choices(pairs: &[String]) -> Result<BTreeMap<String, Vec<String>>, CliError> {
     let mut choices: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for pair in pairs {
-        let (permission, pattern) = split_pair(pair)?;
-        let patterns = choices.entry(permission.to_string()).or_default();
+        let (access, pattern) = split_pair(pair)?;
+        let patterns = choices.entry(access.to_string()).or_default();
         if !pattern.is_empty() {
             patterns.push(pattern.to_string());
         }

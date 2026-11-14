@@ -64,8 +64,8 @@ pub struct InstallBody {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub settings: Map<String, Value>,
-    /// Narrowed resource patterns by permission. A permission left out gets all of the group,
-    /// an empty list removes an optional one; `connections.send` lists connection names.
+    /// Narrowed resource patterns under `read` and `write`, below the group's `meta` or `data`.
+    /// One left out gets all of the group; an empty list removes it when the plugin allows.
     #[serde(default)]
     pub grants: BTreeMap<String, Vec<String>>,
     /// The id a preview answered; sending the same request with it resumes that install.
@@ -82,7 +82,7 @@ pub struct InstallQuery {
     pub preview: Option<bool>,
 }
 
-/// One permission line of the summary: what the manifest requests and what is granted.
+/// One grant line of the summary: `read`, or `write` when the plugin writes, and its patterns.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PermissionLine {
     pub permission: String,
@@ -126,7 +126,7 @@ pub struct SecretLine {
     pub kind: String,
     /// `group:<name>`, `realm:<name>` or `node:<name>`.
     pub secret: String,
-    /// The code may read the secret's value through `secrets.value`.
+    /// The code may read the secret's value: the manifest lists it under `[secrets]`.
     pub value: bool,
 }
 
@@ -176,7 +176,7 @@ pub struct InstallListQuery {
     pub limit: Option<usize>,
 }
 
-const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "webhook": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"], "secrets": [{"slot": "catalog_key", "kind": "bearer", "secret": "group:catalog-key", "value": false}], "warnings": []}}"#;
+const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "webhook": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true}], "triggers": ["dataset_created", "manual"], "secrets": [{"slot": "catalog_key", "kind": "bearer", "secret": "group:catalog-key", "value": false}], "warnings": []}}"#;
 
 pub(crate) fn view_example() -> Value {
     serde_json::from_str(VIEW_EXAMPLE).unwrap_or(Value::Null)
@@ -215,7 +215,7 @@ relays it to one.
 - 404 when no published version matches.
 - 409 when the id belongs to another request or a step failed."#,
     params(("name" = String, Path, description = "The plugin name"), InstallQuery),
-    request_body(content = InstallBody, example = json!({"group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "settings": {"catalog_url": "https://catalog.example.org"}, "grants": {"metadata.write": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/runs/**"]}, "secrets": {"catalog_key": "group:catalog-key"}})),
+    request_body(content = InstallBody, example = json!({"group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "settings": {"catalog_url": "https://catalog.example.org"}, "grants": {"read": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/data/**"], "write": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/runs/**"]}, "secrets": {"catalog_key": "group:catalog-key"}})),
     responses(
         (status = 200, description = "The summary of a preview", body = InstallSummary, example = json!(view_example()["summary"])),
         (status = 201, description = "The active install", body = InstallView, example = json!(view_example())),

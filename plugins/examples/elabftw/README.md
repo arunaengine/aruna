@@ -53,10 +53,8 @@ values; `<prefix>` is eLabFTW's path prefix, a folder name without slashes at it
      --setting elab_url=https://elab.example.org --setting sync_user=<sync user id> \
      --setting aruna_url=https://portal.example.org --setting writers=3,group:4 \
      --setting bucket=/<realm>/g/<group>/data/<node>/<bucket> --setting prefix=<prefix> \
-     --grant 'metadata.read=/<realm>/g/<group>/meta/elabftw/**' \
-     --grant 'metadata.write=/<realm>/g/<group>/meta/elabftw/**' \
-     --grant 'metadata.create=/<realm>/g/<group>/meta/elabftw/**' \
-     --grant 'objects.read=/<realm>/g/<group>/data/<node>/<bucket>/<prefix>/**' \
+     --grant 'read=/<realm>/g/<group>/data/<node>/<bucket>/<prefix>/**' \
+     --grant 'write=/<realm>/g/<group>/meta/elabftw/**' \
      --secret elab=group:elab-key
    ```
 
