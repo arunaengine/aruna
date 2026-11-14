@@ -44,7 +44,7 @@ pub(crate) fn connected() -> Vec<u8> {
     artifact(true, false)
 }
 
-/// The fixture whose `api` connection injects the bearer slot `api_key`.
+/// The fixture whose `api` connection injects its bearer slot `api`.
 pub(crate) fn secured() -> Vec<u8> {
     artifact(true, true)
 }

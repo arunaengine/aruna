@@ -5,22 +5,16 @@
 name = "dataset-announcer"
 version = "0.1.0"
 title = "Announce new datasets"
+on = ["dataset_created", "manual"]
+access = "write"
 
 [settings]
 catalog_url = { title = "Catalog address", type = "url" }
 
-[secrets]
-catalog_key = { title = "Catalog API key", kind = "bearer" }
-
-[connections.catalog]
+[services.catalog]
 url = "{catalog_url}/api/records"
 methods = ["POST"]
-auth = "catalog_key"
+secret = "Catalog API key"
 
-[triggers]
-dataset_created = {}
-manual = { form = { dataset = { title = "Dataset", type = "dataset" } } }
-
-[permissions]
-required = ["metadata.read"]
-optional = ["metadata.write"]
+[manual]
+dataset = { type = "dataset" }

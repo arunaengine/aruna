@@ -359,9 +359,8 @@ fn probe(language: &str, code: &str) -> PathBuf {
     let build = &template[template.find("[build]").unwrap()..];
     let build = build.replace("\"wit\"", &format!("{:?}", wit.display().to_string()));
     let manifest = format!(
-        "name = \"probe\"\nversion = \"0.1.0\"\n\n[triggers]\nmanual = {{}}\n\
-         every = {{ interval = \"1h\" }}\n\n[permissions]\n\
-         required = [\"metadata.read\"]\n\n{build}"
+        "name = \"probe\"\nversion = \"0.1.0\"\non = [\"manual\", \"timer\"]\n\n\
+         [timer]\nevery = \"1h\"\n\n{build}"
     );
     std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
     match language {
@@ -480,7 +479,7 @@ async fn kills_stuck_builds() {
     // A toolchain that never ends is killed with its process group once the deadline passes.
     let project = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stuck");
     std::fs::create_dir_all(&project).unwrap();
-    let manifest = "name = \"stuck\"\nversion = \"0.1.0\"\n\n[build]\n\
+    let manifest = "name = \"stuck\"\nversion = \"0.1.0\"\non = [\"manual\"]\n\n[build]\n\
                     command = [\"sleep\", \"600\"]\noutput = \"plugin.wasm\"\n";
     std::fs::write(project.join("plugin.toml"), manifest).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);

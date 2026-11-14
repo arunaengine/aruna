@@ -50,8 +50,7 @@ pub struct Built {
 /// Reads and checks a project's `plugin.toml`.
 pub fn load_manifest(project: &Path) -> Result<Manifest, BuildError> {
     let text = std::fs::read_to_string(project.join("plugin.toml"))?;
-    let manifest: Manifest =
-        toml::from_str(&text).map_err(|err| BuildError::Manifest(err.to_string()))?;
+    let manifest = crate::authored::parse(&text)?;
     manifest.check()?;
     Ok(manifest)
 }

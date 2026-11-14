@@ -1,12 +1,7 @@
 # Plugin manifest: what the plugin asks for. Build with `aruna-cli plugin build`.
 name = "{{name}}"
 version = "0.1.0"
-
-[triggers]
-manual = {}
-
-[permissions]
-required = []
+on = ["manual"]
 
 [build]
 command = ["uv", "run", "--no-project", "--with", "componentize-py==0.25.1", "componentize-py", "-d", "wit", "-w", "plugin", "componentize", "app", "-o", "plugin.wasm"]

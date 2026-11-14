@@ -5,27 +5,16 @@
 name = "fixture"
 version = "0.2.0"
 title = "Runtime test guest"
+on = ["manual", "timer", "dataset_created", "dataset_updated", "data_uploaded", "sync_completed", "sync_failed"]
+access = "write"
 
 [settings]
 api_url = { title = "API address", type = "url", default = "https://api.example.org" }
 
-[secrets]
-api_key = { title = "API key" }
-
-[connections.api]
+[services.api]
 url = "{api_url}/v1"
 methods = ["GET", "POST"]
-auth = "api_key"
+secret = "API key"
 
-[triggers]
-manual = {}
-every = { interval = "1h" }
-dataset_created = {}
-dataset_updated = {}
-data_uploaded = {}
-sync_completed = {}
-sync_failed = {}
-
-[permissions]
-required = ["metadata.read", "objects.read"]
-optional = ["metadata.write", "metadata.create"]
+[timer]
+every = "1h"

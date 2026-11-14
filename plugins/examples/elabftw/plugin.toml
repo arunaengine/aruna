@@ -5,29 +5,22 @@
 name = "elabftw-sync"
 version = "0.1.0"
 title = "Sync eLabFTW experiments"
+on = ["timer", "dataset_created", "dataset_updated", "manual"]
+access = "write"
 
 [settings]
 elab_url = { title = "eLabFTW address", type = "url" }
 sync_user = { title = "eLabFTW user id of the sync user", type = "integer" }
-writers = { title = "Writers of new experiments: user ids, group:<id> for team groups", type = "string", default = "" }
-bucket = { title = "Bucket path of eLabFTW's uploads on the receiver node", type = "string" }
-prefix = { title = "eLabFTW's path prefix in the bucket", type = "string", default = "elabftw" }
-tag = { title = "Tag of synced experiments", type = "string", default = "aruna" }
+writers = { title = "Writers of new experiments: user ids, group:<id> for team groups", default = "" }
+bucket = "Bucket path of eLabFTW's uploads on the receiver node"
+prefix = { title = "eLabFTW's path prefix in the bucket", default = "elabftw" }
+tag = { title = "Tag of synced experiments", default = "aruna" }
 aruna_url = { title = "Aruna portal address", type = "url" }
 
-[secrets]
-elab_key = { title = "eLabFTW API key of the sync user", kind = "header" }
-
-[connections.elab]
+[services.elab]
 url = "{elab_url}/api/v2/experiments"
 methods = ["GET", "POST", "PATCH"]
-auth = "elab_key"
+secret = { title = "eLabFTW API key of the sync user", kind = "header" }
 
-[triggers]
-every = { interval = "5m" }
-dataset_created = {}
-dataset_updated = {}
-manual = {}
-
-[permissions]
-required = ["metadata.read", "metadata.write", "metadata.create", "objects.read"]
+[timer]
+every = "5m"

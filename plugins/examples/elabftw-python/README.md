@@ -58,7 +58,7 @@ It needs eLabFTW 6.0 or later. It polls every five minutes; eLabFTW 6.0 has no w
      --grant 'metadata.write=/<realm>/g/<group>/meta/elabftw/**' \
      --grant 'metadata.create=/<realm>/g/<group>/meta/elabftw/**' \
      --grant 'objects.read=/<realm>/g/<group>/data/<node>/<bucket>/<prefix>/**' \
-     --secret elab_key=group:elab-key
+     --secret elab=group:elab-key
    ```
 
 3. On the receiver node, create the bucket and the storage account's credential, confined to

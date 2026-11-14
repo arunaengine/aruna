@@ -239,7 +239,7 @@ async fn secured_install(fixture: &Fixture) -> PluginInstall {
     edit_config(fixture, |config| {
         let install = &mut config.installs[0];
         (install.digest, install.version) = (digest, "0.2.1".to_string());
-        install.secrets = [("api_key".to_string(), binding)].into();
+        install.secrets = [("api".to_string(), binding)].into();
     })
     .await;
     let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);

@@ -57,7 +57,7 @@ values; `<prefix>` is eLabFTW's path prefix, a folder name without slashes at it
      --grant 'metadata.write=/<realm>/g/<group>/meta/elabftw/**' \
      --grant 'metadata.create=/<realm>/g/<group>/meta/elabftw/**' \
      --grant 'objects.read=/<realm>/g/<group>/data/<node>/<bucket>/<prefix>/**' \
-     --secret elab_key=group:elab-key
+     --secret elab=group:elab-key
    ```
 
    Experiments the plugin creates are readable by the team (`canread_base` Team) and writable
