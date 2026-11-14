@@ -37,6 +37,7 @@ pub mod state;
 pub mod store;
 pub mod sweep;
 pub mod waiting;
+pub mod work;
 pub mod worker;
 
 #[cfg(test)]
