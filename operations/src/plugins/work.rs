@@ -4,14 +4,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
+use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::structs::execution::job::{JobId, OutputObject};
+use aruna_core::plugin_runs::{RUN_RETENTION_MS, run_key};
+use aruna_core::structs::execution::job::{
+    JobId, JobRecord, JobResultPayload, JobState, OutputObject, PluginWorkSpec,
+};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
+use crate::jobs::store::read_job_record;
 
 /// Row kinds of the work keyspace: the work by install and identity, and its identity by work id.
 pub const WORK_ROW: u8 = b'w';
@@ -264,6 +268,123 @@ pub async fn dispatched(
         }
     })
     .await
+}
+
+/// The summary of a finished job, or `None` while it may still run. A job record that is gone
+/// leaves the outcome unknown.
+pub fn summary_of(record: Option<&JobRecord>) -> Option<Summary> {
+    let Some(record) = record else {
+        let mut gone = Summary::of(FinalState::Unknown);
+        gone.message = Some("the job record is gone".into());
+        return Some(gone);
+    };
+    let state = match record.state {
+        JobState::Succeeded => FinalState::Succeeded,
+        JobState::Failed => FinalState::Failed,
+        JobState::Cancelled => FinalState::Cancelled,
+        JobState::Indeterminate if record.locally_exhausted => FinalState::Unknown,
+        _ => return None,
+    };
+    let mut summary = Summary::of(state);
+    summary.message = (record.last_error.as_ref()).map(|error| error.message.clone());
+    if let Some(JobResultPayload::PluginWork { bytes, version_id }) = &record.result {
+        summary.bytes = Some(*bytes);
+        summary.version_id = *version_id;
+    }
+    Some(summary)
+}
+
+impl Summary {
+    fn of(state: FinalState) -> Self {
+        Self {
+            state,
+            message: None,
+            bytes: None,
+            version_id: None,
+            status: None,
+            reply: None,
+            exit_code: None,
+            outputs: Vec::new(),
+            report: None,
+        }
+    }
+}
+
+/// Keeps the summary of every dispatched work whose job finished, so its status outlives the
+/// job record; answers how many settled.
+pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    let txn = Txn::direct(ctx);
+    let mut settled = 0;
+    for (key, value) in txn.scan(PLUGIN_WORK_KEYSPACE, &[WORK_ROW]).await? {
+        let row: WorkRow = decode(&value)?;
+        let (WorkState::Dispatched, Some(job)) = (row.state, row.job) else {
+            continue;
+        };
+        let record = read_job_record(&ctx.storage_handle, job, None).await;
+        let record = record.map_err(StoreError)?;
+        let Some(summary) = summary_of(record.as_ref()) else {
+            continue;
+        };
+        let Some(install_id) = install_at(&key) else {
+            continue;
+        };
+        let changed = update_work(ctx, (install_id, row.work_id), |row| {
+            if row.state == WorkState::Dispatched {
+                row.state = WorkState::Settled;
+                row.summary = Some(summary);
+                row.settled_ms = Some(now_ms);
+            }
+        });
+        if changed.await?.is_some() {
+            settled += 1;
+        }
+    }
+    Ok(settled)
+}
+
+/// Deletes the unkeyed rows nobody can ask for again: settled, no cancel open, kept past the run
+/// retention, and their run record pruned. Keyed rows stay while their install exists.
+pub async fn prune_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    let txn = Txn::direct(ctx);
+    let mut dropped = Vec::new();
+    for (key, value) in txn.scan(PLUGIN_WORK_KEYSPACE, &[WORK_ROW]).await? {
+        let row: WorkRow = decode(&value)?;
+        let (Some(install_id), Some(Identity::Call { run_id, .. })) =
+            (install_at(&key), identity_at(&key))
+        else {
+            continue;
+        };
+        let aged = (row.settled_ms)
+            .is_some_and(|settled| settled.saturating_add(RUN_RETENTION_MS) <= now_ms);
+        if row.state != WorkState::Settled || row.cancel || !aged {
+            continue;
+        }
+        let run = run_key(install_id, run_id);
+        if txn.read(PLUGIN_RUNS_KEYSPACE, &run).await?.is_none() {
+            dropped.push(index_key(install_id, row.work_id));
+            dropped.push(key);
+        }
+    }
+    let count = dropped.len() / 2;
+    transact(ctx, async |txn: &Txn<'_>| {
+        txn.delete(PLUGIN_WORK_KEYSPACE, dropped).await
+    })
+    .await?;
+    Ok(count)
+}
+
+/// Whether a plugin work job must keep its record: its work row exists and is not settled yet.
+pub async fn holds_job(ctx: &DriverContext, spec: &PluginWorkSpec) -> Result<bool, StoreError> {
+    let row = read_work(ctx, spec.install_id, spec.work_id).await?;
+    Ok(row.is_some_and(|row| row.state != WorkState::Settled))
+}
+
+fn install_at(key: &[u8]) -> Option<Ulid> {
+    Some(Ulid::from_bytes(key.get(1..17)?.try_into().ok()?))
+}
+
+fn identity_at(key: &[u8]) -> Option<Identity> {
+    decode(key.get(17..)?).ok()
 }
 
 #[cfg(test)]

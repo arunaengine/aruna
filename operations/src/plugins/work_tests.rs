@@ -1,5 +1,5 @@
-//! Tests work rows: a repeated call adopts the row, other arguments conflict, a reinstall adopts
-//! nothing, the index finds the row, and dispatch records the job once.
+//! Tests work rows: adoption, conflicts and dispatch; settlement before the job is pruned; and
+//! the lifetime of unkeyed rows.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -90,4 +90,145 @@ async fn dispatch_records_once() {
     assert_eq!(later.job, Some(job(1)));
     let gone = dispatched(&fixture.ctx, (install.install_id, Ulid::generate()), job(3)).await;
     assert_eq!(gone, Ok(None));
+}
+
+fn record(spec: PluginWorkSpec, job: JobId, state: JobState) -> JobRecord {
+    let account = UserId::local(Ulid::from_parts(1, 1), spec.realm_id);
+    let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+    let payload = aruna_core::structs::execution::job::JobPayload::PluginWork(spec);
+    let mut record = JobRecord::new(job, payload, account, node, 1, 1, None);
+    record.state = state;
+    record
+}
+
+fn spec_of(install: &PluginInstall, row: &WorkRow) -> PluginWorkSpec {
+    PluginWorkSpec {
+        realm_id: install.account.realm_id,
+        install_id: install.install_id,
+        work_id: row.work_id,
+        group_id: install.group_id,
+        action: aruna_core::structs::execution::job::PluginWorkAction::Copy {
+            source: "a".into(),
+            source_version: None,
+            target: "b".into(),
+            version_id: Ulid::generate(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn summary_follows_job() {
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let row = proposed(&install, 1);
+    let mut job_record = record(spec_of(&install, &row), job(1), JobState::Running);
+    assert_eq!(summary_of(Some(&job_record)), None);
+    job_record.state = JobState::Indeterminate;
+    assert_eq!(summary_of(Some(&job_record)), None);
+    job_record.locally_exhausted = true;
+    let unknown = summary_of(Some(&job_record)).unwrap();
+    assert_eq!(unknown.state, FinalState::Unknown);
+    job_record.state = JobState::Succeeded;
+    let version = Ulid::generate();
+    job_record.result = Some(JobResultPayload::PluginWork {
+        bytes: 12,
+        version_id: Some(version),
+    });
+    let done = summary_of(Some(&job_record)).unwrap();
+    assert_eq!(
+        (done.state, done.bytes, done.version_id),
+        (FinalState::Succeeded, Some(12), Some(version))
+    );
+    let gone = summary_of(None).unwrap();
+    assert_eq!(gone.state, FinalState::Unknown);
+}
+
+#[tokio::test]
+async fn settles_before_pruning() {
+    // A finished job's row keeps its summary; until then the job record is held.
+    use crate::jobs::prune::prune_job_batch;
+    use crate::jobs::store::insert_job;
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let row = proposed(&install, 1);
+    let identity = Identity::Key("copy-1".into());
+    reserve(&fixture.ctx, (&install, &identity), row.clone())
+        .await
+        .unwrap();
+    let ids = (install.install_id, row.work_id);
+    dispatched(&fixture.ctx, ids, job(1)).await.unwrap();
+    let spec = spec_of(&install, &row);
+    let mut job_record = record(spec.clone(), job(1), JobState::Running);
+    insert_job(&fixture.ctx.storage_handle, &job_record)
+        .await
+        .unwrap();
+    assert_eq!(settle_work(&fixture.ctx, 5).await, Ok(0));
+    assert_eq!(holds_job(&fixture.ctx, &spec).await, Ok(true));
+    // The job ended long ago, so its retention passed; the prune keeps it until the row settled.
+    job_record.state = JobState::Failed;
+    job_record.finished_at_ms = Some(1);
+    insert_job(&fixture.ctx.storage_handle, &job_record)
+        .await
+        .unwrap();
+    let pruned = prune_job_batch(&fixture.ctx).await.unwrap();
+    assert_eq!(pruned.pruned, 0);
+    assert_eq!(settle_work(&fixture.ctx, 5).await, Ok(1));
+    let settled = read_work(&fixture.ctx, ids.0, ids.1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.state, WorkState::Settled);
+    assert_eq!(settled.settled_ms, Some(5));
+    assert_eq!(
+        settled.summary.map(|summary| summary.state),
+        Some(FinalState::Failed)
+    );
+    assert_eq!(holds_job(&fixture.ctx, &spec).await, Ok(false));
+    assert_eq!(settle_work(&fixture.ctx, 6).await, Ok(0));
+    assert_eq!(prune_job_batch(&fixture.ctx).await.unwrap().pruned, 1);
+}
+
+#[tokio::test]
+async fn prunes_unkeyed_rows() {
+    // Unkeyed rows go once settled, aged and their run is pruned; keyed rows stay.
+    use aruna_core::plugin_runs::RUN_RETENTION_MS;
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let ctx = &fixture.ctx;
+    let run = crate::plugins::runs::tests::queued(install.install_id, 1);
+    crate::plugins::runs::admit(ctx, &run).await.unwrap();
+    let call = Identity::Call {
+        run_id: run.run_id,
+        ordinal: 0,
+    };
+    let keyed = Identity::Key("copy-1".into());
+    let mut rows = Vec::new();
+    for identity in [&call, &keyed] {
+        let row = proposed(&install, 1);
+        reserve(ctx, (&install, identity), row.clone())
+            .await
+            .unwrap();
+        let settle = |row: &mut WorkRow| {
+            row.state = WorkState::Settled;
+            row.settled_ms = Some(1);
+        };
+        update_work(ctx, (install.install_id, row.work_id), settle)
+            .await
+            .unwrap();
+        rows.push(row);
+    }
+    let late = 1 + RUN_RETENTION_MS;
+    assert_eq!(prune_work(ctx, late - 1).await, Ok(0));
+    // The run still exists, so a rerun could ask for the work again.
+    assert_eq!(prune_work(ctx, late).await, Ok(0));
+    // The run prune removed the run record.
+    let key = run_key(install.install_id, run.run_id);
+    Txn::direct(ctx)
+        .delete(PLUGIN_RUNS_KEYSPACE, vec![key])
+        .await
+        .unwrap();
+    assert_eq!(prune_work(ctx, late).await, Ok(1));
+    let read = |row: &WorkRow| read_work(ctx, install.install_id, row.work_id);
+    assert_eq!(read(&rows[0]).await, Ok(None));
+    assert!(read(&rows[1]).await.unwrap().is_some());
 }
