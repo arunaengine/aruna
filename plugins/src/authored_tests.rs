@@ -54,6 +54,7 @@ fn short_forms() {
     assert_eq!(manifest.secrets["ncbi"].kind, SecretKind::Bearer);
     assert_eq!(manifest.connections["public"].auth, None);
     assert_eq!(manifest.secrets["signing"].kind, SecretKind::Basic);
+    assert!(manifest.secrets["signing"].readable && !manifest.secrets["ncbi"].readable);
     let hook = &manifest.triggers[&TriggerKind::Webhook];
     assert_eq!(hook.verify.as_deref(), Some("webhook"));
     assert_eq!(manifest.secrets["webhook"].kind, SecretKind::Hmac);

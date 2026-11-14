@@ -96,6 +96,84 @@ impl From<Permission> for String {
     }
 }
 
+/// What an install holds on resource patterns. The installer scopes `read` and `write`; the node
+/// writes the paths of the services and readable secrets the manifest declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Grant {
+    Read,
+    Write,
+    Services,
+    Secrets,
+}
+
+impl Grant {
+    pub const ALL: [Grant; 4] = [Self::Read, Self::Write, Self::Services, Self::Secrets];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Services => "connections.send",
+            Self::Secrets => "secrets.value",
+        }
+    }
+
+    /// Whether the installer chooses this grant's patterns.
+    pub const fn scoped(self) -> bool {
+        matches!(self, Self::Read | Self::Write)
+    }
+}
+
+impl Permission {
+    /// The grants whose patterns a call of this permission may use; write includes read.
+    pub const fn grants(self) -> &'static [Grant] {
+        match self {
+            Self::MetadataRead | Self::ObjectsRead | Self::TransfersUpload => {
+                &[Grant::Read, Grant::Write]
+            }
+            Self::MetadataWrite
+            | Self::MetadataCreate
+            | Self::ObjectsCopy
+            | Self::TransfersDownload
+            | Self::JobsRun => &[Grant::Write],
+            Self::ConnectionsSend => &[Grant::Services],
+            Self::SecretsValue => &[Grant::Secrets],
+        }
+    }
+}
+
+impl fmt::Display for Grant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Grant {
+    type Err = UnknownPermission;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|grant| grant.as_str() == value)
+            .ok_or_else(|| UnknownPermission(value.to_string()))
+    }
+}
+
+impl TryFrom<String> for Grant {
+    type Error = UnknownPermission;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<Grant> for String {
+    fn from(value: Grant) -> Self {
+        value.as_str().to_string()
+    }
+}
+
 /// What importing one host interface of the plugin package requires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Import {
@@ -125,6 +203,19 @@ impl Import {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grants_cover_calls() {
+        for grant in Grant::ALL {
+            assert_eq!(grant.as_str().parse(), Ok(grant));
+        }
+        assert_eq!(
+            Permission::MetadataRead.grants(),
+            [Grant::Read, Grant::Write]
+        );
+        assert_eq!(Permission::MetadataCreate.grants(), [Grant::Write]);
+        assert!(Grant::Read.scoped() && !Grant::Services.scoped());
+    }
 
     #[test]
     fn names_round_trip() {

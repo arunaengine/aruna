@@ -154,6 +154,7 @@ fn rejects_triggers() {
         SecretSlot {
             title: "Webhook key".into(),
             kind: SecretKind::Hmac,
+            readable: false,
         },
     );
     verified

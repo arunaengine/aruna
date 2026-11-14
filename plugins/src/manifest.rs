@@ -74,6 +74,9 @@ pub struct SecretSlot {
     pub title: String,
     #[serde(default)]
     pub kind: SecretKind,
+    /// The code may read the value; a slot of a service or webhook is never readable.
+    #[serde(default)]
+    pub readable: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

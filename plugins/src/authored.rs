@@ -139,6 +139,9 @@ impl Authored {
         let readable = !self.secrets.is_empty();
         for (name, secret) in self.secrets {
             slot(&mut secrets, &name, secret, SecretKind::Bearer)?;
+            if let Some(slot) = secrets.get_mut(&name) {
+                slot.readable = true;
+            }
         }
         let mut triggers = BTreeMap::new();
         let (mut timer, mut webhook) = (self.timer, self.webhook);
@@ -211,10 +214,12 @@ fn slot(
         Secret::Title(title) => (title, default),
         Secret::Table { title, kind } => (title, kind.unwrap_or(default)),
     };
-    if slots
-        .insert(name.to_string(), SecretSlot { title, kind })
-        .is_some()
-    {
+    let slot = SecretSlot {
+        title,
+        kind,
+        readable: false,
+    };
+    if slots.insert(name.to_string(), slot).is_some() {
         return Err(malformed(format!("`{name}` names two secrets")));
     }
     Ok(name.to_string())
