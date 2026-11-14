@@ -246,6 +246,8 @@ pub enum SourceKind {
     DatasetCreated,
     DataUploaded,
     DatasetUpdated,
+    SyncCompleted,
+    SyncFailed,
 }
 
 impl SourceKind {
@@ -255,6 +257,8 @@ impl SourceKind {
             Self::DatasetCreated => "dataset_created",
             Self::DataUploaded => "data_uploaded",
             Self::DatasetUpdated => "dataset_updated",
+            Self::SyncCompleted => "sync_completed",
+            Self::SyncFailed => "sync_failed",
         }
     }
 }
@@ -337,6 +341,28 @@ impl SourceEvent {
             anchor_ms: now_ms,
             journaled_ms: now_ms,
             actor: None,
+        }
+    }
+
+    /// The outcome of a sync relationship's replication job on its source node: `kind` is
+    /// `SyncCompleted` or `SyncFailed`, the resource the relationship and the revision the job.
+    pub fn sync_job(
+        kind: SourceKind,
+        (group_id, path): (GroupId, String),
+        (relationship_id, creator): (Ulid, UserId),
+        (node, job_id): (NodeId, Ulid),
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            kind,
+            group_id,
+            path,
+            resource: relationship_id.to_string(),
+            revision: job_id.to_string(),
+            source: format!("{}/{node}/{job_id}", kind.name()),
+            anchor_ms: now_ms,
+            journaled_ms: now_ms,
+            actor: Some(creator),
         }
     }
 
@@ -512,14 +538,16 @@ pub fn gap_key(install_id: Ulid, kind: SourceKind, reason: GapReason) -> Vec<u8>
 mod tests {
     use super::*;
 
-    // Journal, forward and gap rows store kinds by index; the update kind was appended, so rows
-    // written before it keep their meaning.
+    // Journal, forward and gap rows store kinds by index; later kinds were appended, so rows
+    // written before them keep their meaning.
     #[test]
     fn kind_indexes_kept() {
         let index = |kind: SourceKind| postcard::to_allocvec(&kind).unwrap();
         assert_eq!(index(SourceKind::DatasetCreated), [0]);
         assert_eq!(index(SourceKind::DataUploaded), [1]);
         assert_eq!(index(SourceKind::DatasetUpdated), [2]);
+        assert_eq!(index(SourceKind::SyncCompleted), [3]);
+        assert_eq!(index(SourceKind::SyncFailed), [4]);
         assert_eq!(
             gap_key(Ulid::nil(), SourceKind::DataUploaded, GapReason::Full)[17],
             1

@@ -10,15 +10,18 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    NODE_STATE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
-    REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
+    EVENT_JOURNAL_KEYSPACE, NODE_STATE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
+    RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionSnapshot};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::replication::{ArunaArn, ReplicationFailure};
@@ -1314,8 +1317,8 @@ pub(crate) async fn drain_batch(
                 .cloned()
         });
         match process_blob_job(context, &job, relationship, &mut relationships).await {
-            Ok(BlobJobOutcome::Completed | BlobJobOutcome::Retired) => {
-                retire_job(context, job_key, &job).await?;
+            Ok(outcome @ (BlobJobOutcome::Completed | BlobJobOutcome::Retired)) => {
+                retire_job(context, job_key, &job, &outcome).await?;
                 succeeded = succeeded.saturating_add(1);
             }
             // A member job ends only once delivered or no longer owed: a bootstrap counts a
@@ -1327,8 +1330,8 @@ pub(crate) async fn drain_batch(
                 next_due_ms = min_due_at(next_due_ms, retry_due_at);
                 failed = failed.saturating_add(1);
             }
-            Ok(BlobJobOutcome::Failed) => {
-                retire_job(context, job_key, &job).await?;
+            Ok(outcome @ BlobJobOutcome::Failed) => {
+                retire_job(context, job_key, &job, &outcome).await?;
                 failed = failed.saturating_add(1);
             }
             // No attempt, no error: the next unlock of a key makes the job due again.
@@ -3064,11 +3067,13 @@ async fn write_blob_job(
 }
 
 /// Retires a processed job in one transaction: its row goes only while it still holds this job,
-/// so an enqueue that wrote the row again during the run keeps its own run.
+/// so an enqueue that wrote the row again during the run keeps its own run. The plugin event of
+/// a completed or failed sync job joins the same transaction.
 async fn retire_job(
     context: &DriverContext,
     key: Vec<u8>,
     job: &BlobJobRecord,
+    outcome: &BlobJobOutcome,
 ) -> Result<(), BlobQueueError> {
     transact(context, async |txn: &Txn<'_>| {
         let stored = txn.read(REPLICATION_JOB_KEYSPACE, &key).await?;
@@ -3077,9 +3082,64 @@ async fn retire_job(
             txn.delete(REPLICATION_JOB_KEYSPACE, vec![key.clone()])
                 .await?;
         }
+        if let Some(event) = sync_event(txn, job, outcome).await? {
+            let rows = (journal_entries(&event)?.into_iter())
+                .map(|(_, key, value)| (key.to_vec(), value.to_vec()))
+                .collect();
+            txn.write(EVENT_JOURNAL_KEYSPACE, rows).await?;
+        }
         Ok::<_, BlobQueueError>(())
     })
     .await
+}
+
+/// The plugin event of a retired sync job, from the relationship and source bucket rows as the
+/// retiring transaction reads them: a completed job while its relationship exists and is not
+/// detached, a failed one only while its relationship is enabled, neither once the bucket is
+/// gone. A failure that stopped the relationship reports through its status instead.
+async fn sync_event(
+    txn: &Txn<'_>,
+    job: &BlobJobRecord,
+    outcome: &BlobJobOutcome,
+) -> Result<Option<SourceEvent>, BlobQueueError> {
+    let kind = match outcome {
+        BlobJobOutcome::Completed => SourceKind::SyncCompleted,
+        BlobJobOutcome::Failed => SourceKind::SyncFailed,
+        BlobJobOutcome::Retired | BlobJobOutcome::AwaitingKey(_) => return Ok(None),
+    };
+    let (Some(relationship_id), bucket) = (job.relationship_id, &job.input.bucket) else {
+        return Ok(None);
+    };
+    let key = sync_relationship_key(bucket, relationship_id);
+    let Some(value) = txn.read(RELATIONSHIP_OUT_KEYSPACE, &key).await? else {
+        return Ok(None);
+    };
+    let relationship = SyncRelationship::from_bytes(&value)?;
+    let reports = match kind {
+        SourceKind::SyncCompleted => relationship.state != SyncState::Detached,
+        _ => relationship.state == SyncState::Enabled,
+    };
+    let Some(info) = txn.read(S3_BUCKET_KEYSPACE, bucket.as_bytes()).await? else {
+        return Ok(None);
+    };
+    if !reports {
+        return Ok(None);
+    }
+    let group_id = BucketInfo::from_bytes(&info)?.group_id;
+    let object = match &job.input.target {
+        ReplicateScopeTarget::Version { key, .. } | ReplicateScopeTarget::Object { key } => key,
+        ReplicateScopeTarget::Prefix(prefix) => prefix,
+        ReplicateScopeTarget::Bucket => "",
+    };
+    let source = &relationship.source;
+    let path = object_permission_path(source.realm_id, group_id, source.node_id, bucket, object);
+    Ok(Some(SourceEvent::sync_job(
+        kind,
+        (group_id, path),
+        (relationship.id, relationship.created_by),
+        (source.node_id, job.job_id),
+        unix_timestamp_millis(),
+    )))
 }
 
 async fn delete_blob_job(storage: &StorageHandle, key: Vec<u8>) -> Result<(), BlobQueueError> {
@@ -3724,7 +3784,7 @@ mod tests {
         )
         .await;
 
-        retire_job(&context, key.clone(), &retired)
+        retire_job(&context, key.clone(), &retired, &BlobJobOutcome::Retired)
             .await
             .expect("retires");
         assert_eq!(
@@ -3732,8 +3792,199 @@ mod tests {
             vec![(key.clone(), replaced.clone())]
         );
 
-        retire_job(&context, key, &replaced).await.expect("retires");
+        retire_job(&context, key, &replaced, &BlobJobOutcome::Retired)
+            .await
+            .expect("retires");
         assert!(read_jobs(&storage).await.is_empty());
+    }
+
+    fn plain_context(storage: &StorageHandle) -> DriverContext {
+        DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+    }
+
+    /// The plugin journal rows this node has not matched yet.
+    async fn journaled(context: &DriverContext) -> Vec<SourceEvent> {
+        let txn = Txn::direct(context);
+        let pending = aruna_core::plugin_runs::PENDING_ROW;
+        let page = crate::plugins::journal::journal_page(&txn, pending, None, 100).await;
+        page.unwrap()
+            .0
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn completed_journals_once() {
+        // A completed job journals one `sync_completed` row as it retires, also after a stopped
+        // run had already stored the relationship's success; another drain adds none.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let group_id = Ulid::from_parts(2, 2);
+        write_bucket(&storage, "bucket").await;
+        write_auth_docs(&storage, group_id).await;
+        write_group(&storage, group_id).await;
+        let mut relationship = relationship(80, 2, None, true);
+        relationship.status.last_synced_at = Some(SystemTime::now());
+        write_relationship(&storage, &relationship).await;
+        let context = plain_context(&storage);
+        let input = ReplicateScopeInput {
+            target: ReplicateScopeTarget::Bucket,
+            ..on_demand_input()
+        };
+        let queue = QueueBlobOperation::new_relationship(input, None, relationship.id);
+        drive(queue, &context).await.expect("queue succeeds");
+        let job_id = read_jobs(&storage).await[0].1.job_id;
+
+        process_blob_batch(&context).await.expect("drain succeeds");
+        process_blob_batch(&context).await.expect("drain succeeds");
+
+        assert!(read_jobs(&storage).await.is_empty());
+        let events = journaled(&context).await;
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        let path = object_permission_path(realm(), group_id, node(1), "bucket", "");
+        assert_eq!(event.kind, SourceKind::SyncCompleted);
+        assert_eq!((event.group_id, &event.path), (group_id, &path));
+        assert_eq!(event.resource, relationship.id.to_string());
+        assert_eq!(event.revision, job_id.to_string());
+        assert_eq!(event.source, format!("sync_completed/{}/{job_id}", node(1)));
+        assert_eq!(event.actor, Some(user()));
+    }
+
+    #[tokio::test]
+    async fn retire_reports_rule() {
+        // What a retirement journals, by outcome and by the relationship and bucket rows its
+        // transaction reads. A failure before any relationship check, such as an undecodable
+        // routing input, reaches retirement as `Failed` and follows the same rows.
+        let failed = SyncState::Failed {
+            reason: "access_denied".to_string(),
+        };
+        let (completed, failure) = (
+            Some(SourceKind::SyncCompleted),
+            Some(SourceKind::SyncFailed),
+        );
+        let cases = [
+            (
+                BlobJobOutcome::Completed,
+                Some(SyncState::Enabled),
+                true,
+                completed,
+            ),
+            (
+                BlobJobOutcome::Completed,
+                Some(SyncState::Paused),
+                true,
+                completed,
+            ),
+            (
+                BlobJobOutcome::Completed,
+                Some(SyncState::Detached),
+                true,
+                None,
+            ),
+            (BlobJobOutcome::Completed, None, true, None),
+            (
+                BlobJobOutcome::Completed,
+                Some(SyncState::Enabled),
+                false,
+                None,
+            ),
+            (
+                BlobJobOutcome::Failed,
+                Some(SyncState::Enabled),
+                true,
+                failure,
+            ),
+            (BlobJobOutcome::Failed, Some(SyncState::Paused), true, None),
+            (BlobJobOutcome::Failed, Some(failed), true, None),
+            (BlobJobOutcome::Failed, None, true, None),
+            (
+                BlobJobOutcome::Retired,
+                Some(SyncState::Enabled),
+                true,
+                None,
+            ),
+        ];
+        for (index, (outcome, state, bucket, expected)) in cases.into_iter().enumerate() {
+            let temp_dir = tempdir().expect("temp dir");
+            let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+                .expect("storage opens");
+            let context = plain_context(&storage);
+            if bucket {
+                write_bucket(&storage, "bucket").await;
+            }
+            let mut link = relationship(90, 2, None, true);
+            if let Some(state) = state {
+                link.state = state;
+                write_relationship(&storage, &link).await;
+            }
+            let job = BlobJobRecord::new_relationship(on_demand_input(), None, link.id, 7);
+            write_blob_job(&storage, &job).await.expect("job writes");
+            let key = blob_job_key(&job).unwrap().to_vec();
+
+            retire_job(&context, key, &job, &outcome)
+                .await
+                .expect("retires");
+
+            let kinds: Vec<_> = (journaled(&context).await.iter())
+                .map(|event| event.kind)
+                .collect();
+            assert_eq!(kinds, Vec::from_iter(expected), "case {index}");
+            assert!(read_jobs(&storage).await.is_empty(), "case {index}");
+        }
+        // A job without a relationship never reports.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = plain_context(&storage);
+        write_bucket(&storage, "bucket").await;
+        let job = BlobJobRecord::new(on_demand_input(), None, 7);
+        let key = blob_job_key(&job).unwrap().to_vec();
+        retire_job(&context, key, &job, &BlobJobOutcome::Failed)
+            .await
+            .expect("retires");
+        assert!(journaled(&context).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_advance_journals() {
+        // A reference advance on an enabled relationship that does not keep references is
+        // refused before authorization; its retirement journals one job `sync_failed`.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = plain_context(&storage);
+        write_bucket(&storage, "bucket").await;
+        let link = relationship(91, 2, None, true);
+        write_relationship(&storage, &link).await;
+        let job = BlobJobRecord::new_relationship(on_demand_input(), None, link.id, 0)
+            .with_reference_advance(reference_advance());
+        write_blob_job(&storage, &job).await.expect("job writes");
+
+        let result = process_blob_batch(&context).await.expect("drain succeeds");
+
+        assert_eq!(result.failed, 1);
+        assert!(read_jobs(&storage).await.is_empty());
+        let events = journaled(&context).await;
+        let fields: Vec<_> = (events.iter())
+            .map(|event| (event.kind, event.revision.clone()))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![(SourceKind::SyncFailed, job.job_id.to_string())]
+        );
+        let path =
+            object_permission_path(realm(), Ulid::from_parts(2, 2), node(1), "bucket", "key");
+        assert_eq!(events[0].path, path);
     }
 
     #[test]

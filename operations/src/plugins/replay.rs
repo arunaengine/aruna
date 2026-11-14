@@ -161,6 +161,8 @@ async fn start_replay(
             SourceKind::DatasetCreated,
             SourceKind::DataUploaded,
             SourceKind::DatasetUpdated,
+            SourceKind::SyncCompleted,
+            SourceKind::SyncFailed,
         ] {
             let trigger = super::dispatch::event_trigger(kind);
             if target.coverage.contains_key(&trigger)

@@ -49,7 +49,17 @@ pub(crate) fn secured() -> Vec<u8> {
     artifact(true, true)
 }
 
-fn artifact(connection: bool, secret: bool) -> Vec<u8> {
+/// The runnable fixture that also declares `sync_failed`, handled like `sync_completed`.
+pub(crate) fn failing_sync() -> Vec<u8> {
+    let (component, mut manifest) = bare();
+    let completed = manifest.triggers[&aruna_plugins::trigger::TriggerKind::SyncCompleted].clone();
+    (manifest.triggers).insert(aruna_plugins::trigger::TriggerKind::SyncFailed, completed);
+    (manifest.connections, manifest.secrets) = (BTreeMap::new(), BTreeMap::new());
+    attach_manifest(component, &manifest).unwrap()
+}
+
+/// The fixture's component without its manifest section, and that manifest.
+fn bare() -> (&'static [u8], aruna_plugins::manifest::Manifest) {
     let manifest = read_manifest(FIXTURE).unwrap();
     let json = serde_json::to_vec(&manifest).unwrap();
     let mut content = Vec::new();
@@ -59,7 +69,11 @@ fn artifact(connection: bool, secret: bool) -> Vec<u8> {
     let mut section = vec![0u8];
     leb(content.len(), &mut section);
     section.extend_from_slice(&content);
-    let component = FIXTURE.strip_suffix(section.as_slice()).unwrap();
+    (FIXTURE.strip_suffix(section.as_slice()).unwrap(), manifest)
+}
+
+fn artifact(connection: bool, secret: bool) -> Vec<u8> {
+    let (component, manifest) = bare();
     let mut narrow = manifest;
     match secret {
         true => narrow.version = "0.2.1".to_string(),
