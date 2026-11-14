@@ -1,5 +1,5 @@
-//! Tests the checks of every plugin work attempt: a missing or rebound work ends, a paused install
-//! waits, and a grant that no longer covers a path refuses before any byte moves.
+//! Tests plugin work attempts: a missing or rebound work ends, a paused install waits, a narrowed
+//! grant refuses before any byte moves, and a copy writes its minted version once.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -139,4 +139,37 @@ async fn narrowed_grant_refuses() {
     let (kind, message) = failure(run_plugin_work(&ctx, &spec).await);
     assert_eq!(kind, JobErrorKind::Permanent);
     assert!(message.contains("is not granted"), "{message}");
+}
+
+#[tokio::test]
+async fn copies_once() {
+    // The copy runs as the account and writes the minted version; a rerun after a lost answer
+    // replays that version instead of writing another one.
+    use crate::driver::drive;
+    use crate::s3::object::copy::test::{put_config, seed_bucket, with_blob};
+    use crate::s3::object::put::PutObjectOperation;
+    let fixture = Fixture::new().await;
+    let install = copier(&fixture).await;
+    let root = tempfile::tempdir().unwrap();
+    let blob = with_blob(&fixture.ctx, root.path()).await;
+    for bucket in ["in", "out"] {
+        seed_bucket(&blob, bucket, install.group_id, install.account, Vec::new()).await;
+    }
+    let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
+    let source = put_config(realm, install.group_id, node, "in", "a.txt", b"bytes");
+    drive(PutObjectOperation::new(source), &blob).await.unwrap();
+    let spec = recorded(&fixture, &install, ("in/a.txt", "out/a.txt")).await;
+    let PluginWorkAction::Copy { version_id, .. } = spec.action.clone();
+    let ctx = job_context(&blob, &fixture);
+    for attempt in 0..2 {
+        match run_plugin_work(&ctx, &spec).await {
+            JobRunOutcome::Succeeded(JobResultPayload::PluginWork {
+                bytes,
+                version_id: got,
+            }) => {
+                assert_eq!((bytes, got), (5, Some(version_id)), "attempt {attempt}");
+            }
+            other => panic!("attempt {attempt}: {}", outcome_name(&other)),
+        }
+    }
 }

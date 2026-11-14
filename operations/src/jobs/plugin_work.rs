@@ -24,7 +24,7 @@ use crate::plugins::check::{authorize_call, check_install, matching};
 use crate::plugins::install::read_config;
 use crate::plugins::work::read_work;
 use crate::s3::object::copy::{
-    CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_tracked,
+    CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_at,
 };
 
 /// How often the bytes moved so far reach the job's progress.
@@ -94,7 +94,7 @@ async fn copy_work(
         source,
         source_version,
         target,
-        ..
+        version_id,
     } = &spec.action;
     let mut patterns = BTreeSet::new();
     for path in [source, target] {
@@ -134,7 +134,8 @@ async fn copy_work(
         job_id: Some(ctx.job_id.as_ulid()),
     };
     let pulled = Arc::new(AtomicU64::new(0));
-    let copy = copy_object_tracked(&ctx.driver, input, Some(pulled.clone()));
+    // The version was minted once, so a retry after a lost answer replays it.
+    let copy = copy_object_at(&ctx.driver, input, *version_id, Some(pulled.clone()));
     tokio::pin!(copy);
     let mut tick = tokio::time::interval(PROGRESS_TICK);
     let result = loop {
