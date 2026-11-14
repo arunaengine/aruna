@@ -188,4 +188,4 @@ fn permanent(message: impl Into<String>) -> JobRunOutcome {
 
 #[cfg(test)]
 #[path = "plugin_work_tests.rs"]
-mod tests;
+pub(crate) mod tests;
