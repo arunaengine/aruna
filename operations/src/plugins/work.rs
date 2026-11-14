@@ -88,6 +88,10 @@ pub enum FinalState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
     pub state: FinalState,
+    /// The object path the work reads: a copy's source or an upload's object.
+    pub source: Option<String>,
+    /// The object path or prefix the work writes: a copy or download target, a recipe's outputs.
+    pub target: Option<String>,
     pub message: Option<String>,
     pub bytes: Option<u64>,
     pub version_id: Option<Ulid>,
@@ -106,6 +110,10 @@ pub struct WorkRow {
     pub account: UserId,
     pub work_id: Ulid,
     pub kind: WorkKind,
+    /// The object path the work reads: a copy's source or an upload's object.
+    pub source: Option<String>,
+    /// The object path or prefix the work writes: a copy or download target, a recipe's outputs.
+    pub target: Option<String>,
     /// BLAKE3 of the stable arguments, never of generated ids.
     pub digest: [u8; 32],
     pub binding: Binding,
@@ -131,6 +139,8 @@ impl WorkRow {
             account: install.account,
             work_id: Ulid::generate(),
             kind,
+            source: None,
+            target: None,
             digest: [0; 32],
             binding: Binding {
                 digest: install.digest.clone(),
@@ -310,6 +320,8 @@ impl Summary {
     fn of(state: FinalState) -> Self {
         Self {
             state,
+            source: None,
+            target: None,
             message: None,
             bytes: None,
             version_id: None,
@@ -347,8 +359,14 @@ pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, Stor
         };
         let changed = update_work(ctx, (install_id, row.work_id), |row| {
             if row.state == WorkState::Dispatched {
+                // The paths stay answerable after the job record is pruned.
+                let (source, target) = (row.source.clone(), row.target.clone());
                 row.state = WorkState::Settled;
-                row.summary = Some(summary);
+                row.summary = Some(Summary {
+                    source,
+                    target,
+                    ..summary
+                });
                 row.settled_ms = Some(now_ms);
             }
         });

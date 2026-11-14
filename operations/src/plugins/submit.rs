@@ -63,6 +63,8 @@ pub async fn start_copy(
     let now_ms = unix_timestamp_millis();
     let mut proposed = WorkRow::reserved(&install, WorkKind::Copy, scope.run.run_id, now_ms);
     proposed.digest = digest(&parts);
+    proposed.source = Some(request.source.clone());
+    proposed.target = Some(request.target.clone());
     proposed.version_id = Some(Ulid::generate());
     let (row, _) = match reserve(ctx, (&install, &identity), proposed).await {
         Ok(found) => found,

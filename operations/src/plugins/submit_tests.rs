@@ -55,12 +55,19 @@ async fn repeat_finds_work() {
     let first = start_copy(&fixture.ctx, &scope, copy.clone())
         .await
         .unwrap();
-    let again = start_copy(&fixture.ctx, &scope, copy).await.unwrap();
+    let again = start_copy(&fixture.ctx, &scope, copy.clone())
+        .await
+        .unwrap();
     assert_eq!(first, again);
     let row = read_work(&fixture.ctx, install.install_id, first).await;
     let row = row.unwrap().unwrap();
     assert_eq!(row.state, WorkState::Dispatched);
     assert!(row.job.is_some() && row.version_id.is_some());
+    let paths = (row.source.as_deref(), row.target.as_deref());
+    assert_eq!(
+        paths,
+        (Some(copy.source.as_str()), Some(copy.target.as_str()))
+    );
     // The same call with other arguments conflicts; the run's next call starts its own copy.
     let mut other = request(&fixture, &install, "out/b.txt");
     let refused = start_copy(&fixture.ctx, &scope, other.clone()).await;

@@ -12,8 +12,13 @@ use super::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::worker::tests::installed;
 
+const SOURCE: &str = "/realm/g/group/data/node/in/a.txt";
+const TARGET: &str = "/realm/g/group/data/node/out/a.txt";
+
 fn proposed(install: &PluginInstall, digest: u8) -> WorkRow {
     let mut row = WorkRow::reserved(install, WorkKind::Copy, Ulid::generate(), 1);
+    row.source = Some(SOURCE.into());
+    row.target = Some(TARGET.into());
     row.digest = [digest; 32];
     row.version_id = Some(Ulid::generate());
     row
@@ -214,11 +219,28 @@ async fn settles_before_pruning() {
     assert_eq!(holds_job(&fixture.ctx, &spec).await, Ok(false));
     assert_eq!(settle_work(&fixture.ctx, 6).await, Ok(0));
     assert_eq!(prune_job_batch(&fixture.ctx).await.unwrap().pruned, 1);
+    // The job record is gone; the row still answers the paths, also from its summary.
+    let read = read_work(&fixture.ctx, ids.0, ids.1)
+        .await
+        .unwrap()
+        .unwrap();
+    let summary = read.summary.unwrap();
+    assert_eq!(
+        (read.source.as_deref(), read.target.as_deref()),
+        (Some(SOURCE), Some(TARGET))
+    );
+    assert_eq!(
+        (summary.source.as_deref(), summary.target.as_deref()),
+        (Some(SOURCE), Some(TARGET))
+    );
 }
 
 #[tokio::test]
 async fn prunes_settled_rows() {
-    // A settled row goes once it aged and its run is pruned, since no rerun can ask for it.
+    // A settled row goes once it aged and its run is pruned, since no rerun can ask for it; until
+    // then it answers its paths, also after its job record was pruned.
+    use crate::jobs::prune::prune_job_batch;
+    use crate::jobs::store::insert_job;
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
@@ -235,15 +257,16 @@ async fn prunes_settled_rows() {
         reserve(ctx, (&install, &identity), row.clone())
             .await
             .unwrap();
-        let settle = |row: &mut WorkRow| {
-            row.state = WorkState::Settled;
-            row.settled_ms = Some(1);
-        };
-        update_work(ctx, (install.install_id, row.work_id), settle)
+        dispatched(ctx, (install.install_id, row.work_id), job(seq))
             .await
             .unwrap();
+        let mut job_record = record(spec_of(&install, &row), job(seq), JobState::Succeeded);
+        job_record.finished_at_ms = Some(1);
+        insert_job(&ctx.storage_handle, &job_record).await.unwrap();
         rows.push((run.run_id, row));
     }
+    assert_eq!(settle_work(ctx, 1).await, Ok(2));
+    assert_eq!(prune_job_batch(ctx).await.unwrap().pruned, 2);
     let late = 1 + RUN_RETENTION_MS;
     assert_eq!(prune_work(ctx, late - 1).await, Ok(0));
     // Both runs still exist, so a rerun could ask for the work again.
@@ -257,7 +280,12 @@ async fn prunes_settled_rows() {
     assert_eq!(prune_work(ctx, late).await, Ok(1));
     let read = |row: &WorkRow| read_work(ctx, install.install_id, row.work_id);
     assert_eq!(read(&rows[0].1).await, Ok(None));
-    assert!(read(&rows[1].1).await.unwrap().is_some());
+    let kept = read(&rows[1].1).await.unwrap().unwrap();
+    let summary = kept.summary.unwrap();
+    assert_eq!(
+        (summary.source.as_deref(), summary.target.as_deref()),
+        (Some(SOURCE), Some(TARGET))
+    );
 }
 
 #[tokio::test]

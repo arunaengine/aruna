@@ -136,6 +136,10 @@ pub struct WorkView {
     pub id: String,
     /// `copy`, `download`, `upload` or `recipe`.
     pub kind: String,
+    /// The object path the work reads: a copy's source or an upload's object.
+    pub source: Option<String>,
+    /// The object path or prefix it writes: a copy or download target, a recipe's outputs.
+    pub target: Option<String>,
     /// `queued`, `running`, `error`, `succeeded`, `failed`, `cancelled` or `unknown`.
     pub state: String,
     /// The job that runs it, once submitted.
@@ -635,6 +639,8 @@ pub async fn list_work(
         work.push(WorkView {
             id: row.work_id.to_string(),
             kind: work_kind(row.kind).into(),
+            source: row.source.clone(),
+            target: row.target.clone(),
             state: work_state(&row, record.as_ref()).into(),
             job: row.job.map(|job| job.to_string()),
             run: row.run_id.to_string(),
@@ -661,6 +667,8 @@ fn work_example() -> Value {
     json!({
         "id": "01JBX7Y3S5M3Q8Y1V9K2T4R6W1",
         "kind": "copy",
+        "source": "/01JBX7Y3S5M3Q8Y1V9K2T4R6R1/g/01JBX7Y3S5M3Q8Y1V9K2T4R6G1/data/b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c/raw/reads.fastq",
+        "target": "/01JBX7Y3S5M3Q8Y1V9K2T4R6R1/g/01JBX7Y3S5M3Q8Y1V9K2T4R6G1/data/b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c/shared/reads.fastq",
         "state": "succeeded",
         "job": "01JBX7Y3S5M3Q8Y1V9K2T4R6J1",
         "run": "01JBX7Y3S5M3Q8Y1V9K2T4R6Q1",
@@ -1156,7 +1164,8 @@ mod tests {
         let key = (*realm_id.as_bytes()).into();
         write_doc(&ctx, REALM_CONFIG_KEYSPACE, key, row.into()).await;
         let kind = aruna_operations::plugins::work::WorkKind::Copy;
-        let work = WorkRow::reserved(&install, kind, Ulid::from_parts(5, 5), 1);
+        let mut work = WorkRow::reserved(&install, kind, Ulid::from_parts(5, 5), 1);
+        work.target = Some("/realm/g/group/data/node/out/a.txt".into());
         let identity = Identity::Call {
             run_id: work.run_id,
             ordinal: 0,
@@ -1236,6 +1245,8 @@ mod tests {
             ("copy", "running")
         );
         assert_eq!(listed.job, Some(job.to_string()));
+        assert_eq!(listed.target, work.target);
+        assert_eq!(listed.source, None);
         assert_eq!(page.next, None);
     }
 }
