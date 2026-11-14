@@ -181,7 +181,7 @@ async fn oversized_rerun() {
         query: Vec::new(),
         headers: Vec::new(),
         body: b"{}".to_vec(),
-        intent: Some(Intent::new(0, None, &[b"records"])),
+        intent: Some(Intent::new(0, &[b"records"])),
     };
     for _ in 0..2 {
         let refused = broker

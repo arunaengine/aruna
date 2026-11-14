@@ -151,54 +151,31 @@ impl Metadata {
 
     /// Applies `patch` if the metadata is still at `expected`; returns the new revision.
     pub async fn patch(&self, resource: &str, patch: &Value, expected: &str) -> Result<String> {
-        self.patch_keyed(resource, patch, expected, None).await
-    }
-
-    /// Like [`Metadata::patch`], with a key that names this change across runs.
-    pub async fn patch_keyed(
-        &self,
-        resource: &str,
-        patch: &Value,
-        expected: &str,
-        key: Option<&str>,
-    ) -> Result<String> {
         let text = serde_json::to_string(patch)?;
-        let reply = metadata_write::patch(resource, &text, expected, key);
+        let reply = metadata_write::patch(resource, &text, expected);
         reply.map_err(|err| Error::host(err, "metadata.write", resource))
     }
 
     /// Adds or replaces one `File` entity by `@id` if the dataset is still at `expected`; the
     /// properties it omits go. Returns the new revision.
-    pub async fn put_file(
-        &self,
-        resource: &str,
-        file: &Value,
-        expected: &str,
-        key: Option<&str>,
-    ) -> Result<String> {
+    pub async fn put_file(&self, resource: &str, file: &Value, expected: &str) -> Result<String> {
         let text = serde_json::to_string(file)?;
-        let reply = metadata_write::put_file(resource, &text, expected, key);
+        let reply = metadata_write::put_file(resource, &text, expected);
         reply.map_err(|err| Error::host(err, "metadata.write", resource))
     }
 
     /// Removes one `File` entity by `@id`, and the dataset's link to it, if the dataset is still
     /// at `expected`. Returns the new revision.
-    pub async fn remove_file(
-        &self,
-        resource: &str,
-        id: &str,
-        expected: &str,
-        key: Option<&str>,
-    ) -> Result<String> {
-        let reply = metadata_write::remove_file(resource, id, expected, key);
+    pub async fn remove_file(&self, resource: &str, id: &str, expected: &str) -> Result<String> {
+        let reply = metadata_write::remove_file(resource, id, expected);
         reply.map_err(|err| Error::host(err, "metadata.write", resource))
     }
 
-    /// Creates a dataset at `path` from one dataset entity; the same `key` always names the same
+    /// Creates a dataset at `path` from one dataset entity; the same path always names the same
     /// document. Returns the document and its first revision.
-    pub async fn create(&self, path: &str, dataset: &Value, key: &str) -> Result<Created> {
+    pub async fn create(&self, path: &str, dataset: &Value) -> Result<Created> {
         let text = serde_json::to_string(dataset)?;
-        metadata_create::create(path, &text, key)
+        metadata_create::create(path, &text)
             .map_err(|err| Error::host(err, "metadata.create", path))
     }
 }
@@ -241,34 +218,28 @@ pub struct Http {
 
 impl Http {
     pub async fn get(&self, path: &str) -> Result<Response> {
-        self.send(Method::Get, path, Vec::new(), None).await
+        self.send(Method::Get, path, Vec::new()).await
     }
 
     pub async fn post(&self, path: &str, body: &impl Serialize) -> Result<Response> {
-        self.send(Method::Post, path, serde_json::to_vec(body)?, None)
+        self.send(Method::Post, path, serde_json::to_vec(body)?)
             .await
     }
 
     pub async fn put(&self, path: &str, body: &impl Serialize) -> Result<Response> {
-        self.send(Method::Put, path, serde_json::to_vec(body)?, None)
+        self.send(Method::Put, path, serde_json::to_vec(body)?)
             .await
     }
 
     pub async fn delete(&self, path: &str) -> Result<Response> {
-        self.send(Method::Delete, path, Vec::new(), None).await
+        self.send(Method::Delete, path, Vec::new()).await
     }
 
-    /// Sends a request with a JSON body, if any; `key` names a changing request across runs.
-    pub async fn send(
-        &self,
-        method: Method,
-        path: &str,
-        body: Vec<u8>,
-        key: Option<&str>,
-    ) -> Result<Response> {
+    /// Sends a request with a JSON body, if any.
+    pub async fn send(&self, method: Method, path: &str, body: Vec<u8>) -> Result<Response> {
         let json = [("content-type", "application/json")];
         let headers: &[(&str, &str)] = if body.is_empty() { &[] } else { &json };
-        self.send_with(method, path, &[], headers, body, key).await
+        self.send_with(method, path, &[], headers, body).await
     }
 
     /// Like [`Http::send`], with query pairs and request headers such as `content-type`.
@@ -279,7 +250,6 @@ impl Http {
         query: &[(&str, &str)],
         headers: &[(&str, &str)],
         body: Vec<u8>,
-        key: Option<&str>,
     ) -> Result<Response> {
         let fields = |pairs: &[(&str, &str)]| {
             (pairs.iter())
@@ -296,7 +266,6 @@ impl Http {
             query: fields(query),
             headers: fields(headers),
             body,
-            key: key.map(str::to_string),
         };
         let reply = services::send(&request);
         reply.map_err(|err| Error::host(err, "connections.send", &self.name))

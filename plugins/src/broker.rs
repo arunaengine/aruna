@@ -21,18 +21,17 @@ pub struct CallContext {
     pub max_bytes: usize,
 }
 
-/// Identity of one outside effect of a run. The ordinal names it, the digest of all
-/// arguments checks a rerun asks for the same thing; an author key names it across runs.
+/// Identity of one outside effect of a run. The ordinal names it; the digest of all arguments
+/// checks a rerun asks for the same thing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intent {
     pub ordinal: u32,
     pub digest: [u8; 32],
-    pub key: Option<String>,
 }
 
 impl Intent {
     /// Digests length-prefixed parts, so no two argument lists share bytes.
-    pub fn new(ordinal: u32, key: Option<String>, parts: &[&[u8]]) -> Self {
+    pub fn new(ordinal: u32, parts: &[&[u8]]) -> Self {
         let mut hasher = Sha256::new();
         for part in parts {
             hasher.update((part.len() as u64).to_le_bytes());
@@ -41,7 +40,6 @@ impl Intent {
         Self {
             ordinal,
             digest: hasher.finalize().into(),
-            key,
         }
     }
 }
@@ -69,6 +67,7 @@ pub struct FileChange {
 pub struct MetadataCreate {
     pub path: String,
     pub dataset: String,
+    /// Names the document across runs; the guest's path.
     pub key: String,
     pub intent: Intent,
 }

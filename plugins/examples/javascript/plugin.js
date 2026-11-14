@@ -25,7 +25,7 @@ function announce(ctx, event) {
     throw { kind: "permanent", message: "the response has no field `id`" };
   }
   const identifier = { catalog: record.id };
-  patch(dataset, JSON.stringify({ identifier }), doc.revision, undefined);
+  patch(dataset, JSON.stringify({ identifier }), doc.revision);
 }
 
 // Calls the trigger's handler with a context and a plain event and awaits it; a thrown error fails

@@ -46,9 +46,7 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
         "metadata_create" => {
             let dataset = input.get("dataset").cloned().unwrap_or(Value::Null);
             let metadata = ctx.metadata();
-            let created = metadata
-                .create(&text("path"), &dataset, &text("key"))
-                .await?;
+            let created = metadata.create(&text("path"), &dataset).await?;
             json!({ "resource": created.resource, "revision": created.revision })
         }
         "metadata_summary" => {
@@ -65,18 +63,14 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             let metadata = ctx.metadata();
             json!(
                 metadata
-                    .put_file(&text("resource"), &file, &text("expected"), None)
+                    .put_file(&text("resource"), &file, &text("expected"))
                     .await?
             )
         }
         "remove_file" => {
             let (resource, id, expected) = (text("resource"), text("id"), text("expected"));
             let metadata = ctx.metadata();
-            json!(
-                metadata
-                    .remove_file(&resource, &id, &expected, None)
-                    .await?
-            )
+            json!(metadata.remove_file(&resource, &id, &expected).await?)
         }
         "objects_info" => {
             let info = ctx.objects().info(&text("path")).await?;
@@ -94,7 +88,7 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
                 .unwrap_or_default();
             let reply = ctx
                 .http(&text("connection"))
-                .send(method, &text("path"), body, None)
+                .send(method, &text("path"), body)
                 .await?;
             // A status-only answer has no body; it reads as no fields.
             let fields = reply.json::<Value>().unwrap_or_else(|_| json!({}));

@@ -172,12 +172,10 @@ impl metadata_write::Host for Session {
         resource: String,
         patch: String,
         expected: String,
-        key: Option<String>,
     ) -> wasmtime::Result<Result<String, HostError>> {
-        let size =
-            resource.len() + patch.len() + expected.len() + key.as_ref().map_or(0, String::len);
+        let size = resource.len() + patch.len() + expected.len();
         let parts: [&[u8]; 3] = [resource.as_bytes(), patch.as_bytes(), expected.as_bytes()];
-        let intent = Intent::new(self.next_ordinal(), key, &parts);
+        let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
         let patch = MetadataPatch {
             resource,
@@ -200,17 +198,15 @@ impl metadata_write::Host for Session {
         resource: String,
         file: String,
         expected: String,
-        key: Option<String>,
     ) -> wasmtime::Result<Result<String, HostError>> {
-        let size =
-            resource.len() + file.len() + expected.len() + key.as_ref().map_or(0, String::len);
+        let size = resource.len() + file.len() + expected.len();
         let parts: [&[u8]; 4] = [
             b"put",
             resource.as_bytes(),
             file.as_bytes(),
             expected.as_bytes(),
         ];
-        let intent = Intent::new(self.next_ordinal(), key, &parts);
+        let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
         let change = FileChange {
             resource,
@@ -233,16 +229,15 @@ impl metadata_write::Host for Session {
         resource: String,
         id: String,
         expected: String,
-        key: Option<String>,
     ) -> wasmtime::Result<Result<String, HostError>> {
-        let size = resource.len() + id.len() + expected.len() + key.as_ref().map_or(0, String::len);
+        let size = resource.len() + id.len() + expected.len();
         let parts: [&[u8]; 4] = [
             b"remove",
             resource.as_bytes(),
             id.as_bytes(),
             expected.as_bytes(),
         ];
-        let intent = Intent::new(self.next_ordinal(), key, &parts);
+        let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
         let change = FileChange {
             resource,
@@ -266,16 +261,16 @@ impl metadata_create::Host for Session {
         &mut self,
         path: String,
         dataset: String,
-        key: String,
     ) -> wasmtime::Result<Result<Created, HostError>> {
-        let size = path.len() + dataset.len() + key.len();
-        let parts: [&[u8]; 3] = [path.as_bytes(), dataset.as_bytes(), key.as_bytes()];
-        let intent = Intent::new(self.next_ordinal(), Some(key.clone()), &parts);
+        let size = path.len() + dataset.len();
+        let parts: [&[u8]; 2] = [path.as_bytes(), dataset.as_bytes()];
+        let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
+        // One path names one document, so the path is the create's key across runs.
         let create = MetadataCreate {
+            key: path.clone(),
             path,
             dataset,
-            key,
             intent,
         };
         self.brokered(
@@ -352,8 +347,7 @@ impl Session {
             + request.path.len()
             + fields_len(&request.query)
             + fields_len(&request.headers)
-            + request.body.len()
-            + request.key.as_ref().map_or(0, String::len);
+            + request.body.len();
         let mutating = !matches!(request.method, Method::Get | Method::Head);
         let intent = mutating.then(|| {
             let parts: [&[u8]; 6] = [
@@ -364,7 +358,7 @@ impl Session {
                 &field_bytes(&request.headers),
                 &request.body,
             ];
-            Intent::new(self.next_ordinal(), request.key.clone(), &parts)
+            Intent::new(self.next_ordinal(), &parts)
         });
         let effect = match &intent {
             Some(intent) => Effect::Write(intent.clone()),
@@ -408,7 +402,7 @@ impl state::Host for Session {
             &value,
             version.as_ref().map_or(&[][..], |v| &v[..]),
         ];
-        let intent = Intent::new(self.next_ordinal(), None, &parts);
+        let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
         let put = StatePut {
             key,

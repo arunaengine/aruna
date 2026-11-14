@@ -114,7 +114,6 @@ interface metadata-write {
     %resource: string,
     patch: string,
     expected: string,
-    key: option<string>,
   ) -> result<string, host-error>;
 
   /// Adds or replaces one `File` entity by `@id`; the properties it omits go.
@@ -122,7 +121,6 @@ interface metadata-write {
     %resource: string,
     file: string,
     expected: string,
-    key: option<string>,
   ) -> result<string, host-error>;
 
   /// Removes one root-linked `File` entity by `@id` and the root's link to it.
@@ -130,7 +128,6 @@ interface metadata-write {
     %resource: string,
     id: string,
     expected: string,
-    key: option<string>,
   ) -> result<string, host-error>;
 }
 
@@ -144,8 +141,8 @@ interface metadata-create {
   }
 
   /// Creates a dataset at `path` below the group's metadata root from one dataset entity; the
-  /// same `key` of one install always names the same document.
-  create: func(path: string, dataset: string, key: string) -> result<created, host-error>;
+  /// same `path` of one install always names the same document.
+  create: func(path: string, dataset: string) -> result<created, host-error>;
 }
 
 /// Reads object information and listings of the group, never bytes (`objects.read`).
@@ -180,7 +177,7 @@ interface services {
     delete,
   }
 
-  /// `path` is relative to the service's address; `key` names the effect across runs.
+  /// `path` is relative to the service's address.
   record request {
     service: string,
     method: method,
@@ -188,7 +185,6 @@ interface services {
     query: list<field>,
     headers: list<field>,
     body: list<u8>,
-    key: option<string>,
   }
 
   /// The status, and the headers and body the code may read of the answer.

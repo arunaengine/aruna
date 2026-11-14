@@ -162,7 +162,7 @@ impl Broker for Recorder {
         create: MetadataCreate,
     ) -> Result<Created, HostError> {
         self.note("metadata_create");
-        assert_eq!(create.intent.key.as_deref(), Some(create.key.as_str()));
+        assert_eq!(create.key, create.path, "a create is named by its path");
         self.intents.lock().unwrap().push(create.intent);
         Ok(Created {
             resource: format!("{}-doc", create.key),
@@ -328,13 +328,13 @@ async fn dataset_calls_reach() {
     // The rebuilt guest reaches every dataset call; a create needs its own permission.
     let broker = Arc::new(Recorder::default());
     let mut create = probe(
-        serde_json::json!({"call": "metadata_create", "path": "eln/1", "dataset": {"name": "E"}, "key": "e1"}),
+        serde_json::json!({"call": "metadata_create", "path": "eln/1", "dataset": {"name": "E"}}),
     );
     create.permissions.insert(Permission::MetadataCreate);
     let created = invoke(create, broker.clone()).await;
     assert_eq!(
         output(created),
-        serde_json::json!({"resource": "e1-doc", "revision": "r0"})
+        serde_json::json!({"resource": "eln/1-doc", "revision": "r0"})
     );
     let summary = probe(serde_json::json!({"call": "metadata_summary", "resource": "D1"}));
     let summary = invoke(summary, broker.clone()).await;
@@ -373,9 +373,8 @@ async fn dataset_calls_reach() {
     ];
     assert_eq!(broker.calls(), calls);
 
-    let refused = probe(
-        serde_json::json!({"call": "metadata_create", "path": "eln/2", "dataset": {}, "key": "e2"}),
-    );
+    let refused =
+        probe(serde_json::json!({"call": "metadata_create", "path": "eln/2", "dataset": {}}));
     let Err(InvokeError::Guest(failure)) = invoke(refused, broker.clone()).await else {
         panic!("a create without its permission fails the run");
     };

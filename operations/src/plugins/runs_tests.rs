@@ -109,7 +109,7 @@ async fn pruned_runs() {
         let finished = if seq == 3 { 50 * RUN_RETENTION_MS } else { 10 };
         run.finish(state, None, finished);
         save_run(&ctx, &run).await.unwrap();
-        let intent = Intent::new(0, None, &[b"x"]);
+        let intent = Intent::new(0, &[b"x"]);
         begin(&ctx, run.run_id, &intent).await.unwrap();
         let settle = async |txn: &Txn<'_>| settle_in(txn, run.run_id, &intent, "r".into()).await;
         transact(&ctx, settle).await.unwrap();
@@ -168,7 +168,7 @@ async fn keeps_open_calls() {
     admit(&ctx, &run).await.unwrap();
     run.finish(RunState::Failed, None, 10);
     save_run(&ctx, &run).await.unwrap();
-    mark_unknown(&ctx, run.run_id, &Intent::new(0, None, &[b"x"]), "lost")
+    mark_unknown(&ctx, run.run_id, &Intent::new(0, &[b"x"]), "lost")
         .await
         .unwrap();
     assert_eq!(prune_runs(&ctx, 10 + RUN_RETENTION_MS).await.unwrap(), 0);
@@ -220,7 +220,7 @@ async fn resolved_expire() {
     let install = Ulid::from_parts(1, 1);
     let mut run = queued(install, 1);
     admit(&ctx, &run).await.unwrap();
-    let intent = Intent::new(0, None, &[b"x"]);
+    let intent = Intent::new(0, &[b"x"]);
     mark_unknown(&ctx, run.run_id, &intent, "lost")
         .await
         .unwrap();

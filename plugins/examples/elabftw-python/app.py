@@ -36,7 +36,7 @@ class Host:
         headers = [types.Field("content-type", "application/json")] if body else []
         query = [types.Field(name, value) for name, value in query]
         verb = getattr(services.Method, method)
-        reply = services.send(services.Request("elab", verb, path, query, headers, body, None))
+        reply = services.send(services.Request("elab", verb, path, query, headers, body))
         return reply.status, bytes(reply.body)
 
     @hosted
@@ -56,19 +56,20 @@ class Host:
 
     @hosted
     def patch(self, resource, fields, revision):
-        return metadata_write.patch(resource, json.dumps(fields), revision, None)
+        return metadata_write.patch(resource, json.dumps(fields), revision)
 
     @hosted
     def put_file(self, resource, entity, revision):
-        return metadata_write.put_file(resource, json.dumps(entity), revision, None)
+        return metadata_write.put_file(resource, json.dumps(entity), revision)
 
     @hosted
     def remove_file(self, resource, key, revision):
-        return metadata_write.remove_file(resource, key, revision, None)
+        return metadata_write.remove_file(resource, key, revision)
 
     @hosted
     def create(self, path, entity, key):
-        return metadata_create.create(path, json.dumps(entity), key).resource
+        # The host names a create by its path, which the sync also uses as its key.
+        return metadata_create.create(path, json.dumps(entity)).resource
 
     @hosted
     def objects(self, prefix):

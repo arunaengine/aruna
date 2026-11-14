@@ -81,7 +81,7 @@ fn patch(document: Ulid, expected: &str, ordinal: u32, entity: &str) -> Metadata
         resource: document.to_string(),
         patch: entity.to_string(),
         expected: expected.to_string(),
-        intent: Intent::new(ordinal, None, &[entity.as_bytes(), expected.as_bytes()]),
+        intent: Intent::new(ordinal, &[entity.as_bytes(), expected.as_bytes()]),
     }
 }
 
@@ -175,7 +175,7 @@ async fn state_and_log() {
         key: "cursor".into(),
         value: b"a".to_vec(),
         expected: None,
-        intent: Intent::new(0, None, &[b"cursor", b"a"]),
+        intent: Intent::new(0, &[b"cursor", b"a"]),
     };
     assert_eq!(broker.state_put(&cx(), put.clone()).await.unwrap(), 1);
     // The same call again answers its stored version and writes nothing.
@@ -186,7 +186,7 @@ async fn state_and_log() {
         key: "cursor".into(),
         value: b"b".to_vec(),
         expected: None,
-        intent: Intent::new(1, None, &[b"cursor", b"b"]),
+        intent: Intent::new(1, &[b"cursor", b"b"]),
     };
     let refused = broker.state_put(&cx(), stale).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::Conflict);
@@ -579,7 +579,7 @@ fn create(path: &str, name: &str, key: &str, ordinal: u32) -> MetadataCreate {
         path: path.to_string(),
         dataset: dataset.to_string(),
         key: key.to_string(),
-        intent: Intent::new(ordinal, Some(key.to_string()), &parts),
+        intent: Intent::new(ordinal, &parts),
     }
 }
 
@@ -828,7 +828,7 @@ async fn file_pages() {
 fn put(document: Ulid, file: &Value, expected: &str, ordinal: u32) -> FileChange {
     let file = file.to_string();
     let parts: [&[u8]; 2] = [file.as_bytes(), expected.as_bytes()];
-    let intent = Intent::new(ordinal, None, &parts);
+    let intent = Intent::new(ordinal, &parts);
     FileChange {
         resource: document.to_string(),
         file,
@@ -1437,7 +1437,7 @@ fn removal(document: Ulid, id: &str, expected: &str, ordinal: u32) -> FileChange
         resource: document.to_string(),
         file: id.to_string(),
         expected: expected.to_string(),
-        intent: Intent::new(ordinal, None, &parts),
+        intent: Intent::new(ordinal, &parts),
     }
 }
 

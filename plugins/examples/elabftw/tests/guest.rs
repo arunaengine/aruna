@@ -191,7 +191,7 @@ impl Broker for Hosted {
                 .collect(),
             body: (!request.body.is_empty())
                 .then(|| serde_json::from_slice(&request.body).unwrap()),
-            key: request.intent.and_then(|intent| intent.key),
+            key: None,
         };
         let reply = self.0.elab(&outgoing).map_err(refusal)?;
         let headers = reply

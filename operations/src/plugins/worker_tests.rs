@@ -178,7 +178,7 @@ async fn finishes_runs() {
     let install = installed(&fixture).await;
     let ok = admitted(&fixture, &install, 1, "echo").await;
     let unsure = admitted(&fixture, &install, 2, "echo").await;
-    let intent = Intent::new(0, None, &[b"patch"]);
+    let intent = Intent::new(0, &[b"patch"]);
     mark_unknown(&fixture.ctx, unsure.run_id, &intent, "timed out")
         .await
         .unwrap();
@@ -485,7 +485,7 @@ async fn removed_with_intents() {
     let install = installed(&fixture).await;
     let open = admitted(&fixture, &install, 1, "echo").await;
     let clean = admitted(&fixture, &install, 2, "echo").await;
-    let intent = Intent::new(0, None, &[b"patch"]);
+    let intent = Intent::new(0, &[b"patch"]);
     mark_unknown(ctx, open.run_id, &intent, "timed out")
         .await
         .unwrap();
