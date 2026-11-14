@@ -435,7 +435,7 @@ mod tests {
         let old_bytes = stored(&oldest)[..stored(&oldest).len() - 1].to_vec();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("db");
-        let rows = vec![
+        let rows = [
             (key(&current), current.to_bytes().unwrap()),
             (key(&recent), stored(&recent)),
             (old_key.clone(), old_bytes),
