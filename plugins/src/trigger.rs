@@ -60,9 +60,6 @@ pub enum ManualInput {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Trigger {
-    /// Defaults to the handler named like the trigger, else the only handler.
-    #[serde(default)]
-    pub handler: Option<String>,
     #[serde(default)]
     pub input: Option<ManualInput>,
     /// `every` only: a whole number followed by `m`, `h` or `d`.

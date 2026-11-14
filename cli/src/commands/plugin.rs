@@ -172,7 +172,9 @@ pub async fn plugin(context: &mut Context<'_>, command: PluginCommand) -> Result
             let summary = Built {
                 digest: ArtifactDigest::of(&built.artifact).to_string(),
                 artifact: built.path,
-                handlers: built.manifest.handlers.into_iter().collect(),
+                triggers: (built.manifest.triggers.keys())
+                    .map(|kind| kind.as_str().to_string())
+                    .collect(),
             };
             match context.out.json {
                 true => context.out.json(&summary),
@@ -561,7 +563,7 @@ async fn change(
 struct Built {
     artifact: PathBuf,
     digest: String,
-    handlers: Vec<String>,
+    triggers: Vec<String>,
 }
 
 #[cfg(test)]
@@ -577,12 +579,12 @@ mod tests {
             create("lab-sync", language, &path).unwrap();
             let mut manifest = load_manifest(&path).unwrap();
             assert_eq!(manifest.name, "lab-sync");
-            assert_eq!(manifest.wire(None), Ok(()), "{language:?}");
+            assert_eq!(manifest.wire(), Ok(()), "{language:?}");
             assert_eq!(manifest.build.is_some(), language != Language::Rust);
         }
         let rust = dir.path().join("rust");
         let code = std::fs::read_to_string(rust.join("src").join("lib.rs")).unwrap();
-        assert!(code.contains("aruna_plugin::export!(run);"));
+        assert!(code.contains("aruna_plugin::export! { manual => run }"));
         let contract = std::fs::read_to_string(dir.path().join("python/wit/plugin.wit")).unwrap();
         assert_eq!(contract, CONTRACT);
         assert!(

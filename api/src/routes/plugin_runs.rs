@@ -87,6 +87,7 @@ pub struct RunView {
     pub install: String,
     /// `queued`, `running`, `succeeded`, `failed`, `needs-attention` or `cancelled`.
     pub state: String,
+    /// The trigger the run started for, as the manifest names it.
     pub handler: String,
     /// `manual`, `timer`, `event` or `webhook`.
     pub trigger: String,
@@ -386,7 +387,7 @@ fn run_example(log: bool) -> Value {
         "id": "01JBX7Y3S5M3Q8Y1V9K2T4R6Q1",
         "install": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1",
         "state": "succeeded",
-        "handler": "on_manual",
+        "handler": "manual",
         "trigger": "manual",
         "started_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm",
         "input": "{\"dataset\":\"01JBX7Y3S5M3Q8Y1V9K2T4R6P4\"}",
@@ -933,7 +934,7 @@ mod tests {
             version: "0.1.0".into(),
             revision: 1,
             digest: format!("sha256:{}", "ab".repeat(32)),
-            handler: "on_timer".into(),
+            handler: "every".into(),
             settings: "{}".into(),
             trigger: RunTrigger::Timer { occurrence_ms: 1 },
             state: RunState::Queued,

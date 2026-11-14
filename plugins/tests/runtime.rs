@@ -537,10 +537,10 @@ async fn narrow_requests_compile() {
         .remove(&Permission::MetadataWrite);
     let artifact = aruna_plugins::artifact::attach_manifest(component, &narrow).unwrap();
     assert!(runtime().compile(&artifact).is_ok());
-    let compiled = runtime().compile(FIXTURE).unwrap();
-    let triggers: Vec<&str> = (compiled.manifest.handlers.iter())
-        .map(String::as_str)
-        .collect();
+    let runtime = runtime();
+    let compiled = runtime.compile(FIXTURE).unwrap();
+    let triggers = runtime.triggers(&compiled).await.unwrap();
+    let triggers: Vec<&str> = triggers.iter().map(String::as_str).collect();
     let all = [
         "data_uploaded",
         "dataset_created",

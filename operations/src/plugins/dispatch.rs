@@ -47,7 +47,8 @@ pub struct TimerRow {
     pub skipped: u64,
 }
 
-/// The handler a trigger of the install's pinned version calls.
+/// The trigger's name when the install's pinned version declares it; the guest picks its
+/// function by this name.
 fn handler(
     config: &RealmConfigDocument,
     install: &PluginInstall,
@@ -55,7 +56,10 @@ fn handler(
 ) -> Option<String> {
     let plugin = pick_version(config, &install.plugin, Some(&install.digest)).ok()?;
     let manifest = read_manifest(&plugin).ok()?;
-    manifest.triggers.get(&kind)?.handler.clone()
+    manifest
+        .triggers
+        .contains_key(&kind)
+        .then(|| kind.as_str().to_string())
 }
 
 /// A queued run of the install's current revision, due at `due_ms`.
@@ -172,9 +176,10 @@ pub async fn enqueue_timers(
         else {
             continue;
         };
-        let (Some(handler), Some(secs)) = (every.handler.clone(), every.interval_secs()) else {
+        let Some(secs) = every.interval_secs() else {
             continue;
         };
+        let handler = TriggerKind::Every.as_str().to_string();
         if enqueue_timer(ctx, install, handler, secs * 1000, now_ms).await? {
             queued += 1;
         }

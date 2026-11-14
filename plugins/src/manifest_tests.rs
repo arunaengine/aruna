@@ -1,4 +1,4 @@
-//! Tests manifest checks, trigger wiring and the import rule on the dataset announcer example.
+//! Tests manifest checks, the trigger match and the import rule on the dataset announcer example.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -22,7 +22,7 @@ auth = "catalog_key"
 
 [triggers]
 dataset_created = {}
-manual = { handler = "dataset_created", input = "dataset" }
+manual = { input = "dataset" }
 
 [permissions]
 required = ["metadata.read"]
@@ -33,7 +33,7 @@ fn example() -> Manifest {
     toml::from_str(EXAMPLE).unwrap()
 }
 
-fn handlers(names: &[&str]) -> BTreeSet<String> {
+fn names(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|name| name.to_string()).collect()
 }
 
@@ -41,45 +41,26 @@ fn handlers(names: &[&str]) -> BTreeSet<String> {
 fn example_wires() {
     let mut manifest = example();
     assert_eq!(manifest.check(), Ok(()));
-    manifest.wire(Some(handlers(&["dataset_created"]))).unwrap();
+    manifest.wire().unwrap();
     assert_eq!(manifest.abi.as_deref(), Some(PLUGIN_ABI));
-    let created = &manifest.triggers[&TriggerKind::DatasetCreated];
-    assert_eq!(created.handler.as_deref(), Some("dataset_created"));
     let json = serde_json::to_vec(&manifest).unwrap();
     assert_eq!(Manifest::parse(&json).unwrap(), manifest);
 }
 
 #[test]
-fn wiring_defaults() {
-    let mut named = example();
-    named.wire(None).unwrap();
-    let created = &named.triggers[&TriggerKind::DatasetCreated];
+fn triggers_match() {
+    let manifest = example();
+    let both = names(&["dataset_created", "manual"]);
+    assert_eq!(manifest.check_triggers(&both), Ok(()));
+    let extra = names(&["dataset_created", "manual", "every"]);
     assert_eq!(
-        created.handler.as_deref(),
-        Some("dataset_created"),
-        "the trigger's own name"
+        manifest.check_triggers(&extra),
+        Err(ManifestError::UnknownTrigger("every".into()))
     );
-    assert_eq!(named.handlers, handlers(&["dataset_created"]));
-
-    let mut missing = example();
-    let result = missing.wire(Some(handlers(&["announce"])));
     assert_eq!(
-        result,
-        Err(ManifestError::UnknownHandler("dataset_created".into()))
+        manifest.check_triggers(&names(&["dataset_created"])),
+        Err(ManifestError::Unhandled("manual".into()))
     );
-
-    let mut unused = example();
-    let result = unused.wire(Some(handlers(&["dataset_created", "resync"])));
-    assert_eq!(result, Err(ManifestError::UnusedHandler("resync".into())));
-
-    let mut unknown = example();
-    unknown
-        .triggers
-        .get_mut(&TriggerKind::Manual)
-        .unwrap()
-        .handler = Some("resync".into());
-    let result = unknown.wire(Some(handlers(&["dataset_created"])));
-    assert_eq!(result, Err(ManifestError::UnknownHandler("resync".into())));
 }
 
 #[test]

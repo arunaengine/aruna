@@ -4,7 +4,7 @@
 
 #![cfg(feature = "build")]
 
-use aruna_plugins::artifact::{read_handlers, read_manifest};
+use aruna_plugins::artifact::read_manifest;
 use aruna_plugins::manifest::{Manifest, ManifestError};
 use aruna_plugins::package::{BuildError, package};
 use aruna_plugins::trigger::TriggerKind;
@@ -40,8 +40,8 @@ fn module() -> Vec<u8> {
             ),
             _ => None,
         })
-        .find(|module| read_handlers(module).unwrap().is_some())
-        .expect("the module that lists its handlers");
+        .max_by_key(Vec::len)
+        .expect("the guest's own module, the largest one");
     let wit_component::DecodedWasm::Component(resolve, world) =
         wit_component::decode(&component).unwrap()
     else {
@@ -52,19 +52,15 @@ fn module() -> Vec<u8> {
     module
 }
 
-/// A manifest whose dataset trigger names a handler the guest does not have.
+/// A manifest without the dataset trigger the guest has a function for.
 fn absent(mut manifest: Manifest) -> Manifest {
-    let created = manifest
-        .triggers
-        .get_mut(&TriggerKind::DatasetCreated)
-        .unwrap();
-    created.handler = Some("absent".into());
+    manifest.triggers.remove(&TriggerKind::DatasetCreated);
     manifest.abi = None;
     manifest
 }
 
 #[test]
-fn forms_match_handlers() {
+fn forms_match_triggers() {
     let (component, manifest) = finished();
     for (form, bytes) in [("component", component), ("module", module())] {
         let mut ok = manifest.clone();
@@ -74,7 +70,7 @@ fn forms_match_handlers() {
             Err(BuildError::Manifest(error)) => {
                 assert_eq!(
                     error,
-                    ManifestError::UnknownHandler("absent".into()).to_string(),
+                    ManifestError::UnknownTrigger("dataset_created".into()).to_string(),
                     "{form}"
                 );
             }
@@ -102,7 +98,6 @@ fn refused(wit: &str, world: &str) -> String {
     let (_, manifest) = finished();
     let mut manifest = manifest;
     manifest.abi = None;
-    manifest.handlers.clear();
     match package(&mut manifest, &dummy(wit, world)) {
         Err(BuildError::Host(error)) => error,
         other => panic!("{world}: {other:?}"),

@@ -367,8 +367,7 @@ async fn coverage_times() {
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
     let triggers = json!({
-        "triggers": { "dataset_created": { "handler": "on_created" } },
-        "handlers": ["on_created"]
+        "triggers": { "dataset_created": {} }
     });
     let mut request = fixture.request(None);
     request.version = Some(fixture.publish("0.3.0", "aa", triggers).await);

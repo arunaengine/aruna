@@ -208,7 +208,7 @@ async fn installs_with_secrets() {
         },
         "connections": { "catalog": { "url": "{catalog_url}/api/", "auth": "api_key" } },
         "triggers": { "webhook": {
-            "verify": "hook_key", "delivery_id": "x-delivery", "handler": "on_webhook"
+            "verify": "hook_key", "delivery_id": "x-delivery"
         } },
         "permissions": { "required": ["metadata.read"], "optional": ["secrets.value"] }
     });

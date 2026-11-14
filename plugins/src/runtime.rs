@@ -11,11 +11,16 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use wasmtime::component::types::ComponentItem;
-use wasmtime::component::{Component, HasSelf, InstancePre, Linker};
+use wasmtime::component::{
+    Component, ComponentNamedList, HasSelf, InstancePre, Lift, Linker, Lower,
+};
 use wasmtime::{Config, Engine, Store, Trap, UpdateDeadline};
 
 use crate::artifact::{ArtifactDigest, SectionError, read_manifest};
-use crate::broker::{Broker, CallContext};
+use crate::broker::{
+    Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
+    ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+};
 use crate::host::wit::aruna::plugin::types::{Failure, Field, Invocation as GuestCall, Trigger};
 use crate::host::{Exceeded, Grants, Limit, Session, wit};
 use crate::limits::{Limits, RuntimeConfig};
@@ -244,7 +249,8 @@ impl Runtime {
             settings: call.settings,
             trigger: call.trigger,
         },);
-        let ended = self.run(compiled, session, params, &call.cancel).await;
+        let ended: Result<HandleResult, _> =
+            (self.run(compiled, session, HANDLE_EXPORT, params, &call.cancel)).await;
         // Started writes record their outcome before any end of this run is reported.
         writes.close();
         writes.wait().await;
@@ -260,6 +266,28 @@ impl Runtime {
         }
     }
 
+    /// The triggers the code registered functions for, asked of a fresh instance that is granted
+    /// nothing; `build` checks them against the manifest.
+    pub async fn triggers(&self, compiled: &Compiled) -> Result<BTreeSet<String>, InvokeError> {
+        let limits = Limits::default().within(&self.inner.config.ceiling);
+        let _permit = acquire(&self.inner.runs)?;
+        let cx = CallContext {
+            run: String::new(),
+            install: String::new(),
+            max_bytes: limits.call_bytes,
+        };
+        let grants = Grants {
+            permissions: BTreeSet::new(),
+            connections: BTreeSet::new(),
+        };
+        let trackers = (self.inner.tracker.clone(), TaskTracker::new());
+        let session = Session::new(Arc::new(Refusing), cx, grants, trackers, limits);
+        let cancel = CancellationToken::new();
+        let (names,): TriggersResult =
+            (self.run(compiled, session, TRIGGERS_EXPORT, (), &cancel)).await?;
+        Ok(names.into_iter().collect())
+    }
+
     /// Stops admitting new runs and compilations; running ones continue.
     pub fn close(&self) {
         self.inner.runs.close();
@@ -272,13 +300,18 @@ impl Runtime {
         self.inner.tracker.wait().await;
     }
 
-    async fn run(
+    async fn run<P, R>(
         &self,
         compiled: &Compiled,
         session: Session,
-        params: HandleParams,
+        export: &str,
+        params: P,
         cancel: &CancellationToken,
-    ) -> Result<HandleResult, InvokeError> {
+    ) -> Result<R, InvokeError>
+    where
+        P: ComponentNamedList + Lower + Send + Sync,
+        R: ComponentNamedList + Lift + Send + Sync + 'static,
+    {
         let limits = session.limits();
         let mut store = Store::new(&self.inner.engine, session);
         store.limiter(|session| session);
@@ -292,8 +325,7 @@ impl Runtime {
             .map_err(|err| InvokeError::Trap(err.to_string()))?;
         let work = async {
             let instance = compiled.pre.instantiate_async(&mut store).await?;
-            let func =
-                instance.get_typed_func::<HandleParams, HandleResult>(&mut store, HANDLE_EXPORT)?;
+            let func = instance.get_typed_func::<P, R>(&mut store, export)?;
             func.call_async(&mut store, params).await
         };
         let outcome = tokio::select! {
@@ -319,6 +351,66 @@ impl Inner {
     fn cached(&self, digest: &ArtifactDigest) -> Option<Arc<Compiled>> {
         self.lock_cache().get(digest).cloned()
     }
+}
+
+/// The broker of a build-time call: the code may list its triggers, never reach the node.
+struct Refusing;
+
+fn refused() -> HostError {
+    HostError::new(
+        ErrorKind::Unavailable,
+        "host calls are only possible inside a handler",
+    )
+}
+
+#[async_trait::async_trait]
+impl Broker for Refusing {
+    async fn metadata_get(&self, _: &CallContext, _: &str) -> Result<Document, HostError> {
+        Err(refused())
+    }
+
+    async fn metadata_list(
+        &self,
+        _: &CallContext,
+        _: Option<String>,
+    ) -> Result<Listing, HostError> {
+        Err(refused())
+    }
+
+    async fn metadata_patch(&self, _: &CallContext, _: MetadataPatch) -> Result<String, HostError> {
+        Err(refused())
+    }
+
+    async fn objects_info(&self, _: &CallContext, _: &str) -> Result<ObjectInfo, HostError> {
+        Err(refused())
+    }
+
+    async fn objects_list(
+        &self,
+        _: &CallContext,
+        _: &str,
+        _: Option<String>,
+    ) -> Result<ObjectPage, HostError> {
+        Err(refused())
+    }
+
+    async fn connection_send(
+        &self,
+        _: &CallContext,
+        _: SendRequest,
+    ) -> Result<Response, HostError> {
+        Err(refused())
+    }
+
+    async fn state_get(&self, _: &CallContext, _: &str) -> Result<Option<Entry>, HostError> {
+        Err(refused())
+    }
+
+    async fn state_put(&self, _: &CallContext, _: StatePut) -> Result<u64, HostError> {
+        Err(refused())
+    }
+
+    async fn abandoned(&self, _: &CallContext, _: &Intent) {}
 }
 
 fn acquire(slots: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, InvokeError> {

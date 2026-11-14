@@ -138,12 +138,6 @@ macro_rules! export {
             }
 
             $crate::bindings::export_guest!(Exported with_types_in $crate::bindings);
-
-            const NAMES: &[&str] = &[$(stringify!($trigger)),+];
-            #[cfg(target_arch = "wasm32")]
-            #[used]
-            #[unsafe(link_section = "aruna-handlers")]
-            static HANDLERS: [u8; $crate::section_len(NAMES)] = $crate::section(NAMES);
         };
     };
 }
@@ -215,50 +209,9 @@ fn event(trigger: Trigger) -> Result<Event> {
     })
 }
 
-/// Length of the handler names section: the names joined by newlines.
-#[doc(hidden)]
-pub const fn section_len(names: &[&str]) -> usize {
-    let mut len = 0;
-    let mut index = 0;
-    while index < names.len() {
-        len += names[index].len() + 1;
-        index += 1;
-    }
-    len.saturating_sub(1)
-}
-
-/// The handler names joined by newlines, as `aruna-cli plugin build` reads them.
-#[doc(hidden)]
-pub const fn section<const N: usize>(names: &[&str]) -> [u8; N] {
-    let mut out = [0u8; N];
-    let (mut at, mut index) = (0, 0);
-    while index < names.len() {
-        if index > 0 {
-            out[at] = b'\n';
-            at += 1;
-        }
-        let bytes = names[index].as_bytes();
-        let mut byte = 0;
-        while byte < bytes.len() {
-            out[at] = bytes[byte];
-            at += 1;
-            byte += 1;
-        }
-        index += 1;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn handler_section() {
-        const NAMES: &[&str] = &["dataset_created", "resync"];
-        const SECTION: [u8; section_len(NAMES)] = section(NAMES);
-        assert_eq!(&SECTION, b"dataset_created\nresync");
-    }
 
     #[test]
     fn dataset_inputs() {

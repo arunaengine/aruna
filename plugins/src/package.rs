@@ -2,18 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use thiserror::Error;
 use wasmparser::Parser;
 
-use crate::artifact::{
-    SectionError, attach_manifest, check_artifact, component_imports, read_handlers,
-};
+use crate::artifact::{SectionError, attach_manifest, check_artifact, component_imports};
 use crate::limits::RuntimeConfig;
 use crate::manifest::{BuildStep, Manifest, ManifestError};
-use crate::runtime::Runtime;
+use crate::runtime::{Compiled, Runtime};
 
 /// The target Rust projects without a build step compile to; the host adds no WASI there.
 pub const RUST_TARGET: &str = "wasm32-unknown-unknown";
@@ -81,7 +80,8 @@ pub fn build_project(project: &Path) -> Result<Built, BuildError> {
 }
 
 /// Turns a core module with embedded WIT, or a finished component from any toolchain, into
-/// an artifact: handlers wired, imports checked, manifest embedded, whole artifact checked.
+/// an artifact: manifest checked and embedded, imports checked, whole artifact checked, and the
+/// triggers the code registered compared with the manifest's.
 pub fn package(manifest: &mut Manifest, bytes: &[u8]) -> Result<Vec<u8>, BuildError> {
     let component = if Parser::is_core_wasm(bytes) {
         wit_component::ComponentEncoder::default()
@@ -93,16 +93,35 @@ pub fn package(manifest: &mut Manifest, bytes: &[u8]) -> Result<Vec<u8>, BuildEr
     } else {
         return Err(BuildError::Output("unknown file format".into()));
     };
-    manifest.wire(read_handlers(&component)?)?;
+    manifest.wire()?;
     let imports = component_imports(&component)?;
     manifest.check_imports(imports.iter().map(String::as_str))?;
     let artifact = attach_manifest(&component, manifest)?;
     check_artifact(&artifact)?;
-    // Compiling against the host linker type-checks every import and the `handle` export.
+    // Compiling against the host linker type-checks every import and both exports.
     let config = RuntimeConfig::default();
     let runtime = Runtime::new(config).map_err(|err| BuildError::Host(err.to_string()))?;
-    (runtime.compile(&artifact)).map_err(|err| BuildError::Host(err.to_string()))?;
+    let compiled = (runtime.compile(&artifact)).map_err(|err| BuildError::Host(err.to_string()))?;
+    manifest.check_triggers(&registered(&runtime, &compiled)?)?;
     Ok(artifact)
+}
+
+/// Asks the compiled code for its triggers on a thread of its own, since a build may already run
+/// inside an async runtime.
+fn registered(runtime: &Runtime, compiled: &Compiled) -> Result<BTreeSet<String>, BuildError> {
+    let host = |err: String| BuildError::Host(format!("listing the code's triggers: {err}"));
+    std::thread::scope(|scope| {
+        let asked = scope.spawn(|| {
+            let threads = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| host(err.to_string()))?;
+            (threads.block_on(runtime.triggers(compiled))).map_err(|err| host(err.to_string()))
+        });
+        asked
+            .join()
+            .map_err(|_| host("the thread ended early".into()))?
+    })
 }
 
 fn run_step(project: &Path, step: &BuildStep) -> Result<PathBuf, BuildError> {
