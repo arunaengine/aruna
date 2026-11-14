@@ -934,7 +934,7 @@ mod tests {
             version: "0.1.0".into(),
             revision: 1,
             digest: format!("sha256:{}", "ab".repeat(32)),
-            handler: "every".into(),
+            handler: "timer".into(),
             settings: "{}".into(),
             trigger: RunTrigger::Timer { occurrence_ms: 1 },
             state: RunState::Queued,

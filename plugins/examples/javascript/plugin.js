@@ -60,8 +60,7 @@ export function triggers() {
 
 // The plugin.toml name of the trigger that started the run.
 function triggerName({ tag, val }) {
-  if (tag === "event") return val.kind;
-  return tag === "timer" ? "every" : tag;
+  return tag === "event" ? val.kind : tag;
 }
 
 // The plain event of a trigger: manual input as JSON, the timer tick, or the record's fields.

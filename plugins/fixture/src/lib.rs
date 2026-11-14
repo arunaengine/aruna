@@ -196,7 +196,7 @@ async fn spin(_: Context, _: ()) -> Result<()> {
 
 aruna_plugin::export! {
     manual => probe,
-    every => spin,
+    timer => spin,
     dataset_created => echo,
     dataset_updated => echo,
     data_uploaded => hoard,

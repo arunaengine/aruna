@@ -100,7 +100,7 @@ def started(ctx, work, *args):
         raise Err(types.Failure(kind, fault.message)) from None
 
 
-@on("every")
+@on("timer")
 def poll(ctx, event):
     return started(ctx, walk.poll)
 

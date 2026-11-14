@@ -149,7 +149,7 @@ pub fn trigger_name(trigger: &Trigger) -> &str {
         Trigger::Manual(_) => "manual",
         Trigger::Webhook(_) => "webhook",
         Trigger::Event(event) => &event.kind,
-        Trigger::Timer(_) => "every",
+        Trigger::Timer(_) => "timer",
     }
 }
 

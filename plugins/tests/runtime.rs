@@ -544,12 +544,11 @@ async fn narrow_requests_compile() {
         "data_uploaded",
         "dataset_created",
         "dataset_updated",
-        "every",
         "manual",
     ];
     assert_eq!(
         triggers,
-        [&all[..], &["sync_completed", "sync_failed"]].concat()
+        [&all[..], &["sync_completed", "sync_failed", "timer"]].concat()
     );
 }
 

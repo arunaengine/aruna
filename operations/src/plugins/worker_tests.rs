@@ -147,7 +147,7 @@ async fn admitted(
     let mut run = queued(install.install_id, seq);
     run.digest = install.digest.clone();
     run.settings = install.settings.clone();
-    run.handler = "every".into();
+    run.handler = "timer".into();
     if handler == "echo" {
         run.trigger = RunTrigger::Event(created(install, "D1").0);
         run.handler = "dataset_created".into();

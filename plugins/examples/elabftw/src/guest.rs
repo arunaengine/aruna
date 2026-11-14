@@ -45,7 +45,7 @@ async fn manual(ctx: Context, event: Event) -> aruna_plugin::Result<Value> {
 }
 
 aruna_plugin::export! {
-    every => poll,
+    timer => poll,
     dataset_created => changed,
     dataset_updated => changed,
     manual => manual,

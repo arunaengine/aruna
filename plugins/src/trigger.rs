@@ -27,7 +27,7 @@ impl TriggerKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Manual => "manual",
-            Self::Every => "every",
+            Self::Every => "timer",
             Self::Webhook => "webhook",
             Self::DatasetCreated => "dataset_created",
             Self::DataUploaded => "data_uploaded",

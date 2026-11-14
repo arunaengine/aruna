@@ -37,7 +37,7 @@ def _trigger_name(trigger: Any) -> str:
         return trigger.value.kind
     if isinstance(trigger, types.Trigger_Webhook):
         return "webhook"
-    return "every"
+    return "timer"
 
 
 def _event(trigger: Any) -> dict:

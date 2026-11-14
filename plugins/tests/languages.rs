@@ -416,7 +416,7 @@ async function run(ctx, event) {
 
 const handlers = {
   manual: run,
-  every: run,
+  timer: run,
 };
 "#;
 
@@ -425,7 +425,7 @@ from componentize_py_types import Err
 from wit_world.imports import metadata_read, types
 
 
-@on("manual", "every")
+@on("manual", "timer")
 def run(ctx, event):
     if event["kind"] == "timer":
         return {"tick": event["tick"]}

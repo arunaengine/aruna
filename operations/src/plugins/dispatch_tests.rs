@@ -73,7 +73,7 @@ async fn timer_occurrences() {
     let occurrence_ms = active + 3 * HOUR;
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].trigger, RunTrigger::Timer { occurrence_ms });
-    assert_eq!(runs[0].handler, "every");
+    assert_eq!(runs[0].handler, "timer");
     let other = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
     assert_eq!(
         enqueue_timers(ctx, &config, other, active + 9 * HOUR)

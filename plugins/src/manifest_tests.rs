@@ -52,10 +52,10 @@ fn triggers_match() {
     let manifest = example();
     let both = names(&["dataset_created", "manual"]);
     assert_eq!(manifest.check_triggers(&both), Ok(()));
-    let extra = names(&["dataset_created", "manual", "every"]);
+    let extra = names(&["dataset_created", "manual", "timer"]);
     assert_eq!(
         manifest.check_triggers(&extra),
-        Err(ManifestError::UnknownTrigger("every".into()))
+        Err(ManifestError::UnknownTrigger("timer".into()))
     );
     assert_eq!(
         manifest.check_triggers(&names(&["dataset_created"])),
