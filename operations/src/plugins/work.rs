@@ -452,6 +452,61 @@ pub async fn retire_work(
     Ok(count)
 }
 
+/// At most `limit` works of an install after the work `after`, oldest first, and the id of the
+/// last one when more may follow.
+pub async fn list_work(
+    ctx: &DriverContext,
+    install_id: Ulid,
+    after: Option<Ulid>,
+    limit: usize,
+) -> Result<(Vec<WorkRow>, Option<Ulid>), StoreError> {
+    let txn = Txn::direct(ctx);
+    let prefix = [&[WORK_INDEX][..], &install_id.to_bytes()].concat();
+    let after = after.map(|work_id| index_key(install_id, work_id));
+    let (rows, next) = txn
+        .page(PLUGIN_WORK_KEYSPACE, &prefix, after, limit)
+        .await?;
+    let mut works = Vec::with_capacity(rows.len());
+    for (_, key) in rows {
+        if let Some(value) = txn.read(PLUGIN_WORK_KEYSPACE, &key).await? {
+            works.push(decode::<WorkRow>(&value)?);
+        }
+    }
+    let next = next.and_then(|_| works.last().map(|row| row.work_id));
+    Ok((works, next))
+}
+
+/// The state a work shows: from its summary once settled, else from its job record.
+pub fn work_state(row: &WorkRow, record: Option<&JobRecord>) -> &'static str {
+    if let Some(summary) = &row.summary {
+        return match summary.state {
+            FinalState::Succeeded => "succeeded",
+            FinalState::Failed => "failed",
+            FinalState::Cancelled => "cancelled",
+            FinalState::Unknown => "unknown",
+        };
+    }
+    let Some(record) = record else {
+        return "queued";
+    };
+    match record.state {
+        JobState::Queued | JobState::AwaitingKey => match record.last_error {
+            Some(_) => "error",
+            None => "queued",
+        },
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+        JobState::Cancelled => "cancelled",
+        JobState::Indeterminate if record.locally_exhausted => "unknown",
+        JobState::Indeterminate => "error",
+        JobState::Claimed
+        | JobState::Preparing
+        | JobState::Ready
+        | JobState::Running
+        | JobState::Cancelling => "running",
+    }
+}
+
 /// The job dedup key of a work: its id, so a repeated submission finds the same job.
 pub fn dedup_key(work_id: Ulid) -> Vec<u8> {
     [&b"plugin-work/"[..], &work_id.to_bytes()].concat()
