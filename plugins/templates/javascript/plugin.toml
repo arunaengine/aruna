@@ -3,7 +3,7 @@ name = "{{name}}"
 version = "0.1.0"
 
 [triggers]
-manual = { handler = "run" }
+manual = {}
 
 [permissions]
 required = []

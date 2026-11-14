@@ -44,7 +44,12 @@ async fn manual(ctx: Context, event: Event) -> aruna_plugin::Result<Value> {
     sync.manual(input).map_err(failure)
 }
 
-aruna_plugin::export!(poll, changed, manual);
+aruna_plugin::export! {
+    every => poll,
+    dataset_created => changed,
+    dataset_updated => changed,
+    manual => manual,
+}
 
 /// The run's time: the timer's tick, else the time in the run id, a ULID.
 fn clock(run: &str, event: &Event) -> u64 {

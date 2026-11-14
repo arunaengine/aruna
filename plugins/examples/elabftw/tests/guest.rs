@@ -313,7 +313,7 @@ impl Guest {
 
     async fn poll(&self) -> Value {
         let now = self.now.fetch_add(5 * 60 * 1000, Ordering::SeqCst) + 5 * 60 * 1000;
-        self.invoke("poll", Trigger::Timer(now))
+        self.invoke("every", Trigger::Timer(now))
             .await
             .unwrap()
             .unwrap()
@@ -327,7 +327,7 @@ impl Guest {
             resource: dataset.into(),
             revision: found.revision,
         };
-        self.invoke("changed", Trigger::Event(change))
+        self.invoke("dataset_updated", Trigger::Event(change))
             .await
             .unwrap();
     }
@@ -578,17 +578,19 @@ async fn guest_checks_bucket() {
     let Some(guest) = Guest::new().await else {
         return;
     };
-    let accepted = guest.invoke("poll", Trigger::Timer(START)).await;
+    let accepted = guest.invoke("every", Trigger::Timer(START)).await;
     assert!(
         accepted.is_ok(),
         "an empty bucket on the receiver is fine: {accepted:?}"
     );
     let elsewhere = "/r/g/lab/data/elsewhere/shared";
     let refused = guest
-        .invoke_in("poll", Trigger::Timer(START), elsewhere)
+        .invoke_in("every", Trigger::Timer(START), elsewhere)
         .await
         .unwrap_err();
     assert!(refused.contains("receiver node"), "{refused}");
-    let wrong = guest.invoke("changed", Trigger::Manual("{}".into())).await;
+    let wrong = guest
+        .invoke("dataset_updated", Trigger::Manual("{}".into()))
+        .await;
     assert!(wrong.is_err(), "the event handler takes events only");
 }

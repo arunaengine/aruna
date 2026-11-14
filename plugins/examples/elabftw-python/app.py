@@ -6,7 +6,7 @@ import json
 import time
 
 import walk
-from aruna import WitWorld, handler  # noqa: F401  WitWorld is the component's entry point
+from aruna import WitWorld, on  # noqa: F401  WitWorld is the component's entry point
 from componentize_py_types import Err
 from elab import Fault, Stop
 from sync import Guard, Settings
@@ -99,16 +99,16 @@ def started(ctx, work, *args):
         raise Err(types.Failure(kind, fault.message)) from None
 
 
-@handler
+@on("every")
 def poll(ctx, event):
     return started(ctx, walk.poll)
 
 
-@handler
+@on("dataset_updated")
 def changed(ctx, event):
     return started(ctx, walk.changed, event["resource"])
 
 
-@handler
+@on("manual")
 def manual(ctx, event):
     return started(ctx, walk.manual, event["input"])

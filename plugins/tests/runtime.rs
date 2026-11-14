@@ -249,7 +249,17 @@ fn call(handler: &str, trigger: Trigger) -> Invocation {
 }
 
 fn probe(input: serde_json::Value) -> Invocation {
-    call("probe", Trigger::Manual(input.to_string()))
+    call("manual", Trigger::Manual(input.to_string()))
+}
+
+/// An event of `kind`; the fixture runs `echo` or `hoard` for it by its manifest.
+fn event(kind: &str) -> Trigger {
+    Trigger::Event(WatchEvent {
+        kind: kind.into(),
+        path: "p".into(),
+        resource: "r".into(),
+        revision: "1".into(),
+    })
 }
 
 async fn invoke(call: Invocation, broker: Arc<Recorder>) -> Result<Option<String>, InvokeError> {
@@ -279,7 +289,11 @@ async fn echo_round_trip() {
         resource: "D1".into(),
         revision: "r1".into(),
     };
-    let reply = invoke(call("echo", Trigger::Event(event)), Arc::default()).await;
+    let reply = invoke(
+        call("dataset_created", Trigger::Event(event)),
+        Arc::default(),
+    )
+    .await;
     assert_eq!(
         reply.unwrap().as_deref(),
         Some(
@@ -381,7 +395,11 @@ async fn dataset_calls_reach() {
         resource: "D1".into(),
         revision: "r2".into(),
     };
-    let reply = invoke(call("echo", Trigger::Event(event)), Arc::default()).await;
+    let reply = invoke(
+        call("dataset_created", Trigger::Event(event)),
+        Arc::default(),
+    )
+    .await;
     assert!(
         reply
             .unwrap()
@@ -457,30 +475,37 @@ async fn effects_get_ordinals() {
 
 #[tokio::test]
 async fn budgets_end_runs() {
-    let limited = |handler: &str, edit: fn(&mut Limits)| {
-        let mut run = call(handler, Trigger::Timer(0));
+    let limited = |mut run: Invocation, edit: fn(&mut Limits)| {
         edit(&mut run.limits);
         run
     };
-    type Case = (&'static str, fn(&mut Limits), Limit);
-    let cases: [Case; 3] = [
-        ("spin", |l| l.fuel = 50_000_000, Limit::Fuel),
-        ("hoard", |l| l.memory = 8 << 20, Limit::Memory),
-        ("chatty", |l| l.calls = 50, Limit::Calls),
+    let timer = || call("every", Trigger::Timer(0));
+    let cases: [(Invocation, fn(&mut Limits), Limit); 3] = [
+        (timer(), |l| l.fuel = 50_000_000, Limit::Fuel),
+        (
+            call("data_uploaded", event("data_uploaded")),
+            |l| l.memory = 8 << 20,
+            Limit::Memory,
+        ),
+        (
+            probe(serde_json::json!({"call": "chatty"})),
+            |l| l.calls = 50,
+            Limit::Calls,
+        ),
     ];
-    for (handler, edit, limit) in cases {
-        match invoke(limited(handler, edit), Arc::default()).await {
-            Err(InvokeError::Limit(actual)) => assert_eq!(actual, limit, "{handler}"),
-            other => panic!("{handler}: {other:?}"),
+    for (run, edit, limit) in cases {
+        match invoke(limited(run, edit), Arc::default()).await {
+            Err(InvokeError::Limit(actual)) => assert_eq!(actual, limit),
+            other => panic!("{limit}: {other:?}"),
         }
     }
-    let slow = limited("spin", |l| {
+    let slow = limited(timer(), |l| {
         l.fuel = 1 << 50;
         l.wall = Duration::from_millis(200);
     });
     let ended = invoke(slow, Arc::default()).await;
     assert!(matches!(ended, Err(InvokeError::Timeout)), "{ended:?}");
-    let cancelled = limited("spin", |_| {});
+    let cancelled = limited(timer(), |_| {});
     cancelled.cancel.cancel();
     assert!(matches!(
         invoke(cancelled, Arc::default()).await,
@@ -527,7 +552,17 @@ async fn narrow_requests_compile() {
         .iter()
         .map(String::as_str)
         .collect();
-    assert_eq!(handlers, ["chatty", "echo", "hoard", "probe", "spin"]);
+    let all = [
+        "data_uploaded",
+        "dataset_created",
+        "dataset_updated",
+        "every",
+        "manual",
+    ];
+    assert_eq!(
+        handlers,
+        [&all[..], &["sync_completed", "sync_failed"]].concat()
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -652,7 +687,7 @@ async fn node_admission_bounded() {
         tokio::spawn(async move { invoke_on(&runtime, first, broker).await })
     };
     broker.blocked.notified().await;
-    let second = invoke_on(&runtime, call("echo", Trigger::Timer(0)), broker.clone()).await;
+    let second = invoke_on(&runtime, call("every", Trigger::Timer(0)), broker.clone()).await;
     assert!(matches!(second, Err(InvokeError::Overloaded)), "{second:?}");
     cancel.cancel();
     let first = running.await.unwrap();

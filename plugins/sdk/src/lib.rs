@@ -1,5 +1,5 @@
-//! Rust SDK for Aruna plugins: handlers are async functions over synchronous host calls,
-//! listed once with [`export!`].
+//! Rust SDK for Aruna plugins: handlers are async functions over synchronous host calls, listed
+//! once by trigger with [`export!`].
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -110,11 +110,12 @@ impl Output for Value {
     }
 }
 
-/// Lists a plugin's handlers. Each is `async fn(Context, I) -> Result<O>`; its name is the
-/// one triggers use, and `aruna-cli plugin build` checks the list against the manifest.
+/// Lists a plugin's handlers by trigger, such as `export! { dataset_created => announce }`. Each
+/// is `async fn(Context, I) -> Result<O>`; `aruna-cli plugin build` checks the triggers against
+/// the manifest.
 #[macro_export]
 macro_rules! export {
-    ($($handler:ident),+ $(,)?) => {
+    ($($trigger:ident => $handler:path),+ $(,)?) => {
         const _: () = {
             struct Exported;
 
@@ -127,7 +128,7 @@ macro_rules! export {
                     $crate::bindings::aruna::plugin::types::Failure,
                 > {
                     match handler.as_str() {
-                        $(stringify!($handler) => $crate::dispatch(invocation, $handler),)+
+                        $(stringify!($trigger) => $crate::dispatch(invocation, $handler),)+
                         other => Err($crate::unknown(other)),
                     }
                 }
@@ -135,7 +136,7 @@ macro_rules! export {
 
             $crate::bindings::export_guest!(Exported with_types_in $crate::bindings);
 
-            const NAMES: &[&str] = &[$(stringify!($handler)),+];
+            const NAMES: &[&str] = &[$(stringify!($trigger)),+];
             #[cfg(target_arch = "wasm32")]
             #[used]
             #[unsafe(link_section = "aruna-handlers")]

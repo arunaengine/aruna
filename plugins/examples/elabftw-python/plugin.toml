@@ -23,9 +23,9 @@ methods = ["GET", "POST", "PATCH"]
 auth = "elab_key"
 
 [triggers]
-every = { handler = "poll", interval = "5m" }
-dataset_updated = { handler = "changed" }
-manual = { handler = "manual" }
+every = { interval = "5m" }
+dataset_updated = {}
+manual = {}
 
 [permissions]
 required = ["metadata.read", "metadata.write", "metadata.create", "objects.read"]

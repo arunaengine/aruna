@@ -21,4 +21,7 @@ async fn dataset_created(ctx: Context, event: DatasetEvent) -> Result<()> {
     Ok(())
 }
 
-aruna_plugin::export!(dataset_created);
+aruna_plugin::export! {
+    dataset_created => dataset_created,
+    manual => dataset_created,
+}

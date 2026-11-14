@@ -361,8 +361,8 @@ fn probe(language: &str, code: &str) -> PathBuf {
     let build = &template[template.find("[build]").unwrap()..];
     let build = build.replace("\"wit\"", &format!("{:?}", wit.display().to_string()));
     let manifest = format!(
-        "name = \"probe\"\nversion = \"0.1.0\"\n\n[triggers]\nmanual = {{ handler = \"run\" }}\n\
-         every = {{ handler = \"run\", interval = \"1h\" }}\n\n[permissions]\n\
+        "name = \"probe\"\nversion = \"0.1.0\"\n\n[triggers]\nmanual = {{}}\n\
+         every = {{ interval = \"1h\" }}\n\n[permissions]\n\
          required = [\"metadata.read\"]\n\n{build}"
     );
     std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
@@ -384,17 +384,17 @@ fn probe(language: &str, code: &str) -> PathBuf {
 /// Runs a probe by hand with `input` and by a timer, and checks what each answer became.
 async fn check_probe(language: &str, plugin: &Plugin, plain: &str, tick: &str) {
     let manual = |input: &str| Trigger::Manual(serde_json::json!(input).to_string());
-    let answer = run(plugin, "run", manual("plain"), Catalog::new(RECORD)).await;
+    let answer = run(plugin, "manual", manual("plain"), Catalog::new(RECORD)).await;
     assert_eq!(answer.unwrap().as_deref(), Some(plain), "{language}");
     let timer = Trigger::Timer(1_762_700_000_000);
-    let answer = run(plugin, "run", timer, Catalog::new(RECORD)).await;
+    let answer = run(plugin, "every", timer, Catalog::new(RECORD)).await;
     assert_eq!(answer.unwrap().as_deref(), Some(tick), "{language}");
     for (input, kind) in [
         ("retry", FailureKind::Retryable),
         ("missing", FailureKind::Retryable),
         ("denied", FailureKind::Permanent),
     ] {
-        let ended = run(plugin, "run", manual(input), Catalog::new(RECORD)).await;
+        let ended = run(plugin, "manual", manual(input), Catalog::new(RECORD)).await;
         let Err(InvokeError::Guest(failure)) = ended else {
             panic!("{language} {input}: {ended:?}");
         };
@@ -408,23 +408,26 @@ async fn check_probe(language: &str, plugin: &Plugin, plain: &str, tick: &str) {
 
 const JAVASCRIPT_PROBE: &str = r#"import { get } from "aruna:plugin/metadata-read@0.3.0";
 
+async function run(ctx, event) {
+  if (event.kind === "timer") return { tick: event.tick };
+  if (event.input === "retry") throw { kind: "retryable", message: "try later" };
+  if (event.input !== "plain") return get(event.input).json;
+  await Promise.resolve();
+  return "awaited";
+}
+
 const handlers = {
-  async run(ctx, event) {
-    if (event.kind === "timer") return { tick: event.tick };
-    if (event.input === "retry") throw { kind: "retryable", message: "try later" };
-    if (event.input !== "plain") return get(event.input).json;
-    await Promise.resolve();
-    return "awaited";
-  },
+  manual: run,
+  every: run,
 };
 "#;
 
-const PYTHON_PROBE: &str = r#"from aruna import WitWorld, handler  # noqa: F401
+const PYTHON_PROBE: &str = r#"from aruna import WitWorld, on  # noqa: F401
 from componentize_py_types import Err
 from wit_world.imports import metadata_read, types
 
 
-@handler
+@on("manual", "every")
 def run(ctx, event):
     if event["kind"] == "timer":
         return {"tick": event["tick"]}

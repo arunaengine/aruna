@@ -55,7 +55,7 @@ pub(crate) async fn probe(
     let mut run = queued(install.install_id, 1);
     run.run_id = Ulid::generate();
     (run.digest, run.settings) = (install.digest.clone(), install.settings.clone());
-    (run.handler, run.due_ms) = ("probe".to_string(), 0);
+    (run.handler, run.due_ms) = ("manual".to_string(), 0);
     run.trigger = RunTrigger::Manual {
         by: fixture.actor.user_id,
         input: input.to_string(),
@@ -303,7 +303,7 @@ async fn probe_with(
     let mut run = queued(install.install_id, 1);
     run.run_id = Ulid::generate();
     (run.digest, run.settings) = (install.digest.clone(), install.settings.clone());
-    (run.handler, run.due_ms) = ("probe".to_string(), 0);
+    (run.handler, run.due_ms) = ("manual".to_string(), 0);
     run.trigger = RunTrigger::Manual {
         by: fixture.actor.user_id,
         input: input.to_string(),

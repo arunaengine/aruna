@@ -4,12 +4,12 @@
 
 import json
 
-from aruna import WitWorld, handler  # noqa: F401  WitWorld is the component's entry point
+from aruna import WitWorld, on  # noqa: F401  WitWorld is the component's entry point
 from componentize_py_types import Err
 from wit_world.imports import metadata_read, metadata_write, services, types
 
 
-@handler
+@on("dataset_created", "manual")
 def dataset_created(ctx, event):
     if event["kind"] == "manual":
         given = event["input"]

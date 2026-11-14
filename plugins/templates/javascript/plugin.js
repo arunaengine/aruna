@@ -1,7 +1,7 @@
-// Plugin handlers: each trigger in plugin.toml calls one of these by name. A handler returns a
+// Plugin handlers by trigger: each trigger in plugin.toml runs the one listed here. A handler returns a
 // string, or a value sent as JSON in which a BigInt such as `event.tick` becomes a decimal string.
 const handlers = {
-  run(ctx, event) {
+  manual(ctx, event) {
     return `hello from ${ctx.install}`;
   },
 };

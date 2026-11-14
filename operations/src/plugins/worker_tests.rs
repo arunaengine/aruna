@@ -49,15 +49,9 @@ pub(crate) fn secured() -> Vec<u8> {
     artifact(true, true)
 }
 
-/// The runnable fixture with both sync triggers, handled by `echo`, which answers the event.
+/// The runnable fixture, whose sync triggers `echo` handles; it answers the event.
 pub(crate) fn echoed_sync() -> Vec<u8> {
-    use aruna_plugins::trigger::TriggerKind;
     let (component, mut manifest) = bare();
-    let echo = manifest.triggers[&TriggerKind::DatasetCreated].clone();
-    for kind in [TriggerKind::SyncCompleted, TriggerKind::SyncFailed] {
-        manifest.triggers.insert(kind, echo.clone());
-    }
-    manifest.handlers.retain(|handler| handler != "spin");
     (manifest.connections, manifest.secrets) = (BTreeMap::new(), BTreeMap::new());
     attach_manifest(component, &manifest).unwrap()
 }
@@ -142,7 +136,8 @@ pub(crate) async fn install_artifact(fixture: &Fixture, bytes: Vec<u8>) -> Plugi
     fixture.install(&request).await.unwrap()
 }
 
-/// A run of `install` that calls `handler` and is due now.
+/// A run of `install` that reaches the fixture's `handler` and is due now: `echo` through a
+/// dataset event, `spin` through the timer.
 async fn admitted(
     fixture: &Fixture,
     install: &PluginInstall,
@@ -152,7 +147,11 @@ async fn admitted(
     let mut run = queued(install.install_id, seq);
     run.digest = install.digest.clone();
     run.settings = install.settings.clone();
-    run.handler = handler.into();
+    run.handler = "every".into();
+    if handler == "echo" {
+        run.trigger = RunTrigger::Event(created(install, "D1").0);
+        run.handler = "dataset_created".into();
+    }
     run.due_ms = 0;
     admit(&fixture.ctx, &run).await.unwrap();
     run
@@ -230,7 +229,7 @@ async fn event_input() {
         .unwrap();
     let (event, _) = created(&install, "D1");
     let run = event_run(&config, &install, &event, 0).unwrap();
-    assert_eq!(run.handler, "echo");
+    assert_eq!(run.handler, "dataset_created");
     let call = invocation(&run, &install, Limits::default(), CancellationToken::new());
     let Trigger::Event(given) = call.trigger else {
         panic!("an event run calls its handler with the event")
@@ -278,7 +277,7 @@ async fn sync_input() {
         .unwrap();
     let event = synced(&install, "raw/", Ulid::from_parts(3, 3));
     let run = event_run(&config, &install, &event, 0).unwrap();
-    assert_eq!(run.handler, "spin");
+    assert_eq!(run.handler, "sync_completed");
     let call = invocation(&run, &install, Limits::default(), CancellationToken::new());
     let Trigger::Event(given) = call.trigger else {
         panic!("an event run calls its handler with the event")

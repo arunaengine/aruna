@@ -19,7 +19,7 @@ auth = "catalog_key"
 
 [triggers]
 dataset_created = {}
-manual = { handler = "dataset_created", input = "dataset" }
+manual = { input = "dataset" }
 
 [permissions]
 required = ["metadata.read"]

@@ -1,4 +1,4 @@
-"""Calls plugin handlers by name: builds the context and event, and turns errors into failures."""
+"""Calls plugin handlers by trigger: builds the context and event, and turns errors into failures."""
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -21,10 +21,15 @@ class Context:
     settings: dict
 
 
-def handler(function: Callable) -> Callable:
-    """Registers a function as the handler with its own name."""
-    _handlers[function.__name__] = function
-    return function
+def on(*triggers: str) -> Callable:
+    """Registers a function as the handler of the named triggers of plugin.toml."""
+
+    def register(function: Callable) -> Callable:
+        for trigger in triggers:
+            _handlers[trigger] = function
+        return function
+
+    return register
 
 
 def _event(trigger: Any) -> dict:

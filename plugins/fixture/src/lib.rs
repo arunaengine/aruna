@@ -140,6 +140,13 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             }
             json!(buffer[0])
         }
+        "chatty" => {
+            // Logs until the host call budget ends the run.
+            for line in 0..u32::MAX {
+                ctx.log(Level::Debug, &format!("line {line}"));
+            }
+            json!(null)
+        }
         "errors" => {
             let mut failed = 0;
             for _ in 0..1000 {
@@ -177,14 +184,6 @@ async fn echo(ctx: Context, event: Event) -> Result<String> {
     ))
 }
 
-/// Logs until the host call budget ends the run.
-async fn chatty(ctx: Context, _: ()) -> Result<()> {
-    for line in 0..u32::MAX {
-        ctx.log(Level::Debug, &format!("line {line}"));
-    }
-    Ok(())
-}
-
 /// Allocates until the memory budget ends the run.
 async fn hoard(_: Context, _: ()) -> Result<()> {
     let mut blocks = Vec::new();
@@ -201,4 +200,12 @@ async fn spin(_: Context, _: ()) -> Result<()> {
     }
 }
 
-aruna_plugin::export!(probe, echo, chatty, hoard, spin);
+aruna_plugin::export! {
+    manual => probe,
+    every => spin,
+    dataset_created => echo,
+    dataset_updated => echo,
+    data_uploaded => hoard,
+    sync_completed => echo,
+    sync_failed => echo,
+}
