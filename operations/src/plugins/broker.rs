@@ -24,8 +24,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, JobCopy, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage,
-    Response, SendRequest, StatePut,
+    HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
+    ObjectPage, Response, SendRequest, StatePut,
 };
 use aruna_plugins::connection::relative_path;
 use aruna_plugins::permission::Permission;
@@ -43,6 +43,7 @@ use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
+use super::jobs::{job_outputs, job_status};
 use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
@@ -623,6 +624,14 @@ pub(crate) fn object_path(
     Ok(object_permission_path(realm_id, group, local, bucket, key))
 }
 
+/// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
+/// text stays as it is.
+pub(crate) fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
+    let realm = install.account.realm_id;
+    let root = format!("/{realm}/g/{}/data/{local}/", install.group_id);
+    path.strip_prefix(&root).unwrap_or(path).to_string()
+}
+
 /// Refuses a `contentUrl` that names nothing readers can resolve, such as a short bucket path:
 /// it must be an absolute IRI such as an `s3://` address, an object path below the realm, or a
 /// reference inside the crate.
@@ -1006,6 +1015,21 @@ impl Broker for RunBroker {
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn jobs_get(&self, _cx: &CallContext, id: &str) -> Result<JobStatus, HostError> {
+        let install = self.admitted(None).await?;
+        job_status(&self.ctx, (&install, self.scope.local), id).await
+    }
+
+    async fn jobs_outputs(
+        &self,
+        _cx: &CallContext,
+        id: &str,
+        cursor: Option<String>,
+    ) -> Result<ObjectPage, HostError> {
+        let install = self.admitted(None).await?;
+        job_outputs(&self.ctx, (&install, self.scope.local), id, cursor).await
     }
 
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {

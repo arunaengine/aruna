@@ -19,6 +19,7 @@ pub mod held;
 pub mod hooks;
 pub mod install;
 pub mod intents;
+pub mod jobs;
 pub mod journal;
 pub mod lifecycle;
 pub mod matcher;

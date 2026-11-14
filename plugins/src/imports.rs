@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, JobCopy, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo,
-    ObjectPage, Response, SendRequest, StatePut,
+    HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, Method,
+    ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
 };
 use crate::host::wit::aruna::plugin::{
     jobs, log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services,
@@ -307,14 +307,7 @@ impl objects_read::Host for Session {
             Effect::Read,
             Needs::Permission(Permission::ObjectsRead),
             |broker, cx| async move { broker.objects_list(&cx, &prefix, cursor).await },
-            |page: &ObjectPage| {
-                let items: usize = page
-                    .objects
-                    .iter()
-                    .map(|o| o.path.len() + o.version.len() + 8)
-                    .sum();
-                items + page.cursor.as_ref().map_or(0, String::len)
-            },
+            page_size,
         )
         .await
     }
@@ -347,6 +340,52 @@ impl jobs::Host for Session {
         )
         .await
     }
+
+    async fn get(&mut self, id: String) -> wasmtime::Result<Result<JobStatus, HostError>> {
+        self.brokered(
+            id.len(),
+            Effect::Read,
+            Needs::Free,
+            |broker, cx| async move { broker.jobs_get(&cx, &id).await },
+            status_size,
+        )
+        .await
+    }
+
+    async fn outputs(
+        &mut self,
+        id: String,
+        cursor: Option<String>,
+    ) -> wasmtime::Result<Result<ObjectPage, HostError>> {
+        let size = id.len() + cursor.as_ref().map_or(0, String::len);
+        self.brokered(
+            size,
+            Effect::Read,
+            Needs::Free,
+            |broker, cx| async move { broker.jobs_outputs(&cx, &id, cursor).await },
+            page_size,
+        )
+        .await
+    }
+}
+
+fn status_size(status: &JobStatus) -> usize {
+    let texts = [&status.id, &status.kind, &status.path, &status.state];
+    let optional = [&status.message, &status.version, &status.report];
+    let body = status.reply_body.as_ref().map_or(0, Vec::len);
+    let fixed: usize = texts.iter().map(|text| text.len()).sum();
+    let rest: usize = optional
+        .iter()
+        .map(|text| text.as_ref().map_or(0, String::len))
+        .sum();
+    fixed + rest + body + fields_len(&status.reply_headers) + 16
+}
+
+fn page_size(page: &ObjectPage) -> usize {
+    let items: usize = (page.objects.iter())
+        .map(|object| object.path.len() + object.version.len() + 8)
+        .sum();
+    items + page.cursor.as_ref().map_or(0, String::len)
 }
 
 impl services::Host for Session {

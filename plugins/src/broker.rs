@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
+pub use crate::host::wit::aruna::plugin::jobs::Status as JobStatus;
 pub use crate::host::wit::aruna::plugin::metadata_create::Created;
 pub use crate::host::wit::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 pub use crate::host::wit::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
@@ -196,6 +197,25 @@ pub trait Broker: Send + Sync {
     }
     /// Starts a copy and answers its job id; a broker that runs no jobs refuses it.
     async fn jobs_copy(&self, _cx: &CallContext, _copy: JobCopy) -> Result<String, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "jobs are not run here",
+        ))
+    }
+    /// The status of a job of the install; a broker that runs no jobs refuses it.
+    async fn jobs_get(&self, _cx: &CallContext, _id: &str) -> Result<JobStatus, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "jobs are not run here",
+        ))
+    }
+    /// One page of the objects a task of the install wrote.
+    async fn jobs_outputs(
+        &self,
+        _cx: &CallContext,
+        _id: &str,
+        _cursor: Option<String>,
+    ) -> Result<ObjectPage, HostError> {
         Err(HostError::new(
             ErrorKind::Unavailable,
             "jobs are not run here",

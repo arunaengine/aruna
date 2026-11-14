@@ -10,6 +10,16 @@ use std::hint::black_box;
 use aruna_plugin::{Context, Error, Event, Level, Method, Result};
 use serde_json::{Value, json};
 
+use aruna_plugin::bindings::aruna::plugin::jobs;
+
+/// A host error of a call the SDK does not wrap yet.
+fn host(error: aruna_plugin::bindings::aruna::plugin::types::HostError) -> Error {
+    Error::Host {
+        kind: error.kind,
+        message: error.message,
+    }
+}
+
 mod wasi {
     wit_bindgen::generate!({ path: "wit", world: "aruna-test:wasi/probe", generate_all });
 }
@@ -96,15 +106,15 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
         }
         "copy" => {
             let version = input.get("version").and_then(Value::as_str);
-            let copied = aruna_plugin::bindings::aruna::plugin::jobs::copy(
-                &text("source"),
-                version,
-                &text("target"),
-            );
-            json!(copied.map_err(|error| Error::Host {
-                kind: error.kind,
-                message: error.message,
-            })?)
+            let copied = jobs::copy(&text("source"), version, &text("target"));
+            json!(copied.map_err(host)?)
+        }
+        "job" => {
+            let status = jobs::get(&text("id")).map_err(host)?;
+            let page = jobs::outputs(&text("id"), None).map_err(host)?;
+            let outputs: Vec<_> = page.objects.into_iter().map(|object| object.path).collect();
+            json!({ "kind": status.kind, "state": status.state, "path": status.path,
+                "bytes": status.bytes, "outputs": outputs })
         }
         "random" => {
             let len = input.get("len").and_then(Value::as_u64).unwrap_or_default();

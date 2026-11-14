@@ -28,7 +28,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::artifacts::fetch_artifact;
-use super::broker::RunBroker;
+use super::broker::{RunBroker, short_path};
 use super::check::{RunScope, check_call};
 use super::cleanup::sweep_events;
 use super::clock::probe_clock;
@@ -491,14 +491,6 @@ fn invocation(
         limits,
         cancel,
     }
-}
-
-/// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
-/// text stays as it is.
-fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
-    let realm = install.account.realm_id;
-    let root = format!("/{realm}/g/{}/data/{local}/", install.group_id);
-    path.strip_prefix(&root).unwrap_or(path).to_string()
 }
 
 /// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown

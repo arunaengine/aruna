@@ -220,11 +220,34 @@ interface secrets {
 /// Native work of the install that runs without the run; each start answers the job's id at once,
 /// and a rerun of the same call gets the same id.
 interface jobs {
-  use types.{host-error};
+  use types.{field, host-error};
+  use objects-read.{object-page};
+
+  /// What a job did, read from its row after its record is gone too. `kind` is copy, download,
+  /// upload or task; `path` is the bucket path it wrote or read; `state` is queued, running,
+  /// succeeded, failed, error, cancelled or unknown.
+  record status {
+    id: string,
+    kind: string,
+    path: string,
+    state: string,
+    message: option<string>,
+    bytes: option<u64>,
+    version: option<string>,
+    reply-status: option<u16>,
+    reply-headers: list<field>,
+    reply-body: option<list<u8>>,
+    exit-code: option<s32>,
+    report: option<string>,
+  }
 
   /// Copies an object, pinned to `version` when given, to `target`; needs read on the source and
   /// write on the target.
   copy: func(source: string, version: option<string>, target: string) -> result<string, host-error>;
+  /// Any job of the install.
+  get: func(id: string) -> result<status, host-error>;
+  /// One page of the objects a task wrote.
+  outputs: func(id: string, cursor: option<string>) -> result<object-page, host-error>;
 }
 
 interface log {

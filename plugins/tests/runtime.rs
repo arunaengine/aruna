@@ -11,8 +11,8 @@ use std::time::Duration;
 use aruna_plugins::artifact::read_manifest;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, FileChange, FilePage, HostError,
-    Intent, JobCopy, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response,
-    SendRequest, StatePut,
+    Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage,
+    Response, SendRequest, StatePut,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::manifest::Manifest;
@@ -226,6 +226,42 @@ impl Broker for Recorder {
         self.note(&format!("copy {} {version} {}", copy.source, copy.target));
         self.intents.lock().unwrap().push(copy.intent);
         Ok("job-1".into())
+    }
+
+    async fn jobs_get(&self, _: &CallContext, id: &str) -> Result<JobStatus, HostError> {
+        self.note(&format!("job {id}"));
+        Ok(JobStatus {
+            id: id.into(),
+            kind: "copy".into(),
+            path: "out/a".into(),
+            state: "succeeded".into(),
+            message: None,
+            bytes: Some(5),
+            version: None,
+            reply_status: None,
+            reply_headers: Vec::new(),
+            reply_body: None,
+            exit_code: None,
+            report: None,
+        })
+    }
+
+    async fn jobs_outputs(
+        &self,
+        _: &CallContext,
+        id: &str,
+        _: Option<String>,
+    ) -> Result<ObjectPage, HostError> {
+        self.note(&format!("outputs {id}"));
+        let object = ObjectInfo {
+            path: "out/b".into(),
+            size: 1,
+            version: "v".into(),
+        };
+        Ok(ObjectPage {
+            objects: vec![object],
+            cursor: None,
+        })
     }
 
     async fn abandoned(&self, _: &CallContext, intent: &Intent) {
@@ -625,6 +661,20 @@ async fn copy_answers_id() {
     assert_eq!(broker.intents()[0].ordinal, 1);
     let refused = invoke(probe(input), Arc::default()).await;
     assert!(matches!(refused, Err(InvokeError::Guest(_))), "{refused:?}");
+}
+
+#[tokio::test]
+async fn job_status_read() {
+    // Status and outputs need no grant beyond the install's own jobs.
+    let broker = Arc::new(Recorder::default());
+    let reply = invoke(
+        probe(serde_json::json!({"call": "job", "id": "j1"})),
+        broker.clone(),
+    );
+    let expected = serde_json::json!({"kind": "copy", "state": "succeeded", "path": "out/a",
+        "bytes": 5, "outputs": ["out/b"]});
+    assert_eq!(output(reply.await), expected);
+    assert_eq!(broker.calls(), ["job j1", "outputs j1"]);
 }
 
 #[tokio::test]

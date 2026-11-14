@@ -142,4 +142,4 @@ fn digest(parts: &[&[u8]]) -> [u8; 32] {
 
 #[cfg(test)]
 #[path = "submit_tests.rs"]
-mod tests;
+pub(crate) mod tests;

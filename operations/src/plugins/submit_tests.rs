@@ -13,7 +13,7 @@ use crate::plugins::runs::tests::queued;
 use crate::plugins::work::read_work;
 use crate::s3::object::copy::test::seed_bucket;
 
-fn scope(fixture: &Fixture, install: &PluginInstall) -> RunScope {
+pub(crate) fn scope(fixture: &Fixture, install: &PluginInstall) -> RunScope {
     let mut run = queued(install.install_id, 1);
     (run.digest, run.group_id) = (install.digest.clone(), install.group_id);
     RunScope {
@@ -23,12 +23,12 @@ fn scope(fixture: &Fixture, install: &PluginInstall) -> RunScope {
     }
 }
 
-fn path(fixture: &Fixture, install: &PluginInstall, rest: &str) -> String {
+pub(crate) fn path(fixture: &Fixture, install: &PluginInstall, rest: &str) -> String {
     let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
     format!("/{realm}/g/{}/data/{node}/{rest}", install.group_id)
 }
 
-fn request(fixture: &Fixture, install: &PluginInstall, target: &str) -> CopyRequest {
+pub(crate) fn request(fixture: &Fixture, install: &PluginInstall, target: &str) -> CopyRequest {
     CopyRequest {
         source: path(fixture, install, "in/a.txt"),
         source_version: None,
@@ -37,7 +37,7 @@ fn request(fixture: &Fixture, install: &PluginInstall, target: &str) -> CopyRequ
     }
 }
 
-async fn ready(fixture: &Fixture) -> PluginInstall {
+pub(crate) async fn ready(fixture: &Fixture) -> PluginInstall {
     let install = copier(fixture).await;
     let account = install.account;
     for bucket in ["in", "out"] {
