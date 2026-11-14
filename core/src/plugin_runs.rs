@@ -366,6 +366,26 @@ impl SourceEvent {
         }
     }
 
+    /// A sync relationship stopping as failed, journaled with its status on the source node: the
+    /// resource is the relationship, the revision the transition, minted in that transaction.
+    pub fn sync_failure(
+        (group_id, path): (GroupId, String),
+        (relationship_id, creator): (Ulid, UserId),
+        (node, transition): (NodeId, Ulid),
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            source: format!("sync_failed/{node}/{relationship_id}/{transition}"),
+            ..Self::sync_job(
+                SourceKind::SyncFailed,
+                (group_id, path),
+                (relationship_id, creator),
+                (node, transition),
+                now_ms,
+            )
+        }
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(self)?)
     }

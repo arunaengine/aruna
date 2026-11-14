@@ -4188,6 +4188,37 @@ mod tests {
         assert_eq!(stored.status.last_error.as_deref(), Some("access_denied"));
         assert_eq!(stored.status.counters.failures, 1);
         assert_eq!(stored.status.counters.consecutive_failures, 1);
+        // The status write journaled the relationship's `sync_failed`; the job adds no row.
+        let events = journaled(&context).await;
+        assert_eq!(events.len(), 1);
+        let transition = format!("sync_failed/{}/{}/", node(1), relationship.id);
+        assert!(events[0].source.starts_with(&transition));
+    }
+
+    #[tokio::test]
+    async fn stopped_status_recovers() {
+        // The status write commits and the drain stops before retiring the job: the next drain
+        // retires it as the relationship stands, without a second row.
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = plain_context(&storage);
+        write_bucket(&storage, "bucket").await;
+        let mut relationship = relationship(78, 2, None, true);
+        write_relationship(&storage, &relationship).await;
+        let queue = QueueBlobOperation::new_relationship(on_demand_input(), None, relationship.id);
+        drive(queue, &context).await.expect("queue succeeds");
+        relationship.state = SyncState::Failed {
+            reason: "access_denied".to_string(),
+        };
+        assert!(store_sync_status(&context, &relationship).await.unwrap());
+        assert_eq!(journaled(&context).await.len(), 1);
+
+        let result = process_blob_batch(&context).await.expect("drain succeeds");
+
+        assert_eq!((result.succeeded, result.failed), (1, 0));
+        assert!(read_jobs(&storage).await.is_empty());
+        assert_eq!(journaled(&context).await.len(), 1);
     }
 
     #[tokio::test]

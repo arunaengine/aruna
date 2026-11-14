@@ -9,10 +9,15 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
+use aruna_core::keyspaces::{
+    MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
 use aruna_core::metadata::MetadataError;
+use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::bucket_permission_path;
+use aruna_core::structs::storage::blob::{
+    BucketInfo, bucket_permission_path, object_permission_path,
+};
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
@@ -194,21 +199,33 @@ pub async fn store_sync_status(
         }
 
         let repair = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile);
+        let mut writes = vec![
+            (
+                RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                ByteView::from(relationship_key),
+                ByteView::from(relationship.to_bytes()?),
+            ),
+            (
+                MIRROR_REPAIR_KEYSPACE.to_string(),
+                ByteView::from(repair_key),
+                ByteView::from(repair.to_bytes()?),
+            ),
+        ];
+        let failed = |state: &SyncState| matches!(state, SyncState::Failed { .. });
+        if failed(&relationship.state) && !failed(&existing.state) {
+            let stopped = failure_event(&context.storage_handle, relationship, txn_id).await?;
+            writes.extend(
+                stopped
+                    .map(|event| journal_entries(&event))
+                    .transpose()?
+                    .into_iter()
+                    .flatten(),
+            );
+        }
         match context
             .storage_handle
             .send_storage_effect(StorageEffect::BatchWrite {
-                writes: vec![
-                    (
-                        RELATIONSHIP_OUT_KEYSPACE.to_string(),
-                        ByteView::from(relationship_key),
-                        ByteView::from(relationship.to_bytes()?),
-                    ),
-                    (
-                        MIRROR_REPAIR_KEYSPACE.to_string(),
-                        ByteView::from(repair_key),
-                        ByteView::from(repair.to_bytes()?),
-                    ),
-                ],
+                writes,
                 txn_id: Some(txn_id),
             })
             .await
@@ -1040,6 +1057,44 @@ async fn read_out_relationship(
     }
 }
 
+/// The plugin event of a relationship that stops as failed, from the source bucket row its status
+/// transaction reads; none once that bucket is gone.
+async fn failure_event(
+    storage: &StorageHandle,
+    relationship: &SyncRelationship,
+    txn_id: TxnId,
+) -> Result<Option<SourceEvent>, SyncMirrorError> {
+    let source = &relationship.source;
+    let bucket = source.bucket().unwrap_or_default();
+    let read = StorageEffect::Read {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: ByteView::from(bucket.as_bytes().to_vec()),
+        txn_id: Some(txn_id),
+    };
+    let info = match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(None),
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => BucketInfo::from_bytes(&value)?,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+        other => return Err(SyncMirrorError::Unexpected(other)),
+    };
+    let prefix = source.key_prefix().unwrap_or_default();
+    let path = object_permission_path(
+        source.realm_id,
+        info.group_id,
+        source.node_id,
+        bucket,
+        prefix,
+    );
+    Ok(Some(SourceEvent::sync_failure(
+        (info.group_id, path),
+        (relationship.id, relationship.created_by),
+        (source.node_id, Ulid::generate()),
+        unix_timestamp_millis(),
+    )))
+}
+
 fn same_relationship(left: &SyncRelationship, right: &SyncRelationship) -> bool {
     left.id == right.id
         && left.source == right.source
@@ -1582,6 +1637,99 @@ mod tests {
                 .map(|record| record.relationship),
             Some(relationship)
         );
+    }
+
+    /// The plugin journal rows this node has not matched yet.
+    async fn journaled(context: &DriverContext) -> Vec<SourceEvent> {
+        let txn = crate::plugins::store::Txn::direct(context);
+        let pending = aruna_core::plugin_runs::PENDING_ROW;
+        let page = crate::plugins::journal::journal_page(&txn, pending, None, 100).await;
+        page.unwrap()
+            .0
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect()
+    }
+
+    async fn stored(context: &DriverContext, relationship: &SyncRelationship) {
+        let direction = SyncRelationshipDirection::Outgoing;
+        let store = StoreRelationshipOperation::new(relationship.clone(), direction);
+        drive(store, context).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failure_journals_once() {
+        // A relationship that stops as failed journals one `sync_failed` row with its status;
+        // storing it failed again writes none, and a failure after a resume writes a second.
+        let (_dir, context) = setup_auth(None).await;
+        let mut relationship = relationship();
+        stored(&context, &relationship).await;
+        let failed = SyncState::Failed {
+            reason: "access_denied".to_string(),
+        };
+        relationship.state = failed.clone();
+        assert!(store_sync_status(&context, &relationship).await.unwrap());
+        relationship.status.counters.failures = 2;
+        assert!(store_sync_status(&context, &relationship).await.unwrap());
+
+        let events = journaled(&context).await;
+        assert_eq!(events.len(), 1);
+        let source = &relationship.source;
+        let group_id = Ulid::from_bytes([6; 16]);
+        let path = object_permission_path(source.realm_id, group_id, source.node_id, "source", "");
+        assert_eq!(
+            (events[0].kind, &events[0].path),
+            (aruna_core::plugin_runs::SourceKind::SyncFailed, &path)
+        );
+        assert_eq!(events[0].resource, relationship.id.to_string());
+        let prefix = format!("sync_failed/{}/{}/", source.node_id, relationship.id);
+        assert!(events[0].source.starts_with(&prefix));
+
+        relationship.state = SyncState::Enabled;
+        assert!(store_sync_status(&context, &relationship).await.unwrap());
+        relationship.state = failed;
+        assert!(store_sync_status(&context, &relationship).await.unwrap());
+        let events = journaled(&context).await;
+        assert_eq!(events.len(), 2);
+        assert_ne!(events[0].source, events[1].source);
+    }
+
+    #[tokio::test]
+    async fn failure_needs_commit() {
+        // An aborted status transaction, a detached stub and a deleted source bucket journal
+        // nothing.
+        let failed = SyncState::Failed {
+            reason: "access_denied".to_string(),
+        };
+        let (_dir, context) = setup_auth(None).await;
+        let relationship = relationship();
+        stored(&context, &relationship).await;
+        let mut changed = relationship.clone();
+        changed.replicate_deletes = false;
+        changed.state = failed.clone();
+        assert!(store_sync_status(&context, &changed).await.is_err());
+        let mut detached = relationship.clone();
+        detached.state = SyncState::Detached;
+        stored(&context, &detached).await;
+        detached.state = failed.clone();
+        assert!(!store_sync_status(&context, &detached).await.unwrap());
+        assert!(journaled(&context).await.is_empty());
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let mut relationship = relationship;
+        stored(&context, &relationship).await;
+        relationship.state = failed;
+        assert!(store_sync_status(&context, &relationship).await.unwrap());
+        assert!(journaled(&context).await.is_empty());
     }
 
     #[tokio::test]

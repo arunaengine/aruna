@@ -993,6 +993,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn denial_journals_failure() {
+        // A native read whose creator lost READ fails the relationship and journals its
+        // `sync_failed` with that status write, with no replication job queued.
+        use crate::sync::sync_relationship::{
+            StoreRelationshipOperation, SyncRelationshipDirection,
+        };
+        use aruna_core::structs::storage::blob::BucketInfo;
+        use aruna_core::structs::storage::format::Compression;
+        let tempdir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
+        let source = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let target = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let creator = aruna_core::UserId::local(Ulid::from_parts(5, 5), realm_id);
+        let relationship = SyncRelationship {
+            id: Ulid::from_parts(2, 2),
+            source: ArunaArn::s3_bucket(realm_id, source, "source").unwrap(),
+            target: ArunaArn::s3_bucket(realm_id, target, "target").unwrap(),
+            mode: SyncMode::Continuous,
+            reference_handling: ReferenceHandling::Preserve,
+            reference_serving: true,
+            replicate_deletes: true,
+            created_by: creator,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            state: SyncState::Enabled,
+            status: SyncStatusSnapshot::default(),
+        };
+        let direction = SyncRelationshipDirection::Outgoing;
+        let store = StoreRelationshipOperation::new(relationship.clone(), direction);
+        drive(store, &context).await.unwrap();
+        let info = BucketInfo {
+            group_id: Ulid::from_parts(6, 6),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: creator,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        let write = aruna_core::effects::StorageEffect::Write {
+            key_space: aruna_core::keyspaces::S3_BUCKET_KEYSPACE.to_string(),
+            key: b"source".to_vec().into(),
+            value: info.to_bytes().unwrap().into(),
+            txn_id: None,
+        };
+        storage.send_storage_effect(write).await;
+
+        mark_access_denied(&context, relationship.clone()).await;
+
+        let txn = crate::plugins::store::Txn::direct(&context);
+        let pending = aruna_core::plugin_runs::PENDING_ROW;
+        let (rows, _) = crate::plugins::journal::journal_page(&txn, pending, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.resource, relationship.id.to_string());
+        let transition = format!("sync_failed/{source}/{}/", relationship.id);
+        assert!(rows[0].1.source.starts_with(&transition));
+    }
+
+    #[tokio::test]
     async fn preserve_allows_native() {
         let tempdir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
