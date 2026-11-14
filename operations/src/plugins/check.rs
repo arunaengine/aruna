@@ -13,6 +13,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_plugins::broker::{ErrorKind, HostError};
 use aruna_plugins::permission::Permission;
+use ulid::Ulid;
 
 use super::account::read_user;
 use super::grants::{InstallScope, accesses, parse_grants};
@@ -36,15 +37,24 @@ pub fn check_run<'a>(
     config: &'a RealmConfigDocument,
     account: Option<&User>,
 ) -> Result<&'a PluginInstall, HostError> {
-    let run = &scope.run;
+    let run = (scope.run.install_id, scope.run.digest.as_str());
+    check_install((config, scope.realm_id, scope.local), run, account)
+}
+
+/// Steps 0 to 2 for install `install_id` pinned at `digest`, run by `local`.
+pub fn check_install<'a>(
+    (config, realm_id, local): (&'a RealmConfigDocument, RealmId, NodeId),
+    (install_id, digest): (Ulid, &str),
+    account: Option<&User>,
+) -> Result<&'a PluginInstall, HostError> {
     let install = (config.installs.iter())
-        .find(|install| install.install_id == run.install_id)
+        .find(|install| install.install_id == install_id)
         .ok_or_else(|| denied("the install is removed or conflicting"))?;
-    if install.receiver != scope.local {
+    if install.receiver != local {
         return Err(denied("this node does not run the install"));
     }
     let install_scope = InstallScope {
-        realm_id: scope.realm_id,
+        realm_id,
         group_id: install.group_id,
         install_id: install.install_id,
     };
@@ -62,7 +72,7 @@ pub fn check_run<'a>(
             install.state.as_str()
         )));
     }
-    if install.digest != run.digest {
+    if install.digest != digest {
         return Err(denied("the install runs another version now"));
     }
     Ok(install)

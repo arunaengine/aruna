@@ -240,6 +240,9 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         JobPayload::EmailDelivery(spec) => {
             Box::pin(crate::notifications::email::run_email_job(ctx, spec)).await
         }
+        JobPayload::PluginWork(spec) => {
+            Box::pin(crate::jobs::plugin_work::run_plugin_work(ctx, spec)).await
+        }
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",
@@ -270,7 +273,8 @@ pub fn run_cleanup(payload: &JobPayload) {
         | JobPayload::RegisterIdentifiers(_)
         | JobPayload::BackendImport(_)
         | JobPayload::WebhookDelivery(_)
-        | JobPayload::EmailDelivery(_) => {}
+        | JobPayload::EmailDelivery(_)
+        | JobPayload::PluginWork(_) => {}
     }
 }
 

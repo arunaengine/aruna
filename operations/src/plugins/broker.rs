@@ -537,30 +537,8 @@ impl RunBroker {
         install: &PluginInstall,
         path: &str,
     ) -> Result<(String, String), HostError> {
-        let invalid =
-            || HostError::new(ErrorKind::Invalid, format!("{path} is not an object path"));
-        let root = format!("/{}/g/{}/data/", self.scope.realm_id, install.group_id);
-        let rest = path.strip_prefix(&root).ok_or_else(invalid)?;
-        let mut parts = rest.splitn(3, '/');
-        let (node, bucket) = (
-            parts.next().unwrap_or_default(),
-            parts.next().ok_or_else(invalid)?,
-        );
-        let key = parts.next().unwrap_or_default().to_string();
-        let node = NodeId::from_str(node).map_err(|_| invalid())?;
-        if node != self.scope.local {
-            return Err(unavailable(
-                "objects of another node are not reachable from plugins yet",
-            ));
-        }
-        let info = drive(GetBucketOperation::new(bucket.to_string()), &self.ctx).await;
-        match info {
-            Ok(info) if info.group_id == install.group_id => Ok((bucket.to_string(), key)),
-            _ => Err(HostError::new(
-                ErrorKind::NotFound,
-                format!("no bucket at {path}"),
-            )),
-        }
+        let place = (self.scope.realm_id, self.scope.local);
+        local_object(&self.ctx, place, install, path).await
     }
 }
 
@@ -607,6 +585,39 @@ impl RunBroker {
             }
         }
         Ok(visible)
+    }
+}
+
+/// The bucket and key on `local` of an object path below the install's group data; a bucket of
+/// another node or another group is refused.
+pub(crate) async fn local_object(
+    ctx: &DriverContext,
+    (realm_id, local): (aruna_core::structs::identity::realm::RealmId, NodeId),
+    install: &PluginInstall,
+    path: &str,
+) -> Result<(String, String), HostError> {
+    let invalid = || HostError::new(ErrorKind::Invalid, format!("{path} is not an object path"));
+    let root = format!("/{realm_id}/g/{}/data/", install.group_id);
+    let rest = path.strip_prefix(&root).ok_or_else(invalid)?;
+    let mut parts = rest.splitn(3, '/');
+    let (node, bucket) = (
+        parts.next().unwrap_or_default(),
+        parts.next().ok_or_else(invalid)?,
+    );
+    let key = parts.next().unwrap_or_default().to_string();
+    let node = NodeId::from_str(node).map_err(|_| invalid())?;
+    if node != local {
+        return Err(unavailable(
+            "objects of another node are not reachable from plugins yet",
+        ));
+    }
+    let info = drive(GetBucketOperation::new(bucket.to_string()), ctx).await;
+    match info {
+        Ok(info) if info.group_id == install.group_id => Ok((bucket.to_string(), key)),
+        _ => Err(HostError::new(
+            ErrorKind::NotFound,
+            format!("no bucket at {path}"),
+        )),
     }
 }
 

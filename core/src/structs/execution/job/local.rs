@@ -213,6 +213,11 @@ pub enum JobResultPayload {
     Email {
         sent: bool,
     },
+    /// The bytes a plugin work moved and the version it wrote.
+    PluginWork {
+        bytes: u64,
+        version_id: Option<Ulid>,
+    },
 }
 
 impl JobResultPayload {
@@ -233,6 +238,7 @@ impl JobResultPayload {
             JobResultPayload::BackendImport { .. } => "backend_import",
             JobResultPayload::Webhook { .. } => "webhook",
             JobResultPayload::Email { .. } => "email",
+            JobResultPayload::PluginWork { .. } => "plugin_work",
         }
     }
 
@@ -431,6 +437,10 @@ impl JobResultPayload {
             }),
             JobResultPayload::Webhook { status } => serde_json::json!({ "status": status }),
             JobResultPayload::Email { sent } => serde_json::json!({ "sent": sent }),
+            JobResultPayload::PluginWork { bytes, version_id } => serde_json::json!({
+                "bytes": bytes,
+                "version_id": version_id.map(|id| id.to_string()),
+            }),
         }
     }
 }
@@ -951,6 +961,8 @@ pub fn owner_index_prefix(created_by: UserId) -> Key {
 pub enum ActiveJobKind {
     RoCrate,
     Execution,
+    /// Unfinished native work of one plugin install, counted per install account.
+    PluginWork,
 }
 
 impl ActiveJobKind {
@@ -959,13 +971,18 @@ impl ActiveJobKind {
         if payload.is_rocrate() {
             return Some(Self::RoCrate);
         }
-        matches!(payload, JobPayload::Execution(_)).then_some(Self::Execution)
+        match payload {
+            JobPayload::Execution(_) => Some(Self::Execution),
+            JobPayload::PluginWork(_) => Some(Self::PluginWork),
+            _ => None,
+        }
     }
 
     fn tag(self) -> u8 {
         match self {
             Self::RoCrate => 0,
             Self::Execution => 1,
+            Self::PluginWork => 2,
         }
     }
 }
