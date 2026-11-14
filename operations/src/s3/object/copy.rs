@@ -282,6 +282,13 @@ async fn copy_inner(
     progress: Option<Arc<AtomicU64>>,
     (token, version): (Option<&TokenRead>, Option<Ulid>),
 ) -> Result<CopyResultData, CopyObjectError> {
+    // A given version that already exists was written by an earlier attempt whose answer was
+    // lost; it is answered without the source, which may be gone by now.
+    if let Some(version_id) = version
+        && let Some(committed) = committed_copy(context, &input, version_id).await?
+    {
+        return Ok(committed);
+    }
     ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
         .await
         .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
@@ -540,6 +547,36 @@ async fn sealed_copy(
         source_version_id: Some(source_version_id),
         source_last_modified,
     })
+}
+
+/// The destination version `version_id` when it exists, described as the copy that wrote it.
+async fn committed_copy(
+    context: &DriverContext,
+    input: &CopyObjectInput,
+    version_id: Ulid,
+) -> Result<Option<CopyResultData>, CopyObjectError> {
+    let head = HeadObjectInput {
+        bucket: input.dest_bucket.clone(),
+        key: input.dest_key.clone(),
+        version_id: Some(version_id),
+    };
+    let head = match drive(HeadObjectOperation::new(head), context).await {
+        Ok(head) => head,
+        Err(HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion) => return Ok(None),
+        Err(error) => return Err(head_error(error)),
+    };
+    let size = (head.location.as_ref().map(|location| location.blob_size))
+        .or_else(|| (head.source_metadata.as_ref()).map(|metadata| metadata.content_length))
+        .unwrap_or_default();
+    Ok(Some(CopyResultData {
+        location: head.location,
+        size,
+        source_metadata: head.source_metadata,
+        version_id,
+        created_at: UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms()),
+        source_version_id: None,
+        source_last_modified: None,
+    }))
 }
 
 /// Admits a plaintext read of the source bucket the way GET does: an encrypting bucket must be
@@ -1081,6 +1118,62 @@ pub(crate) mod test {
             .await
             .unwrap();
         assert_eq!(head.resolved_version_id, Some(version));
+    }
+
+    #[tokio::test]
+    async fn replays_without_source() {
+        // The copy committed and its answer was lost; the source was deleted since, yet the
+        // retry answers the committed version instead of failing on the missing source.
+        use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let config = put_config(realm_id, group_id, node_id, "bucket", "a.txt", b"bytes");
+        drive(PutObjectOperation::new(config), &context)
+            .await
+            .unwrap();
+        let input = || CopyObjectInput {
+            source_bucket: "bucket".to_string(),
+            source_key: "a.txt".to_string(),
+            source_version_id: None,
+            source_group_id: group_id,
+            source_auth_context: auth_context(user_id),
+            dest_bucket: "bucket".to_string(),
+            dest_key: "b.txt".to_string(),
+            user_id,
+            group_id,
+            realm_id,
+            node_id,
+            quota_ceiling: None,
+            conditions: CopySourceConditions::default(),
+            metadata: None,
+            restrictions: None,
+            references: CopyReferences::Materialize,
+            job_id: None,
+        };
+        let version = Ulid::generate();
+        let first = copy_object_at(&context, input(), version, None).await;
+        assert_eq!(first.unwrap().size, 5);
+        let delete = DeleteObjectInput {
+            bucket: "bucket".to_string(),
+            key: "a.txt".to_string(),
+            version_id: None,
+            group_id,
+            realm_id,
+            node_id,
+            deleted_by: user_id,
+        };
+        drive(DeleteObjectOperation::new(delete), &context)
+            .await
+            .unwrap();
+        let fresh = copy_object_at(&context, input(), Ulid::generate(), None).await;
+        assert!(fresh.is_err(), "a new copy of the deleted source must fail");
+        let again = copy_object_at(&context, input(), version, None)
+            .await
+            .unwrap();
+        assert_eq!((again.version_id, again.size), (version, 5));
     }
 
     #[tokio::test]
