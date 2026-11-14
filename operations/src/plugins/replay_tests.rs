@@ -8,7 +8,7 @@ use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::match_pending;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::store::decode;
-use crate::plugins::worker::tests::{created, failing_sync, install_artifact, installed, synced};
+use crate::plugins::worker::tests::{created, echoed_sync, install_artifact, installed, synced};
 use aruna_core::keyspaces::PLUGIN_GAPS_KEYSPACE;
 use aruna_core::plugin_installs::Widening;
 use aruna_core::plugin_runs::{GapRow, gap_key};
@@ -247,7 +247,7 @@ async fn unreadable_clock() {
 #[tokio::test]
 async fn pruned_journal() {
     let fixture = crate::plugins::install::tests::Fixture::new().await;
-    let install = install_artifact(&fixture, failing_sync()).await;
+    let install = install_artifact(&fixture, echoed_sync()).await;
     let local = fixture.actor.node_id;
     let now = install.active_since_ms.unwrap() + JOURNAL_RETENTION_MS + 60 * MINUTE;
     let config = config(&fixture).await;

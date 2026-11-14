@@ -49,11 +49,15 @@ pub(crate) fn secured() -> Vec<u8> {
     artifact(true, true)
 }
 
-/// The runnable fixture that also declares `sync_failed`, handled like `sync_completed`.
-pub(crate) fn failing_sync() -> Vec<u8> {
+/// The runnable fixture with both sync triggers, handled by `echo`, which answers the event.
+pub(crate) fn echoed_sync() -> Vec<u8> {
+    use aruna_plugins::trigger::TriggerKind;
     let (component, mut manifest) = bare();
-    let completed = manifest.triggers[&aruna_plugins::trigger::TriggerKind::SyncCompleted].clone();
-    (manifest.triggers).insert(aruna_plugins::trigger::TriggerKind::SyncFailed, completed);
+    let echo = manifest.triggers[&TriggerKind::DatasetCreated].clone();
+    for kind in [TriggerKind::SyncCompleted, TriggerKind::SyncFailed] {
+        manifest.triggers.insert(kind, echo.clone());
+    }
+    manifest.handlers.retain(|handler| handler != "spin");
     (manifest.connections, manifest.secrets) = (BTreeMap::new(), BTreeMap::new());
     attach_manifest(component, &manifest).unwrap()
 }
