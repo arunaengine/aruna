@@ -342,28 +342,7 @@ async fn install(
         summary["digest"].as_str().unwrap_or_default(),
         summary["group"].as_str().unwrap_or_default(),
     )];
-    for line in summary["permissions"].as_array().into_iter().flatten() {
-        let granted = line["granted"].as_array().map_or(0, Vec::len);
-        lines.push(format!(
-            "  {} granted on {granted} paths",
-            line["permission"].as_str().unwrap_or_default()
-        ));
-    }
-    for line in summary["secrets"].as_array().into_iter().flatten() {
-        lines.push(format!(
-            "  secret {} ({}) uses {}",
-            line["slot"].as_str().unwrap_or_default(),
-            line["kind"].as_str().unwrap_or_default(),
-            line["secret"].as_str().unwrap_or_default()
-        ));
-    }
-    for line in summary["connections"].as_array().into_iter().flatten() {
-        let granted = line["granted"].as_bool().unwrap_or(false);
-        lines.push(format!(
-            "  connection {} granted: {granted}",
-            line["url"].as_str().unwrap_or_default()
-        ));
-    }
+    lines.extend(summary_lines(summary));
     lines.push(match preview {
         true => format!(
             "install with --id {} --version {}",
@@ -554,6 +533,44 @@ async fn change(
     context.out.line(lines.join("\n"))
 }
 
+/// The summary's grants, secrets and services, one line each, as the installer reads them.
+fn summary_lines(summary: &Value) -> Vec<String> {
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    let mut lines = Vec::new();
+    for line in summary["permissions"].as_array().into_iter().flatten() {
+        let granted = line["granted"].as_array().map_or(0, Vec::len);
+        let grant = text(&line["permission"]);
+        lines.push(format!("  {grant} granted on {granted} paths"));
+    }
+    for line in summary["secrets"].as_array().into_iter().flatten() {
+        let (slot, kind, secret) = (
+            text(&line["slot"]),
+            text(&line["kind"]),
+            text(&line["secret"]),
+        );
+        let readable = match line["value"].as_bool() == Some(true) {
+            true => ", and the code can read its value",
+            false => "",
+        };
+        lines.push(format!("  secret {slot} ({kind}) uses {secret}{readable}"));
+    }
+    for line in summary["connections"].as_array().into_iter().flatten() {
+        let methods: Vec<String> = (line["methods"].as_array().into_iter().flatten())
+            .map(text)
+            .collect();
+        let methods = match methods.len() {
+            6 => "any method".to_string(),
+            _ => methods.join(", "),
+        };
+        let (name, url) = (text(&line["name"]), text(&line["url"]));
+        lines.push(format!(
+            "  service {name}: {url}, {methods}; the plugin reads everything this service \
+             answers, and can send there anything it may read"
+        ));
+    }
+    lines
+}
+
 #[derive(Debug, Serialize)]
 struct Built {
     artifact: PathBuf,
@@ -565,6 +582,30 @@ struct Built {
 mod tests {
     use super::*;
     use aruna_plugins::package::load_manifest;
+
+    #[test]
+    fn summary_shows_services() {
+        let all = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
+        let summary = serde_json::json!({
+            "permissions": [{"permission": "read", "granted": ["/r/g/a/**"]}],
+            "secrets": [{"slot": "key", "kind": "bearer", "secret": "group:key", "value": true}],
+            "connections": [
+                {"name": "catalog", "url": "https://c.example.org", "methods": ["GET", "POST"]},
+                {"name": "mirror", "url": "https://m.example.org", "methods": all}
+            ]
+        });
+        let tail = "the plugin reads everything this service answers, and can send there \
+                    anything it may read";
+        assert_eq!(
+            summary_lines(&summary),
+            [
+                "  read granted on 1 paths".to_string(),
+                "  secret key (bearer) uses group:key, and the code can read its value".into(),
+                format!("  service catalog: https://c.example.org, GET, POST; {tail}"),
+                format!("  service mirror: https://m.example.org, any method; {tail}"),
+            ]
+        );
+    }
 
     #[test]
     fn starter_projects() {
