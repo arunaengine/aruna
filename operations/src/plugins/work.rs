@@ -24,10 +24,10 @@ use crate::jobs::store::{JobMutationError, read_job_record, set_cancel_requested
 pub const WORK_ROW: u8 = b'w';
 pub const WORK_INDEX: u8 = b'i';
 
-/// What names one work across calls: the author's key, or the run and call ordinal without one.
+/// What names one work across calls: the run and the ordinal of the call that started it, so a
+/// rerun of that run gets the same work back.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Identity {
-    Key(String),
     Call { run_id: Ulid, ordinal: u32 },
 }
 
@@ -154,7 +154,7 @@ impl WorkRow {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WorkError {
-    #[error("the key names other work with other arguments")]
+    #[error("the call started other work with other arguments")]
     Conflict,
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -374,8 +374,8 @@ async fn reconcile(
     Ok(Some(job))
 }
 
-/// Deletes the unkeyed rows nobody can ask for again: settled, no cancel open, kept past the run
-/// retention, and their run record pruned. Keyed rows stay while their install exists.
+/// Deletes the rows nobody can ask for again: settled, no cancel open, kept past the run
+/// retention, and their run record pruned.
 pub async fn prune_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
     let txn = Txn::direct(ctx);
     let mut dropped = Vec::new();

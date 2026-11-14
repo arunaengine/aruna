@@ -1157,7 +1157,10 @@ mod tests {
         write_doc(&ctx, REALM_CONFIG_KEYSPACE, key, row.into()).await;
         let kind = aruna_operations::plugins::work::WorkKind::Copy;
         let work = WorkRow::reserved(&install, kind, Ulid::from_parts(5, 5), 1);
-        let identity = Identity::Key("copy-1".into());
+        let identity = Identity::Call {
+            run_id: work.run_id,
+            ordinal: 0,
+        };
         reserve(&ctx, (&install, &identity), work.clone())
             .await
             .unwrap();

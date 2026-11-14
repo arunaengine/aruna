@@ -47,7 +47,10 @@ pub(crate) async fn recorded(
 ) -> PluginWorkSpec {
     let mut row = WorkRow::reserved(install, WorkKind::Copy, Ulid::generate(), 1);
     row.version_id = Some(Ulid::generate());
-    let identity = Identity::Key(format!("{source}>{target}"));
+    let identity = Identity::Call {
+        run_id: row.run_id,
+        ordinal: 0,
+    };
     let (row, _) = reserve(&fixture.ctx, (install, &identity), row)
         .await
         .unwrap();

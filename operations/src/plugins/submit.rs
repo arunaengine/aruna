@@ -29,8 +29,7 @@ pub struct CopyRequest {
     pub source: String,
     pub source_version: Option<Ulid>,
     pub target: String,
-    /// The author's key, which names the work across runs.
-    pub key: Option<String>,
+    /// The call's ordinal in its run; with the run it names the work.
     pub ordinal: u32,
 }
 
@@ -50,12 +49,9 @@ pub async fn start_copy(
     let place = (scope.realm_id, scope.local);
     local_object(ctx, place, &install, &request.source).await?;
     local_object(ctx, place, &install, &request.target).await?;
-    let identity = match &request.key {
-        Some(key) => Identity::Key(key.clone()),
-        None => Identity::Call {
-            run_id: scope.run.run_id,
-            ordinal: request.ordinal,
-        },
+    let identity = Identity::Call {
+        run_id: scope.run.run_id,
+        ordinal: request.ordinal,
     };
     let version = request.source_version.map(|version| version.to_bytes());
     let parts: [&[u8]; 4] = [
@@ -71,7 +67,7 @@ pub async fn start_copy(
     let (row, _) = match reserve(ctx, (&install, &identity), proposed).await {
         Ok(found) => found,
         Err(WorkError::Conflict) => {
-            let message = "the key names a copy with other arguments";
+            let message = "this call started a copy with other arguments";
             return Err(HostError::new(ErrorKind::Conflict, message));
         }
         Err(WorkError::Store(error)) => return Err(unavailable(error.0)),

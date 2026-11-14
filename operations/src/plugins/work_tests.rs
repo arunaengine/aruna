@@ -1,5 +1,5 @@
-//! Tests work rows: adoption, conflicts and dispatch; settlement before the job is pruned; the
-//! lifetime of unkeyed rows; and the cancel a removed install's work gets first.
+//! Tests work rows: adoption, conflicts and dispatch; settlement before the job is pruned; how
+//! long settled rows stay; and the cancel a removed install's work gets first.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -19,6 +19,14 @@ fn proposed(install: &PluginInstall, digest: u8) -> WorkRow {
     row
 }
 
+/// The identity of call `ordinal` of one fixed run.
+fn call(ordinal: u32) -> Identity {
+    Identity::Call {
+        run_id: Ulid::from_parts(9, 9),
+        ordinal,
+    }
+}
+
 fn job(nonce: u64) -> JobId {
     let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap();
     JobId::from_parts(1_700_000_000_000, handle, BucketId::new(0).unwrap(), nonce).unwrap()
@@ -28,21 +36,17 @@ fn job(nonce: u64) -> JobId {
 async fn repeated_call_adopts() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
-    let identity = Identity::Key("copy-1".into());
+    let identity = call(1);
     let first = proposed(&install, 1);
     let reserved = reserve(&fixture.ctx, (&install, &identity), first.clone()).await;
     assert_eq!(reserved, Ok((first.clone(), Reserve::Fresh)));
-    // A repeat mints new ids, but the stored ones answer.
+    // A rerun of the call mints new ids, but the stored ones answer.
     let again = reserve(&fixture.ctx, (&install, &identity), proposed(&install, 1)).await;
     assert_eq!(again, Ok((first.clone(), Reserve::Earlier)));
     let other = reserve(&fixture.ctx, (&install, &identity), proposed(&install, 2)).await;
     assert_eq!(other, Err(WorkError::Conflict));
-    let call = Identity::Call {
-        run_id: first.run_id,
-        ordinal: 3,
-    };
-    let unkeyed = reserve(&fixture.ctx, (&install, &call), proposed(&install, 2)).await;
-    assert_eq!(unkeyed.map(|(_, reserve)| reserve), Ok(Reserve::Fresh));
+    let next = reserve(&fixture.ctx, (&install, &call(3)), proposed(&install, 2)).await;
+    assert_eq!(next.map(|(_, reserve)| reserve), Ok(Reserve::Fresh));
     let found = read_work(&fixture.ctx, install.install_id, first.work_id).await;
     assert_eq!(found, Ok(Some(first)));
     let missing = read_work(&fixture.ctx, install.install_id, Ulid::generate()).await;
@@ -53,7 +57,7 @@ async fn repeated_call_adopts() {
 async fn reinstall_adopts_nothing() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
-    let identity = Identity::Key("copy-1".into());
+    let identity = call(1);
     let first = proposed(&install, 1);
     reserve(&fixture.ctx, (&install, &identity), first.clone())
         .await
@@ -61,7 +65,7 @@ async fn reinstall_adopts_nothing() {
     let mut reinstalled = install.clone();
     reinstalled.account = UserId::local(Ulid::generate(), install.account.realm_id);
     let other = proposed(&install, 2);
-    let second = Identity::Key("copy-2".into());
+    let second = call(2);
     reserve(&fixture.ctx, (&install, &second), other.clone())
         .await
         .unwrap();
@@ -94,7 +98,7 @@ async fn dispatch_records_once() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);
-    let identity = Identity::Key("copy-1".into());
+    let identity = call(1);
     reserve(&fixture.ctx, (&install, &identity), row.clone())
         .await
         .unwrap();
@@ -175,7 +179,7 @@ async fn settles_before_pruning() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);
-    let identity = Identity::Key("copy-1".into());
+    let identity = call(1);
     reserve(&fixture.ctx, (&install, &identity), row.clone())
         .await
         .unwrap();
@@ -213,23 +217,22 @@ async fn settles_before_pruning() {
 }
 
 #[tokio::test]
-async fn prunes_unkeyed_rows() {
-    // Unkeyed rows go once settled, aged and their run is pruned; keyed rows stay.
+async fn prunes_settled_rows() {
+    // A settled row goes once it aged and its run is pruned, since no rerun can ask for it.
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let ctx = &fixture.ctx;
-    let run = crate::plugins::runs::tests::queued(install.install_id, 1);
-    crate::plugins::runs::admit(ctx, &run).await.unwrap();
-    let call = Identity::Call {
-        run_id: run.run_id,
-        ordinal: 0,
-    };
-    let keyed = Identity::Key("copy-1".into());
     let mut rows = Vec::new();
-    for identity in [&call, &keyed] {
+    for seq in [1, 2] {
+        let run = crate::plugins::runs::tests::queued(install.install_id, seq);
+        crate::plugins::runs::admit(ctx, &run).await.unwrap();
+        let identity = Identity::Call {
+            run_id: run.run_id,
+            ordinal: 0,
+        };
         let row = proposed(&install, 1);
-        reserve(ctx, (&install, identity), row.clone())
+        reserve(ctx, (&install, &identity), row.clone())
             .await
             .unwrap();
         let settle = |row: &mut WorkRow| {
@@ -239,22 +242,22 @@ async fn prunes_unkeyed_rows() {
         update_work(ctx, (install.install_id, row.work_id), settle)
             .await
             .unwrap();
-        rows.push(row);
+        rows.push((run.run_id, row));
     }
     let late = 1 + RUN_RETENTION_MS;
     assert_eq!(prune_work(ctx, late - 1).await, Ok(0));
-    // The run still exists, so a rerun could ask for the work again.
+    // Both runs still exist, so a rerun could ask for the work again.
     assert_eq!(prune_work(ctx, late).await, Ok(0));
-    // The run prune removed the run record.
-    let key = run_key(install.install_id, run.run_id);
+    // The run prune removed the first run's record only.
+    let key = run_key(install.install_id, rows[0].0);
     Txn::direct(ctx)
         .delete(PLUGIN_RUNS_KEYSPACE, vec![key])
         .await
         .unwrap();
     assert_eq!(prune_work(ctx, late).await, Ok(1));
     let read = |row: &WorkRow| read_work(ctx, install.install_id, row.work_id);
-    assert_eq!(read(&rows[0]).await, Ok(None));
-    assert!(read(&rows[1]).await.unwrap().is_some());
+    assert_eq!(read(&rows[0].1).await, Ok(None));
+    assert!(read(&rows[1].1).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -268,10 +271,10 @@ async fn removal_cancels_first() {
     let install = installed(&fixture).await;
     let ctx = &fixture.ctx;
     let mut rows = Vec::new();
-    for name in ["running", "settled", "reserved"] {
+    // Calls 0, 1 and 2: running, settled and reserved work.
+    for ordinal in 0..3 {
         let row = proposed(&install, 1);
-        let identity = Identity::Key(name.into());
-        reserve(ctx, (&install, &identity), row.clone())
+        reserve(ctx, (&install, &call(ordinal)), row.clone())
             .await
             .unwrap();
         rows.push(row);
@@ -318,7 +321,7 @@ async fn reserved_work_settles() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);
-    let identity = Identity::Key("copy-1".into());
+    let identity = call(1);
     reserve(&fixture.ctx, (&install, &identity), row.clone())
         .await
         .unwrap();
@@ -349,7 +352,7 @@ async fn removal_keeps_finished() {
     let install = installed(&fixture).await;
     let ctx = &fixture.ctx;
     let row = proposed(&install, 1);
-    let identity = Identity::Key("copy-1".into());
+    let identity = call(1);
     reserve(ctx, (&install, &identity), row.clone())
         .await
         .unwrap();

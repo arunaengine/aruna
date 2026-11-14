@@ -1,5 +1,5 @@
-//! Tests starting copies from runs: a repeated call answers the same work and job, other
-//! arguments under one key conflict, and refused paths or a paused install start nothing.
+//! Tests starting copies from runs: a repeated call answers the same work and job, the same call
+//! with other arguments conflicts, and refused paths or a paused install start nothing.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -33,7 +33,6 @@ fn request(fixture: &Fixture, install: &PluginInstall, target: &str) -> CopyRequ
         source: path(fixture, install, "in/a.txt"),
         source_version: None,
         target: path(fixture, install, target),
-        key: Some("copy-a".into()),
         ordinal: 0,
     }
 }
@@ -62,12 +61,16 @@ async fn repeat_finds_work() {
     let row = row.unwrap().unwrap();
     assert_eq!(row.state, WorkState::Dispatched);
     assert!(row.job.is_some() && row.version_id.is_some());
-    let other = request(&fixture, &install, "out/b.txt");
-    let refused = start_copy(&fixture.ctx, &scope, other).await;
+    // The same call with other arguments conflicts; the run's next call starts its own copy.
+    let mut other = request(&fixture, &install, "out/b.txt");
+    let refused = start_copy(&fixture.ctx, &scope, other.clone()).await;
     assert_eq!(
         refused.map_err(|error| error.kind),
         Err(ErrorKind::Conflict)
     );
+    other.ordinal = 1;
+    let next = start_copy(&fixture.ctx, &scope, other).await.unwrap();
+    assert_ne!(next, first);
 }
 
 #[tokio::test]
