@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use tracing::warn;
 
+use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
@@ -87,6 +88,7 @@ pub struct NodeNameConfig {
 pub struct NodeNameOperation {
     config: NodeNameConfig,
     txn_id: Option<TxnId>,
+    attempts: usize,
     state: NodeNameState,
     output: Option<Result<NodeDisplay, NodeNameError>>,
 }
@@ -148,6 +150,7 @@ impl NodeNameOperation {
         Self {
             config,
             txn_id: None,
+            attempts: 0,
             state: NodeNameState::Init,
             output: None,
         }
@@ -160,6 +163,7 @@ impl NodeNameOperation {
     }
 
     fn begin_transaction(&mut self) -> Effects {
+        self.attempts += 1;
         self.state = NodeNameState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -416,6 +420,12 @@ impl Operation for NodeNameOperation {
                     self.txn_id = None;
                     self.state = NodeNameState::ScheduleSyncDrain;
                     smallvec![schedule_drain_effect()]
+                }
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) if self.attempts < COMMIT_ATTEMPTS => {
+                    self.txn_id = None;
+                    self.begin_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;

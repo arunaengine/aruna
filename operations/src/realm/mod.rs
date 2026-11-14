@@ -6,6 +6,8 @@ pub mod add_role;
 pub mod announce_presence;
 pub mod assign_role;
 pub mod claim_admin;
+#[cfg(test)]
+mod commit_retry;
 pub mod create_realm;
 pub mod ensure_config;
 pub mod forward;
@@ -25,3 +27,7 @@ pub mod set_policies;
 pub mod set_portal;
 pub mod set_provider;
 pub mod set_quota;
+
+/// Commits one realm config write may try. Background placement and sync writes change the same
+/// document; each attempt rereads, validates and reapplies its change to the newer document.
+const COMMIT_ATTEMPTS: usize = 3;

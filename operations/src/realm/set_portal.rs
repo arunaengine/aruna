@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use tracing::warn;
 
+use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
@@ -45,6 +46,7 @@ pub struct SetPortalConfig {
 pub struct SetPortalOperation {
     config: SetPortalConfig,
     txn_id: Option<TxnId>,
+    attempts: usize,
     state: SetPortalState,
     output: Option<Result<RealmConfigDocument, SetPortalError>>,
 }
@@ -105,6 +107,7 @@ impl SetPortalOperation {
         Self {
             config,
             txn_id: None,
+            attempts: 0,
             state: SetPortalState::Init,
             output: None,
         }
@@ -235,6 +238,15 @@ impl SetPortalOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
+    /// Opens a transaction that reads, validates and applies the change from the start.
+    fn start_transaction(&mut self) -> Effects {
+        self.attempts += 1;
+        self.state = SetPortalState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
     fn fail(&mut self, error: SetPortalError) -> Effects {
         let cleanup = self.abort();
         self.state = SetPortalState::Error;
@@ -276,12 +288,7 @@ impl Operation for SetPortalOperation {
             SetPortalState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
-                        Ok(true) => {
-                            self.state = SetPortalState::StartTransaction;
-                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                                read: false
-                            })]
-                        }
+                        Ok(true) => self.start_transaction(),
                         Ok(false) => self.fail(SetPortalError::Unauthorized),
                         Err(error) => {
                             warn!(error = %error, "Realm portal features authorization check failed");
@@ -353,6 +360,12 @@ impl Operation for SetPortalOperation {
                     self.txn_id = None;
                     self.state = SetPortalState::ScheduleSyncDrain { document };
                     smallvec![schedule_drain_effect()]
+                }
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) if self.attempts < COMMIT_ATTEMPTS => {
+                    self.txn_id = None;
+                    self.start_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -547,6 +560,18 @@ mod tests {
         let emitted = format!("{effects:?}");
         assert!(emitted.contains(&policy_admin_path(realm_id)));
         assert!(emitted.contains("WRITE"));
+    }
+
+    #[test]
+    fn retry_rereads_config() {
+        // A commit lost to a background config write reads again and keeps that write.
+        let actor = actor(RealmId::from_bytes([1u8; 32]));
+        let mut first = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        first.ensure_node(actor.node_id, RealmNodeKind::Management);
+        let mut operation = SetPortalOperation::new(portal_config(&actor, features()));
+        let written =
+            crate::realm::commit_retry::conflict_then_commit(&mut operation, &actor, &first);
+        assert_eq!(written.portal_features, features());
     }
 
     #[test]

@@ -26,6 +26,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
+use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
@@ -43,10 +44,6 @@ pub struct SetQuotaConfig {
     /// Whether replicas count toward group quotas, published as its own operation.
     pub replicas: ReplicaQuota,
 }
-
-/// Commits one quota write may try. Background placement and sync writes change the same
-/// document; the quota replaces wholesale, so re-applying it to the newer document is correct.
-const COMMIT_ATTEMPTS: usize = 3;
 
 #[derive(Debug, PartialEq)]
 pub struct SetQuotaOperation {

@@ -25,6 +25,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
+use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::target_placement_ref;
 use crate::realm::assign_role::should_seed_role;
@@ -50,6 +51,7 @@ pub struct SetAdminConfig {
 pub struct SetAdminOperation {
     config: SetAdminConfig,
     txn_id: Option<TxnId>,
+    attempts: usize,
     state: SetAdminState,
     narrowed: bool,
     output: Option<Result<HashSet<UserId>, SetAdminError>>,
@@ -108,6 +110,7 @@ impl SetAdminOperation {
         Self {
             config,
             txn_id: None,
+            attempts: 0,
             state: SetAdminState::Init,
             narrowed: false,
             output: None,
@@ -254,6 +257,15 @@ impl SetAdminOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
+    /// Opens a transaction that reads, validates and applies the change from the start.
+    fn start_transaction(&mut self) -> Effects {
+        self.attempts += 1;
+        self.state = SetAdminState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
     fn fail(&mut self, error: SetAdminError) -> Effects {
         let cleanup = self.abort();
         self.state = SetAdminState::Error;
@@ -299,6 +311,10 @@ impl Operation for SetAdminOperation {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             if self.state == SetAdminState::CommitTransaction {
                 self.txn_id = None;
+                // It reads the realm config, so a background config write can win its commit.
+                if error == StorageError::TransactionConflict && self.attempts < COMMIT_ATTEMPTS {
+                    return self.start_transaction();
+                }
             }
             return self.fail(error.into());
         }
@@ -313,12 +329,7 @@ impl Operation for SetAdminOperation {
                 SetAdminState::Auth,
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
             ) => match allowed {
-                Ok(true) => {
-                    self.state = SetAdminState::StartTransaction;
-                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                        read: false
-                    })]
-                }
+                Ok(true) => self.start_transaction(),
                 Ok(false) => self.fail(SetAdminError::Unauthorized),
                 Err(error) => {
                     warn!(error = %error, "Realm admin authorization check failed");

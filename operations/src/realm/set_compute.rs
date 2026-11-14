@@ -24,6 +24,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
+use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
@@ -45,6 +46,7 @@ pub struct SetComputeConfig {
 pub struct SetComputeOperation {
     config: SetComputeConfig,
     txn_id: Option<TxnId>,
+    attempts: usize,
     state: SetComputeState,
     output: Option<Result<RealmConfigDocument, SetComputeError>>,
 }
@@ -105,6 +107,7 @@ impl SetComputeOperation {
         Self {
             config,
             txn_id: None,
+            attempts: 0,
             state: SetComputeState::Init,
             output: None,
         }
@@ -236,6 +239,15 @@ impl SetComputeOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
+    /// Opens a transaction that reads, validates and applies the change from the start.
+    fn start_transaction(&mut self) -> Effects {
+        self.attempts += 1;
+        self.state = SetComputeState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
     fn fail(&mut self, error: SetComputeError) -> Effects {
         let cleanup = self.abort();
         self.state = SetComputeState::Error;
@@ -277,12 +289,7 @@ impl Operation for SetComputeOperation {
             SetComputeState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
-                        Ok(true) => {
-                            self.state = SetComputeState::StartTransaction;
-                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                                read: false
-                            })]
-                        }
+                        Ok(true) => self.start_transaction(),
                         Ok(false) => self.fail(SetComputeError::Unauthorized),
                         Err(error) => {
                             warn!(error = %error, "Realm compute authorization check failed");
@@ -354,6 +361,12 @@ impl Operation for SetComputeOperation {
                     self.txn_id = None;
                     self.state = SetComputeState::ScheduleSyncDrain { document };
                     smallvec![schedule_drain_effect()]
+                }
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) if self.attempts < COMMIT_ATTEMPTS => {
+                    self.txn_id = None;
+                    self.start_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -662,6 +675,18 @@ mod tests {
         let emitted = format!("{effects:?}");
         assert!(emitted.contains(&policy_admin_path(realm_id)));
         assert!(emitted.contains("WRITE"));
+    }
+
+    #[test]
+    fn retry_rereads_config() {
+        // A commit lost to a background config write reads again and keeps that write.
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let actor = actor(realm_id);
+        let first = management_config(realm_id, &actor);
+        let mut operation = SetComputeOperation::new(compute_config(&actor, configured()));
+        let written =
+            crate::realm::commit_retry::conflict_then_commit(&mut operation, &actor, &first);
+        assert_eq!(written.compute, configured());
     }
 
     #[test]

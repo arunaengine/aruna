@@ -177,6 +177,19 @@ async fn refuses_server_node() {
 }
 
 #[test]
+fn retry_rereads_config() {
+    // A commit lost to a background config write reads again and keeps that write.
+    let actor = actor(1);
+    let mut first = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+    first.ensure_node(actor.node_id, RealmNodeKind::Management);
+    let profile = input(Some("mailer"), Some("secret-1"));
+    let mut operation = SetEmailOperation::new(email_config(&actor, Some(profile)));
+    let written = crate::realm::commit_retry::conflict_then_commit(&mut operation, &actor, &first);
+    assert_eq!(written.email, operation.finalize().unwrap());
+    assert_eq!(opened(&written), vec![b"secret-1".to_vec()]);
+}
+
+#[test]
 fn denied_is_terminal() {
     let mut operation = SetEmailOperation::new(email_config(&actor(1), None));
     let effects = operation.start();

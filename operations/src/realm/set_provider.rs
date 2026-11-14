@@ -25,6 +25,7 @@ use thiserror::Error;
 use tracing::warn;
 use url::Url;
 
+use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
@@ -54,6 +55,7 @@ pub struct SetProviderConfig {
 pub struct SetProviderOperation {
     config: SetProviderConfig,
     txn_id: Option<TxnId>,
+    attempts: usize,
     state: SetProviderState,
     output: Option<Result<RealmConfigDocument, SetProviderError>>,
 }
@@ -145,6 +147,7 @@ impl SetProviderOperation {
         Self {
             config,
             txn_id: None,
+            attempts: 0,
             state: SetProviderState::Init,
             output: None,
         }
@@ -287,6 +290,15 @@ impl SetProviderOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
+    /// Opens a transaction that reads, validates and applies the change from the start.
+    fn start_transaction(&mut self) -> Effects {
+        self.attempts += 1;
+        self.state = SetProviderState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
     fn fail(&mut self, error: SetProviderError) -> Effects {
         let cleanup = self.abort();
         self.state = SetProviderState::Error;
@@ -335,12 +347,7 @@ impl Operation for SetProviderOperation {
             SetProviderState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
-                        Ok(true) => {
-                            self.state = SetProviderState::StartTransaction;
-                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                                read: false
-                            })]
-                        }
+                        Ok(true) => self.start_transaction(),
                         Ok(false) => self.fail(SetProviderError::Unauthorized),
                         Err(error) => {
                             warn!(error = %error, "Realm OIDC provider authorization check failed");
@@ -412,6 +419,12 @@ impl Operation for SetProviderOperation {
                     self.txn_id = None;
                     self.state = SetProviderState::ScheduleSyncDrain { document };
                     smallvec![schedule_drain_effect()]
+                }
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                }) if self.attempts < COMMIT_ATTEMPTS => {
+                    self.txn_id = None;
+                    self.start_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -570,6 +583,18 @@ mod tests {
         let emitted = format!("{effects:?}");
         assert!(emitted.contains(&policy_admin_path(actor().realm_id)));
         assert!(emitted.contains("WRITE"));
+    }
+
+    #[test]
+    fn retry_rereads_config() {
+        // A commit lost to a background config write reads again and keeps that write.
+        let actor = actor();
+        let mut first = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        first.ensure_node(actor.node_id, RealmNodeKind::Management);
+        let mut operation = operation(ProviderChange::Upsert(provider("ls", "https://ls.example")));
+        let written =
+            crate::realm::commit_retry::conflict_then_commit(&mut operation, &actor, &first);
+        assert_eq!(ids(&written), vec!["ls"]);
     }
 
     #[test]
