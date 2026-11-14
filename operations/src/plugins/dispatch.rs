@@ -1,4 +1,4 @@
-//! Starts runs on the receiver: by hand with a JSON input, and on `every` timers. A timer
+//! Starts runs on the receiver: by hand with the manual form, and on `every` timers. A timer
 //! queues its occurrence and advances its last due time in one transaction.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
@@ -11,13 +11,14 @@ use aruna_core::plugin_runs::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_plugins::trigger::TriggerKind;
+use aruna_plugins::trigger::{Trigger, TriggerKind};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::install::{InstallError, check_admin, pick_version, read_config, read_manifest};
 use super::receiver::lost_reason;
 use super::runs::{ADMISSIONS, RunError, admit, admit_in};
+use super::settings::{SettingError, check_fields};
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
 
@@ -34,8 +35,10 @@ pub enum StartError {
     },
     #[error("the plugin has no {0} trigger")]
     NoTrigger(&'static str),
-    #[error("the input is not a JSON value of at most 64 KiB")]
+    #[error("the input is not a JSON object of at most 64 KiB")]
     Input,
+    #[error("the manual form: {0}")]
+    Form(SettingError),
     #[error(transparent)]
     Run(#[from] RunError),
 }
@@ -54,12 +57,17 @@ fn handler(
     install: &PluginInstall,
     kind: TriggerKind,
 ) -> Option<String> {
+    trigger(config, install, kind).map(|_| kind.as_str().to_string())
+}
+
+/// The trigger of `kind` the install's pinned version declares.
+fn trigger(
+    config: &RealmConfigDocument,
+    install: &PluginInstall,
+    kind: TriggerKind,
+) -> Option<Trigger> {
     let plugin = pick_version(config, &install.plugin, Some(&install.digest)).ok()?;
-    let manifest = read_manifest(&plugin).ok()?;
-    manifest
-        .triggers
-        .contains_key(&kind)
-        .then(|| kind.as_str().to_string())
+    read_manifest(&plugin).ok()?.triggers.remove(&kind)
 }
 
 /// A queued run of the install's current revision, due at `due_ms`.
@@ -91,8 +99,8 @@ pub(super) fn new_run(
     }
 }
 
-/// Queues a manual run for a group admin. Only the install's receiver admits it; an install
-/// over its queue bound refuses it.
+/// Queues a manual run for a group admin with the form's values, defaults filled in. Only the
+/// install's receiver admits it; an install over its queue bound refuses it.
 pub async fn start_run(
     ctx: &DriverContext,
     auth: &AuthContext,
@@ -117,17 +125,22 @@ pub async fn start_run(
     if install.state != InstallState::Active {
         return Err(InstallError::State(install.state.as_str()).into());
     }
-    let valid = serde_json::from_str::<serde_json::Value>(input).is_ok();
-    if !valid || input.len() > MAX_INPUT {
+    let values: serde_json::Map<String, serde_json::Value> = (input.len() <= MAX_INPUT)
+        .then(|| serde_json::from_str(input).ok())
+        .flatten()
+        .ok_or(StartError::Input)?;
+    let manual = TriggerKind::Manual;
+    let form = trigger(&config, install, manual).ok_or(StartError::NoTrigger("manual"))?;
+    let checked = check_fields(&form.form, &values).map_err(StartError::Form)?;
+    let input = serde_json::Value::Object(checked).to_string();
+    if input.len() > MAX_INPUT {
         return Err(StartError::Input);
     }
-    let handler =
-        handler(&config, install, TriggerKind::Manual).ok_or(StartError::NoTrigger("manual"))?;
     let trigger = RunTrigger::Manual {
         by: auth.user_id,
-        input: input.to_string(),
+        input,
     };
-    let run = new_run(install, handler, trigger, now_ms);
+    let run = new_run(install, manual.as_str().to_string(), trigger, now_ms);
     admit(ctx, &run).await?;
     Ok(run)
 }

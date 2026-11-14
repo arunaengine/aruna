@@ -210,7 +210,7 @@ pub enum PluginCommand {
     Run {
         /// The install id.
         id: String,
-        /// The trigger's JSON input; `{}` when omitted.
+        /// The values of the manual form as a JSON object; `{}` when omitted.
         #[arg(long)]
         input: Option<String>,
     },

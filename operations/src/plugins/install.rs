@@ -55,7 +55,7 @@ pub enum InstallError {
     Manifest(String),
     #[error(transparent)]
     Grant(#[from] GrantError),
-    #[error(transparent)]
+    #[error("settings: {0}")]
     Setting(#[from] SettingError),
     #[error("the caller does not hold {0} and cannot grant it")]
     NotHeld(String),
