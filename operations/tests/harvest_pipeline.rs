@@ -573,6 +573,7 @@ fn describe(outcome: &JobRunOutcome) -> &'static str {
         JobRunOutcome::Cancelled => "cancelled",
         JobRunOutcome::Interrupted => "interrupted",
         JobRunOutcome::AwaitingKey(_) => "awaiting key",
+        JobRunOutcome::Undecided(_) => "undecided",
     }
 }
 

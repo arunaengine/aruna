@@ -35,6 +35,7 @@ pub enum JobKind {
     BackendImport,
     WebhookDelivery,
     EmailDelivery,
+    PluginWork,
 }
 
 impl JobKind {
@@ -55,6 +56,7 @@ impl JobKind {
             Self::BackendImport => "backend_import",
             Self::WebhookDelivery => "webhook_delivery",
             Self::EmailDelivery => "email_delivery",
+            Self::PluginWork => "plugin_work",
         }
     }
 
@@ -88,6 +90,7 @@ impl From<&JobPayload> for JobKind {
             JobPayload::BackendImport(_) => Self::BackendImport,
             JobPayload::WebhookDelivery(_) => Self::WebhookDelivery,
             JobPayload::EmailDelivery(_) => Self::EmailDelivery,
+            JobPayload::PluginWork(_) => Self::PluginWork,
         }
     }
 }
@@ -244,6 +247,7 @@ impl RunningJobView {
             JobPayload::BackendImport(spec) => (None, Some(spec.group_id)),
             JobPayload::WebhookDelivery(_) => (None, None),
             JobPayload::EmailDelivery(_) => (None, None),
+            JobPayload::PluginWork(spec) => (None, Some(spec.group_id)),
         };
         Self {
             kind: JobKind::from(&record.payload),

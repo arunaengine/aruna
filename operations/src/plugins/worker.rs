@@ -47,6 +47,7 @@ use super::replay::{plan_replays, run_replays};
 use super::runs::{prune_runs, read_run, save_run, unfinished};
 use super::store::StoreError;
 use super::waiting::recheck_waiting;
+use super::work::{prune_work, retire_work, settle_work};
 use crate::driver::DriverContext;
 
 /// How often the worker looks for due runs.
@@ -55,6 +56,8 @@ pub const TICK: Duration = Duration::from_secs(1);
 const RECHECK_MS: u64 = 10 * 1000;
 /// How often the worker prunes runs that ended before the retention period.
 const PRUNE_MS: u64 = 3600 * 1000;
+/// How often the worker keeps the summaries of finished plugin work.
+const SETTLE_MS: u64 = 30 * 1000;
 /// Longest wait before a run that failed in the host starts again.
 const MAX_BACKOFF_MS: u64 = 10 * 60 * 1000;
 
@@ -222,7 +225,9 @@ impl Worker {
         let swept = sweep_events(&self.ctx, &config, now_ms).await;
         let swept = swept.map_err(|error| error.to_string())?;
         let hooks = prune_hooks(&self.ctx, &config, now_ms).await;
-        Ok(swept + hooks.map_err(|error| error.to_string())?)
+        let hooks = hooks.map_err(|error| error.to_string())?;
+        let retired = retire_work(&self.ctx, &config, now_ms).await;
+        Ok(swept + hooks + retired.map_err(|error| error.to_string())?)
     }
 
     /// Sends connection requests through `outbound` instead of the node's egress client.
@@ -570,11 +575,17 @@ pub fn spawn_worker(
     };
     let token = shutdown.token();
     shutdown.spawn(async move {
-        let mut pruned_at = 0;
+        let (mut pruned_at, mut settled_at) = (0, 0);
         loop {
             let now = unix_timestamp_millis();
             if let Err(error) = worker.claim(now).await {
                 warn!(%error, "Could not start plugin runs");
+            }
+            if now.saturating_sub(settled_at) >= SETTLE_MS {
+                settled_at = now;
+                if let Err(error) = settle_work(&worker.ctx, now).await {
+                    warn!(%error, "Could not keep the summaries of finished plugin work");
+                }
             }
             if now.saturating_sub(pruned_at) >= PRUNE_MS {
                 pruned_at = now;
@@ -589,6 +600,9 @@ pub fn spawn_worker(
                 }
                 if let Err(error) = prune_uses(&worker.ctx, now).await {
                     warn!(%error, "Could not prune plugin secret use audit rows");
+                }
+                if let Err(error) = prune_work(&worker.ctx, now).await {
+                    warn!(%error, "Could not prune settled plugin work");
                 }
                 if let Err(error) = worker.sweep(now).await {
                     warn!(%error, "Could not delete stale plugin event rows");

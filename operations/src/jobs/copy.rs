@@ -139,7 +139,7 @@ async fn live_bucket(ctx: &JobContext, bucket: &str) -> Result<BucketInfo, JobRu
 
 /// Storage, routing and gate failures are the node's, so the job retries;
 /// anything else names the source or destination and is final.
-fn copy_error(error: CopyObjectError) -> JobError {
+pub(super) fn copy_error(error: CopyObjectError) -> JobError {
     match &error {
         CopyObjectError::Get(GetObjectError::StorageError(_))
         | CopyObjectError::Put(PutObjectError::StorageError(_))

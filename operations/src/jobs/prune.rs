@@ -27,6 +27,7 @@ use super::store::{
     staging_row_deletes,
 };
 use crate::driver::DriverContext;
+use crate::plugins::work::holds_job;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct JobPruneOutcome {
@@ -88,6 +89,12 @@ pub(crate) async fn prune_job_page(
                     // The fence state a queued cleanup needs outlives retention: deleting it now
                     // fails the cleanup permanently and strands the backend attempt.
                     if cleanup_pending(storage, &record).await? {
+                        continue;
+                    }
+                    // A plugin work keeps its job until its row holds the summary.
+                    if let JobPayload::PluginWork(spec) = &record.payload
+                        && (holds_job(context, spec).await).map_err(|error| error.0)?
+                    {
                         continue;
                     }
                     let remaining = deletion_cap.saturating_sub(deletes.len()).max(1);

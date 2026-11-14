@@ -265,6 +265,29 @@ pub struct StagingJobSpec {
     pub mirrors: Vec<crate::structs::execution::staging::SourceMapping>,
 }
 
+/// One native work of a plugin install, run on the install's receiver as its account. The
+/// work row of the same id keeps its binding and state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWorkSpec {
+    pub realm_id: RealmId,
+    pub install_id: Ulid,
+    pub work_id: Ulid,
+    pub group_id: GroupId,
+    pub action: PluginWorkAction,
+}
+
+/// What a plugin work does. Object paths are full permission paths on the receiver.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginWorkAction {
+    /// Copies one object into `target` as the version `version_id`, minted once.
+    Copy {
+        source: String,
+        source_version: Option<Ulid>,
+        target: String,
+        version_id: Ulid,
+    },
+}
+
 /// One server-side object copy run outside a request, for a source whose bytes
 /// sit behind a reference and must be pulled before they can be deduplicated.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -720,6 +743,9 @@ pub enum JobPayload {
     WebhookDelivery(crate::structs::execution::webhook::WebhookDeliverySpec),
     /// One notification email. Safe to requeue: its message id stays the same.
     EmailDelivery(crate::structs::execution::email::EmailDeliverySpec),
+    /// One native work of a plugin install. Safe to requeue: each action writes a version id
+    /// minted once, and its attempts check the install again.
+    PluginWork(PluginWorkSpec),
 }
 
 impl ExecutionSpec {
@@ -747,6 +773,7 @@ impl JobPayload {
             Self::StoragePurge(spec) | Self::StoragePurgeFiles(spec) => Some(spec.group_id),
             Self::CopyObject(spec) => Some(spec.group_id),
             Self::BackendImport(spec) => Some(spec.group_id),
+            Self::PluginWork(spec) => Some(spec.group_id),
             Self::Probe { .. }
             | Self::WriteRunCrate { .. }
             | Self::TerminalCleanup { .. }
@@ -777,6 +804,7 @@ impl JobPayload {
             JobPayload::StoragePurgeFiles(_) => "storage_purge_files",
             JobPayload::WebhookDelivery(_) => "webhook_delivery",
             JobPayload::EmailDelivery(_) => "email_delivery",
+            JobPayload::PluginWork(_) => "plugin_work",
         }
     }
 
@@ -791,7 +819,7 @@ impl JobPayload {
             | JobPayload::BackendImport(_) => "items",
             JobPayload::Harvest(_) => "records",
             JobPayload::StoragePurge(_) | JobPayload::StoragePurgeFiles(_) => "entries",
-            JobPayload::CopyObject(_) => "bytes",
+            JobPayload::CopyObject(_) | JobPayload::PluginWork(_) => "bytes",
             JobPayload::MintPersistentId(_)
             | JobPayload::WriteRunCrate { .. }
             | JobPayload::TerminalCleanup { .. }
@@ -819,7 +847,8 @@ impl JobPayload {
             | JobPayload::RegisterIdentifiers(_)
             | JobPayload::BackendImport(_)
             | JobPayload::WebhookDelivery(_)
-            | JobPayload::EmailDelivery(_) => JobExecutionClass::InProcess,
+            | JobPayload::EmailDelivery(_)
+            | JobPayload::PluginWork(_) => JobExecutionClass::InProcess,
             JobPayload::Execution(_) => JobExecutionClass::ExternalAttempt,
         }
     }
@@ -852,6 +881,7 @@ impl JobPayload {
                     | JobPayload::StoragePurgeFiles(_)
                     | JobPayload::WebhookDelivery(_)
                     | JobPayload::EmailDelivery(_)
+                    | JobPayload::PluginWork(_)
             )
     }
 

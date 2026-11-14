@@ -34,9 +34,9 @@ use super::executor::{
 use super::reconcile::ExternalReconciler;
 use super::store::{
     AwaitOutcome, JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job,
-    complete_job, defer_job, fail_job, flush_progress, handoff_external_attempt, iter_prefix_page,
-    park_job, read_job_record, release_job, renew_lease, requeue_job, requeue_progressed,
-    satisfy_key_wait, transition_to_running,
+    complete_job, defer_job, exhaust_job, fail_job, flush_progress, handoff_external_attempt,
+    iter_prefix_page, park_job, read_job_record, release_job, renew_lease, requeue_job,
+    requeue_progressed, satisfy_key_wait, transition_to_running,
 };
 use super::submit::schedule_drain_effect;
 use super::{
@@ -825,6 +825,21 @@ async fn run_job(
         }
         SuperviseResult::Outcome(JobRunOutcome::AwaitingKey(waits)) => {
             await_keys(&context, &record, token, waits).await;
+        }
+        SuperviseResult::Outcome(JobRunOutcome::Undecided(error)) => {
+            terminal_or_none(
+                retry_terminal(|| {
+                    exhaust_job(
+                        storage,
+                        job_id,
+                        token,
+                        error.clone(),
+                        unix_timestamp_millis(),
+                    )
+                })
+                .await,
+                job_id,
+            );
         }
     }
 }

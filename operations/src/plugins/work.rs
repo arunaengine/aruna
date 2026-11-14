@@ -1,0 +1,580 @@
+//! Native work of plugin installs on their receiver: one row per install and identity keeps the
+//! work's generated ids, binding and state, so a repeated call never starts the work twice.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::UserId;
+use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
+use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use aruna_core::plugin_runs::{RUN_RETENTION_MS, run_key};
+use aruna_core::structs::execution::job::{
+    JobId, JobRecord, JobResultPayload, JobState, OutputObject, PluginWorkSpec,
+};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+use ulid::Ulid;
+
+use super::store::{StoreError, Txn, decode, encode, transact};
+use crate::driver::DriverContext;
+use crate::jobs::service::find_dedup_job;
+use crate::jobs::store::{JobMutationError, read_job_record, set_cancel_requested};
+
+/// Row kinds of the work keyspace: the work by install and identity, and its identity by work id.
+pub const WORK_ROW: u8 = b'w';
+pub const WORK_INDEX: u8 = b'i';
+
+/// What names one work across calls: the run and the ordinal of the call that started it, so a
+/// rerun of that run gets the same work back.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Identity {
+    Call { run_id: Ulid, ordinal: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkKind {
+    Copy,
+    Download,
+    Upload,
+    Recipe,
+}
+
+/// What the work was approved under; a later manifest digest stops it before it runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Binding {
+    pub digest: String,
+    pub revision: u64,
+    pub recipe: Option<String>,
+}
+
+/// A transfer's request as resolved when the work started, without any secret, so the work
+/// still runs after its run was pruned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestContext {
+    pub connection: String,
+    /// The connection's base URL resolved from the run's saved settings.
+    pub base: String,
+    pub method: String,
+    pub path: String,
+    pub query: Vec<(String, String)>,
+    pub headers: Vec<(String, String)>,
+}
+
+/// `Reserved` until its job is known, then `Dispatched`, and `Settled` once the summary is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkState {
+    Reserved,
+    Dispatched,
+    Settled,
+}
+
+/// How far a sending attempt came; an attempt that finds `Sending` never sends again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SendBoundary {
+    Sending { attempt: u32 },
+    Sent { status: u16 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FinalState {
+    Succeeded,
+    Failed,
+    Cancelled,
+    /// The outcome cannot be known; nothing is tried again.
+    Unknown,
+}
+
+/// What a settled work answers after its job record is gone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Summary {
+    pub state: FinalState,
+    /// The object path the work reads: a copy's source or an upload's object.
+    pub source: Option<String>,
+    /// The object path or prefix the work writes: a copy or download target, a recipe's outputs.
+    pub target: Option<String>,
+    pub message: Option<String>,
+    pub bytes: Option<u64>,
+    pub version_id: Option<Ulid>,
+    /// The answer status of an upload, and its reply as exposed when it was stored.
+    pub status: Option<u16>,
+    pub reply: Option<String>,
+    pub exit_code: Option<i32>,
+    pub outputs: Vec<OutputObject>,
+    pub report: Option<String>,
+}
+
+/// One work of an install on its receiver.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkRow {
+    /// The account of the install that wrote it; a reinstall under the same id has another one.
+    pub account: UserId,
+    pub work_id: Ulid,
+    pub kind: WorkKind,
+    /// The object path the work reads: a copy's source or an upload's object.
+    pub source: Option<String>,
+    /// The object path or prefix the work writes: a copy or download target, a recipe's outputs.
+    pub target: Option<String>,
+    /// BLAKE3 of the stable arguments, never of generated ids.
+    pub digest: [u8; 32],
+    pub binding: Binding,
+    pub context: Option<RequestContext>,
+    /// The run that started it; an audit reference only, the run may be pruned first.
+    pub run_id: Ulid,
+    /// The version a copy or download writes, minted once.
+    pub version_id: Option<Ulid>,
+    pub job: Option<JobId>,
+    pub state: WorkState,
+    pub boundary: Option<SendBoundary>,
+    pub summary: Option<Summary>,
+    pub notified: bool,
+    pub cancel: bool,
+    pub created_ms: u64,
+    pub settled_ms: Option<u64>,
+}
+
+impl WorkRow {
+    /// A new row of `install` in state `Reserved`.
+    pub fn reserved(install: &PluginInstall, kind: WorkKind, run_id: Ulid, now_ms: u64) -> Self {
+        Self {
+            account: install.account,
+            work_id: Ulid::generate(),
+            kind,
+            source: None,
+            target: None,
+            digest: [0; 32],
+            binding: Binding {
+                digest: install.digest.clone(),
+                revision: install.revision,
+                recipe: None,
+            },
+            context: None,
+            run_id,
+            version_id: None,
+            job: None,
+            state: WorkState::Reserved,
+            boundary: None,
+            summary: None,
+            notified: false,
+            cancel: false,
+            created_ms: now_ms,
+            settled_ms: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WorkError {
+    #[error("the call started other work with other arguments")]
+    Conflict,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// How the row of a call was found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reserve {
+    /// This call wrote the row.
+    Fresh,
+    /// An earlier call with the same arguments wrote it.
+    Earlier,
+}
+
+pub fn row_key(install_id: Ulid, identity: &Identity) -> Result<Vec<u8>, StoreError> {
+    Ok([&[WORK_ROW][..], &install_id.to_bytes(), &encode(identity)?].concat())
+}
+
+fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
+    [
+        &[WORK_INDEX][..],
+        &install_id.to_bytes(),
+        &work_id.to_bytes(),
+    ]
+    .concat()
+}
+
+/// Writes `proposed` for `identity` in one transaction, or adopts the row an earlier call with
+/// the same digest wrote; another digest is a conflict. A former install's row is replaced.
+pub async fn reserve(
+    ctx: &DriverContext,
+    (install, identity): (&PluginInstall, &Identity),
+    proposed: WorkRow,
+) -> Result<(WorkRow, Reserve), WorkError> {
+    let key = row_key(install.install_id, identity)?;
+    transact(ctx, async |txn: &Txn<'_>| {
+        let stored = match txn.read(PLUGIN_WORK_KEYSPACE, &key).await? {
+            Some(bytes) => Some(decode::<WorkRow>(&bytes)?),
+            None => None,
+        };
+        match stored {
+            Some(stored) if stored.account == install.account => {
+                match stored.digest == proposed.digest {
+                    true => Ok((stored, Reserve::Earlier)),
+                    false => Err(WorkError::Conflict),
+                }
+            }
+            former => {
+                // A former install's index goes too, so no index row leads to the replacement.
+                if let Some(former) = former {
+                    let index = vec![index_key(install.install_id, former.work_id)];
+                    txn.delete(PLUGIN_WORK_KEYSPACE, index).await?;
+                }
+                let index = index_key(install.install_id, proposed.work_id);
+                txn.write(PLUGIN_WORK_KEYSPACE, vec![(index, key.clone())])
+                    .await?;
+                txn.write(
+                    PLUGIN_WORK_KEYSPACE,
+                    vec![(key.clone(), encode(&proposed)?)],
+                )
+                .await?;
+                Ok((proposed, Reserve::Fresh))
+            }
+        }
+    })
+    .await
+}
+
+/// The row of work `work_id` of an install and its key, read in `txn`.
+pub async fn read_in(
+    txn: &Txn<'_>,
+    install_id: Ulid,
+    work_id: Ulid,
+) -> Result<Option<(Vec<u8>, WorkRow)>, StoreError> {
+    let index = index_key(install_id, work_id);
+    let Some(key) = txn.read(PLUGIN_WORK_KEYSPACE, &index).await? else {
+        return Ok(None);
+    };
+    let Some(bytes) = txn.read(PLUGIN_WORK_KEYSPACE, &key).await? else {
+        return Ok(None);
+    };
+    let row: WorkRow = decode(&bytes)?;
+    Ok((row.work_id == work_id).then_some((key, row)))
+}
+
+pub async fn read_work(
+    ctx: &DriverContext,
+    install_id: Ulid,
+    work_id: Ulid,
+) -> Result<Option<WorkRow>, StoreError> {
+    let found = read_in(&Txn::direct(ctx), install_id, work_id).await?;
+    Ok(found.map(|(_, row)| row))
+}
+
+/// Changes the row of work `work_id` in one transaction; `None` when it is gone.
+pub async fn update_work(
+    ctx: &DriverContext,
+    (install_id, work_id): (Ulid, Ulid),
+    change: impl FnOnce(&mut WorkRow),
+) -> Result<Option<WorkRow>, StoreError> {
+    transact(ctx, async |txn: &Txn<'_>| {
+        let Some((key, mut row)) = read_in(txn, install_id, work_id).await? else {
+            return Ok(None);
+        };
+        change(&mut row);
+        txn.write(PLUGIN_WORK_KEYSPACE, vec![(key, encode(&row)?)])
+            .await?;
+        Ok(Some(row))
+    })
+    .await
+}
+
+/// Records the job a reserved work was submitted as; a later state keeps its job.
+pub async fn dispatched(
+    ctx: &DriverContext,
+    (install_id, work_id): (Ulid, Ulid),
+    job: JobId,
+) -> Result<Option<WorkRow>, StoreError> {
+    update_work(ctx, (install_id, work_id), |row| {
+        if row.state == WorkState::Reserved {
+            row.state = WorkState::Dispatched;
+            row.job = Some(job);
+        }
+    })
+    .await
+}
+
+/// The summary of a finished job, or `None` while it may still run. A job record that is gone
+/// leaves the outcome unknown.
+pub fn summary_of(record: Option<&JobRecord>) -> Option<Summary> {
+    let Some(record) = record else {
+        let mut gone = Summary::of(FinalState::Unknown);
+        gone.message = Some("the job record is gone".into());
+        return Some(gone);
+    };
+    let state = match record.state {
+        JobState::Succeeded => FinalState::Succeeded,
+        JobState::Failed => FinalState::Failed,
+        JobState::Cancelled => FinalState::Cancelled,
+        JobState::Indeterminate if record.locally_exhausted => FinalState::Unknown,
+        _ => return None,
+    };
+    let mut summary = Summary::of(state);
+    summary.message = (record.last_error.as_ref()).map(|error| error.message.clone());
+    if let Some(JobResultPayload::PluginWork { bytes, version_id }) = &record.result {
+        summary.bytes = Some(*bytes);
+        summary.version_id = *version_id;
+    }
+    Some(summary)
+}
+
+impl Summary {
+    fn of(state: FinalState) -> Self {
+        Self {
+            state,
+            source: None,
+            target: None,
+            message: None,
+            bytes: None,
+            version_id: None,
+            status: None,
+            reply: None,
+            exit_code: None,
+            outputs: Vec::new(),
+            report: None,
+        }
+    }
+}
+
+/// Keeps the summary of every work whose job finished, so its status outlives the job record;
+/// a reserved work first takes the job its dedup key names. Answers how many settled.
+pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    let txn = Txn::direct(ctx);
+    let mut settled = 0;
+    for (key, value) in txn.scan(PLUGIN_WORK_KEYSPACE, &[WORK_ROW]).await? {
+        let row: WorkRow = decode(&value)?;
+        let Some(install_id) = install_at(&key) else {
+            continue;
+        };
+        let job = match (row.state, row.job) {
+            (WorkState::Dispatched, Some(job)) => job,
+            (WorkState::Reserved, _) => match reconcile(ctx, install_id, &row).await? {
+                Some(job) => job,
+                None => continue,
+            },
+            _ => continue,
+        };
+        let record = read_job_record(&ctx.storage_handle, job, None).await;
+        let record = record.map_err(StoreError)?;
+        let Some(summary) = summary_of(record.as_ref()) else {
+            continue;
+        };
+        let changed = update_work(ctx, (install_id, row.work_id), |row| {
+            if row.state == WorkState::Dispatched {
+                // The paths stay answerable after the job record is pruned.
+                let (source, target) = (row.source.clone(), row.target.clone());
+                row.state = WorkState::Settled;
+                row.summary = Some(Summary {
+                    source,
+                    target,
+                    ..summary
+                });
+                row.settled_ms = Some(now_ms);
+            }
+        });
+        if changed.await?.is_some() {
+            settled += 1;
+        }
+    }
+    Ok(settled)
+}
+
+/// Records the job of a reserved work whose submission committed but whose answer was lost; the
+/// job is found by the work's dedup key. `None` while no job was submitted.
+async fn reconcile(
+    ctx: &DriverContext,
+    install_id: Ulid,
+    row: &WorkRow,
+) -> Result<Option<JobId>, StoreError> {
+    let found = find_dedup_job(ctx, row.account, &dedup_key(row.work_id)).await;
+    let Some((job, _)) = found.map_err(|error| StoreError(error.to_string()))? else {
+        return Ok(None);
+    };
+    dispatched(ctx, (install_id, row.work_id), job).await?;
+    Ok(Some(job))
+}
+
+/// Deletes the rows nobody can ask for again: settled, no cancel open, kept past the run
+/// retention, and their run record pruned.
+pub async fn prune_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    let txn = Txn::direct(ctx);
+    let mut dropped = Vec::new();
+    for (key, value) in txn.scan(PLUGIN_WORK_KEYSPACE, &[WORK_ROW]).await? {
+        let row: WorkRow = decode(&value)?;
+        let (Some(install_id), Some(Identity::Call { run_id, .. })) =
+            (install_at(&key), identity_at(&key))
+        else {
+            continue;
+        };
+        let aged = (row.settled_ms)
+            .is_some_and(|settled| settled.saturating_add(RUN_RETENTION_MS) <= now_ms);
+        if row.state != WorkState::Settled || row.cancel || !aged {
+            continue;
+        }
+        let run = run_key(install_id, run_id);
+        if txn.read(PLUGIN_RUNS_KEYSPACE, &run).await?.is_none() {
+            dropped.push(index_key(install_id, row.work_id));
+            dropped.push(key);
+        }
+    }
+    let count = dropped.len() / 2;
+    transact(ctx, async |txn: &Txn<'_>| {
+        txn.delete(PLUGIN_WORK_KEYSPACE, dropped).await
+    })
+    .await?;
+    Ok(count)
+}
+
+/// Whether a plugin work job must keep its record: its work row exists and is not settled yet.
+pub async fn holds_job(ctx: &DriverContext, spec: &PluginWorkSpec) -> Result<bool, StoreError> {
+    let row = read_work(ctx, spec.install_id, spec.work_id).await?;
+    Ok(row.is_some_and(|row| row.state != WorkState::Settled))
+}
+
+/// Asks the jobs of removed installs to cancel and deletes their rows once each job is settled
+/// and kept; a row stays as long as its cancel was not accepted. Answers how many rows went.
+pub async fn retire_work(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    now_ms: u64,
+) -> Result<usize, StoreError> {
+    let storage = &ctx.storage_handle;
+    let txn = Txn::direct(ctx);
+    let mut dropped = Vec::new();
+    for (key, value) in txn.scan(PLUGIN_WORK_KEYSPACE, &[WORK_ROW]).await? {
+        let Some(install_id) = install_at(&key) else {
+            continue;
+        };
+        let kept = (config.installs.iter()).any(|install| {
+            install.install_id == install_id && install.state != InstallState::Removing
+        });
+        if kept {
+            continue;
+        }
+        let mut row: WorkRow = decode(&value)?;
+        if row.state == WorkState::Reserved {
+            match reconcile(ctx, install_id, &row).await? {
+                Some(job) => (row.job, row.state) = (Some(job), WorkState::Dispatched),
+                None => {
+                    dropped.extend([index_key(install_id, row.work_id), key]);
+                    continue;
+                }
+            }
+        }
+        let Some(job) = row.job.filter(|_| row.state != WorkState::Settled) else {
+            dropped.extend([index_key(install_id, row.work_id), key]);
+            continue;
+        };
+        let record = read_job_record(storage, job, None)
+            .await
+            .map_err(StoreError)?;
+        let Some(record) = record else {
+            dropped.extend([index_key(install_id, row.work_id), key]);
+            continue;
+        };
+        // A settled job keeps its outcome; the settle step stores it before the row goes.
+        if row.cancel || record.is_settled() {
+            continue;
+        }
+        match set_cancel_requested(storage, job, now_ms).await {
+            Ok(_) => {
+                let accepted = update_work(ctx, (install_id, row.work_id), |row| {
+                    row.job = Some(job);
+                    row.state = WorkState::Dispatched;
+                    row.cancel = true;
+                });
+                accepted.await?;
+            }
+            Err(JobMutationError::NotFound) => {
+                dropped.extend([index_key(install_id, row.work_id), key]);
+            }
+            Err(error) => warn!(%error, "A removed install's plugin work did not accept a cancel"),
+        }
+    }
+    let count = dropped.len() / 2;
+    transact(ctx, async |txn: &Txn<'_>| {
+        txn.delete(PLUGIN_WORK_KEYSPACE, dropped).await
+    })
+    .await?;
+    Ok(count)
+}
+
+/// At most `limit` works of an install after the work `after`, oldest first, and the id of the
+/// last one when more may follow.
+pub async fn list_work(
+    ctx: &DriverContext,
+    install_id: Ulid,
+    after: Option<Ulid>,
+    limit: usize,
+) -> Result<(Vec<WorkRow>, Option<Ulid>), StoreError> {
+    let txn = Txn::direct(ctx);
+    let prefix = [&[WORK_INDEX][..], &install_id.to_bytes()].concat();
+    let after = after.map(|work_id| index_key(install_id, work_id));
+    let (rows, next) = txn
+        .page(PLUGIN_WORK_KEYSPACE, &prefix, after, limit)
+        .await?;
+    // The cursor is the last index row read, whatever row it leads to.
+    let last = (rows.last()).and_then(|(index, _)| work_at(index));
+    let mut works = Vec::with_capacity(rows.len());
+    for (index, key) in rows {
+        let Some(value) = txn.read(PLUGIN_WORK_KEYSPACE, &key).await? else {
+            continue;
+        };
+        let row = decode::<WorkRow>(&value)?;
+        if index.ends_with(&row.work_id.to_bytes()) {
+            works.push(row);
+        }
+    }
+    Ok((works, next.and(last)))
+}
+
+/// The state a work shows: from its summary once settled, else from its job record.
+pub fn work_state(row: &WorkRow, record: Option<&JobRecord>) -> &'static str {
+    if let Some(summary) = &row.summary {
+        return match summary.state {
+            FinalState::Succeeded => "succeeded",
+            FinalState::Failed => "failed",
+            FinalState::Cancelled => "cancelled",
+            FinalState::Unknown => "unknown",
+        };
+    }
+    let Some(record) = record else {
+        return "queued";
+    };
+    match record.state {
+        JobState::Queued | JobState::AwaitingKey => match record.last_error {
+            Some(_) => "error",
+            None => "queued",
+        },
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+        JobState::Cancelled => "cancelled",
+        JobState::Indeterminate if record.locally_exhausted => "unknown",
+        JobState::Indeterminate => "error",
+        JobState::Claimed
+        | JobState::Preparing
+        | JobState::Ready
+        | JobState::Running
+        | JobState::Cancelling => "running",
+    }
+}
+
+/// The job dedup key of a work: its id, so a repeated submission finds the same job.
+pub fn dedup_key(work_id: Ulid) -> Vec<u8> {
+    [&b"plugin-work/"[..], &work_id.to_bytes()].concat()
+}
+
+fn install_at(key: &[u8]) -> Option<Ulid> {
+    Some(Ulid::from_bytes(key.get(1..17)?.try_into().ok()?))
+}
+
+/// The work id of an index row.
+fn work_at(index: &[u8]) -> Option<Ulid> {
+    Some(Ulid::from_bytes(index.get(17..33)?.try_into().ok()?))
+}
+
+fn identity_at(key: &[u8]) -> Option<Identity> {
+    decode(key.get(17..)?).ok()
+}
+
+#[cfg(test)]
+#[path = "work_tests.rs"]
+mod tests;

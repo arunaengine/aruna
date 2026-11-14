@@ -763,6 +763,7 @@ fn purge_result(
         JobRunOutcome::Cancelled => panic!("purge was cancelled"),
         JobRunOutcome::Interrupted => panic!("purge was interrupted"),
         JobRunOutcome::AwaitingKey(_) => panic!("purge was awaiting a key"),
+        JobRunOutcome::Undecided(error) => panic!("purge was undecided: {}", error.message),
     }
 }
 

@@ -737,6 +737,37 @@ async fn finish_clears_pause() {
     }
 }
 
+// An effect that may have happened is never tried again, and a lost answer proves no failure.
+#[tokio::test]
+async fn undecided_never_retries() {
+    let (_dir, storage) = temp_storage();
+    let job_id = JobId::from_bytes([0x48u8; 16]);
+    insert_job(&storage, &queued_record(job_id)).await.unwrap();
+    let ClaimOutcome::Claimed(record) = claim_job(&storage, job_id, node_id(3), 5_000)
+        .await
+        .unwrap()
+    else {
+        panic!("job must be claimed")
+    };
+    let token = record.claim.unwrap().claim_token;
+    let error = JobError::permanent("the request may have been sent");
+    let ended = exhaust_job(&storage, job_id, token, error, 6_000).await;
+    let ended = ended.unwrap();
+    assert_eq!(ended.state, JobState::Indeterminate);
+    assert!(ended.locally_exhausted && ended.claim.is_none() && ended.is_settled());
+    assert_eq!(
+        ended.last_error.map(|error| error.kind),
+        Some(JobErrorKind::Retryable)
+    );
+    let again = claim_job(&storage, job_id, node_id(3), 7_000)
+        .await
+        .unwrap();
+    assert!(
+        !matches!(again, ClaimOutcome::Claimed(_)),
+        "it must not run again"
+    );
+}
+
 // Retried payload work starts over, so persisted progress must start over too.
 #[tokio::test]
 async fn retry_resets_progress() {
