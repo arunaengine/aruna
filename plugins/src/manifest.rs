@@ -293,7 +293,7 @@ impl Manifest {
 
     fn check_connection(&self, name: &str, connection: &Connection) -> Result<(), ManifestError> {
         let invalid = |why| ManifestError::InvalidConnection(name.to_string(), why);
-        connection.check_fields().map_err(invalid)?;
+        connection.check_methods().map_err(invalid)?;
         if let Address::Setting { setting, .. } = connection.address().map_err(invalid)? {
             let kind = self.settings.get(setting).map(|setting| setting.kind);
             if kind != Some(SettingKind::Url) {

@@ -231,12 +231,7 @@ impl Runtime {
         let writes = TaskTracker::new();
         let declared = &compiled.manifest.connections;
         let connections = (call.connections.into_iter())
-            .filter_map(|name| {
-                Some((
-                    name.clone(),
-                    declared.get(&name)?.response.fields().to_vec(),
-                ))
-            })
+            .filter(|name| declared.contains_key(name))
             .collect();
         let grants = Grants {
             permissions: call.permissions,

@@ -21,7 +21,6 @@ elab_key = { title = "eLabFTW API key of the sync user", kind = "header" }
 url = "{elab_url}/api/v2/experiments"
 methods = ["GET", "POST", "PATCH"]
 auth = "elab_key"
-response = "full"
 
 [triggers]
 every = { handler = "poll", interval = "5m" }

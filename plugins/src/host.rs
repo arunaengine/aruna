@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -88,7 +88,7 @@ pub(crate) struct Session {
     broker: Arc<dyn Broker>,
     cx: CallContext,
     permissions: BTreeSet<Permission>,
-    connections: BTreeMap<String, Vec<String>>,
+    connections: BTreeSet<String>,
     tracker: TaskTracker,
     writes: TaskTracker,
     limits: Limits,
@@ -105,8 +105,8 @@ pub(crate) struct Session {
 
 pub(crate) struct Grants {
     pub permissions: BTreeSet<Permission>,
-    /// Granted connections and the response fields the manifest lets the code read.
-    pub connections: BTreeMap<String, Vec<String>>,
+    /// Granted connections the manifest declares.
+    pub connections: BTreeSet<String>,
 }
 
 impl Session {
@@ -189,7 +189,7 @@ impl Session {
         let granted = match needs {
             Needs::Free => true,
             Needs::Permission(permission) => self.permissions.contains(&permission),
-            Needs::Connection(name) => self.connections.contains_key(name),
+            Needs::Connection(name) => self.connections.contains(name),
         };
         // The reply's charge is held back first, so a call never ends the run on its way back.
         if granted && !self.meter.reserve() {

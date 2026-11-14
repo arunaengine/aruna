@@ -22,8 +22,8 @@ def dataset_created(ctx, event):
     headers = [types.Field("content-type", "application/json")]
     request = services.Request("catalog", services.Method.POST, "", [], headers, body, None)
     reply = services.send(request)
-    fields = json.loads(bytes(reply.body) or b"{}")
-    if "/id" not in fields:
-        raise Err(types.Failure(types.FailureKind.PERMANENT, "the response has no field `/id`"))
-    patch = json.dumps({"identifier": {"catalog": fields["/id"]}})
+    record = json.loads(bytes(reply.body) or b"{}")
+    if "id" not in record:
+        raise Err(types.Failure(types.FailureKind.PERMANENT, "the response has no field `id`"))
+    patch = json.dumps({"identifier": {"catalog": record["id"]}})
     metadata_write.patch(dataset, patch, doc.revision, None)

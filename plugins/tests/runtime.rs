@@ -198,8 +198,8 @@ impl Broker for Recorder {
         if let Some(intent) = request.intent {
             self.intents.lock().unwrap().push(intent);
         }
-        // The broker answers with the exposed fields only, keyed by pointer.
-        let answer = r#"{"/id":"c-1","/meta/name":"n","/items/1":{"b":2}}"#;
+        // The broker answers with the whole answer.
+        let answer = r#"{"id":"c-1","meta":{"name":"n"},"items":[1,{"b":2}]}"#;
         Ok(Response {
             status: 201,
             headers: Vec::new(),
@@ -303,7 +303,7 @@ async fn calls_reach_broker() {
     let sent = invoke(probe(serde_json::json!({"call": "send", "connection": "api", "method": "POST", "path": "/x", "body": {"a": 1}})), broker.clone()).await;
     assert_eq!(
         output(sent),
-        serde_json::json!({"status": 201, "fields": {"/id": "c-1", "/meta/name": "n", "/items/1": {"b": 2}}})
+        serde_json::json!({"status": 201, "fields": {"id": "c-1", "meta": {"name": "n"}, "items": [1, {"b": 2}]}})
     );
     let state = invoke(probe(serde_json::json!({"call": "state"})), broker.clone()).await;
     assert_eq!(

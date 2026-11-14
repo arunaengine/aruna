@@ -225,11 +225,11 @@ impl Response {
         Ok(serde_json::from_slice(&self.body)?)
     }
 
-    /// One field the manifest lets the code read, by its JSON pointer such as `/id`.
+    /// One field of a JSON body by its JSON pointer, such as `/id`.
     pub fn field(&self, pointer: &str) -> Result<Value> {
         let missing = || Error::failed(format!("the response has no field `{pointer}`"));
-        let fields: serde_json::Map<String, Value> = self.json().map_err(|_| missing())?;
-        fields.get(pointer).cloned().ok_or_else(missing)
+        let body: Value = self.json().map_err(|_| missing())?;
+        body.pointer(pointer).cloned().ok_or_else(missing)
     }
 }
 

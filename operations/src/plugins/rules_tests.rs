@@ -107,7 +107,7 @@ async fn install_rules() {
     let inject = &wanted[&name][0];
     assert_eq!(
         (inject.delivery, inject.response.clone()),
-        (Delivery::Inject, ResponseExposure::Status)
+        (Delivery::Inject, ResponseExposure::Full)
     );
     assert_eq!(inject.origins, ["https://catalog.example.org"]);
     assert_eq!(
@@ -318,23 +318,19 @@ async fn shared_secret_slots() {
 }
 
 #[tokio::test]
-async fn overlapping_rules_join() {
+async fn equal_rules_collapse() {
     let fixture = Fixture::keyed().await;
     let (mut install, _) = shared_install(&fixture).await;
-    let fields = |pointers: &[&str]| ResponseExposure::Fields {
-        pointers: pointers.iter().map(|pointer| pointer.to_string()).collect(),
-        headers: Vec::new(),
-    };
     let manifest: aruna_plugins::manifest::Manifest = serde_json::from_value(serde_json::json!({
         "name": "announcer", "version": "0.4.0",
         "settings": { "catalog_url": { "title": "Catalog", "type": "url" } },
         "secrets": { "api_key": { "title": "API key", "kind": "bearer" } },
         "connections": {
-            "ids": { "url": "{catalog_url}/api/", "auth": "api_key", "response": ["/id"] },
-            "names": { "url": "{catalog_url}/api/", "auth": "api_key", "response": ["/name"] },
-            "deep": { "url": "{catalog_url}/api/v2/", "auth": "api_key", "response": ["/z"] },
-            "whole": { "url": "{catalog_url}/files/", "auth": "api_key", "response": "full" },
-            "brief": { "url": "{catalog_url}/files/", "auth": "api_key", "response": ["/id"] }
+            "ids": { "url": "{catalog_url}/api/", "auth": "api_key" },
+            "names": { "url": "{catalog_url}/api/", "auth": "api_key" },
+            "deep": { "url": "{catalog_url}/api/v2/", "auth": "api_key" },
+            "whole": { "url": "{catalog_url}/files/", "auth": "api_key" },
+            "brief": { "url": "{catalog_url}/files/", "auth": "api_key" }
         }
     }))
     .unwrap();
@@ -355,15 +351,13 @@ async fn overlapping_rules_join() {
     let shown: Vec<(Vec<String>, ResponseExposure)> = (wanted[&name].iter())
         .map(|rule| (rule.paths.clone(), rule.response.clone()))
         .collect();
-    // Identical selectors join into one rule; a nested prefix shows what the outer one shows,
-    // and the reverse, so the first matching rule never hides a connection's fields.
-    let joined = fields(&["/id", "/name", "/z"]);
+    // Every rule shows the whole answer, and identical rules collapse into one.
     assert_eq!(
         shown,
         [
             (vec!["/files".to_string()], ResponseExposure::Full),
-            (vec!["/api/v2".to_string()], joined.clone()),
-            (vec!["/api".to_string()], joined),
+            (vec!["/api/v2".to_string()], ResponseExposure::Full),
+            (vec!["/api".to_string()], ResponseExposure::Full),
         ]
     );
 }

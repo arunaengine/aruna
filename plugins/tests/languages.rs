@@ -31,8 +31,8 @@ const BUILD_VAR: &str = "ARUNA_PLUGIN_BUILD";
 /// Where that child run writes the built artifact.
 const OUT_VAR: &str = "ARUNA_PLUGIN_BUILT";
 
-/// The catalog's answer to a new record; the manifest lets the code read only `/id`.
-const RECORD: &str = r#"{"/id":"c-1"}"#;
+/// The catalog's answer to a new record.
+const RECORD: &str = r#"{"id":"c-1","created":true}"#;
 
 /// Answers like a group with one dataset and a catalog, and records what the plugin sent.
 /// Reading `missing` is unavailable and reading `denied` is denied.

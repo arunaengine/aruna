@@ -16,11 +16,11 @@ const handlers = {
     const headers = [{ name: "content-type", value: "application/json" }];
     const request = { service: "catalog", method: "post", path: "", query: [], headers, body: json({ id: dataset, title }) };
     const reply = send(request);
-    const fields = JSON.parse(new TextDecoder().decode(reply.body) || "{}");
-    if (!("/id" in fields)) {
-      throw { kind: "permanent", message: "the response has no field `/id`" };
+    const record = JSON.parse(new TextDecoder().decode(reply.body) || "{}");
+    if (!("id" in record)) {
+      throw { kind: "permanent", message: "the response has no field `id`" };
     }
-    const identifier = { catalog: fields["/id"] };
+    const identifier = { catalog: record.id };
     patch(dataset, JSON.stringify({ identifier }), doc.revision, undefined);
   },
 };

@@ -19,7 +19,6 @@ catalog_key = { title = "Catalog API key", kind = "bearer" }
 url = "{catalog_url}/api/records"
 methods = ["POST"]
 auth = "catalog_key"
-response = ["/id"]
 
 [triggers]
 dataset_created = {}
