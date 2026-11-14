@@ -403,6 +403,25 @@ pub async fn fail_job(
     .await
 }
 
+/// Ends the attempts of a job whose outcome cannot be known: `Indeterminate` and locally
+/// exhausted, so nothing tries it again here and nothing claims it failed.
+pub async fn exhaust_job(
+    storage: &StorageHandle,
+    job_id: JobId,
+    token: Ulid,
+    error: JobError,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    mutate_job(storage, job_id, |record| {
+        guard_token(record, token)?;
+        record.last_error = Some(JobError::retryable(error.message.clone()));
+        record.updated_at_ms = now_ms;
+        exhaust_attempts(record, now_ms);
+        Ok(JobMutation::Persist)
+    })
+    .await
+}
+
 pub async fn cancel_running_job(
     storage: &StorageHandle,
     job_id: JobId,

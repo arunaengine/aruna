@@ -1,5 +1,5 @@
-//! Serves the runs of a plugin install: start, list, read and resolve runs, and show how its
-//! events are delivered. Run data lives on the install's receiver, which answers each call.
+//! Serves the runs of a plugin install: start, list, read and resolve runs, list its native work,
+//! and show how its events are delivered. The install's receiver keeps this data and answers.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -12,11 +12,13 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRec
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::plugins::decide::event_delivery;
 use aruna_operations::plugins::dispatch::{StartError, start_run};
 use aruna_operations::plugins::install::{InstallError, read_config};
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::runs::{RunError, list_runs, read_run, resolve_run};
+use aruna_operations::plugins::work::{WorkKind, list_work as list_work_rows, work_state};
 use aruna_operations::users::service_account::group_admin_path;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, State};
@@ -48,6 +50,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_run))
         .routes(routes!(resolve))
         .routes(routes!(delivery))
+        .routes(routes!(list_work))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
@@ -125,6 +128,35 @@ pub struct RunEvent {
     pub source: String,
     /// The account whose change the event reports, for metadata events.
     pub actor: Option<String>,
+}
+
+/// One native work of an install, without its arguments or answers.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkView {
+    pub id: String,
+    /// `copy`, `download`, `upload` or `recipe`.
+    pub kind: String,
+    /// The object path the work reads: a copy's source or an upload's object.
+    pub source: Option<String>,
+    /// The object path or prefix it writes: a copy or download target, a recipe's outputs.
+    pub target: Option<String>,
+    /// `queued`, `running`, `error`, `succeeded`, `failed`, `cancelled` or `unknown`.
+    pub state: String,
+    /// The job that runs it, once submitted.
+    pub job: Option<String>,
+    /// The run that started it.
+    pub run: String,
+    /// A removal asked its job to stop.
+    pub cancelled: bool,
+    pub created_ms: u64,
+    pub settled_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkPage {
+    pub work: Vec<WorkView>,
+    /// Pass as `cursor` for the next page; absent on the last page.
+    pub next: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -532,6 +564,118 @@ pub async fn list(
         }
         Err(error) => run_error(error),
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/plugin-installs/{id}/work",
+    tag = "plugins",
+    summary = "List plugin work",
+    description = r#"Lists the install's native work with its kind, state and job, oldest first.
+
+**Authentication**: realm bearer token of an admin of the install's group.
+
+**Behavior**
+- Native work is a copy, a transfer or a container recipe; the list never shows its arguments
+  or answers.
+- The install's receiver keeps its work and answers; every other node relays the call there.
+- While the receiver is drained, gone or no longer a server, the call answers 503 and names
+  the receiver and the reason.
+- `state` is `queued`, `running` or `error` (an attempt failed and is retried) until the work
+  ends `succeeded`, `failed`, `cancelled` or `unknown` (its effect may have happened).
+- When an install is removed, its unfinished work is cancelled and kept until its job ends."#,
+    params(("id" = String, Path, description = "The install id"), RunListQuery),
+    responses(
+        (status = 200, description = "One page of work", body = WorkPage, example = json!({"work": [work_example()], "next": null})),
+        (status = 400, description = "The limit or cursor is invalid", body = ErrorResponse),
+        (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
+        (status = 404, description = "No install has this id", body = ErrorResponse),
+        (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_work(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(id): Path<String>,
+    Query(query): Query<RunListQuery>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let call = Call {
+        method,
+        uri,
+        headers,
+        body: Bytes::new(),
+    };
+    let install_id = match serve(&state, auth, &id, None, call).await {
+        Ok(served) => served.install_id,
+        Err(response) => return response,
+    };
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
+    if !(1..=MAX_LIMIT).contains(&limit) {
+        return ServerError::BadRequestReason("limit is 1 to 1000".into()).into_response();
+    }
+    let after = match query.cursor.as_deref().map(parse_id).transpose() {
+        Ok(after) => after,
+        Err(error) => return error.into_response(),
+    };
+    let ctx = state.get_ctx();
+    let unavailable = |error: String| ServerError::ServiceUnavailableReason(error).into_response();
+    let (rows, next) = match list_work_rows(&ctx, install_id, after, limit).await {
+        Ok(page) => page,
+        Err(error) => return unavailable(error.to_string()),
+    };
+    let mut work = Vec::with_capacity(rows.len());
+    for row in rows {
+        let record = match (row.job, &row.summary) {
+            (Some(job), None) => match read_job_record(&ctx.storage_handle, job, None).await {
+                Ok(record) => record,
+                Err(error) => return unavailable(error),
+            },
+            _ => None,
+        };
+        work.push(WorkView {
+            id: row.work_id.to_string(),
+            kind: work_kind(row.kind).into(),
+            source: row.source.clone(),
+            target: row.target.clone(),
+            state: work_state(&row, record.as_ref()).into(),
+            job: row.job.map(|job| job.to_string()),
+            run: row.run_id.to_string(),
+            cancelled: row.cancel,
+            created_ms: row.created_ms,
+            settled_ms: row.settled_ms,
+        });
+    }
+    let next = next.map(|id| id.to_string());
+    Json(WorkPage { work, next }).into_response()
+}
+
+fn work_kind(kind: WorkKind) -> &'static str {
+    match kind {
+        WorkKind::Copy => "copy",
+        WorkKind::Download => "download",
+        WorkKind::Upload => "upload",
+        WorkKind::Recipe => "recipe",
+    }
+}
+
+/// One finished copy as the work route lists it.
+fn work_example() -> Value {
+    json!({
+        "id": "01JBX7Y3S5M3Q8Y1V9K2T4R6W1",
+        "kind": "copy",
+        "source": "/01JBX7Y3S5M3Q8Y1V9K2T4R6R1/g/01JBX7Y3S5M3Q8Y1V9K2T4R6G1/data/b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c/raw/reads.fastq",
+        "target": "/01JBX7Y3S5M3Q8Y1V9K2T4R6R1/g/01JBX7Y3S5M3Q8Y1V9K2T4R6G1/data/b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c/shared/reads.fastq",
+        "state": "succeeded",
+        "job": "01JBX7Y3S5M3Q8Y1V9K2T4R6J1",
+        "run": "01JBX7Y3S5M3Q8Y1V9K2T4R6Q1",
+        "cancelled": false,
+        "created_ms": 1762700000000u64,
+        "settled_ms": 1762700030000u64
+    })
 }
 
 #[utoipa::path(
@@ -955,5 +1099,154 @@ mod tests {
         )
         .await;
         assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn lists_work_state() {
+        // The receiver lists its work with the state of each job, to the group's admins only.
+        use aruna_core::structs::execution::job::{
+            JobId, JobPayload, JobRecord, JobState, PluginWorkAction, PluginWorkSpec,
+        };
+        use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+        use aruna_core::structured_id::{BucketId, PlacementHandle};
+        use aruna_operations::jobs::store::insert_job;
+        use aruna_operations::plugins::work::{Identity, WorkRow, dispatched, reserve};
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let ctx = Arc::new(test_context(storage));
+        let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
+        let state = Arc::new(test_state(ctx.clone(), realm_id, node_id, capabilities).await);
+        let admin = UserId::new(Ulid::from_bytes([3u8; 16]), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: admin,
+            realm_id,
+        };
+        seed_realm_auth(&ctx, realm_id, &actor).await;
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        seed_group_docs(&ctx, realm_id, &actor, group_id, "lab", admin).await;
+        let install_id = Ulid::from_parts(7, 7);
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let install = PluginInstall {
+            install_id,
+            group_id,
+            plugin: "announcer".into(),
+            version: "0.1.0".into(),
+            digest: digest.clone(),
+            state: InstallState::Active,
+            paused: false,
+            settings: "{}".into(),
+            grants: Default::default(),
+            account: UserId::new(install_id, realm_id),
+            role_id: install_id,
+            receiver: node_id,
+            granted_by: admin,
+            request: digest,
+            revision: 1,
+            active_since_ms: Some(1),
+            failed: None,
+            prerequisites: Vec::new(),
+            activated_by: Some(node_id),
+            widened: None,
+            secrets: Default::default(),
+        };
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        // This node runs the install, so it serves the list itself.
+        config
+            .nodes
+            .push(aruna_core::structs::identity::realm::RealmNode {
+                node_id: node_id.to_string(),
+                kind: aruna_core::structs::identity::realm::RealmNodeKind::Server,
+            });
+        config.installs.push(install.clone());
+        let row = config.to_bytes(&actor).unwrap();
+        let key = (*realm_id.as_bytes()).into();
+        write_doc(&ctx, REALM_CONFIG_KEYSPACE, key, row.into()).await;
+        let kind = aruna_operations::plugins::work::WorkKind::Copy;
+        let mut work = WorkRow::reserved(&install, kind, Ulid::from_parts(5, 5), 1);
+        work.target = Some("/realm/g/group/data/node/out/a.txt".into());
+        let identity = Identity::Call {
+            run_id: work.run_id,
+            ordinal: 0,
+        };
+        reserve(&ctx, (&install, &identity), work.clone())
+            .await
+            .unwrap();
+        let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap();
+        let job = JobId::from_parts(2, handle, BucketId::new(0).unwrap(), 1).unwrap();
+        let spec = PluginWorkSpec {
+            realm_id,
+            install_id,
+            work_id: work.work_id,
+            group_id,
+            action: PluginWorkAction::Copy {
+                source: "a".into(),
+                source_version: None,
+                target: "b".into(),
+                version_id: Ulid::from_parts(6, 6),
+            },
+        };
+        let mut record = JobRecord::new(
+            job,
+            JobPayload::PluginWork(spec),
+            install.account,
+            node_id,
+            1,
+            1,
+            None,
+        );
+        record.state = JobState::Running;
+        insert_job(&ctx.storage_handle, &record).await.unwrap();
+        dispatched(&ctx, (install_id, work.work_id), job)
+            .await
+            .unwrap();
+        let path = format!("/api/v1/plugin-installs/{install_id}/work");
+        let list_as = |user: UserId, limit: Option<usize>| {
+            let state = state.clone();
+            let path = path.clone();
+            async move {
+                let auth = AuthContext {
+                    user_id: user,
+                    realm_id,
+                    path_restrictions: None,
+                    session: None,
+                };
+                list_work(
+                    State(state),
+                    Extension(Some(auth)),
+                    Path(install_id.to_string()),
+                    Query(RunListQuery {
+                        cursor: None,
+                        limit,
+                    }),
+                    OriginalUri(path.parse().unwrap()),
+                    Method::GET,
+                    HeaderMap::new(),
+                )
+                .await
+            }
+        };
+        let stranger = UserId::new(Ulid::from_bytes([8u8; 16]), realm_id);
+        assert_eq!(
+            list_as(stranger, None).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let refused = list_as(admin, Some(0)).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let answer = list_as(admin, None).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(answer.into_body(), usize::MAX);
+        let page: WorkPage = serde_json::from_slice(&body.await.unwrap()).unwrap();
+        assert_eq!(page.work.len(), 1);
+        let listed = &page.work[0];
+        assert_eq!(
+            (listed.kind.as_str(), listed.state.as_str()),
+            ("copy", "running")
+        );
+        assert_eq!(listed.job, Some(job.to_string()));
+        assert_eq!(listed.target, work.target);
+        assert_eq!(listed.source, None);
+        assert_eq!(page.next, None);
     }
 }

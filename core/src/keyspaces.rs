@@ -536,6 +536,8 @@ pub const PLUGIN_CREATES_KEYSPACE: &str = "plugin_creates";
 /// Webhook delivery ids this receiver admitted, by install and by receipt time, and where the
 /// prune of secret use audit rows stopped.
 pub const PLUGIN_HOOKS_KEYSPACE: &str = "plugin_hooks";
+/// Native work of plugin installs on their receiver, by install and identity, and by work id.
+pub const PLUGIN_WORK_KEYSPACE: &str = "plugin_work";
 /// The one row of `NODE_STATE_KEYSPACE` that holds the node's identity.
 pub const NODE_STATE_KEY: &[u8] = b"node_state";
 /// Realm signing key a promotion handed to this node; its next start moves it into the identity.
@@ -842,6 +844,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     PLUGIN_STATE_KEYSPACE,
     PLUGIN_CREATES_KEYSPACE,
     PLUGIN_HOOKS_KEYSPACE,
+    PLUGIN_WORK_KEYSPACE,
     ONBOARDING_KEYSPACE,
     DHT_KEYSPACE,
     CRAQLE_TERMS_KEYSPACE,

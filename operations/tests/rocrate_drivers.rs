@@ -2290,6 +2290,7 @@ fn run_name(result: Result<JobRunOutcome, tokio::task::JoinError>) -> &'static s
         Ok(JobRunOutcome::Cancelled) => "cancelled",
         Ok(JobRunOutcome::Interrupted) => "interrupted",
         Ok(JobRunOutcome::AwaitingKey(_)) => "awaiting key",
+        Ok(JobRunOutcome::Undecided(_)) => "undecided",
         Err(_) => "panicked",
     }
 }

@@ -232,7 +232,18 @@ pub async fn copy_object_tracked(
     input: CopyObjectInput,
     progress: Option<Arc<AtomicU64>>,
 ) -> Result<CopyResultData, CopyObjectError> {
-    copy_inner(context, input, progress, None).await
+    copy_inner(context, input, progress, (None, None)).await
+}
+
+/// `copy_object_tracked` that writes the version `version_id`, minted once by the caller, so a
+/// retry after a lost answer replays that version instead of writing another one.
+pub async fn copy_object_at(
+    context: &DriverContext,
+    input: CopyObjectInput,
+    version_id: Ulid,
+    progress: Option<Arc<AtomicU64>>,
+) -> Result<CopyResultData, CopyObjectError> {
+    copy_inner(context, input, progress, (None, Some(version_id))).await
 }
 
 /// `copy_object` where `token` admits the source read while its bucket key is locked.
@@ -262,15 +273,22 @@ pub async fn copy_object_token(
     input: CopyObjectInput,
     token: Option<TokenRead>,
 ) -> Result<CopyResultData, CopyObjectError> {
-    copy_inner(context, input, None, token.as_ref()).await
+    copy_inner(context, input, None, (token.as_ref(), None)).await
 }
 
 async fn copy_inner(
     context: &DriverContext,
     input: CopyObjectInput,
     progress: Option<Arc<AtomicU64>>,
-    token: Option<&TokenRead>,
+    (token, version): (Option<&TokenRead>, Option<Ulid>),
 ) -> Result<CopyResultData, CopyObjectError> {
+    // A given version that already exists was written by an earlier attempt whose answer was
+    // lost; it is answered without the source, which may be gone by now.
+    if let Some(version_id) = version
+        && let Some(committed) = committed_copy(context, &input, version_id).await?
+    {
+        return Ok(committed);
+    }
     ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
         .await
         .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
@@ -317,11 +335,15 @@ async fn copy_inner(
         if input.source_bucket != input.dest_bucket {
             admit_source(context, &input).await?;
         }
-        return preserve_reference(context, input, head, source_last_modified).await;
+        let source = (head, source_last_modified);
+        return preserve_reference(context, input, source, version).await;
     }
-    // A sealed source in the same bucket is aliased, never read, so it copies while locked.
+    // A sealed source in the same bucket is aliased, never read, so it copies while locked. Its
+    // version cannot be given, so a copy with a given version reads the source instead.
     if let Some(location) = head.location.clone().filter(|location| {
-        location.format.bucket_key().is_some() && input.source_bucket == input.dest_bucket
+        location.format.bucket_key().is_some()
+            && input.source_bucket == input.dest_bucket
+            && version.is_none()
     }) {
         return sealed_copy(context, input, head, location, source_last_modified).await;
     }
@@ -411,7 +433,7 @@ async fn copy_inner(
         checksum_type: None,
         exists: false,
         version_source,
-        preassigned_version_id: None,
+        preassigned_version_id: version,
         quota_ceiling: input.quota_ceiling,
         routing,
     })
@@ -527,6 +549,36 @@ async fn sealed_copy(
     })
 }
 
+/// The destination version `version_id` when it exists, described as the copy that wrote it.
+async fn committed_copy(
+    context: &DriverContext,
+    input: &CopyObjectInput,
+    version_id: Ulid,
+) -> Result<Option<CopyResultData>, CopyObjectError> {
+    let head = HeadObjectInput {
+        bucket: input.dest_bucket.clone(),
+        key: input.dest_key.clone(),
+        version_id: Some(version_id),
+    };
+    let head = match drive(HeadObjectOperation::new(head), context).await {
+        Ok(head) => head,
+        Err(HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion) => return Ok(None),
+        Err(error) => return Err(head_error(error)),
+    };
+    let size = (head.location.as_ref().map(|location| location.blob_size))
+        .or_else(|| (head.source_metadata.as_ref()).map(|metadata| metadata.content_length))
+        .unwrap_or_default();
+    Ok(Some(CopyResultData {
+        location: head.location,
+        size,
+        source_metadata: head.source_metadata,
+        version_id,
+        created_at: UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms()),
+        source_version_id: None,
+        source_last_modified: None,
+    }))
+}
+
 /// Admits a plaintext read of the source bucket the way GET does: an encrypting bucket must be
 /// unlocked, since a token opens single objects only. No bytes move, so the lease ends at once.
 async fn admit_source(
@@ -572,8 +624,8 @@ async fn admit_source(
 async fn preserve_reference(
     context: &DriverContext,
     input: CopyObjectInput,
-    head: HeadObjectResult,
-    source_last_modified: Option<SystemTime>,
+    (head, source_last_modified): (HeadObjectResult, Option<SystemTime>),
+    version: Option<Ulid>,
 ) -> Result<CopyResultData, CopyObjectError> {
     let (Some(binding), Some(metadata)) = (head.source_binding, head.source_metadata) else {
         return Err(CopyObjectError::Get(GetObjectError::GetObjectFailed));
@@ -581,7 +633,7 @@ async fn preserve_reference(
     let (version_id, _changed) = write_reference_version(
         context,
         ReferenceWrite {
-            preassigned_version_id: None,
+            preassigned_version_id: version,
             group_id: input.group_id,
             user_id: input.user_id,
             realm_id: input.realm_id,
@@ -690,6 +742,32 @@ pub(crate) mod test {
         (temp_handle, context)
     }
 
+    /// `context` with a file system blob backend below `root` on the same storage.
+    pub(crate) async fn with_blob(
+        context: &DriverContext,
+        root: &std::path::Path,
+    ) -> DriverContext {
+        let storage_handle = context.storage_handle.clone();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
+        let config = BackendConfig {
+            backend_type: Backend::FileSystem,
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100000),
+            multipart_bucket: Some("multipart".to_string()),
+            root: root.to_str().unwrap().to_string(),
+            service_config: HashMap::new(),
+            timeouts: Default::default(),
+        };
+        let policy = EgressPolicy::loopback();
+        let blob = BlobHandler::with_egress(config, storage_handle, net_handle, policy).await;
+        DriverContext {
+            blob_handle: Some(blob.unwrap()),
+            ..context.clone()
+        }
+    }
+
     pub(crate) async fn spawn_reference_server(
         body: &'static [u8],
     ) -> (String, tokio::task::JoinHandle<()>) {
@@ -707,7 +785,7 @@ pub(crate) mod test {
         (format!("http://{addr}"), handle)
     }
 
-    fn put_config(
+    pub(crate) fn put_config(
         realm_id: RealmId,
         group_id: GroupId,
         node_id: NodeId,
@@ -990,6 +1068,112 @@ pub(crate) mod test {
             read_dest_version(&context, "bucket", "dest.txt", result.version_id).await;
         assert!(dest_version.is_materialized());
         assert_eq!(dest_version.created_at, result.created_at);
+    }
+
+    #[tokio::test]
+    async fn given_version_replays() {
+        // A retry with the minted version answers that version instead of writing another.
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let config = put_config(realm_id, group_id, node_id, "bucket", "a.txt", b"bytes");
+        drive(PutObjectOperation::new(config), &context)
+            .await
+            .unwrap();
+        let input = || CopyObjectInput {
+            source_bucket: "bucket".to_string(),
+            source_key: "a.txt".to_string(),
+            source_version_id: None,
+            source_group_id: group_id,
+            source_auth_context: auth_context(user_id),
+            dest_bucket: "bucket".to_string(),
+            dest_key: "b.txt".to_string(),
+            user_id,
+            group_id,
+            realm_id,
+            node_id,
+            quota_ceiling: None,
+            conditions: CopySourceConditions::default(),
+            metadata: None,
+            restrictions: None,
+            references: CopyReferences::Materialize,
+            job_id: None,
+        };
+        let version = Ulid::generate();
+        let first = copy_object_at(&context, input(), version, None)
+            .await
+            .unwrap();
+        let again = copy_object_at(&context, input(), version, None)
+            .await
+            .unwrap();
+        assert_eq!((first.version_id, again.version_id), (version, version));
+        let head = HeadObjectInput {
+            bucket: "bucket".to_string(),
+            key: "b.txt".to_string(),
+            version_id: None,
+        };
+        let head = drive(HeadObjectOperation::new(head), &context)
+            .await
+            .unwrap();
+        assert_eq!(head.resolved_version_id, Some(version));
+    }
+
+    #[tokio::test]
+    async fn replays_without_source() {
+        // The copy committed and its answer was lost; the source was deleted since, yet the
+        // retry answers the committed version instead of failing on the missing source.
+        use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
+        let (_temp, context) = full_context().await;
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::generate();
+        let node_id = context.net_handle.as_ref().unwrap().node_id();
+        let user_id = UserId::local(Ulid::generate(), realm_id);
+        let config = put_config(realm_id, group_id, node_id, "bucket", "a.txt", b"bytes");
+        drive(PutObjectOperation::new(config), &context)
+            .await
+            .unwrap();
+        let input = || CopyObjectInput {
+            source_bucket: "bucket".to_string(),
+            source_key: "a.txt".to_string(),
+            source_version_id: None,
+            source_group_id: group_id,
+            source_auth_context: auth_context(user_id),
+            dest_bucket: "bucket".to_string(),
+            dest_key: "b.txt".to_string(),
+            user_id,
+            group_id,
+            realm_id,
+            node_id,
+            quota_ceiling: None,
+            conditions: CopySourceConditions::default(),
+            metadata: None,
+            restrictions: None,
+            references: CopyReferences::Materialize,
+            job_id: None,
+        };
+        let version = Ulid::generate();
+        let first = copy_object_at(&context, input(), version, None).await;
+        assert_eq!(first.unwrap().size, 5);
+        let delete = DeleteObjectInput {
+            bucket: "bucket".to_string(),
+            key: "a.txt".to_string(),
+            version_id: None,
+            group_id,
+            realm_id,
+            node_id,
+            deleted_by: user_id,
+        };
+        drive(DeleteObjectOperation::new(delete), &context)
+            .await
+            .unwrap();
+        let fresh = copy_object_at(&context, input(), Ulid::generate(), None).await;
+        assert!(fresh.is_err(), "a new copy of the deleted source must fail");
+        let again = copy_object_at(&context, input(), version, None)
+            .await
+            .unwrap();
+        assert_eq!((again.version_id, again.size), (version, 5));
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ pub mod lifecycle;
 pub mod metadata_class;
 pub mod output_record;
 pub mod persistent_id;
+pub mod plugin_work;
 pub(crate) mod protocol;
 pub mod prune;
 pub mod quota;
