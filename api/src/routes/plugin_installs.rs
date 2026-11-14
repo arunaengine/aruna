@@ -21,7 +21,6 @@ use aruna_operations::plugins::install::{
     read_manifest,
 };
 use aruna_operations::plugins::lifecycle::remove_install;
-use aruna_operations::plugins::matcher::{SYNC_WARNING, undelivered};
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::records::RecordError;
 use aruna_operations::users::service_account::group_admin_path;
@@ -117,7 +116,7 @@ pub struct InstallSummary {
     pub triggers: Vec<String>,
     /// The secret each slot uses.
     pub secrets: Vec<SecretLine>,
-    /// What the admin should know before approving, such as triggers not delivered yet.
+    /// What the admin should know before approving, such as a shared secret's use rule.
     pub warnings: Vec<String>,
 }
 
@@ -595,15 +594,13 @@ fn summary(
                 value: readable(slot),
             })
             .collect(),
-        warnings: (undelivered(manifest)
-            .first()
-            .map(|_| SYNC_WARNING.to_string()))
-        .into_iter()
-        .chain(bound.iter().filter_map(|(slot, binding)| {
-            let shared = matches!(binding.scope, BoundScope::Realm | BoundScope::Node);
-            shared.then(|| format!("a realm admin adds the use rule of `{binding}` for `{slot}`"))
-        }))
-        .collect(),
+        warnings: (bound.iter())
+            .filter_map(|(slot, binding)| {
+                let shared = matches!(binding.scope, BoundScope::Realm | BoundScope::Node);
+                shared
+                    .then(|| format!("a realm admin adds the use rule of `{binding}` for `{slot}`"))
+            })
+            .collect(),
     }
 }
 
@@ -800,18 +797,20 @@ mod tests {
     }
 
     #[test]
-    fn sync_warnings() {
+    fn summary_warnings() {
         let scope = InstallScope {
             realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
             group_id: Ulid::from_parts(1, 1),
             install_id: Ulid::from_parts(2, 2),
         };
-        let warned = |triggers: Value| {
+        let warned = |triggers: Value, binding: Option<&str>| {
             let manifest =
                 serde_json::json!({"name": "p", "version": "0.1.0", "triggers": triggers});
             let manifest: Manifest = serde_json::from_value(manifest).unwrap();
-            let none = (&BTreeMap::new(), &BTreeMap::new());
-            summary(&manifest, "sha256:ab", &scope, none).warnings
+            let bound = (binding.into_iter())
+                .map(|text| ("key".to_string(), SecretBinding::parse(text).unwrap()))
+                .collect();
+            summary(&manifest, "sha256:ab", &scope, (&BTreeMap::new(), &bound)).warnings
         };
         let manifest = serde_json::json!({
             "name": "p", "version": "0.1.0",
@@ -822,15 +821,13 @@ mod tests {
         let none = (&BTreeMap::new(), &BTreeMap::new());
         let lines = summary(&manifest, "sha256:ab", &scope, none).connections;
         assert!(lines[0].full_answer);
-        let sync_only = warned(serde_json::json!({"sync_failed": {}}));
-        let mixed = warned(serde_json::json!({"sync_completed": {}, "dataset_created": {}}));
+        // Sync triggers are delivered now and warn about nothing; a shared secret still warns.
+        let sync = serde_json::json!({"sync_completed": {}, "sync_failed": {}});
+        assert!(warned(sync.clone(), None).is_empty());
+        assert!(warned(sync.clone(), Some("group:key")).is_empty());
         assert_eq!(
-            (sync_only, mixed),
-            (
-                vec![SYNC_WARNING.to_string()],
-                vec![SYNC_WARNING.to_string()]
-            )
+            warned(sync, Some("realm:key")),
+            vec!["a realm admin adds the use rule of `realm:key` for `key`".to_string()]
         );
-        assert!(warned(serde_json::json!({"manual": {}, "data_uploaded": {}})).is_empty());
     }
 }

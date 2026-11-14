@@ -147,6 +147,8 @@ pub fn event_trigger(kind: SourceKind) -> TriggerKind {
         SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
         SourceKind::DataUploaded => TriggerKind::DataUploaded,
         SourceKind::DatasetUpdated => TriggerKind::DatasetUpdated,
+        SourceKind::SyncCompleted => TriggerKind::SyncCompleted,
+        SourceKind::SyncFailed => TriggerKind::SyncFailed,
     }
 }
 

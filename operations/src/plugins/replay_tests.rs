@@ -7,8 +7,11 @@ use super::*;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::match_pending;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
-use crate::plugins::worker::tests::{created, installed};
+use crate::plugins::store::decode;
+use crate::plugins::worker::tests::{created, echoed_sync, install_artifact, installed, synced};
+use aruna_core::keyspaces::PLUGIN_GAPS_KEYSPACE;
 use aruna_core::plugin_installs::Widening;
+use aruna_core::plugin_runs::{GapRow, gap_key};
 use aruna_core::time::unix_timestamp_millis;
 
 const MINUTE: u64 = 60 * 1000;
@@ -109,6 +112,49 @@ async fn widened_grant() {
 }
 
 #[tokio::test]
+async fn widened_sync() {
+    // A sync row journaled while the grant left its path out is read once the grant widens.
+    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let install = installed(&fixture).await;
+    let (local, now, auth) = (
+        fixture.actor.node_id,
+        unix_timestamp_millis(),
+        fixture.auth(),
+    );
+    let whole = install.grants["objects.read"].clone();
+    let base = whole[0].strip_suffix("/**").unwrap().to_string();
+    let (inside, outside) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+    let grant = |patterns| BTreeMap::from([("objects.read".to_string(), patterns)]);
+    let id = install.install_id;
+    let narrow = grant(vec![format!("{base}/raw/**")]);
+    (set_grants(&fixture.ctx, &fixture.actor, &auth, id, &narrow).await).unwrap();
+    let narrowed = config(&fixture).await;
+    plan_replays(&fixture.ctx, &narrowed, local, now, no_clock)
+        .await
+        .unwrap();
+    run_replays(&fixture.ctx, now).await.unwrap();
+    for (prefix, relationship, at) in [("raw/", inside, now - 1), ("other/", outside, now)] {
+        let mut event = synced(&install, prefix, relationship);
+        (event.journaled_ms, event.anchor_ms) = (at, at);
+        journal(&fixture, &event).await;
+    }
+    match_pending(&fixture.ctx, &narrowed, local, now)
+        .await
+        .unwrap();
+    assert_eq!(forwarded(&fixture, &install).await, [inside.to_string()]);
+
+    let wide = grant(whole);
+    let widened = set_grants(&fixture.ctx, &fixture.actor, &auth, id, &wide);
+    assert!(widened.await.unwrap().widened.is_some());
+    let config = config(&fixture).await;
+    let planned = plan_replays(&fixture.ctx, &config, local, now, no_clock).await;
+    assert_eq!(planned, Ok(1));
+    run_replays(&fixture.ctx, now).await.unwrap();
+    let both = [inside.to_string(), outside.to_string()];
+    assert_eq!(forwarded(&fixture, &install).await, both);
+}
+
+#[tokio::test]
 async fn growth_rules() {
     let fixture = crate::plugins::install::tests::Fixture::new().await;
     let mut install = installed(&fixture).await;
@@ -201,7 +247,7 @@ async fn unreadable_clock() {
 #[tokio::test]
 async fn pruned_journal() {
     let fixture = crate::plugins::install::tests::Fixture::new().await;
-    let install = installed(&fixture).await;
+    let install = install_artifact(&fixture, echoed_sync()).await;
     let local = fixture.actor.node_id;
     let now = install.active_since_ms.unwrap() + JOURNAL_RETENTION_MS + 60 * MINUTE;
     let config = config(&fixture).await;
@@ -213,4 +259,13 @@ async fn pruned_journal() {
     assert_eq!((pruned.count, pruned.unknown), (0, true));
     let since = install.active_since_ms.unwrap();
     assert!(pruned.earliest_ms < since && pruned.latest_ms == now - JOURNAL_RETENTION_MS);
+    // Each grown sync kind counts its own pruned gap.
+    for kind in [SourceKind::SyncCompleted, SourceKind::SyncFailed] {
+        let key = gap_key(install.install_id, kind, GapReason::Pruned);
+        let row = Txn::direct(&fixture.ctx)
+            .read(PLUGIN_GAPS_KEYSPACE, &key)
+            .await;
+        let row: GapRow = decode(&row.unwrap().expect("a pruned gap")).unwrap();
+        assert_eq!((row.count, row.unknown), (0, true), "{kind:?}");
+    }
 }

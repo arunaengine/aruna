@@ -221,7 +221,7 @@ pub enum PluginCommand {
         /// A run id; shows that run with its log lines.
         run: Option<String>,
     },
-    /// Show an install's waiting events, the events it did not get, and triggers not delivered.
+    /// Show an install's waiting events and the events it did not get.
     Delivery {
         /// The install id.
         id: String,

@@ -1,5 +1,5 @@
-//! Tests matching: grants narrow the match, pages commit with their rows, the bound and stale
-//! rows count gaps, sync triggers match nothing, and a user node keeps no journal.
+//! Tests matching: grants narrow the match, also for sync events, pages commit with their rows,
+//! the bound and stale rows count gaps, and a user node keeps no journal.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,7 +10,7 @@ use super::*;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::lifecycle::set_grants;
-use crate::plugins::worker::tests::{created, installed};
+use crate::plugins::worker::tests::{created, installed, synced};
 
 /// Journals `event` on this node as a committing transaction would.
 pub(crate) async fn journal(fixture: &Fixture, event: &SourceEvent) {
@@ -85,6 +85,32 @@ async fn narrowed_grants() {
 }
 
 #[tokio::test]
+async fn narrowed_sync() {
+    // A sync event under the granted prefix is matched; one under another prefix is not.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let base = install.grants["objects.read"][0]
+        .strip_suffix("/**")
+        .unwrap();
+    let narrowed = BTreeMap::from([("objects.read".into(), vec![format!("{base}/raw/**")])]);
+    let (inside, outside) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+    let events = [
+        synced(&install, "raw/runs/", inside),
+        synced(&install, "other/", outside),
+    ];
+    let auth = fixture.auth();
+    let id = install.install_id;
+    let install = (set_grants(&fixture.ctx, &fixture.actor, &auth, id, &narrowed).await).unwrap();
+    for event in &events {
+        journal(&fixture, event).await;
+    }
+    let local = fixture.actor.node_id;
+    let read = match_pending(&fixture.ctx, &config(&fixture).await, local, 10).await;
+    assert_eq!(read.unwrap(), 2);
+    assert_eq!(forwarded(&fixture, &install).await, [inside.to_string()]);
+}
+
+#[tokio::test]
 async fn rows_commit_once() {
     // A matched page leaves no pending row, so a restart matches each event once.
     let fixture = Fixture::new().await;
@@ -140,7 +166,8 @@ async fn user_node_clears() {
 }
 
 #[test]
-fn sync_matches_nothing() {
+fn sync_matches_kind() {
+    // A sync trigger matches its own kind on a covered path, and no other kind.
     let group_id = Ulid::from_parts(1, 1);
     let target = Target {
         install_id: Ulid::from_parts(2, 2),
@@ -148,7 +175,12 @@ fn sync_matches_nothing() {
         revision: 1,
         coverage: BTreeMap::from([(TriggerKind::SyncCompleted, BTreeSet::from(["/**".into()]))]),
     };
-    for kind in [SourceKind::DatasetCreated, SourceKind::DataUploaded] {
+    for (kind, matched) in [
+        (SourceKind::DatasetCreated, false),
+        (SourceKind::DataUploaded, false),
+        (SourceKind::SyncFailed, false),
+        (SourceKind::SyncCompleted, true),
+    ] {
         let event = SourceEvent {
             kind,
             group_id,
@@ -160,6 +192,6 @@ fn sync_matches_nothing() {
             journaled_ms: 1,
             actor: None,
         };
-        assert!(!target.matches(&event));
+        assert_eq!(target.matches(&event), matched, "{kind:?}");
     }
 }

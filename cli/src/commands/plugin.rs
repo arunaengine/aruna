@@ -391,7 +391,7 @@ fn warnings(summary: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Shows the install's waiting events, its undelivered events and triggers not delivered yet.
+/// Shows the install's waiting events and the events it did not get.
 async fn delivery(context: &mut Context<'_>, id: &str) -> Result<(), CliError> {
     let path = format!("plugin-installs/{id}/delivery");
     let view: Value = context.api()?.get(&path, &[]).await?;
@@ -416,10 +416,6 @@ async fn delivery(context: &mut Context<'_>, id: &str) -> Result<(), CliError> {
             gap["kind"].as_str().unwrap_or_default(),
             gap["reason"].as_str().unwrap_or_default()
         ));
-    }
-    for kind in view["undelivered"].as_array().into_iter().flatten() {
-        let kind = kind.as_str().unwrap_or_default();
-        lines.push(format!("trigger not delivered yet: {kind}"));
     }
     lines.extend(view["note"].as_str().map(|note| format!("note: {note}")));
     context.out.line(lines.join("\n"))

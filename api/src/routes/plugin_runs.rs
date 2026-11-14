@@ -14,8 +14,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_operations::plugins::decide::event_delivery;
 use aruna_operations::plugins::dispatch::{StartError, start_run};
-use aruna_operations::plugins::install::{InstallError, pick_version, read_config, read_manifest};
-use aruna_operations::plugins::matcher::undelivered;
+use aruna_operations::plugins::install::{InstallError, read_config};
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::runs::{RunError, list_runs, read_run, resolve_run};
 use aruna_operations::users::service_account::group_admin_path;
@@ -113,13 +112,14 @@ pub struct RunView {
 /// The source event an event run was started for.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RunEvent {
-    /// `dataset_created`, `dataset_updated` or `data_uploaded`.
+    /// `dataset_created`, `dataset_updated`, `data_uploaded`, `sync_completed` or `sync_failed`.
     pub kind: String,
     /// The policy path the install's grants are checked on.
     pub path: String,
-    /// The document id or object path the guest receives.
+    /// The document id or object path the guest receives; the relationship id of a sync event.
     pub resource: String,
-    /// The document event or object version.
+    /// The document event or object version; for a sync event the replication job, or the
+    /// transition when the relationship itself stopped as failed.
     pub revision: String,
     /// The event's identity, the same on every node that journaled it.
     pub source: String,
@@ -324,6 +324,24 @@ fn resolved_example() -> Value {
 /// queue as they finish or are resolved.
 const QUEUE_RETRY_SECS: u32 = 60;
 
+/// A run a completed sync job started.
+fn sync_example() -> Value {
+    let mut run = run_example(false);
+    let event = json!({
+        "kind": "sync_completed",
+        "path": "/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/data/ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6/raw/runs/",
+        "resource": "01JBX7Y3S5M3Q8Y1V9K2T4R6P6",
+        "revision": "01JBX7Y3S5M3Q8Y1V9K2T4R6P7",
+        "source": "sync_completed/ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6/01JBX7Y3S5M3Q8Y1V9K2T4R6P7",
+        "actor": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm"
+    });
+    run["id"] = json!("01JBX7Y3S5M3Q8Y1V9K2T4R6Q2");
+    run["handler"] = json!("on_synced");
+    run["trigger"] = json!("event");
+    (run["started_by"], run["input"], run["event"]) = (Value::Null, Value::Null, event);
+    run
+}
+
 /// One run as the run routes answer it.
 fn run_example(log: bool) -> Value {
     let log = match log {
@@ -467,7 +485,7 @@ pub async fn start(
 - After the install is removed, the node that ran it still lists, reads and resolves its runs."#,
     params(("id" = String, Path, description = "The install id"), RunListQuery),
     responses(
-        (status = 200, description = "One page of runs", body = RunPage, example = json!({"runs": [run_example(false)], "next": null})),
+        (status = 200, description = "One page of runs", body = RunPage, example = json!({"runs": [run_example(false), sync_example()], "next": null})),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
@@ -667,8 +685,6 @@ pub struct DeliveryView {
     pub oldest_age_ms: Option<u64>,
     /// Events that were not delivered and will not run, by kind and reason.
     pub gaps: Vec<GapView>,
-    /// Declared triggers whose events are not delivered yet.
-    pub undelivered: Vec<String>,
     /// Why the receiver's last replay started at its earliest kept event. Only the receiver's
     /// own replay is covered; other nodes do not report theirs.
     pub note: Option<String>,
@@ -688,11 +704,10 @@ pub struct DeliveryView {
   every other node relays the call there. Totals are summed over the reporting nodes.
 - While the receiver is drained, gone or no longer a server, the call answers 503 and names
   the receiver and the reason.
-- Sync triggers are listed in `undelivered`: they are not delivered yet.
 - `note` covers only the receiver's own replay; replays on other nodes are not reported."#,
     params(("id" = String, Path, description = "The install id")),
     responses(
-        (status = 200, description = "The install's event delivery", body = DeliveryView, example = json!({"waiting": 1, "oldest_age_ms": 4200, "gaps": [{"kind": "dataset_updated", "reason": "full", "count": 3, "unknown": false, "earliest_ms": 1762700000000u64, "latest_ms": 1762700060000u64}], "undelivered": ["sync_completed"], "note": null})),
+        (status = 200, description = "The install's event delivery", body = DeliveryView, example = json!({"waiting": 1, "oldest_age_ms": 4200, "gaps": [{"kind": "dataset_updated", "reason": "full", "count": 3, "unknown": false, "earliest_ms": 1762700000000u64, "latest_ms": 1762700060000u64}], "note": null})),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
@@ -722,11 +737,6 @@ pub async fn delivery(
         Err(response) => return response,
     };
     let ctx = state.get_ctx();
-    let config = read_config(&ctx, state.get_realm_id()).await.ok();
-    let manifest = (config.as_ref())
-        .and_then(|config| pick_version(config, &install.plugin, Some(&install.digest)).ok())
-        .and_then(|plugin| read_manifest(&plugin).ok());
-    let undelivered = manifest.as_ref().map(undelivered).unwrap_or_default();
     let delivery = match event_delivery(&ctx, install.install_id).await {
         Ok(delivery) => delivery,
         Err(error) => {
@@ -748,7 +758,6 @@ pub async fn delivery(
         waiting: delivery.waiting,
         oldest_age_ms: delivery.oldest_ms.map(|at| now.saturating_sub(at)),
         gaps,
-        undelivered: undelivered.into_iter().map(str::to_string).collect(),
         note: delivery.note,
     })
     .into_response()

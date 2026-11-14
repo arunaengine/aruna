@@ -49,7 +49,21 @@ pub(crate) fn secured() -> Vec<u8> {
     artifact(true, true)
 }
 
-fn artifact(connection: bool, secret: bool) -> Vec<u8> {
+/// The runnable fixture with both sync triggers, handled by `echo`, which answers the event.
+pub(crate) fn echoed_sync() -> Vec<u8> {
+    use aruna_plugins::trigger::TriggerKind;
+    let (component, mut manifest) = bare();
+    let echo = manifest.triggers[&TriggerKind::DatasetCreated].clone();
+    for kind in [TriggerKind::SyncCompleted, TriggerKind::SyncFailed] {
+        manifest.triggers.insert(kind, echo.clone());
+    }
+    manifest.handlers.retain(|handler| handler != "spin");
+    (manifest.connections, manifest.secrets) = (BTreeMap::new(), BTreeMap::new());
+    attach_manifest(component, &manifest).unwrap()
+}
+
+/// The fixture's component without its manifest section, and that manifest.
+fn bare() -> (&'static [u8], aruna_plugins::manifest::Manifest) {
     let manifest = read_manifest(FIXTURE).unwrap();
     let json = serde_json::to_vec(&manifest).unwrap();
     let mut content = Vec::new();
@@ -59,7 +73,11 @@ fn artifact(connection: bool, secret: bool) -> Vec<u8> {
     let mut section = vec![0u8];
     leb(content.len(), &mut section);
     section.extend_from_slice(&content);
-    let component = FIXTURE.strip_suffix(section.as_slice()).unwrap();
+    (FIXTURE.strip_suffix(section.as_slice()).unwrap(), manifest)
+}
+
+fn artifact(connection: bool, secret: bool) -> Vec<u8> {
+    let (component, manifest) = bare();
     let mut narrow = manifest;
     match secret {
         true => narrow.version = "0.2.1".to_string(),
@@ -230,6 +248,50 @@ async fn event_input() {
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
     let output = done.output.unwrap_or_default();
     assert!(output.ends_with("change dataset_created D1 r1"), "{output}");
+}
+
+/// A completed sync job of the relationship `relationship` under `prefix` of the install's data.
+pub(crate) fn synced(install: &PluginInstall, prefix: &str, relationship: Ulid) -> SourceEvent {
+    let whole = &install.grants["objects.read"][0];
+    let path = format!("{}/{prefix}", whole.strip_suffix("/**").unwrap());
+    let creator = install.account;
+    let kind = SourceKind::SyncCompleted;
+    let node = iroh::SecretKey::from_bytes(&[9; 32]).public();
+    let ids = (node, Ulid::from_parts(relationship.timestamp_ms(), 7));
+    SourceEvent::sync_job(
+        kind,
+        (install.group_id, path),
+        (relationship, creator),
+        ids,
+        1,
+    )
+}
+
+#[tokio::test]
+async fn sync_input() {
+    // A sync event starts the `sync_completed` handler; the guest gets the kind, the source
+    // path, the relationship and the job.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let event = synced(&install, "raw/", Ulid::from_parts(3, 3));
+    let run = event_run(&config, &install, &event, 0).unwrap();
+    assert_eq!(run.handler, "spin");
+    let call = invocation(&run, &install, Limits::default(), CancellationToken::new());
+    let Trigger::Event(given) = call.trigger else {
+        panic!("an event run calls its handler with the event")
+    };
+    let fields = [given.kind, given.path, given.resource, given.revision];
+    let expected = [
+        &event.kind.name().to_string(),
+        &event.path,
+        &event.resource,
+        &event.revision,
+    ];
+    assert_eq!(fields.each_ref(), expected);
+    assert_eq!(event.resource, Ulid::from_parts(3, 3).to_string());
 }
 
 #[tokio::test]

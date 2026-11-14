@@ -14,7 +14,6 @@ use aruna_core::plugin_runs::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::GroupId;
-use aruna_plugins::manifest::Manifest;
 use aruna_plugins::trigger::TriggerKind;
 use ulid::Ulid;
 
@@ -27,18 +26,6 @@ use super::lifecycle::coverage;
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
 use crate::realm::mutate_placement::node_kind;
-
-/// Why an install with sync triggers gets no sync events yet.
-pub const SYNC_WARNING: &str = "sync triggers are not delivered until a later release, and sync \
-    events before then are not kept for later delivery";
-
-/// The declared event triggers the matcher does not deliver yet.
-pub fn undelivered(manifest: &Manifest) -> Vec<&'static str> {
-    (manifest.triggers.keys())
-        .filter(|kind| matches!(kind, TriggerKind::SyncCompleted | TriggerKind::SyncFailed))
-        .map(|kind| kind.as_str())
-        .collect()
-}
 
 /// An active install with event triggers, as the matcher sees it.
 pub struct Target {
