@@ -6,6 +6,8 @@ pub mod add_role;
 pub mod announce_presence;
 pub mod assign_role;
 pub mod claim_admin;
+#[cfg(test)]
+mod commit_retry;
 pub mod create_realm;
 pub mod ensure_config;
 pub mod forward;

@@ -873,6 +873,19 @@ mod tests {
     }
 
     #[test]
+    fn retry_rereads_config() {
+        // A commit lost to a background config write signs the newer description on its retry.
+        let actor = actor();
+        let mut first = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        first.ensure_node(actor.node_id, RealmNodeKind::Management);
+        let mut operation = SetFederationOperation::new(request(&actor, "https://api.example.org"));
+        let written =
+            crate::realm::commit_retry::conflict_then_commit(&mut operation, &actor, &first);
+        let settings = written.federation.expect("settings written");
+        assert_eq!(settings.descriptor.payload.description, written.description);
+    }
+
+    #[test]
     fn description_sets_realm() {
         // A changed description also replaces the replicated realm description in the same write.
         let (mut operation, description, ops) = written_ops(Some("NFDI4LS"));

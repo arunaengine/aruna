@@ -563,6 +563,18 @@ mod tests {
     }
 
     #[test]
+    fn retry_rereads_config() {
+        // A commit lost to a background config write reads again and keeps that write.
+        let actor = actor(RealmId::from_bytes([1u8; 32]));
+        let mut first = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        first.ensure_node(actor.node_id, RealmNodeKind::Management);
+        let mut operation = SetPortalOperation::new(portal_config(&actor, features()));
+        let written =
+            crate::realm::commit_retry::conflict_then_commit(&mut operation, &actor, &first);
+        assert_eq!(written.portal_features, features());
+    }
+
+    #[test]
     fn denied_is_terminal() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let mut operation = SetPortalOperation::new(portal_config(&actor(realm_id), features()));

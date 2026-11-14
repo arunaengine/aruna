@@ -586,6 +586,18 @@ mod tests {
     }
 
     #[test]
+    fn retry_rereads_config() {
+        // A commit lost to a background config write reads again and keeps that write.
+        let actor = actor();
+        let mut first = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+        first.ensure_node(actor.node_id, RealmNodeKind::Management);
+        let mut operation = operation(ProviderChange::Upsert(provider("ls", "https://ls.example")));
+        let written =
+            crate::realm::commit_retry::conflict_then_commit(&mut operation, &actor, &first);
+        assert_eq!(ids(&written), vec!["ls"]);
+    }
+
+    #[test]
     fn denied_is_terminal() {
         let mut operation = operation(ProviderChange::Upsert(provider("ls", "https://ls.example")));
         operation.start();
