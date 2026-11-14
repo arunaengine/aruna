@@ -246,6 +246,50 @@ async fn event_input() {
     assert!(output.ends_with("change dataset_created D1 r1"), "{output}");
 }
 
+/// A completed sync job of the relationship `relationship` under `prefix` of the install's data.
+pub(crate) fn synced(install: &PluginInstall, prefix: &str, relationship: Ulid) -> SourceEvent {
+    let whole = &install.grants["objects.read"][0];
+    let path = format!("{}/{prefix}", whole.strip_suffix("/**").unwrap());
+    let creator = install.account;
+    let kind = SourceKind::SyncCompleted;
+    let node = iroh::SecretKey::from_bytes(&[9; 32]).public();
+    let ids = (node, Ulid::from_parts(relationship.timestamp_ms(), 7));
+    SourceEvent::sync_job(
+        kind,
+        (install.group_id, path),
+        (relationship, creator),
+        ids,
+        1,
+    )
+}
+
+#[tokio::test]
+async fn sync_input() {
+    // A sync event starts the `sync_completed` handler; the guest gets the kind, the source
+    // path, the relationship and the job.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    let event = synced(&install, "raw/", Ulid::from_parts(3, 3));
+    let run = event_run(&config, &install, &event, 0).unwrap();
+    assert_eq!(run.handler, "spin");
+    let call = invocation(&run, &install, Limits::default(), CancellationToken::new());
+    let Trigger::Event(given) = call.trigger else {
+        panic!("an event run calls its handler with the event")
+    };
+    let fields = [given.kind, given.path, given.resource, given.revision];
+    let expected = [
+        &event.kind.name().to_string(),
+        &event.path,
+        &event.resource,
+        &event.revision,
+    ];
+    assert_eq!(fields.each_ref(), expected);
+    assert_eq!(event.resource, Ulid::from_parts(3, 3).to_string());
+}
+
 #[tokio::test]
 async fn event_rechecked() {
     let fixture = Fixture::new().await;
