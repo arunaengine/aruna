@@ -467,7 +467,7 @@ fn unknown_post_kept() {
     assert_eq!(runner.world.lock().posts, 1);
     assert!(runner.world.lock().experiments.is_empty());
 
-    runner.manual(json!({ "resolve_create": dataset, "experiment": "absent" }));
+    runner.manual(json!({ "resolve_create": dataset, "absent": true }));
     assert_eq!(runner.world.lock().posts, 2);
     assert_eq!(runner.world.lock().experiments.len(), 1);
     let pointer = runner.world.state(&format!("dataset/{dataset}")).unwrap();
@@ -540,7 +540,7 @@ fn stopped_create_waits() {
     assert_eq!(pointer["reservation"]["unknown"], true);
     assert!(pointer["marks"]["unknown_create"].is_array(), "{pointer}");
 
-    runner.manual(json!({ "resolve_create": dataset, "experiment": "absent" }));
+    runner.manual(json!({ "resolve_create": dataset, "absent": true }));
     assert_eq!(runner.world.lock().posts, 1);
 }
 

@@ -17,8 +17,10 @@ use aruna_plugins::broker::{
     ObjectPage, Response, SendRequest, StatePut,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
+use aruna_plugins::manifest::SettingKind;
 use aruna_plugins::package::{load_manifest, package};
 use aruna_plugins::permission::Permission;
+use aruna_plugins::trigger::TriggerKind;
 use aruna_plugins::{CancellationToken, Compiled, Invocation, Runtime, Trigger, WatchEvent};
 use elabftw_sync::host::{Fault, Host, Kind, Method, Request};
 use serde_json::{Value, json};
@@ -233,6 +235,28 @@ fn module() -> Option<Vec<u8>> {
     Some(package(&mut manifest, &std::fs::read(path).unwrap()).unwrap())
 }
 
+/// Manual input as the node passes it on: checked against the `[manual]` form of plugin.toml,
+/// defaults filled in.
+fn filled(input: &Value) -> String {
+    let manifest = load_manifest(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let form = &manifest.triggers[&TriggerKind::Manual].form;
+    let given = input.as_object().unwrap();
+    if let Some(unknown) = given.keys().find(|name| !form.contains_key(*name)) {
+        panic!("`{unknown}` is not a field of the manual form");
+    }
+    let values = form.iter().map(|(name, field)| {
+        let value = given.get(name).or(field.default.as_ref()).unwrap().clone();
+        let fits = match field.kind {
+            SettingKind::Integer => value.is_u64(),
+            SettingKind::Boolean => value.is_boolean(),
+            _ => value.is_string(),
+        };
+        assert!(fits, "`{name}` has the wrong type: {value}");
+        (name.clone(), value)
+    });
+    Value::Object(values.collect()).to_string()
+}
+
 /// The compiled guest and the fake it runs against, at a moving time.
 struct Guest {
     runtime: Runtime,
@@ -322,7 +346,7 @@ impl Guest {
     }
 
     async fn manual(&self, input: Value) -> Value {
-        let output = self.invoke(Trigger::Manual(input.to_string())).await;
+        let output = self.invoke(Trigger::Manual(filled(&input))).await;
         output.unwrap().unwrap()
     }
 
@@ -437,7 +461,7 @@ async fn guest_settles_conflicts() {
     // A timer and a manual run at once still make one link and one dataset; the run that
     // finds the link held fails as retryable.
     let other = guest.world.experiment("Parallel", "", &["aruna"]);
-    let input = Trigger::Manual(json!({ "experiment": other }).to_string());
+    let input = Trigger::Manual(filled(&json!({ "experiment": other })));
     let (timer, manual) = tokio::join!(guest.poll(), guest.invoke(input));
     assert!(timer.is_object());
     if let Err(held) = manual {
@@ -480,7 +504,7 @@ async fn guest_recovers_creates() {
         "a negative lookup sends no second POST"
     );
     guest
-        .manual(json!({ "resolve_create": dataset, "experiment": "absent" }))
+        .manual(json!({ "resolve_create": dataset, "absent": true }))
         .await;
     assert_eq!(guest.world.lock().posts, 2);
 

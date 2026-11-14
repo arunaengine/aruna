@@ -110,12 +110,14 @@ until the next cycle, so it never holds up the others.
 
 ## Manual runs
 
-Run them with `aruna-cli plugin run <install id> --input '<json>'`.
+Run them with `aruna-cli plugin run <install id> --input '<json>'`. The input fills the
+`[manual]` form of plugin.toml; a field left out keeps its default (false, 0 or empty), which
+means not given.
 
 | Input | Effect |
 | --- | --- |
 | `{"report": true}` | Marked and unlinked entries, at most 48 KiB per page, with `next` while more follow |
-| `{"report": true, "next": <cursor>}` | The next page of the report |
+| `{"report": true, "next": "<next>"}` | The next page of the report; `next` is the text the last page returned |
 | `{"resolve": <experiment id>, "keep": "elabftw"}` | eLabFTW's record wins; `"aruna"` lets Aruna's win |
 | `{"experiment": <id>}` | Syncs one experiment now, or enrols it |
 

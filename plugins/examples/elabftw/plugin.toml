@@ -24,3 +24,14 @@ secret = { title = "eLabFTW API key of the sync user", kind = "header" }
 
 [timer]
 every = "5m"
+
+# One command per run; a field left at its default is not given.
+[manual]
+report = { title = "Show the report", type = "boolean", default = false }
+after = { title = "Report page start", type = "integer", default = 0 }
+resolve = { title = "Settle the conflict of this experiment id", type = "integer", default = 0 }
+keep = { title = "The side that wins a conflict: elabftw or aruna", default = "" }
+resolve_create = { title = "Settle the unknown create of this dataset id", default = "" }
+absent = { title = "The unknown create made no experiment", type = "boolean", default = false }
+reconcile = { title = "Start a full reconciliation", type = "boolean", default = false }
+experiment = { title = "Sync this experiment id", type = "integer", default = 0 }

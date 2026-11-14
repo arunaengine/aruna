@@ -155,14 +155,16 @@ Once a day the plugin compares every linked pair in small chunks across runs. Va
 differ while neither side changed since the last sync mark the link `out_of_sync` with the
 fields. The run log gets one summary line per pass.
 
-Manual runs, with `aruna-cli plugin run <install id> --input '<json>'`:
+Manual runs, with `aruna-cli plugin run <install id> --input '<json>'`. The input fills the
+`[manual]` form of plugin.toml; a field left out keeps its default (false, 0 or empty), which
+means not given.
 
 | Input | Effect |
 | --- | --- |
 | `{"report": true, "after": 0}` | One page of marked links (at most 100), the totals per mark, and `next` while more follow |
 | `{"resolve": <experiment id>, "keep": "elabftw"}` | The marked fields take the eLabFTW values; `"aruna"` takes Aruna's |
 | `{"resolve_create": "<dataset id>", "experiment": <id>}` | Links an experiment found after an unknown create |
-| `{"resolve_create": "<dataset id>", "experiment": "absent"}` | Allows a new create after you checked eLabFTW |
+| `{"resolve_create": "<dataset id>", "absent": true}` | Allows a new create after you checked eLabFTW |
 | `{"reconcile": true}` | Starts a full reconciliation now |
 | `{"experiment": <id>}` | Syncs one experiment now |
 

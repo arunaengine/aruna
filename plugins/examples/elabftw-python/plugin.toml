@@ -23,3 +23,11 @@ secret = { title = "eLabFTW API key of the sync user", kind = "header" }
 
 [timer]
 every = "5m"
+
+# One command per run; a field left at its default is not given.
+[manual]
+report = { title = "Show the report", type = "boolean", default = false }
+next = { title = "Report page cursor from the last page", default = "" }
+resolve = { title = "Settle the conflict of this experiment id", type = "integer", default = 0 }
+keep = { title = "The side that wins a conflict: elabftw or aruna", default = "" }
+experiment = { title = "Sync this experiment id", type = "integer", default = 0 }
