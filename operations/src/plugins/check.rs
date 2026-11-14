@@ -43,6 +43,23 @@ pub fn check_run<'a>(
 
 /// Steps 0 to 2 for install `install_id` pinned at `digest`, run by `local`.
 pub fn check_install<'a>(
+    place: (&'a RealmConfigDocument, RealmId, NodeId),
+    binding: (Ulid, &str),
+    account: Option<&User>,
+) -> Result<&'a PluginInstall, HostError> {
+    let install = check_identity(place, binding, account)?;
+    if install.state != InstallState::Active {
+        return Err(denied(&format!(
+            "the install is {}",
+            install.state.as_str()
+        )));
+    }
+    Ok(install)
+}
+
+/// The install whatever its state: this node runs it, its account is active and marked with
+/// it, and it still pins `digest`.
+pub fn check_identity<'a>(
     (config, realm_id, local): (&'a RealmConfigDocument, RealmId, NodeId),
     (install_id, digest): (Ulid, &str),
     account: Option<&User>,
@@ -65,12 +82,6 @@ pub fn check_install<'a>(
     });
     if !active {
         return Err(denied("the plugin account is not active"));
-    }
-    if install.state != InstallState::Active {
-        return Err(denied(&format!(
-            "the install is {}",
-            install.state.as_str()
-        )));
     }
     if install.digest != digest {
         return Err(denied("the install runs another version now"));

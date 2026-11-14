@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::structs::execution::job::{
     JobError, JobResultPayload, PluginWorkAction, PluginWorkSpec,
 };
@@ -20,7 +20,7 @@ use aruna_plugins::permission::Permission;
 use super::executor::{JobContext, JobRunOutcome};
 use crate::plugins::account::read_user;
 use crate::plugins::broker::local_object;
-use crate::plugins::check::{authorize_call, check_install, matching};
+use crate::plugins::check::{authorize_call, check_identity, matching};
 use crate::plugins::install::read_config;
 use crate::plugins::work::read_work;
 use crate::s3::object::copy::{
@@ -61,15 +61,20 @@ async fn admit_work(
         .map_err(deferred)?;
     let place = (&config, spec.realm_id, ctx.owner_node_id);
     let binding = (spec.install_id, row.binding.digest.as_str());
-    let install = check_install(place, binding, user.as_ref()).map_err(refused)?;
+    let install = check_identity(place, binding, user.as_ref()).map_err(refused)?;
     if install.account != row.account {
         return Err(permanent("the plugin work belongs to an earlier install"));
     }
-    if install.paused {
-        let message = JobError::retryable("the install is paused");
-        return Err(JobRunOutcome::DeferredFor(message, PAUSED_RETRY));
+    // A pause, or an update waiting for approval, holds the work until the install is active.
+    match install.state {
+        InstallState::Active if !install.paused => Ok((install.clone(), config)),
+        InstallState::Active | InstallState::Paused | InstallState::Blocked => {
+            let message = format!("the install is {}", install.state.as_str());
+            let message = JobError::retryable(message);
+            Err(JobRunOutcome::DeferredFor(message, PAUSED_RETRY))
+        }
+        state => Err(permanent(format!("the install is {}", state.as_str()))),
     }
-    Ok((install.clone(), config))
 }
 
 /// Checks `permission` on `target` with the current grants, as a plugin call does.

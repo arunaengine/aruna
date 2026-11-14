@@ -110,17 +110,25 @@ async fn refuses_changed_work() {
 
 #[tokio::test]
 async fn paused_install_waits() {
+    // A real pause holds the work and a resume lets it run; neither fails it.
+    use crate::plugins::lifecycle::{pause_install, resume_install};
     let fixture = Fixture::new().await;
-    let install = copier(&fixture).await;
-    let ctx = job_context(&fixture.ctx, &fixture);
-    let spec = recorded(&fixture, &install, ("in/a", "out/a")).await;
-    edit_config(&fixture, |config| config.installs[0].paused = true).await;
+    let (_root, blob, install, spec) = ready_copy(&fixture).await;
+    let ctx = job_context(&blob, &fixture);
+    let (actor, auth) = (&fixture.actor, fixture.auth());
+    let paused = pause_install(&fixture.ctx, actor, &auth, install.install_id).await;
+    assert_eq!(paused.unwrap().state, InstallState::Paused);
     let outcome = run_plugin_work(&ctx, &spec).await;
     assert!(
         matches!(outcome, JobRunOutcome::DeferredFor(_, wait) if wait == PAUSED_RETRY),
         "{}",
         outcome_name(&outcome)
     );
+    resume_install(&fixture.ctx, actor, &auth, install.install_id)
+        .await
+        .unwrap();
+    let outcome = run_plugin_work(&ctx, &spec).await;
+    assert!(copied(&outcome, &spec), "{}", outcome_name(&outcome));
 }
 
 #[tokio::test]
@@ -141,15 +149,20 @@ async fn narrowed_grant_refuses() {
     assert!(message.contains("is not granted"), "{message}");
 }
 
-#[tokio::test]
-async fn copies_once() {
-    // The copy runs as the account and writes the minted version; a rerun after a lost answer
-    // replays that version instead of writing another one.
+/// The install's objects `in/a.txt` (5 bytes) and the empty bucket `out` on a blob backend, and
+/// a recorded copy between them.
+async fn ready_copy(
+    fixture: &Fixture,
+) -> (
+    tempfile::TempDir,
+    DriverContext,
+    PluginInstall,
+    PluginWorkSpec,
+) {
     use crate::driver::drive;
     use crate::s3::object::copy::test::{put_config, seed_bucket, with_blob};
     use crate::s3::object::put::PutObjectOperation;
-    let fixture = Fixture::new().await;
-    let install = copier(&fixture).await;
+    let install = copier(fixture).await;
     let root = tempfile::tempdir().unwrap();
     let blob = with_blob(&fixture.ctx, root.path()).await;
     for bucket in ["in", "out"] {
@@ -158,18 +171,33 @@ async fn copies_once() {
     let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
     let source = put_config(realm, install.group_id, node, "in", "a.txt", b"bytes");
     drive(PutObjectOperation::new(source), &blob).await.unwrap();
-    let spec = recorded(&fixture, &install, ("in/a.txt", "out/a.txt")).await;
-    let PluginWorkAction::Copy { version_id, .. } = spec.action.clone();
+    let spec = recorded(fixture, &install, ("in/a.txt", "out/a.txt")).await;
+    (root, blob, install, spec)
+}
+
+/// Whether `outcome` copied the 5 bytes as the work's minted version.
+fn copied(outcome: &JobRunOutcome, spec: &PluginWorkSpec) -> bool {
+    let PluginWorkAction::Copy { version_id, .. } = &spec.action;
+    matches!(
+        outcome,
+        JobRunOutcome::Succeeded(JobResultPayload::PluginWork { bytes: 5, version_id: got })
+            if *got == Some(*version_id)
+    )
+}
+
+#[tokio::test]
+async fn copies_once() {
+    // The copy runs as the account and writes the minted version; a rerun after a lost answer
+    // replays that version instead of writing another one.
+    let fixture = Fixture::new().await;
+    let (_root, blob, _, spec) = ready_copy(&fixture).await;
     let ctx = job_context(&blob, &fixture);
     for attempt in 0..2 {
-        match run_plugin_work(&ctx, &spec).await {
-            JobRunOutcome::Succeeded(JobResultPayload::PluginWork {
-                bytes,
-                version_id: got,
-            }) => {
-                assert_eq!((bytes, got), (5, Some(version_id)), "attempt {attempt}");
-            }
-            other => panic!("attempt {attempt}: {}", outcome_name(&other)),
-        }
+        let outcome = run_plugin_work(&ctx, &spec).await;
+        assert!(
+            copied(&outcome, &spec),
+            "attempt {attempt}: {}",
+            outcome_name(&outcome)
+        );
     }
 }
