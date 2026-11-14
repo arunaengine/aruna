@@ -470,7 +470,8 @@ async fn budgets_end_runs() {
         run
     };
     let timer = || call(Trigger::Timer(0));
-    let cases: [(Invocation, fn(&mut Limits), Limit); 3] = [
+    type Case = (Invocation, fn(&mut Limits), Limit);
+    let cases: [Case; 3] = [
         (timer(), |l| l.fuel = 50_000_000, Limit::Fuel),
         (
             call(event("data_uploaded")),

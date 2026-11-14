@@ -110,7 +110,10 @@ fn author_errors() {
             "`webhook` names two secrets",
         ),
         ("on = [\"manual\"]\ntitel = \"x\"\n", "unknown field"),
-        ("on = [\"manual\"]\n[build]\noutput = \"x\"\n", "unknown field `build`"),
+        (
+            "on = [\"manual\"]\n[build]\noutput = \"x\"\n",
+            "unknown field `build`",
+        ),
     ];
     for (rest, expected) in cases {
         let message = error(rest);
@@ -119,7 +122,7 @@ fn author_errors() {
 }
 
 #[test]
-fn form_and_setting_types() {
+fn settings_refuse_datasets() {
     let picked = "name = \"p\"\nversion = \"0.1.0\"\non = [\"manual\"]\n[settings]\nd = { type = \"dataset\" }\n";
     assert!(matches!(
         parse(picked).unwrap().check(),
