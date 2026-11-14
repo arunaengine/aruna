@@ -108,19 +108,6 @@ pub struct Manifest {
     pub triggers: BTreeMap<TriggerKind, Trigger>,
     #[serde(default)]
     pub permissions: Requests,
-    /// How the project's own toolchain builds it; never part of a published artifact.
-    #[serde(default, skip_serializing)]
-    pub build: Option<BuildStep>,
-}
-
-/// A language toolchain step that writes a core module or a component.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BuildStep {
-    /// The program and its arguments, run in the project folder without a shell.
-    pub command: Vec<String>,
-    /// The module or component the command writes, relative to the project folder.
-    pub output: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

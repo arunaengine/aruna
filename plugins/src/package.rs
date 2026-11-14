@@ -11,11 +11,21 @@ use wasmparser::Parser;
 
 use crate::artifact::{SectionError, attach_manifest, check_artifact, component_imports};
 use crate::limits::RuntimeConfig;
-use crate::manifest::{BuildStep, Manifest, ManifestError};
+use crate::manifest::{Manifest, ManifestError};
 use crate::runtime::{Compiled, Runtime};
 
-/// The target Rust projects without a build step compile to; the host adds no WASI there.
+/// The target Rust projects compile to; the host adds no WASI there.
 pub const RUST_TARGET: &str = "wasm32-unknown-unknown";
+
+/// The host contract Python and JavaScript builds read from the build folder.
+const CONTRACT: &str = include_str!("../wit/plugin.wit");
+
+/// The folder a Python or JavaScript build writes into the project, again on every build.
+const BUILD_DIR: &str = ".aruna";
+
+/// The pinned toolchains of Python and JavaScript projects.
+const COMPONENTIZE_PY: &str = "componentize-py==0.25.1";
+const JCO: &str = "@bytecodealliance/jco@1.17.0";
 
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -55,21 +65,22 @@ pub fn load_manifest(project: &Path) -> Result<Manifest, BuildError> {
     Ok(manifest)
 }
 
-/// Runs the project's build step, or cargo for a Rust project without one, then packages
-/// the output and writes `<name>-<version>.wasm` beside it.
+/// Builds a Rust project with cargo, a Python (`app.py`) or JavaScript (`plugin.js`) one with
+/// its pinned toolchain, then packages the output as `<name>-<version>.wasm`: beside cargo's
+/// module, or in the project folder.
 pub fn build_project(project: &Path) -> Result<Built, BuildError> {
     let mut manifest = load_manifest(project)?;
-    let output = match &manifest.build {
-        Some(step) => run_step(project, step)?,
-        None if project.join("Cargo.toml").is_file() => cargo_module(&project.join("Cargo.toml"))?,
-        None => {
-            let hint = "add a [build] section with the command and output of your toolchain";
-            return Err(BuildError::Toolchain(hint.into()));
+    let file = format!("{}-{}.wasm", manifest.name, manifest.version);
+    let (output, path) = match project.join("Cargo.toml") {
+        cargo if cargo.is_file() => {
+            let module = cargo_module(&cargo)?;
+            let path = module.with_file_name(file);
+            (module, path)
         }
+        _ => (component(project)?, project.join(file)),
     };
     let bytes = std::fs::read(&output)?;
     let artifact = package(&mut manifest, &bytes)?;
-    let path = output.with_file_name(format!("{}-{}.wasm", manifest.name, manifest.version));
     std::fs::write(&path, &artifact)?;
     Ok(Built {
         manifest,
@@ -123,13 +134,55 @@ fn registered(runtime: &Runtime, compiled: &Compiled) -> Result<BTreeSet<String>
     })
 }
 
-fn run_step(project: &Path, step: &BuildStep) -> Result<PathBuf, BuildError> {
-    let (program, args) = step
-        .command
-        .split_first()
-        .ok_or_else(|| BuildError::Manifest("build.command is empty".into()))?;
+/// Writes the contract to `.aruna/wit/` and builds the project's component into `.aruna/`.
+fn component(project: &Path) -> Result<PathBuf, BuildError> {
+    let (wit, output) = (".aruna/wit", ".aruna/plugin.wasm");
+    let command = if project.join("app.py").is_file() {
+        let world = [
+            "-d",
+            wit,
+            "-w",
+            "plugin",
+            "componentize",
+            "app",
+            "-o",
+            output,
+        ];
+        let uv = [
+            "uv",
+            "run",
+            "--no-project",
+            "--with",
+            COMPONENTIZE_PY,
+            "componentize-py",
+        ];
+        [&uv[..], &world[..]].concat()
+    } else if project.join("plugin.js").is_file() {
+        let world = [
+            "--wit",
+            wit,
+            "--world-name",
+            "plugin",
+            "--disable",
+            "all",
+            "-o",
+            output,
+        ];
+        [
+            &["npx", "--yes", JCO, "componentize", "plugin.js"][..],
+            &world[..],
+        ]
+        .concat()
+    } else {
+        let hint = "found no Cargo.toml, app.py or plugin.js to build";
+        return Err(BuildError::Toolchain(hint.into()));
+    };
+    let folder = project.join(BUILD_DIR).join("wit");
+    std::fs::create_dir_all(&folder)?;
+    std::fs::write(folder.join("plugin.wit"), CONTRACT)?;
+    let program = command[0];
     let status = Command::new(program)
-        .args(args)
+        .args(&command[1..])
         .current_dir(project)
         .status()
         .map_err(|err| BuildError::Toolchain(format!("cannot run `{program}`: {err}")))?;
@@ -138,7 +191,7 @@ fn run_step(project: &Path, step: &BuildStep) -> Result<PathBuf, BuildError> {
             "`{program}` failed with {status}"
         )));
     }
-    Ok(project.join(&step.output))
+    Ok(project.join(output))
 }
 
 /// Runs `cargo build` for [`RUST_TARGET`] and returns the project's module.

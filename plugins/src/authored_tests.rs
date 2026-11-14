@@ -110,6 +110,7 @@ fn author_errors() {
             "`webhook` names two secrets",
         ),
         ("on = [\"manual\"]\ntitel = \"x\"\n", "unknown field"),
+        ("on = [\"manual\"]\n[build]\noutput = \"x\"\n", "unknown field `build`"),
     ];
     for (rest, expected) in cases {
         let message = error(rest);

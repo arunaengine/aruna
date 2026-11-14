@@ -193,7 +193,7 @@ struct Plugin {
 /// Builds the project in a child process and compiles it; the whole case shares one deadline.
 async fn build(project: PathBuf) -> Plugin {
     let deadline = Instant::now() + HANG_CAP;
-    let artifact = build_child(&project, deadline).await.unwrap();
+    let artifact = build_child(&project, None, deadline).await.unwrap();
     let runtime = Runtime::new(RuntimeConfig {
         max_artifact: 64 << 20,
         ceiling: limits(),
@@ -212,8 +212,13 @@ async fn build(project: PathBuf) -> Plugin {
 }
 
 /// Builds `project` in a child run of this binary, in a process group of its own, so a stuck
-/// toolchain is killed with everything it started once the deadline passes.
-async fn build_child(project: &Path, deadline: Instant) -> Result<Vec<u8>, String> {
+/// toolchain is killed with everything it started once the deadline passes. `tools` comes first
+/// in the child's PATH.
+async fn build_child(
+    project: &Path,
+    tools: Option<&Path>,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
     let name = project.file_name().unwrap().to_string_lossy().to_string();
     let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("built-{name}.wasm"));
     let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
@@ -222,6 +227,13 @@ async fn build_child(project: &Path, deadline: Instant) -> Result<Vec<u8>, Strin
         .env(BUILD_VAR, project)
         .env(OUT_VAR, &out)
         .kill_on_drop(true);
+    if let Some(tools) = tools {
+        let rest = std::env::var_os("PATH").unwrap_or_default();
+        let paths = [tools.to_path_buf()]
+            .into_iter()
+            .chain(std::env::split_paths(&rest));
+        command.env("PATH", std::env::join_paths(paths).unwrap());
+    }
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().unwrap();
@@ -347,21 +359,15 @@ async fn announce(language: &str) {
 }
 
 /// A project from the language's template whose `run` handler is `code`, triggered by hand and
-/// by a timer; the build reads the WIT from this crate.
+/// by a timer.
 fn probe(language: &str, code: &str) -> PathBuf {
     let templates = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("templates")
         .join(language);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("probe-{language}"));
     std::fs::create_dir_all(&dir).unwrap();
-    let wit = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wit");
-    let template = std::fs::read_to_string(templates.join("plugin.toml")).unwrap();
-    let build = &template[template.find("[build]").unwrap()..];
-    let build = build.replace("\"wit\"", &format!("{:?}", wit.display().to_string()));
-    let manifest = format!(
-        "name = \"probe\"\nversion = \"0.1.0\"\non = [\"manual\", \"timer\"]\n\n\
-         [timer]\nevery = \"1h\"\n\n{build}"
-    );
+    let manifest = "name = \"probe\"\nversion = \"0.1.0\"\non = [\"manual\", \"timer\"]\n\n\
+                    [timer]\nevery = \"1h\"\n";
     std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
     match language {
         "javascript" => {
@@ -477,12 +483,17 @@ async fn probes_python() {
 #[tokio::test]
 async fn kills_stuck_builds() {
     // A toolchain that never ends is killed with its process group once the deadline passes.
+    use std::os::unix::fs::PermissionsExt;
     let project = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stuck");
-    std::fs::create_dir_all(&project).unwrap();
-    let manifest = "name = \"stuck\"\nversion = \"0.1.0\"\non = [\"manual\"]\n\n[build]\n\
-                    command = [\"sleep\", \"600\"]\noutput = \"plugin.wasm\"\n";
+    let tools = project.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let manifest = "name = \"stuck\"\nversion = \"0.1.0\"\non = [\"manual\"]\n";
     std::fs::write(project.join("plugin.toml"), manifest).unwrap();
+    std::fs::write(project.join("app.py"), "").unwrap();
+    let uv = tools.join("uv");
+    std::fs::write(&uv, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    let built = build_child(&project, deadline).await;
+    let built = build_child(&project, Some(&tools), deadline).await;
     assert!(built.is_err_and(|why| why.contains("deadline")));
 }

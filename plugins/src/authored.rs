@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::connection::{Connection, Method};
 use crate::manifest::{
-    BuildStep, Manifest, ManifestError, Requests, SecretKind, SecretSlot, Setting, SettingKind,
+    Manifest, ManifestError, Requests, SecretKind, SecretSlot, Setting, SettingKind,
 };
 use crate::permission::Permission;
 use crate::trigger::{Trigger, TriggerKind};
@@ -40,8 +40,6 @@ struct Authored {
     webhook: Option<Webhook>,
     #[serde(default)]
     manual: BTreeMap<String, Field>,
-    #[serde(default)]
-    build: Option<BuildStep>,
 }
 
 /// What the plugin may do with what the installer scopes: read only, or also write.
@@ -198,7 +196,6 @@ impl Authored {
             connections,
             triggers,
             permissions: requests(self.access, readable),
-            build: self.build,
         })
     }
 }

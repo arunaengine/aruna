@@ -16,9 +16,6 @@ use crate::args::{Language, PluginCommand};
 use crate::client::read_json;
 use crate::error::CliError;
 
-/// The host contract every non-Rust project builds against; the Rust SDK carries its own copy.
-const CONTRACT: &str = include_str!("../../../plugins/wit/plugin.wit");
-
 /// Template files per language as (path, content); `{{name}}` becomes the plugin name.
 fn template(language: Language) -> Vec<(&'static str, &'static str)> {
     match language {
@@ -45,7 +42,6 @@ fn template(language: Language) -> Vec<(&'static str, &'static str)> {
                 "plugin.js",
                 include_str!("../../../plugins/templates/javascript/plugin.js"),
             ),
-            ("wit/plugin.wit", CONTRACT),
         ],
         Language::Python => vec![
             (
@@ -60,7 +56,6 @@ fn template(language: Language) -> Vec<(&'static str, &'static str)> {
                 "aruna.py",
                 include_str!("../../../plugins/templates/python/aruna.py"),
             ),
-            ("wit/plugin.wit", CONTRACT),
         ],
     }
 }
@@ -580,13 +575,10 @@ mod tests {
             let mut manifest = load_manifest(&path).unwrap();
             assert_eq!(manifest.name, "lab-sync");
             assert_eq!(manifest.wire(), Ok(()), "{language:?}");
-            assert_eq!(manifest.build.is_some(), language != Language::Rust);
         }
         let rust = dir.path().join("rust");
         let code = std::fs::read_to_string(rust.join("src").join("lib.rs")).unwrap();
         assert!(code.contains("aruna_plugin::export! { manual => run }"));
-        let contract = std::fs::read_to_string(dir.path().join("python/wit/plugin.wit")).unwrap();
-        assert_eq!(contract, CONTRACT);
         assert!(
             create("lab-sync", Language::Rust, &rust).is_err(),
             "a folder with files is refused"

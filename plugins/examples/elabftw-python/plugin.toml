@@ -23,7 +23,3 @@ secret = { title = "eLabFTW API key of the sync user", kind = "header" }
 
 [timer]
 every = "5m"
-
-[build]
-command = ["uv", "run", "--no-project", "--with", "componentize-py==0.25.1", "componentize-py", "-d", "../../wit", "-w", "plugin", "componentize", "app", "-o", "plugin.wasm"]
-output = "plugin.wasm"
