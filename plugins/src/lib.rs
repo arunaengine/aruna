@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod artifact;
+#[cfg(feature = "build")]
+pub mod authored;
 pub mod connection;
 pub mod manifest;
 #[cfg(feature = "build")]
