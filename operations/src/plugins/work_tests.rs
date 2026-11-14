@@ -60,9 +60,33 @@ async fn reinstall_adopts_nothing() {
         .unwrap();
     let mut reinstalled = install.clone();
     reinstalled.account = UserId::local(Ulid::generate(), install.account.realm_id);
+    let other = proposed(&install, 2);
+    let second = Identity::Key("copy-2".into());
+    reserve(&fixture.ctx, (&install, &second), other.clone())
+        .await
+        .unwrap();
     let fresh = proposed(&reinstalled, 1);
     let reserved = reserve(&fixture.ctx, (&reinstalled, &identity), fresh.clone()).await;
-    assert_eq!(reserved, Ok((fresh, Reserve::Fresh)));
+    assert_eq!(reserved, Ok((fresh.clone(), Reserve::Fresh)));
+    let former = index_key(install.install_id, first.work_id);
+    let txn = Txn::direct(&fixture.ctx);
+    let former = txn.read(PLUGIN_WORK_KEYSPACE, &former).await;
+    assert_eq!(former, Ok(None), "the former index goes with its row");
+    // Paging one row at a time lists each live row once, in order, and nothing of the former.
+    let (mut listed, mut after) = (Vec::new(), None);
+    loop {
+        let page = list_work(&fixture.ctx, install.install_id, after, 1).await;
+        let (rows, next) = page.unwrap();
+        listed.extend(rows.into_iter().map(|row| row.work_id));
+        match next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    // Rows are listed by work id, which orders ids of one millisecond at random.
+    let mut live = [other.work_id, fresh.work_id];
+    live.sort();
+    assert_eq!(listed, live);
 }
 
 #[tokio::test]

@@ -195,10 +195,19 @@ pub async fn reserve(
             Some(bytes) => Some(decode::<WorkRow>(&bytes)?),
             None => None,
         };
-        match stored.filter(|stored| stored.account == install.account) {
-            Some(stored) if stored.digest == proposed.digest => Ok((stored, Reserve::Earlier)),
-            Some(_) => Err(WorkError::Conflict),
-            None => {
+        match stored {
+            Some(stored) if stored.account == install.account => {
+                match stored.digest == proposed.digest {
+                    true => Ok((stored, Reserve::Earlier)),
+                    false => Err(WorkError::Conflict),
+                }
+            }
+            former => {
+                // A former install's index goes too, so no index row leads to the replacement.
+                if let Some(former) = former {
+                    let index = vec![index_key(install.install_id, former.work_id)];
+                    txn.delete(PLUGIN_WORK_KEYSPACE, index).await?;
+                }
                 let index = index_key(install.install_id, proposed.work_id);
                 txn.write(PLUGIN_WORK_KEYSPACE, vec![(index, key.clone())])
                     .await?;
@@ -466,14 +475,19 @@ pub async fn list_work(
     let (rows, next) = txn
         .page(PLUGIN_WORK_KEYSPACE, &prefix, after, limit)
         .await?;
+    // The cursor is the last index row read, whatever row it leads to.
+    let last = (rows.last()).and_then(|(index, _)| work_at(index));
     let mut works = Vec::with_capacity(rows.len());
-    for (_, key) in rows {
-        if let Some(value) = txn.read(PLUGIN_WORK_KEYSPACE, &key).await? {
-            works.push(decode::<WorkRow>(&value)?);
+    for (index, key) in rows {
+        let Some(value) = txn.read(PLUGIN_WORK_KEYSPACE, &key).await? else {
+            continue;
+        };
+        let row = decode::<WorkRow>(&value)?;
+        if index.ends_with(&row.work_id.to_bytes()) {
+            works.push(row);
         }
     }
-    let next = next.and_then(|_| works.last().map(|row| row.work_id));
-    Ok((works, next))
+    Ok((works, next.and(last)))
 }
 
 /// The state a work shows: from its summary once settled, else from its job record.
@@ -514,6 +528,11 @@ pub fn dedup_key(work_id: Ulid) -> Vec<u8> {
 
 fn install_at(key: &[u8]) -> Option<Ulid> {
     Some(Ulid::from_bytes(key.get(1..17)?.try_into().ok()?))
+}
+
+/// The work id of an index row.
+fn work_at(index: &[u8]) -> Option<Ulid> {
+    Some(Ulid::from_bytes(index.get(17..33)?.try_into().ok()?))
 }
 
 fn identity_at(key: &[u8]) -> Option<Identity> {
