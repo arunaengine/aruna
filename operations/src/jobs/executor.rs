@@ -153,6 +153,9 @@ pub enum JobRunOutcome {
     Interrupted,
     /// Needs these locked bucket keys; the runtime parks the job without spending an attempt.
     AwaitingKey(Vec<aruna_core::structs::execution::job::KeyWait>),
+    /// The outcome cannot be known and the effect must not run again: the job ends
+    /// `Indeterminate` and locally exhausted, never `Failed`.
+    Undecided(JobError),
 }
 
 /// Payload dispatch, mirroring how the task handler matches `TaskKey`. Execution
