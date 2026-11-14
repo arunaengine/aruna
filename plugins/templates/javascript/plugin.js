@@ -6,12 +6,13 @@ const handlers = {
   },
 };
 
-// Calls the named handler with a context and a plain event and awaits it; a thrown error fails
+// Calls the trigger's handler with a context and a plain event and awaits it; a thrown error fails
 // the run with the kind the Rust SDK would give it.
-export async function handle(name, invocation) {
+export async function handle(invocation) {
+  const name = triggerName(invocation.trigger);
   const handler = handlers[name];
   if (!handler) {
-    throw { kind: "invalid-input", message: `${name} is not a handler of this plugin` };
+    throw { kind: "invalid-input", message: `no handler for the trigger ${name}` };
   }
   const ctx = {
     run: invocation.run,
@@ -29,6 +30,17 @@ export async function handle(name, invocation) {
 
 // JSON has no BigInt, so a timer tick or another 64-bit number is written as a decimal string.
 const bigints = (_, value) => (typeof value === "bigint" ? value.toString() : value);
+
+// The triggers this plugin has handlers for; the build checks them against plugin.toml.
+export function triggers() {
+  return Object.keys(handlers);
+}
+
+// The plugin.toml name of the trigger that started the run.
+function triggerName({ tag, val }) {
+  if (tag === "event") return val.kind;
+  return tag === "timer" ? "every" : tag;
+}
 
 // The plain event of a trigger: manual input as JSON, the timer tick, or the record's fields.
 function toEvent({ tag, val }) {

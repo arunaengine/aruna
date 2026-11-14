@@ -233,12 +233,11 @@ fn runtime() -> Runtime {
     Runtime::new(config).unwrap()
 }
 
-fn call(handler: &str, trigger: Trigger) -> Invocation {
+fn call(trigger: Trigger) -> Invocation {
     Invocation {
         run: "run-1".into(),
         install: "install-1".into(),
         group: "group-1".into(),
-        handler: handler.into(),
         settings: r#"{"api_url":"https://api.example.org"}"#.into(),
         trigger,
         permissions: BTreeSet::from([Permission::MetadataRead, Permission::MetadataWrite]),
@@ -249,7 +248,7 @@ fn call(handler: &str, trigger: Trigger) -> Invocation {
 }
 
 fn probe(input: serde_json::Value) -> Invocation {
-    call("manual", Trigger::Manual(input.to_string()))
+    call(Trigger::Manual(input.to_string()))
 }
 
 /// An event of `kind`; the fixture runs `echo` or `hoard` for it by its manifest.
@@ -289,11 +288,7 @@ async fn echo_round_trip() {
         resource: "D1".into(),
         revision: "r1".into(),
     };
-    let reply = invoke(
-        call("dataset_created", Trigger::Event(event)),
-        Arc::default(),
-    )
-    .await;
+    let reply = invoke(call(Trigger::Event(event)), Arc::default()).await;
     assert_eq!(
         reply.unwrap().as_deref(),
         Some(
@@ -395,11 +390,7 @@ async fn dataset_calls_reach() {
         resource: "D1".into(),
         revision: "r2".into(),
     };
-    let reply = invoke(
-        call("dataset_created", Trigger::Event(event)),
-        Arc::default(),
-    )
-    .await;
+    let reply = invoke(call(Trigger::Event(event)), Arc::default()).await;
     assert!(
         reply
             .unwrap()
@@ -479,11 +470,11 @@ async fn budgets_end_runs() {
         edit(&mut run.limits);
         run
     };
-    let timer = || call("every", Trigger::Timer(0));
+    let timer = || call(Trigger::Timer(0));
     let cases: [(Invocation, fn(&mut Limits), Limit); 3] = [
         (timer(), |l| l.fuel = 50_000_000, Limit::Fuel),
         (
-            call("data_uploaded", event("data_uploaded")),
+            call(event("data_uploaded")),
             |l| l.memory = 8 << 20,
             Limit::Memory,
         ),
@@ -517,11 +508,12 @@ async fn budgets_end_runs() {
         invoke(big, Arc::default()).await,
         Err(InvokeError::Limit(Limit::Input))
     ));
-    let unknown = call("resync", Trigger::Timer(0));
-    assert!(matches!(
-        invoke(unknown, Arc::default()).await,
-        Err(InvokeError::Handler(_))
-    ));
+    // A trigger the code registered no function for fails as invalid input.
+    let unknown = call(event("dataset_deleted"));
+    match invoke(unknown, Arc::default()).await {
+        Err(InvokeError::Guest(failure)) => assert_eq!(failure.kind, FailureKind::InvalidInput),
+        other => panic!("an unknown trigger ran: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -546,10 +538,7 @@ async fn narrow_requests_compile() {
     let artifact = aruna_plugins::artifact::attach_manifest(component, &narrow).unwrap();
     assert!(runtime().compile(&artifact).is_ok());
     let compiled = runtime().compile(FIXTURE).unwrap();
-    let handlers: Vec<&str> = compiled
-        .manifest
-        .handlers
-        .iter()
+    let triggers: Vec<&str> = (compiled.manifest.handlers.iter())
         .map(String::as_str)
         .collect();
     let all = [
@@ -560,7 +549,7 @@ async fn narrow_requests_compile() {
         "manual",
     ];
     assert_eq!(
-        handlers,
+        triggers,
         [&all[..], &["sync_completed", "sync_failed"]].concat()
     );
 }
@@ -687,7 +676,7 @@ async fn node_admission_bounded() {
         tokio::spawn(async move { invoke_on(&runtime, first, broker).await })
     };
     broker.blocked.notified().await;
-    let second = invoke_on(&runtime, call("every", Trigger::Timer(0)), broker.clone()).await;
+    let second = invoke_on(&runtime, call(event("dataset_created")), broker.clone()).await;
     assert!(matches!(second, Err(InvokeError::Overloaded)), "{second:?}");
     cancel.cancel();
     let first = running.await.unwrap();

@@ -30,6 +30,16 @@ def on(*triggers: str) -> Callable:
     return register
 
 
+def _trigger_name(trigger: Any) -> str:
+    if isinstance(trigger, types.Trigger_Manual):
+        return "manual"
+    if isinstance(trigger, types.Trigger_Event):
+        return trigger.value.kind
+    if isinstance(trigger, types.Trigger_Webhook):
+        return "webhook"
+    return "every"
+
+
 def _event(trigger: Any) -> dict:
     if isinstance(trigger, types.Trigger_Manual):
         return {"kind": "manual", "input": json.loads(trigger.value) if trigger.value else None}
@@ -53,10 +63,11 @@ def _failure(error: Exception) -> types.Failure:
 
 
 class WitWorld(wit_world.WitWorld):
-    def handle(self, handler: str, invocation: types.Invocation) -> str | None:
-        function = _handlers.get(handler)
+    def handle(self, invocation: types.Invocation) -> str | None:
+        name = _trigger_name(invocation.trigger)
+        function = _handlers.get(name)
         if function is None:
-            raise Err(types.Failure(types.FailureKind.INVALID_INPUT, f"{handler} is not a handler"))
+            raise Err(types.Failure(types.FailureKind.INVALID_INPUT, f"no handler for the trigger {name}"))
         ctx = Context(invocation.run, invocation.install, invocation.group, json.loads(invocation.settings))
         try:
             result = function(ctx, _event(invocation.trigger))
@@ -65,3 +76,6 @@ class WitWorld(wit_world.WitWorld):
         if result is None or isinstance(result, str):
             return result
         return json.dumps(result)
+
+    def triggers(self) -> list[str]:
+        return sorted(_handlers)

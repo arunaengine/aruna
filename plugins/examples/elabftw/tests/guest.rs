@@ -269,17 +269,12 @@ impl Guest {
         format!("{}{run:016}", time.collect::<String>())
     }
 
-    async fn invoke(&self, handler: &str, trigger: Trigger) -> Result<Option<Value>, String> {
-        self.invoke_in(handler, trigger, BUCKET).await
+    async fn invoke(&self, trigger: Trigger) -> Result<Option<Value>, String> {
+        self.invoke_in(trigger, BUCKET).await
     }
 
     /// A run with the uploads in `bucket`.
-    async fn invoke_in(
-        &self,
-        handler: &str,
-        trigger: Trigger,
-        bucket: &str,
-    ) -> Result<Option<Value>, String> {
+    async fn invoke_in(&self, trigger: Trigger, bucket: &str) -> Result<Option<Value>, String> {
         let settings = serde_json::to_string(&json!({
             "elab_url": "https://elab.example.org", "sync_user": support::SYNC_USER, "writers": "3",
             "bucket": bucket, "prefix": "elabftw", "tag": "aruna", "aruna_url": "https://portal.example.org",
@@ -289,7 +284,6 @@ impl Guest {
             run: self.run_id(),
             install: "install-1".into(),
             group: "lab".into(),
-            handler: handler.into(),
             settings,
             trigger,
             permissions: BTreeSet::from([
@@ -313,10 +307,7 @@ impl Guest {
 
     async fn poll(&self) -> Value {
         let now = self.now.fetch_add(5 * 60 * 1000, Ordering::SeqCst) + 5 * 60 * 1000;
-        self.invoke("every", Trigger::Timer(now))
-            .await
-            .unwrap()
-            .unwrap()
+        self.invoke(Trigger::Timer(now)).await.unwrap().unwrap()
     }
 
     async fn event(&self, dataset: &str) {
@@ -327,15 +318,11 @@ impl Guest {
             resource: dataset.into(),
             revision: found.revision,
         };
-        self.invoke("dataset_updated", Trigger::Event(change))
-            .await
-            .unwrap();
+        self.invoke(Trigger::Event(change)).await.unwrap();
     }
 
     async fn manual(&self, input: Value) -> Value {
-        let output = self
-            .invoke("manual", Trigger::Manual(input.to_string()))
-            .await;
+        let output = self.invoke(Trigger::Manual(input.to_string())).await;
         output.unwrap().unwrap()
     }
 
@@ -451,7 +438,7 @@ async fn guest_settles_conflicts() {
     // finds the link held fails as retryable.
     let other = guest.world.experiment("Parallel", "", &["aruna"]);
     let input = Trigger::Manual(json!({ "experiment": other }).to_string());
-    let (timer, manual) = tokio::join!(guest.poll(), guest.invoke("manual", input));
+    let (timer, manual) = tokio::join!(guest.poll(), guest.invoke(input));
     assert!(timer.is_object());
     if let Err(held) = manual {
         assert!(
@@ -578,19 +565,23 @@ async fn guest_checks_bucket() {
     let Some(guest) = Guest::new().await else {
         return;
     };
-    let accepted = guest.invoke("every", Trigger::Timer(START)).await;
+    let accepted = guest.invoke(Trigger::Timer(START)).await;
     assert!(
         accepted.is_ok(),
         "an empty bucket on the receiver is fine: {accepted:?}"
     );
     let elsewhere = "/r/g/lab/data/elsewhere/shared";
     let refused = guest
-        .invoke_in("every", Trigger::Timer(START), elsewhere)
+        .invoke_in(Trigger::Timer(START), elsewhere)
         .await
         .unwrap_err();
     assert!(refused.contains("receiver node"), "{refused}");
-    let wrong = guest
-        .invoke("dataset_updated", Trigger::Manual("{}".into()))
-        .await;
-    assert!(wrong.is_err(), "the event handler takes events only");
+    let upload = WatchEvent {
+        kind: "data_uploaded".into(),
+        path: "p".into(),
+        resource: "r".into(),
+        revision: "1".into(),
+    };
+    let wrong = guest.invoke(Trigger::Event(upload)).await;
+    assert!(wrong.is_err(), "a trigger without a handler is refused");
 }

@@ -121,16 +121,19 @@ macro_rules! export {
 
             impl $crate::bindings::Guest for Exported {
                 fn handle(
-                    handler: String,
                     invocation: $crate::bindings::aruna::plugin::types::Invocation,
                 ) -> ::std::result::Result<
                     Option<String>,
                     $crate::bindings::aruna::plugin::types::Failure,
                 > {
-                    match handler.as_str() {
+                    match $crate::trigger_name(&invocation.trigger) {
                         $(stringify!($trigger) => $crate::dispatch(invocation, $handler),)+
                         other => Err($crate::unknown(other)),
                     }
+                }
+
+                fn triggers() -> Vec<String> {
+                    vec![$(stringify!($trigger).to_string()),+]
                 }
             }
 
@@ -143,6 +146,17 @@ macro_rules! export {
             static HANDLERS: [u8; $crate::section_len(NAMES)] = $crate::section(NAMES);
         };
     };
+}
+
+/// The manifest name of the trigger that started a run.
+#[doc(hidden)]
+pub fn trigger_name(trigger: &Trigger) -> &str {
+    match trigger {
+        Trigger::Manual(_) => "manual",
+        Trigger::Webhook(_) => "webhook",
+        Trigger::Event(event) => &event.kind,
+        Trigger::Timer(_) => "every",
+    }
 }
 
 #[doc(hidden)]
@@ -178,10 +192,10 @@ where
 }
 
 #[doc(hidden)]
-pub fn unknown(handler: &str) -> Failure {
+pub fn unknown(trigger: &str) -> Failure {
     Failure {
         kind: FailureKind::InvalidInput,
-        message: format!("`{handler}` is not a handler of this plugin"),
+        message: format!("this plugin has no handler for the trigger `{trigger}`"),
     }
 }
 

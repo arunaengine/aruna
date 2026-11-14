@@ -27,19 +27,21 @@ const TICK: std::time::Duration = std::time::Duration::from_millis(10);
 /// Live component handles per store, including async subtasks and waitables.
 const MAX_HANDLES: usize = 1_024;
 const MAX_TRAP_TEXT: usize = 512;
-/// The one export every plugin provides; handlers are dispatched by name inside the guest.
+/// The export every run calls; the code picks its function by the invocation's trigger.
 const HANDLE_EXPORT: &str = "handle";
+/// The export that lists the triggers the code registered functions for.
+const TRIGGERS_EXPORT: &str = "triggers";
 
-type HandleParams = (String, GuestCall);
+type HandleParams = (GuestCall,);
 type HandleResult = (Result<Option<String>, Failure>,);
+type TriggersResult = (Vec<String>,);
 
-/// One handler call with its pinned identity, settings, grants and budget.
+/// One run of a trigger with its pinned identity, settings, grants and budget.
 #[derive(Clone, Debug)]
 pub struct Invocation {
     pub run: String,
     pub install: String,
     pub group: String,
-    pub handler: String,
     /// The install's settings as a JSON object.
     pub settings: String,
     pub trigger: Trigger,
@@ -68,8 +70,6 @@ pub enum InvokeError {
     Overloaded,
     #[error("plugin runtime is closed")]
     Closed,
-    #[error("`{0}` is not a handler of this plugin")]
-    Handler(String),
 }
 
 /// Why an artifact cannot be compiled.
@@ -81,7 +81,7 @@ pub enum CompileError {
     Section(#[from] SectionError),
     #[error(transparent)]
     Manifest(#[from] ManifestError),
-    #[error("the `handle` export is missing or has the wrong type: {0}")]
+    #[error("the `handle` or `triggers` export is missing or has the wrong type: {0}")]
     Export(String),
     #[error("artifact does not compile: {0}")]
     Wasm(String),
@@ -184,13 +184,14 @@ impl Runtime {
             matches!(item.ty, ComponentItem::ComponentInstance(_)).then_some(name)
         });
         manifest.check_imports(instances)?;
-        let Some(ComponentItem::ComponentFunc(func)) = ty
-            .get_export(&inner.engine, HANDLE_EXPORT)
-            .map(|export| export.ty)
-        else {
-            return Err(CompileError::Export("no function export".into()));
+        let export = |name: &str| match ty.get_export(&inner.engine, name).map(|e| e.ty) {
+            Some(ComponentItem::ComponentFunc(func)) => Ok(func),
+            _ => Err(CompileError::Export(format!("no function export `{name}`"))),
         };
-        func.typecheck::<HandleParams, HandleResult>(&ty.instance_type())
+        let instance = ty.instance_type();
+        (export(HANDLE_EXPORT)?.typecheck::<HandleParams, HandleResult>(&instance))
+            .map_err(|err| CompileError::Export(err.to_string()))?;
+        (export(TRIGGERS_EXPORT)?.typecheck::<(), TriggersResult>(&instance))
             .map_err(|err| CompileError::Export(err.to_string()))?;
         let pre = inner
             .linker
@@ -205,7 +206,7 @@ impl Runtime {
         Ok(compiled)
     }
 
-    /// Runs one handler in a fresh instance and store. Any trap, budget or deadline ends it
+    /// Runs one trigger in a fresh instance and store. Any trap, budget or deadline ends it
     /// without a result, but only after its started writes recorded their outcome.
     pub async fn invoke(
         &self,
@@ -213,9 +214,6 @@ impl Runtime {
         call: Invocation,
         broker: Arc<dyn Broker>,
     ) -> Result<Option<String>, InvokeError> {
-        if !compiled.manifest.handlers.contains(&call.handler) {
-            return Err(InvokeError::Handler(call.handler));
-        }
         let limits = call.limits.within(&self.inner.config.ceiling);
         let input = call.run.len() + call.install.len() + call.group.len() + call.settings.len();
         if input + trigger_size(&call.trigger) > limits.input {
@@ -239,16 +237,13 @@ impl Runtime {
         };
         let trackers = (self.inner.tracker.clone(), writes.clone());
         let session = Session::new(broker, cx, grants, trackers, limits);
-        let params = (
-            call.handler,
-            GuestCall {
-                run: call.run,
-                install: call.install,
-                group: call.group,
-                settings: call.settings,
-                trigger: call.trigger,
-            },
-        );
+        let params = (GuestCall {
+            run: call.run,
+            install: call.install,
+            group: call.group,
+            settings: call.settings,
+            trigger: call.trigger,
+        },);
         let ended = self.run(compiled, session, params, &call.cancel).await;
         // Started writes record their outcome before any end of this run is reported.
         writes.close();

@@ -484,7 +484,6 @@ fn invocation(
         run: run.run_id.to_string(),
         install: run.install_id.to_string(),
         group: install.group_id.to_string(),
-        handler: run.handler.clone(),
         settings: run.settings.clone(),
         trigger,
         permissions,

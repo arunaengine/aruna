@@ -215,7 +215,6 @@ async fn enrols_tagged() {
         run: "run-1".into(),
         install: "install-1".into(),
         group: "group-1".into(),
-        handler: "every".into(),
         settings: settings.to_string(),
         trigger: Trigger::Timer(1_762_700_000_000),
         permissions: BTreeSet::from(permissions),

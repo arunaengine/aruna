@@ -267,7 +267,6 @@ fn build_entry() {
 
 async fn run(
     plugin: &Plugin,
-    handler: &str,
     trigger: Trigger,
     broker: Arc<Catalog>,
 ) -> Result<Option<String>, InvokeError> {
@@ -275,7 +274,6 @@ async fn run(
         run: "run-1".into(),
         install: "install-1".into(),
         group: "group-1".into(),
-        handler: handler.into(),
         settings: r#"{"catalog_url":"https://catalog.example.org"}"#.into(),
         trigger,
         permissions: BTreeSet::from([Permission::MetadataRead, Permission::MetadataWrite]),
@@ -308,7 +306,7 @@ fn created() -> Trigger {
 async fn announce(language: &str) {
     let plugin = build(example(language)).await;
     let catalog = Catalog::new(RECORD);
-    let ended = run(&plugin, "dataset_created", created(), catalog.clone()).await;
+    let ended = run(&plugin, created(), catalog.clone()).await;
     assert!(ended.is_ok(), "{language}: {ended:?}");
     let calls = catalog.calls();
     let sent: serde_json::Value =
@@ -336,7 +334,7 @@ async fn announce(language: &str) {
 
     // A catalog answer without `/id` fails the run before any metadata is written.
     let catalog = Catalog::new(r#"{"other":1}"#);
-    let ended = run(&plugin, "dataset_created", created(), catalog.clone()).await;
+    let ended = run(&plugin, created(), catalog.clone()).await;
     let Err(InvokeError::Guest(failure)) = ended else {
         panic!("{language}: a missing id must fail the run: {ended:?}");
     };
@@ -384,17 +382,17 @@ fn probe(language: &str, code: &str) -> PathBuf {
 /// Runs a probe by hand with `input` and by a timer, and checks what each answer became.
 async fn check_probe(language: &str, plugin: &Plugin, plain: &str, tick: &str) {
     let manual = |input: &str| Trigger::Manual(serde_json::json!(input).to_string());
-    let answer = run(plugin, "manual", manual("plain"), Catalog::new(RECORD)).await;
+    let answer = run(plugin, manual("plain"), Catalog::new(RECORD)).await;
     assert_eq!(answer.unwrap().as_deref(), Some(plain), "{language}");
     let timer = Trigger::Timer(1_762_700_000_000);
-    let answer = run(plugin, "every", timer, Catalog::new(RECORD)).await;
+    let answer = run(plugin, timer, Catalog::new(RECORD)).await;
     assert_eq!(answer.unwrap().as_deref(), Some(tick), "{language}");
     for (input, kind) in [
         ("retry", FailureKind::Retryable),
         ("missing", FailureKind::Retryable),
         ("denied", FailureKind::Permanent),
     ] {
-        let ended = run(plugin, "manual", manual(input), Catalog::new(RECORD)).await;
+        let ended = run(plugin, manual(input), Catalog::new(RECORD)).await;
         let Err(InvokeError::Guest(failure)) = ended else {
             panic!("{language} {input}: {ended:?}");
         };
