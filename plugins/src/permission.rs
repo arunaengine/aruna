@@ -116,7 +116,7 @@ impl Import {
             "metadata-create" => Self::Needs(Permission::MetadataCreate),
             "objects-read" => Self::Needs(Permission::ObjectsRead),
             "secrets" => Self::Needs(Permission::SecretsValue),
-            "connections" => Self::Connections,
+            "services" => Self::Connections,
             _ => return None,
         })
     }
@@ -155,7 +155,7 @@ mod tests {
             Import::of("metadata-create"),
             Some(Import::Needs(Permission::MetadataCreate))
         );
-        assert_eq!(Import::of("connections"), Some(Import::Connections));
+        assert_eq!(Import::of("services"), Some(Import::Connections));
         assert_eq!(Import::of("wasi:cli/environment"), None);
     }
 }

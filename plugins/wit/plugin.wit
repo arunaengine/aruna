@@ -167,8 +167,8 @@ interface objects-read {
   %list: func(prefix: string, cursor: option<string>) -> result<object-page, host-error>;
 }
 
-/// Sends requests through the connections the manifest declares (`connections.send`).
-interface connections {
+/// Sends requests to the services the manifest declares; the host adds their secrets.
+interface services {
   use types.{field, host-error};
 
   enum method {
@@ -180,9 +180,9 @@ interface connections {
     delete,
   }
 
-  /// `path` is relative to the connection's prefix; `key` names the effect across runs.
+  /// `path` is relative to the service's address; `key` names the effect across runs.
   record request {
-    connection: string,
+    service: string,
     method: method,
     path: string,
     query: list<field>,
@@ -191,23 +191,14 @@ interface connections {
     key: option<string>,
   }
 
-  /// The status, and the response fields the manifest allows as a JSON object keyed by pointer.
+  /// The status, and the headers and body the code may read of the answer.
   record response {
-    status: u16,
-    json: option<string>,
-  }
-
-  /// The whole answer, for a connection whose manifest reads it in full.
-  record full-response {
     status: u16,
     headers: list<field>,
     body: list<u8>,
   }
 
   send: func(request: request) -> result<response, host-error>;
-  /// Only for a connection whose manifest says `response = "full"` and whose secret's rule
-  /// exposes the full answer; any other connection refuses it.
-  send-full: func(request: request) -> result<full-response, host-error>;
 }
 
 /// Small private values of the install, changed by compare and swap.
@@ -249,7 +240,7 @@ world plugin {
   import metadata-write;
   import metadata-create;
   import objects-read;
-  import connections;
+  import services;
   import state;
   import secrets;
   import log;

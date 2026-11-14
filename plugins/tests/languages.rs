@@ -121,8 +121,11 @@ impl Broker for Catalog {
             "send {} {:?} {body}",
             request.connection, request.method
         ));
-        let json = Some(self.reply.into());
-        Ok(Response { status: 201, json })
+        Ok(Response {
+            status: 201,
+            headers: Vec::new(),
+            body: self.reply.into(),
+        })
     }
 
     async fn state_get(&self, _: &CallContext, _: &str) -> Result<Option<Entry>, HostError> {

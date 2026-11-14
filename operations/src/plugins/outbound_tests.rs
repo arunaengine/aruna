@@ -447,7 +447,7 @@ async fn whole_answers_gated() {
                 body: Vec::new(),
                 intent: None,
             };
-            broker.connection_send_full(&cx, request).await
+            broker.connection_send(&cx, request).await
         }
     };
     use crate::plugins::rules::{RuleGuard, consumer, edit_rules};

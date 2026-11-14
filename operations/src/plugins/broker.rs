@@ -24,8 +24,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    FullResponse, HostError, Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
-    ObjectPage, Response, SendRequest, StatePut,
+    HostError, Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response,
+    SendRequest, StatePut,
 };
 use aruna_plugins::connection::{Readable, relative_path};
 use aruna_plugins::permission::Permission;
@@ -917,80 +917,11 @@ impl Broker for RunBroker {
         cx: &CallContext,
         request: SendRequest,
     ) -> Result<Response, HostError> {
-        let mut ready = self.ready(request).await?;
-        // A whole answer is only for `send-full`; here the code reads fields at most.
-        if ready.exposure == ResponseExposure::Full {
-            ready.exposure = ResponseExposure::Status;
-        }
-        let Ready {
-            outgoing,
-            exposure,
-            fields,
-            body,
-            intent,
-            ..
-        } = ready;
-        let Some(intent) = intent else {
-            let answer = self.outbound.send(outgoing, body).await;
-            let answer = answer.map_err(send_refusal)?;
-            return Ok(exposed(&exposure, &fields, &answer));
-        };
-        if let Some(reply) = self.begun(&intent).await? {
-            return Ok(kept(stored_reply(&reply)?, &exposure));
-        }
-        // A sent request's answer that does not fit is stored as a marker before it is refused,
-        // so a rerun answers the same refusal and never sends again.
-        let outcome = match self.outbound.send(outgoing, body).await {
-            Ok(answer) => {
-                let shown = exposed(&exposure, &fields, &answer);
-                let size = shown.json.as_ref().map_or(0, String::len) + 2;
-                Ok(match size > cx.max_bytes {
-                    true => too_large(answer.status),
-                    false => reply_text(&shown),
-                })
-            }
-            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
-            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
-            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
-        };
-        stored_reply(&self.record(&intent, outcome).await?)
-    }
-
-    async fn connection_send_full(
-        &self,
-        cx: &CallContext,
-        request: SendRequest,
-    ) -> Result<FullResponse, HostError> {
         let ready = self.ready(request).await?;
-        // The manifest reads whole answers, and the secret's current rule exposes them.
-        if !ready.whole || ready.exposure != ResponseExposure::Full {
-            let narrower = "this connection does not expose its whole answer";
-            return Err(HostError::new(ErrorKind::Denied, narrower));
+        match ready.whole {
+            true => self.send_whole(cx, ready).await,
+            false => self.send_fields(cx, ready).await.map(Fields::reply),
         }
-        let Some(intent) = ready.intent else {
-            let answer = self.outbound.send(ready.outgoing, ready.body).await;
-            let answer = answer.map_err(send_refusal)?;
-            return Ok(whole(&ready.fields, &answer));
-        };
-        if let Some(reply) = self.begun(&intent).await? {
-            return stored_whole(&reply);
-        }
-        let outcome = match self.outbound.send(ready.outgoing, ready.body).await {
-            Ok(answer) => {
-                let shown = whole(&ready.fields, &answer);
-                let head: usize = (shown.headers.iter())
-                    .map(|field| field.name.len() + field.value.len())
-                    .sum();
-                Ok(match head + shown.body.len() + 2 > cx.max_bytes {
-                    true => too_large(answer.status),
-                    false => whole_text(&shown),
-                })
-            }
-            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
-            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
-            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
-        };
-        stored_whole(&self.record(&intent, outcome).await?)
     }
 
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {
@@ -1412,6 +1343,23 @@ fn write_outcome(error: MetadataWriteError) -> Outcome {
     }
 }
 
+/// What a connection whose manifest reads fields shows: the status and the readable fields as
+/// a JSON object keyed by pointer.
+struct Fields {
+    status: u16,
+    json: Option<String>,
+}
+
+impl Fields {
+    fn reply(self) -> Response {
+        Response {
+            status: self.status,
+            headers: Vec::new(),
+            body: self.json.map(String::into_bytes).unwrap_or_default(),
+        }
+    }
+}
+
 /// A checked connection request: the outgoing request with any secret added, the exposure of
 /// its answer, the secret's fields for echo removal, and whether the manifest reads it whole.
 struct Ready {
@@ -1424,6 +1372,78 @@ struct Ready {
 }
 
 impl RunBroker {
+    /// Sends for a connection whose manifest reads fields; the code reads those fields at most.
+    async fn send_fields(&self, cx: &CallContext, mut ready: Ready) -> Result<Fields, HostError> {
+        if ready.exposure == ResponseExposure::Full {
+            ready.exposure = ResponseExposure::Status;
+        }
+        let Ready {
+            outgoing,
+            exposure,
+            fields,
+            body,
+            intent,
+            ..
+        } = ready;
+        let Some(intent) = intent else {
+            let answer = self.outbound.send(outgoing, body).await;
+            let answer = answer.map_err(send_refusal)?;
+            return Ok(exposed(&exposure, &fields, &answer));
+        };
+        if let Some(reply) = self.begun(&intent).await? {
+            return Ok(kept(stored_reply(&reply)?, &exposure));
+        }
+        // A sent request's answer that does not fit is stored as a marker before it is refused,
+        // so a rerun answers the same refusal and never sends again.
+        let outcome = match self.outbound.send(outgoing, body).await {
+            Ok(answer) => {
+                let shown = exposed(&exposure, &fields, &answer);
+                let size = shown.json.as_ref().map_or(0, String::len) + 2;
+                Ok(match size > cx.max_bytes {
+                    true => too_large(answer.status),
+                    false => reply_text(&shown),
+                })
+            }
+            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
+            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
+            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
+        };
+        stored_reply(&self.record(&intent, outcome).await?)
+    }
+
+    /// Sends for a connection whose manifest reads whole answers, while the secret's current
+    /// rule exposes them too.
+    async fn send_whole(&self, cx: &CallContext, ready: Ready) -> Result<Response, HostError> {
+        if ready.exposure != ResponseExposure::Full {
+            let narrower = "this connection does not expose its whole answer";
+            return Err(HostError::new(ErrorKind::Denied, narrower));
+        }
+        let Some(intent) = ready.intent else {
+            let answer = self.outbound.send(ready.outgoing, ready.body).await;
+            let answer = answer.map_err(send_refusal)?;
+            return Ok(whole(&ready.fields, &answer));
+        };
+        if let Some(reply) = self.begun(&intent).await? {
+            return stored_whole(&reply);
+        }
+        let outcome = match self.outbound.send(ready.outgoing, ready.body).await {
+            Ok(answer) => {
+                let shown = whole(&ready.fields, &answer);
+                let head: usize = (shown.headers.iter())
+                    .map(|field| field.name.len() + field.value.len())
+                    .sum();
+                Ok(match head + shown.body.len() + 2 > cx.max_bytes {
+                    true => too_large(answer.status),
+                    false => whole_text(&shown),
+                })
+            }
+            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
+            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
+            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
+        };
+        stored_whole(&self.record(&intent, outcome).await?)
+    }
+
     /// The per call check, the address below the connection, the guest's own headers, and the
     /// secret released and added; every use of a secret, a replay included, passes the check.
     async fn ready(&self, request: SendRequest) -> Result<Ready, HostError> {
@@ -1578,7 +1598,7 @@ fn credential(name: &str) -> bool {
 }
 
 /// The answer as the guest may see it: the one place an exposure applies to an answer.
-fn exposed(exposure: &ResponseExposure, fields: &SecretFields, answer: &Answer) -> Response {
+fn exposed(exposure: &ResponseExposure, fields: &SecretFields, answer: &Answer) -> Fields {
     let shown = expose_response(
         exposure,
         fields,
@@ -1586,7 +1606,7 @@ fn exposed(exposure: &ResponseExposure, fields: &SecretFields, answer: &Answer) 
         &answer.headers,
         &answer.body,
     );
-    Response {
+    Fields {
         status: shown.status,
         json: shown
             .body
@@ -1631,7 +1651,7 @@ fn narrowed(rule: &ResponseExposure, reads: &Readable) -> ResponseExposure {
 }
 
 /// The whole answer as the code may see it, with echoes of the secret removed.
-fn whole(fields: &SecretFields, answer: &Answer) -> FullResponse {
+fn whole(fields: &SecretFields, answer: &Answer) -> Response {
     let shown = expose_response(
         &ResponseExposure::Full,
         fields,
@@ -1639,7 +1659,7 @@ fn whole(fields: &SecretFields, answer: &Answer) -> FullResponse {
         &answer.headers,
         &answer.body,
     );
-    FullResponse {
+    Response {
         status: shown.status,
         headers: (shown.headers.into_iter())
             .map(|(name, value)| Field { name, value })
@@ -1648,7 +1668,7 @@ fn whole(fields: &SecretFields, answer: &Answer) -> FullResponse {
     }
 }
 
-fn whole_text(reply: &FullResponse) -> String {
+fn whole_text(reply: &Response) -> String {
     let headers: Vec<(&str, &str)> = (reply.headers.iter())
         .map(|field| (field.name.as_str(), field.value.as_str()))
         .collect();
@@ -1682,7 +1702,7 @@ fn send_refusal(error: SendError) -> HostError {
     }
 }
 
-fn stored_whole(reply: &str) -> Result<FullResponse, HostError> {
+fn stored_whole(reply: &str) -> Result<Response, HostError> {
     let broken = || unavailable("a stored whole answer does not decode");
     let value: Value = serde_json::from_str(reply).map_err(|_| broken())?;
     refuse_large(&value)?;
@@ -1700,7 +1720,7 @@ fn stored_whole(reply: &str) -> Result<FullResponse, HostError> {
     let body = base64::engine::general_purpose::STANDARD
         .decode(body)
         .map_err(|_| broken())?;
-    Ok(FullResponse {
+    Ok(Response {
         status: status.ok_or_else(broken)?,
         headers: (headers.into_iter())
             .map(|(name, value)| Field { name, value })
@@ -1711,7 +1731,7 @@ fn stored_whole(reply: &str) -> Result<FullResponse, HostError> {
 
 /// A stored reply under the current exposure: each stored field stays or goes by its pointer
 /// key, so a replay can only narrow what the guest saw, never widen it.
-fn kept(reply: Response, exposure: &ResponseExposure) -> Response {
+fn kept(reply: Fields, exposure: &ResponseExposure) -> Fields {
     let json = match exposure {
         ResponseExposure::Status => None,
         ResponseExposure::Full => reply.json,
@@ -1724,18 +1744,18 @@ fn kept(reply: Response, exposure: &ResponseExposure) -> Response {
                 Value::Object(kept).to_string()
             }),
     };
-    Response {
+    Fields {
         status: reply.status,
         json,
     }
 }
 
 /// The stored reply of a settled send.
-fn reply_text(response: &Response) -> String {
+fn reply_text(response: &Fields) -> String {
     serde_json::json!({ "status": response.status, "json": response.json }).to_string()
 }
 
-fn stored_reply(reply: &str) -> Result<Response, HostError> {
+fn stored_reply(reply: &str) -> Result<Fields, HostError> {
     let value: Value =
         serde_json::from_str(reply).map_err(|error| unavailable(error.to_string()))?;
     refuse_large(&value)?;
@@ -1743,7 +1763,7 @@ fn stored_reply(reply: &str) -> Result<Response, HostError> {
         .get("status")
         .and_then(Value::as_u64)
         .and_then(|s| u16::try_from(s).ok());
-    Ok(Response {
+    Ok(Fields {
         status: status.ok_or_else(|| unavailable("a stored reply has no status"))?,
         json: value
             .get("json")

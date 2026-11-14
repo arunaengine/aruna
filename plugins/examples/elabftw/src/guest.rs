@@ -137,7 +137,7 @@ impl Host for Guest<'_> {
         let headers: &[(&str, &str)] = if body.is_empty() { &[] } else { &json };
         let http = self.ctx.http("elab");
         let key = request.key.as_deref();
-        let reply = ready(http.send_full_with(method, &request.path, &query, headers, body, key))?;
+        let reply = ready(http.send_with(method, &request.path, &query, headers, body, key))?;
         let headers = reply
             .headers
             .into_iter()

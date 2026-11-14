@@ -5,10 +5,10 @@
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-pub use crate::host::wit::aruna::plugin::connections::{FullResponse, Method, Response};
 pub use crate::host::wit::aruna::plugin::metadata_create::Created;
 pub use crate::host::wit::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 pub use crate::host::wit::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
+pub use crate::host::wit::aruna::plugin::services::{Method, Response};
 pub use crate::host::wit::aruna::plugin::state::Entry;
 pub use crate::host::wit::aruna::plugin::types::{ErrorKind, Field, HostError};
 
@@ -172,25 +172,12 @@ pub trait Broker: Send + Sync {
         prefix: &str,
         cursor: Option<String>,
     ) -> Result<ObjectPage, HostError>;
-    /// Sends through a declared connection; the reply is what the guest may read, already
-    /// limited to the exposure, with the fields as an object keyed by JSON pointer.
+    /// Sends to a declared service; the reply is what the guest may read of the answer.
     async fn connection_send(
         &self,
         cx: &CallContext,
         request: SendRequest,
     ) -> Result<Response, HostError>;
-    /// Sends through a connection whose manifest reads whole answers; the reply is the whole
-    /// answer within the exposure. A broker that serves none refuses it.
-    async fn connection_send_full(
-        &self,
-        _cx: &CallContext,
-        _request: SendRequest,
-    ) -> Result<FullResponse, HostError> {
-        Err(HostError::new(
-            ErrorKind::Unavailable,
-            "whole answers are not served here",
-        ))
-    }
     /// The fields of a slot granted through `secrets.value`. A broker that serves none refuses.
     async fn secret_value(&self, _cx: &CallContext, _slot: &str) -> Result<Vec<Field>, HostError> {
         Err(HostError::new(

@@ -202,7 +202,8 @@ impl Broker for Recorder {
         let answer = r#"{"/id":"c-1","/meta/name":"n","/items/1":{"b":2}}"#;
         Ok(Response {
             status: 201,
-            json: Some(answer.into()),
+            headers: Vec::new(),
+            body: answer.into(),
         })
     }
 

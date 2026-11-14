@@ -13,9 +13,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 
 use aruna_plugins::broker::{
-    Broker, CallContext, Created, Document, Entry, ErrorKind, FilePage, FullResponse, HostError,
-    Intent, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo, ObjectPage, Response,
-    SendRequest, StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, FilePage, HostError, Intent, Listing,
+    MetadataCreate, MetadataPatch, Method, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::package::build_project;
@@ -130,16 +129,8 @@ impl Broker for Team {
     async fn connection_send(
         &self,
         _: &CallContext,
-        _: SendRequest,
-    ) -> Result<Response, HostError> {
-        Err(unused())
-    }
-
-    async fn connection_send_full(
-        &self,
-        _: &CallContext,
         request: SendRequest,
-    ) -> Result<FullResponse, HostError> {
+    ) -> Result<Response, HostError> {
         let body = String::from_utf8_lossy(&request.body).to_string();
         self.note(format!("elab {:?} {} {body}", request.method, request.path));
         let offset = (request.query.iter()).find(|field| field.name == "offset");
@@ -151,7 +142,7 @@ impl Broker for Team {
             _ => experiment(),
         };
         let body = answer.to_string().into_bytes();
-        Ok(FullResponse {
+        Ok(Response {
             status: 200,
             headers: Vec::new(),
             body,

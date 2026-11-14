@@ -96,7 +96,9 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
                 .http(&text("connection"))
                 .send(method, &text("path"), body, None)
                 .await?;
-            json!({ "status": reply.status, "fields": reply.fields })
+            // A status-only answer has no body; it reads as no fields.
+            let fields = reply.json::<Value>().unwrap_or_else(|_| json!({}));
+            json!({ "status": reply.status, "fields": fields })
         }
         "random" => {
             let len = input.get("len").and_then(Value::as_u64).unwrap_or_default();

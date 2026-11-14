@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    FullResponse, HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method as Verb,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method as Verb, ObjectInfo,
+    ObjectPage, Response, SendRequest, StatePut,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::package::{load_manifest, package};
@@ -167,16 +167,8 @@ impl Broker for Hosted {
     async fn connection_send(
         &self,
         _: &CallContext,
-        _: SendRequest,
-    ) -> Result<Response, HostError> {
-        Err(unused())
-    }
-
-    async fn connection_send_full(
-        &self,
-        _: &CallContext,
         request: SendRequest,
-    ) -> Result<FullResponse, HostError> {
+    ) -> Result<Response, HostError> {
         assert_eq!(request.connection, "elab");
         let method = match request.method {
             Verb::Get => Method::Get,
@@ -207,7 +199,7 @@ impl Broker for Hosted {
             .into_iter()
             .map(|(name, value)| Field { name, value })
             .collect();
-        Ok(FullResponse {
+        Ok(Response {
             status: reply.status,
             headers,
             body: reply.body,

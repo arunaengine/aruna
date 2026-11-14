@@ -7,14 +7,14 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::bindings::aruna::plugin::{
-    connections, log, metadata_create, metadata_read, metadata_write, objects_read, secrets, state,
+    log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services, state,
 };
 use crate::error::{Error, Result};
 
-pub use connections::{FullResponse, Method};
 pub use log::Level;
 pub use metadata_create::Created;
 pub use objects_read::{ObjectInfo, ObjectPage};
+pub use services::{Method, Response};
 pub use state::Entry;
 
 /// What every handler gets: who runs it, the install's settings and the host calls.
@@ -219,23 +219,21 @@ impl Objects {
     }
 }
 
-/// The answer of a connection: its status and the response fields the manifest allows.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Response {
-    pub status: u16,
-    /// Allowed fields by JSON pointer, such as `/id`; the host drops everything else.
-    pub fields: serde_json::Map<String, Value>,
-}
-
 impl Response {
-    /// One allowed response field by its JSON pointer from the manifest, such as `/id`.
-    pub fn field(&self, pointer: &str) -> Result<&Value> {
+    /// The body as JSON.
+    pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
+        Ok(serde_json::from_slice(&self.body)?)
+    }
+
+    /// One field the manifest lets the code read, by its JSON pointer such as `/id`.
+    pub fn field(&self, pointer: &str) -> Result<Value> {
         let missing = || Error::failed(format!("the response has no field `{pointer}`"));
-        self.fields.get(pointer).ok_or_else(missing)
+        let fields: serde_json::Map<String, Value> = self.json().map_err(|_| missing())?;
+        fields.get(pointer).cloned().ok_or_else(missing)
     }
 }
 
-/// Requests through one declared connection; the host adds its secret.
+/// Requests to one declared service; the host adds its secret.
 #[derive(Debug, Clone)]
 pub struct Http {
     name: String,
@@ -260,7 +258,7 @@ impl Http {
         self.send(Method::Delete, path, Vec::new(), None).await
     }
 
-    /// Sends a request; `key` names a changing request across runs.
+    /// Sends a request with a JSON body, if any; `key` names a changing request across runs.
     pub async fn send(
         &self,
         method: Method,
@@ -268,50 +266,13 @@ impl Http {
         body: Vec<u8>,
         key: Option<&str>,
     ) -> Result<Response> {
-        let json_body = !body.is_empty();
-        let headers = json_body
-            .then(|| connections::Field {
-                name: "content-type".into(),
-                value: "application/json".into(),
-            })
-            .into_iter()
-            .collect();
-        let request = connections::Request {
-            connection: self.name.clone(),
-            method,
-            path: path.to_string(),
-            query: Vec::new(),
-            headers,
-            body,
-            key: key.map(str::to_string),
-        };
-        let reply = connections::send(&request);
-        let reply = reply.map_err(|err| Error::host(err, "connections.send", &self.name))?;
-        let fields = match reply.json {
-            Some(text) => serde_json::from_str(&text)?,
-            None => serde_json::Map::new(),
-        };
-        Ok(Response {
-            status: reply.status,
-            fields,
-        })
-    }
-}
-
-impl Http {
-    /// The whole answer, for a connection whose manifest says `response = "full"`.
-    pub async fn send_full(
-        &self,
-        method: Method,
-        path: &str,
-        body: Vec<u8>,
-        key: Option<&str>,
-    ) -> Result<FullResponse> {
-        self.send_full_with(method, path, &[], &[], body, key).await
+        let json = [("content-type", "application/json")];
+        let headers: &[(&str, &str)] = if body.is_empty() { &[] } else { &json };
+        self.send_with(method, path, &[], headers, body, key).await
     }
 
-    /// Like [`Http::send_full`], with query pairs and request headers such as `content-type`.
-    pub async fn send_full_with(
+    /// Like [`Http::send`], with query pairs and request headers such as `content-type`.
+    pub async fn send_with(
         &self,
         method: Method,
         path: &str,
@@ -319,17 +280,17 @@ impl Http {
         headers: &[(&str, &str)],
         body: Vec<u8>,
         key: Option<&str>,
-    ) -> Result<FullResponse> {
+    ) -> Result<Response> {
         let fields = |pairs: &[(&str, &str)]| {
             (pairs.iter())
-                .map(|(name, value)| connections::Field {
+                .map(|(name, value)| services::Field {
                     name: name.to_string(),
                     value: value.to_string(),
                 })
                 .collect()
         };
-        let request = connections::Request {
-            connection: self.name.clone(),
+        let request = services::Request {
+            service: self.name.clone(),
             method,
             path: path.to_string(),
             query: fields(query),
@@ -337,7 +298,7 @@ impl Http {
             body,
             key: key.map(str::to_string),
         };
-        let reply = connections::send_full(&request);
+        let reply = services::send(&request);
         reply.map_err(|err| Error::host(err, "connections.send", &self.name))
     }
 }

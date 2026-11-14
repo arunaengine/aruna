@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 import { get } from "aruna:plugin/metadata-read@0.3.0";
 import { patch } from "aruna:plugin/metadata-write@0.3.0";
-import { send } from "aruna:plugin/connections@0.3.0";
+import { send } from "aruna:plugin/services@0.3.0";
 
 const json = (value) => new TextEncoder().encode(JSON.stringify(value));
 
@@ -14,9 +14,9 @@ const handlers = {
     const doc = get(dataset);
     const title = JSON.parse(doc.json).name ?? null;
     const headers = [{ name: "content-type", value: "application/json" }];
-    const request = { connection: "catalog", method: "post", path: "", query: [], headers, body: json({ id: dataset, title }) };
+    const request = { service: "catalog", method: "post", path: "", query: [], headers, body: json({ id: dataset, title }) };
     const reply = send(request);
-    const fields = JSON.parse(reply.json ?? "{}");
+    const fields = JSON.parse(new TextDecoder().decode(reply.body) || "{}");
     if (!("/id" in fields)) {
       throw { kind: "permanent", message: "the response has no field `/id`" };
     }

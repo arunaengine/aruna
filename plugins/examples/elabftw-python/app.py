@@ -10,7 +10,7 @@ from aruna import WitWorld, handler  # noqa: F401  WitWorld is the component's e
 from componentize_py_types import Err
 from elab import Fault, Stop
 from sync import Guard, Settings
-from wit_world.imports import connections, log, metadata_create, metadata_read, metadata_write
+from wit_world.imports import log, metadata_create, metadata_read, metadata_write, services
 from wit_world.imports import objects_read, state, types
 
 
@@ -35,8 +35,8 @@ class Host:
     def elab(self, method, path, query, body):
         headers = [types.Field("content-type", "application/json")] if body else []
         query = [types.Field(name, value) for name, value in query]
-        verb = getattr(connections.Method, method)
-        reply = connections.send_full(connections.Request("elab", verb, path, query, headers, body, None))
+        verb = getattr(services.Method, method)
+        reply = services.send(services.Request("elab", verb, path, query, headers, body, None))
         return reply.status, bytes(reply.body)
 
     @hosted

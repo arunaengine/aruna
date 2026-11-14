@@ -254,15 +254,9 @@ fn checks_settings() {
 fn import_rule() {
     let manifest = example();
     let import = |name: &str| format!("aruna:plugin/{name}@0.3.0");
-    let mut allowed = [
-        "types",
-        "log",
-        "metadata-read",
-        "objects-read",
-        "connections",
-    ]
-    .map(import)
-    .to_vec();
+    let mut allowed = ["types", "log", "metadata-read", "objects-read", "services"]
+        .map(import)
+        .to_vec();
     allowed.extend(
         [
             "wasi:cli/environment@0.2.9",

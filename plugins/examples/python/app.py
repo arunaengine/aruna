@@ -6,7 +6,7 @@ import json
 
 from aruna import WitWorld, handler  # noqa: F401  WitWorld is the component's entry point
 from componentize_py_types import Err
-from wit_world.imports import connections, metadata_read, metadata_write, types
+from wit_world.imports import metadata_read, metadata_write, services, types
 
 
 @handler
@@ -20,9 +20,9 @@ def dataset_created(ctx, event):
     title = json.loads(doc.json).get("name")
     body = json.dumps({"id": dataset, "title": title}).encode()
     headers = [types.Field("content-type", "application/json")]
-    request = connections.Request("catalog", connections.Method.POST, "", [], headers, body, None)
-    reply = connections.send(request)
-    fields = json.loads(reply.json or "{}")
+    request = services.Request("catalog", services.Method.POST, "", [], headers, body, None)
+    reply = services.send(request)
+    fields = json.loads(bytes(reply.body) or b"{}")
     if "/id" not in fields:
         raise Err(types.Failure(types.FailureKind.PERMANENT, "the response has no field `/id`"))
     patch = json.dumps({"identifier": {"catalog": fields["/id"]}})
