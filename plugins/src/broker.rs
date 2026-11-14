@@ -5,8 +5,6 @@
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use crate::permission::Permission;
-
 pub use crate::host::wit::aruna::plugin::connections::{FullResponse, Method, Response};
 pub use crate::host::wit::aruna::plugin::metadata_create::Created;
 pub use crate::host::wit::aruna::plugin::metadata_read::{Document, FilePage, Listing};
@@ -100,8 +98,6 @@ pub struct StatePut {
 /// already checked that the permission or connection is granted at all and the budgets.
 #[async_trait]
 pub trait Broker: Send + Sync {
-    /// Whether the permission is granted for this resource now.
-    async fn granted(&self, cx: &CallContext, permission: Permission, resource: &str) -> bool;
     async fn metadata_get(&self, cx: &CallContext, resource: &str) -> Result<Document, HostError>;
     async fn metadata_list(
         &self,

@@ -153,7 +153,7 @@ pub fn check_artifact(bytes: &[u8]) -> Result<Manifest, SectionError> {
 }
 
 /// Names of the top-level instance and function imports of a component, such as
-/// `aruna:plugin/log@0.2.0`. Type imports carry no host calls and are left out.
+/// `aruna:plugin/log@0.3.0`. Type imports carry no host calls and are left out.
 pub fn component_imports(component: &[u8]) -> Result<Vec<String>, SectionError> {
     let mut depth = 0usize;
     let mut names = Vec::new();

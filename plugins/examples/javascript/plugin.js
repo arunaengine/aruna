@@ -1,11 +1,10 @@
-// Example plugin: posts the title of each new dataset to a catalog and, when granted,
-// records the catalog id on the dataset.
+// Example plugin: posts the title of each new dataset to a catalog and records the catalog id
+// on the dataset.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
-import { granted } from "aruna:plugin/grants@0.2.0";
-import { get } from "aruna:plugin/metadata-read@0.2.0";
-import { patch } from "aruna:plugin/metadata-write@0.2.0";
-import { send } from "aruna:plugin/connections@0.2.0";
+import { get } from "aruna:plugin/metadata-read@0.3.0";
+import { patch } from "aruna:plugin/metadata-write@0.3.0";
+import { send } from "aruna:plugin/connections@0.3.0";
 
 const json = (value) => new TextEncoder().encode(JSON.stringify(value));
 
@@ -17,14 +16,12 @@ const handlers = {
     const headers = [{ name: "content-type", value: "application/json" }];
     const request = { connection: "catalog", method: "post", path: "", query: [], headers, body: json({ id: dataset, title }) };
     const reply = send(request);
-    if (granted("metadata.write", dataset)) {
-      const fields = JSON.parse(reply.json ?? "{}");
-      if (!("/id" in fields)) {
-        throw { kind: "permanent", message: "the response has no field `/id`" };
-      }
-      const identifier = { catalog: fields["/id"] };
-      patch(dataset, JSON.stringify({ identifier }), doc.revision, undefined);
+    const fields = JSON.parse(reply.json ?? "{}");
+    if (!("/id" in fields)) {
+      throw { kind: "permanent", message: "the response has no field `/id`" };
     }
+    const identifier = { catalog: fields["/id"] };
+    patch(dataset, JSON.stringify({ identifier }), doc.revision, undefined);
   },
 };
 

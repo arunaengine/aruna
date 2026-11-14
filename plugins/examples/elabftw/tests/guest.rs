@@ -55,10 +55,6 @@ struct Hosted(Arc<World>);
 
 #[async_trait::async_trait]
 impl Broker for Hosted {
-    async fn granted(&self, _: &CallContext, _: Permission, _: &str) -> bool {
-        true
-    }
-
     async fn metadata_get(&self, _: &CallContext, _: &str) -> Result<Document, HostError> {
         Err(unused())
     }

@@ -57,11 +57,6 @@ impl Recorder {
 
 #[async_trait::async_trait]
 impl Broker for Recorder {
-    async fn granted(&self, _: &CallContext, permission: Permission, resource: &str) -> bool {
-        self.note("granted");
-        permission == Permission::MetadataRead && resource == "D1"
-    }
-
     async fn metadata_get(&self, _: &CallContext, resource: &str) -> Result<Document, HostError> {
         self.note("metadata_get");
         match resource {
@@ -314,27 +309,7 @@ async fn calls_reach_broker() {
         output(state),
         serde_json::json!({"version": 1, "stored": 1})
     );
-    let granted = invoke(
-        probe(
-            serde_json::json!({"call": "granted", "permission": "metadata.read", "resource": "D1"}),
-        ),
-        broker.clone(),
-    )
-    .await;
-    assert_eq!(output(granted), serde_json::json!(true));
-    let unknown = invoke(
-        probe(serde_json::json!({"call": "granted", "permission": "files.read", "resource": "D1"})),
-        broker.clone(),
-    )
-    .await;
-    assert_eq!(output(unknown), serde_json::json!(false));
-    let calls = [
-        "metadata_get",
-        "connection_send",
-        "state_put",
-        "state_get",
-        "granted",
-    ];
+    let calls = ["metadata_get", "connection_send", "state_put", "state_get"];
     assert_eq!(broker.calls(), calls);
 }
 

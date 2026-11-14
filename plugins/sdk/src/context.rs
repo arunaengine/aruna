@@ -7,8 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::bindings::aruna::plugin::{
-    connections, grants, log, metadata_create, metadata_read, metadata_write, objects_read,
-    secrets, state,
+    connections, log, metadata_create, metadata_read, metadata_write, objects_read, secrets, state,
 };
 use crate::error::{Error, Result};
 
@@ -47,11 +46,6 @@ impl Context {
 
     pub fn setting(&self, name: &str) -> Option<&Value> {
         self.settings.get(name)
-    }
-
-    /// Whether an optional permission is granted for `resource`, before trying the call.
-    pub async fn granted(&self, permission: &str, resource: &str) -> bool {
-        grants::granted(permission, resource)
     }
 
     pub fn metadata(&self) -> Metadata {

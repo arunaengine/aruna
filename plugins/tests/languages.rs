@@ -62,11 +62,6 @@ fn unused() -> HostError {
 
 #[async_trait::async_trait]
 impl Broker for Catalog {
-    async fn granted(&self, _: &CallContext, permission: Permission, resource: &str) -> bool {
-        self.note(format!("granted {permission} {resource}"));
-        permission == Permission::MetadataWrite
-    }
-
     async fn metadata_get(&self, _: &CallContext, resource: &str) -> Result<Document, HostError> {
         self.note(format!("get {resource}"));
         match resource {
@@ -325,8 +320,7 @@ async fn announce(language: &str) {
         serde_json::json!({"id": "D1", "title": "Run 7"}),
         "{language}"
     );
-    assert_eq!(calls[2], "granted metadata.write D1", "{language}");
-    let (_, patch) = calls[3]
+    let (_, patch) = calls[2]
         .split_once("D1 r1 ")
         .expect("a patch at the read revision");
     let patch: serde_json::Value = serde_json::from_str(patch).unwrap();
@@ -335,7 +329,7 @@ async fn announce(language: &str) {
         serde_json::json!({"identifier": {"catalog": "c-1"}}),
         "{language}"
     );
-    assert_eq!(calls.len(), 4, "{language}: {calls:?}");
+    assert_eq!(calls.len(), 3, "{language}: {calls:?}");
 
     // A catalog answer without `/id` fails the run before any metadata is written.
     let catalog = Catalog::new(r#"{"other":1}"#);
@@ -409,7 +403,7 @@ async fn check_probe(language: &str, plugin: &Plugin, plain: &str, tick: &str) {
     }
 }
 
-const JAVASCRIPT_PROBE: &str = r#"import { get } from "aruna:plugin/metadata-read@0.2.0";
+const JAVASCRIPT_PROBE: &str = r#"import { get } from "aruna:plugin/metadata-read@0.3.0";
 
 const handlers = {
   async run(ctx, event) {

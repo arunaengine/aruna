@@ -253,7 +253,7 @@ fn checks_settings() {
 #[test]
 fn import_rule() {
     let manifest = example();
-    let import = |name: &str| format!("aruna:plugin/{name}@0.2.0");
+    let import = |name: &str| format!("aruna:plugin/{name}@0.3.0");
     let mut allowed = [
         "types",
         "log",
@@ -279,7 +279,7 @@ fn import_rule() {
         "wasi:http/outgoing-handler@0.2.9",
         "wasi:cli/environment@0.3.0",
         "aruna:plugin/log@0.1.0",
-        "aruna:plugin/files@0.2.0",
+        "aruna:plugin/files@0.3.0",
         "invocation",
     ] {
         assert_eq!(

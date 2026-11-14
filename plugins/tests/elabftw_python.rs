@@ -52,10 +52,6 @@ fn unused() -> HostError {
 
 #[async_trait::async_trait]
 impl Broker for Team {
-    async fn granted(&self, _: &CallContext, _: Permission, _: &str) -> bool {
-        true
-    }
-
     async fn metadata_get(&self, _: &CallContext, resource: &str) -> Result<Document, HostError> {
         self.note(format!("get {resource}"));
         let dataset = self.dataset.lock().unwrap().clone();

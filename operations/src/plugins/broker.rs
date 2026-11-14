@@ -631,10 +631,6 @@ enum Outcome {
 
 #[async_trait]
 impl Broker for RunBroker {
-    async fn granted(&self, _cx: &CallContext, permission: Permission, resource: &str) -> bool {
-        self.checked(permission, resource).await.is_ok()
-    }
-
     async fn metadata_get(&self, cx: &CallContext, resource: &str) -> Result<Document, HostError> {
         self.dataset_read(cx, resource, RoCrateExportView::Full)
             .await

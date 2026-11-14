@@ -111,8 +111,8 @@ fn refused(wit: &str, world: &str) -> String {
 
 #[test]
 fn refuses_unrunnable_components() {
-    let missing = "package test:bad; world empty { import aruna:plugin/log@0.2.0; }
-        package aruna:plugin@0.2.0 { interface log { enum level { debug, info, warn, error } log: func(level: level, message: string); } }";
+    let missing = "package test:bad; world empty { import aruna:plugin/log@0.3.0; }
+        package aruna:plugin@0.3.0 { interface log { enum level { debug, info, warn, error } log: func(level: level, message: string); } }";
     assert!(
         refused(missing, "empty").contains("handle"),
         "missing export"
@@ -123,7 +123,7 @@ fn refuses_unrunnable_components() {
         refused(signature, "shape").contains("handle"),
         "wrong signature"
     );
-    let import = "package test:bad; world shout { import aruna:plugin/log@0.2.0; export handle: func(handler: string) -> string; }
-        package aruna:plugin@0.2.0 { interface log { shout: func(message: string); } }";
+    let import = "package test:bad; world shout { import aruna:plugin/log@0.3.0; export handle: func(handler: string) -> string; }
+        package aruna:plugin@0.3.0 { interface log { shout: func(message: string); } }";
     assert!(!refused(import, "shout").is_empty(), "unsupported import");
 }

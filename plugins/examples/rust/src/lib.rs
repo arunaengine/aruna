@@ -1,5 +1,5 @@
-//! Example plugin: posts the title of each new dataset to a catalog and, when granted,
-//! records the catalog id on the dataset.
+//! Example plugin: posts the title of each new dataset to a catalog and records the catalog id
+//! on the dataset.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -13,13 +13,11 @@ async fn dataset_created(ctx: Context, event: DatasetEvent) -> Result<()> {
         .http("catalog")
         .post("", &json!({ "id": event.dataset, "title": title }))
         .await?;
-    if ctx.granted("metadata.write", &event.dataset).await {
-        let id = record.field("/id")?;
-        let patch = json!({ "identifier": { "catalog": id } });
-        ctx.metadata()
-            .patch(&event.dataset, &patch, &dataset.revision)
-            .await?;
-    }
+    let id = record.field("/id")?;
+    let patch = json!({ "identifier": { "catalog": id } });
+    ctx.metadata()
+        .patch(&event.dataset, &patch, &dataset.revision)
+        .await?;
     Ok(())
 }
 

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-package aruna:plugin@0.2.0;
+package aruna:plugin@0.3.0;
 
 /// Data shared by the handler export and the host interfaces.
 interface types {
@@ -76,11 +76,6 @@ interface types {
     kind: error-kind,
     message: string,
   }
-}
-
-/// Checks a grant before trying an optional call; needs no permission.
-interface grants {
-  granted: func(permission: string, %resource: string) -> bool;
 }
 
 /// Reads dataset metadata of the group (`metadata.read`).
@@ -250,7 +245,6 @@ interface log {
 world plugin {
   use types.{invocation, failure};
 
-  import grants;
   import metadata-read;
   import metadata-write;
   import metadata-create;

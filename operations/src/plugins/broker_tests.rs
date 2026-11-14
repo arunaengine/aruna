@@ -133,8 +133,18 @@ async fn object_calls() {
     let refused = broker.objects_info(&cx(), &path).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::NotGranted);
     let meta = format!("/{}/g/{}/meta/x", fixture.actor.realm_id, fixture.group_id);
-    assert!(broker.granted(&cx(), Permission::MetadataRead, &meta).await);
-    assert!(!broker.granted(&cx(), Permission::ObjectsRead, &path).await);
+    assert!(
+        broker
+            .checked(Permission::MetadataRead, &meta)
+            .await
+            .is_ok()
+    );
+    assert!(
+        broker
+            .checked(Permission::ObjectsRead, &path)
+            .await
+            .is_err()
+    );
 
     // With `objects.read`, objects of other nodes and buckets outside the group are refused.
     let reads = serde_json::json!({ "permissions": { "required": ["objects.read"] } });

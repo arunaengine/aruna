@@ -30,7 +30,6 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
     let call = text("call");
     Ok(match call.as_str() {
         "settings" => ctx.settings::<Value>()?,
-        "granted" => json!(ctx.granted(&text("permission"), &text("resource")).await),
         "metadata_get" => {
             let doc = ctx.metadata().get(&text("resource")).await?;
             json!({ "revision": doc.revision, "json": doc.json })

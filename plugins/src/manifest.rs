@@ -14,7 +14,7 @@ use crate::permission::{Import, Permission};
 use crate::trigger::{Trigger, TriggerKind};
 
 /// Host interface package every artifact manifest must name.
-pub const PLUGIN_ABI: &str = "aruna:plugin@0.2.0";
+pub const PLUGIN_ABI: &str = "aruna:plugin@0.3.0";
 pub const MAX_MANIFEST: usize = 64 * 1024;
 pub const MAX_ENTRIES: usize = 32;
 pub const MAX_NAME: usize = 64;

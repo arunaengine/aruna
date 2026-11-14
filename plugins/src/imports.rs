@@ -11,8 +11,8 @@ use crate::broker::{
     ObjectPage, Response, SendRequest, StatePut,
 };
 use crate::host::wit::aruna::plugin::{
-    connections, grants, log, metadata_create, metadata_read, metadata_write, objects_read,
-    secrets, state, types,
+    connections, log, metadata_create, metadata_read, metadata_write, objects_read, secrets, state,
+    types,
 };
 use crate::host::{Needs, Session};
 use crate::permission::Permission;
@@ -104,27 +104,6 @@ fn method_name(method: Method) -> &'static str {
         Method::Put => "PUT",
         Method::Patch => "PATCH",
         Method::Delete => "DELETE",
-    }
-}
-
-impl grants::Host for Session {
-    async fn granted(&mut self, permission: String, resource: String) -> wasmtime::Result<bool> {
-        let size = permission.len() + resource.len();
-        let Ok(permission) = permission.parse::<Permission>() else {
-            self.count_call()?;
-            self.charge(size)?;
-            return Ok(false);
-        };
-        let reply = self
-            .brokered(
-                size,
-                Effect::Read,
-                Needs::Free,
-                |broker, cx| async move { Ok(broker.granted(&cx, permission, &resource).await) },
-                |_| 0,
-            )
-            .await?;
-        Ok(reply.unwrap_or(false))
     }
 }
 
