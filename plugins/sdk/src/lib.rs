@@ -7,16 +7,18 @@ mod form;
 mod host;
 #[doc(hidden)]
 pub mod legacy;
+pub mod objects;
 mod outcome;
 mod run;
 
 pub use bindings::aruna::plugin::log::Level;
 pub use bindings::aruna::plugin::types::WatchEvent;
 pub use form::Form;
+pub use objects::Object;
 pub use outcome::{Error, Result, fail, retry};
 #[doc(hidden)]
 pub use run::{Handler, handle, trigger_name, unhandled};
-pub use run::{Run, Subject, run, settings};
+pub use run::{Request, Run, Subject, SyncEvent, run, settings};
 
 /// The generated host interface. Code may call it directly; the library is only a convenience.
 #[doc(hidden)]

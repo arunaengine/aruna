@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::bindings::aruna::plugin::types::{Failure, FailureKind, Invocation, Trigger};
+use crate::objects::{self, Object};
 use crate::{Error, Form, Result, WatchEvent};
 
 /// Who runs the handler, and the raw event of an event trigger.
@@ -37,6 +38,46 @@ pub fn settings<T: DeserializeOwned>() -> Result<T> {
     serde_json::from_str(&text).map_err(|error| Error::Fail(format!("settings: {error}")))
 }
 
+/// A verified webhook request; authentication headers are already removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    pub method: String,
+    pub query: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// The provider's delivery id, when the manifest names its header.
+    pub delivery_id: Option<String>,
+}
+
+impl Request {
+    /// The value of the first header named `name`, in any case.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        (self.headers.iter())
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    pub fn text(&self) -> Result<&str> {
+        std::str::from_utf8(&self.body)
+            .map_err(|_| Error::InvalidInput("the body is not UTF-8".into()))
+    }
+
+    pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_slice(&self.body)
+            .map_err(|error| Error::InvalidInput(format!("body: {error}")))
+    }
+}
+
+/// A sync relationship's job that completed or failed, below the source path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncEvent {
+    /// Whether the sync completed.
+    pub ok: bool,
+    pub path: String,
+    pub relationship: String,
+    pub job: String,
+}
+
 /// What a handler takes: its trigger's subject.
 pub trait Subject: Sized {
     fn from_trigger(trigger: Trigger) -> Result<Self>;
@@ -61,7 +102,50 @@ impl Subject for SystemTime {
     }
 }
 
-fn mismatch(wanted: &str, trigger: &Trigger) -> Error {
+impl Subject for Request {
+    fn from_trigger(trigger: Trigger) -> Result<Self> {
+        let Trigger::Webhook(delivery) = trigger else {
+            return Err(mismatch("a webhook request", &trigger));
+        };
+        let request = delivery.request;
+        let headers = (request.headers.into_iter())
+            .map(|field| (field.name, field.value))
+            .collect();
+        Ok(Request {
+            method: request.method,
+            query: request.query,
+            headers,
+            body: request.body,
+            delivery_id: delivery.delivery_id,
+        })
+    }
+}
+
+impl Subject for SyncEvent {
+    fn from_trigger(trigger: Trigger) -> Result<Self> {
+        match trigger {
+            Trigger::Event(event) if event.kind.starts_with("sync_") => Ok(SyncEvent {
+                ok: event.kind == "sync_completed",
+                path: event.path,
+                relationship: event.resource,
+                job: event.revision,
+            }),
+            other => Err(mismatch("a sync event", &other)),
+        }
+    }
+}
+
+/// The uploaded object, as it is when the run starts.
+impl Subject for Object {
+    fn from_trigger(trigger: Trigger) -> Result<Self> {
+        match trigger {
+            Trigger::Event(event) if event.kind == "data_uploaded" => objects::get(&event.resource),
+            other => Err(mismatch("an uploaded object", &other)),
+        }
+    }
+}
+
+pub(crate) fn mismatch(wanted: &str, trigger: &Trigger) -> Error {
     let got = trigger_name(trigger);
     Error::InvalidInput(format!("the handler takes {wanted}, not a `{got}` run"))
 }

@@ -5,11 +5,19 @@
 use std::cell::RefCell;
 
 use crate::Level;
-use crate::bindings::aruna::plugin::log;
+use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
+use crate::bindings::aruna::plugin::types::HostError;
+use crate::bindings::aruna::plugin::{log, objects_read};
+
+/// One host call's answer.
+pub(crate) type Answer<T> = Result<T, HostError>;
 
 /// Every host call of the library; the component's imports, or a fake in tests.
 pub(crate) trait Host {
     fn log(&self, level: Level, message: &str);
+    fn object_info(&self, path: &str) -> Answer<ObjectInfo>;
+    fn object_list(&self, prefix: &str, cursor: Option<&str>) -> Answer<ObjectPage>;
+    fn object_read(&self, path: &str, version: Option<&str>) -> Answer<Vec<u8>>;
 }
 
 /// The component's own imports.
@@ -18,6 +26,18 @@ struct Imports;
 impl Host for Imports {
     fn log(&self, level: Level, message: &str) {
         log::log(level, message);
+    }
+
+    fn object_info(&self, path: &str) -> Answer<ObjectInfo> {
+        objects_read::info(path)
+    }
+
+    fn object_list(&self, prefix: &str, cursor: Option<&str>) -> Answer<ObjectPage> {
+        objects_read::list(prefix, cursor)
+    }
+
+    fn object_read(&self, path: &str, version: Option<&str>) -> Answer<Vec<u8>> {
+        objects_read::read(path, version)
     }
 }
 
@@ -35,3 +55,7 @@ pub(crate) fn with<R>(call: impl FnOnce(&dyn Host) -> R) -> R {
 pub(crate) fn replace(fake: Box<dyn Host>) {
     HOST.with(|host| *host.borrow_mut() = fake);
 }
+
+#[cfg(test)]
+#[path = "fake.rs"]
+pub(crate) mod fake;

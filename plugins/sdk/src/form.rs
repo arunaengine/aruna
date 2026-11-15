@@ -5,6 +5,7 @@
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
+use crate::objects::{self, Object};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -32,6 +33,11 @@ impl Form {
 
     pub fn text(&self, name: &str) -> Result<String> {
         self.get(name)
+    }
+
+    /// The object a field of type `object` names, loaded.
+    pub fn object(&self, name: &str) -> Result<Object> {
+        objects::get(&self.text(name)?)
     }
 
     pub fn value(&self, name: &str) -> Option<&Value> {

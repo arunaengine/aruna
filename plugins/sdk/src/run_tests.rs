@@ -3,14 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::rc::Rc;
-
 use serde::Deserialize;
 
 use super::*;
-use crate::bindings::aruna::plugin::types::{ErrorKind, HostError};
-use crate::host::{Host, replace};
-use crate::{Level, fail, retry};
+use crate::bindings::aruna::plugin::types::{
+    ErrorKind, Field, HostError, WebhookDelivery, WebhookRequest,
+};
+use crate::host::fake::install;
+use crate::{fail, retry};
 
 fn invocation(trigger: Trigger) -> Invocation {
     Invocation {
@@ -42,6 +42,38 @@ fn subjects_from_triggers() {
         handle(invocation(Trigger::Timer(1500)), tick),
         Ok(Some("1500".into()))
     );
+    let delivery = WebhookDelivery {
+        delivery_id: Some("d1".into()),
+        request: WebhookRequest {
+            method: "POST".into(),
+            query: String::new(),
+            headers: vec![Field {
+                name: "X-Kind".into(),
+                value: "push".into(),
+            }],
+            body: br#"{"ref": "main"}"#.to_vec(),
+        },
+    };
+    let pushed = |request: Request| {
+        let body: serde_json::Value = request.json()?;
+        Ok(format!(
+            "{} {} {}",
+            request.header("x-kind").unwrap_or_default(),
+            body["ref"],
+            request.delivery_id.clone().unwrap_or_default()
+        ))
+    };
+    let answered = handle(invocation(Trigger::Webhook(delivery)), pushed);
+    assert_eq!(answered, Ok(Some(r#""push \"main\" d1""#.into())));
+    let event = WatchEvent {
+        kind: "sync_failed".into(),
+        path: "raw/".into(),
+        resource: "rel-1".into(),
+        revision: "job-1".into(),
+    };
+    let synced = |sync: SyncEvent| Ok((sync.ok, sync.relationship, sync.job));
+    let answered = handle(invocation(Trigger::Event(event)), synced);
+    assert_eq!(answered, Ok(Some(r#"[false,"rel-1","job-1"]"#.into())));
 }
 
 #[test]
@@ -103,20 +135,13 @@ fn error_outcomes() {
     assert_eq!(unhandled("timer").kind, FailureKind::InvalidInput);
 }
 
-/// Keeps the log lines a handler writes.
-struct Lines(Rc<RefCell<Vec<String>>>);
-
-impl Host for Lines {
-    fn log(&self, level: Level, message: &str) {
-        self.0.borrow_mut().push(format!("{level:?} {message}"));
-    }
-}
-
 #[test]
 fn log_lines() {
-    let lines = Rc::new(RefCell::new(Vec::new()));
-    replace(Box::new(Lines(lines.clone())));
+    let fake = install(&[]);
     crate::log!("{} done", 3);
     crate::log!(warn, "slow");
-    assert_eq!(*lines.borrow(), ["Level::Info 3 done", "Level::Warn slow"]);
+    assert_eq!(
+        fake.calls(),
+        ["log Level::Info 3 done", "log Level::Warn slow"]
+    );
 }
