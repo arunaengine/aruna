@@ -19,7 +19,7 @@ members = [
     "cli",
     "plugins",
     "plugins/examples/elabftw",
-    "plugins/examples/rust",
+    "plugins/examples/announcer/rust",
     "plugins/fixture",
     "plugins/sdk",
     "registry",

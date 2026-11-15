@@ -1,5 +1,6 @@
-//! Builds the dataset announcer and template probes in each language with its toolchain and runs
-//! them. Opt in with ARUNA_PLUGIN_LANGUAGES=1: the toolchains download packages on first use.
+//! Builds probes and the starter projects in each language with its toolchain and runs them; the
+//! examples run in `examples.rs`. Opt in with ARUNA_PLUGIN_LANGUAGES=1: the toolchains download
+//! packages on first use.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -20,7 +21,7 @@ use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
 use aruna_plugins::permission::Permission;
 use aruna_plugins::{
-    CancellationToken, Compiled, FailureKind, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
+    CancellationToken, Compiled, FailureKind, Invocation, InvokeError, Runtime, Trigger,
 };
 
 use common::{available, limits};
@@ -48,10 +49,6 @@ impl Catalog {
     fn new(reply: &'static str) -> Arc<Self> {
         let calls = Mutex::default();
         Arc::new(Self { calls, reply })
-    }
-
-    fn calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().clone()
     }
 
     fn note(&self, call: String) {
@@ -274,65 +271,6 @@ async fn run(
         .expect("the run ended before the deadline")
 }
 
-fn example(language: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("examples")
-        .join(language)
-}
-
-fn created() -> Trigger {
-    Trigger::Event(WatchEvent {
-        kind: "dataset_created".into(),
-        path: "meta/group-1/D1".into(),
-        resource: "D1".into(),
-        revision: "r1".into(),
-    })
-}
-
-/// Runs the example on a new dataset: it reads it, posts it, and records the catalog id.
-async fn announce(language: &str) {
-    let plugin = build(example(language)).await;
-    let catalog = Catalog::new(RECORD);
-    let ended = run(&plugin, created(), catalog.clone()).await;
-    assert!(ended.is_ok(), "{language}: {ended:?}");
-    let calls = catalog.calls();
-    let sent: serde_json::Value =
-        serde_json::from_str(calls[1].splitn(4, ' ').nth(3).unwrap()).unwrap();
-    assert_eq!(calls[0], "get D1", "{language}");
-    assert!(
-        calls[1].starts_with("send catalog Method::Post "),
-        "{language}: {calls:?}"
-    );
-    assert_eq!(
-        sent,
-        serde_json::json!({"id": "D1", "title": "Run 7"}),
-        "{language}"
-    );
-    let (_, patch) = calls[2]
-        .split_once("D1 r1 ")
-        .expect("a patch at the read revision");
-    let patch: serde_json::Value = serde_json::from_str(patch).unwrap();
-    assert_eq!(
-        patch,
-        serde_json::json!({"identifier": {"catalog": "c-1"}}),
-        "{language}"
-    );
-    assert_eq!(calls.len(), 3, "{language}: {calls:?}");
-
-    // A catalog answer without `/id` fails the run before any metadata is written.
-    let catalog = Catalog::new(r#"{"other":1}"#);
-    let ended = run(&plugin, created(), catalog.clone()).await;
-    let Err(InvokeError::Guest(failure)) = ended else {
-        panic!("{language}: a missing id must fail the run: {ended:?}");
-    };
-    assert_eq!(failure.kind, FailureKind::Permanent, "{language}");
-    let calls = catalog.calls();
-    assert!(
-        !calls.iter().any(|call| call.starts_with("patch")),
-        "{language}: {calls:?}"
-    );
-}
-
 /// A project whose plugin code is `code`, triggered by hand and by a timer.
 fn probe(language: &str, code: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("probe-{language}"));
@@ -443,27 +381,6 @@ def run(form):
 def tick(tick):
     return {"tick": int(tick.timestamp() * 1000)}
 "#;
-
-#[tokio::test]
-async fn announces_rust() {
-    if available("rust", "cargo") {
-        announce("rust").await;
-    }
-}
-
-#[tokio::test]
-async fn announces_javascript() {
-    if available("javascript", "npx") {
-        announce("javascript").await;
-    }
-}
-
-#[tokio::test]
-async fn announces_python() {
-    if available("python", "uv") {
-        announce("python").await;
-    }
-}
 
 #[tokio::test]
 async fn probes_javascript() {
