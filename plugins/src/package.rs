@@ -65,7 +65,7 @@ pub fn load_manifest(project: &Path) -> Result<Manifest, BuildError> {
     Ok(manifest)
 }
 
-/// Builds a Rust project with cargo, a Python (`app.py`) or JavaScript (`plugin.js`) one with
+/// Builds a Rust project with cargo, a Python (`plugin.py`) or JavaScript (`plugin.js`) one with
 /// its pinned toolchain, then packages the output as `<name>-<version>.wasm`: beside cargo's
 /// module, or in the project folder.
 pub fn build_project(project: &Path) -> Result<Built, BuildError> {
@@ -77,7 +77,7 @@ pub fn build_project(project: &Path) -> Result<Built, BuildError> {
             let path = module.with_file_name(file);
             (module, path)
         }
-        _ => (component(project)?, project.join(file)),
+        _ => (component(project, &manifest)?, project.join(file)),
     };
     let bytes = std::fs::read(&output)?;
     let artifact = package(&mut manifest, &bytes)?;
@@ -135,16 +135,22 @@ fn registered(runtime: &Runtime, compiled: &Compiled) -> Result<BTreeSet<String>
 }
 
 /// Writes the contract to `.aruna/wit/` and builds the project's component into `.aruna/`.
-fn component(project: &Path) -> Result<PathBuf, BuildError> {
+fn component(project: &Path, manifest: &Manifest) -> Result<PathBuf, BuildError> {
     let (wit, output) = (".aruna/wit", ".aruna/plugin.wasm");
-    let command = if project.join("app.py").is_file() {
+    let command = if project.join("plugin.py").is_file() {
+        // The library's entry imports the project's `plugin` module, which registers handlers.
+        crate::bundle::python(project, manifest)?;
         let world = [
             "-d",
             wit,
             "-w",
             "plugin",
             "componentize",
-            "app",
+            "-p",
+            ".aruna/python",
+            "-p",
+            ".",
+            "aruna._component",
             "-o",
             output,
         ];
@@ -174,7 +180,7 @@ fn component(project: &Path) -> Result<PathBuf, BuildError> {
         ]
         .concat()
     } else {
-        let hint = "found no Cargo.toml, app.py or plugin.js to build";
+        let hint = "found no Cargo.toml, plugin.py or plugin.js to build";
         return Err(BuildError::Toolchain(hint.into()));
     };
     let folder = project.join(BUILD_DIR).join("wit");

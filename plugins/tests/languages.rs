@@ -385,17 +385,15 @@ fn probe(language: &str, code: &str) -> PathBuf {
             let rest = &source[end..];
             std::fs::write(dir.join("plugin.js"), format!("{code}\n{rest}")).unwrap();
         }
-        _ => {
-            std::fs::copy(templates.join("aruna.py"), dir.join("aruna.py")).unwrap();
-            std::fs::write(dir.join("app.py"), code).unwrap();
-        }
+        _ => std::fs::write(dir.join("plugin.py"), code).unwrap(),
     }
     dir
 }
 
-/// Runs a probe by hand with `input` and by a timer, and checks what each answer became.
+/// Runs a probe by hand with the form field `input` and by a timer, and checks what each answer
+/// became.
 async fn check_probe(language: &str, plugin: &Plugin, plain: &str, tick: &str) {
-    let manual = |input: &str| Trigger::Manual(serde_json::json!(input).to_string());
+    let manual = |input: &str| Trigger::Manual(serde_json::json!({ "input": input }).to_string());
     let answer = run(plugin, manual("plain"), Catalog::new(RECORD)).await;
     assert_eq!(answer.unwrap().as_deref(), Some(plain), "{language}");
     let timer = Trigger::Timer(1_762_700_000_000);
@@ -422,8 +420,9 @@ const JAVASCRIPT_PROBE: &str = r#"import { get } from "aruna:plugin/metadata-rea
 
 async function run(ctx, event) {
   if (event.kind === "timer") return { tick: event.tick };
-  if (event.input === "retry") throw { kind: "retryable", message: "try later" };
-  if (event.input !== "plain") return get(event.input).json;
+  const input = event.input.input;
+  if (input === "retry") throw { kind: "retryable", message: "try later" };
+  if (input !== "plain") return get(input).json;
   await Promise.resolve();
   return "awaited";
 }
@@ -434,20 +433,21 @@ const handlers = {
 };
 "#;
 
-const PYTHON_PROBE: &str = r#"from aruna import WitWorld, on  # noqa: F401
-from componentize_py_types import Err
-from wit_world.imports import metadata_read, types
+const PYTHON_PROBE: &str = r#"import aruna
 
 
-@on("manual", "timer")
-def run(ctx, event):
-    if event["kind"] == "timer":
-        return {"tick": event["tick"]}
-    if event["input"] == "retry":
-        raise Err(types.Failure(types.FailureKind.RETRYABLE, "try later"))
-    if event["input"] != "plain":
-        return metadata_read.get(event["input"]).json
+@aruna.on("manual")
+def run(form):
+    if form.input == "retry":
+        raise aruna.Retry("try later")
+    if form.input != "plain":
+        return aruna.datasets.get(form.input).name
     return "plain"
+
+
+@aruna.on("timer")
+def tick(tick):
+    return {"tick": int(tick.timestamp() * 1000)}
 "#;
 
 #[tokio::test]
@@ -484,7 +484,7 @@ async fn probes_javascript() {
 async fn probes_python() {
     if available("python", "uv") {
         let plugin = build(probe("python", PYTHON_PROBE)).await;
-        check_probe("python", &plugin, "plain", r#"{"tick": 1762700000000}"#).await;
+        check_probe("python", &plugin, "\"plain\"", r#"{"tick": 1762700000000}"#).await;
     }
 }
 
@@ -498,7 +498,7 @@ async fn kills_stuck_builds() {
     std::fs::create_dir_all(&tools).unwrap();
     let manifest = "name = \"stuck\"\nversion = \"0.1.0\"\non = [\"manual\"]\n";
     std::fs::write(project.join("plugin.toml"), manifest).unwrap();
-    std::fs::write(project.join("app.py"), "").unwrap();
+    std::fs::write(project.join("plugin.py"), "").unwrap();
     let uv = tools.join("uv");
     std::fs::write(&uv, "#!/bin/sh\nexec sleep 600\n").unwrap();
     std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();

@@ -5,8 +5,8 @@
 import json
 import time
 
+import aruna
 import walk
-from aruna import WitWorld, on  # noqa: F401  WitWorld is the component's entry point
 from componentize_py_types import Err
 from elab import Fault, Stop
 from sync import Guard, Settings
@@ -88,28 +88,27 @@ class Host:
         log.log(log.Level.INFO, message)
 
 
-def started(ctx, work, *args):
+def started(work, *args):
     """Runs the work with a guarded host; a fault fails the run with its message."""
     try:
-        return work(Guard(Host(), time.monotonic), Settings(ctx.settings), *args)
+        return work(Guard(Host(), time.monotonic), Settings(dict(aruna.settings)), *args)
     except Stop as stop:
         return {"stopped": str(stop)}
     except Fault as fault:
-        retry = fault.kind == "unavailable"
-        kind = types.FailureKind.RETRYABLE if retry else types.FailureKind.PERMANENT
-        raise Err(types.Failure(kind, fault.message)) from None
+        error = aruna.Unavailable if fault.kind == "unavailable" else aruna.Fail
+        raise error(fault.message) from None
 
 
-@on("timer")
-def poll(ctx, event):
-    return started(ctx, walk.poll)
+@aruna.on("timer")
+def poll():
+    return started(walk.poll)
 
 
-@on("dataset_updated")
-def changed(ctx, event):
-    return started(ctx, walk.changed, event["resource"])
+@aruna.on("dataset_updated")
+def changed():
+    return started(walk.changed, aruna.run.event["resource"])
 
 
-@on("manual")
-def manual(ctx, event):
-    return started(ctx, walk.manual, event["input"])
+@aruna.on("manual")
+def manual(form):
+    return started(walk.manual, dict(form))

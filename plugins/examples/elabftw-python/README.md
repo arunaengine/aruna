@@ -21,11 +21,10 @@ It needs eLabFTW 6.0 or later. It polls every five minutes; eLabFTW 6.0 has no w
 
 | File | Content |
 | --- | --- |
-| `app.py` | The handlers and the host calls through the WIT imports |
+| `plugin.py` | The handlers, through the library, and the host calls through the WIT imports |
 | `sync.py` | One link: compare, copy, enrol, resolve, uploads, and the run's budget guard |
 | `walk.py` | The walk over datasets and tagged experiments, and the report |
 | `elab.py` | The eLabFTW API calls and the size of eLabFTW's answers |
-| `aruna.py` | The handler helper of every Python example |
 | `tests/` | A fake eLabFTW and a fake Aruna host, and the tests |
 
 ## Requirements and setup

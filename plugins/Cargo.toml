@@ -52,6 +52,7 @@ wit-component = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 wit-component = { workspace = true, features = ["dummy-module"] }

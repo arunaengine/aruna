@@ -60,6 +60,9 @@ class Settings:
     def get(self, name, default=None):
         return self._values.get(name, default)
 
+    def keys(self):
+        return self._values.keys()
+
 
 settings = Settings()
 
@@ -81,6 +84,9 @@ class Form:
 
     def get(self, name, default=None):
         return self._values.get(name, default)
+
+    def keys(self):
+        return self._values.keys()
 
 
 class Request:
