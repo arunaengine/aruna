@@ -21,7 +21,7 @@ use aruna_plugins::package::build_project;
 use aruna_plugins::permission::Permission;
 use aruna_plugins::{
     CancellationToken, Compiled, Failure, FailureKind, Invocation, InvokeError, Runtime, Trigger,
-    WatchEvent,
+    WatchEvent, WebhookDelivery, WebhookRequest,
 };
 
 use common::{available, limits};
@@ -50,6 +50,8 @@ struct Stored {
 #[derive(Default)]
 struct State {
     datasets: BTreeMap<String, Stored>,
+    /// Datasets the install may read but not write.
+    read_only: BTreeSet<String>,
     /// Versions of each object by bucket path, the current one last.
     objects: BTreeMap<String, Vec<Version>>,
     /// Service answers by connection and path: status and body.
@@ -113,6 +115,10 @@ impl Group {
         sent.collect()
     }
 
+    fn read_only(&self, id: &str) {
+        self.with(|state| state.read_only.insert(id.into()));
+    }
+
     /// Stores a new current version `id` of the object at `path`.
     fn object(&self, path: &str, id: &str, content: &[u8]) {
         let version = Version {
@@ -149,6 +155,10 @@ impl Group {
         change: impl FnOnce(&mut Stored),
     ) -> Result<String, HostError> {
         let mut state = self.0.lock().unwrap();
+        if state.read_only.contains(id) {
+            let message = format!("the install may not write datasets/{id}");
+            return Err(HostError::new(ErrorKind::Denied, message));
+        }
         let missing = || HostError::new(ErrorKind::NotFound, format!("no dataset {id}"));
         let stored = state.datasets.get_mut(id).ok_or_else(missing)?;
         if stored.revision.to_string() != expected {
@@ -899,4 +909,97 @@ async fn object_report() {
         empty.await.unwrap(),
         json!({ "objects": 0, "bytes": 0, "largest": null })
     );
+}
+
+/// A verified webhook delivery with a JSON body, as the node hands it to the plugin.
+fn webhook(delivery: &str, body: Value) -> Trigger {
+    Trigger::Webhook(WebhookDelivery {
+        delivery_id: Some(delivery.into()),
+        request: WebhookRequest {
+            method: "POST".into(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: body.to_string().into_bytes(),
+        },
+    })
+}
+
+#[tokio::test]
+async fn release_datasets() {
+    // A published release becomes a dataset; a repeated delivery answers the same one.
+    let Some(example) = example("release-datasets").await else {
+        return;
+    };
+    let group = Group::new();
+    let release = json!({ "id": 7, "tag_name": "v1.0", "name": "First", "body": "Notes",
+        "html_url": "https://github.com/lab/tool/releases/v1.0" });
+    let body = json!({ "action": "published", "release": release,
+        "repository": { "full_name": "lab/tool" } });
+    let created = example
+        .run(&group, json!({}), webhook("d-1", body.clone()))
+        .await;
+    let answer = json!({ "dataset": "D-releases/lab/tool/v1.0", "delivery": "d-1" });
+    assert_eq!(created.unwrap(), answer);
+    let entity = group.entity("D-releases/lab/tool/v1.0");
+    assert_eq!(
+        (&entity["name"], &entity["identifier"]),
+        (&json!("First"), &json!({ "github_release": "7" }))
+    );
+    let again = example.run(&group, json!({}), webhook("d-1", body)).await;
+    assert_eq!(again.unwrap()["dataset"], "D-releases/lab/tool/v1.0");
+    let other = example.run(
+        &group,
+        json!({}),
+        webhook("d-2", json!({ "action": "created" })),
+    );
+    assert_eq!(other.await.unwrap(), Value::Null);
+}
+
+#[tokio::test]
+async fn fill_license() {
+    // A dataset outside the install's write scope answers `NotAllowed` and is skipped.
+    let Some(example) = example("fill-license").await else {
+        return;
+    };
+    let group = Group::new();
+    group.dataset("D1", json!({ "name": "Run 7" }));
+    group.dataset("D2", json!({ "name": "Run 8", "license": "CC0-1.0" }));
+    group.dataset("D3", json!({ "name": "Run 9" }));
+    group.read_only("D3");
+    let filled = example.run(&group, json!({ "license": "CC-BY-4.0" }), manual(json!({})));
+    assert_eq!(
+        filled.await.unwrap(),
+        json!({ "filled": ["D1"], "skipped": ["D3"] })
+    );
+    assert_eq!(group.entity("D1")["license"], "CC-BY-4.0");
+    assert_eq!(group.entity("D3"), json!({ "name": "Run 9" }));
+}
+
+#[tokio::test]
+async fn orcid_names() {
+    // The public record names the author once; a second run writes nothing.
+    let Some(example) = example("orcid-names").await else {
+        return;
+    };
+    let group = Group::new();
+    group.dataset("D1", json!({ "name": "Run 7" }));
+    let id = "0000-0002-1825-0097";
+    let name =
+        json!({ "given-names": { "value": "Josiah" }, "family-name": { "value": "Carberry" } });
+    group.reply(
+        "orcid",
+        &format!("{id}/person"),
+        200,
+        json!({ "name": name }),
+    );
+    let form = manual(json!({ "dataset": "D1", "orcid": format!("https://orcid.org/{id}") }));
+    let added = example.run(&group, json!({}), form.clone()).await.unwrap();
+    assert_eq!(
+        added,
+        json!({ "dataset": "D1", "author": "Josiah Carberry" })
+    );
+    let author = json!([{ "@id": format!("https://orcid.org/{id}"), "name": "Josiah Carberry" }]);
+    assert_eq!(group.entity("D1")["author"], author);
+    example.run(&group, json!({}), form).await.unwrap();
+    assert_eq!(group.entity("D1")["author"], author);
 }

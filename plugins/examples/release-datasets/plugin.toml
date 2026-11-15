@@ -1,0 +1,14 @@
+# Example plugin: creates a dataset for each published GitHub release.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "release-datasets"
+version = "0.1.0"
+title = "Create a dataset for each release"
+on = ["webhook"]
+access = "write"
+
+# The node checks the HMAC signature with this key before the plugin runs.
+[webhook]
+secret = "Webhook signing key"
+delivery_id = "x-github-delivery"
