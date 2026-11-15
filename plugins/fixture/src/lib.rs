@@ -109,6 +109,13 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             let copied = jobs::copy(&text("source"), version, &text("target"));
             json!(copied.map_err(host)?)
         }
+        "state_remove" => {
+            let key = text("key");
+            let state = ctx.state();
+            let version = state.put(&key, b"v".to_vec(), None).await?;
+            aruna_plugin::bindings::aruna::plugin::state::remove(&key, version).map_err(host)?;
+            json!(state.get(&key).await?.is_none())
+        }
         "cancel" => {
             jobs::cancel(&text("id")).map_err(host)?;
             json!(true)

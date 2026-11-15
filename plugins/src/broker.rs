@@ -104,6 +104,14 @@ pub struct StatePut {
     pub intent: Intent,
 }
 
+/// A version-checked removal of a private state value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateRemove {
+    pub key: String,
+    pub expected: u64,
+    pub intent: Intent,
+}
+
 /// Runs host calls under the install's current grants and authority. The runtime has
 /// already checked that the permission or connection is granted at all and the budgets.
 #[async_trait]
@@ -235,6 +243,13 @@ pub trait Broker: Send + Sync {
     }
     async fn state_get(&self, cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError>;
     async fn state_put(&self, cx: &CallContext, put: StatePut) -> Result<u64, HostError>;
+    /// Removes a state value at its expected version; a broker without removals refuses it.
+    async fn state_remove(&self, _cx: &CallContext, _remove: StateRemove) -> Result<(), HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "state removals are not served here",
+        ))
+    }
     /// Records that a write did not finish within its deadline, so its outcome is unknown.
     /// The run's slot is held until this returns or its own deadline passes.
     async fn abandoned(&self, cx: &CallContext, intent: &Intent);

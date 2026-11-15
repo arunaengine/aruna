@@ -12,7 +12,7 @@ use aruna_plugins::artifact::read_manifest;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, FileChange, FilePage, HostError,
     Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage,
-    Response, SendRequest, StatePut,
+    Response, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::manifest::Manifest;
@@ -273,6 +273,12 @@ impl Broker for Recorder {
             objects: vec![object],
             cursor: None,
         })
+    }
+
+    async fn state_remove(&self, _: &CallContext, remove: StateRemove) -> Result<(), HostError> {
+        self.note(&format!("state_remove {} {}", remove.key, remove.expected));
+        self.intents.lock().unwrap().push(remove.intent);
+        Ok(())
     }
 
     async fn abandoned(&self, _: &CallContext, intent: &Intent) {
@@ -673,6 +679,27 @@ async fn copy_answers_id() {
     assert_eq!(broker.intents()[0].ordinal, 1);
     let refused = invoke(probe(input), Arc::default()).await;
     assert!(matches!(refused, Err(InvokeError::Guest(_))), "{refused:?}");
+}
+
+#[tokio::test]
+async fn remove_after_put() {
+    // A removal is a write after the put, at the version the put answered.
+    let broker = Arc::new(Recorder::default());
+    let reply = invoke(
+        probe(serde_json::json!({"call": "state_remove", "key": "k"})),
+        broker.clone(),
+    );
+    assert_eq!(output(reply.await), false);
+    assert_eq!(
+        broker.calls(),
+        ["state_put", "state_remove k 1", "state_get"]
+    );
+    let ordinals: Vec<u32> = broker
+        .intents()
+        .iter()
+        .map(|intent| intent.ordinal)
+        .collect();
+    assert_eq!(ordinals, [1, 2]);
 }
 
 #[tokio::test]

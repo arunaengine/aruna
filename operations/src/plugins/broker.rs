@@ -25,7 +25,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
     HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
-    ObjectPage, Response, SendRequest, StatePut,
+    ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::connection::relative_path;
 use aruna_plugins::permission::Permission;
@@ -47,7 +47,7 @@ use super::jobs::{cancel_job, job_outputs, job_status};
 use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
-use super::state::{PutError, check_key, put_state, read_state};
+use super::state::{PutError, check_key, put_state, read_state, remove_state};
 use super::store::{StoreError, Txn, transact};
 use super::submit::{CopyRequest, start_copy};
 use crate::auth::request_authorization::AuthorizeError;
@@ -1069,6 +1069,26 @@ impl Broker for RunBroker {
                 Err(HostError::new(kind, message))
             }
             Err(PutError::Store(error)) => Err(self.unknown(&put.intent, &error.0).await),
+        }
+    }
+
+    async fn state_remove(&self, _cx: &CallContext, remove: StateRemove) -> Result<(), HostError> {
+        check_key(&remove.key)?;
+        let install = self.admitted(None).await?;
+        if self.begun(&remove.intent).await?.is_some() {
+            return Ok(());
+        }
+        let run_id = self.scope.run.run_id;
+        match remove_state(&self.ctx, run_id, install.install_id, &remove).await {
+            Ok(()) => Ok(()),
+            Err(PutError::Refused(message, kind)) => {
+                let clear = async |txn: &Txn<'_>| clear_in(txn, run_id, &remove.intent).await;
+                transact::<(), StoreError>(&self.ctx, clear)
+                    .await
+                    .map_err(|error| unavailable(error.0))?;
+                Err(HostError::new(kind, message))
+            }
+            Err(PutError::Store(error)) => Err(self.unknown(&remove.intent, &error.0).await),
         }
     }
 

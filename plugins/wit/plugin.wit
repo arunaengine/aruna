@@ -208,6 +208,8 @@ interface state {
 
   get: func(key: string) -> result<option<entry>, host-error>;
   put: func(key: string, value: list<u8>, expected: option<u64>) -> result<u64, host-error>;
+  /// Removes the value if it is still at version `expected`.
+  remove: func(key: string, expected: u64) -> result<_, host-error>;
 }
 
 /// The fields of a secret slot granted through `secrets.value`; they are the code's data then.

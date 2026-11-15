@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
     HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, Method,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
 use crate::host::wit::aruna::plugin::{
     jobs, log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services,
@@ -498,6 +498,30 @@ impl state::Host for Session {
             Needs::Free,
             |broker, cx| async move { broker.state_put(&cx, put).await },
             |_| 8,
+        )
+        .await
+    }
+
+    async fn remove(
+        &mut self,
+        key: String,
+        expected: u64,
+    ) -> wasmtime::Result<Result<(), HostError>> {
+        let version = expected.to_le_bytes();
+        let parts: [&[u8]; 3] = [b"remove", key.as_bytes(), &version];
+        let intent = Intent::new(self.next_ordinal(), &parts);
+        let size = key.len();
+        let remove = StateRemove {
+            key,
+            expected,
+            intent: intent.clone(),
+        };
+        self.brokered(
+            size,
+            Effect::Write(intent),
+            Needs::Free,
+            |broker, cx| async move { broker.state_remove(&cx, remove).await },
+            |_| 0,
         )
         .await
     }
