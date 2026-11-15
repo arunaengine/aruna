@@ -70,10 +70,27 @@ pub enum WorkState {
 }
 
 /// How far a sending attempt came; an attempt that finds `Sending` never sends again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendBoundary {
-    Sending { attempt: u32 },
-    Sent { status: u16 },
+    Sending {
+        attempt: u32,
+    },
+    /// The answer: its status and its reply as exposed when stored, absent when too large.
+    Sent {
+        status: u16,
+        reply: Option<String>,
+    },
+}
+
+/// What an attempt that sends may do, from the boundary earlier attempts left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Send {
+    /// The attempt wrote `Sending` and sends now.
+    Now,
+    /// An earlier attempt may have sent; nothing is sent again and the outcome stays unknown.
+    Undecided,
+    /// An earlier attempt has the answer; it decides without a second request.
+    Answered { status: u16, reply: Option<String> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +331,46 @@ pub async fn dispatched(
     .await
 }
 
+/// Moves the send boundary of work `work_id` before an attempt sends, in one transaction. A request
+/// that may be sent twice (`again`) always sends; any other never follows an earlier `Sending`.
+pub async fn begin_send(
+    ctx: &DriverContext,
+    (install_id, work_id): (Ulid, Ulid),
+    again: bool,
+) -> Result<Option<Send>, StoreError> {
+    transact(ctx, async |txn: &Txn<'_>| {
+        let Some((key, mut row)) = read_in(txn, install_id, work_id).await? else {
+            return Ok(None);
+        };
+        let attempt = match &row.boundary {
+            Some(SendBoundary::Sent { status, reply }) if !again => {
+                let (status, reply) = (*status, reply.clone());
+                return Ok(Some(Send::Answered { status, reply }));
+            }
+            Some(SendBoundary::Sending { .. }) if !again => return Ok(Some(Send::Undecided)),
+            Some(SendBoundary::Sending { attempt }) => attempt + 1,
+            _ => 1,
+        };
+        row.boundary = Some(SendBoundary::Sending { attempt });
+        txn.write(PLUGIN_WORK_KEYSPACE, vec![(key, encode(&row)?)])
+            .await?;
+        Ok(Some(Send::Now))
+    })
+    .await
+}
+
+/// Keeps the answer of a sent request: its status and its reply as exposed now.
+pub async fn record_sent(
+    ctx: &DriverContext,
+    ids: (Ulid, Ulid),
+    (status, reply): (u16, Option<String>),
+) -> Result<Option<WorkRow>, StoreError> {
+    update_work(ctx, ids, |row| {
+        row.boundary = Some(SendBoundary::Sent { status, reply });
+    })
+    .await
+}
+
 /// The summary of a finished job, or `None` while it may still run. A job record that is gone
 /// leaves the outcome unknown.
 pub fn summary_of(record: Option<&JobRecord>) -> Option<Summary> {
@@ -381,12 +438,18 @@ pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, Stor
         };
         let changed = update_work(ctx, (install_id, row.work_id), |row| {
             if row.state == WorkState::Dispatched {
-                // The paths stay answerable after the job record is pruned.
+                // The paths and an upload's answer stay answerable after the job record is pruned.
                 let (source, target) = (row.source.clone(), row.target.clone());
+                let (status, reply) = match &row.boundary {
+                    Some(SendBoundary::Sent { status, reply }) => (Some(*status), reply.clone()),
+                    _ => (None, None),
+                };
                 row.state = WorkState::Settled;
                 row.summary = Some(Summary {
                     source,
                     target,
+                    status,
+                    reply,
                     ..summary
                 });
                 row.settled_ms = Some(now_ms);
