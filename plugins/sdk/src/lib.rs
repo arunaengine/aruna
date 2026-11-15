@@ -6,6 +6,7 @@
 pub mod datasets;
 mod form;
 mod host;
+pub mod jobs;
 #[doc(hidden)]
 pub mod legacy;
 pub mod objects;
@@ -21,6 +22,7 @@ pub use bindings::aruna::plugin::services::Method;
 pub use bindings::aruna::plugin::types::WatchEvent;
 pub use datasets::Dataset;
 pub use form::Form;
+pub use jobs::Job;
 pub use objects::Object;
 pub use outcome::{Error, Result, fail, retry};
 #[doc(hidden)]

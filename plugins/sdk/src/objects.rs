@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use crate::bindings::aruna::plugin::objects_read::ObjectInfo;
 use crate::datasets::Pages;
 use crate::host;
+use crate::jobs::Copy;
 use crate::{Error, Result};
 
 /// One object version. A `marked` version was written by a job with a secret: a plugin cannot
@@ -55,6 +56,15 @@ pub fn get(path: &str) -> Result<Object> {
     Ok(Object::from_info(host::with(|host| {
         host.object_info(path)
     })?))
+}
+
+/// A copy of the object at `source` to `target`, started with `.start()`.
+pub fn copy(source: &str, target: &str) -> Copy {
+    Copy {
+        source: source.to_string(),
+        target: target.to_string(),
+        version: None,
+    }
 }
 
 /// Every object below `prefix` the install may read, fetched one page at a time.

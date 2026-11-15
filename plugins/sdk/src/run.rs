@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::bindings::aruna::plugin::types::{Failure, FailureKind, Invocation, Trigger};
 use crate::datasets::{self, Dataset};
+use crate::jobs::{self, Job};
 use crate::objects::{self, Object};
 use crate::{Error, Form, Result, WatchEvent};
 
@@ -144,6 +145,16 @@ impl Subject for Dataset {
                 datasets::get(&event.resource)
             }
             other => Err(mismatch("a dataset", &other)),
+        }
+    }
+}
+
+/// The finished job, loaded.
+impl Subject for Job {
+    fn from_trigger(trigger: Trigger) -> Result<Self> {
+        match trigger {
+            Trigger::Event(event) if event.kind == "job_finished" => jobs::get(&event.resource),
+            other => Err(mismatch("a finished job", &other)),
         }
     }
 }

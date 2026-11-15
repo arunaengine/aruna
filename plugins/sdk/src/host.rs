@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 
 use crate::Level;
+use crate::bindings::aruna::plugin::jobs::Status;
 use crate::bindings::aruna::plugin::metadata_create::Created;
 use crate::bindings::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
@@ -12,7 +13,8 @@ use crate::bindings::aruna::plugin::services::{Request, Response};
 use crate::bindings::aruna::plugin::state::Entry;
 use crate::bindings::aruna::plugin::types::{Field, HostError};
 use crate::bindings::aruna::plugin::{
-    log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services, state,
+    jobs, log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services,
+    state,
 };
 
 /// One host call's answer.
@@ -37,6 +39,10 @@ pub(crate) trait Host {
     fn state_get(&self, key: &str) -> Answer<Option<Entry>>;
     fn state_put(&self, key: &str, value: &[u8], expected: Option<u64>) -> Answer<u64>;
     fn state_remove(&self, key: &str, expected: u64) -> Answer<()>;
+    fn job_copy(&self, source: &str, version: Option<&str>, target: &str) -> Answer<String>;
+    fn job_get(&self, id: &str) -> Answer<Status>;
+    fn job_outputs(&self, id: &str, cursor: Option<&str>) -> Answer<ObjectPage>;
+    fn job_cancel(&self, id: &str) -> Answer<()>;
 }
 
 /// The component's own imports.
@@ -108,6 +114,22 @@ impl Host for Imports {
 
     fn state_remove(&self, key: &str, expected: u64) -> Answer<()> {
         state::remove(key, expected)
+    }
+
+    fn job_copy(&self, source: &str, version: Option<&str>, target: &str) -> Answer<String> {
+        jobs::copy(source, version, target)
+    }
+
+    fn job_get(&self, id: &str) -> Answer<Status> {
+        jobs::get(id)
+    }
+
+    fn job_outputs(&self, id: &str, cursor: Option<&str>) -> Answer<ObjectPage> {
+        jobs::outputs(id, cursor)
+    }
+
+    fn job_cancel(&self, id: &str) -> Answer<()> {
+        jobs::cancel(id)
     }
 }
 

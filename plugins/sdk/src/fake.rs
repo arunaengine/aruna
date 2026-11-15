@@ -10,6 +10,7 @@ use std::rc::Rc;
 use serde_json::{Map, Value};
 
 use crate::Level;
+use crate::bindings::aruna::plugin::jobs::Status;
 use crate::bindings::aruna::plugin::metadata_create::Created;
 use crate::bindings::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
@@ -31,6 +32,8 @@ pub(crate) struct State {
     /// Values by key with their version; versions never repeat.
     pub state: BTreeMap<String, (u64, Vec<u8>)>,
     pub versions: u64,
+    /// Jobs by id with their outputs.
+    pub jobs: BTreeMap<String, (Status, Vec<ObjectInfo>)>,
     pub page: usize,
 }
 
@@ -295,6 +298,39 @@ impl Host for Fake {
             return Err(refusal(ErrorKind::Conflict, key));
         }
         state.state.remove(key);
+        Ok(())
+    }
+
+    fn job_copy(&self, source: &str, version: Option<&str>, target: &str) -> Answer<String> {
+        self.note(format!("copy {source} {} {target}", version.unwrap_or("-")));
+        Ok(format!("job-{}", self.0.borrow().jobs.len() + 1))
+    }
+
+    fn job_get(&self, id: &str) -> Answer<Status> {
+        self.note(format!("job {id}"));
+        let state = self.0.borrow();
+        let (status, _) = state
+            .jobs
+            .get(id)
+            .ok_or_else(|| refusal(ErrorKind::NotFound, id))?;
+        Ok(status.clone())
+    }
+
+    fn job_outputs(&self, id: &str, cursor: Option<&str>) -> Answer<ObjectPage> {
+        self.note(format!("outputs {id} {}", cursor.unwrap_or("-")));
+        let outputs = (self
+            .0
+            .borrow()
+            .jobs
+            .get(id)
+            .map(|(_, outputs)| outputs.clone()))
+        .unwrap_or_default();
+        let (objects, cursor) = self.paged(&outputs, cursor);
+        Ok(ObjectPage { objects, cursor })
+    }
+
+    fn job_cancel(&self, id: &str) -> Answer<()> {
+        self.note(format!("cancel {id}"));
         Ok(())
     }
 
