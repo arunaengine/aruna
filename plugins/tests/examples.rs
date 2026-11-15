@@ -232,8 +232,25 @@ fn entity_id(id: &str) -> String {
     }
 }
 
+/// Whether a value is an entity of its own, which the node refuses: an object with JSON-LD keys
+/// that is neither a reference nor a value (`property_value_terms`, `entity_convert.rs`).
+fn inline_entity(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let reference = (object.keys()).all(|key| matches!(key.as_str(), "@id" | "@type"));
+    let keyed = object.keys().any(|key| key.starts_with('@'));
+    keyed && !(reference && object.contains_key("@id")) && !object.contains_key("@value")
+}
+
+/// The dataset as the node's export answers it: a field with one value reads as that value.
 fn document(id: &str, stored: &Stored, whole: bool) -> Document {
     let mut entity = stored.entity.clone();
+    for value in entity.values_mut() {
+        if let Some([single]) = value.as_array().map(Vec::as_slice) {
+            *value = single.clone();
+        }
+    }
     if whole {
         let parts = stored
             .files
@@ -291,6 +308,16 @@ impl Broker for Group {
         patch: MetadataPatch,
     ) -> Result<String, HostError> {
         let changes: Value = serde_json::from_str(&patch.patch).unwrap();
+        let values = changes
+            .as_object()
+            .into_iter()
+            .flat_map(|fields| fields.values());
+        let mut entries =
+            values.flat_map(|value| value.as_array().cloned().unwrap_or(vec![value.clone()]));
+        if entries.any(|entry| inline_entity(&entry)) {
+            let message = "a dataset names other entities only by @id";
+            return Err(HostError::new(ErrorKind::Invalid, message));
+        }
         self.write(&patch.resource, &patch.expected, |stored| {
             let mut entity = Value::Object(std::mem::take(&mut stored.entity));
             merge_into(&mut entity, changes);
@@ -1035,12 +1062,14 @@ async fn fill_license() {
 
 #[tokio::test]
 async fn orcid_names() {
-    // The public record names the author once; a second run writes nothing.
+    // The author is added as a reference to the ORCID iD, next to the one already there, and
+    // once only; the name from the public record is the run's answer.
     let Some(example) = example("orcid-names").await else {
         return;
     };
     let group = Group::new();
-    group.dataset("D1", json!({ "name": "Run 7" }));
+    let before = json!({ "@id": "https://orcid.org/0000-0001-5109-3700" });
+    group.dataset("D1", json!({ "name": "Run 7", "author": [before] }));
     let id = "0000-0002-1825-0097";
     let name =
         json!({ "given-names": { "value": "Josiah" }, "family-name": { "value": "Carberry" } });
@@ -1056,7 +1085,7 @@ async fn orcid_names() {
         added,
         json!({ "dataset": "D1", "author": "Josiah Carberry" })
     );
-    let author = json!([{ "@id": format!("https://orcid.org/{id}"), "name": "Josiah Carberry" }]);
+    let author = json!([before, { "@id": format!("https://orcid.org/{id}") }]);
     assert_eq!(group.entity("D1")["author"], author);
     example.run(&group, json!({}), form).await.unwrap();
     assert_eq!(group.entity("D1")["author"], author);

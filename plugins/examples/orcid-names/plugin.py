@@ -12,9 +12,12 @@ def add_author(form):
     orcid_id = form.orcid.strip().removeprefix("https://orcid.org/")
     person = orcid.get(f"{orcid_id}/person", headers={"accept": "application/json"}).json()
     name = f"{person['name']['given-names']['value']} {person['name']['family-name']['value']}"
-    author = {"@id": f"https://orcid.org/{orcid_id}", "name": name}
+    # A dataset names other entities by @id only, so the author is a reference to the iD.
+    author = {"@id": f"https://orcid.org/{orcid_id}"}
     dataset = form.dataset
     authors = dataset.get("author") or []
+    # One author reads as that author alone, more as a list.
+    authors = authors if isinstance(authors, list) else [authors]
     if author not in authors:
         dataset["author"] = [*authors, author]
         dataset.save()
