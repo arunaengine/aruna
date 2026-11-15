@@ -42,10 +42,13 @@ struct Held {
     worker: Arc<Worker>,
     run_id: Ulid,
     job: String,
+    /// The version of the value that fills the state.
+    pad: u64,
 }
 
-/// Fills the install's state, so the guest's mapping write after its copy fails.
-async fn fill(ctx: &DriverContext, install_id: Ulid) {
+/// Fills the install's state, so the guest's mapping write after its copy fails; answers the
+/// version of the value that takes the last bytes.
+async fn fill(ctx: &DriverContext, install_id: Ulid) -> u64 {
     let value = vec![0u8; MAX_STATE_VALUE];
     let count = MAX_STATE_BYTES as usize / MAX_STATE_VALUE - 1;
     let mut used = 0;
@@ -71,7 +74,7 @@ async fn fill(ctx: &DriverContext, install_id: Ulid) {
     };
     put_state(ctx, Ulid::from_parts(77, 1), install_id, &pad)
         .await
-        .unwrap();
+        .unwrap()
 }
 
 /// Runs every due run to its end.
@@ -131,7 +134,7 @@ async fn held(fixture: &Fixture) -> Held {
     let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
     let source = put_config(realm, install.group_id, node, "in", "a.txt", b"bytes");
     drive(PutObjectOperation::new(source), &blob).await.unwrap();
-    fill(&blob, install.install_id).await;
+    let pad = fill(&blob, install.install_id).await;
     let mut run = queued(install.install_id, 1);
     (run.digest, run.settings) = (install.digest.clone(), install.settings.clone());
     run.group_id = install.group_id;
@@ -167,6 +170,7 @@ async fn held(fixture: &Fixture) -> Held {
         worker,
         run_id: run.run_id,
         job,
+        pad,
     }
 }
 
@@ -182,7 +186,7 @@ async fn retry_delivers_once() {
     let (blob, install) = (&held.blob, &held.install);
     let free = StateRemove {
         key: PAD.into(),
-        expected: 1,
+        expected: held.pad,
         intent: Intent::new(9_001, &[b"free"]),
     };
     let freed = remove_state(blob, Ulid::from_parts(77, 1), install.install_id, &free);
