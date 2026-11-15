@@ -311,7 +311,8 @@ async fn marked_source_refused() {
         install: install.install_id.to_string(),
         max_bytes: 1 << 20,
     };
-    assert!(broker.objects_info(&cx, "in/a.txt").await.unwrap().marked);
+    let info = broker.objects_info(&cx, "in/a.txt", None).await.unwrap();
+    assert!(info.marked);
 }
 
 #[tokio::test]
@@ -350,7 +351,11 @@ async fn small_reads_unmarked() {
         missing.map_err(|error| error.kind),
         Err(ErrorKind::NotFound)
     );
-    let info = broker.objects_info(&cx(1 << 20), "in/a.txt").await.unwrap();
+    let context = cx(1 << 20);
+    let info = broker
+        .objects_info(&context, "in/a.txt", None)
+        .await
+        .unwrap();
     let version = Ulid::from_string(&info.version).unwrap();
     let mark = Mark {
         install_id: Ulid::from_parts(8, 8),
@@ -367,4 +372,70 @@ async fn small_reads_unmarked() {
         refused.map_err(|error| error.message),
         Err(MARKED.to_string())
     );
+}
+
+#[tokio::test]
+async fn versioned_info() {
+    // Information on a named version answers that version, with its own mark; the current one
+    // is still answered without a version.
+    use aruna_plugins::broker::{Broker, CallContext, ErrorKind};
+
+    use crate::driver::drive;
+    use crate::plugins::broker::RunBroker;
+    use crate::plugins::marks::{Mark, mark_in};
+    use crate::plugins::store::{Txn, transact};
+    use crate::plugins::submit::tests::scope;
+    use crate::plugins::work::WorkKind;
+    use crate::s3::object::copy::test::put_config;
+    use crate::s3::object::put::PutObjectOperation;
+    let fixture = Fixture::new().await;
+    let (_root, blob, install, _) = ready_copy(&fixture).await;
+    let broker = RunBroker::new(Arc::new(blob.clone()), scope(&fixture, &install));
+    let cx = CallContext {
+        run: "run".into(),
+        install: install.install_id.to_string(),
+        max_bytes: 1 << 20,
+    };
+    let first = broker.objects_info(&cx, "in/a.txt", None).await.unwrap();
+    let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
+    let newer = put_config(realm, install.group_id, node, "in", "a.txt", b"newer bytes");
+    drive(PutObjectOperation::new(newer), &blob).await.unwrap();
+    let current = broker.objects_info(&cx, "in/a.txt", None).await.unwrap();
+    assert_ne!(current.version, first.version);
+    assert_eq!(current.size, 11);
+    let pinned = Some(first.version.clone());
+    let older = broker.objects_info(&cx, "in/a.txt", pinned.clone()).await;
+    assert_eq!(older.unwrap(), first);
+    let mark = Mark {
+        install_id: Ulid::from_parts(8, 8),
+        work_id: Ulid::from_parts(8, 9),
+        job: None,
+        kind: WorkKind::Download,
+        at_ms: 1,
+    };
+    let version = Ulid::from_string(&first.version).unwrap();
+    let marked = async |txn: &Txn<'_>| mark_in(txn, ("in", "a.txt", version), &mark).await;
+    transact(&blob, marked).await.unwrap();
+    assert!(
+        broker
+            .objects_info(&cx, "in/a.txt", pinned)
+            .await
+            .unwrap()
+            .marked
+    );
+    assert!(
+        !broker
+            .objects_info(&cx, "in/a.txt", None)
+            .await
+            .unwrap()
+            .marked
+    );
+    let unknown = Some(Ulid::from_parts(1, 1).to_string());
+    let missing = broker.objects_info(&cx, "in/a.txt", unknown).await;
+    assert_eq!(
+        missing.map_err(|error| error.kind),
+        Err(ErrorKind::NotFound)
+    );
+    let invalid = broker.objects_info(&cx, "in/a.txt", Some("v".into())).await;
+    assert_eq!(invalid.map_err(|error| error.kind), Err(ErrorKind::Invalid));
 }

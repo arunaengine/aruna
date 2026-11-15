@@ -78,6 +78,15 @@ impl Broker for Catalog {
         })
     }
 
+    /// The library reads a dataset without its file links; the dataset is the same.
+    async fn metadata_summary(
+        &self,
+        cx: &CallContext,
+        resource: &str,
+    ) -> Result<Document, HostError> {
+        self.metadata_get(cx, resource).await
+    }
+
     async fn metadata_list(
         &self,
         _: &CallContext,
@@ -98,7 +107,12 @@ impl Broker for Catalog {
         Ok("r2".into())
     }
 
-    async fn objects_info(&self, _: &CallContext, _: &str) -> Result<ObjectInfo, HostError> {
+    async fn objects_info(
+        &self,
+        _: &CallContext,
+        _: &str,
+        _: Option<String>,
+    ) -> Result<ObjectInfo, HostError> {
         Err(unused())
     }
 
@@ -223,9 +237,11 @@ async fn build_child(
     let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("built-{name}.wasm"));
     let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
     command.args(["build_entry", "--exact", "--nocapture", "--test-threads=1"]);
+    // Cargo resolves from its local cache only, so a build needs no network.
     command
         .env(BUILD_VAR, project)
         .env(OUT_VAR, &out)
+        .env("CARGO_NET_OFFLINE", "true")
         .kill_on_drop(true);
     if let Some(tools) = tools {
         let rest = std::env::var_os("PATH").unwrap_or_default();
@@ -358,35 +374,30 @@ async fn announce(language: &str) {
     );
 }
 
-/// A project from the language's template whose `run` handler is `code`, triggered by hand and
-/// by a timer.
+/// A project whose plugin code is `code`, triggered by hand and by a timer.
 fn probe(language: &str, code: &str) -> PathBuf {
-    let templates = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("templates")
-        .join(language);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("probe-{language}"));
     std::fs::create_dir_all(&dir).unwrap();
     let manifest = "name = \"probe\"\nversion = \"0.1.0\"\non = [\"manual\", \"timer\"]\n\n\
                     [timer]\nevery = \"1h\"\n";
     std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
-    match language {
-        "javascript" => {
-            let source = std::fs::read_to_string(templates.join("plugin.js")).unwrap();
-            let end = source.find("\n};\n").unwrap() + 4;
-            let rest = &source[end..];
-            std::fs::write(dir.join("plugin.js"), format!("{code}\n{rest}")).unwrap();
+    let file = match language {
+        "javascript" => "plugin.js",
+        "rust" => {
+            std::fs::write(dir.join("Cargo.toml"), RUST_PROJECT).unwrap();
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            "src/lib.rs"
         }
-        _ => {
-            std::fs::copy(templates.join("aruna.py"), dir.join("aruna.py")).unwrap();
-            std::fs::write(dir.join("app.py"), code).unwrap();
-        }
-    }
+        _ => "plugin.py",
+    };
+    std::fs::write(dir.join(file), code).unwrap();
     dir
 }
 
-/// Runs a probe by hand with `input` and by a timer, and checks what each answer became.
+/// Runs a probe by hand with the form field `input` and by a timer, and checks what each answer
+/// became.
 async fn check_probe(language: &str, plugin: &Plugin, plain: &str, tick: &str) {
-    let manual = |input: &str| Trigger::Manual(serde_json::json!(input).to_string());
+    let manual = |input: &str| Trigger::Manual(serde_json::json!({ "input": input }).to_string());
     let answer = run(plugin, manual("plain"), Catalog::new(RECORD)).await;
     assert_eq!(answer.unwrap().as_deref(), Some(plain), "{language}");
     let timer = Trigger::Timer(1_762_700_000_000);
@@ -409,36 +420,69 @@ async fn check_probe(language: &str, plugin: &Plugin, plain: &str, tick: &str) {
     }
 }
 
-const JAVASCRIPT_PROBE: &str = r#"import { get } from "aruna:plugin/metadata-read@0.3.0";
+const JAVASCRIPT_PROBE: &str = r#"import aruna from "aruna";
 
-async function run(ctx, event) {
-  if (event.kind === "timer") return { tick: event.tick };
-  if (event.input === "retry") throw { kind: "retryable", message: "try later" };
-  if (event.input !== "plain") return get(event.input).json;
-  await Promise.resolve();
-  return "awaited";
-}
-
-const handlers = {
-  manual: run,
-  timer: run,
-};
+aruna.on("manual", async (form) => {
+  if (form.input === "retry") throw new aruna.Retry("try later");
+  if (form.input !== "plain") return aruna.datasets.get(form.input).name;
+  return await Promise.resolve("awaited");
+});
+aruna.on("timer", (tick) => ({ tick: tick.getTime() }));
 "#;
 
-const PYTHON_PROBE: &str = r#"from aruna import WitWorld, on  # noqa: F401
-from componentize_py_types import Err
-from wit_world.imports import metadata_read, types
+/// A new project's manifest, on the library the build writes into it.
+const RUST_PROJECT: &str = r#"[package]
+name = "probe"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aruna = { package = "aruna-plugin", path = ".aruna/rust/aruna-plugin" }
+serde_json = "1"
+
+# The probe is a project of its own, not a member of the repository's workspace.
+[workspace]
+"#;
+
+const RUST_PROBE: &str = r#"use std::time::{SystemTime, UNIX_EPOCH};
+
+use aruna::{Form, Result};
+use serde_json::{Value, json};
+
+fn run(form: Form) -> Result<String> {
+    match form.text("input")?.as_str() {
+        "retry" => Err(aruna::retry("try later")),
+        "plain" => Ok("plain".into()),
+        other => Ok(aruna::datasets::get(other)?.name),
+    }
+}
+
+fn tick(tick: SystemTime) -> Result<Value> {
+    let since = tick.duration_since(UNIX_EPOCH).unwrap_or_default();
+    Ok(json!({ "tick": since.as_millis() as u64 }))
+}
+
+aruna::plugin! { manual => run, timer => tick }
+"#;
+
+const PYTHON_PROBE: &str = r#"import aruna
 
 
-@on("manual", "timer")
-def run(ctx, event):
-    if event["kind"] == "timer":
-        return {"tick": event["tick"]}
-    if event["input"] == "retry":
-        raise Err(types.Failure(types.FailureKind.RETRYABLE, "try later"))
-    if event["input"] != "plain":
-        return metadata_read.get(event["input"]).json
+@aruna.on("manual")
+def run(form):
+    if form.input == "retry":
+        raise aruna.Retry("try later")
+    if form.input != "plain":
+        return aruna.datasets.get(form.input).name
     return "plain"
+
+
+@aruna.on("timer")
+def tick(tick):
+    return {"tick": int(tick.timestamp() * 1000)}
 "#;
 
 #[tokio::test]
@@ -466,8 +510,17 @@ async fn announces_python() {
 async fn probes_javascript() {
     if available("javascript", "npx") {
         let plugin = build(probe("javascript", JAVASCRIPT_PROBE)).await;
-        let tick = r#"{"tick":"1762700000000"}"#;
-        check_probe("javascript", &plugin, "awaited", tick).await;
+        let tick = r#"{"tick":1762700000000}"#;
+        check_probe("javascript", &plugin, "\"awaited\"", tick).await;
+    }
+}
+
+#[tokio::test]
+async fn probes_rust() {
+    // A new project builds offline against the library the build writes into it.
+    if available("rust", "cargo") {
+        let plugin = build(probe("rust", RUST_PROBE)).await;
+        check_probe("rust", &plugin, "\"plain\"", r#"{"tick":1762700000000}"#).await;
     }
 }
 
@@ -475,7 +528,39 @@ async fn probes_javascript() {
 async fn probes_python() {
     if available("python", "uv") {
         let plugin = build(probe("python", PYTHON_PROBE)).await;
-        check_probe("python", &plugin, "plain", r#"{"tick": 1762700000000}"#).await;
+        check_probe("python", &plugin, "\"plain\"", r#"{"tick": 1762700000000}"#).await;
+    }
+}
+
+/// Copies the folder `from` to `to`, naming the plugin `starter` as `plugin new` would.
+fn copy_template(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let path = entry.unwrap().path();
+        let target = to.join(path.file_name().unwrap());
+        if path.is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+            copy_template(&path, &target);
+        } else {
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(target, text.replace("{{name}}", "starter")).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn builds_templates() {
+    // Each language's starter project builds on its library and answers a manual run.
+    for (language, program) in [("rust", "cargo"), ("javascript", "npx"), ("python", "uv")] {
+        if !available(language, program) {
+            continue;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let template = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        copy_template(&template.join(language), project.path());
+        let plugin = build(project.path().to_path_buf()).await;
+        let answer = run(&plugin, Trigger::Manual("{}".into()), Catalog::new(RECORD)).await;
+        let hello = "\"hello from install-1\"";
+        assert_eq!(answer.unwrap().as_deref(), Some(hello), "{language}");
     }
 }
 
@@ -489,7 +574,7 @@ async fn kills_stuck_builds() {
     std::fs::create_dir_all(&tools).unwrap();
     let manifest = "name = \"stuck\"\nversion = \"0.1.0\"\non = [\"manual\"]\n";
     std::fs::write(project.join("plugin.toml"), manifest).unwrap();
-    std::fs::write(project.join("app.py"), "").unwrap();
+    std::fs::write(project.join("plugin.py"), "").unwrap();
     let uv = tools.join("uv");
     std::fs::write(&uv, "#!/bin/sh\nexec sleep 600\n").unwrap();
     std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();

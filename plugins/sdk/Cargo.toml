@@ -1,10 +1,10 @@
-# Manifest of aruna-plugin, the Rust SDK for writing Aruna plugins as async functions.
+# Manifest of aruna-plugin, the Rust library for Aruna plugins.
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 
 [package]
 name = "aruna-plugin"
-description = "Write Aruna plugins as ordinary async Rust functions"
+description = "Write Aruna plugins as plain Rust functions by trigger"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

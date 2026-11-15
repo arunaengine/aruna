@@ -5,6 +5,8 @@
 pub mod artifact;
 #[cfg(feature = "build")]
 pub mod authored;
+#[cfg(feature = "build")]
+mod bundle;
 pub mod connection;
 pub mod manifest;
 #[cfg(feature = "build")]

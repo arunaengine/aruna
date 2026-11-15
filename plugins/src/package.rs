@@ -17,8 +17,8 @@ use crate::runtime::{Compiled, Runtime};
 /// The target Rust projects compile to; the host adds no WASI there.
 pub const RUST_TARGET: &str = "wasm32-unknown-unknown";
 
-/// The host contract Python and JavaScript builds read from the build folder.
-const CONTRACT: &str = include_str!("../wit/plugin.wit");
+/// The host contract every build reads from the build folder.
+pub(crate) const CONTRACT: &str = include_str!("../wit/plugin.wit");
 
 /// The folder a Python or JavaScript build writes into the project, again on every build.
 const BUILD_DIR: &str = ".aruna";
@@ -26,6 +26,7 @@ const BUILD_DIR: &str = ".aruna";
 /// The pinned toolchains of Python and JavaScript projects.
 const COMPONENTIZE_PY: &str = "componentize-py==0.25.1";
 const JCO: &str = "@bytecodealliance/jco@1.17.0";
+const ESBUILD: &str = "esbuild@0.25.12";
 
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -65,7 +66,13 @@ pub fn load_manifest(project: &Path) -> Result<Manifest, BuildError> {
     Ok(manifest)
 }
 
-/// Builds a Rust project with cargo, a Python (`app.py`) or JavaScript (`plugin.js`) one with
+/// Writes the Rust library crate and the contract to `.aruna/rust/`, as a new project gets them
+/// and every build writes them again.
+pub fn rust_library(project: &Path) -> Result<(), BuildError> {
+    Ok(crate::bundle::rust(project)?)
+}
+
+/// Builds a Rust project with cargo, a Python (`plugin.py`) or JavaScript (`plugin.js`) one with
 /// its pinned toolchain, then packages the output as `<name>-<version>.wasm`: beside cargo's
 /// module, or in the project folder.
 pub fn build_project(project: &Path) -> Result<Built, BuildError> {
@@ -73,11 +80,12 @@ pub fn build_project(project: &Path) -> Result<Built, BuildError> {
     let file = format!("{}-{}.wasm", manifest.name, manifest.version);
     let (output, path) = match project.join("Cargo.toml") {
         cargo if cargo.is_file() => {
+            crate::bundle::rust(project)?;
             let module = cargo_module(&cargo)?;
             let path = module.with_file_name(file);
             (module, path)
         }
-        _ => (component(project)?, project.join(file)),
+        _ => (component(project, &manifest)?, project.join(file)),
     };
     let bytes = std::fs::read(&output)?;
     let artifact = package(&mut manifest, &bytes)?;
@@ -135,16 +143,22 @@ fn registered(runtime: &Runtime, compiled: &Compiled) -> Result<BTreeSet<String>
 }
 
 /// Writes the contract to `.aruna/wit/` and builds the project's component into `.aruna/`.
-fn component(project: &Path) -> Result<PathBuf, BuildError> {
+fn component(project: &Path, manifest: &Manifest) -> Result<PathBuf, BuildError> {
     let (wit, output) = (".aruna/wit", ".aruna/plugin.wasm");
-    let command = if project.join("app.py").is_file() {
+    let commands = if project.join("plugin.py").is_file() {
+        // The library's entry imports the project's `plugin` module, which registers handlers.
+        crate::bundle::python(project, manifest)?;
         let world = [
             "-d",
             wit,
             "-w",
             "plugin",
             "componentize",
-            "app",
+            "-p",
+            ".aruna/python",
+            "-p",
+            ".",
+            "aruna._component",
             "-o",
             output,
         ];
@@ -156,8 +170,23 @@ fn component(project: &Path) -> Result<PathBuf, BuildError> {
             COMPONENTIZE_PY,
             "componentize-py",
         ];
-        [&uv[..], &world[..]].concat()
+        vec![[&uv[..], &world[..]].concat()]
     } else if project.join("plugin.js").is_file() {
+        // The entry binds the host and imports `plugin.js`; `aruna` names the written library.
+        crate::bundle::javascript(project, manifest)?;
+        let bundle = [
+            "npx",
+            "--yes",
+            ESBUILD,
+            ".aruna/javascript/entry.js",
+            "--bundle",
+            "--format=esm",
+            "--platform=browser",
+            "--alias:aruna=./.aruna/javascript/aruna.js",
+            "--external:aruna:plugin/*",
+            "--log-level=warning",
+            "--outfile=.aruna/javascript/bundle.js",
+        ];
         let world = [
             "--wit",
             wit,
@@ -168,28 +197,33 @@ fn component(project: &Path) -> Result<PathBuf, BuildError> {
             "-o",
             output,
         ];
-        [
-            &["npx", "--yes", JCO, "componentize", "plugin.js"][..],
-            &world[..],
-        ]
-        .concat()
+        let componentize = [
+            "npx",
+            "--yes",
+            JCO,
+            "componentize",
+            ".aruna/javascript/bundle.js",
+        ];
+        vec![bundle.to_vec(), [&componentize[..], &world[..]].concat()]
     } else {
-        let hint = "found no Cargo.toml, app.py or plugin.js to build";
+        let hint = "found no Cargo.toml, plugin.py or plugin.js to build";
         return Err(BuildError::Toolchain(hint.into()));
     };
     let folder = project.join(BUILD_DIR).join("wit");
     std::fs::create_dir_all(&folder)?;
     std::fs::write(folder.join("plugin.wit"), CONTRACT)?;
-    let program = command[0];
-    let status = Command::new(program)
-        .args(&command[1..])
-        .current_dir(project)
-        .status()
-        .map_err(|err| BuildError::Toolchain(format!("cannot run `{program}`: {err}")))?;
-    if !status.success() {
-        return Err(BuildError::Toolchain(format!(
-            "`{program}` failed with {status}"
-        )));
+    for command in commands {
+        let program = command[0];
+        let status = Command::new(program)
+            .args(&command[1..])
+            .current_dir(project)
+            .status()
+            .map_err(|err| BuildError::Toolchain(format!("cannot run `{program}`: {err}")))?;
+        if !status.success() {
+            return Err(BuildError::Toolchain(format!(
+                "`{program}` failed with {status}"
+            )));
+        }
     }
     Ok(project.join(output))
 }

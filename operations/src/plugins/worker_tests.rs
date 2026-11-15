@@ -208,7 +208,7 @@ async fn finishes_runs() {
     assert!(
         done.output
             .unwrap_or_default()
-            .starts_with(&ok.run_id.to_string())
+            .starts_with(&format!("\"{}", ok.run_id))
     );
     assert_eq!(done.attempts, 1);
     let open = read_run(&fixture.ctx, install.install_id, unsure.run_id)
@@ -275,7 +275,10 @@ async fn event_input() {
         .unwrap();
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
     let output = done.output.unwrap_or_default();
-    assert!(output.ends_with("change dataset_created D1 r1"), "{output}");
+    assert!(
+        output.ends_with("change dataset_created D1 r1\""),
+        "{output}"
+    );
 }
 
 /// A completed sync job of the relationship `relationship` under `prefix` of the install's data.

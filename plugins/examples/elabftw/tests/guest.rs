@@ -144,7 +144,12 @@ impl Broker for Hosted {
         })
     }
 
-    async fn objects_info(&self, _: &CallContext, path: &str) -> Result<ObjectInfo, HostError> {
+    async fn objects_info(
+        &self,
+        _: &CallContext,
+        path: &str,
+        _: Option<String>,
+    ) -> Result<ObjectInfo, HostError> {
         let size = self.0.object_size(path).map_err(refusal)?;
         Ok(ObjectInfo {
             path: path.into(),

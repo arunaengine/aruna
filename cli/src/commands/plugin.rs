@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use aruna_plugins::artifact::ArtifactDigest;
 use aruna_plugins::manifest::valid_plugin;
-use aruna_plugins::package::build_project;
+use aruna_plugins::package::{build_project, rust_library};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -49,12 +49,8 @@ fn template(language: Language) -> Vec<(&'static str, &'static str)> {
                 include_str!("../../../plugins/templates/python/plugin.toml"),
             ),
             (
-                "app.py",
-                include_str!("../../../plugins/templates/python/app.py"),
-            ),
-            (
-                "aruna.py",
-                include_str!("../../../plugins/templates/python/aruna.py"),
+                "plugin.py",
+                include_str!("../../../plugins/templates/python/plugin.py"),
             ),
         ],
     }
@@ -219,6 +215,10 @@ fn create(name: &str, language: Language, path: &Path) -> Result<(), CliError> {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(target, content.replace("{{name}}", name))?;
+    }
+    if matches!(language, Language::Rust) {
+        // Editors resolve the library before the first build writes it again.
+        rust_library(path).map_err(|err| CliError::usage(err.to_string()))?;
     }
     Ok(())
 }
@@ -636,7 +636,10 @@ mod tests {
         }
         let rust = dir.path().join("rust");
         let code = std::fs::read_to_string(rust.join("src").join("lib.rs")).unwrap();
-        assert!(code.contains("aruna_plugin::export! { manual => run }"));
+        assert!(code.contains("aruna::plugin! { manual => hello }"));
+        let python = std::fs::read_to_string(dir.path().join("python/plugin.py")).unwrap();
+        assert!(python.contains("@aruna.on(\"manual\")"));
+        assert!(rust.join(".aruna/rust/aruna-plugin/src/lib.rs").is_file());
         assert!(
             create("lab-sync", Language::Rust, &rust).is_err(),
             "a folder with files is refused"

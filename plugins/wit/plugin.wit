@@ -162,7 +162,8 @@ interface objects-read {
     cursor: option<string>,
   }
 
-  info: func(path: string) -> result<object-info, host-error>;
+  /// The information of one version, the current one unless `version` is given.
+  info: func(path: string, version: option<string>) -> result<object-info, host-error>;
   /// The bytes of one version, the current one unless `version` is given, within the call's
   /// byte bound; a marked version is refused.
   read: func(path: string, version: option<string>) -> result<list<u8>, host-error>;
