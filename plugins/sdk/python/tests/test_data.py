@@ -40,6 +40,15 @@ class DataTest(unittest.TestCase):
         stale.reload()
         self.assertEqual(stale.name, "Run 8")
 
+    def test_nested_edits(self):
+        self.fake.dataset("D2", name="Gel", author=["Bob"])
+        dataset = aruna.datasets.get("D2")
+        dataset["author"].append("Alice")
+        self.assertEqual(dataset.save(), ["author"])
+        dataset["author"].append("Carol")
+        self.assertEqual(dataset.save(), ["author"])
+        self.assertEqual(aruna.datasets.get("D2")["author"], ["Bob", "Alice", "Carol"])
+
     def test_merge_cases(self):
         # The host's own merge patch is tested against the same cases.
         for target, patch, result in json.loads(CASES.read_text()):

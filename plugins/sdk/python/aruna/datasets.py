@@ -3,6 +3,7 @@ revision read, file entities, and creates named by a path."""
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 
+import copy
 import json
 
 from ._host import host
@@ -18,8 +19,9 @@ class Dataset:
         self.identifiers = {}
         for name, value in entity.items():
             self._put(name, value)
-        # Compared in the form a save writes, so a field read as text is unchanged until changed.
-        self._read = self._entity()
+        # Compared in the form a save writes, so a field read as text is unchanged until changed;
+        # a copy, so editing a nested value in place still counts as a change.
+        self._read = copy.deepcopy(self._entity())
 
     def _put(self, name, value):
         if name in ("name", "description"):
@@ -65,7 +67,7 @@ class Dataset:
             return []
         text = json.dumps(patch, sort_keys=True)
         self.revision = host().dataset_patch(self.id, text, self.revision)
-        self._read = now
+        self._read = copy.deepcopy(now)
         return ["identifiers" if name == "identifier" else name for name in sorted(patch)]
 
     def reload(self):

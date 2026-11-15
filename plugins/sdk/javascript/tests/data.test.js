@@ -46,6 +46,17 @@ test("saves changes", () => {
   assert.deepEqual(aruna.datasets.get("D1").keywords, []);
 });
 
+test("saves nested edits", () => {
+  const fake = seeded();
+  fake.dataset("D2", { name: "Gel", author: ["Bob"] });
+  const dataset = aruna.datasets.get("D2");
+  dataset.get("author").push("Alice");
+  assert.deepEqual(dataset.save(), ["author"]);
+  dataset.get("author").push("Carol");
+  assert.deepEqual(dataset.save(), ["author"]);
+  assert.deepEqual(aruna.datasets.get("D2").get("author"), ["Bob", "Alice", "Carol"]);
+});
+
 test("applies merge cases", () => {
   // The host's own merge patch is tested against the same cases.
   for (const [target, patch, result] of CASES) {

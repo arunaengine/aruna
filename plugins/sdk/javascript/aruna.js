@@ -214,6 +214,7 @@ function* pages(fetch) {
 }
 
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+const copied = (value) => JSON.parse(json(value));
 const filled = (value) =>
   value !== null && value !== undefined && value !== "" && (typeof value !== "object" || Object.keys(value).length > 0);
 
@@ -241,8 +242,9 @@ export class Dataset {
     this.revision = revision;
     Object.assign(this, { name: "", description: "", keywords: [], license: null, identifiers: {} });
     for (const [name, value] of Object.entries(entity)) this.set(name, value);
-    // Compared in the form a save writes, so a field read as text is unchanged until changed.
-    this.#read = this.#entity();
+    // Compared in the form a save writes, so a field read as text is unchanged until changed;
+    // a copy, so editing a nested value in place still counts as a change.
+    this.#read = copied(this.#entity());
   }
 
   get(name) {
@@ -284,7 +286,7 @@ export class Dataset {
     const changed = Object.keys(patch).sort();
     if (changed.length === 0) return [];
     this.revision = calls().datasetPatch(this.id, json(patch), this.revision);
-    this.#read = now;
+    this.#read = copied(now);
     return changed.map((name) => (name === "identifier" ? "identifiers" : name));
   }
 
