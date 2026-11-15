@@ -1,6 +1,5 @@
-//! Builds probes and the starter projects in each language with its toolchain and runs them; the
-//! examples run in `examples.rs`. Opt in with ARUNA_PLUGIN_LANGUAGES=1: the toolchains download
-//! packages on first use.
+//! Builds probes and the starter projects in each language and runs them; the examples run in
+//! `examples.rs`. Opt in with ARUNA_PLUGIN_LANGUAGES=1: toolchains download packages on first use.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

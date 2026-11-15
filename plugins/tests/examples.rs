@@ -1,6 +1,5 @@
-//! Builds each plugin example once and runs its cases against one fake group: datasets changed by
-//! merge patches, objects with small contents, canned service answers, secrets, state and copies.
-//! Opt in with ARUNA_PLUGIN_LANGUAGES=1, as for the language tests.
+//! Builds each plugin example once and runs its cases against one fake group of datasets, objects,
+//! service answers, secrets, state and copies. Opt in with ARUNA_PLUGIN_LANGUAGES=1.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
