@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::Level;
 use crate::bindings::aruna::plugin::metadata_create::Created;
-use crate::bindings::aruna::plugin::metadata_read::{Document, Listing};
+use crate::bindings::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
 use crate::bindings::aruna::plugin::types::{ErrorKind, HostError};
 use crate::host::{Answer, Host, replace};
@@ -172,6 +172,15 @@ impl Host for Fake {
         Ok(Listing { resources, cursor })
     }
 
+    fn dataset_files(&self, id: &str, cursor: Option<&str>) -> Answer<FilePage> {
+        self.note(format!("files {id} {}", cursor.unwrap_or("-")));
+        let files: Vec<String> = (self.0.borrow().datasets.get(id).iter())
+            .flat_map(|stored| stored.files.iter().map(Value::to_string))
+            .collect();
+        let (files, cursor) = self.paged(&files, cursor);
+        Ok(FilePage { files, cursor })
+    }
+
     fn dataset_patch(&self, id: &str, patch: &str, expected: &str) -> Answer<String> {
         self.note(format!("patch {id} {patch} {expected}"));
         let patch: Map<String, Value> = serde_json::from_str(patch).unwrap();
@@ -182,6 +191,22 @@ impl Host for Fake {
                     value => drop(stored.entity.insert(name, value)),
                 }
             }
+        })
+    }
+
+    fn file_put(&self, id: &str, file: &str, expected: &str) -> Answer<String> {
+        self.note(format!("put {id} {file} {expected}"));
+        let file: Value = serde_json::from_str(file).unwrap();
+        self.write(id, expected, |stored| {
+            stored.files.retain(|kept| kept["@id"] != file["@id"]);
+            stored.files.push(file);
+        })
+    }
+
+    fn file_remove(&self, id: &str, file: &str, expected: &str) -> Answer<String> {
+        self.note(format!("remove {id} {file} {expected}"));
+        self.write(id, expected, |stored| {
+            stored.files.retain(|kept| kept["@id"] != file)
         })
     }
 

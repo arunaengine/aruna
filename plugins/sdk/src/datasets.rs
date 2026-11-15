@@ -1,5 +1,5 @@
 //! Datasets of the install's group: their fields, saved as a change of only what changed at the
-//! revision read, and creates named by a path.
+//! revision read, their file entities, and creates named by a path.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value, json};
 
 use crate::host;
-use crate::{Error, Result};
+use crate::{Error, Object, Result};
 
 /// One dataset at the revision it was read. Its fields can be changed in place; `save` sends what
 /// changed. Any other property is reached by name.
@@ -176,6 +176,61 @@ impl Dataset {
     /// Reads the dataset again; changes not saved are lost.
     pub fn reload(&mut self) -> Result<()> {
         *self = get(&self.id)?;
+        Ok(())
+    }
+
+    /// The dataset entity with its file links.
+    pub fn ro_crate(&self) -> Result<Value> {
+        let document = host::with(|host| host.dataset_get(&self.id, true))?;
+        Ok(serde_json::from_str(&document.json)?)
+    }
+
+    /// The dataset's `File` entities, one page at a time.
+    pub fn files(&self) -> impl Iterator<Item = Result<Value>> + use<> {
+        let id = self.id.clone();
+        let pages = Pages::new(move |cursor| {
+            let page = host::with(|host| host.dataset_files(&id, cursor.as_deref()))?;
+            Ok((page.files, page.cursor))
+        });
+        pages.map(|file| Ok(serde_json::from_str(&file?)?))
+    }
+
+    /// Links `object` as a `File` entity named by `id`, else by its `s3://` address, whose
+    /// `contentUrl` is that address.
+    pub fn add_file(&mut self, object: &Object, id: Option<&str>) -> Result<()> {
+        self.add_file_with(object, id, Map::new())
+    }
+
+    /// `add_file` with further properties of the entity.
+    pub fn add_file_with(
+        &mut self,
+        object: &Object,
+        id: Option<&str>,
+        properties: Map<String, Value>,
+    ) -> Result<()> {
+        let name = object.path.rsplit('/').next().unwrap_or(&object.path);
+        let mut file = json!({
+            "@id": id.unwrap_or(&object.url),
+            "@type": "File",
+            "name": name,
+            "contentSize": object.size,
+            "contentUrl": object.url,
+        });
+        if let Value::Object(fields) = &mut file {
+            fields.extend(properties);
+        }
+        self.put_file(file)
+    }
+
+    /// Adds or replaces one `File` entity the plugin built itself.
+    pub fn put_file(&mut self, file: Value) -> Result<()> {
+        let text = file.to_string();
+        self.revision = host::with(|host| host.file_put(&self.id, &text, &self.revision))?;
+        Ok(())
+    }
+
+    pub fn remove_file(&mut self, id: &str) -> Result<()> {
+        self.revision = host::with(|host| host.file_remove(&self.id, id, &self.revision))?;
         Ok(())
     }
 }

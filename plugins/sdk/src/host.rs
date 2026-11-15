@@ -6,7 +6,7 @@ use std::cell::RefCell;
 
 use crate::Level;
 use crate::bindings::aruna::plugin::metadata_create::Created;
-use crate::bindings::aruna::plugin::metadata_read::{Document, Listing};
+use crate::bindings::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
 use crate::bindings::aruna::plugin::types::HostError;
 use crate::bindings::aruna::plugin::{
@@ -25,7 +25,10 @@ pub(crate) trait Host {
     /// The dataset entity without its file links, or with them when `whole`.
     fn dataset_get(&self, id: &str, whole: bool) -> Answer<Document>;
     fn dataset_list(&self, cursor: Option<&str>) -> Answer<Listing>;
+    fn dataset_files(&self, id: &str, cursor: Option<&str>) -> Answer<FilePage>;
     fn dataset_patch(&self, id: &str, patch: &str, expected: &str) -> Answer<String>;
+    fn file_put(&self, id: &str, file: &str, expected: &str) -> Answer<String>;
+    fn file_remove(&self, id: &str, file: &str, expected: &str) -> Answer<String>;
     fn dataset_create(&self, path: &str, dataset: &str) -> Answer<Created>;
 }
 
@@ -60,8 +63,20 @@ impl Host for Imports {
         metadata_read::list(cursor)
     }
 
+    fn dataset_files(&self, id: &str, cursor: Option<&str>) -> Answer<FilePage> {
+        metadata_read::files(id, cursor)
+    }
+
     fn dataset_patch(&self, id: &str, patch: &str, expected: &str) -> Answer<String> {
         metadata_write::patch(id, patch, expected)
+    }
+
+    fn file_put(&self, id: &str, file: &str, expected: &str) -> Answer<String> {
+        metadata_write::put_file(id, file, expected)
+    }
+
+    fn file_remove(&self, id: &str, file: &str, expected: &str) -> Answer<String> {
+        metadata_write::remove_file(id, file, expected)
     }
 
     fn dataset_create(&self, path: &str, dataset: &str) -> Answer<Created> {

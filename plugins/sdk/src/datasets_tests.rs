@@ -1,15 +1,15 @@
 //! Tests datasets: fields read from the entity, a save of only what changed at the revision read,
-//! a conflict, listings, creates named by their path, and the dataset subject.
+//! a conflict, file entities, listings, creates named by their path, and the dataset subject.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
 use crate::bindings::aruna::plugin::types::{Invocation, Trigger};
 use crate::host::fake::{Fake, install};
-use crate::{WatchEvent, handle};
+use crate::{WatchEvent, handle, objects};
 
 fn seeded() -> Fake {
-    let fake = install(&[]);
+    let fake = install(&[("raw/reads.fq", b"ACGT", "v1")]);
     let entity = json!({ "@id": "./", "@type": "Dataset", "name": "Run 7", "keywords": "pcr, gel",
         "license": { "@id": "CC-BY-4.0" }, "identifier": { "doi": "10.1/x" }, "publisher": "Lab" });
     fake.dataset("D1", entity);
@@ -51,6 +51,28 @@ fn fields_and_save() {
     assert!(matches!(stale.save(), Err(Error::Conflict(_))));
     stale.reload().unwrap();
     assert_eq!(stale.name, "Run 8");
+}
+
+#[test]
+fn file_entities() {
+    let fake = seeded();
+    let mut dataset = get("D1").unwrap();
+    let object = objects::get("raw/reads.fq").unwrap();
+    dataset.add_file(&object, Some("reads/x")).unwrap();
+    dataset.add_file(&object, None).unwrap();
+    let files: Vec<Value> = dataset.files().map(Result::unwrap).collect();
+    let expected = json!({ "@id": "reads/x", "@type": "File", "name": "reads.fq",
+        "contentSize": 4, "contentUrl": "s3://raw/reads.fq" });
+    assert_eq!(files[0], expected);
+    assert_eq!(files[1]["@id"], "s3://raw/reads.fq");
+    dataset.remove_file("reads/x").unwrap();
+    assert_eq!(dataset.revision, "4");
+    assert_eq!(dataset.files().count(), 1);
+    assert_eq!(
+        dataset.ro_crate().unwrap()["hasPart"],
+        json!([{ "@id": "s3://raw/reads.fq" }])
+    );
+    assert!(fake.calls().iter().any(|call| call == "get D1 true"));
 }
 
 #[test]
