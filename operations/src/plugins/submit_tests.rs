@@ -367,3 +367,108 @@ async fn retired_unmarked() {
     assert_eq!(sweep_marks(&fixture.ctx).await, Ok(1));
     assert_eq!(marks(&fixture).await, 0);
 }
+
+#[tokio::test]
+async fn broker_starts_downloads() {
+    // The broker keeps the request with the address from the run's settings, and a rerun of the
+    // call gets the same job; a checksum it cannot check is invalid input.
+    use std::sync::Arc;
+
+    use aruna_plugins::broker::{Broker, CallContext, Field, Intent, JobDownload};
+
+    use crate::plugins::broker::RunBroker;
+    let fixture = Fixture::new().await;
+    let install = ready(&fixture).await;
+    let mut scope = scope(&fixture, &install);
+    scope.run.settings = r#"{"catalog_url":"https://catalog.example.org"}"#.into();
+    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope);
+    let cx = CallContext {
+        run: "run".into(),
+        install: install.install_id.to_string(),
+        max_bytes: 1 << 20,
+    };
+    let download = |checksums: Vec<Field>| JobDownload {
+        service: "catalog".into(),
+        path: "reads.fq".into(),
+        query: Vec::new(),
+        headers: Vec::new(),
+        target: "in/reads.fq".into(),
+        size_limit: Some(9),
+        checksums,
+        intent: Intent::new(4, &[b"download"]),
+    };
+    let md5 = |value: &str| Field {
+        name: "MD5".into(),
+        value: value.into(),
+    };
+    let digest = "0123456789abcdef0123456789abcdef";
+    let id = broker
+        .jobs_download(&cx, download(vec![md5(digest)]))
+        .await
+        .unwrap();
+    let again = broker.jobs_download(&cx, download(vec![md5(digest)])).await;
+    assert_eq!(again, Ok(id.clone()));
+    let row = read_work(&fixture.ctx, install.install_id, id.parse().unwrap()).await;
+    let row = row.unwrap().unwrap();
+    assert_eq!(row.target, Some(path(&fixture, &install, "in/reads.fq")));
+    let context = row.context.unwrap();
+    assert_eq!(
+        (context.base.as_str(), context.path.as_str()),
+        ("https://catalog.example.org/api/", "reads.fq")
+    );
+    for wrong in [
+        md5("00"),
+        md5("not hex"),
+        Field {
+            name: "md4".into(),
+            value: digest.into(),
+        },
+    ] {
+        let refused = broker.jobs_download(&cx, download(vec![wrong])).await;
+        assert_eq!(refused.map_err(|error| error.kind), Err(ErrorKind::Invalid));
+    }
+}
+
+#[tokio::test]
+async fn narrowed_download_refused() {
+    // A rule that shows only the status refuses the download at the call; no work is recorded.
+    use std::sync::Arc;
+
+    use aruna_core::secrets::ResponseExposure;
+    use aruna_plugins::broker::{Broker, CallContext, Intent, JobDownload};
+
+    use crate::plugins::bound::tests::{ORIGIN, keys, secret_with};
+    use crate::plugins::broker::RunBroker;
+    use crate::plugins::work::list_work;
+    let fixture = Fixture::keyed().await;
+    let install = fetcher(&fixture).await;
+    secret_with(&fixture, &install, ResponseExposure::Status).await;
+    let mut scope = scope(&fixture, &install);
+    scope.run.settings = format!(r#"{{"catalog_url":"{ORIGIN}"}}"#);
+    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope).with_keys(keys());
+    let cx = CallContext {
+        run: "run".into(),
+        install: install.install_id.to_string(),
+        max_bytes: 1 << 20,
+    };
+    let download = JobDownload {
+        service: "catalog".into(),
+        path: "reads.fq".into(),
+        query: Vec::new(),
+        headers: Vec::new(),
+        target: "in/reads.fq".into(),
+        size_limit: None,
+        checksums: Vec::new(),
+        intent: Intent::new(4, &[b"download"]),
+    };
+    let refused = broker.jobs_download(&cx, download).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Denied);
+    assert_eq!(
+        refused.message,
+        "this connection does not expose its whole answer"
+    );
+    let (works, _) = list_work(&fixture.ctx, install.install_id, None, 10)
+        .await
+        .unwrap();
+    assert!(works.is_empty());
+}

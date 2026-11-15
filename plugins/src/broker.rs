@@ -23,6 +23,20 @@ pub struct JobCopy {
     pub intent: Intent,
 }
 
+/// A download through a service into an object path; the ordinal names the job across reruns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobDownload {
+    pub service: String,
+    pub path: String,
+    pub query: Vec<Field>,
+    pub headers: Vec<Field>,
+    pub target: String,
+    pub size_limit: Option<u64>,
+    /// Expected digests by algorithm name, hex encoded.
+    pub checksums: Vec<Field>,
+    pub intent: Intent,
+}
+
 /// Identity of the run that issued a host call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallContext {
@@ -223,6 +237,17 @@ pub trait Broker: Send + Sync {
     }
     /// Starts a copy and answers its job id; a broker that runs no jobs refuses it.
     async fn jobs_copy(&self, _cx: &CallContext, _copy: JobCopy) -> Result<String, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "jobs are not run here",
+        ))
+    }
+    /// Starts a download through a service; a broker that runs no jobs refuses it.
+    async fn jobs_download(
+        &self,
+        _cx: &CallContext,
+        _download: JobDownload,
+    ) -> Result<String, HostError> {
         Err(HostError::new(
             ErrorKind::Unavailable,
             "jobs are not run here",

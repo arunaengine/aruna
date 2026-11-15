@@ -257,11 +257,12 @@ fn fields(fields: BTreeMap<String, Field>) -> BTreeMap<String, Setting> {
 fn requests(access: Access, readable: bool) -> Requests {
     let mut required = BTreeSet::from([Permission::MetadataRead, Permission::ObjectsRead]);
     if access == Access::Write {
-        // A copy needs read on the source and write on the target.
+        // A copy needs read on the source and write on the target; a download writes its target.
         required.extend([
             Permission::MetadataWrite,
             Permission::MetadataCreate,
             Permission::ObjectsCopy,
+            Permission::TransfersDownload,
         ]);
     }
     if readable {

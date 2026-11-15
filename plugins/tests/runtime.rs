@@ -11,8 +11,8 @@ use std::time::Duration;
 use aruna_plugins::artifact::read_manifest;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, FileChange, FilePage, HostError,
-    Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage,
-    Response, SendRequest, StatePut, StateRemove,
+    Intent, JobCopy, JobDownload, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
+    ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::manifest::Manifest;
@@ -242,6 +242,21 @@ impl Broker for Recorder {
         self.note(&format!("copy {} {version} {}", copy.source, copy.target));
         self.intents.lock().unwrap().push(copy.intent);
         Ok("job-1".into())
+    }
+
+    async fn jobs_download(
+        &self,
+        _: &CallContext,
+        download: JobDownload,
+    ) -> Result<String, HostError> {
+        let limit = download.size_limit.unwrap_or_default();
+        let call = format!(
+            "download {} {} {} {limit}",
+            download.service, download.path, download.target
+        );
+        self.note(&call);
+        self.intents.lock().unwrap().push(download.intent);
+        Ok("job-2".into())
     }
 
     async fn jobs_get(&self, _: &CallContext, id: &str) -> Result<JobStatus, HostError> {
@@ -696,6 +711,42 @@ async fn copy_answers_id() {
     assert_eq!(broker.intents()[0].ordinal, 1);
     let refused = invoke(probe(input), Arc::default()).await;
     assert!(matches!(refused, Err(InvokeError::Guest(_))), "{refused:?}");
+}
+
+#[tokio::test]
+async fn download_gated() {
+    // A download reaches the broker as a write with an ordinal; it needs the download permission
+    // and the service's connection, and says which one is missing.
+    let input = serde_json::json!({"call": "download", "connection": "api", "path": "r.fq",
+        "target": "in/r.fq", "limit": 9});
+    let mut download = probe(input.clone());
+    download.permissions.insert(Permission::TransfersDownload);
+    let broker = Arc::new(Recorder::default());
+    assert_eq!(
+        output(invoke(download.clone(), broker.clone()).await),
+        "job-2"
+    );
+    assert_eq!(broker.calls(), ["download api r.fq in/r.fq 9"]);
+    assert_eq!(broker.intents()[0].ordinal, 1);
+    let missing = |invocation| async move {
+        let Err(InvokeError::Guest(failure)) = invoke(invocation, Arc::default()).await else {
+            panic!("a download without its grants fails the run");
+        };
+        failure.message
+    };
+    let unconnected = {
+        let mut unconnected = download.clone();
+        unconnected.connections.clear();
+        unconnected
+    };
+    let message = missing(unconnected).await;
+    assert_eq!(
+        message,
+        "not allowed: connection `api` is not granted to this install"
+    );
+    let message = missing(probe(input)).await;
+    let wanted = "not allowed: permission `transfers.download` is not granted to this install";
+    assert_eq!(message, wanted);
 }
 
 #[tokio::test]

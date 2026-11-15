@@ -14,7 +14,7 @@ use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun};
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
-use aruna_core::structs::checksum::HASH_BLAKE3;
+use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_BLAKE3};
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
@@ -24,8 +24,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
-    ObjectPage, Response, SendRequest, StatePut, StateRemove,
+    HostError, Intent, JobCopy, JobDownload, JobStatus, Listing, MetadataCreate, MetadataPatch,
+    ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
@@ -51,7 +51,8 @@ use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
 use super::state::{PutError, check_key, put_state, read_state, remove_state};
 use super::store::{StoreError, Txn, transact};
-use super::submit::{CopyRequest, start_copy};
+use super::submit::{CopyRequest, DownloadRequest, start_copy, start_download};
+use super::work::RequestContext;
 use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
@@ -1105,6 +1106,46 @@ impl Broker for RunBroker {
         }
     }
 
+    async fn jobs_download(
+        &self,
+        _cx: &CallContext,
+        download: JobDownload,
+    ) -> Result<String, HostError> {
+        let target = self.expand(&download.target)?;
+        let checksums = expected(&download.checksums)?;
+        let request = SendRequest {
+            connection: download.service,
+            method: aruna_plugins::broker::Method::Get,
+            path: download.path,
+            query: download.query,
+            headers: download.headers,
+            body: Vec::new(),
+            intent: None,
+        };
+        // The whole answer lands in a bucket, so the rule must let the plugin see it whole.
+        let ready = self.ready(request).await?;
+        if ready.exposure != ResponseExposure::Full {
+            let narrower = "this connection does not expose its whole answer";
+            return Err(HostError::new(ErrorKind::Denied, narrower));
+        }
+        let request = DownloadRequest {
+            context: ready.context,
+            target,
+            checksums,
+            max_bytes: download.size_limit,
+            secret: ready.secret,
+            ordinal: download.intent.ordinal,
+        };
+        let started = start_download(&self.ctx, &self.scope, request);
+        match self.native(&download.intent, started).await {
+            Err(error) if error.kind == ErrorKind::Conflict => {
+                self.changed.store(true, Ordering::Relaxed);
+                Err(error)
+            }
+            answered => answered,
+        }
+    }
+
     async fn jobs_get(&self, _cx: &CallContext, id: &str) -> Result<JobStatus, HostError> {
         let install = self.admitted(None).await?;
         job_status(&self.ctx, (&install, self.scope.local), id).await
@@ -1578,6 +1619,9 @@ struct Ready {
     fields: SecretFields,
     body: Vec<u8>,
     intent: Option<Intent>,
+    /// The request as a work row keeps it, and whether the connection injects a secret.
+    context: RequestContext,
+    secret: bool,
 }
 
 impl RunBroker {
@@ -1649,9 +1693,11 @@ impl RunBroker {
         Ok(Ready {
             outgoing,
             exposure,
+            secret: fields.is_some(),
             fields: fields.unwrap_or_else(|| SecretFields::new(Default::default())),
             body: request.body,
             intent: request.intent,
+            context,
         })
     }
 
@@ -1724,6 +1770,32 @@ fn install_scope(install: &PluginInstall) -> InstallScope {
 }
 
 /// The manifest's name of a method the guest called.
+/// The expected digests of a download: a known algorithm and a hex digest of its length.
+fn expected(fields: &[Field]) -> Result<Vec<(ChecksumAlgorithm, Vec<u8>)>, HostError> {
+    use ChecksumAlgorithm::{Crc32, Crc32c, Md5, Sha1, Sha256};
+    let mut found = Vec::with_capacity(fields.len());
+    for field in fields {
+        let invalid = || {
+            let message = format!("`{}` is not a checksum this node checks", field.name);
+            HostError::new(ErrorKind::Invalid, message)
+        };
+        let algorithm = match field.name.to_ascii_lowercase().as_str() {
+            "md5" => Md5,
+            "sha1" => Sha1,
+            "sha256" => Sha256,
+            "crc32" => Crc32,
+            "crc32c" => Crc32c,
+            _ => return Err(invalid()),
+        };
+        let digest = hex::decode(field.value.trim()).map_err(|_| invalid())?;
+        if digest.len() != algorithm.digest_len() {
+            return Err(invalid());
+        }
+        found.push((algorithm, digest));
+    }
+    Ok(found)
+}
+
 fn declared_method(method: aruna_plugins::broker::Method) -> aruna_plugins::connection::Method {
     use aruna_plugins::broker::Method as Called;
     use aruna_plugins::connection::Method;
