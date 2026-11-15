@@ -1,0 +1,15 @@
+# Example plugin: imports a Zenodo record as a new dataset, run by hand.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "import-record"
+version = "0.1.0"
+title = "Import a Zenodo record as a dataset"
+on = ["manual"]
+access = "write"
+
+[services.zenodo]
+url = "https://zenodo.org/api/records"
+
+[manual]
+record = "Zenodo record id"

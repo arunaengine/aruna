@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Map, Value, json};
 
 use aruna_plugins::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, Field, HostError, Intent, Listing,
-    MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, HostError, Intent, Listing,
+    MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
 };
 use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
@@ -201,6 +201,23 @@ impl Broker for Group {
             let mut entity = Value::Object(std::mem::take(&mut stored.entity));
             merge_into(&mut entity, changes);
             stored.entity = entity.as_object().cloned().unwrap_or_default();
+        })
+    }
+
+    /// The path names the dataset, so a repeat answers the stored one.
+    async fn metadata_create(
+        &self,
+        _: &CallContext,
+        create: MetadataCreate,
+    ) -> Result<Created, HostError> {
+        let id = format!("D-{}", create.path);
+        if self.stored(&id).is_err() {
+            self.dataset(&id, serde_json::from_str(&create.dataset).unwrap());
+        }
+        let revision = self.stored(&id)?.revision.to_string();
+        Ok(Created {
+            resource: id,
+            revision,
         })
     }
 
@@ -451,4 +468,83 @@ async fn announcer_javascript() {
 #[tokio::test]
 async fn announcer_rust() {
     announce("rust").await;
+}
+
+#[tokio::test]
+async fn import_record() {
+    // A record becomes a dataset named by its path, so a second import answers the same one.
+    let Some(example) = example("import-record").await else {
+        return;
+    };
+    let group = Group::new();
+    let meta = json!({ "title": "Gel images", "keywords": ["gel"], "license": { "id": "cc-by-4.0" },
+        "publication_date": "2026-01-02", "creators": [{ "name": "Ada" }] });
+    group.reply(
+        "zenodo",
+        "123",
+        200,
+        json!({ "doi": "10.5281/zenodo.123", "metadata": meta }),
+    );
+    let form = manual(json!({ "record": " 123 " }));
+    let imported = example.run(&group, json!({}), form.clone()).await.unwrap();
+    assert_eq!(
+        imported,
+        json!({ "dataset": "D-zenodo/123", "title": "Gel images" })
+    );
+    let entity = group.entity("D-zenodo/123");
+    assert_eq!(
+        entity["identifier"],
+        json!({ "doi": "10.5281/zenodo.123", "zenodo": "123" })
+    );
+    assert_eq!(
+        (&entity["author"], &entity["license"]),
+        (&json!(["Ada"]), &json!("cc-by-4.0"))
+    );
+    assert_eq!(
+        example.run(&group, json!({}), form).await.unwrap(),
+        imported
+    );
+    let invalid = example
+        .run(&group, json!({}), manual(json!({ "record": "x1" })))
+        .await;
+    assert_eq!(invalid.unwrap_err().kind, FailureKind::InvalidInput);
+    let missing = example
+        .run(&group, json!({}), manual(json!({ "record": "9" })))
+        .await;
+    assert_eq!(
+        missing.unwrap_err().kind,
+        FailureKind::Permanent,
+        "the service answered 404"
+    );
+}
+
+#[tokio::test]
+async fn fill_defaults() {
+    // Only missing fields are filled; a dataset that has them all makes no write.
+    let Some(example) = example("fill-defaults").await else {
+        return;
+    };
+    let settings = json!({ "license": "CC0-1.0", "publisher": "Lab" });
+    let group = Group::new();
+    group.dataset(
+        "D1",
+        json!({ "name": "Run 7", "keywords": "Gel, pcr, gel" }),
+    );
+    let filled = example.run(
+        &group,
+        settings.clone(),
+        event("dataset_created", "D1", "1"),
+    );
+    assert_eq!(
+        filled.await.unwrap(),
+        json!({ "changed": ["keywords", "license", "publisher"] })
+    );
+    let entity = group.entity("D1");
+    assert_eq!(
+        (&entity["license"], &entity["publisher"]),
+        (&json!("CC0-1.0"), &json!("Lab"))
+    );
+    assert_eq!(entity["keywords"], json!(["gel", "pcr"]));
+    let again = example.run(&group, settings, manual(json!({ "dataset": "D1" })));
+    assert_eq!(again.await.unwrap(), json!({ "changed": [] }));
 }
