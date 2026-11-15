@@ -7,8 +7,6 @@ pub mod datasets;
 mod form;
 mod host;
 pub mod jobs;
-#[doc(hidden)]
-pub mod legacy;
 pub mod objects;
 mod outcome;
 mod run;
