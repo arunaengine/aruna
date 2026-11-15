@@ -842,30 +842,24 @@ async fn archive_uploads() {
 
 #[tokio::test]
 async fn archive_inside() {
-    // The node delivers the copy's own upload too; an archive inside the watched path is left
-    // alone, so nothing is copied twice.
+    // The node delivers the copy's own upload too, so overlapping paths are refused before
+    // anything is copied.
     let Some(example) = example("archive-uploads").await else {
         return;
     };
-    let settings = json!({ "incoming": "lab/", "archive": "lab/archive/" });
     let group = Group::new();
-    group.object("lab/run/a.txt", "v1", b"first");
-    let upload = event("data_uploaded", "lab/run/a.txt", "v1");
-    let copied = example.run(&group, settings.clone(), upload).await.unwrap();
-    assert_eq!(copied["target"], "lab/archive/run/a.txt");
-    let own = event("data_uploaded", "lab/archive/run/a.txt", "job-1");
-    assert_eq!(
-        example.run(&group, settings, own).await.unwrap(),
-        Value::Null
-    );
-    assert_eq!(group.copies().len(), 1);
-    // An archive above the watched path still gets every upload.
-    let settings = json!({ "incoming": "lab/incoming/", "archive": "lab/" });
-    let group = Group::new();
-    group.object("lab/incoming/a.txt", "v1", b"first");
-    let upload = event("data_uploaded", "lab/incoming/a.txt", "v1");
-    let copied = example.run(&group, settings, upload).await.unwrap();
-    assert_eq!(copied["target"], "lab/a.txt");
+    group.object("lab/incoming/run/a.txt", "v1", b"first");
+    let upload = event("data_uploaded", "lab/incoming/run/a.txt", "v1");
+    for (incoming, archive) in [("lab/", "lab/archive/"), ("lab/incoming/", "lab/")] {
+        let settings = json!({ "incoming": incoming, "archive": archive });
+        let refused = example.run(&group, settings, upload.clone()).await;
+        assert_eq!(
+            refused.unwrap_err().kind,
+            FailureKind::Permanent,
+            "{archive}"
+        );
+    }
+    assert!(group.copies().is_empty());
 }
 
 #[tokio::test]

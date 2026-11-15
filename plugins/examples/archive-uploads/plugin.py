@@ -8,9 +8,10 @@ import aruna
 @aruna.on("data_uploaded")
 def archive(upload):
     incoming, archive_path = aruna.settings.incoming, aruna.settings.archive
-    # A copy is an upload too; one into an archive inside the watched path is not copied again.
-    inside = archive_path.startswith(incoming) and upload.path.startswith(archive_path)
-    if not upload.path.startswith(incoming) or inside:
+    # A copy is an upload too, so overlapping paths would copy the archive again.
+    if incoming.startswith(archive_path) or archive_path.startswith(incoming):
+        raise aruna.Fail("the archive path must lie outside the watched path")
+    if not upload.path.startswith(incoming):
         return None
     target = archive_path + upload.path.removeprefix(incoming)
     job = aruna.objects.copy(upload.path, target, version=upload.version)
