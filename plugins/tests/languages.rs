@@ -78,6 +78,15 @@ impl Broker for Catalog {
         })
     }
 
+    /// The library reads a dataset without its file links; the dataset is the same.
+    async fn metadata_summary(
+        &self,
+        cx: &CallContext,
+        resource: &str,
+    ) -> Result<Document, HostError> {
+        self.metadata_get(cx, resource).await
+    }
+
     async fn metadata_list(
         &self,
         _: &CallContext,

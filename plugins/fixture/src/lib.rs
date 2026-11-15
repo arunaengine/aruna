@@ -7,28 +7,28 @@
 
 use std::hint::black_box;
 
-use aruna_plugin::legacy::{Context, Error, Event, Level, Method, Result};
+use aruna_plugin::bindings::aruna::plugin::types::HostError;
+use aruna_plugin::bindings::aruna::plugin::{
+    jobs, metadata_create, metadata_read, metadata_write, objects_read, state,
+};
+use aruna_plugin::{Error, Form, Level, Method, Result, fail, run};
 use serde_json::{Value, json};
-
-use aruna_plugin::bindings::aruna::plugin::jobs;
-
-/// A host error of a call the SDK does not wrap yet.
-fn host(error: aruna_plugin::bindings::aruna::plugin::types::HostError) -> Error {
-    Error::Host {
-        kind: error.kind,
-        message: error.message,
-    }
-}
 
 mod wasi {
     wit_bindgen::generate!({ path: "wit", world: "aruna-test:wasi/probe", generate_all });
 }
 
-/// Runs the host call named by the manual input and returns what it answered.
-async fn probe(ctx: Context, event: Event) -> Result<Value> {
-    let Event::Manual(input) = event else {
-        return Err(Error::Input("probe needs manual input".into()));
-    };
+/// A metadata read as the probes answer it: the revision and the dataset entity.
+fn document(read: std::result::Result<metadata_read::Document, HostError>) -> Result<Value> {
+    let doc = read?;
+    let json: Value = serde_json::from_str(&doc.json)?;
+    Ok(json!({ "revision": doc.revision, "json": json }))
+}
+
+/// Runs the host call named by the manual input and returns what it answered. The probes call
+/// the host interface itself, as a plugin may without the library.
+fn probe(form: Form) -> Result<Value> {
+    let input = Value::Object(form.fields().clone());
     let text = |name: &str| {
         input
             .get(name)
@@ -36,60 +36,52 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             .unwrap_or_default()
             .to_string()
     };
+    let json_of = |name: &str| input.get(name).cloned().unwrap_or(Value::Null).to_string();
     let number = |name: &str| input.get(name).and_then(Value::as_u64).unwrap_or_default();
     let call = text("call");
     Ok(match call.as_str() {
-        "settings" => ctx.settings::<Value>()?,
-        "metadata_get" => {
-            let doc = ctx.metadata().get(&text("resource")).await?;
-            json!({ "revision": doc.revision, "json": doc.json })
-        }
+        "settings" => aruna_plugin::settings::<Value>()?,
+        "metadata_get" => document(metadata_read::get(&text("resource")))?,
         "metadata_patch" => {
-            let patch = input.get("patch").cloned().unwrap_or(Value::Null);
-            let metadata = ctx.metadata();
-            let first = metadata
-                .patch(&text("resource"), &patch, &text("expected"))
-                .await?;
-            let second = metadata.patch(&text("resource"), &patch, &first).await?;
+            let (resource, patch) = (text("resource"), json_of("patch"));
+            let first = metadata_write::patch(&resource, &patch, &text("expected"))?;
+            let second = metadata_write::patch(&resource, &patch, &first)?;
             json!([first, second])
         }
         "metadata_create" => {
-            let dataset = input.get("dataset").cloned().unwrap_or(Value::Null);
-            let metadata = ctx.metadata();
-            let created = metadata.create(&text("path"), &dataset).await?;
+            let created = metadata_create::create(&text("path"), &json_of("dataset"))?;
             json!({ "resource": created.resource, "revision": created.revision })
         }
-        "metadata_summary" => {
-            let doc = ctx.metadata().summary(&text("resource")).await?;
-            json!({ "revision": doc.revision, "json": doc.json })
-        }
+        "metadata_summary" => document(metadata_read::summary(&text("resource")))?,
         "metadata_files" => {
             let cursor = input.get("cursor").and_then(Value::as_str);
-            let page = ctx.metadata().files(&text("resource"), cursor).await?;
-            json!({ "files": page.files, "cursor": page.cursor })
+            let page = metadata_read::files(&text("resource"), cursor)?;
+            let files = (page.files.iter())
+                .map(|file| serde_json::from_str(file))
+                .collect::<std::result::Result<Vec<Value>, _>>()?;
+            json!({ "files": files, "cursor": page.cursor })
         }
         "put_file" => {
-            let file = input.get("file").cloned().unwrap_or(Value::Null);
-            let metadata = ctx.metadata();
-            json!(
-                metadata
-                    .put_file(&text("resource"), &file, &text("expected"))
-                    .await?
-            )
+            let (resource, file) = (text("resource"), json_of("file"));
+            json!(metadata_write::put_file(
+                &resource,
+                &file,
+                &text("expected")
+            )?)
         }
         "remove_file" => {
             let (resource, id, expected) = (text("resource"), text("id"), text("expected"));
-            let metadata = ctx.metadata();
-            json!(metadata.remove_file(&resource, &id, &expected).await?)
+            json!(metadata_write::remove_file(&resource, &id, &expected)?)
         }
         "read" => {
             let version = input.get("version").and_then(Value::as_str);
-            let read =
-                aruna_plugin::bindings::aruna::plugin::objects_read::read(&text("path"), version);
-            json!(String::from_utf8_lossy(&read.map_err(host)?))
+            json!(String::from_utf8_lossy(&objects_read::read(
+                &text("path"),
+                version
+            )?))
         }
         "objects_info" => {
-            let info = ctx.objects().info(&text("path")).await?;
+            let info = objects_read::info(&text("path"))?;
             json!({ "path": info.path, "size": info.size, "version": info.version })
         }
         "send" => {
@@ -97,45 +89,41 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
                 "POST" => Method::Post,
                 _ => Method::Get,
             };
-            let body = input
-                .get("body")
-                .map(serde_json::to_vec)
-                .transpose()?
-                .unwrap_or_default();
-            let reply = ctx
-                .http(&text("connection"))
-                .send(method, &text("path"), body)
-                .await?;
+            let mut request = aruna_plugin::service(&text("connection"))
+                .request(method)
+                .path(&text("path"))
+                .check(false);
+            if let Some(body) = input.get("body") {
+                request = request.json(body);
+            }
+            let reply = request.send()?;
             // A status-only answer has no body; it reads as no fields.
             let fields = reply.json::<Value>().unwrap_or_else(|_| json!({}));
             json!({ "status": reply.status, "fields": fields })
         }
         "copy" => {
             let version = input.get("version").and_then(Value::as_str);
-            let copied = jobs::copy(&text("source"), version, &text("target"));
-            json!(copied.map_err(host)?)
+            json!(jobs::copy(&text("source"), version, &text("target"))?)
         }
         "state_remove" => {
             let key = text("key");
-            let state = ctx.state();
-            let version = state.put(&key, b"v".to_vec(), None).await?;
-            aruna_plugin::bindings::aruna::plugin::state::remove(&key, version).map_err(host)?;
-            json!(state.get(&key).await?.is_none())
+            let version = state::put(&key, b"v", None)?;
+            state::remove(&key, version)?;
+            json!(state::get(&key)?.is_none())
         }
         "cancel" => {
-            jobs::cancel(&text("id")).map_err(host)?;
+            jobs::cancel(&text("id"))?;
             json!(true)
         }
         "copy_mapped" => {
             // A copy, then the mapping its `job_finished` run reads, as a plugin keeps it.
-            let id = jobs::copy(&text("source"), None, &text("target")).map_err(host)?;
-            let key = format!("job/{id}");
-            ctx.state().put(&key, b"mapped".to_vec(), None).await?;
+            let id = jobs::copy(&text("source"), None, &text("target"))?;
+            state::put(&format!("job/{id}"), b"mapped", None)?;
             json!(id)
         }
         "job" => {
-            let status = jobs::get(&text("id")).map_err(host)?;
-            let page = jobs::outputs(&text("id"), None).map_err(host)?;
+            let status = jobs::get(&text("id"))?;
+            let page = jobs::outputs(&text("id"), None)?;
             let outputs: Vec<_> = page.objects.into_iter().map(|object| object.path).collect();
             json!({ "kind": status.kind, "state": status.state, "path": status.path,
                 "bytes": status.bytes, "outputs": outputs })
@@ -154,7 +142,7 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
                     "write" => out.blocking_write_and_flush(&chunk),
                     _ => out.write_zeroes(size as u64),
                 };
-                written.map_err(|_| Error::failed("the stream refused"))?;
+                written.map_err(|_| fail("the stream refused"))?;
             }
             json!(true)
         }
@@ -173,69 +161,65 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
                 value = black_box(value.wrapping_add(1));
             }
             if input.get("slow").is_some() {
-                ctx.metadata().get("slow").await?;
+                metadata_read::get("slow")?;
             }
             for _ in 0..number("logs") {
-                ctx.log(Level::Debug, "after the fill");
+                aruna_plugin::log(Level::Debug, "after the fill");
             }
             json!(buffer[0])
         }
         "chatty" => {
             // Logs until the host call budget ends the run.
             for line in 0..u32::MAX {
-                ctx.log(Level::Debug, &format!("line {line}"));
+                aruna_plugin::log(Level::Debug, &format!("line {line}"));
             }
             json!(null)
         }
         "errors" => {
             let mut failed = 0;
             for _ in 0..1000 {
-                failed += u32::from(ctx.metadata().get("missing").await.is_err());
+                failed += u32::from(metadata_read::get("missing").is_err());
             }
             json!(failed)
         }
         "state" => {
-            let state = ctx.state();
-            let version = state.put("counter", b"1".to_vec(), None).await?;
-            let entry = state.get("counter").await?;
+            let version = state::put("counter", b"1", None)?;
+            let entry = state::get("counter")?;
             json!({ "version": version, "stored": entry.map(|e| e.version) })
         }
-        other => return Err(Error::Input(format!("unknown call `{other}`"))),
+        other => return Err(Error::InvalidInput(format!("unknown call `{other}`"))),
     })
 }
 
-/// Returns the run identity, settings and trigger it was called with.
 /// A finished job with the mapping the run that started it kept under `job/<id>`.
-async fn finished(ctx: Context, event: Event) -> Result<Value> {
-    let Event::Change(change) = event else {
-        return Err(Error::Input("job_finished needs a job".into()));
-    };
-    let mapping = ctx.state().get(&format!("job/{}", change.resource)).await?;
+fn finished() -> Result<Value> {
+    let change = run()
+        .event
+        .ok_or_else(|| Error::InvalidInput("job_finished needs a job".into()))?;
+    let mapping = state::get(&format!("job/{}", change.resource))?;
     let mapping = mapping.map(|entry| String::from_utf8_lossy(&entry.value).into_owned());
     Ok(json!({ "job": change.resource, "state": change.revision, "mapping": mapping }))
 }
 
-async fn echo(ctx: Context, event: Event) -> Result<String> {
-    let trigger = match event {
-        Event::Change(change) => format!(
-            "change {} {} {}",
-            change.kind, change.resource, change.revision
-        ),
-        Event::Manual(input) => format!("manual {input}"),
-        Event::Webhook { delivery_id, .. } => format!("webhook {delivery_id:?}"),
-        Event::Timer(tick) => format!("timer {tick}"),
-    };
-    let settings = ctx.settings::<Value>()?;
+/// Returns the run identity, settings and the event it was called with.
+fn echo() -> Result<String> {
+    let run = run();
+    let change = run
+        .event
+        .ok_or_else(|| Error::InvalidInput("echo needs an event".into()))?;
+    let trigger = format!(
+        "change {} {} {}",
+        change.kind, change.resource, change.revision
+    );
+    let settings = aruna_plugin::settings::<Value>()?;
     Ok(format!(
         "{} {} {} {settings} {trigger}",
-        ctx.run(),
-        ctx.install(),
-        ctx.group()
+        run.id, run.install, run.group
     ))
 }
 
 /// Allocates until the memory budget ends the run.
-async fn hoard(_: Context, _: ()) -> Result<()> {
+fn hoard() -> Result<()> {
     let mut blocks = Vec::new();
     loop {
         blocks.push(black_box(vec![1u8; 1 << 20]));
@@ -243,14 +227,14 @@ async fn hoard(_: Context, _: ()) -> Result<()> {
 }
 
 /// Computes until the fuel budget ends the run.
-async fn spin(_: Context, _: ()) -> Result<()> {
+fn spin() -> Result<()> {
     let mut value = 0u64;
     loop {
         value = black_box(value.wrapping_add(1));
     }
 }
 
-aruna_plugin::export! {
+aruna_plugin::plugin! {
     manual => probe,
     timer => spin,
     dataset_created => echo,

@@ -258,7 +258,7 @@ async fn sync_job_runs() {
         panic!("a sync event starts the run")
     };
     let answer = format!(
-        "change sync_completed {} {}",
+        "change sync_completed {} {}\"",
         relationship.id, event.revision
     );
     let output = runs[0].output.clone().unwrap_or_default();

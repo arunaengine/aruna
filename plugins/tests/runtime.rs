@@ -362,10 +362,8 @@ async fn echo_round_trip() {
     };
     let reply = invoke(call(Trigger::Event(event)), Arc::default()).await;
     assert_eq!(
-        reply.unwrap().as_deref(),
-        Some(
-            r#"run-1 install-1 group-1 {"api_url":"https://api.example.org"} change dataset_created D1 r1"#
-        )
+        output(reply),
+        r#"run-1 install-1 group-1 {"api_url":"https://api.example.org"} change dataset_created D1 r1"#
     );
 }
 
@@ -462,11 +460,13 @@ async fn dataset_calls_reach() {
         revision: "r2".into(),
     };
     let reply = invoke(call(Trigger::Event(event)), Arc::default()).await;
+    let reply = output(reply);
     assert!(
         reply
+            .as_str()
             .unwrap()
-            .unwrap()
-            .ends_with("change dataset_updated D1 r2")
+            .ends_with("change dataset_updated D1 r2"),
+        "{reply}"
     );
 }
 
@@ -481,7 +481,7 @@ async fn missing_grant_stops() {
     assert_eq!(failure.kind, FailureKind::Permanent);
     assert_eq!(
         failure.message,
-        "permission `objects.read` is not granted for `s3/x`"
+        "not allowed: permission `objects.read` is not granted to this install"
     );
     let mut send = probe(serde_json::json!({"call": "send", "connection": "api", "path": "/x"}));
     send.connections.clear();
@@ -490,7 +490,7 @@ async fn missing_grant_stops() {
     };
     assert_eq!(
         failure.message,
-        "permission `connections.send` is not granted for `api`"
+        "not allowed: connection `api` is not granted to this install"
     );
     assert!(broker.calls().is_empty(), "nothing reached the broker");
 }

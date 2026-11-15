@@ -15,7 +15,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-aruna-plugin = { workspace = true }
+aruna = { package = "aruna-plugin", path = "../../sdk" }
 hex = { workspace = true }
 html5ever = { workspace = true }
 serde = { workspace = true }
