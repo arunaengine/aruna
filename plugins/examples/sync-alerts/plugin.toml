@@ -1,0 +1,15 @@
+# Example plugin: tells a chat channel when a sync relationship starts failing.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "sync-alerts"
+version = "0.1.0"
+title = "Report failing syncs"
+on = ["sync_completed", "sync_failed"]
+
+[settings]
+chat_url = { type = "url" }
+
+[services.chat]
+url = "{chat_url}/api/messages"
+secret = "Chat bot token"

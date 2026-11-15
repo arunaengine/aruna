@@ -1003,3 +1003,43 @@ async fn orcid_names() {
     example.run(&group, json!({}), form).await.unwrap();
     assert_eq!(group.entity("D1")["author"], author);
 }
+
+#[tokio::test]
+async fn sync_alerts() {
+    // The first failure after a success is sent; a completed sync starts the count again.
+    let Some(example) = example("sync-alerts").await else {
+        return;
+    };
+    let settings = json!({ "chat_url": "https://chat.example.org" });
+    let group = Group::new();
+    group.reply("chat", "", 201, json!({}));
+    let sync = |kind: &str, job: &str| {
+        Trigger::Event(WatchEvent {
+            kind: kind.into(),
+            path: "raw/run-7/".into(),
+            resource: "rel-1".into(),
+            revision: job.into(),
+        })
+    };
+    let mut counts = Vec::new();
+    for (kind, job) in [
+        ("sync_failed", "j1"),
+        ("sync_failed", "j2"),
+        ("sync_completed", "j3"),
+        ("sync_failed", "j4"),
+    ] {
+        let answer = example
+            .run(&group, settings.clone(), sync(kind, job))
+            .await
+            .unwrap();
+        counts.push(answer["failures"].clone());
+    }
+    assert_eq!(counts, [json!(1), json!(2), json!(0), json!(1)]);
+    let texts: Vec<Value> = group
+        .sent()
+        .into_iter()
+        .map(|(_, _, body)| body["text"].clone())
+        .collect();
+    let text = |job: &str| json!(format!("The sync of raw/run-7/ failed (job {job})"));
+    assert_eq!(texts, [text("j1"), text("j4")]);
+}
