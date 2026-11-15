@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
+use super::marks::{Mark, mark_in};
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
 use crate::jobs::service::find_dedup_job;
@@ -199,6 +200,17 @@ pub async fn reserve(
     (install, identity): (&PluginInstall, &Identity),
     proposed: WorkRow,
 ) -> Result<(WorkRow, Reserve), WorkError> {
+    reserve_marked(ctx, (install, identity), proposed, None).await
+}
+
+/// [`reserve`], marking the version the work writes at `bucket/key` in the same transaction when
+/// it writes the row, so the version is marked before any byte of it exists.
+pub async fn reserve_marked(
+    ctx: &DriverContext,
+    (install, identity): (&PluginInstall, &Identity),
+    proposed: WorkRow,
+    marked: Option<(&str, &str)>,
+) -> Result<(WorkRow, Reserve), WorkError> {
     let key = row_key(install.install_id, identity)?;
     transact(ctx, async |txn: &Txn<'_>| {
         let stored = match txn.read(PLUGIN_WORK_KEYSPACE, &key).await? {
@@ -226,6 +238,16 @@ pub async fn reserve(
                     vec![(key.clone(), encode(&proposed)?)],
                 )
                 .await?;
+                if let (Some((bucket, object)), Some(version_id)) = (marked, proposed.version_id) {
+                    let mark = Mark {
+                        install_id: install.install_id,
+                        work_id: proposed.work_id,
+                        job: None,
+                        kind: proposed.kind,
+                        at_ms: proposed.created_ms,
+                    };
+                    mark_in(txn, (bucket, object, version_id), &mark).await?;
+                }
                 Ok((proposed, Reserve::Fresh))
             }
         }

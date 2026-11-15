@@ -12,6 +12,7 @@ use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::work::read_work;
 use crate::s3::object::copy::test::seed_bucket;
+use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 
 pub(crate) fn scope(fixture: &Fixture, install: &PluginInstall) -> RunScope {
     let mut run = queued(install.install_id, 1);
@@ -203,4 +204,166 @@ async fn shifted_copy_refused() {
         .await
         .unwrap();
     assert!(rows.is_empty());
+}
+
+/// An install granted the group's data whose `catalog` connection injects the slot `api_key`.
+async fn fetcher(fixture: &Fixture) -> PluginInstall {
+    let install = crate::plugins::bound::tests::bound(fixture).await;
+    let data = format!("/{}/g/{}/data/**", fixture.actor.realm_id, fixture.group_id);
+    edit_config(fixture, |config| {
+        config.installs[0].grants.insert("write".into(), vec![data]);
+    })
+    .await;
+    let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let install = (config.await.unwrap().installs.into_iter())
+        .find(|found| found.install_id == install.install_id)
+        .unwrap();
+    seed_bucket(
+        &fixture.ctx,
+        "in",
+        install.group_id,
+        install.account,
+        Vec::new(),
+    )
+    .await;
+    install
+}
+
+fn fetch(fixture: &Fixture, install: &PluginInstall, secret: bool) -> DownloadRequest {
+    DownloadRequest {
+        context: RequestContext {
+            connection: "catalog".into(),
+            base: "https://api.example.org/api/".into(),
+            method: "GET".into(),
+            path: "reads.fq".into(),
+            query: Vec::new(),
+            headers: Vec::new(),
+        },
+        target: path(fixture, install, "in/reads.fq"),
+        checksums: Vec::new(),
+        max_bytes: None,
+        secret,
+        ordinal: 0,
+    }
+}
+
+/// The marks of the work keyspace, by their key.
+async fn marks(fixture: &Fixture) -> usize {
+    use crate::plugins::marks::MARK_ROW;
+    use crate::plugins::store::Txn;
+    let txn = Txn::direct(&fixture.ctx);
+    let rows = txn.scan(PLUGIN_WORK_KEYSPACE, &[MARK_ROW]).await.unwrap();
+    rows.len()
+}
+
+#[tokio::test]
+async fn download_marked() {
+    // A download through a connection with a secret marks the version it will write in the
+    // reservation, before any byte exists; the same call again finds the same work and mark.
+    use crate::plugins::marks::is_marked;
+    let fixture = Fixture::keyed().await;
+    let install = fetcher(&fixture).await;
+    let scope = scope(&fixture, &install);
+    let request = fetch(&fixture, &install, true);
+    let work_id = start_download(&fixture.ctx, &scope, request.clone())
+        .await
+        .unwrap();
+    let row = read_work(&fixture.ctx, install.install_id, work_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let version = ("in", "reads.fq", row.version_id.unwrap());
+    assert!(is_marked(&fixture.ctx, version).await.unwrap());
+    let again = start_download(&fixture.ctx, &scope, request.clone()).await;
+    assert_eq!(again, Ok(work_id));
+    assert_eq!(marks(&fixture).await, 1);
+    let mut other = request;
+    other.max_bytes = Some(5);
+    let changed = start_download(&fixture.ctx, &scope, other)
+        .await
+        .unwrap_err();
+    assert_eq!(changed.kind, ErrorKind::Conflict);
+}
+
+#[tokio::test]
+async fn download_unmarked() {
+    // Without a secret the answer is the service's public data, so nothing is marked.
+    let fixture = Fixture::keyed().await;
+    let install = fetcher(&fixture).await;
+    let scope = scope(&fixture, &install);
+    start_download(&fixture.ctx, &scope, fetch(&fixture, &install, false))
+        .await
+        .unwrap();
+    assert_eq!(marks(&fixture).await, 0);
+}
+
+#[tokio::test]
+async fn marks_once() {
+    // Two reservations of the same call at once, the loser tried again, leave one mark.
+    use crate::plugins::work::Reserve;
+    let fixture = Fixture::keyed().await;
+    let install = fetcher(&fixture).await;
+    let identity = Identity::Call {
+        run_id: Ulid::from_parts(9, 9),
+        ordinal: 0,
+    };
+    let proposed = || {
+        let mut row = WorkRow::reserved(&install, WorkKind::Download, Ulid::from_parts(9, 9), 1);
+        (row.digest, row.version_id) = ([3; 32], Some(Ulid::generate()));
+        row
+    };
+    let marked = Some(("in", "reads.fq"));
+    let reserve = |row| reserve_marked(&fixture.ctx, (&install, &identity), row, marked);
+    let (first, second) = tokio::join!(reserve(proposed()), reserve(proposed()));
+    let mut found = Vec::new();
+    for outcome in [first, second] {
+        let outcome = match outcome {
+            Ok(found) => found,
+            Err(_) => reserve(proposed()).await.unwrap(),
+        };
+        found.push(outcome);
+    }
+    let fresh = found
+        .iter()
+        .filter(|(_, how)| *how == Reserve::Fresh)
+        .count();
+    assert_eq!(fresh, 1, "one reservation wrote the row");
+    assert_eq!(found[0].0.work_id, found[1].0.work_id);
+    assert_eq!(marks(&fixture).await, 1);
+}
+
+#[tokio::test]
+async fn retired_unmarked() {
+    // A download that was never submitted, retired with its install, loses its mark at the next
+    // sweep: its row is gone and the version it would have written never existed.
+    use crate::plugins::marks::sweep_marks;
+    use crate::plugins::work::retire_work;
+    use aruna_core::plugin_installs::InstallState;
+    let fixture = Fixture::keyed().await;
+    let install = fetcher(&fixture).await;
+    let identity = Identity::Call {
+        run_id: Ulid::from_parts(9, 9),
+        ordinal: 0,
+    };
+    let mut row = WorkRow::reserved(&install, WorkKind::Download, Ulid::from_parts(9, 9), 1);
+    row.version_id = Some(Ulid::generate());
+    let marked = Some(("in", "reads.fq"));
+    reserve_marked(&fixture.ctx, (&install, &identity), row, marked)
+        .await
+        .unwrap();
+    assert_eq!(
+        sweep_marks(&fixture.ctx).await,
+        Ok(0),
+        "its work may still write"
+    );
+    edit_config(&fixture, |config| {
+        config.installs[0].state = InstallState::Removing
+    })
+    .await;
+    let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    retire_work(&fixture.ctx, &config.await.unwrap(), 5)
+        .await
+        .unwrap();
+    assert_eq!(sweep_marks(&fixture.ctx).await, Ok(1));
+    assert_eq!(marks(&fixture).await, 0);
 }
