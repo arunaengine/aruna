@@ -46,7 +46,7 @@ use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
 use super::jobs::{cancel_job, job_outputs, job_status};
 use super::marks::{is_marked, unmarked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
-use super::outgoing::{outgoing, request_context};
+use super::outgoing::{node_keys, outgoing, request_context};
 use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
 use super::state::{PutError, check_key, put_state, read_state, remove_state};
@@ -99,12 +99,7 @@ impl RunBroker {
         lines.log.clear();
         Self {
             outbound: Arc::new(Egress(ctx.blob_handle.clone())),
-            keys: (ctx.metadata_handle.as_ref())
-                .map(|handle| ReleaseKeys {
-                    seal: handle.realm_seal_key(),
-                    vault: handle.realm_vault_key(),
-                })
-                .unwrap_or_default(),
+            keys: node_keys(&ctx),
             held: tokio::sync::Mutex::default(),
             shown: Mutex::default(),
             ctx,
