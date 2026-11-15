@@ -13,8 +13,8 @@ use serde_json::{Map, Value, json};
 
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
-    ObjectPage, Response, SendRequest, StatePut, StateRemove,
+    HostError, Intent, JobCopy, JobDownload, JobStatus, JobUpload, Listing, MetadataCreate,
+    MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
@@ -47,6 +47,16 @@ struct Stored {
     files: Vec<Value>,
 }
 
+/// A download or upload: what started it, its bucket path, its state and an upload's answer.
+#[derive(Clone)]
+struct Transfer {
+    call: String,
+    kind: &'static str,
+    path: String,
+    state: String,
+    reply: Option<(u16, Vec<u8>)>,
+}
+
 #[derive(Default)]
 struct State {
     datasets: BTreeMap<String, Stored>,
@@ -61,9 +71,43 @@ struct State {
     versions: u64,
     /// Copies by job id, and the id each run's call ordinal got.
     copies: BTreeMap<String, JobCopy>,
+    transfers: BTreeMap<String, Transfer>,
     ids: BTreeMap<(String, u32), String>,
     lines: Vec<String>,
     runs: u64,
+}
+
+impl State {
+    /// A rerun of the same run reaches the same call ordinal, so it gets the same job back.
+    fn job_id(&mut self, cx: &CallContext, intent: &Intent) -> String {
+        let count = self.ids.len() + 1;
+        let key = (cx.run.clone(), intent.ordinal);
+        let id = self
+            .ids
+            .entry(key)
+            .or_insert_with(|| format!("job-{count}"));
+        id.clone()
+    }
+
+    /// Starts a queued download or upload once per job.
+    fn transfer(
+        &mut self,
+        cx: &CallContext,
+        intent: &Intent,
+        call: String,
+        (kind, path): (&'static str, String),
+    ) -> String {
+        let id = self.job_id(cx, intent);
+        let transfer = Transfer {
+            call,
+            kind,
+            path,
+            state: "queued".into(),
+            reply: None,
+        };
+        self.transfers.entry(id.clone()).or_insert(transfer);
+        id
+    }
 }
 
 /// The fake group every example runs against; the test seeds it and reads what the plugin did.
@@ -135,6 +179,34 @@ impl Group {
 
     fn copies(&self) -> Vec<JobCopy> {
         self.with(|state| state.copies.values().cloned().collect())
+    }
+
+    /// The downloads and uploads started, in job order.
+    fn transfers(&self) -> Vec<String> {
+        let transfers = self.with(|state| state.transfers.clone());
+        transfers
+            .into_values()
+            .map(|transfer| transfer.call)
+            .collect()
+    }
+
+    /// Ends job `id` in `state` with an upload's `reply`; a download that succeeded wrote its
+    /// target as a new version named by the job.
+    fn finish(&self, id: &str, state: &str, reply: Option<(u16, Value)>) {
+        self.with(|group| {
+            let transfer = group.transfers.get_mut(id).unwrap();
+            transfer.state = state.into();
+            transfer.reply = reply.map(|(status, body)| (status, body.to_string().into_bytes()));
+            if transfer.kind == "download" && state == "succeeded" {
+                let version = Version {
+                    id: id.into(),
+                    content: b"@r1".to_vec(),
+                    marked: false,
+                };
+                let path = transfer.path.clone();
+                group.objects.entry(path).or_default().push(version);
+            }
+        });
     }
 
     fn value(&self, key: &str) -> Option<Value> {
@@ -442,13 +514,7 @@ impl Broker for Group {
     async fn jobs_copy(&self, cx: &CallContext, copy: JobCopy) -> Result<String, HostError> {
         let (_, source) = self.version(&copy.source, copy.version.as_deref())?;
         Ok(self.with(|state| {
-            let count = state.copies.len() + 1;
-            let key = (cx.run.clone(), copy.intent.ordinal);
-            let id = state
-                .ids
-                .entry(key)
-                .or_insert_with(|| format!("job-{count}"))
-                .clone();
+            let id = state.job_id(cx, &copy.intent);
             if state.copies.insert(id.clone(), copy.clone()).is_none() {
                 let target = Version {
                     id: id.clone(),
@@ -460,7 +526,66 @@ impl Broker for Group {
         }))
     }
 
+    /// The download writes its target only once the test finishes it.
+    async fn jobs_download(
+        &self,
+        cx: &CallContext,
+        download: JobDownload,
+    ) -> Result<String, HostError> {
+        let sums: Vec<String> = (download.checksums.iter())
+            .map(|sum| format!("{}={}", sum.name, sum.value))
+            .collect();
+        let limit = download.size_limit.map(|bytes| bytes.to_string());
+        let call = format!(
+            "download {} {} to {} limit {} {}",
+            download.service,
+            download.path,
+            download.target,
+            limit.as_deref().unwrap_or("-"),
+            sums.join(",")
+        );
+        Ok(self.with(|state| {
+            state.transfer(cx, &download.intent, call, ("download", download.target))
+        }))
+    }
+
+    /// As on the node, a source the install may not send is not found.
+    async fn jobs_upload(&self, cx: &CallContext, upload: JobUpload) -> Result<String, HostError> {
+        let (_, source) = self.version(&upload.source, upload.version.as_deref())?;
+        if source.marked {
+            let missing = format!("no object at {}", upload.source);
+            return Err(HostError::new(ErrorKind::NotFound, missing));
+        }
+        let call = format!(
+            "upload {} {:?} {} from {} {}",
+            upload.service, upload.method, upload.path, upload.source, source.id
+        );
+        Ok(self.with(|state| state.transfer(cx, &upload.intent, call, ("upload", upload.source))))
+    }
+
     async fn jobs_get(&self, _: &CallContext, id: &str) -> Result<JobStatus, HostError> {
+        let transfer = self.with(|state| state.transfers.get(id).cloned());
+        if let Some(transfer) = transfer {
+            let (status, body) = transfer.reply.unzip();
+            let headers = vec![Field {
+                name: "content-type".into(),
+                value: "application/json".into(),
+            }];
+            return Ok(JobStatus {
+                id: id.into(),
+                kind: transfer.kind.into(),
+                path: transfer.path,
+                state: transfer.state,
+                message: None,
+                bytes: None,
+                version: None,
+                reply_headers: status.map(|_| headers).unwrap_or_default(),
+                reply_status: status,
+                reply_body: body,
+                exit_code: None,
+                report: None,
+            });
+        }
         let copy = self.with(|state| state.copies.get(id).cloned());
         let copy =
             copy.ok_or_else(|| HostError::new(ErrorKind::NotFound, format!("no job {id}")))?;
@@ -1146,4 +1271,107 @@ async fn sync_alerts() {
         .collect();
     let text = |job: &str| json!(format!("The sync of raw/run-7/ failed (job {job})"));
     assert_eq!(texts, [text("j1"), text("j2"), text("j5")]);
+}
+
+#[tokio::test]
+async fn fetch_reads() {
+    // Each file of the run starts one bounded, checked download; a finished download is linked to
+    // the dataset, a failed one only logged, and each mapping is used once.
+    let Some(example) = example("fetch-reads").await else {
+        return;
+    };
+    let settings = json!({ "bucket": "raw" });
+    let group = Group::new();
+    group.dataset("D1", json!({ "name": "Run 7" }));
+    let file = |n: u8| format!("ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_{n}.fq");
+    let row = json!({
+        "fastq_ftp": format!("{};{}", file(1), file(2)),
+        "fastq_bytes": "100;200",
+        "fastq_md5": "aa;bb",
+    });
+    group.reply("ena", "filereport", 200, json!([row]));
+    let form = |run: &str| manual(json!({ "dataset": "D1", "run": run }));
+    let wrong = example.run(&group, settings.clone(), form("run 1")).await;
+    assert_eq!(wrong.unwrap_err().kind, FailureKind::InvalidInput);
+    let started = example
+        .run(&group, settings.clone(), form("SRR000001"))
+        .await;
+    assert_eq!(started.unwrap(), json!({ "files": 2 }));
+    let call = |n: u8, limit: u16, md5: &str| {
+        let path = format!("fastq/SRR000/SRR000001/SRR000001_{n}.fq");
+        let target = format!("raw/SRR000001/SRR000001_{n}.fq");
+        format!("download ena_files {path} to {target} limit {limit} md5={md5}")
+    };
+    assert_eq!(group.transfers(), [call(1, 100, "aa"), call(2, 200, "bb")]);
+    group.finish("job-1", "succeeded", None);
+    group.finish("job-2", "failed", None);
+    for job in ["job-1", "job-2", "job-1"] {
+        let finished = event("job_finished", job, "");
+        let answer = example.run(&group, settings.clone(), finished).await;
+        assert_eq!(answer.unwrap(), Value::Null, "{job}");
+    }
+    let files = group.files("D1");
+    let linked = (files.len(), &files[0]["@id"], &files[0]["contentUrl"]);
+    let url = json!("s3://raw/SRR000001/SRR000001_1.fq");
+    assert_eq!(linked, (1, &json!("./reads/SRR000001_1.fq"), &url));
+    let lines = group.with(|state| state.lines.clone());
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("SRR000001_2.fq was not fetched"))
+    );
+    assert_eq!(
+        (group.value("job/job-1"), group.value("job/job-2")),
+        (None, None)
+    );
+}
+
+#[tokio::test]
+async fn zenodo_deposit() {
+    // The current version goes to a new draft, and Zenodo's answer is recorded on the dataset
+    // once the upload ended; a failed upload fails the run and keeps its mapping.
+    let Some(example) = example("zenodo-deposit").await else {
+        return;
+    };
+    let group = Group::new();
+    group.dataset("D1", json!({ "name": "Run 7", "description": "Reads" }));
+    group.object("raw/run-7/r1.fq", "v1", b"@r1");
+    group.object("raw/run-7/r1.fq", "v2", b"@r1 again");
+    let bucket = "https://zenodo.org/api/files/b-1";
+    let draft = json!({ "id": 42, "links": { "bucket": bucket } });
+    group.reply("zenodo", "deposit/depositions", 201, draft);
+    let form = manual(json!({ "dataset": "D1", "file": "raw/run-7/r1.fq" }));
+    let started = example.run(&group, json!({}), form.clone()).await;
+    assert_eq!(started.unwrap(), json!({ "draft": 42, "job": "job-1" }));
+    assert_eq!(group.sent()[0].2["metadata"]["title"], "Run 7");
+    let upload = "upload zenodo Method::Put files/b-1/r1.fq from raw/run-7/r1.fq v2";
+    assert_eq!(group.transfers(), [upload]);
+    group.finish(
+        "job-1",
+        "succeeded",
+        Some((201, json!({ "checksum": "md5:1" }))),
+    );
+    let recorded = example
+        .run(&group, json!({}), event("job_finished", "job-1", ""))
+        .await;
+    assert_eq!(recorded.unwrap(), Value::Null);
+    let entity = group.entity("D1");
+    let saved = (
+        &entity["identifier"]["zenodo_draft"],
+        &entity["zenodoChecksum"],
+    );
+    assert_eq!(saved, (&json!("42"), &json!("md5:1")));
+    assert_eq!(group.value("job/job-1"), None);
+    example.run(&group, json!({}), form).await.unwrap();
+    group.finish("job-2", "failed", None);
+    let failed = example
+        .run(&group, json!({}), event("job_finished", "job-2", ""))
+        .await;
+    assert_eq!(failed.unwrap_err().kind, FailureKind::Permanent);
+    assert!(group.value("job/job-2").is_some(), "the mapping stays");
+    group.object("raw/run-7/m.fq", "v1", b"@m");
+    group.with(|state| state.objects.get_mut("raw/run-7/m.fq").unwrap()[0].marked = true);
+    let marked = manual(json!({ "dataset": "D1", "file": "raw/run-7/m.fq" }));
+    assert!(example.run(&group, json!({}), marked).await.is_err());
+    assert_eq!(group.transfers().len(), 2, "a marked version is not sent");
 }
