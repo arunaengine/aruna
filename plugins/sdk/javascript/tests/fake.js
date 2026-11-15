@@ -13,8 +13,8 @@ export class Fake {
   page = 2;
 
   constructor(types = {}) {
-    Object.assign(this, { lines: [], calls: [], settings: {} });
-    Object.assign(this, { datasets: new Map(), objects: new Map() });
+    Object.assign(this, { lines: [], calls: [], settings: {}, secrets: {}, version: 0n });
+    Object.assign(this, { datasets: new Map(), objects: new Map(), replies: new Map(), values: new Map() });
     use(this, types);
   }
 
@@ -25,6 +25,11 @@ export class Fake {
 
   object(path, content = "", { version = "v1", marked = false } = {}) {
     this.objects.set(path, { content: encoder.encode(content), version, marked });
+  }
+
+  /** What `service` answers for `path`. */
+  reply(service, path, { status = 200, json, body = "" } = {}) {
+    this.replies.set(`${service} ${path}`, { status, body: json === undefined ? body : text(json) });
   }
 
   /** Runs the handler of `tag` with `val`, as the node would. */
@@ -114,5 +119,32 @@ export class Fake {
     if (info.marked) throw new NotAllowed("this object was written by a job with a secret");
     this.calls.push(["read", path, version]);
     return this.objects.get(path).content;
+  }
+
+  send(request) {
+    this.calls.push(["send", request]);
+    const reply = this.replies.get(`${request.service} ${request.path}`) ?? { status: 404, body: "not found" };
+    return { status: reply.status, headers: [["Content-Type", "application/json"]], body: encoder.encode(reply.body) };
+  }
+
+  secret(name) {
+    if (!(name in this.secrets)) throw new NotAllowed(`the install has no secret ${name}`);
+    return Object.entries(this.secrets[name]);
+  }
+
+  stateGet(key) {
+    return this.values.get(key) ?? null;
+  }
+
+  statePut(key, value, expected) {
+    if ((this.values.get(key)?.version ?? null) !== expected) throw new Conflict(`state ${key} changed meanwhile`);
+    this.version += 1n;
+    this.values.set(key, { version: this.version, value });
+    return this.version;
+  }
+
+  stateRemove(key, expected) {
+    if (this.values.get(key)?.version !== expected) throw new Conflict(`state ${key} changed meanwhile`);
+    this.values.delete(key);
   }
 }

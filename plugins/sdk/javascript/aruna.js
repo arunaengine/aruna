@@ -70,6 +70,7 @@ const loaders = new Map();
 const fieldLoaders = new Map();
 // What every run starts with, such as forgetting the state versions of an earlier run.
 const starts = [];
+const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 /** Puts `calls` in place of the component's imports, with the type of each `[manual]` field; the
@@ -376,9 +377,134 @@ export const objects = {
 loaders.set("data_uploaded", objects.get);
 fieldLoaders.set("object", objects.get);
 
+/** A service's whole answer. */
+export class Reply {
+  constructor({ status, headers, body }) {
+    this.status = status;
+    this.body = Uint8Array.from(body);
+    this.headers = Object.fromEntries(headers.map(([name, value]) => [name.toLowerCase(), value]));
+  }
+
+  get text() {
+    return decoder.decode(this.body);
+  }
+
+  json() {
+    return JSON.parse(this.text);
+  }
+}
+
+const pairs = (values) => Object.entries(values ?? {}).map(([name, value]) => [String(name), String(value)]);
+
+/** The service the manifest declares as `[services.<name>]`; each method takes a path below its
+ * address, options, or both. */
+export class Service {
+  constructor(name) {
+    this.name = name;
+  }
+
+  /** Sends one request. A status outside 200 to 299 throws `ServiceError` unless `check` is false. */
+  request(method, path = "", { json: value, body, query, headers = {}, check = true } = {}) {
+    const sent = { ...headers };
+    if (value !== undefined) {
+      body = json(value);
+      sent["content-type"] ??= "application/json";
+    }
+    const bytes = typeof body === "string" ? encoder.encode(body) : (body ?? new Uint8Array());
+    const request = { service: this.name, method, path, query: pairs(query), headers: pairs(sent), body: bytes };
+    const reply = new Reply(calls().send(request));
+    if (check && !(reply.status >= 200 && reply.status < 300)) {
+      throw new ServiceError(reply.status, reply.text.slice(0, 200));
+    }
+    return reply;
+  }
+
+  get(path, options) {
+    return this.#call("get", path, options);
+  }
+
+  head(path, options) {
+    return this.#call("head", path, options);
+  }
+
+  post(path, options) {
+    return this.#call("post", path, options);
+  }
+
+  put(path, options) {
+    return this.#call("put", path, options);
+  }
+
+  patch(path, options) {
+    return this.#call("patch", path, options);
+  }
+
+  delete(path, options) {
+    return this.#call("delete", path, options);
+  }
+
+  // The path may be left out: `catalog.post({ json })`.
+  #call(method, path, options) {
+    return typeof path === "string" ? this.request(method, path, options) : this.request(method, "", path);
+  }
+}
+
+export function service(name) {
+  return new Service(name);
+}
+
+/** The fields of a secret the manifest lists under `[secrets]`; they are the code's data then.
+ * Secrets of services are added by the node and never reach the code. */
+export function secret(name) {
+  return Object.fromEntries(calls().secret(name));
+}
+
+// The version of each key this run read, for compare and swap writes.
+const versions = new Map();
+// How often `update` reads and writes again after a conflict.
+const TRIES = 5;
+
+/** Small private values of the install as JSON. A write uses the version this run read, or makes
+ * a new value when the run did not read the key. */
+export const state = {
+  get(key, fallback) {
+    const entry = calls().stateGet(key);
+    versions.set(key, entry ? entry.version : null);
+    return entry ? JSON.parse(decoder.decode(entry.value)) : fallback;
+  },
+
+  set(key, value) {
+    const text = encoder.encode(json(value));
+    versions.set(key, calls().statePut(key, text, versions.get(key) ?? null));
+  },
+
+  /** Reads `key`, applies `change` and writes the result, again after a conflict up to five times;
+   * answers the value written. */
+  update(key, change, fallback) {
+    for (let tried = 1; ; tried++) {
+      const value = change(state.get(key, fallback));
+      try {
+        state.set(key, value);
+        return value;
+      } catch (error) {
+        if (!(error instanceof Conflict) || tried === TRIES) throw error;
+      }
+    }
+  },
+
+  /** Removes `key` at the version this run read, reading it first when it did not. */
+  remove(key) {
+    if (!versions.has(key)) state.get(key);
+    const version = versions.get(key);
+    if (version !== null) calls().stateRemove(key, version);
+    versions.set(key, null);
+  },
+};
+starts.push(() => versions.clear());
+
 export default {
-  on, run, settings, log, datasets, objects,
-  Dataset, Object: BucketObject, Request, SyncEvent,
+  on, run, settings, log, datasets, objects, service, secret, state,
+  Dataset, Object: BucketObject, Reply, Request, Service, SyncEvent,
   ArunaError, Conflict, Fail, InvalidCall, InvalidInput, LimitReached, NotAllowed, NotFound, Retry,
   ServiceError, Unavailable, UnknownOutcome,
 };

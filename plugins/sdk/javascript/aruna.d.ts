@@ -120,6 +120,45 @@ export declare const objects: {
   list(prefix: string): Iterable<BucketObject>;
 };
 
+/** A service's whole answer. */
+export declare class Reply {
+  status: number;
+  headers: { [name: string]: string };
+  body: Uint8Array;
+  readonly text: string;
+  json(): any;
+}
+
+export interface RequestOptions {
+  json?: unknown;
+  body?: string | Uint8Array;
+  query?: { [name: string]: unknown };
+  headers?: { [name: string]: unknown };
+  /** A status outside 200 to 299 throws `ServiceError` unless this is false. */
+  check?: boolean;
+}
+
+export declare class Service {
+  name: string;
+  request(method: string, path?: string, options?: RequestOptions): Reply;
+  get(path?: string | RequestOptions, options?: RequestOptions): Reply;
+  head(path?: string | RequestOptions, options?: RequestOptions): Reply;
+  post(path?: string | RequestOptions, options?: RequestOptions): Reply;
+  put(path?: string | RequestOptions, options?: RequestOptions): Reply;
+  patch(path?: string | RequestOptions, options?: RequestOptions): Reply;
+  delete(path?: string | RequestOptions, options?: RequestOptions): Reply;
+}
+
+export declare function service(name: string): Service;
+export declare function secret(name: string): { [field: string]: string };
+
+export declare const state: {
+  get<T = any>(key: string, fallback?: T): T;
+  set(key: string, value: unknown): void;
+  update<T = any>(key: string, change: (value: T) => T, fallback?: T): T;
+  remove(key: string): void;
+};
+
 /** Puts a host in place of the component's imports; for the build's entry and tests. */
 export declare function use(host: object, types?: { [field: string]: string }): void;
 
@@ -130,9 +169,14 @@ declare const aruna: {
   log: typeof log;
   datasets: typeof datasets;
   objects: typeof objects;
+  service: typeof service;
+  secret: typeof secret;
+  state: typeof state;
   Dataset: typeof Dataset;
   Object: typeof BucketObject;
+  Reply: typeof Reply;
   Request: typeof Request;
+  Service: typeof Service;
   SyncEvent: typeof SyncEvent;
   ArunaError: typeof ArunaError;
   Conflict: typeof Conflict;
