@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::NodeId;
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{
@@ -14,6 +13,7 @@ use aruna_core::plugin_runs::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::GroupId;
+use aruna_core::{NodeId, UserId};
 use aruna_plugins::trigger::TriggerKind;
 use ulid::Ulid;
 
@@ -33,12 +33,20 @@ pub struct Target {
     pub(crate) group_id: GroupId,
     pub(crate) revision: u64,
     pub(crate) coverage: BTreeMap<TriggerKind, BTreeSet<String>>,
+    /// The install's account; datasets it wrote start no run of the install.
+    pub(crate) account: UserId,
 }
 
 impl Target {
-    /// Whether the install's trigger of the event's kind covers the event's path.
+    /// Whether the install's trigger of the event's kind covers the event's path, and the
+    /// event is not a dataset write of the install itself.
     pub(crate) fn matches(&self, event: &SourceEvent) -> bool {
+        let dataset = matches!(
+            event.kind,
+            SourceKind::DatasetCreated | SourceKind::DatasetUpdated
+        );
         self.group_id == event.group_id
+            && !(dataset && event.actor == Some(self.account))
             && (self.coverage.get(&event_trigger(event.kind)))
                 .is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &event.path)))
     }
@@ -57,6 +65,7 @@ pub fn targets(config: &RealmConfigDocument) -> Vec<Target> {
                 group_id: install.group_id,
                 revision: install.revision,
                 coverage,
+                account: install.account,
             })
         })
         .collect()

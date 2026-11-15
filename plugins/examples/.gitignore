@@ -4,3 +4,4 @@
 
 *.wasm
 __pycache__/
+.aruna/

@@ -24,10 +24,10 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    FullResponse, HostError, Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
-    ObjectPage, Response, SendRequest, StatePut,
+    HostError, Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response,
+    SendRequest, StatePut,
 };
-use aruna_plugins::connection::{Readable, relative_path};
+use aruna_plugins::connection::relative_path;
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
 use base64::Engine;
@@ -39,7 +39,7 @@ use ulid::Ulid;
 
 use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
 use super::creates::{Lookup, Step, claim_key, next_step, settle_key};
-use super::grants::{InstallScope, accesses, parse_grants};
+use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
@@ -171,7 +171,7 @@ impl RunBroker {
     ) -> Result<(PluginInstall, AuthContext), HostError> {
         let install = self.admitted(None).await?;
         let grants = parse_grants(&install.grants);
-        let patterns = grants.get(&permission).cloned().unwrap_or_default();
+        let patterns = patterns_for(&grants, permission);
         Ok((
             install.clone(),
             self.account(&install, &patterns, permission),
@@ -251,6 +251,7 @@ impl RunBroker {
         let (install, auth) =
             (self.checked(Permission::MetadataWrite, &record.permission_path)).await?;
         if let Some(file) = file {
+            content_urls(&file)?;
             self.objects_named(&install, (&record.graph_iri, &file))
                 .await?;
         }
@@ -531,6 +532,12 @@ impl RunBroker {
         }
     }
 
+    /// The full permission path of an object path the plugin gave; see [`object_path`].
+    fn expand(&self, text: &str) -> Result<String, HostError> {
+        let place = (self.scope.realm_id, self.scope.local);
+        object_path(place, self.scope.run.group_id, text)
+    }
+
     /// The local bucket and key of an object path below the install's group data.
     async fn object_at(
         &self,
@@ -578,7 +585,7 @@ impl RunBroker {
                 .await?
             {
                 visible.push(ObjectInfo {
-                    path,
+                    path: format!("{bucket}/{key}"),
                     size,
                     version,
                 });
@@ -586,6 +593,57 @@ impl RunBroker {
         }
         Ok(visible)
     }
+}
+
+/// The full permission path of an object path a plugin gives: a path below the realm as it is,
+/// or `bucket/key` (a prefix ends in `/`) on this node. Expanded before any grant check, so a
+/// path the plugin did not mean is never checked.
+pub(crate) fn object_path(
+    (realm_id, local): (aruna_core::structs::identity::realm::RealmId, NodeId),
+    group: aruna_core::types::GroupId,
+    text: &str,
+) -> Result<String, HostError> {
+    if text.starts_with('/') {
+        return Ok(text.to_string());
+    }
+    let invalid = || {
+        let message = format!("`{text}` is not a bucket path such as `bucket/key`");
+        HostError::new(ErrorKind::Invalid, message)
+    };
+    let (bucket, key) = text.split_once('/').unwrap_or((text, ""));
+    let segments: Vec<&str> = key.split('/').collect();
+    let last = segments.len() - 1;
+    let plain = (segments.iter().enumerate()).all(|(index, segment)| {
+        !matches!(*segment, "." | "..") && (index == last || !segment.is_empty())
+    });
+    if matches!(bucket, "" | "." | "..") || !plain {
+        return Err(invalid());
+    }
+    Ok(object_permission_path(realm_id, group, local, bucket, key))
+}
+
+/// Refuses a `contentUrl` that names nothing readers can resolve, such as a short bucket path:
+/// it must be an absolute IRI such as an `s3://` address, an object path below the realm, or a
+/// reference inside the crate.
+fn content_urls(file: &Value) -> Result<(), HostError> {
+    let urls = match file.get("contentUrl") {
+        Some(Value::Array(urls)) => urls.iter().collect(),
+        Some(url) => vec![url],
+        None => Vec::new(),
+    };
+    for url in urls {
+        let text = (url.get("@id").unwrap_or(url).as_str()).unwrap_or_default();
+        let scheme = text
+            .split_once(':')
+            .is_some_and(|(scheme, _)| !scheme.is_empty() && !scheme.contains('/'));
+        if !(scheme || text.starts_with('/') || text.starts_with("./")) {
+            let message = format!(
+                "the contentUrl `{text}` names no object; use the object's s3:// address or path"
+            );
+            return Err(HostError::new(ErrorKind::Invalid, message));
+        }
+    }
+    Ok(())
 }
 
 /// The bucket and key on `local` of an object path below the install's group data; a bucket of
@@ -631,10 +689,6 @@ enum Outcome {
 
 #[async_trait]
 impl Broker for RunBroker {
-    async fn granted(&self, _cx: &CallContext, permission: Permission, resource: &str) -> bool {
-        self.checked(permission, resource).await.is_ok()
-    }
-
     async fn metadata_get(&self, cx: &CallContext, resource: &str) -> Result<Document, HostError> {
         self.dataset_read(cx, resource, RoCrateExportView::Full)
             .await
@@ -850,9 +904,11 @@ impl Broker for RunBroker {
         self.file_write(cx, &change, mutation, None).await
     }
 
-    async fn objects_info(&self, _cx: &CallContext, path: &str) -> Result<ObjectInfo, HostError> {
-        let (install, _) = self.checked(Permission::ObjectsRead, path).await?;
-        let (bucket, key) = self.object_at(&install, path).await?;
+    async fn objects_info(&self, _cx: &CallContext, text: &str) -> Result<ObjectInfo, HostError> {
+        let path = self.expand(text)?;
+        let (install, _) = self.checked(Permission::ObjectsRead, &path).await?;
+        let (bucket, key) = self.object_at(&install, &path).await?;
+        let short = format!("{bucket}/{key}");
         let head = HeadObjectInput {
             bucket,
             key,
@@ -862,7 +918,7 @@ impl Broker for RunBroker {
         let head =
             head.map_err(|_| HostError::new(ErrorKind::NotFound, format!("no object at {path}")))?;
         Ok(ObjectInfo {
-            path: path.to_string(),
+            path: short,
             size: head.location.map_or(0, |location| location.blob_size),
             version: head
                 .resolved_version_id
@@ -878,7 +934,7 @@ impl Broker for RunBroker {
         cursor: Option<String>,
     ) -> Result<ObjectPage, HostError> {
         let (install, _) = self.listing(Permission::ObjectsRead).await?;
-        let (bucket, key) = self.object_at(&install, prefix).await?;
+        let (bucket, key) = self.object_at(&install, &self.expand(prefix)?).await?;
         let invalid = || HostError::new(ErrorKind::Invalid, "bad cursor");
         let token = match cursor {
             Some(cursor) => Some(
@@ -921,80 +977,8 @@ impl Broker for RunBroker {
         cx: &CallContext,
         request: SendRequest,
     ) -> Result<Response, HostError> {
-        let mut ready = self.ready(request).await?;
-        // A whole answer is only for `send-full`; here the code reads fields at most.
-        if ready.exposure == ResponseExposure::Full {
-            ready.exposure = ResponseExposure::Status;
-        }
-        let Ready {
-            outgoing,
-            exposure,
-            fields,
-            body,
-            intent,
-            ..
-        } = ready;
-        let Some(intent) = intent else {
-            let answer = self.outbound.send(outgoing, body).await;
-            let answer = answer.map_err(send_refusal)?;
-            return Ok(exposed(&exposure, &fields, &answer));
-        };
-        if let Some(reply) = self.begun(&intent).await? {
-            return Ok(kept(stored_reply(&reply)?, &exposure));
-        }
-        // A sent request's answer that does not fit is stored as a marker before it is refused,
-        // so a rerun answers the same refusal and never sends again.
-        let outcome = match self.outbound.send(outgoing, body).await {
-            Ok(answer) => {
-                let shown = exposed(&exposure, &fields, &answer);
-                let size = shown.json.as_ref().map_or(0, String::len) + 2;
-                Ok(match size > cx.max_bytes {
-                    true => too_large(answer.status),
-                    false => reply_text(&shown),
-                })
-            }
-            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
-            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
-            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
-        };
-        stored_reply(&self.record(&intent, outcome).await?)
-    }
-
-    async fn connection_send_full(
-        &self,
-        cx: &CallContext,
-        request: SendRequest,
-    ) -> Result<FullResponse, HostError> {
         let ready = self.ready(request).await?;
-        // The manifest reads whole answers, and the secret's current rule exposes them.
-        if !ready.whole || ready.exposure != ResponseExposure::Full {
-            let narrower = "this connection does not expose its whole answer";
-            return Err(HostError::new(ErrorKind::Denied, narrower));
-        }
-        let Some(intent) = ready.intent else {
-            let answer = self.outbound.send(ready.outgoing, ready.body).await;
-            let answer = answer.map_err(send_refusal)?;
-            return Ok(whole(&ready.fields, &answer));
-        };
-        if let Some(reply) = self.begun(&intent).await? {
-            return stored_whole(&reply);
-        }
-        let outcome = match self.outbound.send(ready.outgoing, ready.body).await {
-            Ok(answer) => {
-                let shown = whole(&ready.fields, &answer);
-                let head: usize = (shown.headers.iter())
-                    .map(|field| field.name.len() + field.value.len())
-                    .sum();
-                Ok(match head + shown.body.len() + 2 > cx.max_bytes {
-                    true => too_large(answer.status),
-                    false => whole_text(&shown),
-                })
-            }
-            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
-            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
-            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
-        };
-        stored_whole(&self.record(&intent, outcome).await?)
+        self.send_whole(cx, ready).await
     }
 
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {
@@ -1416,18 +1400,50 @@ fn write_outcome(error: MetadataWriteError) -> Outcome {
     }
 }
 
-/// A checked connection request: the outgoing request with any secret added, the exposure of
-/// its answer, the secret's fields for echo removal, and whether the manifest reads it whole.
+/// A checked connection request: the outgoing request with any secret added, the exposure its
+/// secret's rule allows, and the secret's fields for echo removal.
 struct Ready {
     outgoing: OutgoingRequest,
     exposure: ResponseExposure,
     fields: SecretFields,
     body: Vec<u8>,
     intent: Option<Intent>,
-    whole: bool,
 }
 
 impl RunBroker {
+    /// Sends and answers the whole answer. Install writes every rule of a plugin secret with
+    /// the whole answer; one an admin narrowed by hand refuses the call instead of filtering it.
+    async fn send_whole(&self, cx: &CallContext, ready: Ready) -> Result<Response, HostError> {
+        if ready.exposure != ResponseExposure::Full {
+            let narrower = "the secret's use rule no longer lets this plugin read the answer";
+            return Err(HostError::new(ErrorKind::Denied, narrower));
+        }
+        let Some(intent) = ready.intent else {
+            let answer = self.outbound.send(ready.outgoing, ready.body).await;
+            let answer = answer.map_err(send_refusal)?;
+            return Ok(whole(&ready.fields, &answer));
+        };
+        if let Some(reply) = self.begun(&intent).await? {
+            return stored_whole(&reply);
+        }
+        let outcome = match self.outbound.send(ready.outgoing, ready.body).await {
+            Ok(answer) => {
+                let shown = whole(&ready.fields, &answer);
+                let head: usize = (shown.headers.iter())
+                    .map(|field| field.name.len() + field.value.len())
+                    .sum();
+                Ok(match head + shown.body.len() + 2 > cx.max_bytes {
+                    true => too_large(answer.status),
+                    false => whole_text(&shown),
+                })
+            }
+            Err(SendError::TooLarge { status }) => Ok(too_large(status)),
+            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
+            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
+        };
+        stored_whole(&self.record(&intent, outcome).await?)
+    }
+
     /// The per call check, the address below the connection, the guest's own headers, and the
     /// secret released and added; every use of a secret, a replay included, passes the check.
     async fn ready(&self, request: SendRequest) -> Result<Ready, HostError> {
@@ -1474,14 +1490,11 @@ impl RunBroker {
             headers,
         };
         let (exposure, fields) = match &connection.auth {
-            None => (manifest_exposure(&connection.response), None),
+            None => (ResponseExposure::Full, None),
             Some(slot) => {
                 let (released, fields) =
                     self.inject(&install, slot, &config, &mut outgoing).await?;
-                (
-                    narrowed(&released.exposure, &connection.response),
-                    Some(fields),
-                )
+                (released.exposure, Some(fields))
             }
         };
         Ok(Ready {
@@ -1490,7 +1503,6 @@ impl RunBroker {
             fields: fields.unwrap_or_else(|| SecretFields::new(Default::default())),
             body: request.body,
             intent: request.intent,
-            whole: connection.response.full(),
         })
     }
 
@@ -1581,61 +1593,8 @@ fn credential(name: &str) -> bool {
     ["authorization", "cookie", "proxy-authorization"].contains(&name.to_ascii_lowercase().as_str())
 }
 
-/// The answer as the guest may see it: the one place an exposure applies to an answer.
-fn exposed(exposure: &ResponseExposure, fields: &SecretFields, answer: &Answer) -> Response {
-    let shown = expose_response(
-        exposure,
-        fields,
-        answer.status,
-        &answer.headers,
-        &answer.body,
-    );
-    Response {
-        status: shown.status,
-        json: shown
-            .body
-            .map(|body| String::from_utf8_lossy(&body).into_owned()),
-    }
-}
-
-/// The exposure of a connection without a secret: what its manifest reads.
-fn manifest_exposure(reads: &Readable) -> ResponseExposure {
-    match reads {
-        Readable::Full(_) => ResponseExposure::Full,
-        Readable::Fields(fields) => fields_exposure(fields.to_vec()),
-    }
-}
-
-fn fields_exposure(pointers: Vec<String>) -> ResponseExposure {
-    match pointers.is_empty() {
-        true => ResponseExposure::Status,
-        false => ResponseExposure::Fields {
-            pointers,
-            headers: Vec::new(),
-        },
-    }
-}
-
-/// The rule's exposure, never wider than what the manifest lets the code read.
-fn narrowed(rule: &ResponseExposure, reads: &Readable) -> ResponseExposure {
-    match (rule, reads) {
-        (ResponseExposure::Status, _) => ResponseExposure::Status,
-        (ResponseExposure::Full, reads) => manifest_exposure(reads),
-        (ResponseExposure::Fields { pointers, .. }, Readable::Full(_)) => {
-            fields_exposure(pointers.clone())
-        }
-        (ResponseExposure::Fields { pointers, .. }, Readable::Fields(fields)) => fields_exposure(
-            pointers
-                .iter()
-                .filter(|p| fields.contains(p))
-                .cloned()
-                .collect(),
-        ),
-    }
-}
-
 /// The whole answer as the code may see it, with echoes of the secret removed.
-fn whole(fields: &SecretFields, answer: &Answer) -> FullResponse {
+fn whole(fields: &SecretFields, answer: &Answer) -> Response {
     let shown = expose_response(
         &ResponseExposure::Full,
         fields,
@@ -1643,7 +1602,7 @@ fn whole(fields: &SecretFields, answer: &Answer) -> FullResponse {
         &answer.headers,
         &answer.body,
     );
-    FullResponse {
+    Response {
         status: shown.status,
         headers: (shown.headers.into_iter())
             .map(|(name, value)| Field { name, value })
@@ -1652,7 +1611,7 @@ fn whole(fields: &SecretFields, answer: &Answer) -> FullResponse {
     }
 }
 
-fn whole_text(reply: &FullResponse) -> String {
+fn whole_text(reply: &Response) -> String {
     let headers: Vec<(&str, &str)> = (reply.headers.iter())
         .map(|field| (field.name.as_str(), field.value.as_str()))
         .collect();
@@ -1686,7 +1645,7 @@ fn send_refusal(error: SendError) -> HostError {
     }
 }
 
-fn stored_whole(reply: &str) -> Result<FullResponse, HostError> {
+fn stored_whole(reply: &str) -> Result<Response, HostError> {
     let broken = || unavailable("a stored whole answer does not decode");
     let value: Value = serde_json::from_str(reply).map_err(|_| broken())?;
     refuse_large(&value)?;
@@ -1704,55 +1663,12 @@ fn stored_whole(reply: &str) -> Result<FullResponse, HostError> {
     let body = base64::engine::general_purpose::STANDARD
         .decode(body)
         .map_err(|_| broken())?;
-    Ok(FullResponse {
+    Ok(Response {
         status: status.ok_or_else(broken)?,
         headers: (headers.into_iter())
             .map(|(name, value)| Field { name, value })
             .collect(),
         body,
-    })
-}
-
-/// A stored reply under the current exposure: each stored field stays or goes by its pointer
-/// key, so a replay can only narrow what the guest saw, never widen it.
-fn kept(reply: Response, exposure: &ResponseExposure) -> Response {
-    let json = match exposure {
-        ResponseExposure::Status => None,
-        ResponseExposure::Full => reply.json,
-        ResponseExposure::Fields { pointers, .. } => (reply.json)
-            .and_then(|json| serde_json::from_str::<serde_json::Map<String, Value>>(&json).ok())
-            .map(|stored| {
-                let kept: serde_json::Map<String, Value> = (stored.into_iter())
-                    .filter(|(pointer, _)| pointers.contains(pointer))
-                    .collect();
-                Value::Object(kept).to_string()
-            }),
-    };
-    Response {
-        status: reply.status,
-        json,
-    }
-}
-
-/// The stored reply of a settled send.
-fn reply_text(response: &Response) -> String {
-    serde_json::json!({ "status": response.status, "json": response.json }).to_string()
-}
-
-fn stored_reply(reply: &str) -> Result<Response, HostError> {
-    let value: Value =
-        serde_json::from_str(reply).map_err(|error| unavailable(error.to_string()))?;
-    refuse_large(&value)?;
-    let status = value
-        .get("status")
-        .and_then(Value::as_u64)
-        .and_then(|s| u16::try_from(s).ok());
-    Ok(Response {
-        status: status.ok_or_else(|| unavailable("a stored reply has no status"))?,
-        json: value
-            .get("json")
-            .and_then(Value::as_str)
-            .map(str::to_string),
     })
 }
 

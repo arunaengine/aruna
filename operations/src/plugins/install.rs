@@ -16,6 +16,7 @@ use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use aruna_plugins::artifact::ArtifactDigest;
 use aruna_plugins::manifest::Manifest;
+use aruna_plugins::permission::Permission;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -29,7 +30,7 @@ use super::account::{
 use super::bound::{BindError, BindPlace, bind_slots};
 use super::grants::{
     GrantError, Grants, InstallScope, accesses, carry_grants, check_supported, narrow_grants,
-    parse_grants, role_paths, stored_grants,
+    parse_grants, patterns_for, role_paths, stored_grants,
 };
 use super::receiver::pick_receiver;
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
@@ -54,7 +55,7 @@ pub enum InstallError {
     Manifest(String),
     #[error(transparent)]
     Grant(#[from] GrantError),
-    #[error(transparent)]
+    #[error("settings: {0}")]
     Setting(#[from] SettingError),
     #[error("the caller does not hold {0} and cannot grant it")]
     NotHeld(String),
@@ -483,9 +484,9 @@ pub(crate) async fn check_admin(
         .map_err(|_| InstallError::Unauthorized)
 }
 
-/// Refuses grants the caller does not hold now: each action with its own access and operation
-/// `plugin.<permission>` against roles, denies below a subtree, restrictions and policies. Any
-/// policy reading the path refuses every subtree, even one guarded off for plugins.
+/// Refuses grants the caller does not hold now: each action they allow, with its own access and
+/// operation `plugin.<permission>`, against roles, denies below a subtree, restrictions and
+/// policies. Any policy reading the path refuses every subtree, even one guarded off for plugins.
 pub(crate) async fn check_holder(
     ctx: &DriverContext,
     auth: &AuthContext,
@@ -503,8 +504,8 @@ pub(crate) async fn check_holder(
     let group_policies = group.iter().flat_map(|auth_doc| auth_doc.policies.iter());
     let path_policies =
         (config.request_policies.iter().chain(group_policies)).any(|policy| policy.reads_path());
-    for (permission, patterns) in grants {
-        for pattern in patterns {
+    for permission in Permission::ALL {
+        for pattern in &patterns_for(grants, permission) {
             let subtree = pattern.strip_suffix("**");
             if subtree.is_some() && path_policies {
                 let why = "a request policy reads the path, so grant exact paths";
@@ -512,7 +513,7 @@ pub(crate) async fn check_holder(
                     "{permission} on {pattern} ({why})"
                 )));
             }
-            for access in accesses(*permission) {
+            for access in accesses(permission) {
                 let what = || format!("{permission} ({access}) on {pattern}");
                 let held = match subtree {
                     Some(base) => rules.holds_below(base, access),

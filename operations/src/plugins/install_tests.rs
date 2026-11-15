@@ -356,7 +356,7 @@ async fn installs_and_resumes() {
     fixture.publish("0.1.1", "cd", json!({})).await;
     assert_eq!(fixture.install(&request).await.unwrap(), installed);
     let mut other = request.clone();
-    other.grants.insert("metadata.write".into(), Vec::new());
+    other.grants.insert("write".into(), Vec::new());
     assert!(matches!(
         fixture.install(&other).await,
         Err(InstallError::Changed)
@@ -437,9 +437,7 @@ async fn refuses_requests() {
     ));
     let mut outside = fixture.request(None);
     let other_group = format!("/{realm_id}/g/{}/meta/**", Ulid::from_parts(5, 5));
-    outside
-        .grants
-        .insert("metadata.read".into(), vec![other_group]);
+    outside.grants.insert("read".into(), vec![other_group]);
     assert!(matches!(
         fixture.install(&outside).await,
         Err(InstallError::Grant(_))
@@ -559,8 +557,8 @@ async fn checks_policies() {
     let mut exact = fixture.request(None);
     exact
         .grants
-        .insert("metadata.read".into(), vec![format!("{meta}/runs")]);
-    exact.grants.insert("metadata.write".into(), Vec::new());
+        .insert("read".into(), vec![format!("{meta}/runs")]);
+    exact.grants.insert("write".into(), Vec::new());
     assert!(fixture.install(&exact).await.is_ok());
 
     // A policy on one action refuses that action only, with its own access and operation.
@@ -574,7 +572,7 @@ async fn checks_policies() {
         "{refused:?}"
     );
     let mut read_only = fixture.request(None);
-    read_only.grants.insert("metadata.write".into(), Vec::new());
+    read_only.grants.insert("write".into(), Vec::new());
     assert!(fixture.install(&read_only).await.is_ok());
 }
 
@@ -672,7 +670,7 @@ async fn failed_activation() {
 
 #[tokio::test]
 async fn copy_needs_both() {
-    // `objects.copy` needs both READ and WRITE: a policy denying either one refuses the grant.
+    // `objects.copy` needs both READ and WRITE: a policy denying either one refuses `write`.
     for denied in ["read", "write"] {
         let fixture = Fixture::new().await;
         let copy = json!({ "permissions": { "required": ["metadata.read"], "optional": ["objects.copy"] } });
@@ -686,7 +684,7 @@ async fn copy_needs_both() {
             matches!(refused, Err(InstallError::NotHeld(_))),
             "{denied}: {refused:?}"
         );
-        request.grants.insert("objects.copy".into(), Vec::new());
+        request.grants.insert("write".into(), Vec::new());
         assert!(fixture.install(&request).await.is_ok(), "{denied}");
     }
 }

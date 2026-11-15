@@ -4,12 +4,15 @@
 
 import json
 import re
+import tomllib
+from pathlib import Path
 
 import walk
 from elab import Fault
 from sync import Guard, Settings
 
 MIB = 1 << 20
+MANIFEST = Path(__file__).resolve().parent.parent / "plugin.toml"
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 SYMFONY = {'\\"': "\\u0022", "<": "\\u003C", ">": "\\u003E", "&": "\\u0026", "'": "\\u0027", "/": "\\/"}
 NAMES = {}
@@ -332,7 +335,7 @@ class Plugin:
         return self.run(walk.poll)
 
     def manual(self, given):
-        return self.run(walk.manual, given)
+        return self.run(walk.manual, filled(given))
 
     def changed(self, dataset):
         return self.run(walk.changed, dataset)
@@ -356,3 +359,19 @@ def trap(name, count, action, test=None):
         return False
 
     return (match, action)
+
+
+def filled(given):
+    """Manual input as the node passes it on: checked against the [manual] form, defaults filled in."""
+    form = tomllib.loads(MANIFEST.read_text()).get("manual", {})
+    unknown = set(given) - set(form)
+    assert not unknown, f"{sorted(unknown)} are not fields of the manual form"
+    kinds = {"boolean": bool, "integer": int, "string": str}
+    values = {}
+    for name, field in form.items():
+        field = field if isinstance(field, dict) else {}
+        value = given.get(name, field.get("default"))
+        kind = kinds[field.get("type", "string")]
+        assert type(value) is kind, f"{name} has the wrong type: {value!r}"
+        values[name] = value
+    return values

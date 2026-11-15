@@ -252,8 +252,10 @@ impl<'a> Sync<'a> {
         self.dataset(dataset).map(drop)
     }
 
-    /// A manual run: a report page, a settled conflict or create, a full pass, or one link.
+    /// A manual run: a report page, a settled conflict or create, a full pass, or one link. A
+    /// field at its form default (false, 0 or empty) is not given.
     pub fn manual(&self, input: &Value) -> Result<Value> {
+        let id = |name: &str| input.get(name).and_then(Value::as_u64).filter(|id| *id > 0);
         if input.get("report").and_then(Value::as_bool) == Some(true) {
             let after = input
                 .get("after")
@@ -261,19 +263,21 @@ impl<'a> Sync<'a> {
                 .unwrap_or_default();
             return report(self.host, after);
         }
-        if let Some(experiment) = input.get("resolve").and_then(Value::as_u64) {
+        if let Some(experiment) = id("resolve") {
             let keep: Origin = serde_json::from_value(input["keep"].clone())
                 .map_err(|_| Fault::new(Kind::Invalid, "keep is \"elabftw\" or \"aruna\""))?;
             return self.resolve(experiment, keep);
         }
-        if let Some(dataset) = input.get("resolve_create").and_then(Value::as_str) {
-            return self.resolve_create(dataset, &input["experiment"]);
+        let created = input.get("resolve_create").and_then(Value::as_str);
+        if let Some(dataset) = created.filter(|dataset| !dataset.is_empty()) {
+            let absent = input.get("absent").and_then(Value::as_bool) == Some(true);
+            return self.resolve_create(dataset, id("experiment"), absent);
         }
         if input.get("reconcile").and_then(Value::as_bool) == Some(true) {
             self.full(true)?;
             return Ok(json!({ "reconcile": "started" }));
         }
-        if let Some(experiment) = input.get("experiment").and_then(Value::as_u64) {
+        if let Some(experiment) = id("experiment") {
             let outcome = self.experiment(experiment, Mode::Manual)?;
             return shown(json!({ "experiment": experiment }), outcome);
         }
@@ -1148,16 +1152,21 @@ impl<'a> Sync<'a> {
     }
 
     /// Settles an experiment create with an unknown outcome: the experiment a person found, or
-    /// `"absent"` to allow a new create under a new key.
-    fn resolve_create(&self, dataset: &str, experiment: &Value) -> Result<Value> {
-        if let Some(experiment) = experiment.as_u64() {
+    /// `absent` to allow a new create under a new key.
+    fn resolve_create(
+        &self,
+        dataset: &str,
+        experiment: Option<u64>,
+        absent: bool,
+    ) -> Result<Value> {
+        if let Some(experiment) = experiment {
             let outcome = self.adopt(dataset, experiment)?;
             return shown(json!({ "adopted": experiment }), outcome);
         }
-        if experiment.as_str() != Some("absent") {
+        if !absent {
             return Err(Fault::new(
                 Kind::Invalid,
-                "experiment is an id or \"absent\"",
+                "give the experiment id, or absent as true",
             ));
         }
         let mut record = Record::load(self.host, &dataset_key(dataset))?;

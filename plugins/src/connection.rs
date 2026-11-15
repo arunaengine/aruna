@@ -1,4 +1,4 @@
-//! Checks a declared outgoing connection: its https address template, methods and response fields.
+//! Checks a declared outgoing connection: its https address template and methods.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub const MAX_URL: usize = 512;
-pub const MAX_FIELDS: usize = 32;
-pub const MAX_POINTER: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -55,47 +53,8 @@ pub struct Connection {
     /// Secret slot the host injects into every request.
     #[serde(default)]
     pub auth: Option<String>,
-    /// What the code may read of the answer: JSON pointers (none means status only), or
-    /// `"full"` for status, headers and body through `send-full`.
-    #[serde(default)]
-    pub response: Readable,
     #[serde(default)]
     pub optional: bool,
-}
-
-/// What the code may read of a connection's answers.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Readable {
-    Fields(Vec<String>),
-    Full(Whole),
-}
-
-/// The one word that names a whole answer in a manifest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Whole {
-    Full,
-}
-
-impl Default for Readable {
-    fn default() -> Self {
-        Self::Fields(Vec::new())
-    }
-}
-
-impl Readable {
-    /// The readable JSON pointers; a whole answer lists none.
-    pub fn fields(&self) -> &[String] {
-        match self {
-            Self::Fields(fields) => fields,
-            Self::Full(_) => &[],
-        }
-    }
-
-    pub fn full(&self) -> bool {
-        matches!(self, Self::Full(_))
-    }
 }
 
 /// The parts of an address template.
@@ -157,22 +116,12 @@ impl Connection {
         Url::parse(&joined).map_err(|_| "the address does not parse")
     }
 
-    /// Checks methods and response fields; the address is checked by [`Connection::address`].
-    pub fn check_fields(&self) -> Result<(), &'static str> {
-        if self.methods.is_empty() {
-            return Err("no method");
+    /// Checks the methods; the address is checked by [`Connection::address`].
+    pub fn check_methods(&self) -> Result<(), &'static str> {
+        match self.methods.is_empty() {
+            true => Err("no method"),
+            false => Ok(()),
         }
-        let fields = self.response.fields();
-        if fields.len() > MAX_FIELDS {
-            return Err("too many response fields");
-        }
-        let pointer = |field: &String| {
-            field.starts_with('/') && field.len() <= MAX_POINTER && !field.contains('\0')
-        };
-        if !fields.iter().all(pointer) {
-            return Err("a response field is not a JSON pointer");
-        }
-        Ok(())
     }
 }
 
@@ -204,7 +153,6 @@ mod tests {
             url: url.to_string(),
             methods: get_only(),
             auth: None,
-            response: Readable::default(),
             optional: false,
         }
     }
@@ -255,20 +203,11 @@ mod tests {
     }
 
     #[test]
-    fn checks_fields() {
+    fn checks_methods() {
         let mut item = connection("https://catalog.example.org");
-        assert!(item.check_fields().is_ok());
-        item.response = Readable::Fields(vec!["/id".into(), "/meta/name".into()]);
-        assert!(item.check_fields().is_ok());
-        item.response = Readable::Fields(vec!["id".into()]);
-        assert!(item.check_fields().is_err());
-        // A manifest reads the whole answer with the one word `full`, nothing else.
-        let full: Readable = serde_json::from_str(r#""full""#).unwrap();
-        assert!(full.full() && full.fields().is_empty());
-        assert!(serde_json::from_str::<Readable>(r#""all""#).is_err());
-        item.response = Readable::default();
+        assert!(item.check_methods().is_ok());
         item.methods.clear();
-        assert!(item.check_fields().is_err());
+        assert!(item.check_methods().is_err());
         assert!(Method::Post.mutating() && !Method::Head.mutating());
     }
 }

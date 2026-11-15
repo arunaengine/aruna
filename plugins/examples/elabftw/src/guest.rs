@@ -44,7 +44,12 @@ async fn manual(ctx: Context, event: Event) -> aruna_plugin::Result<Value> {
     sync.manual(input).map_err(failure)
 }
 
-aruna_plugin::export!(poll, changed, manual);
+aruna_plugin::export! {
+    timer => poll,
+    dataset_created => changed,
+    dataset_updated => changed,
+    manual => manual,
+}
 
 /// The run's time: the timer's tick, else the time in the run id, a ULID.
 fn clock(run: &str, event: &Event) -> u64 {
@@ -136,8 +141,7 @@ impl Host for Guest<'_> {
         let json = [("content-type", "application/json")];
         let headers: &[(&str, &str)] = if body.is_empty() { &[] } else { &json };
         let http = self.ctx.http("elab");
-        let key = request.key.as_deref();
-        let reply = ready(http.send_full_with(method, &request.path, &query, headers, body, key))?;
+        let reply = ready(http.send_with(method, &request.path, &query, headers, body))?;
         let headers = reply
             .headers
             .into_iter()
@@ -170,15 +174,16 @@ impl Host for Guest<'_> {
     }
 
     fn put_file(&self, dataset: &str, file: &Value, expected: &str) -> Result<String> {
-        ready(self.ctx.metadata().put_file(dataset, file, expected, None))
+        ready(self.ctx.metadata().put_file(dataset, file, expected))
     }
 
     fn remove_file(&self, dataset: &str, id: &str, expected: &str) -> Result<String> {
-        ready(self.ctx.metadata().remove_file(dataset, id, expected, None))
+        ready(self.ctx.metadata().remove_file(dataset, id, expected))
     }
 
-    fn create(&self, path: &str, dataset: &Value, key: &str) -> Result<Created> {
-        let created = ready(self.ctx.metadata().create(path, dataset, key))?;
+    // The host names a create by its path, which the sync also uses as its key.
+    fn create(&self, path: &str, dataset: &Value, _key: &str) -> Result<Created> {
+        let created = ready(self.ctx.metadata().create(path, dataset))?;
         Ok(Created {
             resource: created.resource,
             revision: created.revision,

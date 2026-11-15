@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
-
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::plugin_runs::{RECEIVER_GAP, RunState, RunTrigger, SourceEvent};
 use aruna_core::storage_entries::reducer_state_key;
@@ -15,7 +13,7 @@ use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, list_runs, prune_runs, save_run, unfinished};
-use crate::plugins::worker::tests::{created, installed, worker};
+use crate::plugins::worker::tests::{created, installed, scoped, worker};
 
 /// A created dataset journaled now, and its forward row for `install`.
 fn event(install: &PluginInstall, resource: &str, now: u64) -> (SourceEvent, ForwardRow) {
@@ -111,7 +109,7 @@ async fn denied_once() {
     let install = installed(&fixture).await;
     let (_, outside) = event(&install, "B/one", unix_timestamp_millis());
     let base = created(&install, "").1;
-    let narrowed = BTreeMap::from([("metadata.read".into(), vec![format!("{base}/A/**")])]);
+    let narrowed = scoped(vec![format!("{base}/A/**")]);
     let auth = fixture.auth();
     let id = install.install_id;
     set_grants(&fixture.ctx, &fixture.actor, &auth, id, &narrowed)

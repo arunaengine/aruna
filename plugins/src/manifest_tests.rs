@@ -1,4 +1,4 @@
-//! Tests manifest checks, trigger wiring and the import rule on the dataset announcer example.
+//! Tests manifest checks, the trigger match and the import rule on the dataset announcer example.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -19,11 +19,10 @@ catalog_key = { title = "Catalog API key", kind = "bearer" }
 url = "{catalog_url}/api/records"
 methods = ["POST"]
 auth = "catalog_key"
-response = ["/id"]
 
 [triggers]
 dataset_created = {}
-manual = { handler = "dataset_created", input = "dataset" }
+manual = {}
 
 [permissions]
 required = ["metadata.read"]
@@ -34,7 +33,7 @@ fn example() -> Manifest {
     toml::from_str(EXAMPLE).unwrap()
 }
 
-fn handlers(names: &[&str]) -> BTreeSet<String> {
+fn names(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|name| name.to_string()).collect()
 }
 
@@ -42,45 +41,26 @@ fn handlers(names: &[&str]) -> BTreeSet<String> {
 fn example_wires() {
     let mut manifest = example();
     assert_eq!(manifest.check(), Ok(()));
-    manifest.wire(Some(handlers(&["dataset_created"]))).unwrap();
+    manifest.wire().unwrap();
     assert_eq!(manifest.abi.as_deref(), Some(PLUGIN_ABI));
-    let created = &manifest.triggers[&TriggerKind::DatasetCreated];
-    assert_eq!(created.handler.as_deref(), Some("dataset_created"));
     let json = serde_json::to_vec(&manifest).unwrap();
     assert_eq!(Manifest::parse(&json).unwrap(), manifest);
 }
 
 #[test]
-fn wiring_defaults() {
-    let mut named = example();
-    named.wire(None).unwrap();
-    let created = &named.triggers[&TriggerKind::DatasetCreated];
+fn triggers_match() {
+    let manifest = example();
+    let both = names(&["dataset_created", "manual"]);
+    assert_eq!(manifest.check_triggers(&both), Ok(()));
+    let extra = names(&["dataset_created", "manual", "timer"]);
     assert_eq!(
-        created.handler.as_deref(),
-        Some("dataset_created"),
-        "the trigger's own name"
+        manifest.check_triggers(&extra),
+        Err(ManifestError::UnknownTrigger("timer".into()))
     );
-    assert_eq!(named.handlers, handlers(&["dataset_created"]));
-
-    let mut missing = example();
-    let result = missing.wire(Some(handlers(&["announce"])));
     assert_eq!(
-        result,
-        Err(ManifestError::UnknownHandler("dataset_created".into()))
+        manifest.check_triggers(&names(&["dataset_created"])),
+        Err(ManifestError::Unhandled("manual".into()))
     );
-
-    let mut unused = example();
-    let result = unused.wire(Some(handlers(&["dataset_created", "resync"])));
-    assert_eq!(result, Err(ManifestError::UnusedHandler("resync".into())));
-
-    let mut unknown = example();
-    unknown
-        .triggers
-        .get_mut(&TriggerKind::Manual)
-        .unwrap()
-        .handler = Some("resync".into());
-    let result = unknown.wire(Some(handlers(&["dataset_created"])));
-    assert_eq!(result, Err(ManifestError::UnknownHandler("resync".into())));
 }
 
 #[test]
@@ -174,6 +154,7 @@ fn rejects_triggers() {
         SecretSlot {
             title: "Webhook key".into(),
             kind: SecretKind::Hmac,
+            readable: false,
         },
     );
     verified
@@ -253,16 +234,10 @@ fn checks_settings() {
 #[test]
 fn import_rule() {
     let manifest = example();
-    let import = |name: &str| format!("aruna:plugin/{name}@0.2.0");
-    let mut allowed = [
-        "types",
-        "log",
-        "metadata-read",
-        "objects-read",
-        "connections",
-    ]
-    .map(import)
-    .to_vec();
+    let import = |name: &str| format!("aruna:plugin/{name}@0.3.0");
+    let mut allowed = ["types", "log", "metadata-read", "objects-read", "services"]
+        .map(import)
+        .to_vec();
     allowed.extend(
         [
             "wasi:cli/environment@0.2.9",
@@ -279,7 +254,7 @@ fn import_rule() {
         "wasi:http/outgoing-handler@0.2.9",
         "wasi:cli/environment@0.3.0",
         "aruna:plugin/log@0.1.0",
-        "aruna:plugin/files@0.2.0",
+        "aruna:plugin/files@0.3.0",
         "invocation",
     ] {
         assert_eq!(
@@ -303,5 +278,39 @@ fn parse_bounds() {
     assert!(matches!(
         Manifest::parse(b"{"),
         Err(ManifestError::Malformed(_))
+    ));
+}
+
+#[test]
+fn manual_forms() {
+    let field = |kind| Setting {
+        title: "Dataset".into(),
+        kind,
+        default: None,
+        choices: Vec::new(),
+    };
+    let with_form = |kind: TriggerKind| {
+        let mut manifest = example();
+        let trigger = manifest.triggers.get_mut(&kind).unwrap();
+        trigger
+            .form
+            .insert("dataset".into(), field(SettingKind::Dataset));
+        manifest.check()
+    };
+    assert_eq!(with_form(TriggerKind::Manual), Ok(()));
+    assert!(matches!(
+        with_form(TriggerKind::DatasetCreated),
+        Err(ManifestError::InvalidTrigger(
+            TriggerKind::DatasetCreated,
+            _
+        ))
+    ));
+    let mut picked = example();
+    picked
+        .settings
+        .insert("dataset".into(), field(SettingKind::Dataset));
+    assert!(matches!(
+        picked.check(),
+        Err(ManifestError::InvalidSetting(name, _)) if name == "dataset"
     ));
 }

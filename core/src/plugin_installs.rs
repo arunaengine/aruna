@@ -98,7 +98,7 @@ pub struct PluginInstall {
     pub paused: bool,
     /// The checked setting values as a JSON object.
     pub settings: String,
-    /// Granted resource patterns by permission name, each within what the manifest requests.
+    /// Granted resource patterns by grant name (`read`, `write`, `connections.send`, ...).
     pub grants: BTreeMap<String, Vec<String>>,
     pub account: UserId,
     pub role_id: RoleId,
@@ -201,9 +201,8 @@ impl PluginInstall {
     pub fn valid(&self) -> bool {
         let realm_id = self.account.realm_id;
         let group_root = format!("/{realm_id}/g/{}/", self.group_id);
-        let grants = (self.grants.iter()).all(|(permission, patterns)| {
-            valid_permission(permission)
-                && (patterns.iter()).all(|pattern| pattern.starts_with(&group_root))
+        let grants = (self.grants.iter()).all(|(grant, patterns)| {
+            valid_grant(grant) && (patterns.iter()).all(|pattern| pattern.starts_with(&group_root))
         });
         let settings = self.settings.len() <= MAX_SETTINGS
             && serde_json::from_str::<serde_json::Value>(&self.settings)
@@ -227,13 +226,10 @@ impl PluginInstall {
     }
 }
 
-/// A permission name such as `metadata.read`: two lowercase words joined by a dot.
-fn valid_permission(name: &str) -> bool {
+/// A grant name such as `read` or `connections.send`: one or two lowercase words joined by a dot.
+fn valid_grant(name: &str) -> bool {
     let word = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase());
-    name.len() <= 64
-        && name
-            .split_once('.')
-            .is_some_and(|(a, b)| word(a) && word(b))
+    name.len() <= 64 && name.split('.').count() <= 2 && name.split('.').all(word)
 }
 
 #[cfg(test)]
@@ -256,7 +252,7 @@ pub(crate) mod tests {
             state: InstallState::Active,
             paused: false,
             settings: r#"{"catalog_url":"https://catalog.example.org"}"#.into(),
-            grants: BTreeMap::from([("metadata.read".to_string(), vec![pattern])]),
+            grants: BTreeMap::from([("read".to_string(), vec![pattern])]),
             account: UserId::local(install_id, realm_id),
             role_id: install_id,
             receiver: node,
@@ -302,11 +298,11 @@ pub(crate) mod tests {
             |i| i.settings = "[]".into(),
             |i| i.revision = 0,
             |i| i.active_since_ms = None,
-            |i| drop(i.grants.insert("Metadata.Read".into(), Vec::new())),
+            |i| drop(i.grants.insert("Read".into(), Vec::new())),
             |i| {
                 drop(
                     i.grants
-                        .insert("objects.read".into(), vec!["/x/g/y/data/**".into()]),
+                        .insert("write".into(), vec!["/x/g/y/data/**".into()]),
                 )
             },
             |i| i.settings = format!("{{\"a\":\"{}\"}}", "x".repeat(MAX_SETTINGS)),

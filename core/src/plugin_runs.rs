@@ -131,6 +131,7 @@ pub struct PluginRun {
     /// The install revision and the artifact the run was admitted with.
     pub revision: u64,
     pub digest: String,
+    /// The trigger that starts the run; the guest picks its function by this name.
     pub handler: String,
     /// The install's settings as a JSON object, as they were at admission.
     pub settings: String,

@@ -77,8 +77,8 @@ pub async fn admit_hook(
     let manifest = manifest.map_err(|error| unavailable(error.to_string()))?;
     let hook = manifest.triggers.get(&TriggerKind::Webhook);
     let hook = hook.ok_or(HookError::NotFound)?;
-    let both = hook.verify.clone().zip(hook.handler.clone());
-    let (slot, handler) = both.ok_or(HookError::NotFound)?;
+    let slot = hook.verify.clone().ok_or(HookError::NotFound)?;
+    let handler = TriggerKind::Webhook.as_str().to_string();
     if let Some(reason) = lost_reason(&config, install.receiver) {
         return Err(HookError::Paused(reason));
     }

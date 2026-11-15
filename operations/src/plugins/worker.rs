@@ -18,7 +18,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::ErrorKind;
 use aruna_plugins::limits::{Limits, RuntimeConfig};
-use aruna_plugins::permission::Permission;
+use aruna_plugins::permission::{Grant, Permission};
 use aruna_plugins::{
     CancellationToken, FailureKind, Field, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
     WebhookDelivery, WebhookRequest,
@@ -35,6 +35,7 @@ use super::clock::probe_clock;
 use super::decide::{decide_batch, prune_seen};
 use super::dispatch::{enqueue_timers, event_trigger};
 use super::forward::{Backoff, Decisions, EventBatch, send_outbox};
+use super::grants::{parse_grants, patterns_for};
 use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
@@ -415,7 +416,7 @@ impl Worker {
             Ok(compiled) => compiled,
             Err(error) => return Ended::Retry(format!("the artifact does not compile: {error}")),
         };
-        let call = invocation(run, install, self.limits, cancel);
+        let call = invocation(run, (install, self.local), self.limits, cancel);
         let invoked = self.runtime.invoke(&compiled, call, broker).await;
         ended(invoked, self.stopping.is_cancelled())
     }
@@ -439,21 +440,20 @@ fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool) -> Ended 
     }
 }
 
-/// The handler call of a run: its saved invocation and the install's grants.
+/// The handler call of a run: its saved invocation and the install's grants. An event's object on
+/// this node is named by its short `bucket/key` path; `path` keeps the permission path.
 fn invocation(
     run: &PluginRun,
-    install: &PluginInstall,
+    (install, local): (&PluginInstall, NodeId),
     limits: Limits,
     cancel: CancellationToken,
 ) -> Invocation {
-    let permissions: BTreeSet<Permission> = (install.grants.iter())
-        .filter(|(_, patterns)| !patterns.is_empty())
-        .filter_map(|(name, _)| name.parse().ok())
+    let grants = parse_grants(&install.grants);
+    let permissions: BTreeSet<Permission> = (Permission::ALL.into_iter())
+        .filter(|permission| !patterns_for(&grants, *permission).is_empty())
         .collect();
-    // A `connections.send` grant path ends in the connection's name.
-    let connections = (install.grants.get(Permission::ConnectionsSend.as_str()))
-        .into_iter()
-        .flatten()
+    // A service's grant path ends in the connection's name.
+    let connections = (grants.get(&Grant::Services).into_iter().flatten())
         .filter_map(|path| path.rsplit('/').next().map(str::to_string))
         .collect();
     let trigger = match &run.trigger {
@@ -462,7 +462,7 @@ fn invocation(
         RunTrigger::Event(event) => Trigger::Event(WatchEvent {
             kind: event.kind.name().into(),
             path: event.path.clone(),
-            resource: event.resource.clone(),
+            resource: short_path(&event.resource, (install, local)),
             revision: event.revision.clone(),
         }),
         RunTrigger::Webhook(hook) => Trigger::Webhook(WebhookDelivery {
@@ -484,7 +484,6 @@ fn invocation(
         run: run.run_id.to_string(),
         install: run.install_id.to_string(),
         group: install.group_id.to_string(),
-        handler: run.handler.clone(),
         settings: run.settings.clone(),
         trigger,
         permissions,
@@ -492,6 +491,14 @@ fn invocation(
         limits,
         cancel,
     }
+}
+
+/// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
+/// text stays as it is.
+fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
+    let realm = install.account.realm_id;
+    let root = format!("/{realm}/g/{}/data/{local}/", install.group_id);
+    path.strip_prefix(&root).unwrap_or(path).to_string()
 }
 
 /// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown

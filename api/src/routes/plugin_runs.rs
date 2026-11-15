@@ -55,7 +55,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct StartBody {
-    /// The manual trigger's input; `{}` when absent.
+    /// The values of the manual trigger's form by field name; `{}` when absent.
     #[schema(value_type = Object)]
     pub input: Option<Value>,
 }
@@ -87,6 +87,7 @@ pub struct RunView {
     pub install: String,
     /// `queued`, `running`, `succeeded`, `failed`, `needs-attention` or `cancelled`.
     pub state: String,
+    /// The trigger the run started for, as the manifest names it.
     pub handler: String,
     /// `manual`, `timer`, `event` or `webhook`.
     pub trigger: String,
@@ -386,7 +387,7 @@ fn run_example(log: bool) -> Value {
         "id": "01JBX7Y3S5M3Q8Y1V9K2T4R6Q1",
         "install": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1",
         "state": "succeeded",
-        "handler": "on_manual",
+        "handler": "manual",
         "trigger": "manual",
         "started_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm",
         "input": "{\"dataset\":\"01JBX7Y3S5M3Q8Y1V9K2T4R6P4\"}",
@@ -412,7 +413,9 @@ fn start_error(error: StartError) -> Response {
         StartError::Install(InstallError::State(_)) | StartError::NoTrigger(_) => {
             ServerError::Conflict(message).into_response()
         }
-        StartError::Input => ServerError::BadRequestReason(message).into_response(),
+        StartError::Input | StartError::Form(_) => {
+            ServerError::BadRequestReason(message).into_response()
+        }
         StartError::Lost { receiver, reason } => lost(receiver, reason),
         StartError::Run(error) => run_error(error),
         StartError::Install(_) | StartError::Elsewhere(_) => {
@@ -426,7 +429,11 @@ fn start_error(error: StartError) -> Response {
     path = "/plugin-installs/{id}/runs",
     tag = "plugins",
     summary = "Start a plugin run",
-    description = r#"Queues a run of the install's manual trigger with a JSON input.
+    description = r#"Queues a run of the install's manual trigger with the values of its form.
+
+The input names each `[manual]` field of the pinned version: unknown names, missing values
+without a default and values of the wrong type are refused. The run gets every field, with
+defaults filled in.
 
 **Authentication**: realm bearer token of an admin of the install's group.
 
@@ -439,7 +446,7 @@ fn start_error(error: StartError) -> Response {
     request_body(content = StartBody, example = json!({"input": {"dataset": "01JBX7Y3S5M3Q8Y1V9K2T4R6P4"}})),
     responses(
         (status = 201, description = "The queued run", body = RunView, example = json!(queued_example())),
-        (status = 400, description = "The input is not JSON of at most 64 KiB", body = ErrorResponse),
+        (status = 400, description = "The input is not a JSON object of at most 64 KiB, or does not fit the form", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 409, description = "The install is not active or has no manual trigger", body = ErrorResponse),
@@ -933,7 +940,7 @@ mod tests {
             version: "0.1.0".into(),
             revision: 1,
             digest: format!("sha256:{}", "ab".repeat(32)),
-            handler: "on_timer".into(),
+            handler: "timer".into(),
             settings: "{}".into(),
             trigger: RunTrigger::Timer { occurrence_ms: 1 },
             state: RunState::Queued,

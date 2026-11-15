@@ -5,12 +5,10 @@
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use crate::permission::Permission;
-
-pub use crate::host::wit::aruna::plugin::connections::{FullResponse, Method, Response};
 pub use crate::host::wit::aruna::plugin::metadata_create::Created;
 pub use crate::host::wit::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 pub use crate::host::wit::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
+pub use crate::host::wit::aruna::plugin::services::{Method, Response};
 pub use crate::host::wit::aruna::plugin::state::Entry;
 pub use crate::host::wit::aruna::plugin::types::{ErrorKind, Field, HostError};
 
@@ -23,18 +21,17 @@ pub struct CallContext {
     pub max_bytes: usize,
 }
 
-/// Identity of one outside effect of a run. The ordinal names it, the digest of all
-/// arguments checks a rerun asks for the same thing; an author key names it across runs.
+/// Identity of one outside effect of a run. The ordinal names it; the digest of all arguments
+/// checks a rerun asks for the same thing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intent {
     pub ordinal: u32,
     pub digest: [u8; 32],
-    pub key: Option<String>,
 }
 
 impl Intent {
     /// Digests length-prefixed parts, so no two argument lists share bytes.
-    pub fn new(ordinal: u32, key: Option<String>, parts: &[&[u8]]) -> Self {
+    pub fn new(ordinal: u32, parts: &[&[u8]]) -> Self {
         let mut hasher = Sha256::new();
         for part in parts {
             hasher.update((part.len() as u64).to_le_bytes());
@@ -43,7 +40,6 @@ impl Intent {
         Self {
             ordinal,
             digest: hasher.finalize().into(),
-            key,
         }
     }
 }
@@ -71,6 +67,7 @@ pub struct FileChange {
 pub struct MetadataCreate {
     pub path: String,
     pub dataset: String,
+    /// Names the document across runs; the guest's path.
     pub key: String,
     pub intent: Intent,
 }
@@ -100,8 +97,6 @@ pub struct StatePut {
 /// already checked that the permission or connection is granted at all and the budgets.
 #[async_trait]
 pub trait Broker: Send + Sync {
-    /// Whether the permission is granted for this resource now.
-    async fn granted(&self, cx: &CallContext, permission: Permission, resource: &str) -> bool;
     async fn metadata_get(&self, cx: &CallContext, resource: &str) -> Result<Document, HostError>;
     async fn metadata_list(
         &self,
@@ -176,25 +171,12 @@ pub trait Broker: Send + Sync {
         prefix: &str,
         cursor: Option<String>,
     ) -> Result<ObjectPage, HostError>;
-    /// Sends through a declared connection; the reply is what the guest may read, already
-    /// limited to the exposure, with the fields as an object keyed by JSON pointer.
+    /// Sends to a declared service; the reply is what the guest may read of the answer.
     async fn connection_send(
         &self,
         cx: &CallContext,
         request: SendRequest,
     ) -> Result<Response, HostError>;
-    /// Sends through a connection whose manifest reads whole answers; the reply is the whole
-    /// answer within the exposure. A broker that serves none refuses it.
-    async fn connection_send_full(
-        &self,
-        _cx: &CallContext,
-        _request: SendRequest,
-    ) -> Result<FullResponse, HostError> {
-        Err(HostError::new(
-            ErrorKind::Unavailable,
-            "whole answers are not served here",
-        ))
-    }
     /// The fields of a slot granted through `secrets.value`. A broker that serves none refuses.
     async fn secret_value(&self, _cx: &CallContext, _slot: &str) -> Result<Vec<Field>, HostError> {
         Err(HostError::new(

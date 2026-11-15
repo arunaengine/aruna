@@ -57,11 +57,6 @@ impl Recorder {
 
 #[async_trait::async_trait]
 impl Broker for Recorder {
-    async fn granted(&self, _: &CallContext, permission: Permission, resource: &str) -> bool {
-        self.note("granted");
-        permission == Permission::MetadataRead && resource == "D1"
-    }
-
     async fn metadata_get(&self, _: &CallContext, resource: &str) -> Result<Document, HostError> {
         self.note("metadata_get");
         match resource {
@@ -167,7 +162,7 @@ impl Broker for Recorder {
         create: MetadataCreate,
     ) -> Result<Created, HostError> {
         self.note("metadata_create");
-        assert_eq!(create.intent.key.as_deref(), Some(create.key.as_str()));
+        assert_eq!(create.key, create.path, "a create is named by its path");
         self.intents.lock().unwrap().push(create.intent);
         Ok(Created {
             resource: format!("{}-doc", create.key),
@@ -203,11 +198,12 @@ impl Broker for Recorder {
         if let Some(intent) = request.intent {
             self.intents.lock().unwrap().push(intent);
         }
-        // The broker answers with the exposed fields only, keyed by pointer.
-        let answer = r#"{"/id":"c-1","/meta/name":"n","/items/1":{"b":2}}"#;
+        // The broker answers with the whole answer.
+        let answer = r#"{"id":"c-1","meta":{"name":"n"},"items":[1,{"b":2}]}"#;
         Ok(Response {
             status: 201,
-            json: Some(answer.into()),
+            headers: Vec::new(),
+            body: answer.into(),
         })
     }
 
@@ -237,12 +233,11 @@ fn runtime() -> Runtime {
     Runtime::new(config).unwrap()
 }
 
-fn call(handler: &str, trigger: Trigger) -> Invocation {
+fn call(trigger: Trigger) -> Invocation {
     Invocation {
         run: "run-1".into(),
         install: "install-1".into(),
         group: "group-1".into(),
-        handler: handler.into(),
         settings: r#"{"api_url":"https://api.example.org"}"#.into(),
         trigger,
         permissions: BTreeSet::from([Permission::MetadataRead, Permission::MetadataWrite]),
@@ -253,7 +248,17 @@ fn call(handler: &str, trigger: Trigger) -> Invocation {
 }
 
 fn probe(input: serde_json::Value) -> Invocation {
-    call("probe", Trigger::Manual(input.to_string()))
+    call(Trigger::Manual(input.to_string()))
+}
+
+/// An event of `kind`; the fixture runs `echo` or `hoard` for it by its manifest.
+fn event(kind: &str) -> Trigger {
+    Trigger::Event(WatchEvent {
+        kind: kind.into(),
+        path: "p".into(),
+        resource: "r".into(),
+        revision: "1".into(),
+    })
 }
 
 async fn invoke(call: Invocation, broker: Arc<Recorder>) -> Result<Option<String>, InvokeError> {
@@ -283,7 +288,7 @@ async fn echo_round_trip() {
         resource: "D1".into(),
         revision: "r1".into(),
     };
-    let reply = invoke(call("echo", Trigger::Event(event)), Arc::default()).await;
+    let reply = invoke(call(Trigger::Event(event)), Arc::default()).await;
     assert_eq!(
         reply.unwrap().as_deref(),
         Some(
@@ -307,34 +312,14 @@ async fn calls_reach_broker() {
     let sent = invoke(probe(serde_json::json!({"call": "send", "connection": "api", "method": "POST", "path": "/x", "body": {"a": 1}})), broker.clone()).await;
     assert_eq!(
         output(sent),
-        serde_json::json!({"status": 201, "fields": {"/id": "c-1", "/meta/name": "n", "/items/1": {"b": 2}}})
+        serde_json::json!({"status": 201, "fields": {"id": "c-1", "meta": {"name": "n"}, "items": [1, {"b": 2}]}})
     );
     let state = invoke(probe(serde_json::json!({"call": "state"})), broker.clone()).await;
     assert_eq!(
         output(state),
         serde_json::json!({"version": 1, "stored": 1})
     );
-    let granted = invoke(
-        probe(
-            serde_json::json!({"call": "granted", "permission": "metadata.read", "resource": "D1"}),
-        ),
-        broker.clone(),
-    )
-    .await;
-    assert_eq!(output(granted), serde_json::json!(true));
-    let unknown = invoke(
-        probe(serde_json::json!({"call": "granted", "permission": "files.read", "resource": "D1"})),
-        broker.clone(),
-    )
-    .await;
-    assert_eq!(output(unknown), serde_json::json!(false));
-    let calls = [
-        "metadata_get",
-        "connection_send",
-        "state_put",
-        "state_get",
-        "granted",
-    ];
+    let calls = ["metadata_get", "connection_send", "state_put", "state_get"];
     assert_eq!(broker.calls(), calls);
 }
 
@@ -343,13 +328,13 @@ async fn dataset_calls_reach() {
     // The rebuilt guest reaches every dataset call; a create needs its own permission.
     let broker = Arc::new(Recorder::default());
     let mut create = probe(
-        serde_json::json!({"call": "metadata_create", "path": "eln/1", "dataset": {"name": "E"}, "key": "e1"}),
+        serde_json::json!({"call": "metadata_create", "path": "eln/1", "dataset": {"name": "E"}}),
     );
     create.permissions.insert(Permission::MetadataCreate);
     let created = invoke(create, broker.clone()).await;
     assert_eq!(
         output(created),
-        serde_json::json!({"resource": "e1-doc", "revision": "r0"})
+        serde_json::json!({"resource": "eln/1-doc", "revision": "r0"})
     );
     let summary = probe(serde_json::json!({"call": "metadata_summary", "resource": "D1"}));
     let summary = invoke(summary, broker.clone()).await;
@@ -388,9 +373,8 @@ async fn dataset_calls_reach() {
     ];
     assert_eq!(broker.calls(), calls);
 
-    let refused = probe(
-        serde_json::json!({"call": "metadata_create", "path": "eln/2", "dataset": {}, "key": "e2"}),
-    );
+    let refused =
+        probe(serde_json::json!({"call": "metadata_create", "path": "eln/2", "dataset": {}}));
     let Err(InvokeError::Guest(failure)) = invoke(refused, broker.clone()).await else {
         panic!("a create without its permission fails the run");
     };
@@ -405,7 +389,7 @@ async fn dataset_calls_reach() {
         resource: "D1".into(),
         revision: "r2".into(),
     };
-    let reply = invoke(call("echo", Trigger::Event(event)), Arc::default()).await;
+    let reply = invoke(call(Trigger::Event(event)), Arc::default()).await;
     assert!(
         reply
             .unwrap()
@@ -481,30 +465,38 @@ async fn effects_get_ordinals() {
 
 #[tokio::test]
 async fn budgets_end_runs() {
-    let limited = |handler: &str, edit: fn(&mut Limits)| {
-        let mut run = call(handler, Trigger::Timer(0));
+    let limited = |mut run: Invocation, edit: fn(&mut Limits)| {
         edit(&mut run.limits);
         run
     };
-    type Case = (&'static str, fn(&mut Limits), Limit);
+    let timer = || call(Trigger::Timer(0));
+    type Case = (Invocation, fn(&mut Limits), Limit);
     let cases: [Case; 3] = [
-        ("spin", |l| l.fuel = 50_000_000, Limit::Fuel),
-        ("hoard", |l| l.memory = 8 << 20, Limit::Memory),
-        ("chatty", |l| l.calls = 50, Limit::Calls),
+        (timer(), |l| l.fuel = 50_000_000, Limit::Fuel),
+        (
+            call(event("data_uploaded")),
+            |l| l.memory = 8 << 20,
+            Limit::Memory,
+        ),
+        (
+            probe(serde_json::json!({"call": "chatty"})),
+            |l| l.calls = 50,
+            Limit::Calls,
+        ),
     ];
-    for (handler, edit, limit) in cases {
-        match invoke(limited(handler, edit), Arc::default()).await {
-            Err(InvokeError::Limit(actual)) => assert_eq!(actual, limit, "{handler}"),
-            other => panic!("{handler}: {other:?}"),
+    for (run, edit, limit) in cases {
+        match invoke(limited(run, edit), Arc::default()).await {
+            Err(InvokeError::Limit(actual)) => assert_eq!(actual, limit),
+            other => panic!("{limit}: {other:?}"),
         }
     }
-    let slow = limited("spin", |l| {
+    let slow = limited(timer(), |l| {
         l.fuel = 1 << 50;
         l.wall = Duration::from_millis(200);
     });
     let ended = invoke(slow, Arc::default()).await;
     assert!(matches!(ended, Err(InvokeError::Timeout)), "{ended:?}");
-    let cancelled = limited("spin", |_| {});
+    let cancelled = limited(timer(), |_| {});
     cancelled.cancel.cancel();
     assert!(matches!(
         invoke(cancelled, Arc::default()).await,
@@ -516,11 +508,12 @@ async fn budgets_end_runs() {
         invoke(big, Arc::default()).await,
         Err(InvokeError::Limit(Limit::Input))
     ));
-    let unknown = call("resync", Trigger::Timer(0));
-    assert!(matches!(
-        invoke(unknown, Arc::default()).await,
-        Err(InvokeError::Handler(_))
-    ));
+    // A trigger the code registered no function for fails as invalid input.
+    let unknown = call(event("dataset_deleted"));
+    match invoke(unknown, Arc::default()).await {
+        Err(InvokeError::Guest(failure)) => assert_eq!(failure.kind, FailureKind::InvalidInput),
+        other => panic!("an unknown trigger ran: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -544,14 +537,20 @@ async fn narrow_requests_compile() {
         .remove(&Permission::MetadataWrite);
     let artifact = aruna_plugins::artifact::attach_manifest(component, &narrow).unwrap();
     assert!(runtime().compile(&artifact).is_ok());
-    let compiled = runtime().compile(FIXTURE).unwrap();
-    let handlers: Vec<&str> = compiled
-        .manifest
-        .handlers
-        .iter()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(handlers, ["chatty", "echo", "hoard", "probe", "spin"]);
+    let runtime = runtime();
+    let compiled = runtime.compile(FIXTURE).unwrap();
+    let triggers = runtime.triggers(&compiled).await.unwrap();
+    let triggers: Vec<&str> = triggers.iter().map(String::as_str).collect();
+    let all = [
+        "data_uploaded",
+        "dataset_created",
+        "dataset_updated",
+        "manual",
+    ];
+    assert_eq!(
+        triggers,
+        [&all[..], &["sync_completed", "sync_failed", "timer"]].concat()
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -676,7 +675,7 @@ async fn node_admission_bounded() {
         tokio::spawn(async move { invoke_on(&runtime, first, broker).await })
     };
     broker.blocked.notified().await;
-    let second = invoke_on(&runtime, call("echo", Trigger::Timer(0)), broker.clone()).await;
+    let second = invoke_on(&runtime, call(event("dataset_created")), broker.clone()).await;
     assert!(matches!(second, Err(InvokeError::Overloaded)), "{second:?}");
     cancel.cancel();
     let first = running.await.unwrap();

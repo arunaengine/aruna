@@ -16,8 +16,13 @@ use aruna_core::structs::identity::auth::{PathRestriction, Permission as Access}
 use aruna_core::time::unix_timestamp_secs;
 use serde_json::json;
 
-fn needs_objects() -> Value {
-    json!({ "permissions": { "required": ["metadata.read", "objects.read"], "optional": ["metadata.write"] } })
+fn needs_write() -> Value {
+    json!({ "permissions": { "required": ["metadata.read", "metadata.write"] } })
+}
+
+/// Choices that remove the optional `write` of the fixture's first version.
+fn no_write() -> BTreeMap<String, Vec<String>> {
+    BTreeMap::from([("write".to_string(), Vec::new())])
 }
 
 #[tokio::test]
@@ -27,19 +32,14 @@ async fn later_changes() {
     let installed = fixture.install(&fixture.request(None)).await.unwrap();
     let id = installed.install_id;
     let meta = format!("/{}/g/{}/meta", actor.realm_id, fixture.group_id);
-    let choices = BTreeMap::from([(
-        "metadata.write".to_string(),
-        vec![format!("{meta}/runs/**")],
-    )]);
+    let choices = BTreeMap::from([("write".to_string(), vec![format!("{meta}/runs/**")])]);
     let narrowed = set_grants(ctx, actor, &auth, id, &choices).await.unwrap();
     assert_eq!(narrowed.state, InstallState::Active);
-    assert_eq!(
-        narrowed.grants["metadata.write"],
-        vec![format!("{meta}/runs/**")]
-    );
+    assert_eq!(narrowed.grants["write"], vec![format!("{meta}/runs/**")]);
     let role = fixture.role(&narrowed).await.unwrap();
     assert_eq!(role.permissions[&format!("{meta}/runs/**")], Access::WRITE);
-    assert_eq!(role.permissions[&format!("{meta}/**")], Access::READ);
+    let group = format!("/{}/g/{}/**", actor.realm_id, fixture.group_id);
+    assert_eq!(role.permissions[&group], Access::READ);
 
     assert_eq!(narrowed.receiver, installed.receiver);
     let paused = pause_install(ctx, actor, &auth, id).await.unwrap();
@@ -54,19 +54,14 @@ async fn later_changes() {
         InstallState::Active
     );
 
-    let digest = fixture.publish("0.2.0", "ef", needs_objects()).await;
+    // A version that requires writing keeps the narrowed write.
+    let digest = fixture.publish("0.2.0", "ef", needs_write()).await;
     let (updated, missing) = update_install(ctx, actor, &auth, id, &digest, None)
         .await
         .unwrap();
-    assert_eq!(
-        (updated.state, missing),
-        (InstallState::Blocked, vec!["objects.read".to_string()])
-    );
+    assert_eq!((updated.state, missing), (InstallState::Active, Vec::new()));
     assert_eq!(updated.receiver, installed.receiver);
-    assert_eq!(
-        updated.grants["metadata.write"],
-        vec![format!("{meta}/runs/**")]
-    );
+    assert_eq!(updated.grants["write"], vec![format!("{meta}/runs/**")]);
     let approved = set_grants(ctx, actor, &auth, id, &BTreeMap::new())
         .await
         .unwrap();
@@ -108,8 +103,11 @@ async fn keeps_pause() {
         .await
         .unwrap()
         .install_id;
+    set_grants(ctx, actor, &auth, id, &no_write())
+        .await
+        .unwrap();
     pause_install(ctx, actor, &auth, id).await.unwrap();
-    let digest = fixture.publish("0.2.0", "ef", needs_objects()).await;
+    let digest = fixture.publish("0.2.0", "ef", needs_write()).await;
     let (updated, _) = update_install(ctx, actor, &auth, id, &digest, None)
         .await
         .unwrap();
@@ -141,8 +139,11 @@ async fn resume_needs_grants() {
         .await
         .unwrap()
         .install_id;
+    set_grants(ctx, actor, &auth, id, &no_write())
+        .await
+        .unwrap();
     pause_install(ctx, actor, &auth, id).await.unwrap();
-    let digest = fixture.publish("0.2.0", "ef", needs_objects()).await;
+    let digest = fixture.publish("0.2.0", "ef", needs_write()).await;
     update_install(ctx, actor, &auth, id, &digest, None)
         .await
         .unwrap();
@@ -188,8 +189,8 @@ async fn recovers_changes() {
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
     let installed = fixture.install(&fixture.request(None)).await.unwrap();
     let id = installed.install_id;
-    let meta = format!("/{}/g/{}/meta", actor.realm_id, fixture.group_id);
-    let choices = BTreeMap::from([("metadata.write".to_string(), Vec::new())]);
+    let group = format!("/{}/g/{}", actor.realm_id, fixture.group_id);
+    let choices = no_write();
     let scope = scope_of(actor.realm_id, &installed);
     let manifest_grants = narrow_grants(
         &read_manifest(&fixture_plugin(&fixture, &installed).await).unwrap(),
@@ -204,7 +205,7 @@ async fn recovers_changes() {
     assert_eq!(finished.state, InstallState::Active);
     let role = fixture.role(&finished).await.unwrap();
     assert_eq!(
-        role.permissions[&format!("{meta}/**")],
+        role.permissions[&format!("{group}/**")],
         Access::READ,
         "write is gone"
     );
@@ -231,7 +232,7 @@ async fn stale_node_changes() {
     let a_auth = a.auth();
     let scope = scope_of(a.actor.realm_id, &installed);
     let manifest = read_manifest(&fixture_plugin(&a, &installed).await).unwrap();
-    let dropped = BTreeMap::from([("metadata.write".to_string(), Vec::new())]);
+    let dropped = no_write();
     let grants_a = narrow_grants(&manifest, &scope, &dropped).unwrap();
     let stale = preparing(&installed, &grants_a);
     let stale = write_record(
@@ -246,10 +247,7 @@ async fn stale_node_changes() {
     a.deliver_config(&b).await;
 
     let meta = format!("/{}/g/{}/meta", b.actor.realm_id, b.group_id);
-    let runs = BTreeMap::from([(
-        "metadata.write".to_string(),
-        vec![format!("{meta}/runs/**")],
-    )]);
+    let runs = BTreeMap::from([("write".to_string(), vec![format!("{meta}/runs/**")])]);
     let active = set_grants(&b.ctx, &b.actor, &b.auth(), id, &runs)
         .await
         .unwrap();
@@ -367,17 +365,14 @@ async fn coverage_times() {
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
     let triggers = json!({
-        "triggers": { "dataset_created": { "handler": "on_created" } },
-        "handlers": ["on_created"]
+        "triggers": { "dataset_created": {} }
     });
     let mut request = fixture.request(None);
     request.version = Some(fixture.publish("0.3.0", "aa", triggers).await);
     let meta = format!("/{}/g/{}/meta", actor.realm_id, fixture.group_id);
     let only = |pattern: &str| {
-        BTreeMap::from([(
-            "metadata.read".to_string(),
-            vec![format!("{meta}/{pattern}")],
-        )])
+        let read = ("read".to_string(), vec![format!("{meta}/{pattern}")]);
+        BTreeMap::from([read, ("write".to_string(), Vec::new())])
     };
     request.grants = only("a/**");
     let installed = fixture.install(&request).await.unwrap();

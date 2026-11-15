@@ -126,13 +126,15 @@ def changed(host, settings, dataset):
 
 
 def manual(host, settings, given):
+    """One command per run; a field at its form default (false, 0 or empty) is not given."""
     given = given if isinstance(given, dict) else {}
     if given.get("report"):
-        return report(host, settings, given.get("next"))
-    if "resolve" in given and given.get("keep") in ("elabftw", "aruna"):
+        start = given.get("next")
+        return report(host, settings, json.loads(start) if start else None)
+    if given.get("resolve") and given.get("keep") in ("elabftw", "aruna"):
         link = Link(host, settings, int(given["resolve"]), None)
         return {"experiment": link.number, "mark": link.run(keep=given["keep"])}
-    if "experiment" in given:
+    if given.get("experiment"):
         link = Link(host, settings, int(given["experiment"]), None)
         return {"experiment": link.number, "mark": link.run()}
     raise Fault("invalid", 'expected {"report": true}, {"resolve": <id>, "keep": ...} or {"experiment": <id>}')
@@ -156,7 +158,7 @@ def describe(host, settings, phase, entry):
 
 
 def report(host, settings, start):
-    """One page of marked links; `next` continues it while more follow."""
+    """One page of marked links; `next`, a cursor as JSON text, continues it while more follow."""
     cursor = dict(start or {"phase": "datasets", "page": None, "index": 0})
     marks, size = [], 2
     try:
@@ -170,7 +172,7 @@ def report(host, settings, start):
                 if entry is None:
                     continue
                 if size + len(json.dumps(entry)) + 1 > REPORT_BYTES:
-                    return {"marks": marks, "next": cursor}
+                    return {"marks": marks, "next": json.dumps(cursor)}
                 marks.append(entry)
                 size += len(json.dumps(entry)) + 1
             if after is not None:
@@ -178,7 +180,7 @@ def report(host, settings, start):
             elif cursor["phase"] == "datasets":
                 cursor.update(phase="experiments", page=None, index=0)
             else:
-                return {"marks": marks, "next": None}
+                return {"marks": marks, "next": ""}
         raise Stop("the run's time is used up")
     except Stop:
-        return {"marks": marks, "next": cursor}
+        return {"marks": marks, "next": json.dumps(cursor)}

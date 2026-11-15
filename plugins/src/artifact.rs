@@ -1,8 +1,7 @@
-//! Reads and writes the sections of a plugin artifact: the manifest, handler names and imports.
+//! Reads and writes the sections of a plugin artifact: the manifest and the imports.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
@@ -16,8 +15,6 @@ use crate::manifest::{Manifest, ManifestError};
 
 /// Top-level component section that carries the manifest JSON.
 pub const MANIFEST_SECTION: &str = "aruna-plugin";
-/// Core module section the SDK's `export!` writes: handler names separated by newlines.
-pub const HANDLERS_SECTION: &str = "aruna-handlers";
 const DIGEST_PREFIX: &str = "sha256:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -81,10 +78,6 @@ pub enum SectionError {
     WrongKind(&'static str),
     #[error("the artifact needs exactly one top-level {MANIFEST_SECTION} section")]
     Manifest,
-    #[error("the module has more than one {HANDLERS_SECTION} section")]
-    Handlers,
-    #[error("the module lists a handler name that is not valid UTF-8 or is empty")]
-    HandlerName,
     #[error("the binary does not parse: {0}")]
     Parse(String),
     #[error("artifact manifest is invalid: {0}")]
@@ -114,33 +107,6 @@ pub fn attach_manifest(component: &[u8], manifest: &Manifest) -> Result<Vec<u8>,
     Ok(out)
 }
 
-/// The handler names a toolchain recorded, such as the Rust SDK's `export!`, in a core module
-/// or in a module nested in a finished component; `None` when nothing lists them.
-pub fn read_handlers(module: &[u8]) -> Result<Option<BTreeSet<String>>, SectionError> {
-    if !Parser::is_core_wasm(module) && !Parser::is_component(module) {
-        return Err(SectionError::WrongKind("module or component"));
-    }
-    let mut found = None;
-    for payload in Parser::new(0).parse_all(module) {
-        let payload = payload.map_err(|err| SectionError::Parse(err.to_string()))?;
-        if let Payload::CustomSection(section) = payload
-            && section.name() == HANDLERS_SECTION
-            && found.replace(section.data()).is_some()
-        {
-            return Err(SectionError::Handlers);
-        }
-    }
-    let Some(data) = found else {
-        return Ok(None);
-    };
-    let text = std::str::from_utf8(data).map_err(|_| SectionError::HandlerName)?;
-    let names: BTreeSet<String> = text.split('\n').map(str::to_string).collect();
-    if names.iter().any(String::is_empty) {
-        return Err(SectionError::HandlerName);
-    }
-    Ok(Some(names))
-}
-
 /// Checks a finished artifact from any toolchain without compiling it: a valid component
 /// with a wired manifest that imports only interfaces the host provides.
 pub fn check_artifact(bytes: &[u8]) -> Result<Manifest, SectionError> {
@@ -153,7 +119,7 @@ pub fn check_artifact(bytes: &[u8]) -> Result<Manifest, SectionError> {
 }
 
 /// Names of the top-level instance and function imports of a component, such as
-/// `aruna:plugin/log@0.2.0`. Type imports carry no host calls and are left out.
+/// `aruna:plugin/log@0.3.0`. Type imports carry no host calls and are left out.
 pub fn component_imports(component: &[u8]) -> Result<Vec<String>, SectionError> {
     let mut depth = 0usize;
     let mut names = Vec::new();
@@ -216,7 +182,7 @@ mod tests {
     fn manifest() -> Manifest {
         let json = serde_json::json!({
             "abi": PLUGIN_ABI, "name": "probe", "version": "1.0.0",
-            "triggers": { "manual": { "handler": "run" } }, "handlers": ["run"]
+            "triggers": { "manual": {} }
         });
         serde_json::from_value(json).unwrap()
     }
@@ -250,24 +216,6 @@ mod tests {
             Err(SectionError::Manifest)
         ));
         assert_eq!(component_imports(&attached).unwrap(), Vec::<String>::new());
-    }
-
-    #[test]
-    fn handler_names() {
-        let module = module_with(&[(HANDLERS_SECTION, b"dataset_created\nresync")]).finish();
-        let names = read_handlers(&module).unwrap().unwrap();
-        assert_eq!(
-            names.into_iter().collect::<Vec<_>>(),
-            ["dataset_created", "resync"]
-        );
-        let empty = module_with(&[(HANDLERS_SECTION, b"a\n\nb")]).finish();
-        assert!(matches!(
-            read_handlers(&empty),
-            Err(SectionError::HandlerName)
-        ));
-        let twice = module_with(&[(HANDLERS_SECTION, b"a"), (HANDLERS_SECTION, b"b")]).finish();
-        assert!(matches!(read_handlers(&twice), Err(SectionError::Handlers)));
-        assert_eq!(read_handlers(&module_with(&[]).finish()).unwrap(), None);
     }
 
     #[test]

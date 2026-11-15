@@ -30,7 +30,6 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
     let call = text("call");
     Ok(match call.as_str() {
         "settings" => ctx.settings::<Value>()?,
-        "granted" => json!(ctx.granted(&text("permission"), &text("resource")).await),
         "metadata_get" => {
             let doc = ctx.metadata().get(&text("resource")).await?;
             json!({ "revision": doc.revision, "json": doc.json })
@@ -47,9 +46,7 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
         "metadata_create" => {
             let dataset = input.get("dataset").cloned().unwrap_or(Value::Null);
             let metadata = ctx.metadata();
-            let created = metadata
-                .create(&text("path"), &dataset, &text("key"))
-                .await?;
+            let created = metadata.create(&text("path"), &dataset).await?;
             json!({ "resource": created.resource, "revision": created.revision })
         }
         "metadata_summary" => {
@@ -66,18 +63,14 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             let metadata = ctx.metadata();
             json!(
                 metadata
-                    .put_file(&text("resource"), &file, &text("expected"), None)
+                    .put_file(&text("resource"), &file, &text("expected"))
                     .await?
             )
         }
         "remove_file" => {
             let (resource, id, expected) = (text("resource"), text("id"), text("expected"));
             let metadata = ctx.metadata();
-            json!(
-                metadata
-                    .remove_file(&resource, &id, &expected, None)
-                    .await?
-            )
+            json!(metadata.remove_file(&resource, &id, &expected).await?)
         }
         "objects_info" => {
             let info = ctx.objects().info(&text("path")).await?;
@@ -95,9 +88,11 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
                 .unwrap_or_default();
             let reply = ctx
                 .http(&text("connection"))
-                .send(method, &text("path"), body, None)
+                .send(method, &text("path"), body)
                 .await?;
-            json!({ "status": reply.status, "fields": reply.fields })
+            // A status-only answer has no body; it reads as no fields.
+            let fields = reply.json::<Value>().unwrap_or_else(|_| json!({}));
+            json!({ "status": reply.status, "fields": fields })
         }
         "random" => {
             let len = input.get("len").and_then(Value::as_u64).unwrap_or_default();
@@ -139,6 +134,13 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             }
             json!(buffer[0])
         }
+        "chatty" => {
+            // Logs until the host call budget ends the run.
+            for line in 0..u32::MAX {
+                ctx.log(Level::Debug, &format!("line {line}"));
+            }
+            json!(null)
+        }
         "errors" => {
             let mut failed = 0;
             for _ in 0..1000 {
@@ -176,14 +178,6 @@ async fn echo(ctx: Context, event: Event) -> Result<String> {
     ))
 }
 
-/// Logs until the host call budget ends the run.
-async fn chatty(ctx: Context, _: ()) -> Result<()> {
-    for line in 0..u32::MAX {
-        ctx.log(Level::Debug, &format!("line {line}"));
-    }
-    Ok(())
-}
-
 /// Allocates until the memory budget ends the run.
 async fn hoard(_: Context, _: ()) -> Result<()> {
     let mut blocks = Vec::new();
@@ -200,4 +194,12 @@ async fn spin(_: Context, _: ()) -> Result<()> {
     }
 }
 
-aruna_plugin::export!(probe, echo, chatty, hoard, spin);
+aruna_plugin::export! {
+    manual => probe,
+    timer => spin,
+    dataset_created => echo,
+    dataset_updated => echo,
+    data_uploaded => hoard,
+    sync_completed => echo,
+    sync_failed => echo,
+}

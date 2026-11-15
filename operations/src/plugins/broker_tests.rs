@@ -26,10 +26,16 @@ async fn project(ctx: &DriverContext) {
 
 const ENTITY: &str = r#"{"description":"first"}"#;
 
-/// A broker for a run of a fresh install, and a document of the install's group.
+/// A broker for a run of a fresh install granted the group's metadata, and a document of it.
 async fn broker() -> (Fixture, RunBroker, Ulid, tempfile::TempDir) {
     let fixture = Fixture::new().await;
-    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let meta = format!("/{}/g/{}/meta/**", fixture.actor.realm_id, fixture.group_id);
+    let mut request = fixture.request(None);
+    request.grants = BTreeMap::from([
+        ("read".into(), vec![meta.clone()]),
+        ("write".into(), vec![meta]),
+    ]);
+    let installed = fixture.install(&request).await.unwrap();
     let mut ctx = fixture.ctx.clone();
     let dir = tempfile::tempdir().unwrap();
     let metadata = MetadataHandle::new(
@@ -81,7 +87,7 @@ fn patch(document: Ulid, expected: &str, ordinal: u32, entity: &str) -> Metadata
         resource: document.to_string(),
         patch: entity.to_string(),
         expected: expected.to_string(),
-        intent: Intent::new(ordinal, None, &[entity.as_bytes(), expected.as_bytes()]),
+        intent: Intent::new(ordinal, &[entity.as_bytes(), expected.as_bytes()]),
     }
 }
 
@@ -133,10 +139,20 @@ async fn object_calls() {
     let refused = broker.objects_info(&cx(), &path).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::NotGranted);
     let meta = format!("/{}/g/{}/meta/x", fixture.actor.realm_id, fixture.group_id);
-    assert!(broker.granted(&cx(), Permission::MetadataRead, &meta).await);
-    assert!(!broker.granted(&cx(), Permission::ObjectsRead, &path).await);
+    assert!(
+        broker
+            .checked(Permission::MetadataRead, &meta)
+            .await
+            .is_ok()
+    );
+    assert!(
+        broker
+            .checked(Permission::ObjectsRead, &path)
+            .await
+            .is_err()
+    );
 
-    // With `objects.read`, objects of other nodes and buckets outside the group are refused.
+    // With `read` on the whole group, objects of other nodes and buckets outside it are refused.
     let reads = serde_json::json!({ "permissions": { "required": ["objects.read"] } });
     let mut request = fixture.request(None);
     request.version = Some(fixture.publish("0.1.1", "cd", reads).await);
@@ -165,7 +181,7 @@ async fn state_and_log() {
         key: "cursor".into(),
         value: b"a".to_vec(),
         expected: None,
-        intent: Intent::new(0, None, &[b"cursor", b"a"]),
+        intent: Intent::new(0, &[b"cursor", b"a"]),
     };
     assert_eq!(broker.state_put(&cx(), put.clone()).await.unwrap(), 1);
     // The same call again answers its stored version and writes nothing.
@@ -176,7 +192,7 @@ async fn state_and_log() {
         key: "cursor".into(),
         value: b"b".to_vec(),
         expected: None,
-        intent: Intent::new(1, None, &[b"cursor", b"b"]),
+        intent: Intent::new(1, &[b"cursor", b"b"]),
     };
     let refused = broker.state_put(&cx(), stale).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::Conflict);
@@ -192,7 +208,7 @@ async fn state_and_log() {
     );
 }
 
-/// A broker for a run of an install granted `objects.read` on `patterns` only.
+/// A broker for a run of an install granted `read` on `patterns` only.
 async fn objects_broker(
     fixture: &Fixture,
     broker: &RunBroker,
@@ -201,7 +217,7 @@ async fn objects_broker(
     let reads = serde_json::json!({ "permissions": { "required": ["objects.read"] } });
     let mut request = fixture.request(None);
     request.version = Some(fixture.publish("0.1.2", "ef", reads).await);
-    let grants = BTreeMap::from([("objects.read".to_string(), patterns.to_vec())]);
+    let grants = BTreeMap::from([("read".to_string(), patterns.to_vec())]);
     request.grants = grants;
     let installed = fixture.install(&request).await.unwrap();
     let mut scope = broker.scope.clone();
@@ -234,7 +250,8 @@ async fn object_paths() {
         .visible(&install, "dataset", listed.clone())
         .await
         .unwrap();
-    let path = format!("/{realm}/g/{group}/data/{node}/dataset/private");
+    // Listed objects of this node come back by their short bucket path.
+    let path = "dataset/private".to_string();
     assert_eq!(
         shown.iter().map(|object| &object.path).collect::<Vec<_>>(),
         [&path]
@@ -404,8 +421,8 @@ async fn patch_keeps_entities() {
 }
 
 #[tokio::test]
-async fn write_only_patches() {
-    // A plugin that may write a document but not read it patches it at a revision it was given.
+async fn write_includes_read() {
+    // A plugin that may write a document also reads it, though its `read` names another path.
     let (fixture, broker, document, _dir) = broker().await;
     let read = broker
         .metadata_get(&cx(), &document.to_string())
@@ -414,19 +431,16 @@ async fn write_only_patches() {
     let meta = format!("/{}/g/{}/meta", fixture.actor.realm_id, fixture.group_id);
     let mut request = fixture.request(None);
     request.grants = BTreeMap::from([
-        (
-            "metadata.read".to_string(),
-            vec![format!("{meta}/other/**")],
-        ),
-        ("metadata.write".to_string(), vec![format!("{meta}/**")]),
+        ("read".to_string(), vec![format!("{meta}/other/**")]),
+        ("write".to_string(), vec![format!("{meta}/**")]),
     ]);
     let installed = fixture.install(&request).await.unwrap();
     let mut scope = broker.scope.clone();
     scope.run.install_id = installed.install_id;
     scope.run.digest = installed.digest.clone();
     let writer = RunBroker::new(broker.ctx.clone(), scope);
-    let unread = writer.metadata_get(&cx(), &document.to_string()).await;
-    assert!(unread.is_err());
+    let seen = writer.metadata_get(&cx(), &document.to_string()).await;
+    assert_eq!(seen.unwrap().revision, read.revision);
     let change = patch(
         document,
         &read.revision,
@@ -569,7 +583,7 @@ fn create(path: &str, name: &str, key: &str, ordinal: u32) -> MetadataCreate {
         path: path.to_string(),
         dataset: dataset.to_string(),
         key: key.to_string(),
-        intent: Intent::new(ordinal, Some(key.to_string()), &parts),
+        intent: Intent::new(ordinal, &parts),
     }
 }
 
@@ -582,10 +596,9 @@ async fn keyed_creates() {
     let creates = serde_json::json!({ "permissions": { "required": ["metadata.create"] } });
     let mut request = fixture.request(None);
     request.version = Some(fixture.publish("0.1.3", "12", creates).await);
-    request.grants = BTreeMap::from([(
-        "metadata.create".to_string(),
-        vec![format!("{meta}/elabftw/**")],
-    )]);
+    let read = ("read".to_string(), vec![format!("{meta}/**")]);
+    let write = ("write".to_string(), vec![format!("{meta}/elabftw/**")]);
+    request.grants = BTreeMap::from([read, write]);
     let installed = fixture.install(&request).await.unwrap();
     let mut scope = broker.scope.clone();
     scope.run.install_id = installed.install_id;
@@ -624,7 +637,7 @@ async fn keyed_creates() {
     nested.dataset = r##"{"name":"Exp 4","author":{"@id":"#a","name":"A"}}"##.to_string();
     let refused = later.metadata_create(&cx(), nested).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::Invalid);
-    // A dataset naming an object needs `objects.read` on it, whatever the property.
+    // A dataset naming an object needs `read` on it, whatever the property.
     let mut linked = create("elabftw/exp-6", "Exp 6", "e6", 5);
     let arn = private_arn(&fixture);
     linked.dataset = serde_json::json!({"name": "Exp 6", "description": "d",
@@ -818,7 +831,7 @@ async fn file_pages() {
 fn put(document: Ulid, file: &Value, expected: &str, ordinal: u32) -> FileChange {
     let file = file.to_string();
     let parts: [&[u8]; 2] = [file.as_bytes(), expected.as_bytes()];
-    let intent = Intent::new(ordinal, None, &parts);
+    let intent = Intent::new(ordinal, &parts);
     FileChange {
         resource: document.to_string(),
         file,
@@ -903,7 +916,7 @@ async fn file_puts() {
         .await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
 
-    // A file naming an exact object needs `objects.read` on it.
+    // A file naming an exact object needs `read` on it.
     let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
     let arn = aruna_core::structs::storage::replication::VersionedObjectArn::new(
         realm,
@@ -921,7 +934,7 @@ async fn file_puts() {
 
 #[tokio::test]
 async fn object_references() {
-    // Every object a file names passes the plugin's own `objects.read` check: `s3://` and path
+    // Every object a file names passes the plugin's own `read` check: `s3://` and path
     // references need the grant and pass its policies, content ids name no object to check.
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;
@@ -1427,7 +1440,7 @@ fn removal(document: Ulid, id: &str, expected: &str, ordinal: u32) -> FileChange
         resource: document.to_string(),
         file: id.to_string(),
         expected: expected.to_string(),
-        intent: Intent::new(ordinal, None, &parts),
+        intent: Intent::new(ordinal, &parts),
     }
 }
 
@@ -1593,4 +1606,43 @@ async fn unprojected_event_refused() {
     // Once the older event is projected and applied, the same removal is planned on it.
     project(&broker.ctx).await;
     remove().await.unwrap();
+}
+
+#[test]
+fn short_object_paths() {
+    let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]);
+    let node = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+    let group = Ulid::from_parts(1, 1);
+    let expand = |text: &str| object_path((realm, node), group, text);
+    let root = format!("/{realm}/g/{group}/data/{node}");
+    let cases = [
+        ("raw/run-7/a.fq", format!("{root}/raw/run-7/a.fq")),
+        ("raw/run-7/", format!("{root}/raw/run-7/")),
+        ("raw", format!("{root}/raw/")),
+    ];
+    for (text, full) in cases {
+        assert_eq!(expand(text).unwrap(), full, "{text}");
+    }
+    let full = format!("{root}/raw/a");
+    assert_eq!(expand(&full).unwrap(), full, "a full path stays as it is");
+    for bad in ["", "raw/../x", "raw/./x", "raw//x", "../x"] {
+        let refused = expand(bad).unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::Invalid, "{bad}");
+    }
+}
+
+#[test]
+fn content_url_rule() {
+    let named = |url: Value| content_urls(&serde_json::json!({ "contentUrl": url }));
+    for url in [
+        "s3://raw/a.fq",
+        "https://example.org/a",
+        "/r/g/x/data/n/raw/a.fq",
+    ] {
+        assert!(named(url.into()).is_ok(), "{url}");
+    }
+    assert!(named(serde_json::json!(["s3://raw/a", "https://x.example/a"])).is_ok());
+    let refused = named("raw/a.fq".into()).unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Invalid);
+    assert!(content_urls(&serde_json::json!({ "name": "a" })).is_ok());
 }

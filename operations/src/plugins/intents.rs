@@ -211,8 +211,8 @@ mod tests {
     async fn intent_outcomes() {
         let (_dir, ctx) = opened();
         let run = Ulid::from_parts(5, 1);
-        let first = Intent::new(0, None, &[b"patch a"]);
-        let second = Intent::new(1, None, &[b"patch b"]);
+        let first = Intent::new(0, &[b"patch a"]);
+        let second = Intent::new(1, &[b"patch b"]);
         assert_eq!(begin(&ctx, run, &first).await.unwrap(), Begun::Fresh);
         let settle = async |txn: &Txn<'_>| settle_in(txn, run, &first, "r2".into()).await;
         transact(&ctx, settle).await.unwrap();
@@ -221,7 +221,7 @@ mod tests {
             begin(&ctx, run, &first).await.unwrap(),
             Begun::Settled("r2".into())
         );
-        let other = Intent::new(0, None, &[b"patch c"]);
+        let other = Intent::new(0, &[b"patch c"]);
         assert_eq!(begin(&ctx, run, &other).await.unwrap(), Begun::Changed);
 
         // A pending intent found by a later attempt is unknown and stays so.
@@ -235,7 +235,7 @@ mod tests {
             begin(&ctx, run, &second).await,
             Ok(Begun::Unknown(_))
         ));
-        let third = Intent::new(2, None, &[b"put"]);
+        let third = Intent::new(2, &[b"put"]);
         mark_unknown(&ctx, run, &third, "timed out").await.unwrap();
         assert!(matches!(
             begin(&ctx, run, &third).await,

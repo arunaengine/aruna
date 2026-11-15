@@ -13,12 +13,14 @@ use std::time::Duration;
 
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    FullResponse, HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method as Verb,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method as Verb, ObjectInfo,
+    ObjectPage, Response, SendRequest, StatePut,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
+use aruna_plugins::manifest::SettingKind;
 use aruna_plugins::package::{load_manifest, package};
 use aruna_plugins::permission::Permission;
+use aruna_plugins::trigger::TriggerKind;
 use aruna_plugins::{CancellationToken, Compiled, Invocation, Runtime, Trigger, WatchEvent};
 use elabftw_sync::host::{Fault, Host, Kind, Method, Request};
 use serde_json::{Value, json};
@@ -55,10 +57,6 @@ struct Hosted(Arc<World>);
 
 #[async_trait::async_trait]
 impl Broker for Hosted {
-    async fn granted(&self, _: &CallContext, _: Permission, _: &str) -> bool {
-        true
-    }
-
     async fn metadata_get(&self, _: &CallContext, _: &str) -> Result<Document, HostError> {
         Err(unused())
     }
@@ -171,16 +169,8 @@ impl Broker for Hosted {
     async fn connection_send(
         &self,
         _: &CallContext,
-        _: SendRequest,
-    ) -> Result<Response, HostError> {
-        Err(unused())
-    }
-
-    async fn connection_send_full(
-        &self,
-        _: &CallContext,
         request: SendRequest,
-    ) -> Result<FullResponse, HostError> {
+    ) -> Result<Response, HostError> {
         assert_eq!(request.connection, "elab");
         let method = match request.method {
             Verb::Get => Method::Get,
@@ -203,7 +193,7 @@ impl Broker for Hosted {
                 .collect(),
             body: (!request.body.is_empty())
                 .then(|| serde_json::from_slice(&request.body).unwrap()),
-            key: request.intent.and_then(|intent| intent.key),
+            key: None,
         };
         let reply = self.0.elab(&outgoing).map_err(refusal)?;
         let headers = reply
@@ -211,7 +201,7 @@ impl Broker for Hosted {
             .into_iter()
             .map(|(name, value)| Field { name, value })
             .collect();
-        Ok(FullResponse {
+        Ok(Response {
             status: reply.status,
             headers,
             body: reply.body,
@@ -243,6 +233,28 @@ fn module() -> Option<Vec<u8>> {
     let project = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut manifest = load_manifest(project).unwrap();
     Some(package(&mut manifest, &std::fs::read(path).unwrap()).unwrap())
+}
+
+/// Manual input as the node passes it on: checked against the `[manual]` form of plugin.toml,
+/// defaults filled in.
+fn filled(input: &Value) -> String {
+    let manifest = load_manifest(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let form = &manifest.triggers[&TriggerKind::Manual].form;
+    let given = input.as_object().unwrap();
+    if let Some(unknown) = given.keys().find(|name| !form.contains_key(*name)) {
+        panic!("`{unknown}` is not a field of the manual form");
+    }
+    let values = form.iter().map(|(name, field)| {
+        let value = given.get(name).or(field.default.as_ref()).unwrap().clone();
+        let fits = match field.kind {
+            SettingKind::Integer => value.is_u64(),
+            SettingKind::Boolean => value.is_boolean(),
+            _ => value.is_string(),
+        };
+        assert!(fits, "`{name}` has the wrong type: {value}");
+        (name.clone(), value)
+    });
+    Value::Object(values.collect()).to_string()
 }
 
 /// The compiled guest and the fake it runs against, at a moving time.
@@ -281,17 +293,12 @@ impl Guest {
         format!("{}{run:016}", time.collect::<String>())
     }
 
-    async fn invoke(&self, handler: &str, trigger: Trigger) -> Result<Option<Value>, String> {
-        self.invoke_in(handler, trigger, BUCKET).await
+    async fn invoke(&self, trigger: Trigger) -> Result<Option<Value>, String> {
+        self.invoke_in(trigger, BUCKET).await
     }
 
     /// A run with the uploads in `bucket`.
-    async fn invoke_in(
-        &self,
-        handler: &str,
-        trigger: Trigger,
-        bucket: &str,
-    ) -> Result<Option<Value>, String> {
+    async fn invoke_in(&self, trigger: Trigger, bucket: &str) -> Result<Option<Value>, String> {
         let settings = serde_json::to_string(&json!({
             "elab_url": "https://elab.example.org", "sync_user": support::SYNC_USER, "writers": "3",
             "bucket": bucket, "prefix": "elabftw", "tag": "aruna", "aruna_url": "https://portal.example.org",
@@ -301,7 +308,6 @@ impl Guest {
             run: self.run_id(),
             install: "install-1".into(),
             group: "lab".into(),
-            handler: handler.into(),
             settings,
             trigger,
             permissions: BTreeSet::from([
@@ -325,10 +331,7 @@ impl Guest {
 
     async fn poll(&self) -> Value {
         let now = self.now.fetch_add(5 * 60 * 1000, Ordering::SeqCst) + 5 * 60 * 1000;
-        self.invoke("poll", Trigger::Timer(now))
-            .await
-            .unwrap()
-            .unwrap()
+        self.invoke(Trigger::Timer(now)).await.unwrap().unwrap()
     }
 
     async fn event(&self, dataset: &str) {
@@ -339,15 +342,11 @@ impl Guest {
             resource: dataset.into(),
             revision: found.revision,
         };
-        self.invoke("changed", Trigger::Event(change))
-            .await
-            .unwrap();
+        self.invoke(Trigger::Event(change)).await.unwrap();
     }
 
     async fn manual(&self, input: Value) -> Value {
-        let output = self
-            .invoke("manual", Trigger::Manual(input.to_string()))
-            .await;
+        let output = self.invoke(Trigger::Manual(filled(&input))).await;
         output.unwrap().unwrap()
     }
 
@@ -462,8 +461,8 @@ async fn guest_settles_conflicts() {
     // A timer and a manual run at once still make one link and one dataset; the run that
     // finds the link held fails as retryable.
     let other = guest.world.experiment("Parallel", "", &["aruna"]);
-    let input = Trigger::Manual(json!({ "experiment": other }).to_string());
-    let (timer, manual) = tokio::join!(guest.poll(), guest.invoke("manual", input));
+    let input = Trigger::Manual(filled(&json!({ "experiment": other })));
+    let (timer, manual) = tokio::join!(guest.poll(), guest.invoke(input));
     assert!(timer.is_object());
     if let Err(held) = manual {
         assert!(
@@ -505,7 +504,7 @@ async fn guest_recovers_creates() {
         "a negative lookup sends no second POST"
     );
     guest
-        .manual(json!({ "resolve_create": dataset, "experiment": "absent" }))
+        .manual(json!({ "resolve_create": dataset, "absent": true }))
         .await;
     assert_eq!(guest.world.lock().posts, 2);
 
@@ -590,17 +589,23 @@ async fn guest_checks_bucket() {
     let Some(guest) = Guest::new().await else {
         return;
     };
-    let accepted = guest.invoke("poll", Trigger::Timer(START)).await;
+    let accepted = guest.invoke(Trigger::Timer(START)).await;
     assert!(
         accepted.is_ok(),
         "an empty bucket on the receiver is fine: {accepted:?}"
     );
     let elsewhere = "/r/g/lab/data/elsewhere/shared";
     let refused = guest
-        .invoke_in("poll", Trigger::Timer(START), elsewhere)
+        .invoke_in(Trigger::Timer(START), elsewhere)
         .await
         .unwrap_err();
     assert!(refused.contains("receiver node"), "{refused}");
-    let wrong = guest.invoke("changed", Trigger::Manual("{}".into())).await;
-    assert!(wrong.is_err(), "the event handler takes events only");
+    let upload = WatchEvent {
+        kind: "data_uploaded".into(),
+        path: "p".into(),
+        resource: "r".into(),
+        revision: "1".into(),
+    };
+    let wrong = guest.invoke(Trigger::Event(upload)).await;
+    assert!(wrong.is_err(), "a trigger without a handler is refused");
 }

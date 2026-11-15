@@ -1,31 +1,20 @@
-# Test guest manifest: each trigger reaches one handler the runtime tests call by name.
+# Test guest manifest: each trigger reaches one handler of the runtime tests.
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 
 name = "fixture"
 version = "0.2.0"
 title = "Runtime test guest"
+on = ["manual", "timer", "dataset_created", "dataset_updated", "data_uploaded", "sync_completed", "sync_failed"]
+access = "write"
 
 [settings]
 api_url = { title = "API address", type = "url", default = "https://api.example.org" }
 
-[secrets]
-api_key = { title = "API key" }
-
-[connections.api]
+[services.api]
 url = "{api_url}/v1"
 methods = ["GET", "POST"]
-auth = "api_key"
-response = ["/id", "/meta/name", "/items/1"]
+secret = "API key"
 
-[triggers]
-manual = { handler = "probe" }
-every = { handler = "chatty", interval = "1h" }
-dataset_created = { handler = "echo" }
-dataset_updated = { handler = "echo" }
-data_uploaded = { handler = "hoard" }
-sync_completed = { handler = "spin" }
-
-[permissions]
-required = ["metadata.read", "objects.read"]
-optional = ["metadata.write", "metadata.create"]
+[timer]
+every = "1h"

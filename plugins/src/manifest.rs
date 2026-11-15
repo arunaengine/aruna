@@ -1,5 +1,5 @@
 //! Declares what a plugin asks for: settings, secret slots, connections, triggers, permissions.
-//! A manifest only asks; it never grants. `build` wires triggers to handlers before publishing.
+//! A manifest only asks; it never grants. `build` checks the code handles exactly its triggers.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -14,7 +14,7 @@ use crate::permission::{Import, Permission};
 use crate::trigger::{Trigger, TriggerKind};
 
 /// Host interface package every artifact manifest must name.
-pub const PLUGIN_ABI: &str = "aruna:plugin@0.2.0";
+pub const PLUGIN_ABI: &str = "aruna:plugin@0.3.0";
 pub const MAX_MANIFEST: usize = 64 * 1024;
 pub const MAX_ENTRIES: usize = 32;
 pub const MAX_NAME: usize = 64;
@@ -28,6 +28,10 @@ pub enum SettingKind {
     Boolean,
     Url,
     Choice,
+    /// A form field only: a dataset the person picks.
+    Dataset,
+    /// A form field only: an object the person picks.
+    Object,
 }
 
 /// One value the installer fills in. The form is generated from these.
@@ -70,6 +74,9 @@ pub struct SecretSlot {
     pub title: String,
     #[serde(default)]
     pub kind: SecretKind,
+    /// The code may read the value; a slot of a service or webhook is never readable.
+    #[serde(default)]
+    pub readable: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,22 +108,6 @@ pub struct Manifest {
     pub triggers: BTreeMap<TriggerKind, Trigger>,
     #[serde(default)]
     pub permissions: Requests,
-    /// Handler names the triggers call through the `handle` export; set by `build`.
-    #[serde(default)]
-    pub handlers: BTreeSet<String>,
-    /// How the project's own toolchain builds it; never part of a published artifact.
-    #[serde(default, skip_serializing)]
-    pub build: Option<BuildStep>,
-}
-
-/// A language toolchain step that writes a core module or a component.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BuildStep {
-    /// The program and its arguments, run in the project folder without a shell.
-    pub command: Vec<String>,
-    /// The module or component the command writes, relative to the project folder.
-    pub output: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -147,12 +138,10 @@ pub enum ManifestError {
     MissingPermission(TriggerKind, Permission),
     #[error("permission `{0}` is listed twice or cannot be requested")]
     InvalidPermission(Permission),
-    #[error("trigger `{}` has no handler to call", .0.as_str())]
-    NoHandler(TriggerKind),
-    #[error("handler `{0}` is not exported")]
-    UnknownHandler(String),
-    #[error("handler `{0}` is exported but no trigger calls it")]
-    UnusedHandler(String),
+    #[error("the code handles `{0}`, which the manifest's triggers do not list")]
+    UnknownTrigger(String),
+    #[error("trigger `{0}` has no function in the code")]
+    Unhandled(String),
     #[error("the code imports `{0}`, which the plugin host does not provide")]
     UnknownImport(String),
 }
@@ -174,7 +163,6 @@ impl Manifest {
             }
         }
         manifest.check()?;
-        manifest.check_wiring()?;
         Ok(manifest)
     }
 
@@ -196,15 +184,19 @@ impl Manifest {
         bounded("settings", self.settings.len())?;
         bounded("secret slots", self.secrets.len())?;
         bounded("connections", self.connections.len())?;
-        bounded("handlers", self.handlers.len())?;
         let names = self.settings.keys().chain(self.secrets.keys());
-        let names = names.chain(self.connections.keys()).chain(&self.handlers);
+        let names = names.chain(self.connections.keys());
         if let Some(name) = names.into_iter().find(|name| !valid_name(name)) {
             return Err(ManifestError::InvalidName(name.clone()));
         }
         for (name, setting) in &self.settings {
-            check_setting(setting)
-                .map_err(|why| ManifestError::InvalidSetting(name.clone(), why))?;
+            let picked = matches!(setting.kind, SettingKind::Dataset | SettingKind::Object);
+            let why = if picked {
+                Err("only a form field picks a dataset or object")
+            } else {
+                check_setting(setting)
+            };
+            why.map_err(|why| ManifestError::InvalidSetting(name.clone(), why))?;
         }
         if self.secrets.values().any(|slot| !valid_title(&slot.title)) {
             return Err(ManifestError::InvalidTitle);
@@ -218,29 +210,24 @@ impl Manifest {
         self.check_permissions()
     }
 
-    /// Resolves each trigger's handler (default: the trigger's own name), records the handler
-    /// names and marks the manifest as built for this host. Toolchains that list their handlers
-    /// pass them as `declared`, which must then match exactly.
-    pub fn wire(&mut self, declared: Option<BTreeSet<String>>) -> Result<(), ManifestError> {
-        for (kind, trigger) in &mut self.triggers {
-            trigger
-                .handler
-                .get_or_insert_with(|| kind.as_str().to_string());
-        }
-        self.handlers = (self.triggers.values())
-            .filter_map(|t| t.handler.clone())
-            .collect();
-        if let Some(declared) = declared {
-            if let Some(unknown) = self.handlers.difference(&declared).next() {
-                return Err(ManifestError::UnknownHandler(unknown.clone()));
-            }
-            if let Some(unused) = declared.difference(&self.handlers).next() {
-                return Err(ManifestError::UnusedHandler(unused.clone()));
-            }
-        }
+    /// Marks the manifest as built for this host after checking it.
+    pub fn wire(&mut self) -> Result<(), ManifestError> {
         self.abi = Some(PLUGIN_ABI.to_string());
-        self.check()?;
-        self.check_wiring()
+        self.check()
+    }
+
+    /// Checks that the code registered functions for exactly the manifest's triggers.
+    pub fn check_triggers(&self, registered: &BTreeSet<String>) -> Result<(), ManifestError> {
+        let declared: BTreeSet<String> = (self.triggers.keys())
+            .map(|kind| kind.as_str().to_string())
+            .collect();
+        if let Some(extra) = registered.difference(&declared).next() {
+            return Err(ManifestError::UnknownTrigger(extra.clone()));
+        }
+        match declared.difference(registered).next() {
+            Some(missing) => Err(ManifestError::Unhandled(missing.clone())),
+            None => Ok(()),
+        }
     }
 
     /// Checks that the code imports only interfaces the host provides. Grants are checked per
@@ -273,27 +260,9 @@ impl Manifest {
             .collect()
     }
 
-    fn check_wiring(&self) -> Result<(), ManifestError> {
-        let mut used = BTreeSet::new();
-        for (kind, trigger) in &self.triggers {
-            let handler = trigger
-                .handler
-                .as_ref()
-                .ok_or(ManifestError::NoHandler(*kind))?;
-            if !self.handlers.contains(handler) {
-                return Err(ManifestError::UnknownHandler(handler.clone()));
-            }
-            used.insert(handler);
-        }
-        match self.handlers.iter().find(|handler| !used.contains(handler)) {
-            Some(unused) => Err(ManifestError::UnusedHandler(unused.clone())),
-            None => Ok(()),
-        }
-    }
-
     fn check_connection(&self, name: &str, connection: &Connection) -> Result<(), ManifestError> {
         let invalid = |why| ManifestError::InvalidConnection(name.to_string(), why);
-        connection.check_fields().map_err(invalid)?;
+        connection.check_methods().map_err(invalid)?;
         if let Address::Setting { setting, .. } = connection.address().map_err(invalid)? {
             let kind = self.settings.get(setting).map(|setting| setting.kind);
             if kind != Some(SettingKind::Url) {
@@ -310,15 +279,17 @@ impl Manifest {
 
     fn check_trigger(&self, kind: TriggerKind, trigger: &Trigger) -> Result<(), ManifestError> {
         let invalid = |why| ManifestError::InvalidTrigger(kind, why);
-        if let Some(handler) = &trigger.handler
-            && !valid_name(handler)
-        {
-            return Err(ManifestError::InvalidName(handler.clone()));
-        }
         let timer = kind == TriggerKind::Every;
         let webhook = kind == TriggerKind::Webhook;
-        if trigger.input.is_some() && kind != TriggerKind::Manual {
-            return Err(invalid("only a manual trigger takes input"));
+        if !trigger.form.is_empty() && kind != TriggerKind::Manual {
+            return Err(invalid("only a manual trigger has a form"));
+        }
+        bounded("form fields", trigger.form.len())?;
+        for (name, field) in &trigger.form {
+            if !valid_name(name) {
+                return Err(ManifestError::InvalidName(name.clone()));
+            }
+            check_setting(field).map_err(|why| ManifestError::InvalidSetting(name.clone(), why))?;
         }
         if timer != trigger.interval.is_some() || (timer && trigger.interval_secs().is_none()) {
             return Err(invalid(
@@ -391,6 +362,7 @@ fn check_setting(setting: &Setting) -> Result<(), &'static str> {
         SettingKind::Choice => default
             .as_str()
             .is_some_and(|d| setting.choices.iter().any(|c| c == d)),
+        SettingKind::Dataset | SettingKind::Object => default.is_string(),
     };
     if !fits {
         return Err("the default does not fit the type");
@@ -441,7 +413,7 @@ pub fn valid_plugin(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
-/// A setting, slot, connection or handler name: 1 to 64 of `a-z`, `0-9` or `_`, starting with a letter.
+/// A setting, slot or connection name: 1 to 64 of `a-z`, `0-9` or `_`, starting with a letter.
 pub fn valid_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     (1..=MAX_NAME).contains(&bytes.len())

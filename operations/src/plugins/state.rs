@@ -139,7 +139,7 @@ mod tests {
             key: key.into(),
             value: value.to_vec(),
             expected,
-            intent: Intent::new(ordinal, None, &[key.as_bytes(), value]),
+            intent: Intent::new(ordinal, &[key.as_bytes(), value]),
         }
     }
 

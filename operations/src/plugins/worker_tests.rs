@@ -44,20 +44,14 @@ pub(crate) fn connected() -> Vec<u8> {
     artifact(true, false)
 }
 
-/// The fixture whose `api` connection injects the bearer slot `api_key`.
+/// The fixture whose `api` connection injects its bearer slot `api`.
 pub(crate) fn secured() -> Vec<u8> {
     artifact(true, true)
 }
 
-/// The runnable fixture with both sync triggers, handled by `echo`, which answers the event.
+/// The runnable fixture, whose sync triggers `echo` handles; it answers the event.
 pub(crate) fn echoed_sync() -> Vec<u8> {
-    use aruna_plugins::trigger::TriggerKind;
     let (component, mut manifest) = bare();
-    let echo = manifest.triggers[&TriggerKind::DatasetCreated].clone();
-    for kind in [TriggerKind::SyncCompleted, TriggerKind::SyncFailed] {
-        manifest.triggers.insert(kind, echo.clone());
-    }
-    manifest.handlers.retain(|handler| handler != "spin");
     (manifest.connections, manifest.secrets) = (BTreeMap::new(), BTreeMap::new());
     attach_manifest(component, &manifest).unwrap()
 }
@@ -142,7 +136,8 @@ pub(crate) async fn install_artifact(fixture: &Fixture, bytes: Vec<u8>) -> Plugi
     fixture.install(&request).await.unwrap()
 }
 
-/// A run of `install` that calls `handler` and is due now.
+/// A run of `install` that reaches the fixture's `handler` and is due now: `echo` through a
+/// dataset event, `spin` through the timer.
 async fn admitted(
     fixture: &Fixture,
     install: &PluginInstall,
@@ -152,7 +147,11 @@ async fn admitted(
     let mut run = queued(install.install_id, seq);
     run.digest = install.digest.clone();
     run.settings = install.settings.clone();
-    run.handler = handler.into();
+    run.handler = "timer".into();
+    if handler == "echo" {
+        run.trigger = RunTrigger::Event(created(install, "D1").0);
+        run.handler = "dataset_created".into();
+    }
     run.due_ms = 0;
     admit(&fixture.ctx, &run).await.unwrap();
     run
@@ -179,7 +178,7 @@ async fn finishes_runs() {
     let install = installed(&fixture).await;
     let ok = admitted(&fixture, &install, 1, "echo").await;
     let unsure = admitted(&fixture, &install, 2, "echo").await;
-    let intent = Intent::new(0, None, &[b"patch"]);
+    let intent = Intent::new(0, &[b"patch"]);
     mark_unknown(&fixture.ctx, unsure.run_id, &intent, "timed out")
         .await
         .unwrap();
@@ -203,10 +202,18 @@ async fn finishes_runs() {
     assert!(unfinished(&fixture.ctx).await.unwrap().is_empty());
 }
 
-/// A created dataset `resource` under the install's whole metadata grant, and that grant's base.
+/// Grant choices that scope both `read` and `write` to `patterns`.
+pub(crate) fn scoped(patterns: Vec<String>) -> BTreeMap<String, Vec<String>> {
+    BTreeMap::from([
+        ("read".into(), patterns.clone()),
+        ("write".into(), patterns),
+    ])
+}
+
+/// A created dataset `resource` under the install's group metadata, and that metadata's base.
 pub(crate) fn created(install: &PluginInstall, resource: &str) -> (SourceEvent, String) {
-    let whole = &install.grants["metadata.read"][0];
-    let base = whole.strip_suffix("/**").unwrap().to_string();
+    let whole = &install.grants["read"][0];
+    let base = format!("{}/meta", whole.strip_suffix("/**").unwrap());
     let event = SourceEvent {
         kind: SourceKind::DatasetCreated,
         group_id: install.group_id,
@@ -230,8 +237,13 @@ async fn event_input() {
         .unwrap();
     let (event, _) = created(&install, "D1");
     let run = event_run(&config, &install, &event, 0).unwrap();
-    assert_eq!(run.handler, "echo");
-    let call = invocation(&run, &install, Limits::default(), CancellationToken::new());
+    assert_eq!(run.handler, "dataset_created");
+    let call = invocation(
+        &run,
+        (&install, fixture.actor.node_id),
+        Limits::default(),
+        CancellationToken::new(),
+    );
     let Trigger::Event(given) = call.trigger else {
         panic!("an event run calls its handler with the event")
     };
@@ -252,8 +264,8 @@ async fn event_input() {
 
 /// A completed sync job of the relationship `relationship` under `prefix` of the install's data.
 pub(crate) fn synced(install: &PluginInstall, prefix: &str, relationship: Ulid) -> SourceEvent {
-    let whole = &install.grants["objects.read"][0];
-    let path = format!("{}/{prefix}", whole.strip_suffix("/**").unwrap());
+    let whole = &install.grants["read"][0];
+    let path = format!("{}/data/{prefix}", whole.strip_suffix("/**").unwrap());
     let creator = install.account;
     let kind = SourceKind::SyncCompleted;
     let node = iroh::SecretKey::from_bytes(&[9; 32]).public();
@@ -278,8 +290,13 @@ async fn sync_input() {
         .unwrap();
     let event = synced(&install, "raw/", Ulid::from_parts(3, 3));
     let run = event_run(&config, &install, &event, 0).unwrap();
-    assert_eq!(run.handler, "spin");
-    let call = invocation(&run, &install, Limits::default(), CancellationToken::new());
+    assert_eq!(run.handler, "sync_completed");
+    let call = invocation(
+        &run,
+        (&install, fixture.actor.node_id),
+        Limits::default(),
+        CancellationToken::new(),
+    );
     let Trigger::Event(given) = call.trigger else {
         panic!("an event run calls its handler with the event")
     };
@@ -307,7 +324,7 @@ async fn event_rechecked() {
     admit(&fixture.ctx, &run).await.unwrap();
     (run.state, run.attempts) = (RunState::Running, 1);
     save_run(&fixture.ctx, &run).await.unwrap();
-    let narrowed = BTreeMap::from([("metadata.read".into(), vec![format!("{base}/D2/**")])]);
+    let narrowed = scoped(vec![format!("{base}/D2/**")]);
     let auth = fixture.auth();
     set_grants(
         &fixture.ctx,
@@ -486,7 +503,7 @@ async fn removed_with_intents() {
     let install = installed(&fixture).await;
     let open = admitted(&fixture, &install, 1, "echo").await;
     let clean = admitted(&fixture, &install, 2, "echo").await;
-    let intent = Intent::new(0, None, &[b"patch"]);
+    let intent = Intent::new(0, &[b"patch"]);
     mark_unknown(ctx, open.run_id, &intent, "timed out")
         .await
         .unwrap();
@@ -552,4 +569,19 @@ async fn retries_hide_values() {
     let stored = stored.unwrap();
     assert_eq!(stored.state, RunState::Queued);
     assert_eq!(stored.message.as_deref(), Some("upstream said [redacted]"));
+}
+
+#[tokio::test]
+async fn event_paths_shortened() {
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let local = fixture.actor.node_id;
+    let realm = fixture.actor.realm_id;
+    let full = format!("/{realm}/g/{}/data/{local}/raw/a.fq", install.group_id);
+    assert_eq!(short_path(&full, (&install, local)), "raw/a.fq");
+    // An object of another node keeps its full path, so the plugin never names it ambiguously.
+    let other = iroh::SecretKey::from_bytes(&[9; 32]).public();
+    let remote = full.replace(&local.to_string(), &other.to_string());
+    assert_eq!(short_path(&remote, (&install, local)), remote);
+    assert_eq!(short_path("D1", (&install, local)), "D1");
 }

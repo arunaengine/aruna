@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::NodeId;
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
@@ -14,6 +13,7 @@ use aruna_core::plugin_runs::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::GroupId;
+use aruna_core::{NodeId, UserId};
 use aruna_plugins::trigger::TriggerKind;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -46,6 +46,7 @@ pub struct CoverageRow {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayRow {
     pub group_id: GroupId,
+    pub account: UserId,
     pub next: CoverageRow,
     pub old: Coverage,
     pub after: Vec<u8>,
@@ -190,6 +191,7 @@ async fn start_replay(
     };
     Ok(ReplayRow {
         group_id: target.group_id,
+        account: target.account,
         next,
         old,
         after: journal_key(JOURNAL_ROW, start.unwrap_or_default(), Ulid::nil()),
@@ -253,6 +255,7 @@ async fn replay_page(
         group_id: task.group_id,
         revision: task.next.revision,
         coverage: coverage.clone(),
+        account: task.account,
     };
     let (new, old) = (target(&task.next.coverage), target(&task.old));
     let mut outbox = Outbox::new(now_ms);

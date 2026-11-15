@@ -16,9 +16,6 @@ use crate::args::{Language, PluginCommand};
 use crate::client::read_json;
 use crate::error::CliError;
 
-/// The host contract every non-Rust project builds against; the Rust SDK carries its own copy.
-const CONTRACT: &str = include_str!("../../../plugins/wit/plugin.wit");
-
 /// Template files per language as (path, content); `{{name}}` becomes the plugin name.
 fn template(language: Language) -> Vec<(&'static str, &'static str)> {
     match language {
@@ -45,7 +42,6 @@ fn template(language: Language) -> Vec<(&'static str, &'static str)> {
                 "plugin.js",
                 include_str!("../../../plugins/templates/javascript/plugin.js"),
             ),
-            ("wit/plugin.wit", CONTRACT),
         ],
         Language::Python => vec![
             (
@@ -60,7 +56,6 @@ fn template(language: Language) -> Vec<(&'static str, &'static str)> {
                 "aruna.py",
                 include_str!("../../../plugins/templates/python/aruna.py"),
             ),
-            ("wit/plugin.wit", CONTRACT),
         ],
     }
 }
@@ -172,7 +167,9 @@ pub async fn plugin(context: &mut Context<'_>, command: PluginCommand) -> Result
             let summary = Built {
                 digest: ArtifactDigest::of(&built.artifact).to_string(),
                 artifact: built.path,
-                handlers: built.manifest.handlers.into_iter().collect(),
+                triggers: (built.manifest.triggers.keys())
+                    .map(|kind| kind.as_str().to_string())
+                    .collect(),
             };
             match context.out.json {
                 true => context.out.json(&summary),
@@ -283,12 +280,12 @@ fn setting_values(pairs: &[String]) -> Result<serde_json::Map<String, Value>, Cl
     Ok(values)
 }
 
-/// `permission=pattern` pairs grouped by permission; `permission=` keeps an empty list.
+/// `read=pattern` and `write=pattern` pairs grouped by access; `write=` keeps an empty list.
 fn grant_choices(pairs: &[String]) -> Result<BTreeMap<String, Vec<String>>, CliError> {
     let mut choices: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for pair in pairs {
-        let (permission, pattern) = split_pair(pair)?;
-        let patterns = choices.entry(permission.to_string()).or_default();
+        let (access, pattern) = split_pair(pair)?;
+        let patterns = choices.entry(access.to_string()).or_default();
         if !pattern.is_empty() {
             patterns.push(pattern.to_string());
         }
@@ -345,28 +342,7 @@ async fn install(
         summary["digest"].as_str().unwrap_or_default(),
         summary["group"].as_str().unwrap_or_default(),
     )];
-    for line in summary["permissions"].as_array().into_iter().flatten() {
-        let granted = line["granted"].as_array().map_or(0, Vec::len);
-        lines.push(format!(
-            "  {} granted on {granted} paths",
-            line["permission"].as_str().unwrap_or_default()
-        ));
-    }
-    for line in summary["secrets"].as_array().into_iter().flatten() {
-        lines.push(format!(
-            "  secret {} ({}) uses {}",
-            line["slot"].as_str().unwrap_or_default(),
-            line["kind"].as_str().unwrap_or_default(),
-            line["secret"].as_str().unwrap_or_default()
-        ));
-    }
-    for line in summary["connections"].as_array().into_iter().flatten() {
-        let granted = line["granted"].as_bool().unwrap_or(false);
-        lines.push(format!(
-            "  connection {} granted: {granted}",
-            line["url"].as_str().unwrap_or_default()
-        ));
-    }
+    lines.extend(summary_lines(summary));
     lines.push(match preview {
         true => format!(
             "install with --id {} --version {}",
@@ -557,17 +533,79 @@ async fn change(
     context.out.line(lines.join("\n"))
 }
 
+/// The summary's grants, secrets and services, one line each, as the installer reads them.
+fn summary_lines(summary: &Value) -> Vec<String> {
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    let mut lines = Vec::new();
+    for line in summary["permissions"].as_array().into_iter().flatten() {
+        let granted = line["granted"].as_array().map_or(0, Vec::len);
+        let grant = text(&line["permission"]);
+        lines.push(format!("  {grant} granted on {granted} paths"));
+    }
+    for line in summary["secrets"].as_array().into_iter().flatten() {
+        let (slot, kind, secret) = (
+            text(&line["slot"]),
+            text(&line["kind"]),
+            text(&line["secret"]),
+        );
+        let readable = match line["value"].as_bool() == Some(true) {
+            true => ", and the code can read its value",
+            false => "",
+        };
+        lines.push(format!("  secret {slot} ({kind}) uses {secret}{readable}"));
+    }
+    for line in summary["connections"].as_array().into_iter().flatten() {
+        let methods: Vec<String> = (line["methods"].as_array().into_iter().flatten())
+            .map(text)
+            .collect();
+        let methods = match methods.len() {
+            6 => "any method".to_string(),
+            _ => methods.join(", "),
+        };
+        let (name, url) = (text(&line["name"]), text(&line["url"]));
+        lines.push(format!(
+            "  service {name}: {url}, {methods}; the plugin reads everything this service \
+             answers, and can send there anything it may read"
+        ));
+    }
+    lines
+}
+
 #[derive(Debug, Serialize)]
 struct Built {
     artifact: PathBuf,
     digest: String,
-    handlers: Vec<String>,
+    triggers: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use aruna_plugins::package::load_manifest;
+
+    #[test]
+    fn summary_shows_services() {
+        let all = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
+        let summary = serde_json::json!({
+            "permissions": [{"permission": "read", "granted": ["/r/g/a/**"]}],
+            "secrets": [{"slot": "key", "kind": "bearer", "secret": "group:key", "value": true}],
+            "connections": [
+                {"name": "catalog", "url": "https://c.example.org", "methods": ["GET", "POST"]},
+                {"name": "mirror", "url": "https://m.example.org", "methods": all}
+            ]
+        });
+        let tail = "the plugin reads everything this service answers, and can send there \
+                    anything it may read";
+        assert_eq!(
+            summary_lines(&summary),
+            [
+                "  read granted on 1 paths".to_string(),
+                "  secret key (bearer) uses group:key, and the code can read its value".into(),
+                format!("  service catalog: https://c.example.org, GET, POST; {tail}"),
+                format!("  service mirror: https://m.example.org, any method; {tail}"),
+            ]
+        );
+    }
 
     #[test]
     fn starter_projects() {
@@ -577,14 +615,11 @@ mod tests {
             create("lab-sync", language, &path).unwrap();
             let mut manifest = load_manifest(&path).unwrap();
             assert_eq!(manifest.name, "lab-sync");
-            assert_eq!(manifest.wire(None), Ok(()), "{language:?}");
-            assert_eq!(manifest.build.is_some(), language != Language::Rust);
+            assert_eq!(manifest.wire(), Ok(()), "{language:?}");
         }
         let rust = dir.path().join("rust");
         let code = std::fs::read_to_string(rust.join("src").join("lib.rs")).unwrap();
-        assert!(code.contains("aruna_plugin::export!(run);"));
-        let contract = std::fs::read_to_string(dir.path().join("python/wit/plugin.wit")).unwrap();
-        assert_eq!(contract, CONTRACT);
+        assert!(code.contains("aruna_plugin::export! { manual => run }"));
         assert!(
             create("lab-sync", Language::Rust, &rust).is_err(),
             "a folder with files is refused"

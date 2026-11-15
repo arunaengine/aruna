@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
+use aruna_core::secrets::ResponseExposure;
 use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
@@ -54,7 +55,7 @@ pub(crate) async fn probe(
     let mut run = queued(install.install_id, 1);
     run.run_id = Ulid::generate();
     (run.digest, run.settings) = (install.digest.clone(), install.settings.clone());
-    (run.handler, run.due_ms) = ("probe".to_string(), 0);
+    (run.handler, run.due_ms) = ("manual".to_string(), 0);
     run.trigger = RunTrigger::Manual {
         by: fixture.actor.user_id,
         input: input.to_string(),
@@ -81,8 +82,8 @@ async fn sends_below_connection() {
     let done = probe(&fixture, &install, sender.clone(), input).await;
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
     let output: serde_json::Value = serde_json::from_str(&done.output.unwrap()).unwrap();
-    // Projected once: the listed pointers and nothing beside them.
-    let fields = serde_json::json!({"/id": 7, "/meta/name": "n"});
+    // The code reads the whole answer.
+    let fields: serde_json::Value = serde_json::from_str(answer).unwrap();
     assert_eq!(output, serde_json::json!({"status": 200, "fields": fields}));
     let (request, body) = sender.asked.lock().unwrap()[0].clone();
     assert_eq!(request.url.as_str(), "https://api.example.org/v1/records");
@@ -180,7 +181,7 @@ async fn oversized_rerun() {
         query: Vec::new(),
         headers: Vec::new(),
         body: b"{}".to_vec(),
-        intent: Some(Intent::new(0, None, &[b"records"])),
+        intent: Some(Intent::new(0, &[b"records"])),
     };
     for _ in 0..2 {
         let refused = broker
@@ -228,8 +229,8 @@ async fn undeclared_method() {
 }
 
 /// The secured fixture installed with its slot bound to the group secret `api-key`, whose
-/// one rule lets this install inject it toward the fixture's address with `pointers`.
-async fn secured_install(fixture: &Fixture, pointers: &[&str]) -> PluginInstall {
+/// one rule lets this install inject it toward the fixture's address.
+async fn secured_install(fixture: &Fixture) -> PluginInstall {
     use crate::plugins::bound::tests::{edit_config, secret_with};
     use crate::plugins::worker::tests::{publish_artifact, secured};
     install_artifact(fixture, connected()).await;
@@ -238,24 +239,13 @@ async fn secured_install(fixture: &Fixture, pointers: &[&str]) -> PluginInstall 
     edit_config(fixture, |config| {
         let install = &mut config.installs[0];
         (install.digest, install.version) = (digest, "0.2.1".to_string());
-        install.secrets = [("api_key".to_string(), binding)].into();
+        install.secrets = [("api".to_string(), binding)].into();
     })
     .await;
     let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
     let install = config.await.unwrap().installs.remove(0);
-    secret_with(fixture, &install, exposure(pointers)).await;
+    secret_with(fixture, &install, ResponseExposure::Full).await;
     install
-}
-
-fn exposure(pointers: &[&str]) -> aruna_core::secrets::ResponseExposure {
-    use aruna_core::secrets::ResponseExposure;
-    match pointers.is_empty() {
-        true => ResponseExposure::Status,
-        false => ResponseExposure::Fields {
-            pointers: pointers.iter().map(|pointer| pointer.to_string()).collect(),
-            headers: Vec::new(),
-        },
-    }
 }
 
 /// Every stored byte of the run's record and intents, to look for a canary.
@@ -275,7 +265,7 @@ async fn stored(fixture: &Fixture) -> Vec<u8> {
 async fn injects_without_showing() {
     use crate::plugins::bound::tests::{TOKEN, keys};
     let fixture = Fixture::keyed().await;
-    let install = secured_install(&fixture, &["/id", "/meta/name"]).await;
+    let install = secured_install(&fixture).await;
     // The destination echoes the token back in a field the code may read.
     let echo = format!(r#"{{"id":7,"meta":{{"name":"{TOKEN}"}},"items":[1,2]}}"#);
     let sender = fake(200, &echo);
@@ -293,7 +283,7 @@ async fn injects_without_showing() {
         Some(format!("Bearer {TOKEN}").as_str())
     );
     let output: serde_json::Value = serde_json::from_str(done.output.as_ref().unwrap()).unwrap();
-    let fields = serde_json::json!({"/id": 7, "/meta/name": "[redacted]"});
+    let fields = serde_json::json!({"id": 7, "meta": {"name": "[redacted]"}, "items": [1, 2]});
     assert_eq!(output, serde_json::json!({"status": 200, "fields": fields}));
     let kept = stored(&fixture).await;
     assert!(
@@ -313,7 +303,7 @@ async fn probe_with(
     let mut run = queued(install.install_id, 1);
     run.run_id = Ulid::generate();
     (run.digest, run.settings) = (install.digest.clone(), install.settings.clone());
-    (run.handler, run.due_ms) = ("probe".to_string(), 0);
+    (run.handler, run.due_ms) = ("manual".to_string(), 0);
     run.trigger = RunTrigger::Manual {
         by: fixture.actor.user_id,
         input: input.to_string(),
@@ -328,11 +318,11 @@ async fn probe_with(
 }
 
 #[tokio::test]
-async fn replays_only_narrow() {
+async fn narrowed_rules_refuse() {
     use crate::plugins::bound::tests::keys;
     use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
     let fixture = Fixture::keyed().await;
-    let install = secured_install(&fixture, &["/id", "/meta/name"]).await;
+    let install = secured_install(&fixture).await;
     let sender = fake(200, r#"{"id":7,"meta":{"name":"n"}}"#);
     let input = serde_json::json!({
         "call": "send", "connection": "api", "method": "POST", "path": "records"
@@ -340,54 +330,32 @@ async fn replays_only_narrow() {
     let worker = worker(&fixture);
     worker.use_keys(keys());
     let mut run = probe_with(&fixture, &install, (&worker, sender.clone()), input).await;
-    let fields = |run: &aruna_core::plugin_runs::PluginRun| {
-        let output: serde_json::Value = serde_json::from_str(run.output.as_ref().unwrap()).unwrap();
-        output["fields"].clone()
-    };
-    assert_eq!(
-        fields(&run),
-        serde_json::json!({"/id": 7, "/meta/name": "n"})
-    );
+    assert_eq!(run.state, RunState::Succeeded, "{:?}", run.message);
+    // An admin narrows the rule by hand: a retry refuses the settled call instead of filtering
+    // its stored reply, and never sends it again.
     let name = aruna_core::secrets::SecretName::try_from("api-key".to_string()).unwrap();
     let guard = RuleGuard::Revision {
         install_id: install.install_id,
         revision: install.revision,
     };
-    // Each retry answers the settled call from its stored reply under the rule of that moment.
-    for (pointers, expected) in [
-        (
-            vec!["/id", "/meta/name"],
-            serde_json::json!({"/id": 7, "/meta/name": "n"}),
-        ),
-        (vec!["/id"], serde_json::json!({"/id": 7})),
-        (vec![], serde_json::json!({})),
-    ] {
-        let mut rule = crate::plugins::bound::tests::rule_for(&install, exposure(&pointers));
-        rule.paths = vec!["/v1".to_string()];
-        let target = (install.group_id, &name);
-        edit_rules(
-            &fixture.ctx,
-            &fixture.actor,
-            target,
-            (&consumer(&install), vec![rule]),
-            guard,
-        )
+    let mut rule = crate::plugins::bound::tests::rule_for(&install, ResponseExposure::Status);
+    rule.paths = vec!["/v1".to_string()];
+    let target = (install.group_id, &name);
+    let rules = (&consumer(&install), vec![rule]);
+    edit_rules(&fixture.ctx, &fixture.actor, target, rules, guard)
         .await
         .unwrap();
-        (run.state, run.output, run.finished_ms) = (RunState::Queued, None, None);
-        admit(&fixture.ctx, &run).await.unwrap();
-        worker.claim(unix_timestamp_millis()).await.unwrap();
-        worker.settle().await;
-        run = read_run(&fixture.ctx, install.install_id, run.run_id)
-            .await
-            .unwrap();
-        assert_eq!(fields(&run), expected, "{pointers:?}");
-    }
-    assert_eq!(
-        sender.asked.lock().unwrap().len(),
-        1,
-        "a settled call is never sent again"
-    );
+    (run.state, run.output, run.finished_ms) = (RunState::Queued, None, None);
+    admit(&fixture.ctx, &run).await.unwrap();
+    worker.claim(unix_timestamp_millis()).await.unwrap();
+    worker.settle().await;
+    run = read_run(&fixture.ctx, install.install_id, run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(run.state, RunState::Failed);
+    let message = run.message.unwrap_or_default();
+    assert!(message.contains("use rule"), "{message}");
+    assert_eq!(sender.asked.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -395,14 +363,13 @@ async fn whole_answers_gated() {
     use crate::plugins::bound::tests::{bound, edit_config, keys, secret_with};
     use crate::plugins::broker::RunBroker;
     use crate::plugins::check::RunScope;
-    use aruna_core::secrets::ResponseExposure;
     use aruna_plugins::broker::{Broker, CallContext, ErrorKind, Method, SendRequest};
     let fixture = Fixture::keyed().await;
     // A connection that reads whole answers with the bearer slot `api_key`.
     let install = bound(&fixture).await;
     let whole = serde_json::json!({
         "secrets": { "api_key": { "title": "API key", "kind": "bearer" } },
-        "connections": { "catalog": { "url": "{catalog_url}/api/", "auth": "api_key", "response": "full" } }
+        "connections": { "catalog": { "url": "{catalog_url}/api/", "auth": "api_key" } }
     });
     let digest = fixture.publish("0.3.0", "ef", whole).await;
     edit_config(&fixture, |config| {
@@ -447,7 +414,7 @@ async fn whole_answers_gated() {
                 body: Vec::new(),
                 intent: None,
             };
-            broker.connection_send_full(&cx, request).await
+            broker.connection_send(&cx, request).await
         }
     };
     use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
@@ -474,7 +441,7 @@ async fn whole_answers_gated() {
     let narrower = send().await.unwrap_err();
     assert_eq!(narrower.kind, ErrorKind::Denied);
     assert!(
-        narrower.message.contains("whole answer"),
+        narrower.message.contains("use rule"),
         "{}",
         narrower.message
     );
@@ -514,7 +481,7 @@ async fn canaries_stay_hidden() {
     use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
     use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
     let fixture = Fixture::keyed().await;
-    let install = secured_install(&fixture, &["/id", "/meta/name"]).await;
+    let install = secured_install(&fixture).await;
     // The destination echoes the token in a readable field and in a header.
     let echo = format!(r#"{{"id":7,"meta":{{"name":"Bearer {TOKEN}"}}}}"#);
     let sender = Arc::new(Fake {

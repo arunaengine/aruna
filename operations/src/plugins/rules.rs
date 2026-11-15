@@ -12,7 +12,7 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::Permission;
+use aruna_plugins::permission::Grant;
 use aruna_plugins::trigger::TriggerKind;
 use tracing::warn;
 use ulid::Ulid;
@@ -153,7 +153,7 @@ pub fn wanted_rules(
         install_id: install.install_id,
     };
     let granted = parse_grants(&install.grants);
-    let sends = granted.get(&Permission::ConnectionsSend);
+    let sends = granted.get(&Grant::Services);
     let group_bound = |slot: &String| {
         (install.secrets.get(slot)).filter(|binding| binding.scope == BoundScope::Group)
     };
@@ -179,15 +179,6 @@ pub fn wanted_rules(
             .base(&settings)
             .map_err(|why| format!("`{name}`: {why}"))?;
         let prefix = base.path().trim_end_matches('/');
-        let fields = connection.response.fields();
-        let response = match (connection.response.full(), fields.is_empty()) {
-            (true, _) => ResponseExposure::Full,
-            (false, true) => ResponseExposure::Status,
-            (false, false) => ResponseExposure::Fields {
-                pointers: fields.to_vec(),
-                headers: Vec::new(),
-            },
-        };
         wanted
             .entry(binding.name.clone())
             .or_default()
@@ -202,7 +193,7 @@ pub fn wanted_rules(
                     .iter()
                     .map(|m| m.as_str().to_string())
                     .collect(),
-                response,
+                response: ResponseExposure::Full,
                 ..rule(Delivery::Inject)
             });
     }
@@ -216,7 +207,7 @@ pub fn wanted_rules(
             .or_default()
             .push(rule(Delivery::Verify));
     }
-    let values = granted.get(&Permission::SecretsValue);
+    let values = granted.get(&Grant::Secrets);
     for slot in manifest.secrets.keys() {
         let path = scope.secret(slot);
         let shown = values.is_some_and(|patterns| patterns.iter().any(|p| covers(p, &path)));
@@ -225,81 +216,19 @@ pub fn wanted_rules(
             rules.push(rule(Delivery::Value));
         }
     }
-    wanted.values_mut().for_each(widen_shared);
+    wanted.values_mut().for_each(distinct);
     Ok(wanted)
 }
 
-/// A use check takes the first matching rule, so every rule gets the exposure of each rule a
-/// request could match with it, and exact duplicates go. The broker still narrows each answer to
-/// its own connection's fields.
-fn widen_shared(rules: &mut Vec<UseRule>) {
-    let joined: Vec<ResponseExposure> = (rules.iter())
-        .map(|rule| {
-            (rules.iter())
-                .filter(|other| overlaps(rule, other))
-                .fold(rule.response.clone(), |joined, other| {
-                    join(joined, &other.response)
-                })
-        })
-        .collect();
+/// Drops exact duplicates, such as two connections with the same address and methods.
+fn distinct(rules: &mut Vec<UseRule>) {
     let mut kept: Vec<UseRule> = Vec::new();
-    for (mut rule, response) in rules.drain(..).zip(joined) {
-        rule.response = response;
+    for rule in rules.drain(..) {
         if !kept.contains(&rule) {
             kept.push(rule);
         }
     }
     *rules = kept;
-}
-
-/// Whether one request could match both inject rules.
-fn overlaps(a: &UseRule, b: &UseRule) -> bool {
-    let nested = |p: &String, q: &String| {
-        let within = |path: &str, prefix: &str| {
-            let rest = path.strip_prefix(prefix);
-            rest.is_some_and(|rest| {
-                rest.is_empty() || prefix.ends_with('/') || rest.starts_with('/')
-            })
-        };
-        within(p, q) || within(q, p)
-    };
-    a.delivery == b.delivery
-        && a.origins.iter().any(|origin| b.origins.contains(origin))
-        && (a.methods.is_empty()
-            || b.methods.is_empty()
-            || a.methods.iter().any(|method| b.methods.contains(method)))
-        && (a.paths.is_empty()
-            || b.paths.is_empty()
-            || a.paths.iter().any(|p| b.paths.iter().any(|q| nested(p, q))))
-}
-
-/// The exposure that shows what either shows.
-fn join(joined: ResponseExposure, other: &ResponseExposure) -> ResponseExposure {
-    use ResponseExposure::{Fields, Full, Status};
-    match (joined, other) {
-        (Full, _) | (_, Full) => Full,
-        (Status, other) => other.clone(),
-        (fields, Status) => fields,
-        (
-            Fields { pointers, headers },
-            Fields {
-                pointers: more,
-                headers: added,
-            },
-        ) => {
-            // Sorted, so rules with the same selectors and fields compare equal.
-            let union = |mut list: Vec<String>, more: &[String]| {
-                list.extend_from_slice(more);
-                list.sort_unstable();
-                list.dedup();
-                list
-            };
-            Fields {
-                pointers: union(pointers, more),
-                headers: union(headers, added),
-            }
-        }
-    }
 }
 
 /// Ensures the install's rules on every group secret it binds, for its current revision.

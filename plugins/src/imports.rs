@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use crate::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    FullResponse, HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo,
-    ObjectPage, Response, SendRequest, StatePut,
+    HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo, ObjectPage,
+    Response, SendRequest, StatePut,
 };
 use crate::host::wit::aruna::plugin::{
-    connections, grants, log, metadata_create, metadata_read, metadata_write, objects_read,
-    secrets, state, types,
+    log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services, state,
+    types,
 };
 use crate::host::{Needs, Session};
 use crate::permission::Permission;
@@ -107,27 +107,6 @@ fn method_name(method: Method) -> &'static str {
     }
 }
 
-impl grants::Host for Session {
-    async fn granted(&mut self, permission: String, resource: String) -> wasmtime::Result<bool> {
-        let size = permission.len() + resource.len();
-        let Ok(permission) = permission.parse::<Permission>() else {
-            self.count_call()?;
-            self.charge(size)?;
-            return Ok(false);
-        };
-        let reply = self
-            .brokered(
-                size,
-                Effect::Read,
-                Needs::Free,
-                |broker, cx| async move { Ok(broker.granted(&cx, permission, &resource).await) },
-                |_| 0,
-            )
-            .await?;
-        Ok(reply.unwrap_or(false))
-    }
-}
-
 impl metadata_read::Host for Session {
     async fn get(&mut self, resource: String) -> wasmtime::Result<Result<Document, HostError>> {
         self.brokered(
@@ -193,12 +172,10 @@ impl metadata_write::Host for Session {
         resource: String,
         patch: String,
         expected: String,
-        key: Option<String>,
     ) -> wasmtime::Result<Result<String, HostError>> {
-        let size =
-            resource.len() + patch.len() + expected.len() + key.as_ref().map_or(0, String::len);
+        let size = resource.len() + patch.len() + expected.len();
         let parts: [&[u8]; 3] = [resource.as_bytes(), patch.as_bytes(), expected.as_bytes()];
-        let intent = Intent::new(self.next_ordinal(), key, &parts);
+        let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
         let patch = MetadataPatch {
             resource,
@@ -221,17 +198,15 @@ impl metadata_write::Host for Session {
         resource: String,
         file: String,
         expected: String,
-        key: Option<String>,
     ) -> wasmtime::Result<Result<String, HostError>> {
-        let size =
-            resource.len() + file.len() + expected.len() + key.as_ref().map_or(0, String::len);
+        let size = resource.len() + file.len() + expected.len();
         let parts: [&[u8]; 4] = [
             b"put",
             resource.as_bytes(),
             file.as_bytes(),
             expected.as_bytes(),
         ];
-        let intent = Intent::new(self.next_ordinal(), key, &parts);
+        let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
         let change = FileChange {
             resource,
@@ -254,16 +229,15 @@ impl metadata_write::Host for Session {
         resource: String,
         id: String,
         expected: String,
-        key: Option<String>,
     ) -> wasmtime::Result<Result<String, HostError>> {
-        let size = resource.len() + id.len() + expected.len() + key.as_ref().map_or(0, String::len);
+        let size = resource.len() + id.len() + expected.len();
         let parts: [&[u8]; 4] = [
             b"remove",
             resource.as_bytes(),
             id.as_bytes(),
             expected.as_bytes(),
         ];
-        let intent = Intent::new(self.next_ordinal(), key, &parts);
+        let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
         let change = FileChange {
             resource,
@@ -287,16 +261,16 @@ impl metadata_create::Host for Session {
         &mut self,
         path: String,
         dataset: String,
-        key: String,
     ) -> wasmtime::Result<Result<Created, HostError>> {
-        let size = path.len() + dataset.len() + key.len();
-        let parts: [&[u8]; 3] = [path.as_bytes(), dataset.as_bytes(), key.as_bytes()];
-        let intent = Intent::new(self.next_ordinal(), Some(key.clone()), &parts);
+        let size = path.len() + dataset.len();
+        let parts: [&[u8]; 2] = [path.as_bytes(), dataset.as_bytes()];
+        let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
+        // One path names one document, so the path is the create's key across runs.
         let create = MetadataCreate {
+            key: path.clone(),
             path,
             dataset,
-            key,
             intent,
         };
         self.brokered(
@@ -346,10 +320,10 @@ impl objects_read::Host for Session {
     }
 }
 
-impl connections::Host for Session {
+impl services::Host for Session {
     async fn send(
         &mut self,
-        request: connections::Request,
+        request: services::Request,
     ) -> wasmtime::Result<Result<Response, HostError>> {
         let (size, effect, outbound) = self.outbound(request);
         let connection = outbound.connection.clone();
@@ -359,56 +333,39 @@ impl connections::Host for Session {
             Needs::Connection(&connection),
             // The broker applies the exposure; the reply passes through as it answers.
             |broker, cx| async move { broker.connection_send(&cx, outbound).await },
-            |reply: &Response| reply.json.as_ref().map_or(0, String::len) + 2,
-        )
-        .await
-    }
-
-    async fn send_full(
-        &mut self,
-        request: connections::Request,
-    ) -> wasmtime::Result<Result<FullResponse, HostError>> {
-        let (size, effect, outbound) = self.outbound(request);
-        let connection = outbound.connection.clone();
-        self.brokered(
-            size,
-            effect,
-            Needs::Connection(&connection),
-            |broker, cx| async move { broker.connection_send_full(&cx, outbound).await },
-            |reply: &FullResponse| fields_len(&reply.headers) + reply.body.len() + 2,
+            |reply: &Response| fields_len(&reply.headers) + reply.body.len() + 2,
         )
         .await
     }
 }
 
 impl Session {
-    /// A connection request as the broker gets it, its size, and its intent when it may
-    /// change remote state.
-    fn outbound(&mut self, request: connections::Request) -> (usize, Effect, SendRequest) {
-        let size = request.connection.len()
+    /// A service request as the broker gets it, its size, and its intent when it may change
+    /// remote state.
+    fn outbound(&mut self, request: services::Request) -> (usize, Effect, SendRequest) {
+        let size = request.service.len()
             + request.path.len()
             + fields_len(&request.query)
             + fields_len(&request.headers)
-            + request.body.len()
-            + request.key.as_ref().map_or(0, String::len);
+            + request.body.len();
         let mutating = !matches!(request.method, Method::Get | Method::Head);
         let intent = mutating.then(|| {
             let parts: [&[u8]; 6] = [
-                request.connection.as_bytes(),
+                request.service.as_bytes(),
                 method_name(request.method).as_bytes(),
                 request.path.as_bytes(),
                 &field_bytes(&request.query),
                 &field_bytes(&request.headers),
                 &request.body,
             ];
-            Intent::new(self.next_ordinal(), request.key.clone(), &parts)
+            Intent::new(self.next_ordinal(), &parts)
         });
         let effect = match &intent {
             Some(intent) => Effect::Write(intent.clone()),
             None => Effect::Read,
         };
         let outbound = SendRequest {
-            connection: request.connection,
+            connection: request.service,
             method: request.method,
             path: request.path,
             query: request.query,
@@ -445,7 +402,7 @@ impl state::Host for Session {
             &value,
             version.as_ref().map_or(&[][..], |v| &v[..]),
         ];
-        let intent = Intent::new(self.next_ordinal(), None, &parts);
+        let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
         let put = StatePut {
             key,

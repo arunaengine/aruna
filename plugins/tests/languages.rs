@@ -31,8 +31,8 @@ const BUILD_VAR: &str = "ARUNA_PLUGIN_BUILD";
 /// Where that child run writes the built artifact.
 const OUT_VAR: &str = "ARUNA_PLUGIN_BUILT";
 
-/// The catalog's answer to a new record; the manifest lets the code read only `/id`.
-const RECORD: &str = r#"{"/id":"c-1"}"#;
+/// The catalog's answer to a new record.
+const RECORD: &str = r#"{"id":"c-1","created":true}"#;
 
 /// Answers like a group with one dataset and a catalog, and records what the plugin sent.
 /// Reading `missing` is unavailable and reading `denied` is denied.
@@ -62,11 +62,6 @@ fn unused() -> HostError {
 
 #[async_trait::async_trait]
 impl Broker for Catalog {
-    async fn granted(&self, _: &CallContext, permission: Permission, resource: &str) -> bool {
-        self.note(format!("granted {permission} {resource}"));
-        permission == Permission::MetadataWrite
-    }
-
     async fn metadata_get(&self, _: &CallContext, resource: &str) -> Result<Document, HostError> {
         self.note(format!("get {resource}"));
         match resource {
@@ -126,8 +121,11 @@ impl Broker for Catalog {
             "send {} {:?} {body}",
             request.connection, request.method
         ));
-        let json = Some(self.reply.into());
-        Ok(Response { status: 201, json })
+        Ok(Response {
+            status: 201,
+            headers: Vec::new(),
+            body: self.reply.into(),
+        })
     }
 
     async fn state_get(&self, _: &CallContext, _: &str) -> Result<Option<Entry>, HostError> {
@@ -195,7 +193,7 @@ struct Plugin {
 /// Builds the project in a child process and compiles it; the whole case shares one deadline.
 async fn build(project: PathBuf) -> Plugin {
     let deadline = Instant::now() + HANG_CAP;
-    let artifact = build_child(&project, deadline).await.unwrap();
+    let artifact = build_child(&project, None, deadline).await.unwrap();
     let runtime = Runtime::new(RuntimeConfig {
         max_artifact: 64 << 20,
         ceiling: limits(),
@@ -214,8 +212,13 @@ async fn build(project: PathBuf) -> Plugin {
 }
 
 /// Builds `project` in a child run of this binary, in a process group of its own, so a stuck
-/// toolchain is killed with everything it started once the deadline passes.
-async fn build_child(project: &Path, deadline: Instant) -> Result<Vec<u8>, String> {
+/// toolchain is killed with everything it started once the deadline passes. `tools` comes first
+/// in the child's PATH.
+async fn build_child(
+    project: &Path,
+    tools: Option<&Path>,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
     let name = project.file_name().unwrap().to_string_lossy().to_string();
     let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("built-{name}.wasm"));
     let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
@@ -224,6 +227,13 @@ async fn build_child(project: &Path, deadline: Instant) -> Result<Vec<u8>, Strin
         .env(BUILD_VAR, project)
         .env(OUT_VAR, &out)
         .kill_on_drop(true);
+    if let Some(tools) = tools {
+        let rest = std::env::var_os("PATH").unwrap_or_default();
+        let paths = [tools.to_path_buf()]
+            .into_iter()
+            .chain(std::env::split_paths(&rest));
+        command.env("PATH", std::env::join_paths(paths).unwrap());
+    }
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().unwrap();
@@ -269,7 +279,6 @@ fn build_entry() {
 
 async fn run(
     plugin: &Plugin,
-    handler: &str,
     trigger: Trigger,
     broker: Arc<Catalog>,
 ) -> Result<Option<String>, InvokeError> {
@@ -277,7 +286,6 @@ async fn run(
         run: "run-1".into(),
         install: "install-1".into(),
         group: "group-1".into(),
-        handler: handler.into(),
         settings: r#"{"catalog_url":"https://catalog.example.org"}"#.into(),
         trigger,
         permissions: BTreeSet::from([Permission::MetadataRead, Permission::MetadataWrite]),
@@ -310,7 +318,7 @@ fn created() -> Trigger {
 async fn announce(language: &str) {
     let plugin = build(example(language)).await;
     let catalog = Catalog::new(RECORD);
-    let ended = run(&plugin, "dataset_created", created(), catalog.clone()).await;
+    let ended = run(&plugin, created(), catalog.clone()).await;
     assert!(ended.is_ok(), "{language}: {ended:?}");
     let calls = catalog.calls();
     let sent: serde_json::Value =
@@ -325,8 +333,7 @@ async fn announce(language: &str) {
         serde_json::json!({"id": "D1", "title": "Run 7"}),
         "{language}"
     );
-    assert_eq!(calls[2], "granted metadata.write D1", "{language}");
-    let (_, patch) = calls[3]
+    let (_, patch) = calls[2]
         .split_once("D1 r1 ")
         .expect("a patch at the read revision");
     let patch: serde_json::Value = serde_json::from_str(patch).unwrap();
@@ -335,11 +342,11 @@ async fn announce(language: &str) {
         serde_json::json!({"identifier": {"catalog": "c-1"}}),
         "{language}"
     );
-    assert_eq!(calls.len(), 4, "{language}: {calls:?}");
+    assert_eq!(calls.len(), 3, "{language}: {calls:?}");
 
     // A catalog answer without `/id` fails the run before any metadata is written.
     let catalog = Catalog::new(r#"{"other":1}"#);
-    let ended = run(&plugin, "dataset_created", created(), catalog.clone()).await;
+    let ended = run(&plugin, created(), catalog.clone()).await;
     let Err(InvokeError::Guest(failure)) = ended else {
         panic!("{language}: a missing id must fail the run: {ended:?}");
     };
@@ -352,22 +359,15 @@ async fn announce(language: &str) {
 }
 
 /// A project from the language's template whose `run` handler is `code`, triggered by hand and
-/// by a timer; the build reads the WIT from this crate.
+/// by a timer.
 fn probe(language: &str, code: &str) -> PathBuf {
     let templates = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("templates")
         .join(language);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("probe-{language}"));
     std::fs::create_dir_all(&dir).unwrap();
-    let wit = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wit");
-    let template = std::fs::read_to_string(templates.join("plugin.toml")).unwrap();
-    let build = &template[template.find("[build]").unwrap()..];
-    let build = build.replace("\"wit\"", &format!("{:?}", wit.display().to_string()));
-    let manifest = format!(
-        "name = \"probe\"\nversion = \"0.1.0\"\n\n[triggers]\nmanual = {{ handler = \"run\" }}\n\
-         every = {{ handler = \"run\", interval = \"1h\" }}\n\n[permissions]\n\
-         required = [\"metadata.read\"]\n\n{build}"
-    );
+    let manifest = "name = \"probe\"\nversion = \"0.1.0\"\non = [\"manual\", \"timer\"]\n\n\
+                    [timer]\nevery = \"1h\"\n";
     std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
     match language {
         "javascript" => {
@@ -387,17 +387,17 @@ fn probe(language: &str, code: &str) -> PathBuf {
 /// Runs a probe by hand with `input` and by a timer, and checks what each answer became.
 async fn check_probe(language: &str, plugin: &Plugin, plain: &str, tick: &str) {
     let manual = |input: &str| Trigger::Manual(serde_json::json!(input).to_string());
-    let answer = run(plugin, "run", manual("plain"), Catalog::new(RECORD)).await;
+    let answer = run(plugin, manual("plain"), Catalog::new(RECORD)).await;
     assert_eq!(answer.unwrap().as_deref(), Some(plain), "{language}");
     let timer = Trigger::Timer(1_762_700_000_000);
-    let answer = run(plugin, "run", timer, Catalog::new(RECORD)).await;
+    let answer = run(plugin, timer, Catalog::new(RECORD)).await;
     assert_eq!(answer.unwrap().as_deref(), Some(tick), "{language}");
     for (input, kind) in [
         ("retry", FailureKind::Retryable),
         ("missing", FailureKind::Retryable),
         ("denied", FailureKind::Permanent),
     ] {
-        let ended = run(plugin, "run", manual(input), Catalog::new(RECORD)).await;
+        let ended = run(plugin, manual(input), Catalog::new(RECORD)).await;
         let Err(InvokeError::Guest(failure)) = ended else {
             panic!("{language} {input}: {ended:?}");
         };
@@ -409,25 +409,28 @@ async fn check_probe(language: &str, plugin: &Plugin, plain: &str, tick: &str) {
     }
 }
 
-const JAVASCRIPT_PROBE: &str = r#"import { get } from "aruna:plugin/metadata-read@0.2.0";
+const JAVASCRIPT_PROBE: &str = r#"import { get } from "aruna:plugin/metadata-read@0.3.0";
+
+async function run(ctx, event) {
+  if (event.kind === "timer") return { tick: event.tick };
+  if (event.input === "retry") throw { kind: "retryable", message: "try later" };
+  if (event.input !== "plain") return get(event.input).json;
+  await Promise.resolve();
+  return "awaited";
+}
 
 const handlers = {
-  async run(ctx, event) {
-    if (event.kind === "timer") return { tick: event.tick };
-    if (event.input === "retry") throw { kind: "retryable", message: "try later" };
-    if (event.input !== "plain") return get(event.input).json;
-    await Promise.resolve();
-    return "awaited";
-  },
+  manual: run,
+  timer: run,
 };
 "#;
 
-const PYTHON_PROBE: &str = r#"from aruna import WitWorld, handler  # noqa: F401
+const PYTHON_PROBE: &str = r#"from aruna import WitWorld, on  # noqa: F401
 from componentize_py_types import Err
 from wit_world.imports import metadata_read, types
 
 
-@handler
+@on("manual", "timer")
 def run(ctx, event):
     if event["kind"] == "timer":
         return {"tick": event["tick"]}
@@ -480,12 +483,17 @@ async fn probes_python() {
 #[tokio::test]
 async fn kills_stuck_builds() {
     // A toolchain that never ends is killed with its process group once the deadline passes.
+    use std::os::unix::fs::PermissionsExt;
     let project = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stuck");
-    std::fs::create_dir_all(&project).unwrap();
-    let manifest = "name = \"stuck\"\nversion = \"0.1.0\"\n\n[build]\n\
-                    command = [\"sleep\", \"600\"]\noutput = \"plugin.wasm\"\n";
+    let tools = project.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let manifest = "name = \"stuck\"\nversion = \"0.1.0\"\non = [\"manual\"]\n";
     std::fs::write(project.join("plugin.toml"), manifest).unwrap();
+    std::fs::write(project.join("app.py"), "").unwrap();
+    let uv = tools.join("uv");
+    std::fs::write(&uv, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    let built = build_child(&project, deadline).await;
+    let built = build_child(&project, Some(&tools), deadline).await;
     assert!(built.is_err_and(|why| why.contains("deadline")));
 }

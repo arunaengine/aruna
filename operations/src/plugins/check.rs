@@ -16,7 +16,7 @@ use aruna_plugins::permission::Permission;
 use ulid::Ulid;
 
 use super::account::read_user;
-use super::grants::{InstallScope, accesses, parse_grants};
+use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
 use super::install::read_config;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -96,9 +96,8 @@ pub fn matching(
     target: &str,
 ) -> Result<BTreeSet<String>, HostError> {
     let grants = parse_grants(&install.grants);
-    let patterns: BTreeSet<String> = (grants.get(&permission).into_iter().flatten())
+    let patterns: BTreeSet<String> = (patterns_for(&grants, permission).into_iter())
         .filter(|pattern| covers(pattern, target))
-        .cloned()
         .collect();
     match patterns.is_empty() {
         true => Err(HostError::new(

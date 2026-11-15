@@ -1,39 +1,40 @@
-// Example plugin: posts the title of each new dataset to a catalog and, when granted,
-// records the catalog id on the dataset.
+// Example plugin: posts the title of each new dataset to a catalog and records the catalog id
+// on the dataset.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
-import { granted } from "aruna:plugin/grants@0.2.0";
-import { get } from "aruna:plugin/metadata-read@0.2.0";
-import { patch } from "aruna:plugin/metadata-write@0.2.0";
-import { send } from "aruna:plugin/connections@0.2.0";
+import { get } from "aruna:plugin/metadata-read@0.3.0";
+import { patch } from "aruna:plugin/metadata-write@0.3.0";
+import { send } from "aruna:plugin/services@0.3.0";
 
 const json = (value) => new TextEncoder().encode(JSON.stringify(value));
 
 const handlers = {
-  dataset_created(ctx, event) {
-    const dataset = event.kind === "manual" ? event.input?.dataset ?? event.input : event.resource;
-    const doc = get(dataset);
-    const title = JSON.parse(doc.json).name ?? null;
-    const headers = [{ name: "content-type", value: "application/json" }];
-    const request = { connection: "catalog", method: "post", path: "", query: [], headers, body: json({ id: dataset, title }) };
-    const reply = send(request);
-    if (granted("metadata.write", dataset)) {
-      const fields = JSON.parse(reply.json ?? "{}");
-      if (!("/id" in fields)) {
-        throw { kind: "permanent", message: "the response has no field `/id`" };
-      }
-      const identifier = { catalog: fields["/id"] };
-      patch(dataset, JSON.stringify({ identifier }), doc.revision, undefined);
-    }
-  },
+  dataset_created: announce,
+  manual: announce,
 };
 
-// Calls the named handler with a context and a plain event and awaits it; a thrown error fails
+function announce(ctx, event) {
+  const dataset = event.kind === "manual" ? event.input?.dataset ?? event.input : event.resource;
+  const doc = get(dataset);
+  const title = JSON.parse(doc.json).name ?? null;
+  const headers = [{ name: "content-type", value: "application/json" }];
+  const request = { service: "catalog", method: "post", path: "", query: [], headers, body: json({ id: dataset, title }) };
+  const reply = send(request);
+  const record = JSON.parse(new TextDecoder().decode(reply.body) || "{}");
+  if (!("id" in record)) {
+    throw { kind: "permanent", message: "the response has no field `id`" };
+  }
+  const identifier = { catalog: record.id };
+  patch(dataset, JSON.stringify({ identifier }), doc.revision);
+}
+
+// Calls the trigger's handler with a context and a plain event and awaits it; a thrown error fails
 // the run with the kind the Rust SDK would give it.
-export async function handle(name, invocation) {
+export async function handle(invocation) {
+  const name = triggerName(invocation.trigger);
   const handler = handlers[name];
   if (!handler) {
-    throw { kind: "invalid-input", message: `${name} is not a handler of this plugin` };
+    throw { kind: "invalid-input", message: `no handler for the trigger ${name}` };
   }
   const ctx = {
     run: invocation.run,
@@ -51,6 +52,16 @@ export async function handle(name, invocation) {
 
 // JSON has no BigInt, so a timer tick or another 64-bit number is written as a decimal string.
 const bigints = (_, value) => (typeof value === "bigint" ? value.toString() : value);
+
+// The triggers this plugin has handlers for; the build checks them against plugin.toml.
+export function triggers() {
+  return Object.keys(handlers);
+}
+
+// The plugin.toml name of the trigger that started the run.
+function triggerName({ tag, val }) {
+  return tag === "event" ? val.kind : tag;
+}
 
 // The plain event of a trigger: manual input as JSON, the timer tick, or the record's fields.
 function toEvent({ tag, val }) {

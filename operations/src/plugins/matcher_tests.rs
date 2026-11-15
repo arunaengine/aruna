@@ -1,16 +1,17 @@
-//! Tests matching: grants narrow the match, also for sync events, pages commit with their rows,
-//! the bound and stale rows count gaps, and a user node keeps no journal.
+//! Tests matching: grants narrow the match, also for sync events, own writes start nothing, pages
+//! commit with their rows, the bound and stale rows count gaps, and a user node keeps no journal.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{SourceKind, journal_entries};
+use aruna_core::structs::identity::realm::RealmId;
 
 use super::*;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::lifecycle::set_grants;
-use crate::plugins::worker::tests::{created, installed, synced};
+use crate::plugins::worker::tests::{created, installed, scoped, synced};
 
 /// Journals `event` on this node as a committing transaction would.
 pub(crate) async fn journal(fixture: &Fixture, event: &SourceEvent) {
@@ -64,7 +65,7 @@ async fn narrowed_grants() {
     let install = installed(&fixture).await;
     let (_, base) = created(&install, "A");
     let (inside, outside) = (created(&install, "A/one").0, created(&install, "B/two").0);
-    let narrowed = BTreeMap::from([("metadata.read".into(), vec![format!("{base}/A/**")])]);
+    let narrowed = scoped(vec![format!("{base}/A/**")]);
     let auth = fixture.auth();
     let install = set_grants(
         &fixture.ctx,
@@ -89,10 +90,8 @@ async fn narrowed_sync() {
     // A sync event under the granted prefix is matched; one under another prefix is not.
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
-    let base = install.grants["objects.read"][0]
-        .strip_suffix("/**")
-        .unwrap();
-    let narrowed = BTreeMap::from([("objects.read".into(), vec![format!("{base}/raw/**")])]);
+    let base = install.grants["read"][0].strip_suffix("/**").unwrap();
+    let narrowed = scoped(vec![format!("{base}/data/raw/**")]);
     let (inside, outside) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
     let events = [
         synced(&install, "raw/runs/", inside),
@@ -174,6 +173,7 @@ fn sync_matches_kind() {
         group_id,
         revision: 1,
         coverage: BTreeMap::from([(TriggerKind::SyncCompleted, BTreeSet::from(["/**".into()]))]),
+        account: UserId::local(Ulid::from_parts(2, 2), RealmId::from_bytes([1u8; 32])),
     };
     for (kind, matched) in [
         (SourceKind::DatasetCreated, false),
@@ -194,4 +194,24 @@ fn sync_matches_kind() {
         };
         assert_eq!(target.matches(&event), matched, "{kind:?}");
     }
+}
+
+#[tokio::test]
+async fn own_changes_skipped() {
+    // A dataset write of the install's own account starts no run of it; one by anyone else does.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let (mut own, _) = created(&install, "A/own");
+    let (mut other, _) = created(&install, "A/other");
+    for event in [&mut own, &mut other] {
+        event.kind = SourceKind::DatasetUpdated;
+        event.source = format!("dataset_updated/{}", event.resource);
+    }
+    (own.actor, other.actor) = (Some(install.account), Some(fixture.actor.user_id));
+    journal(&fixture, &own).await;
+    journal(&fixture, &other).await;
+    let local = fixture.actor.node_id;
+    let read = match_pending(&fixture.ctx, &config(&fixture).await, local, 10).await;
+    assert_eq!(read.unwrap(), 2);
+    assert_eq!(forwarded(&fixture, &install).await, ["A/other"]);
 }

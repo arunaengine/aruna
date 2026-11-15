@@ -157,8 +157,8 @@ pub enum PluginCommand {
         /// A setting as `name=value`; a JSON value is read as JSON, anything else as text.
         #[arg(long = "setting", value_name = "NAME=VALUE")]
         settings: Vec<String>,
-        /// A grant as `permission=pattern`, repeated for more; `permission=` removes it.
-        #[arg(long = "grant", value_name = "PERMISSION=PATTERN")]
+        /// A grant as `read=pattern` or `write=pattern`, repeated for more; `write=` removes it.
+        #[arg(long = "grant", value_name = "ACCESS=PATTERN")]
         grants: Vec<String>,
         /// A secret slot's secret as `slot=group:name`, `slot=realm:name` or `slot=node:name`.
         #[arg(long = "secret", value_name = "SLOT=SECRET")]
@@ -176,12 +176,12 @@ pub enum PluginCommand {
         #[arg(long)]
         group: String,
     },
-    /// Replace the grants of an install; a permission left out gets all of the group.
+    /// Replace the grants of an install; `read` or `write` left out gets all of the group.
     Grants {
         /// The install id.
         id: String,
-        /// A grant as `permission=pattern`, repeated for more; `permission=` removes it.
-        #[arg(long = "grant", value_name = "PERMISSION=PATTERN")]
+        /// A grant as `read=pattern` or `write=pattern`, repeated for more; `write=` removes it.
+        #[arg(long = "grant", value_name = "ACCESS=PATTERN")]
         grants: Vec<String>,
     },
     /// Move an install to another published version of its plugin.
@@ -210,7 +210,7 @@ pub enum PluginCommand {
     Run {
         /// The install id.
         id: String,
-        /// The trigger's JSON input; `{}` when omitted.
+        /// The values of the manual form as a JSON object; `{}` when omitted.
         #[arg(long)]
         input: Option<String>,
     },
@@ -583,9 +583,9 @@ mod tests {
             "--group",
             "g",
             "--grant",
-            "a=b",
+            "read=b",
             "--grant",
-            "c=",
+            "write=",
             "--secret",
             "api_key=realm:shared",
         ];
@@ -600,7 +600,7 @@ mod tests {
         };
         assert_eq!(
             (grants, preview),
-            (vec!["a=b".to_string(), "c=".to_string()], false)
+            (vec!["read=b".to_string(), "write=".to_string()], false)
         );
         assert_eq!(secrets, ["api_key=realm:shared"]);
         assert!(parse(&["plugin", "install", "announcer"]).is_err());

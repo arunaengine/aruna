@@ -25,7 +25,9 @@ fn covered_paths() {
 async fn checks_each_step() {
     let fixture = Fixture::new().await;
     let (ctx, actor) = (&fixture.ctx, &fixture.actor);
-    let installed = fixture.install(&fixture.request(None)).await.unwrap();
+    let mut request = fixture.request(None);
+    request.grants.insert("write".into(), Vec::new());
+    let installed = fixture.install(&request).await.unwrap();
     let mut run = queued(installed.install_id, 1);
     run.digest = installed.digest.clone();
     let scope = RunScope {
@@ -41,9 +43,9 @@ async fn checks_each_step() {
     assert!(call(scope.clone(), read.clone()).await.is_ok());
     assert!(check_call(ctx, &scope, None).await.is_ok());
 
-    let objects = (Permission::ObjectsRead, format!("{meta}/x"));
+    let write = (Permission::MetadataWrite, format!("{meta}/x"));
     assert_eq!(
-        kind(call(scope.clone(), objects).await),
+        kind(call(scope.clone(), write).await),
         Some(ErrorKind::NotGranted)
     );
     let elsewhere = (

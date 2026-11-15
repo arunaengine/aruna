@@ -2,8 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
+use crate::manifest::Setting;
 use crate::permission::Permission;
 
 /// Timers are coarse schedules, not sleep loops.
@@ -24,10 +27,26 @@ pub enum TriggerKind {
 }
 
 impl TriggerKind {
+    pub const ALL: [TriggerKind; 8] = [
+        Self::Manual,
+        Self::Every,
+        Self::Webhook,
+        Self::DatasetCreated,
+        Self::DataUploaded,
+        Self::SyncCompleted,
+        Self::SyncFailed,
+        Self::DatasetUpdated,
+    ];
+
+    /// The kind an author names in `on`, such as `timer` for [`TriggerKind::Every`].
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Manual => "manual",
-            Self::Every => "every",
+            Self::Every => "timer",
             Self::Webhook => "webhook",
             Self::DatasetCreated => "dataset_created",
             Self::DataUploaded => "data_uploaded",
@@ -49,22 +68,13 @@ impl TriggerKind {
     }
 }
 
-/// What a manual run asks the person for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ManualInput {
-    Dataset,
-}
-
 /// One trigger. Which fields apply depends on its kind.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Trigger {
-    /// Defaults to the handler named like the trigger, else the only handler.
+    /// `manual` only: the form a person fills in to start a run.
     #[serde(default)]
-    pub handler: Option<String>,
-    #[serde(default)]
-    pub input: Option<ManualInput>,
+    pub form: BTreeMap<String, Setting>,
     /// `every` only: a whole number followed by `m`, `h` or `d`.
     #[serde(default)]
     pub interval: Option<String>,

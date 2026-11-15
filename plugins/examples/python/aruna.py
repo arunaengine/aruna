@@ -1,4 +1,4 @@
-"""Calls plugin handlers by name: builds the context and event, and turns errors into failures."""
+"""Calls plugin handlers by trigger: builds the context and event, and turns errors into failures."""
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -21,10 +21,25 @@ class Context:
     settings: dict
 
 
-def handler(function: Callable) -> Callable:
-    """Registers a function as the handler with its own name."""
-    _handlers[function.__name__] = function
-    return function
+def on(*triggers: str) -> Callable:
+    """Registers a function as the handler of the named triggers of plugin.toml."""
+
+    def register(function: Callable) -> Callable:
+        for trigger in triggers:
+            _handlers[trigger] = function
+        return function
+
+    return register
+
+
+def _trigger_name(trigger: Any) -> str:
+    if isinstance(trigger, types.Trigger_Manual):
+        return "manual"
+    if isinstance(trigger, types.Trigger_Event):
+        return trigger.value.kind
+    if isinstance(trigger, types.Trigger_Webhook):
+        return "webhook"
+    return "timer"
 
 
 def _event(trigger: Any) -> dict:
@@ -50,10 +65,11 @@ def _failure(error: Exception) -> types.Failure:
 
 
 class WitWorld(wit_world.WitWorld):
-    def handle(self, handler: str, invocation: types.Invocation) -> str | None:
-        function = _handlers.get(handler)
+    def handle(self, invocation: types.Invocation) -> str | None:
+        name = _trigger_name(invocation.trigger)
+        function = _handlers.get(name)
         if function is None:
-            raise Err(types.Failure(types.FailureKind.INVALID_INPUT, f"{handler} is not a handler"))
+            raise Err(types.Failure(types.FailureKind.INVALID_INPUT, f"no handler for the trigger {name}"))
         ctx = Context(invocation.run, invocation.install, invocation.group, json.loads(invocation.settings))
         try:
             result = function(ctx, _event(invocation.trigger))
@@ -62,3 +78,6 @@ class WitWorld(wit_world.WitWorld):
         if result is None or isinstance(result, str):
             return result
         return json.dumps(result)
+
+    def triggers(self) -> list[str]:
+        return sorted(_handlers)

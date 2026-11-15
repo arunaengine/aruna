@@ -2,21 +2,30 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use thiserror::Error;
 use wasmparser::Parser;
 
-use crate::artifact::{
-    SectionError, attach_manifest, check_artifact, component_imports, read_handlers,
-};
+use crate::artifact::{SectionError, attach_manifest, check_artifact, component_imports};
 use crate::limits::RuntimeConfig;
-use crate::manifest::{BuildStep, Manifest, ManifestError};
-use crate::runtime::Runtime;
+use crate::manifest::{Manifest, ManifestError};
+use crate::runtime::{Compiled, Runtime};
 
-/// The target Rust projects without a build step compile to; the host adds no WASI there.
+/// The target Rust projects compile to; the host adds no WASI there.
 pub const RUST_TARGET: &str = "wasm32-unknown-unknown";
+
+/// The host contract Python and JavaScript builds read from the build folder.
+const CONTRACT: &str = include_str!("../wit/plugin.wit");
+
+/// The folder a Python or JavaScript build writes into the project, again on every build.
+const BUILD_DIR: &str = ".aruna";
+
+/// The pinned toolchains of Python and JavaScript projects.
+const COMPONENTIZE_PY: &str = "componentize-py==0.25.1";
+const JCO: &str = "@bytecodealliance/jco@1.17.0";
 
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -51,27 +60,27 @@ pub struct Built {
 /// Reads and checks a project's `plugin.toml`.
 pub fn load_manifest(project: &Path) -> Result<Manifest, BuildError> {
     let text = std::fs::read_to_string(project.join("plugin.toml"))?;
-    let manifest: Manifest =
-        toml::from_str(&text).map_err(|err| BuildError::Manifest(err.to_string()))?;
+    let manifest = crate::authored::parse(&text)?;
     manifest.check()?;
     Ok(manifest)
 }
 
-/// Runs the project's build step, or cargo for a Rust project without one, then packages
-/// the output and writes `<name>-<version>.wasm` beside it.
+/// Builds a Rust project with cargo, a Python (`app.py`) or JavaScript (`plugin.js`) one with
+/// its pinned toolchain, then packages the output as `<name>-<version>.wasm`: beside cargo's
+/// module, or in the project folder.
 pub fn build_project(project: &Path) -> Result<Built, BuildError> {
     let mut manifest = load_manifest(project)?;
-    let output = match &manifest.build {
-        Some(step) => run_step(project, step)?,
-        None if project.join("Cargo.toml").is_file() => cargo_module(&project.join("Cargo.toml"))?,
-        None => {
-            let hint = "add a [build] section with the command and output of your toolchain";
-            return Err(BuildError::Toolchain(hint.into()));
+    let file = format!("{}-{}.wasm", manifest.name, manifest.version);
+    let (output, path) = match project.join("Cargo.toml") {
+        cargo if cargo.is_file() => {
+            let module = cargo_module(&cargo)?;
+            let path = module.with_file_name(file);
+            (module, path)
         }
+        _ => (component(project)?, project.join(file)),
     };
     let bytes = std::fs::read(&output)?;
     let artifact = package(&mut manifest, &bytes)?;
-    let path = output.with_file_name(format!("{}-{}.wasm", manifest.name, manifest.version));
     std::fs::write(&path, &artifact)?;
     Ok(Built {
         manifest,
@@ -81,7 +90,8 @@ pub fn build_project(project: &Path) -> Result<Built, BuildError> {
 }
 
 /// Turns a core module with embedded WIT, or a finished component from any toolchain, into
-/// an artifact: handlers wired, imports checked, manifest embedded, whole artifact checked.
+/// an artifact: manifest checked and embedded, imports checked, whole artifact checked, and the
+/// triggers the code registered compared with the manifest's.
 pub fn package(manifest: &mut Manifest, bytes: &[u8]) -> Result<Vec<u8>, BuildError> {
     let component = if Parser::is_core_wasm(bytes) {
         wit_component::ComponentEncoder::default()
@@ -93,25 +103,86 @@ pub fn package(manifest: &mut Manifest, bytes: &[u8]) -> Result<Vec<u8>, BuildEr
     } else {
         return Err(BuildError::Output("unknown file format".into()));
     };
-    manifest.wire(read_handlers(&component)?)?;
+    manifest.wire()?;
     let imports = component_imports(&component)?;
     manifest.check_imports(imports.iter().map(String::as_str))?;
     let artifact = attach_manifest(&component, manifest)?;
     check_artifact(&artifact)?;
-    // Compiling against the host linker type-checks every import and the `handle` export.
+    // Compiling against the host linker type-checks every import and both exports.
     let config = RuntimeConfig::default();
     let runtime = Runtime::new(config).map_err(|err| BuildError::Host(err.to_string()))?;
-    (runtime.compile(&artifact)).map_err(|err| BuildError::Host(err.to_string()))?;
+    let compiled = (runtime.compile(&artifact)).map_err(|err| BuildError::Host(err.to_string()))?;
+    manifest.check_triggers(&registered(&runtime, &compiled)?)?;
     Ok(artifact)
 }
 
-fn run_step(project: &Path, step: &BuildStep) -> Result<PathBuf, BuildError> {
-    let (program, args) = step
-        .command
-        .split_first()
-        .ok_or_else(|| BuildError::Manifest("build.command is empty".into()))?;
+/// Asks the compiled code for its triggers on a thread of its own, since a build may already run
+/// inside an async runtime.
+fn registered(runtime: &Runtime, compiled: &Compiled) -> Result<BTreeSet<String>, BuildError> {
+    let host = |err: String| BuildError::Host(format!("listing the code's triggers: {err}"));
+    std::thread::scope(|scope| {
+        let asked = scope.spawn(|| {
+            let threads = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| host(err.to_string()))?;
+            (threads.block_on(runtime.triggers(compiled))).map_err(|err| host(err.to_string()))
+        });
+        asked
+            .join()
+            .map_err(|_| host("the thread ended early".into()))?
+    })
+}
+
+/// Writes the contract to `.aruna/wit/` and builds the project's component into `.aruna/`.
+fn component(project: &Path) -> Result<PathBuf, BuildError> {
+    let (wit, output) = (".aruna/wit", ".aruna/plugin.wasm");
+    let command = if project.join("app.py").is_file() {
+        let world = [
+            "-d",
+            wit,
+            "-w",
+            "plugin",
+            "componentize",
+            "app",
+            "-o",
+            output,
+        ];
+        let uv = [
+            "uv",
+            "run",
+            "--no-project",
+            "--with",
+            COMPONENTIZE_PY,
+            "componentize-py",
+        ];
+        [&uv[..], &world[..]].concat()
+    } else if project.join("plugin.js").is_file() {
+        let world = [
+            "--wit",
+            wit,
+            "--world-name",
+            "plugin",
+            "--disable",
+            "all",
+            "-o",
+            output,
+        ];
+        [
+            &["npx", "--yes", JCO, "componentize", "plugin.js"][..],
+            &world[..],
+        ]
+        .concat()
+    } else {
+        let hint = "found no Cargo.toml, app.py or plugin.js to build";
+        return Err(BuildError::Toolchain(hint.into()));
+    };
+    let folder = project.join(BUILD_DIR).join("wit");
+    std::fs::create_dir_all(&folder)?;
+    std::fs::write(folder.join("plugin.wit"), CONTRACT)?;
+    let program = command[0];
     let status = Command::new(program)
-        .args(args)
+        .args(&command[1..])
         .current_dir(project)
         .status()
         .map_err(|err| BuildError::Toolchain(format!("cannot run `{program}`: {err}")))?;
@@ -120,7 +191,7 @@ fn run_step(project: &Path, step: &BuildStep) -> Result<PathBuf, BuildError> {
             "`{program}` failed with {status}"
         )));
     }
-    Ok(project.join(&step.output))
+    Ok(project.join(output))
 }
 
 /// Runs `cargo build` for [`RUST_TARGET`] and returns the project's module.

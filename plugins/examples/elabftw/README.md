@@ -53,11 +53,9 @@ values; `<prefix>` is eLabFTW's path prefix, a folder name without slashes at it
      --setting elab_url=https://elab.example.org --setting sync_user=<sync user id> \
      --setting aruna_url=https://portal.example.org --setting writers=3,group:4 \
      --setting bucket=/<realm>/g/<group>/data/<node>/<bucket> --setting prefix=<prefix> \
-     --grant 'metadata.read=/<realm>/g/<group>/meta/elabftw/**' \
-     --grant 'metadata.write=/<realm>/g/<group>/meta/elabftw/**' \
-     --grant 'metadata.create=/<realm>/g/<group>/meta/elabftw/**' \
-     --grant 'objects.read=/<realm>/g/<group>/data/<node>/<bucket>/<prefix>/**' \
-     --secret elab_key=group:elab-key
+     --grant 'read=/<realm>/g/<group>/data/<node>/<bucket>/<prefix>/**' \
+     --grant 'write=/<realm>/g/<group>/meta/elabftw/**' \
+     --secret elab=group:elab-key
    ```
 
    Experiments the plugin creates are readable by the team (`canread_base` Team) and writable
@@ -157,14 +155,16 @@ Once a day the plugin compares every linked pair in small chunks across runs. Va
 differ while neither side changed since the last sync mark the link `out_of_sync` with the
 fields. The run log gets one summary line per pass.
 
-Manual runs, with `aruna-cli plugin run <install id> --input '<json>'`:
+Manual runs, with `aruna-cli plugin run <install id> --input '<json>'`. The input fills the
+`[manual]` form of plugin.toml; a field left out keeps its default (false, 0 or empty), which
+means not given.
 
 | Input | Effect |
 | --- | --- |
 | `{"report": true, "after": 0}` | One page of marked links (at most 100), the totals per mark, and `next` while more follow |
 | `{"resolve": <experiment id>, "keep": "elabftw"}` | The marked fields take the eLabFTW values; `"aruna"` takes Aruna's |
 | `{"resolve_create": "<dataset id>", "experiment": <id>}` | Links an experiment found after an unknown create |
-| `{"resolve_create": "<dataset id>", "experiment": "absent"}` | Allows a new create after you checked eLabFTW |
+| `{"resolve_create": "<dataset id>", "absent": true}` | Allows a new create after you checked eLabFTW |
 | `{"reconcile": true}` | Starts a full reconciliation now |
 | `{"experiment": <id>}` | Syncs one experiment now |
 

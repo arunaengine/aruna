@@ -54,11 +54,9 @@ It needs eLabFTW 6.0 or later. It polls every five minutes; eLabFTW 6.0 has no w
      --setting elab_url=https://elab.example.org --setting sync_user=<sync user id> \
      --setting aruna_url=https://portal.example.org \
      --setting bucket=/<realm>/g/<group>/data/<node>/<bucket> --setting prefix=<prefix> \
-     --grant 'metadata.read=/<realm>/g/<group>/meta/elabftw/**' \
-     --grant 'metadata.write=/<realm>/g/<group>/meta/elabftw/**' \
-     --grant 'metadata.create=/<realm>/g/<group>/meta/elabftw/**' \
-     --grant 'objects.read=/<realm>/g/<group>/data/<node>/<bucket>/<prefix>/**' \
-     --secret elab_key=group:elab-key
+     --grant 'read=/<realm>/g/<group>/data/<node>/<bucket>/<prefix>/**' \
+     --grant 'write=/<realm>/g/<group>/meta/elabftw/**' \
+     --secret elab=group:elab-key
    ```
 
 3. On the receiver node, create the bucket and the storage account's credential, confined to
@@ -112,12 +110,14 @@ until the next cycle, so it never holds up the others.
 
 ## Manual runs
 
-Run them with `aruna-cli plugin run <install id> --input '<json>'`.
+Run them with `aruna-cli plugin run <install id> --input '<json>'`. The input fills the
+`[manual]` form of plugin.toml; a field left out keeps its default (false, 0 or empty), which
+means not given.
 
 | Input | Effect |
 | --- | --- |
 | `{"report": true}` | Marked and unlinked entries, at most 48 KiB per page, with `next` while more follow |
-| `{"report": true, "next": <cursor>}` | The next page of the report |
+| `{"report": true, "next": "<next>"}` | The next page of the report; `next` is the text the last page returned |
 | `{"resolve": <experiment id>, "keep": "elabftw"}` | eLabFTW's record wins; `"aruna"` lets Aruna's win |
 | `{"experiment": <id>}` | Syncs one experiment now, or enrols it |
 

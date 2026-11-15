@@ -36,7 +36,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct GrantsBody {
-    /// Narrowed resource patterns by permission, as for an install.
+    /// Narrowed resource patterns under `read` and `write`, as for an install.
     #[serde(default)]
     pub grants: BTreeMap<String, Vec<String>>,
 }
@@ -75,7 +75,7 @@ the call and every other node relays it to one.
 - A `blocked` install becomes `active`, since the admin approved what it needs, or `paused`
   when an admin paused it before."#,
     params(("id" = String, Path, description = "The install id")),
-    request_body(content = GrantsBody, example = json!({"grants": {"metadata.write": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/runs/**"]}})),
+    request_body(content = GrantsBody, example = json!({"grants": {"write": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/runs/**"]}})),
     responses(
         (status = 200, description = "The changed install", body = InstallView, example = json!(view_example())),
         (status = 400, description = "A grant is invalid", body = ErrorResponse),

@@ -22,7 +22,7 @@ async fn hooked(fixture: &Fixture) -> PluginInstall {
     let hook = json!({
         "secrets": { "hook_key": { "title": "Hook key", "kind": "header" } },
         "triggers": { "webhook": {
-            "verify": "hook_key", "delivery_id": "x-delivery", "handler": "on_webhook"
+            "verify": "hook_key", "delivery_id": "x-delivery"
         } }
     });
     let digest = fixture.publish("0.3.0", "ef", hook).await;

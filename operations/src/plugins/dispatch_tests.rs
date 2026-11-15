@@ -20,16 +20,26 @@ async fn manual_runs() {
         let auth = fixture.auth();
         async move { start_run(ctx, &auth, realm, local, install.install_id, input, 5).await }
     };
-    let run = start(r#"{"dataset":"d1"}"#).await.unwrap();
+    // The fixture's manual trigger has no form, so only empty input fits it.
+    let refused = start(r#"{"dataset":"d1"}"#).await;
+    let unknown = SettingError::Unknown("dataset".into());
+    assert!(matches!(refused, Err(StartError::Form(error)) if error == unknown));
+    for input in ["[]", "1", "{"] {
+        assert!(
+            matches!(start(input).await, Err(StartError::Input)),
+            "{input}"
+        );
+    }
+    let run = start("{}").await.unwrap();
     let stored = read_run(ctx, install.install_id, run.run_id).await.unwrap();
     assert_eq!(stored, run);
     assert_eq!(
         (run.handler.as_str(), run.revision),
-        ("probe", install.revision)
+        ("manual", install.revision)
     );
     assert_eq!(run.settings, install.settings);
     let by = fixture.actor.user_id;
-    let input = r#"{"dataset":"d1"}"#.to_string();
+    let input = "{}".to_string();
     assert_eq!(run.trigger, RunTrigger::Manual { by, input });
     assert!(matches!(start("not json").await, Err(StartError::Input)));
 
@@ -73,7 +83,7 @@ async fn timer_occurrences() {
     let occurrence_ms = active + 3 * HOUR;
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].trigger, RunTrigger::Timer { occurrence_ms });
-    assert_eq!(runs[0].handler, "chatty");
+    assert_eq!(runs[0].handler, "timer");
     let other = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
     assert_eq!(
         enqueue_timers(ctx, &config, other, active + 9 * HOUR)

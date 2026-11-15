@@ -1,5 +1,5 @@
-//! Rust SDK for Aruna plugins: handlers are async functions over synchronous host calls,
-//! listed once with [`export!`].
+//! Rust SDK for Aruna plugins: handlers are async functions over synchronous host calls, listed
+//! once by trigger with [`export!`].
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -11,8 +11,8 @@ use std::future::Future;
 use serde_json::Value;
 
 pub use context::{
-    Context, Created, Document, Entry, FilePage, FullResponse, Http, Level, Listing, Metadata,
-    Method, ObjectInfo, ObjectPage, Objects, Response, State,
+    Context, Created, Document, Entry, FilePage, Http, Level, Listing, Metadata, Method,
+    ObjectInfo, ObjectPage, Objects, Response, State,
 };
 pub use error::{Error, Result};
 
@@ -110,38 +110,47 @@ impl Output for Value {
     }
 }
 
-/// Lists a plugin's handlers. Each is `async fn(Context, I) -> Result<O>`; its name is the
-/// one triggers use, and `aruna-cli plugin build` checks the list against the manifest.
+/// Lists a plugin's handlers by trigger, such as `export! { dataset_created => announce }`. Each
+/// is `async fn(Context, I) -> Result<O>`; `aruna-cli plugin build` checks the triggers against
+/// the manifest.
 #[macro_export]
 macro_rules! export {
-    ($($handler:ident),+ $(,)?) => {
+    ($($trigger:ident => $handler:path),+ $(,)?) => {
         const _: () = {
             struct Exported;
 
             impl $crate::bindings::Guest for Exported {
                 fn handle(
-                    handler: String,
                     invocation: $crate::bindings::aruna::plugin::types::Invocation,
                 ) -> ::std::result::Result<
                     Option<String>,
                     $crate::bindings::aruna::plugin::types::Failure,
                 > {
-                    match handler.as_str() {
-                        $(stringify!($handler) => $crate::dispatch(invocation, $handler),)+
+                    match $crate::trigger_name(&invocation.trigger) {
+                        $(stringify!($trigger) => $crate::dispatch(invocation, $handler),)+
                         other => Err($crate::unknown(other)),
                     }
+                }
+
+                fn triggers() -> Vec<String> {
+                    vec![$(stringify!($trigger).to_string()),+]
                 }
             }
 
             $crate::bindings::export_guest!(Exported with_types_in $crate::bindings);
-
-            const NAMES: &[&str] = &[$(stringify!($handler)),+];
-            #[cfg(target_arch = "wasm32")]
-            #[used]
-            #[unsafe(link_section = "aruna-handlers")]
-            static HANDLERS: [u8; $crate::section_len(NAMES)] = $crate::section(NAMES);
         };
     };
+}
+
+/// The manifest name of the trigger that started a run.
+#[doc(hidden)]
+pub fn trigger_name(trigger: &Trigger) -> &str {
+    match trigger {
+        Trigger::Manual(_) => "manual",
+        Trigger::Webhook(_) => "webhook",
+        Trigger::Event(event) => &event.kind,
+        Trigger::Timer(_) => "timer",
+    }
 }
 
 #[doc(hidden)]
@@ -177,10 +186,10 @@ where
 }
 
 #[doc(hidden)]
-pub fn unknown(handler: &str) -> Failure {
+pub fn unknown(trigger: &str) -> Failure {
     Failure {
         kind: FailureKind::InvalidInput,
-        message: format!("`{handler}` is not a handler of this plugin"),
+        message: format!("this plugin has no handler for the trigger `{trigger}`"),
     }
 }
 
@@ -200,50 +209,9 @@ fn event(trigger: Trigger) -> Result<Event> {
     })
 }
 
-/// Length of the handler names section: the names joined by newlines.
-#[doc(hidden)]
-pub const fn section_len(names: &[&str]) -> usize {
-    let mut len = 0;
-    let mut index = 0;
-    while index < names.len() {
-        len += names[index].len() + 1;
-        index += 1;
-    }
-    len.saturating_sub(1)
-}
-
-/// The handler names joined by newlines, as `aruna-cli plugin build` reads them.
-#[doc(hidden)]
-pub const fn section<const N: usize>(names: &[&str]) -> [u8; N] {
-    let mut out = [0u8; N];
-    let (mut at, mut index) = (0, 0);
-    while index < names.len() {
-        if index > 0 {
-            out[at] = b'\n';
-            at += 1;
-        }
-        let bytes = names[index].as_bytes();
-        let mut byte = 0;
-        while byte < bytes.len() {
-            out[at] = bytes[byte];
-            at += 1;
-            byte += 1;
-        }
-        index += 1;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn handler_section() {
-        const NAMES: &[&str] = &["dataset_created", "resync"];
-        const SECTION: [u8; section_len(NAMES)] = section(NAMES);
-        assert_eq!(&SECTION, b"dataset_created\nresync");
-    }
 
     #[test]
     fn dataset_inputs() {

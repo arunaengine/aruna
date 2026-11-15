@@ -15,7 +15,7 @@ use aruna_core::types::GroupId;
 use aruna_operations::plugins::account::plugin_account;
 use aruna_operations::plugins::bound::vault_kind;
 use aruna_operations::plugins::check::covers;
-use aruna_operations::plugins::grants::{GrantError, InstallScope, parse_grants};
+use aruna_operations::plugins::grants::{GrantError, InstallScope, parse_grants, writes};
 use aruna_operations::plugins::install::{
     InstallError, InstallRequest, install_plugin, pick_version, prepare_install, read_config,
     read_manifest,
@@ -25,7 +25,7 @@ use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::records::RecordError;
 use aruna_operations::users::service_account::group_admin_path;
 use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::Permission as Grant;
+use aruna_plugins::permission::Grant;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -64,8 +64,8 @@ pub struct InstallBody {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub settings: Map<String, Value>,
-    /// Narrowed resource patterns by permission. A permission left out gets all of the group,
-    /// an empty list removes an optional one; `connections.send` lists connection names.
+    /// Narrowed resource patterns under `read` and `write`, below the group's `meta` or `data`.
+    /// One left out gets all of the group; an empty list removes it when the plugin allows.
     #[serde(default)]
     pub grants: BTreeMap<String, Vec<String>>,
     /// The id a preview answered; sending the same request with it resumes that install.
@@ -82,7 +82,7 @@ pub struct InstallQuery {
     pub preview: Option<bool>,
 }
 
-/// One permission line of the summary: what the manifest requests and what is granted.
+/// One grant line of the summary: `read`, or `write` when the plugin writes, and its patterns.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PermissionLine {
     pub permission: String,
@@ -95,10 +95,10 @@ pub struct PermissionLine {
 pub struct ConnectionLine {
     pub name: String,
     pub url: String,
+    /// The HTTP methods the plugin may use there; all six unless the manifest narrows them.
+    pub methods: Vec<String>,
     pub required: bool,
     pub granted: bool,
-    /// The code reads whole answers, headers and body, as far as the secret's rule allows.
-    pub full_answer: bool,
 }
 
 /// What an admin approves: the version, the permissions and connections, and the triggers.
@@ -128,7 +128,7 @@ pub struct SecretLine {
     pub kind: String,
     /// `group:<name>`, `realm:<name>` or `node:<name>`.
     pub secret: String,
-    /// The code may read the secret's value through `secrets.value`.
+    /// The code may read the secret's value: the manifest lists it under `[secrets]`.
     pub value: bool,
 }
 
@@ -178,7 +178,7 @@ pub struct InstallListQuery {
     pub limit: Option<usize>,
 }
 
-const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "webhook": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "metadata.read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "required": true, "granted": true, "full_answer": false}], "triggers": ["dataset_created", "manual"], "secrets": [{"slot": "catalog_key", "kind": "bearer", "secret": "group:catalog-key", "value": false}], "warnings": []}}"#;
+const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "webhook": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "methods": ["POST"], "required": true, "granted": true}], "triggers": ["dataset_created", "manual"], "secrets": [{"slot": "catalog_key", "kind": "bearer", "secret": "group:catalog-key", "value": false}], "warnings": []}}"#;
 
 pub(crate) fn view_example() -> Value {
     serde_json::from_str(VIEW_EXAMPLE).unwrap_or(Value::Null)
@@ -217,7 +217,7 @@ relays it to one.
 - 404 when no published version matches.
 - 409 when the id belongs to another request or a step failed."#,
     params(("name" = String, Path, description = "The plugin name"), InstallQuery),
-    request_body(content = InstallBody, example = json!({"group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "settings": {"catalog_url": "https://catalog.example.org"}, "grants": {"metadata.write": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/runs/**"]}, "secrets": {"catalog_key": "group:catalog-key"}})),
+    request_body(content = InstallBody, example = json!({"group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "settings": {"catalog_url": "https://catalog.example.org"}, "grants": {"read": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/data/**"], "write": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/meta/runs/**"]}, "secrets": {"catalog_key": "group:catalog-key"}})),
     responses(
         (status = 200, description = "The summary of a preview", body = InstallSummary, example = json!(view_example()["summary"])),
         (status = 201, description = "The active install", body = InstallView, example = json!(view_example())),
@@ -545,18 +545,20 @@ fn summary(
     ),
 ) -> InstallSummary {
     let granted = parse_grants(grants);
-    let required = &manifest.permissions.required;
-    let permissions = (manifest.requested().into_iter())
-        .map(|permission| PermissionLine {
-            permission: permission.to_string(),
-            required: required.contains(&permission),
-            granted: (granted.get(&permission).into_iter().flatten())
+    let requested = [Grant::Read]
+        .into_iter()
+        .chain(writes(manifest).then_some(Grant::Write));
+    let permissions = requested
+        .map(|grant| PermissionLine {
+            permission: grant.to_string(),
+            required: true,
+            granted: (granted.get(&grant).into_iter().flatten())
                 .cloned()
                 .collect(),
         })
         .collect();
-    let sends = granted.get(&Grant::ConnectionsSend);
-    let values = granted.get(&Grant::SecretsValue);
+    let sends = granted.get(&Grant::Services);
+    let values = granted.get(&Grant::Secrets);
     let readable = |slot: &str| {
         let path = scope.secret(slot);
         values.is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &path)))
@@ -565,9 +567,11 @@ fn summary(
         .map(|(name, connection)| ConnectionLine {
             name: name.clone(),
             url: connection.url.clone(),
+            methods: (connection.methods.iter())
+                .map(|method| method.as_str().to_string())
+                .collect(),
             required: !connection.optional,
             granted: sends.is_some_and(|paths| paths.contains(&scope.connection(name))),
-            full_answer: connection.response.full(),
         })
         .collect();
     InstallSummary {
@@ -812,15 +816,6 @@ mod tests {
                 .collect();
             summary(&manifest, "sha256:ab", &scope, (&BTreeMap::new(), &bound)).warnings
         };
-        let manifest = serde_json::json!({
-            "name": "p", "version": "0.1.0",
-            "settings": { "base": { "title": "Base", "type": "url" } },
-            "connections": { "receipts": { "url": "{base}/x", "response": "full" } },
-        });
-        let manifest: Manifest = serde_json::from_value(manifest).unwrap();
-        let none = (&BTreeMap::new(), &BTreeMap::new());
-        let lines = summary(&manifest, "sha256:ab", &scope, none).connections;
-        assert!(lines[0].full_answer);
         // Sync triggers are delivered now and warn about nothing; a shared secret still warns.
         let sync = serde_json::json!({"sync_completed": {}, "sync_failed": {}});
         assert!(warned(sync.clone(), None).is_empty());
@@ -829,5 +824,20 @@ mod tests {
             warned(sync, Some("realm:key")),
             vec!["a realm admin adds the use rule of `realm:key` for `key`".to_string()]
         );
+    }
+
+    #[test]
+    fn summary_lists_methods() {
+        let scope = InstallScope {
+            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
+            group_id: Ulid::from_parts(1, 1),
+            install_id: Ulid::from_parts(2, 2),
+        };
+        let manifest = serde_json::json!({"name": "p", "version": "0.1.0", "connections": {
+            "catalog": {"url": "https://c.example.org/", "methods": ["GET", "POST"]}}});
+        let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+        let none = (&BTreeMap::new(), &BTreeMap::new());
+        let lines = summary(&manifest, "sha256:ab", &scope, none).connections;
+        assert_eq!(lines[0].methods, ["GET", "POST"]);
     }
 }

@@ -5,27 +5,16 @@
 name = "dataset-announcer"
 version = "0.1.0"
 title = "Announce new datasets"
+on = ["dataset_created", "manual"]
+access = "write"
 
 [settings]
 catalog_url = { title = "Catalog address", type = "url" }
 
-[secrets]
-catalog_key = { title = "Catalog API key", kind = "bearer" }
-
-[connections.catalog]
+[services.catalog]
 url = "{catalog_url}/api/records"
 methods = ["POST"]
-auth = "catalog_key"
-response = ["/id"]
+secret = "Catalog API key"
 
-[triggers]
-dataset_created = {}
-manual = { handler = "dataset_created", input = "dataset" }
-
-[permissions]
-required = ["metadata.read"]
-optional = ["metadata.write"]
-
-[build]
-command = ["npx", "--yes", "@bytecodealliance/jco@1.17.0", "componentize", "plugin.js", "--wit", "../../wit", "--world-name", "plugin", "--disable", "all", "-o", "plugin.wasm"]
-output = "plugin.wasm"
+[manual]
+dataset = { type = "dataset" }

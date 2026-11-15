@@ -29,13 +29,13 @@ class WalkTests(unittest.TestCase):
         return [(self.plugin.link(number)["mark"] or {}).get("kind") for number in numbers]
 
     def report(self):
-        pages, after = [], None
+        pages, after = [], ""
         while True:
             found = self.plugin.manual({"report": True, "next": after})
             self.assertLess(len(json.dumps(found)), 64 << 10)
             pages.append(found["marks"])
             after = found["next"]
-            if after is None:
+            if not after:
                 return pages
 
     def test_lookup(self):
@@ -233,13 +233,13 @@ class WalkTests(unittest.TestCase):
         for number in range(60):
             self.host.make({"name": f"d{number}"})
         self.host.tick = 1.0
-        entries, after = [], None
+        entries, after = [], ""
         while True:
             start = self.host.now
             found = self.plugin.manual({"report": True, "next": after})
             self.assertLessEqual(self.host.now - start, 42)
             entries, after = entries + found["marks"], found["next"]
-            if after is None:
+            if not after:
                 break
         self.assertEqual(len(entries), 60)
 

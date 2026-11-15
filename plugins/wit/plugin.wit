@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-package aruna:plugin@0.2.0;
+package aruna:plugin@0.3.0;
 
 /// Data shared by the handler export and the host interfaces.
 interface types {
@@ -78,11 +78,6 @@ interface types {
   }
 }
 
-/// Checks a grant before trying an optional call; needs no permission.
-interface grants {
-  granted: func(permission: string, %resource: string) -> bool;
-}
-
 /// Reads dataset metadata of the group (`metadata.read`).
 interface metadata-read {
   use types.{host-error};
@@ -119,7 +114,6 @@ interface metadata-write {
     %resource: string,
     patch: string,
     expected: string,
-    key: option<string>,
   ) -> result<string, host-error>;
 
   /// Adds or replaces one `File` entity by `@id`; the properties it omits go.
@@ -127,7 +121,6 @@ interface metadata-write {
     %resource: string,
     file: string,
     expected: string,
-    key: option<string>,
   ) -> result<string, host-error>;
 
   /// Removes one root-linked `File` entity by `@id` and the root's link to it.
@@ -135,7 +128,6 @@ interface metadata-write {
     %resource: string,
     id: string,
     expected: string,
-    key: option<string>,
   ) -> result<string, host-error>;
 }
 
@@ -149,8 +141,8 @@ interface metadata-create {
   }
 
   /// Creates a dataset at `path` below the group's metadata root from one dataset entity; the
-  /// same `key` of one install always names the same document.
-  create: func(path: string, dataset: string, key: string) -> result<created, host-error>;
+  /// same `path` of one install always names the same document.
+  create: func(path: string, dataset: string) -> result<created, host-error>;
 }
 
 /// Reads object information and listings of the group, never bytes (`objects.read`).
@@ -172,8 +164,8 @@ interface objects-read {
   %list: func(prefix: string, cursor: option<string>) -> result<object-page, host-error>;
 }
 
-/// Sends requests through the connections the manifest declares (`connections.send`).
-interface connections {
+/// Sends requests to the services the manifest declares; the host adds their secrets.
+interface services {
   use types.{field, host-error};
 
   enum method {
@@ -185,34 +177,24 @@ interface connections {
     delete,
   }
 
-  /// `path` is relative to the connection's prefix; `key` names the effect across runs.
+  /// `path` is relative to the service's address.
   record request {
-    connection: string,
+    service: string,
     method: method,
     path: string,
     query: list<field>,
     headers: list<field>,
     body: list<u8>,
-    key: option<string>,
   }
 
-  /// The status, and the response fields the manifest allows as a JSON object keyed by pointer.
+  /// The status, and the headers and body the code may read of the answer.
   record response {
-    status: u16,
-    json: option<string>,
-  }
-
-  /// The whole answer, for a connection whose manifest reads it in full.
-  record full-response {
     status: u16,
     headers: list<field>,
     body: list<u8>,
   }
 
   send: func(request: request) -> result<response, host-error>;
-  /// Only for a connection whose manifest says `response = "full"` and whose secret's rule
-  /// exposes the full answer; any other connection refuses it.
-  send-full: func(request: request) -> result<full-response, host-error>;
 }
 
 /// Small private values of the install, changed by compare and swap.
@@ -246,19 +228,20 @@ interface log {
   log: func(level: level, message: string);
 }
 
-/// One plugin: every handler is called through `handle` with its manifest name.
+/// One plugin: the code runs the function it registered for the invocation's trigger.
 world plugin {
   use types.{invocation, failure};
 
-  import grants;
   import metadata-read;
   import metadata-write;
   import metadata-create;
   import objects-read;
-  import connections;
+  import services;
   import state;
   import secrets;
   import log;
 
-  export handle: func(handler: string, invocation: invocation) -> result<option<string>, failure>;
+  export handle: func(invocation: invocation) -> result<option<string>, failure>;
+  /// The triggers the code registered functions for; the build checks them against the manifest.
+  export triggers: func() -> list<string>;
 }
