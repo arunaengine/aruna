@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
     HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
-    ObjectPage, Response, SendRequest, StatePut,
+    ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
@@ -493,6 +493,16 @@ impl Broker for Group {
             state.versions += 1;
             state.values.insert(put.key, (state.versions, put.value));
             Ok(state.versions)
+        })
+    }
+
+    async fn state_remove(&self, _: &CallContext, remove: StateRemove) -> Result<(), HostError> {
+        self.with(|state| match state.values.get(&remove.key) {
+            Some((version, _)) if *version == remove.expected => {
+                state.values.remove(&remove.key);
+                Ok(())
+            }
+            _ => Err(HostError::new(ErrorKind::Conflict, "changed meanwhile")),
         })
     }
 
@@ -1093,13 +1103,13 @@ async fn orcid_names() {
 
 #[tokio::test]
 async fn sync_alerts() {
-    // The first failure after a success is sent; a completed sync starts the count again.
+    // The first failure after a success is sent; a post the chat refused is tried again at the
+    // next failure, and a completed sync starts again.
     let Some(example) = example("sync-alerts").await else {
         return;
     };
     let settings = json!({ "chat_url": "https://chat.example.org" });
     let group = Group::new();
-    group.reply("chat", "", 201, json!({}));
     let sync = |kind: &str, job: &str| {
         Trigger::Event(WatchEvent {
             kind: kind.into(),
@@ -1108,12 +1118,18 @@ async fn sync_alerts() {
             revision: job.into(),
         })
     };
+    group.reply("chat", "", 500, json!({}));
+    let refused = example
+        .run(&group, settings.clone(), sync("sync_failed", "j1"))
+        .await;
+    assert_eq!(refused.unwrap_err().kind, FailureKind::Permanent);
+    group.reply("chat", "", 201, json!({}));
     let mut counts = Vec::new();
     for (kind, job) in [
-        ("sync_failed", "j1"),
         ("sync_failed", "j2"),
-        ("sync_completed", "j3"),
-        ("sync_failed", "j4"),
+        ("sync_failed", "j3"),
+        ("sync_completed", "j4"),
+        ("sync_failed", "j5"),
     ] {
         let answer = example
             .run(&group, settings.clone(), sync(kind, job))
@@ -1121,12 +1137,12 @@ async fn sync_alerts() {
             .unwrap();
         counts.push(answer["failures"].clone());
     }
-    assert_eq!(counts, [json!(1), json!(2), json!(0), json!(1)]);
+    assert_eq!(counts, [json!(2), json!(3), json!(0), json!(1)]);
     let texts: Vec<Value> = group
         .sent()
         .into_iter()
         .map(|(_, _, body)| body["text"].clone())
         .collect();
     let text = |job: &str| json!(format!("The sync of raw/run-7/ failed (job {job})"));
-    assert_eq!(texts, [text("j1"), text("j4")]);
+    assert_eq!(texts, [text("j1"), text("j2"), text("j5")]);
 }
