@@ -40,6 +40,7 @@ use super::grants::{parse_grants, patterns_for};
 use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
+use super::marks::sweep_marks;
 use super::matcher::match_pending;
 use super::outbound::Outbound;
 use super::prune::{prune_hooks, prune_uses};
@@ -614,6 +615,9 @@ pub fn spawn_worker(
                 }
                 if let Err(error) = prune_work(&worker.ctx, now).await {
                     warn!(%error, "Could not prune settled plugin work");
+                }
+                if let Err(error) = sweep_marks(&worker.ctx).await {
+                    warn!(%error, "Could not drop the marks of absent object versions");
                 }
                 if let Err(error) = worker.sweep(now).await {
                     warn!(%error, "Could not delete stale plugin event rows");

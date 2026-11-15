@@ -153,6 +153,8 @@ interface objects-read {
     path: string,
     size: u64,
     version: string,
+    /// A job with a secret wrote this version: a plugin cannot read, copy or upload it.
+    marked: bool,
   }
 
   record object-page {

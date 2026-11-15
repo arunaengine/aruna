@@ -159,7 +159,7 @@ async fn narrowed_grant_refuses() {
 
 /// The install's objects `in/a.txt` (5 bytes) and the empty bucket `out` on a blob backend, and
 /// a recorded copy between them.
-async fn ready_copy(
+pub(crate) async fn ready_copy(
     fixture: &Fixture,
 ) -> (
     tempfile::TempDir,
@@ -261,4 +261,55 @@ async fn locked_source_waits() {
         .await;
     let outcome = run_plugin_work(&ctx, &spec).await;
     assert!(copied(&outcome, &spec), "{}", outcome_name(&outcome));
+}
+
+#[tokio::test]
+async fn marked_source_refused() {
+    // A source version a job with a secret wrote is refused when the copy is asked for, on every
+    // attempt, and shown as marked.
+    use aruna_plugins::broker::Broker;
+
+    use crate::driver::drive;
+    use crate::plugins::broker::RunBroker;
+    use crate::plugins::marks::{MARKED, Mark, mark_in};
+    use crate::plugins::store::{Txn, transact};
+    use crate::plugins::submit::start_copy;
+    use crate::plugins::submit::tests::{request, scope};
+    use crate::plugins::work::WorkKind;
+    use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+    let fixture = Fixture::new().await;
+    let (_root, blob, install, spec) = ready_copy(&fixture).await;
+    let head = HeadObjectInput {
+        bucket: "in".into(),
+        key: "a.txt".into(),
+        version_id: None,
+    };
+    let version = drive(HeadObjectOperation::new(head), &blob).await.unwrap();
+    let version = version.resolved_version_id.unwrap();
+    let mark = Mark {
+        install_id: Ulid::from_parts(8, 8),
+        work_id: Ulid::from_parts(8, 9),
+        job: None,
+        kind: WorkKind::Download,
+        at_ms: 1,
+    };
+    let marked = async |txn: &Txn<'_>| mark_in(txn, ("in", "a.txt", version), &mark).await;
+    transact(&blob, marked).await.unwrap();
+    let (kind, message) = failure(run_plugin_work(&job_context(&blob, &fixture), &spec).await);
+    assert_eq!((kind, message.as_str()), (JobErrorKind::Permanent, MARKED));
+    let run = scope(&fixture, &install);
+    let mut copy = request(&fixture, &install, "out/b.txt");
+    copy.ordinal = 7;
+    let refused = start_copy(&blob, &run, copy).await;
+    assert_eq!(
+        refused.map_err(|error| error.message),
+        Err(MARKED.to_string())
+    );
+    let broker = RunBroker::new(Arc::new(blob.clone()), run);
+    let cx = aruna_plugins::broker::CallContext {
+        run: "run".into(),
+        install: install.install_id.to_string(),
+        max_bytes: 1 << 20,
+    };
+    assert!(broker.objects_info(&cx, "in/a.txt").await.unwrap().marked);
 }

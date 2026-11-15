@@ -10,6 +10,7 @@ use ulid::Ulid;
 
 use super::broker::short_path;
 use super::check::unavailable;
+use super::marks::is_marked;
 use super::work::{
     Summary, WorkKind, WorkRow, WorkState, read_work, reconcile, summary_of, work_state,
 };
@@ -95,14 +96,21 @@ pub async fn job_outputs(
         None => 0,
     };
     let outputs = (row.summary.map(|summary| summary.outputs)).unwrap_or_default();
-    let objects = (outputs.iter().skip(start).take(PAGE))
-        .filter(|output| output.node_id == local)
-        .map(|output| ObjectInfo {
+    let mut objects = Vec::new();
+    for output in (outputs.iter().skip(start).take(PAGE)).filter(|output| output.node_id == local) {
+        let version = (
+            output.bucket.as_str(),
+            output.key.as_str(),
+            output.version_id,
+        );
+        let marked = is_marked(ctx, version).await;
+        objects.push(ObjectInfo {
             path: format!("{}/{}", output.bucket, output.key),
             size: output.size,
             version: output.version_id.to_string(),
-        })
-        .collect();
+            marked: marked.map_err(|error| unavailable(error.0))?,
+        });
+    }
     let next = start + PAGE;
     let cursor = (next < outputs.len()).then(|| next.to_string());
     Ok(ObjectPage { objects, cursor })

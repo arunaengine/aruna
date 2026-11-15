@@ -150,6 +150,7 @@ impl Broker for Hosted {
             path: path.into(),
             size,
             version: "v1".into(),
+            marked: false,
         })
     }
 

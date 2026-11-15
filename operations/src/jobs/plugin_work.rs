@@ -26,6 +26,7 @@ use crate::plugins::account::read_user;
 use crate::plugins::broker::local_object;
 use crate::plugins::check::{check_identity, copy_grants};
 use crate::plugins::install::read_config;
+use crate::plugins::marks::unmarked;
 use crate::plugins::work::read_work;
 use crate::s3::object::copy::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_at,
@@ -110,12 +111,18 @@ async fn copy_work(
         Ok(found) => found,
         Err(error) => return refused(error),
     };
+    // The version checked is the version copied, so a newer marked one never slips in.
+    let source_version =
+        match unmarked(&ctx.driver, (&source_bucket, &source_key), *source_version).await {
+            Ok(found) => found.or(*source_version),
+            Err(error) => return refused(error),
+        };
     let auth = account(install, &patterns);
-    let read = (source_bucket.clone(), source_key.clone(), *source_version);
+    let read = (source_bucket.clone(), source_key.clone(), source_version);
     let input = CopyObjectInput {
         source_bucket,
         source_key,
-        source_version_id: *source_version,
+        source_version_id: source_version,
         source_group_id: install.group_id,
         source_auth_context: auth.clone(),
         dest_bucket,

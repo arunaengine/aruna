@@ -44,6 +44,7 @@ use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
 use super::jobs::{cancel_job, job_outputs, job_status};
+use super::marks::is_marked;
 use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
@@ -570,6 +571,15 @@ impl RunBroker {
         }
     }
 
+    /// Whether a job with a secret wrote this version of `bucket/key`.
+    async fn marked(&self, bucket: &str, key: &str, version: &str) -> Result<bool, HostError> {
+        let Ok(version_id) = Ulid::from_string(version) else {
+            return Ok(false);
+        };
+        let marked = is_marked(&self.ctx, (bucket, key, version_id)).await;
+        marked.map_err(|error| unavailable(error.0))
+    }
+
     /// The listed objects of a local bucket the account may read, each named by the permission
     /// path of its own bucket and key, never by the text of the listing prefix.
     async fn visible(
@@ -586,10 +596,12 @@ impl RunBroker {
                 .authorized(install, Permission::ObjectsRead, &path)
                 .await?
             {
+                let marked = self.marked(bucket, &key, &version).await?;
                 visible.push(ObjectInfo {
                     path: format!("{bucket}/{key}"),
                     size,
                     version,
+                    marked,
                 });
             }
         }
@@ -919,21 +931,20 @@ impl Broker for RunBroker {
         let (install, _) = self.checked(Permission::ObjectsRead, &path).await?;
         let (bucket, key) = self.object_at(&install, &path).await?;
         let short = format!("{bucket}/{key}");
-        let head = HeadObjectInput {
-            bucket,
-            key,
+        let input = HeadObjectInput {
+            bucket: bucket.clone(),
+            key: key.clone(),
             version_id: None,
         };
-        let head = drive(HeadObjectOperation::new(head), &self.ctx).await;
+        let head = drive(HeadObjectOperation::new(input), &self.ctx).await;
         let head =
             head.map_err(|_| HostError::new(ErrorKind::NotFound, format!("no object at {path}")))?;
+        let version = (head.resolved_version_id.map(|id| id.to_string())).unwrap_or_default();
         Ok(ObjectInfo {
             path: short,
             size: head.location.map_or(0, |location| location.blob_size),
-            version: head
-                .resolved_version_id
-                .map(|id| id.to_string())
-                .unwrap_or_default(),
+            marked: self.marked(&bucket, &key, &version).await?,
+            version,
         })
     }
 

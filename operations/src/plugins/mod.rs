@@ -23,6 +23,7 @@ pub mod intents;
 pub mod jobs;
 pub mod journal;
 pub mod lifecycle;
+pub mod marks;
 pub mod matcher;
 pub mod outbound;
 pub mod prune;

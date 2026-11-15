@@ -176,6 +176,7 @@ impl Broker for Recorder {
             path: path.to_string(),
             size: 7,
             version: "v1".into(),
+            marked: false,
         })
     }
 
@@ -268,6 +269,7 @@ impl Broker for Recorder {
             path: "out/b".into(),
             size: 1,
             version: "v".into(),
+            marked: true,
         };
         Ok(ObjectPage {
             objects: vec![object],
