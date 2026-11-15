@@ -8,7 +8,8 @@ import aruna
 @aruna.on("data_uploaded")
 def archive(upload):
     incoming, archive_path = aruna.settings.incoming, aruna.settings.archive
-    if not upload.path.startswith(incoming):
+    # A copy is an upload too; one into an archive inside the watched path is not copied again.
+    if not upload.path.startswith(incoming) or upload.path.startswith(archive_path):
         return None
     target = archive_path + upload.path.removeprefix(incoming)
     job = aruna.objects.copy(upload.path, target, version=upload.version)

@@ -402,8 +402,10 @@ impl Broker for Group {
         })
     }
 
-    /// A rerun of the same run reaches the same call ordinal, so it gets the same job back.
+    /// A rerun of the same run reaches the same call ordinal, so it gets the same job back. The
+    /// copy writes its target at once, a new version named by the job, as an upload does.
     async fn jobs_copy(&self, cx: &CallContext, copy: JobCopy) -> Result<String, HostError> {
+        let (_, source) = self.version(&copy.source, copy.version.as_deref())?;
         Ok(self.with(|state| {
             let count = state.copies.len() + 1;
             let key = (cx.run.clone(), copy.intent.ordinal);
@@ -412,7 +414,13 @@ impl Broker for Group {
                 .entry(key)
                 .or_insert_with(|| format!("job-{count}"))
                 .clone();
-            state.copies.insert(id.clone(), copy);
+            if state.copies.insert(id.clone(), copy.clone()).is_none() {
+                let target = Version {
+                    id: id.clone(),
+                    ..source
+                };
+                state.objects.entry(copy.target).or_default().push(target);
+            }
             id
         }))
     }
@@ -784,6 +792,27 @@ async fn archive_uploads() {
         event("data_uploaded", "other/b.txt", "v1"),
     );
     assert_eq!(elsewhere.await.unwrap(), Value::Null);
+    assert_eq!(group.copies().len(), 1);
+}
+
+#[tokio::test]
+async fn archive_inside() {
+    // The node delivers the copy's own upload too; an archive inside the watched path is left
+    // alone, so nothing is copied twice.
+    let Some(example) = example("archive-uploads").await else {
+        return;
+    };
+    let settings = json!({ "incoming": "lab/", "archive": "lab/archive/" });
+    let group = Group::new();
+    group.object("lab/run/a.txt", "v1", b"first");
+    let upload = event("data_uploaded", "lab/run/a.txt", "v1");
+    let copied = example.run(&group, settings.clone(), upload).await.unwrap();
+    assert_eq!(copied["target"], "lab/archive/run/a.txt");
+    let own = event("data_uploaded", "lab/archive/run/a.txt", "job-1");
+    assert_eq!(
+        example.run(&group, settings, own).await.unwrap(),
+        Value::Null
+    );
     assert_eq!(group.copies().len(), 1);
 }
 
