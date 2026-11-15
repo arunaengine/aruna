@@ -1,0 +1,12 @@
+# Example plugin: adds a keyword to every dataset that changes.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "tag-updates"
+version = "0.1.0"
+title = "Tag changed datasets"
+on = ["dataset_updated"]
+access = "write"
+
+[settings]
+tag = "Keyword to add"

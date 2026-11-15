@@ -807,3 +807,52 @@ async fn set_keywords() {
     let empty = example.run(&group, json!({}), form(" , ", false)).await;
     assert_eq!(empty.unwrap_err().kind, FailureKind::InvalidInput);
 }
+
+#[tokio::test]
+async fn tag_updates() {
+    // A changed dataset gets the keyword once; the change that adds it writes nothing more.
+    let Some(example) = example("tag-updates").await else {
+        return;
+    };
+    let settings = json!({ "tag": "changed" });
+    let group = Group::new();
+    group.dataset("D1", json!({ "name": "Run 7", "keywords": ["seq"] }));
+    let updated = example.run(
+        &group,
+        settings.clone(),
+        event("dataset_updated", "D1", "2"),
+    );
+    assert_eq!(updated.await.unwrap(), json!({ "tagged": "D1" }));
+    assert_eq!(group.entity("D1")["keywords"], json!(["seq", "changed"]));
+    let again = example.run(&group, settings, event("dataset_updated", "D1", "3"));
+    assert_eq!(again.await.unwrap(), Value::Null);
+}
+
+#[tokio::test]
+async fn link_uploads() {
+    // An upload below the path becomes a file of the dataset, named by its `s3://` address.
+    let Some(example) = example("link-uploads").await else {
+        return;
+    };
+    let settings = json!({ "dataset": "D1", "prefix": "lab-incoming/" });
+    let group = Group::new();
+    group.dataset("D1", json!({ "name": "Run 7" }));
+    group.object("lab-incoming/gel.png", "v1", b"png");
+    group.object("other/x.txt", "v1", b"x");
+    let upload = event("data_uploaded", "lab-incoming/gel.png", "v1");
+    let linked = example.run(&group, settings.clone(), upload).await.unwrap();
+    let file = "s3://lab-incoming/gel.png";
+    assert_eq!(linked, json!({ "dataset": "D1", "file": file }));
+    let files = group.files("D1");
+    assert_eq!(
+        (&files[0]["@id"], &files[0]["contentUrl"]),
+        (&json!(file), &json!(file))
+    );
+    let elsewhere = example.run(
+        &group,
+        settings,
+        event("data_uploaded", "other/x.txt", "v1"),
+    );
+    assert_eq!(elsewhere.await.unwrap(), Value::Null);
+    assert_eq!(group.files("D1").len(), 1);
+}

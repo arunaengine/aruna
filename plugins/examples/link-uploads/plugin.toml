@@ -1,0 +1,13 @@
+# Example plugin: links every new upload below a bucket path into one dataset as a file.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "link-uploads"
+version = "0.1.0"
+title = "Link new uploads into a dataset"
+on = ["data_uploaded"]
+access = "write"
+
+[settings]
+dataset = "Dataset id"
+prefix = "Bucket path to watch, such as lab-incoming/"
