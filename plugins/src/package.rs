@@ -17,8 +17,8 @@ use crate::runtime::{Compiled, Runtime};
 /// The target Rust projects compile to; the host adds no WASI there.
 pub const RUST_TARGET: &str = "wasm32-unknown-unknown";
 
-/// The host contract Python and JavaScript builds read from the build folder.
-const CONTRACT: &str = include_str!("../wit/plugin.wit");
+/// The host contract every build reads from the build folder.
+pub(crate) const CONTRACT: &str = include_str!("../wit/plugin.wit");
 
 /// The folder a Python or JavaScript build writes into the project, again on every build.
 const BUILD_DIR: &str = ".aruna";
@@ -66,6 +66,12 @@ pub fn load_manifest(project: &Path) -> Result<Manifest, BuildError> {
     Ok(manifest)
 }
 
+/// Writes the Rust library crate and the contract to `.aruna/rust/`, as a new project gets them
+/// and every build writes them again.
+pub fn rust_library(project: &Path) -> Result<(), BuildError> {
+    Ok(crate::bundle::rust(project)?)
+}
+
 /// Builds a Rust project with cargo, a Python (`plugin.py`) or JavaScript (`plugin.js`) one with
 /// its pinned toolchain, then packages the output as `<name>-<version>.wasm`: beside cargo's
 /// module, or in the project folder.
@@ -74,6 +80,7 @@ pub fn build_project(project: &Path) -> Result<Built, BuildError> {
     let file = format!("{}-{}.wasm", manifest.name, manifest.version);
     let (output, path) = match project.join("Cargo.toml") {
         cargo if cargo.is_file() => {
+            crate::bundle::rust(project)?;
             let module = cargo_module(&cargo)?;
             let path = module.with_file_name(file);
             (module, path)

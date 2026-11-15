@@ -232,9 +232,11 @@ async fn build_child(
     let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("built-{name}.wasm"));
     let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
     command.args(["build_entry", "--exact", "--nocapture", "--test-threads=1"]);
+    // Cargo resolves from its local cache only, so a build needs no network.
     command
         .env(BUILD_VAR, project)
         .env(OUT_VAR, &out)
+        .env("CARGO_NET_OFFLINE", "true")
         .kill_on_drop(true);
     if let Some(tools) = tools {
         let rest = std::env::var_os("PATH").unwrap_or_default();
@@ -376,6 +378,11 @@ fn probe(language: &str, code: &str) -> PathBuf {
     std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
     let file = match language {
         "javascript" => "plugin.js",
+        "rust" => {
+            std::fs::write(dir.join("Cargo.toml"), RUST_PROJECT).unwrap();
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            "src/lib.rs"
+        }
         _ => "plugin.py",
     };
     std::fs::write(dir.join(file), code).unwrap();
@@ -416,6 +423,44 @@ aruna.on("manual", async (form) => {
   return await Promise.resolve("awaited");
 });
 aruna.on("timer", (tick) => ({ tick: tick.getTime() }));
+"#;
+
+/// A new project's manifest, on the library the build writes into it.
+const RUST_PROJECT: &str = r#"[package]
+name = "probe"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aruna = { package = "aruna-plugin", path = ".aruna/rust/aruna-plugin" }
+serde_json = "1"
+
+# The probe is a project of its own, not a member of the repository's workspace.
+[workspace]
+"#;
+
+const RUST_PROBE: &str = r#"use std::time::{SystemTime, UNIX_EPOCH};
+
+use aruna::{Form, Result};
+use serde_json::{Value, json};
+
+fn run(form: Form) -> Result<String> {
+    match form.text("input")?.as_str() {
+        "retry" => Err(aruna::retry("try later")),
+        "plain" => Ok("plain".into()),
+        other => Ok(aruna::datasets::get(other)?.name),
+    }
+}
+
+fn tick(tick: SystemTime) -> Result<Value> {
+    let since = tick.duration_since(UNIX_EPOCH).unwrap_or_default();
+    Ok(json!({ "tick": since.as_millis() as u64 }))
+}
+
+aruna::plugin! { manual => run, timer => tick }
 "#;
 
 const PYTHON_PROBE: &str = r#"import aruna
@@ -462,6 +507,15 @@ async fn probes_javascript() {
         let plugin = build(probe("javascript", JAVASCRIPT_PROBE)).await;
         let tick = r#"{"tick":1762700000000}"#;
         check_probe("javascript", &plugin, "\"awaited\"", tick).await;
+    }
+}
+
+#[tokio::test]
+async fn probes_rust() {
+    // A new project builds offline against the library the build writes into it.
+    if available("rust", "cargo") {
+        let plugin = build(probe("rust", RUST_PROBE)).await;
+        check_probe("rust", &plugin, "\"plain\"", r#"{"tick":1762700000000}"#).await;
     }
 }
 

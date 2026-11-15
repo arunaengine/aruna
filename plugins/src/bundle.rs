@@ -24,6 +24,39 @@ const PYTHON: [(&str, &str); 11] = library!("python/aruna":
 /// The JavaScript library's files: the module, its types, and the binding of the host's imports.
 const JAVASCRIPT: [(&str, &str); 3] = library!("javascript": "aruna.js", "aruna.d.ts", "bind.js");
 
+/// The Rust library's source files, as in `plugins/sdk/src`.
+const RUST: [(&str, &str); 10] = library!("src":
+    "datasets.rs", "form.rs", "host.rs", "jobs.rs", "lib.rs", "objects.rs", "outcome.rs", "run.rs",
+    "service.rs", "state.rs"
+);
+
+/// The versions the Rust library depends on; a test checks them against the workspace's.
+const SERDE: &str = "1.0.229";
+const SERDE_JSON: &str = "1.0.152";
+const WIT_BINDGEN: &str = "0.61.1";
+
+/// Writes the crate `aruna-plugin` with a standalone manifest to `.aruna/rust/aruna-plugin/` and
+/// the contract to `.aruna/rust/wit/`, the layout its bindings expect.
+pub(crate) fn rust(project: &Path) -> std::io::Result<()> {
+    let folder = project.join(".aruna/rust");
+    let source = folder.join("aruna-plugin/src");
+    std::fs::create_dir_all(&source)?;
+    std::fs::create_dir_all(folder.join("wit"))?;
+    for (name, text) in RUST {
+        std::fs::write(source.join(name), text)?;
+    }
+    let manifest = format!(
+        "# The Rust library for Aruna plugins, written by aruna-cli again on every build.\n\
+         [package]\nname = \"aruna-plugin\"\nversion = \"{}\"\nedition = \"2024\"\n\
+         license = \"MIT OR Apache-2.0\"\npublish = false\n\n[dependencies]\n\
+         serde = {{ version = \"{SERDE}\", features = [\"derive\"] }}\n\
+         serde_json = \"{SERDE_JSON}\"\nwit-bindgen = \"{WIT_BINDGEN}\"\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(folder.join("aruna-plugin/Cargo.toml"), manifest)?;
+    std::fs::write(folder.join("wit/plugin.wit"), crate::package::CONTRACT)
+}
+
 /// Writes the package `aruna` to `.aruna/python/aruna/`, with the types of the manifest's form
 /// fields, so `dataset` and `object` fields load before the handler runs.
 pub(crate) fn python(project: &Path, manifest: &Manifest) -> std::io::Result<()> {
@@ -83,6 +116,29 @@ mod tests {
         let text = "name = \"p\"\nversion = \"0.1.0\"\non = [\"manual\"]\n[manual]\n\
                     dataset = { type = \"dataset\" }\nnote = \"Note\"\n";
         crate::authored::parse(text).unwrap()
+    }
+
+    #[test]
+    fn rust_crate() {
+        let project = tempfile::tempdir().unwrap();
+        rust(project.path()).unwrap();
+        let folder = project.path().join(".aruna/rust");
+        let source = std::fs::read_dir(folder.join("aruna-plugin/src")).unwrap();
+        assert_eq!(source.count(), RUST.len());
+        assert!(folder.join("wit/plugin.wit").is_file());
+        let text = std::fs::read_to_string(folder.join("aruna-plugin/Cargo.toml")).unwrap();
+        let written: toml::Table = text.parse().unwrap();
+        let workspace: toml::Table = include_str!("../../Cargo.toml").parse().unwrap();
+        let version = |table: &toml::Value| {
+            let version = table.get("version").unwrap_or(table);
+            version.as_str().unwrap().to_string()
+        };
+        for name in ["serde", "serde_json", "wit-bindgen"] {
+            let wanted = version(&workspace["workspace"]["dependencies"][name]);
+            assert_eq!(version(&written["dependencies"][name]), wanted, "{name}");
+        }
+        let package = &workspace["workspace"]["package"]["version"];
+        assert_eq!(&written["package"]["version"], package);
     }
 
     #[test]
