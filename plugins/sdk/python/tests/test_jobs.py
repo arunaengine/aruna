@@ -23,7 +23,7 @@ class JobsTest(unittest.TestCase):
         self.fake.job("j1", kind="upload", path="raw/a", reply=reply, report='{"reads": 9}', outputs=["out/0", "out/1", "out/2"])
         job = aruna.jobs.get("j1")
         self.assertTrue(job.ok)
-        self.assertEqual((job.reply.status, job.reply.headers["etag"], job.reply["checksum"]), (201, "e1", "md5:1"))
+        self.assertEqual((job.reply.status, job.reply.header("etag"), job.reply["checksum"]), (201, "e1", "md5:1"))
         self.assertEqual(job.report_json(), {"reads": 9})
         self.assertEqual([output.path for output in job.outputs()], ["out/0", "out/1", "out/2"])
         job.cancel()

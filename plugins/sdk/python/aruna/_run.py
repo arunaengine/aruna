@@ -90,11 +90,16 @@ class Form:
 
 
 class Request:
-    """A verified webhook request; authentication headers are already removed."""
+    """A verified webhook request; authentication headers are already removed. `headers` holds every
+    header as a name and value pair, in order."""
 
     def __init__(self, method, query, headers, body, delivery_id):
         self.method, self.query, self.body, self.delivery_id = method, query, body, delivery_id
-        self.headers = {name.lower(): value for name, value in headers}
+        self.headers = [(name, value) for name, value in headers]
+
+    def header(self, name):
+        """The value of the first header named `name`, in any case, or None."""
+        return next((value for header, value in self.headers if header.lower() == name.lower()), None)
 
     @property
     def text(self):

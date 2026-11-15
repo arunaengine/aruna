@@ -23,7 +23,7 @@ test("reads jobs", () => {
   fake.job("j1", { kind: "upload", path: "raw/a", reply, report: '{"reads": 9}', outputs: ["out/0", "out/1", "out/2"] });
   const job = aruna.jobs.get("j1");
   assert.equal(job.ok, true);
-  assert.deepEqual([job.reply.status, job.reply.headers.etag, job.reply.json().checksum], [201, "e1", "md5:1"]);
+  assert.deepEqual([job.reply.status, job.reply.header("etag"), job.reply.json().checksum], [201, "e1", "md5:1"]);
   assert.deepEqual(job.reportJson(), { reads: 9 });
   assert.deepEqual([...job.outputs()].map((output) => output.path), ["out/0", "out/1", "out/2"]);
   job.cancel();

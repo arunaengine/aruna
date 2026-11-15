@@ -20,7 +20,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(self.fake.manual(n=2), {"n": 4, "missing": "-"})
         aruna.on("timer")(lambda tick: tick.isoformat())
         self.assertEqual(self.fake.timer(1_500), datetime.fromtimestamp(1.5, tz=timezone.utc).isoformat())
-        aruna.on("webhook")(lambda request: [request.json()["ref"], request.headers["x-kind"], request.delivery_id])
+        aruna.on("webhook")(lambda request: [request.json()["ref"], request.header("x-kind"), request.delivery_id])
         pushed = self.fake.webhook(body=b'{"ref": "main"}', headers=[("X-Kind", "push")], delivery_id="d1")
         self.assertEqual(pushed, ["main", "push", "d1"])
         aruna.on("sync_completed", "sync_failed")(lambda sync: [sync.ok, sync.relationship, sync.job])

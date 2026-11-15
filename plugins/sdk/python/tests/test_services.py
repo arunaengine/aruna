@@ -18,7 +18,7 @@ class ServicesTest(unittest.TestCase):
         self.fake.reply("catalog", "down", status=500, body=b"broken")
         catalog = aruna.service("catalog")
         record = catalog.post(json={"title": "Run 7"})
-        self.assertEqual((record.status, record["id"], record.headers["content-type"]), (201, "c-1", "application/json"))
+        self.assertEqual((record.status, record["id"], record.header("content-type")), (201, "c-1", "application/json"))
         self.assertEqual(self.fake.calls[-1], ("send", "catalog", "post", "", b'{"title": "Run 7"}'))
         with self.assertRaises(aruna.ServiceError) as raised:
             catalog.get("down")
@@ -28,6 +28,17 @@ class ServicesTest(unittest.TestCase):
         self.assertEqual(aruna.secret("signing"), {"key": "s3cret"})
         with self.assertRaises(aruna.NotAllowed):
             aruna.secret("other")
+
+    def test_repeated_headers(self):
+        links = [("Link", '<https://c.example.org/2>; rel="next"'), ("link", '<https://c.example.org/9>; rel="last"')]
+        self.fake.reply("catalog", "records", json=[], headers=links)
+        reply = aruna.service("catalog").get("records")
+        self.assertEqual(reply.headers, links)
+        self.assertEqual(reply.header("LINK"), links[0][1])
+        self.assertIsNone(reply.header("etag"))
+        aruna.on("webhook")(lambda request: [request.headers, request.header("x-tag")])
+        pushed = self.fake.webhook(headers=[("X-Tag", "a"), ("x-tag", "b")])
+        self.assertEqual(pushed, [[["X-Tag", "a"], ["x-tag", "b"]], "a"])
 
     def test_state(self):
         state = aruna.state

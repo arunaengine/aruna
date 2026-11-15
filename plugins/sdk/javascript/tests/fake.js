@@ -8,6 +8,7 @@ import { Conflict, NotAllowed, NotFound, handle, use } from "../aruna.js";
 const encoder = new TextEncoder();
 const text = (value) => JSON.stringify(value);
 
+const JSON_TYPE = [["Content-Type", "application/json"]];
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
 /** `target` with the JSON merge patch `patch` applied, by the host's rules; the host and every fake
@@ -44,8 +45,8 @@ export class Fake {
   }
 
   /** What `service` answers for `path`. */
-  reply(service, path, { status = 200, json, body = "" } = {}) {
-    this.replies.set(`${service} ${path}`, { status, body: json === undefined ? body : text(json) });
+  reply(service, path, { status = 200, json, body = "", headers = JSON_TYPE } = {}) {
+    this.replies.set(`${service} ${path}`, { status, headers, body: json === undefined ? body : text(json) });
   }
 
   /** Stores job `id` as it stands, with the paths of its outputs. */
@@ -143,8 +144,9 @@ export class Fake {
 
   send(request) {
     this.calls.push(["send", request]);
-    const reply = this.replies.get(`${request.service} ${request.path}`) ?? { status: 404, body: "not found" };
-    return { status: reply.status, headers: [["Content-Type", "application/json"]], body: encoder.encode(reply.body) };
+    const missing = { status: 404, headers: [], body: "not found" };
+    const reply = this.replies.get(`${request.service} ${request.path}`) ?? missing;
+    return { status: reply.status, headers: reply.headers, body: encoder.encode(reply.body) };
   }
 
   secret(name) {

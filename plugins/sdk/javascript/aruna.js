@@ -103,14 +103,23 @@ export const run = { id: "", install: "", group: "", event: null };
 /** The install's settings by name. */
 export const settings = {};
 
-/** A verified webhook request; authentication headers are already removed. */
+// The value of the first of `headers` named `name`, in any case, or null.
+const first = (headers, name) =>
+  headers.find(([header]) => header.toLowerCase() === name.toLowerCase())?.[1] ?? null;
+
+/** A verified webhook request; authentication headers are already removed. `headers` holds every
+ * header as a name and value pair, in order. */
 export class Request {
   constructor({ deliveryId, request }) {
     this.method = request.method;
     this.query = request.query;
     this.body = Uint8Array.from(request.body);
     this.deliveryId = deliveryId ?? null;
-    this.headers = Object.fromEntries(request.headers.map(({ name, value }) => [name.toLowerCase(), value]));
+    this.headers = request.headers.map(({ name, value }) => [name, value]);
+  }
+
+  header(name) {
+    return first(this.headers, name);
   }
 
   get text() {
@@ -397,12 +406,17 @@ export const objects = {
 loaders.set("data_uploaded", objects.get);
 fieldLoaders.set("object", objects.get);
 
-/** A service's whole answer. */
+/** A service's whole answer; `headers` holds every header as a name and value pair, in order. */
 export class Reply {
   constructor({ status, headers, body }) {
     this.status = status;
     this.body = Uint8Array.from(body);
-    this.headers = Object.fromEntries(headers.map(([name, value]) => [name.toLowerCase(), value]));
+    this.headers = headers.map(([name, value]) => [name, value]);
+  }
+
+  /** The value of the first header named `name`, in any case, or null. */
+  header(name) {
+    return first(this.headers, name);
   }
 
   get text() {

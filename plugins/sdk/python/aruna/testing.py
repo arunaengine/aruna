@@ -40,9 +40,9 @@ class Fake:
     def object(self, path, content=b"", version="v1", marked=False):
         self.objects[path] = (content, version, marked)
 
-    def reply(self, service, path="", status=200, json=None, body=b""):
+    def reply(self, service, path="", status=200, json=None, body=b"", headers=(("Content-Type", "application/json"),)):
         """What `service` answers for `path`."""
-        self.replies[(service, path)] = (status, body if json is None else _json(json))
+        self.replies[(service, path)] = (status, body if json is None else _json(json), list(headers))
 
     def log(self, level, message):
         self.lines.append((level, message))
@@ -124,8 +124,8 @@ class Fake:
 
     def send(self, service, method, path, query, headers, body):
         self.calls.append(("send", service, method, path, body))
-        status, answer = self.replies.get((service, path), (404, b"not found"))
-        return status, [("Content-Type", "application/json")], answer
+        status, answer, answer_headers = self.replies.get((service, path), (404, b"not found", []))
+        return status, answer_headers, answer
 
     def secret(self, name):
         if name not in self.secrets:

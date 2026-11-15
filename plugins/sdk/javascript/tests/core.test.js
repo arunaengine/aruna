@@ -44,9 +44,9 @@ test("loads subjects", async () => {
   const fake = new Fake();
   const headers = [{ name: "X-Token-Id", value: "t" }];
   const request = { method: "POST", query: "a=1", headers, body: new TextEncoder().encode('{"id": 7}') };
-  aruna.on("webhook", (got) => [got.method, got.query, got.headers, got.json(), got.deliveryId]);
+  aruna.on("webhook", (got) => [got.method, got.query, got.header("x-token-id"), got.json(), got.deliveryId]);
   const answer = JSON.parse(await fake.invoke("webhook", { deliveryId: "d-1", request }));
-  assert.deepEqual(answer, ["POST", "a=1", { "x-token-id": "t" }, { id: 7 }, "d-1"]);
+  assert.deepEqual(answer, ["POST", "a=1", "t", { id: 7 }, "d-1"]);
   aruna.on("sync_failed", (event) => [event.ok, event.path, event.relationship, event.job, aruna.run.event.kind]);
   const event = { kind: "sync_failed", path: "raw/", resource: "rel-1", revision: "job-1" };
   assert.deepEqual(JSON.parse(await fake.invoke("event", event)), [false, "raw/", "rel-1", "job-1", "sync_failed"]);

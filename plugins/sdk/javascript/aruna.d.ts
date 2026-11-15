@@ -60,7 +60,10 @@ export declare const log: {
 export declare class Request {
   method: string;
   query: string;
-  headers: { [name: string]: string };
+  /** Every header as a name and value pair, in order. */
+  headers: [string, string][];
+  /** The value of the first header named `name`, in any case, or null. */
+  header(name: string): string | null;
   body: Uint8Array;
   deliveryId: string | null;
   readonly text: string;
@@ -128,7 +131,10 @@ export declare const objects: {
 /** A service's whole answer. */
 export declare class Reply {
   status: number;
-  headers: { [name: string]: string };
+  /** Every header as a name and value pair, in order. */
+  headers: [string, string][];
+  /** The value of the first header named `name`, in any case, or null. */
+  header(name: string): string | null;
   body: Uint8Array;
   readonly text: string;
   json(): any;

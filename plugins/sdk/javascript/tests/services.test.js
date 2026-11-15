@@ -15,7 +15,7 @@ test("sends requests", () => {
   fake.reply("catalog", "busy", { status: 503, body: "try later" });
   const catalog = aruna.service("catalog");
   const record = catalog.post({ json: { title: "Run 7", id: "D1" }, query: { dry: true } });
-  assert.deepEqual([record.status, record.json().id, record.headers["content-type"]], [200, "c-1", "application/json"]);
+  assert.deepEqual([record.status, record.json().id, record.header("content-type")], [200, "c-1", "application/json"]);
   const [, sent] = fake.calls[0];
   assert.deepEqual([sent.method, sent.path, sent.query, sent.headers], ["post", "", [["dry", "true"]],
     [["content-type", "application/json"]]]);
@@ -24,6 +24,21 @@ test("sends requests", () => {
   assert.equal(catalog.get("busy", { check: false }).text, "try later");
   catalog.put("busy", { body: "plain", headers: { accept: "text/plain" }, check: false });
   assert.deepEqual(fake.calls.at(-1)[1].headers, [["accept", "text/plain"]]);
+});
+
+test("keeps repeated headers", async () => {
+  const fake = new Fake();
+  const links = [["Link", '<https://c.example.org/2>; rel="next"'], ["link", '<https://c.example.org/9>; rel="last"']];
+  fake.reply("catalog", "records", { json: [], headers: links });
+  const reply = aruna.service("catalog").get("records");
+  assert.deepEqual(reply.headers, links);
+  assert.equal(reply.header("LINK"), links[0][1]);
+  assert.equal(reply.header("etag"), null);
+  aruna.on("webhook", (request) => [request.headers, request.header("x-tag")]);
+  const headers = [{ name: "X-Tag", value: "a" }, { name: "x-tag", value: "b" }];
+  const request = { method: "POST", query: "", headers, body: new Uint8Array() };
+  const answer = JSON.parse(await fake.invoke("webhook", { deliveryId: null, request }));
+  assert.deepEqual(answer, [[["X-Tag", "a"], ["x-tag", "b"]], "a"]);
 });
 
 test("keeps state", async () => {

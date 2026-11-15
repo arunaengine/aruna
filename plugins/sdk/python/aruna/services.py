@@ -9,11 +9,16 @@ from .errors import ServiceError
 
 
 class Reply:
-    """A service's whole answer; `reply["id"]` reads a field of a JSON answer."""
+    """A service's whole answer; `headers` holds every header as a name and value pair, in order,
+    and `reply["id"]` reads a field of a JSON answer."""
 
     def __init__(self, status, headers, body):
         self.status, self.body = status, body
-        self.headers = {name.lower(): value for name, value in headers}
+        self.headers = [(name, value) for name, value in headers]
+
+    def header(self, name):
+        """The value of the first header named `name`, in any case, or None."""
+        return next((value for header, value in self.headers if header.lower() == name.lower()), None)
 
     @property
     def text(self):
