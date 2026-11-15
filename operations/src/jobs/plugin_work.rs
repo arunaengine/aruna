@@ -30,7 +30,7 @@ use crate::plugins::marks::unmarked;
 use crate::plugins::outgoing::node_keys;
 use crate::plugins::work::{WorkRow, read_work};
 
-use super::transfers::{Download, download_work};
+use super::transfers::{Download, Upload, download_work, upload_work};
 use crate::s3::object::copy::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_at,
 };
@@ -65,6 +65,15 @@ pub async fn run_plugin_work(ctx: &JobContext, spec: &PluginWorkSpec) -> JobRunO
             let keys = node_keys(&ctx.driver);
             let admitted = (&install, &config, &row);
             download_work(ctx, spec, admitted, (download, &keys)).await
+        }
+        PluginWorkAction::Upload { source, version } => {
+            let upload = Upload {
+                source,
+                version: *version,
+            };
+            let keys = node_keys(&ctx.driver);
+            let admitted = (&install, &config, &row);
+            upload_work(ctx, spec, admitted, (upload, &keys)).await
         }
     }
 }
@@ -197,7 +206,7 @@ fn source_locked(error: &CopyObjectError) -> bool {
 
 /// Parks the work on the key of the source version it reads, so it runs again once that key is
 /// unlocked; a key unlocked meanwhile is tried again at once.
-async fn key_wait(
+pub(super) async fn key_wait(
     ctx: &JobContext,
     install: &PluginInstall,
     (bucket, key, version_id): (String, String, Option<ulid::Ulid>),

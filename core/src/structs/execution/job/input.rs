@@ -294,6 +294,11 @@ pub enum PluginWorkAction {
         checksums: Vec<(ChecksumAlgorithm, Vec<u8>)>,
         max_bytes: Option<u64>,
     },
+    /// Sends one object version as the body of the work row's request; `version` pins it.
+    Upload {
+        source: String,
+        version: Option<Ulid>,
+    },
 }
 
 /// One server-side object copy run outside a request, for a source whose bytes

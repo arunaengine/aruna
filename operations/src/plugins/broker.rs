@@ -1827,7 +1827,7 @@ fn whole(fields: &SecretFields, answer: &Answer) -> Response {
     }
 }
 
-fn whole_text(reply: &Response) -> String {
+pub(crate) fn whole_text(reply: &Response) -> String {
     let headers: Vec<(&str, &str)> = (reply.headers.iter())
         .map(|field| (field.name.as_str(), field.value.as_str()))
         .collect();
