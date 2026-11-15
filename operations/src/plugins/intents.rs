@@ -193,6 +193,22 @@ pub async fn resolve_intents(txn: &Txn<'_>, run_id: Ulid, done: bool) -> Result<
     txn.write(PLUGIN_INTENTS_KEYSPACE, resolved).await
 }
 
+/// Removes the intents a person resolved as not done, so a retry makes those calls again; the
+/// other intents, settled replies among them, stay.
+pub async fn clear_undone(txn: &Txn<'_>, run_id: Ulid) -> Result<(), StoreError> {
+    let rows = txn
+        .scan(PLUGIN_INTENTS_KEYSPACE, &run_id.to_bytes())
+        .await?;
+    let mut undone = Vec::new();
+    for (key, value) in rows {
+        let record = decode::<IntentRecord>(&value)?;
+        if record.state == (IntentState::Resolved { done: false }) {
+            undone.push(key);
+        }
+    }
+    txn.delete(PLUGIN_INTENTS_KEYSPACE, undone).await
+}
+
 /// Removes every intent of a run.
 pub async fn drop_intents(txn: &Txn<'_>, run_id: Ulid) -> Result<(), StoreError> {
     let rows = txn

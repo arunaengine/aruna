@@ -182,3 +182,36 @@ async fn drop_delivers_none() {
     let missing = drop_completion(&fixture.ctx, (install.install_id, Ulid::nil()), &dropped);
     assert_eq!(missing.await.map(drop), Err(RunError::NotFound));
 }
+
+#[tokio::test]
+async fn retry_redoes_undone() {
+    // A call a person resolved as not done is made again by the retry; a settled one answers its
+    // reply again.
+    use aruna_plugins::broker::Intent;
+
+    use crate::plugins::intents::{Begun, begin, mark_unknown, resolve_intents, settle_in};
+    let fixture = Fixture::new().await;
+    let install = finisher(&fixture).await;
+    let mut run = scope(&fixture, &install).run;
+    let (settled, undone) = (Intent::new(1, &[b"put"]), Intent::new(2, &[b"copy"]));
+    let ctx = &fixture.ctx;
+    begin(ctx, run.run_id, &settled).await.unwrap();
+    let settle = async |txn: &Txn<'_>| settle_in(txn, run.run_id, &settled, "7".into()).await;
+    transact(ctx, settle).await.unwrap();
+    mark_unknown(ctx, run.run_id, &undone, "timed out")
+        .await
+        .unwrap();
+    let resolve = async |txn: &Txn<'_>| resolve_intents(txn, run.run_id, false).await;
+    transact(ctx, resolve).await.unwrap();
+    run.finish(RunState::Failed, None, 1);
+    save_run(ctx, &run).await.unwrap();
+    let retried = audit(&fixture, AdminAuditAction::PluginRunRetried);
+    retry_run(ctx, (install.install_id, run.run_id), &retried, 9)
+        .await
+        .unwrap();
+    assert_eq!(begin(ctx, run.run_id, &undone).await.unwrap(), Begun::Fresh);
+    assert_eq!(
+        begin(ctx, run.run_id, &settled).await.unwrap(),
+        Begun::Settled("7".into())
+    );
+}

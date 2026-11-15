@@ -13,6 +13,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::dispatch::event_run;
+use super::intents::clear_undone;
 use super::runs::{ADMISSIONS, RunError, admit_in, read_run};
 use super::store::{StoreError, Txn, decode, encode, transact};
 use super::work::{WORK_ROW, WorkKind, WorkRow, WorkState, read_in, work_state};
@@ -101,7 +102,8 @@ pub fn waits_for(row: &WorkRow, run: Option<RunState>) -> Option<Ulid> {
 }
 
 /// Queues a failed or cancelled run again with its intents kept, so its calls reach the same
-/// ordinals and its jobs the same ids; the audit row commits with it.
+/// ordinals and its jobs the same ids; a call resolved as not done is made again. The audit row
+/// commits with it.
 pub async fn retry_run(
     ctx: &DriverContext,
     (install_id, run_id): (Ulid, Ulid),
@@ -121,6 +123,7 @@ pub async fn retry_run(
         (run.finished_ms, run.message, run.output) = (None, None, None);
         run.log.clear();
         admit_in(txn, &run).await?;
+        clear_undone(txn, run_id).await?;
         audited(txn, audit).await?;
         Ok(run)
     })
