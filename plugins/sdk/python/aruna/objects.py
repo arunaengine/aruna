@@ -40,6 +40,13 @@ def get(path):
     return Object(**host().object_info(path))
 
 
+def copy(source, target, version=None):
+    """Starts a copy of the object at `source` to `target` and answers its `Job`."""
+    from . import jobs
+
+    return jobs.copy(source, target, version)
+
+
 def list(prefix):
     """Every object below `prefix` the install may read, one page at a time."""
     pages = _pages(lambda cursor: host().object_list(prefix, cursor))

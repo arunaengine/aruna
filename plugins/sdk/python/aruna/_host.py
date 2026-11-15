@@ -109,6 +109,26 @@ class Imports:
     def state_remove(self, key, expected):
         self.call(self.imports.state.remove, key, expected)
 
+    def job_copy(self, source, version, target):
+        return self.call(self.imports.jobs.copy, source, version, target)
+
+    def job_get(self, id):
+        status = self.call(self.imports.jobs.get, id)
+        reply = None
+        if status.reply_status is not None:
+            headers = [(field.name, field.value) for field in status.reply_headers]
+            reply = (status.reply_status, headers, bytes(status.reply_body or b""))
+        return {"id": status.id, "kind": status.kind, "path": status.path, "state": status.state,
+                "message": status.message, "bytes": status.bytes, "version": status.version,
+                "exit_code": status.exit_code, "reply": reply, "report": status.report}
+
+    def job_outputs(self, id, cursor):
+        page = self.call(self.imports.jobs.outputs, id, cursor)
+        return [_info(info) for info in page.objects], page.cursor
+
+    def job_cancel(self, id):
+        self.call(self.imports.jobs.cancel, id)
+
 
 def _info(info):
     return {"path": info.path, "size": info.size, "version": info.version, "marked": info.marked}

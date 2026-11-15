@@ -22,6 +22,8 @@ class Fake:
         self.lines, self.calls, self.runs = [], [], 0
         self.datasets, self.objects, self.replies, self.secrets = {}, {}, {}, {}
         self.values, self.versions = {}, 0
+        #: Jobs by id: their status, as `aruna.jobs.get` answers it, and their outputs.
+        self.jobs = {}
         _run.fields.clear()
         if manifest is not None:
             with open(manifest, "rb") as file:
@@ -133,6 +135,28 @@ class Fake:
         if name not in self.secrets:
             raise NotAllowed(f"the install may not read the secret {name}")
         return list(self.secrets[name].items())
+
+    def job(self, id, kind="copy", state="succeeded", outputs=(), **status):
+        """Stores job `id` as it stands, with the bucket paths of its outputs."""
+        self.jobs[id] = ({"id": id, "kind": kind, "state": state, **status}, [*outputs])
+
+    def job_copy(self, source, version, target):
+        self.calls.append(("copy", source, version, target))
+        id = f"job-{len(self.jobs) + 1}"
+        self.job(id, path=target, state="queued")
+        return id
+
+    def job_get(self, id):
+        if id not in self.jobs:
+            raise NotFound(f"the install has no job {id}")
+        return self.jobs[id][0]
+
+    def job_outputs(self, id, cursor):
+        infos = [{"path": path, "size": 0, "version": "v1", "marked": False} for path in self.jobs[id][1]]
+        return self._paged(infos, cursor)
+
+    def job_cancel(self, id):
+        self.calls.append(("cancel", id))
 
     def state_get(self, key):
         return self.values.get(key)
