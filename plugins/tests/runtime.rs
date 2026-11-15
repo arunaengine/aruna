@@ -11,8 +11,8 @@ use std::time::Duration;
 use aruna_plugins::artifact::read_manifest;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, FileChange, FilePage, HostError,
-    Intent, JobCopy, JobDownload, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
-    ObjectPage, Response, SendRequest, StatePut, StateRemove,
+    Intent, JobCopy, JobDownload, JobStatus, JobUpload, Listing, MetadataCreate, MetadataPatch,
+    ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::manifest::Manifest;
@@ -257,6 +257,17 @@ impl Broker for Recorder {
         self.note(&call);
         self.intents.lock().unwrap().push(download.intent);
         Ok("job-2".into())
+    }
+
+    async fn jobs_upload(&self, _: &CallContext, upload: JobUpload) -> Result<String, HostError> {
+        let field = upload.file_field.unwrap_or_default();
+        let call = format!(
+            "upload {} {:?} {} {} {field}",
+            upload.service, upload.method, upload.path, upload.source
+        );
+        self.note(&call);
+        self.intents.lock().unwrap().push(upload.intent);
+        Ok("job-3".into())
     }
 
     async fn jobs_get(&self, _: &CallContext, id: &str) -> Result<JobStatus, HostError> {
@@ -747,6 +758,27 @@ async fn download_gated() {
     let message = missing(probe(input)).await;
     let wanted = "not allowed: permission `transfers.download` is not granted to this install";
     assert_eq!(message, wanted);
+}
+
+#[tokio::test]
+async fn upload_gated() {
+    // An upload reaches the broker as a write with its form field; it needs the upload
+    // permission and the service's connection.
+    let input = serde_json::json!({"call": "upload", "connection": "api", "path": "deposit",
+        "source": "in/a.fq", "field": "file"});
+    let mut upload = probe(input.clone());
+    upload.permissions.insert(Permission::TransfersUpload);
+    let broker = Arc::new(Recorder::default());
+    assert_eq!(output(invoke(upload, broker.clone()).await), "job-3");
+    assert_eq!(
+        broker.calls(),
+        ["upload api Method::Post deposit in/a.fq file"]
+    );
+    let Err(InvokeError::Guest(failure)) = invoke(probe(input), Arc::default()).await else {
+        panic!("an upload without its permission fails the run");
+    };
+    let wanted = "not allowed: permission `transfers.upload` is not granted to this install";
+    assert_eq!(failure.message, wanted);
 }
 
 #[tokio::test]

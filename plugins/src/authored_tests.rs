@@ -84,6 +84,7 @@ fn read_by_default() {
     assert_eq!(manifest.check(), Ok(()));
     let required = &manifest.permissions.required;
     assert!(required.contains(&Permission::MetadataRead));
+    assert!(required.contains(&Permission::TransfersUpload));
     assert!(!required.contains(&Permission::MetadataWrite));
     assert!(!required.contains(&Permission::ObjectsCopy));
     assert!(!required.contains(&Permission::TransfersDownload));

@@ -255,7 +255,12 @@ fn fields(fields: BTreeMap<String, Field>) -> BTreeMap<String, Setting> {
 
 /// The permissions an access asks for, until grants name read and write themselves.
 fn requests(access: Access, readable: bool) -> Requests {
-    let mut required = BTreeSet::from([Permission::MetadataRead, Permission::ObjectsRead]);
+    // An upload reads its source and sends it through a declared service, as `send` may.
+    let mut required = BTreeSet::from([
+        Permission::MetadataRead,
+        Permission::ObjectsRead,
+        Permission::TransfersUpload,
+    ]);
     if access == Access::Write {
         // A copy needs read on the source and write on the target; a download writes its target.
         required.extend([

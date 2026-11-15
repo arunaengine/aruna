@@ -628,3 +628,63 @@ async fn reply_rechecked() {
     assert_eq!((narrowed.reply_status, narrowed.reply_body), (None, None));
     assert_eq!(narrowed.state, shown.state);
 }
+
+#[tokio::test]
+async fn broker_starts_uploads() {
+    // An upload is a PUT or a POST; a form names its file part after the source's file name.
+    use std::sync::Arc;
+
+    use aruna_plugins::broker::{Broker, CallContext, Field, Intent, JobUpload, Method};
+
+    use crate::plugins::broker::RunBroker;
+    use crate::plugins::work::read_work;
+    let fixture = Fixture::new().await;
+    let install = ready(&fixture).await;
+    let puts = serde_json::json!({
+        "permissions": { "required": ["objects.copy"] },
+        "connections": { "catalog": { "url": "{catalog_url}/api/", "methods": ["GET", "POST"] } }
+    });
+    let digest = fixture.publish("0.3.0", "ef", puts).await;
+    edit_config(&fixture, |config| {
+        (config.installs[0].digest, config.installs[0].version) = (digest, "0.3.0".into());
+    })
+    .await;
+    let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let install = (config.await.unwrap().installs.into_iter())
+        .find(|found| found.install_id == install.install_id)
+        .unwrap();
+    let (_root, blob) = stored_object(&fixture, &install).await;
+    let mut scope = scope(&fixture, &install);
+    scope.run.settings = r#"{"catalog_url":"https://catalog.example.org"}"#.into();
+    let broker = RunBroker::new(Arc::new(blob), scope);
+    let cx = CallContext {
+        run: "run".into(),
+        install: install.install_id.to_string(),
+        max_bytes: 1 << 20,
+    };
+    let upload = |method| JobUpload {
+        service: "catalog".into(),
+        method,
+        path: "deposit".into(),
+        query: Vec::new(),
+        headers: Vec::new(),
+        source: "in/a.txt".into(),
+        version: None,
+        file_field: Some("file".into()),
+        fields: vec![Field {
+            name: "title".into(),
+            value: "Run 7".into(),
+        }],
+        intent: Intent::new(5, &[b"upload"]),
+    };
+    let refused = broker
+        .jobs_upload(&cx, upload(Method::Get))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Invalid);
+    let id = broker.jobs_upload(&cx, upload(Method::Post)).await.unwrap();
+    let row = read_work(&fixture.ctx, install.install_id, id.parse().unwrap()).await;
+    let row = row.unwrap().unwrap();
+    assert_eq!(row.source, Some(path(&fixture, &install, "in/a.txt")));
+    assert_eq!(row.context.unwrap().method, "POST");
+}

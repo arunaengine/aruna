@@ -15,6 +15,7 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun};
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_BLAKE3};
+use aruna_core::structs::execution::job::UploadForm;
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
@@ -24,8 +25,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, JobCopy, JobDownload, JobStatus, Listing, MetadataCreate, MetadataPatch,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
+    HostError, Intent, JobCopy, JobDownload, JobStatus, JobUpload, Listing, MetadataCreate,
+    MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
@@ -51,7 +52,9 @@ use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
 use super::state::{PutError, check_key, put_state, read_state, remove_state};
 use super::store::{StoreError, Txn, transact};
-use super::submit::{CopyRequest, DownloadRequest, start_copy, start_download};
+use super::submit::{
+    CopyRequest, DownloadRequest, UploadRequest, start_copy, start_download, start_upload,
+};
 use super::work::RequestContext;
 use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -1138,6 +1141,50 @@ impl Broker for RunBroker {
         };
         let started = start_download(&self.ctx, &self.scope, request);
         match self.native(&download.intent, started).await {
+            Err(error) if error.kind == ErrorKind::Conflict => {
+                self.changed.store(true, Ordering::Relaxed);
+                Err(error)
+            }
+            answered => answered,
+        }
+    }
+
+    async fn jobs_upload(&self, _cx: &CallContext, upload: JobUpload) -> Result<String, HostError> {
+        use aruna_plugins::broker::Method;
+        if !matches!(upload.method, Method::Put | Method::Post) {
+            let message = "an upload is sent with PUT or POST";
+            return Err(HostError::new(ErrorKind::Invalid, message));
+        }
+        let source = self.expand(&upload.source)?;
+        let version = (upload.version.as_deref()).map(version_id).transpose()?;
+        let request = SendRequest {
+            connection: upload.service,
+            method: upload.method,
+            path: upload.path,
+            query: upload.query,
+            headers: upload.headers,
+            body: Vec::new(),
+            intent: None,
+        };
+        // The same checks as a request the run sends itself, with its secret released.
+        let ready = self.ready(request).await?;
+        let file_name = source.rsplit('/').next().unwrap_or_default().to_string();
+        let form = upload.file_field.map(|file_field| UploadForm {
+            file_field,
+            file_name,
+            fields: (upload.fields.into_iter())
+                .map(|field| (field.name, field.value))
+                .collect(),
+        });
+        let request = UploadRequest {
+            context: ready.context,
+            source,
+            version,
+            form,
+            ordinal: upload.intent.ordinal,
+        };
+        let started = start_upload(&self.ctx, &self.scope, request);
+        match self.native(&upload.intent, started).await {
             Err(error) if error.kind == ErrorKind::Conflict => {
                 self.changed.store(true, Ordering::Relaxed);
                 Err(error)
