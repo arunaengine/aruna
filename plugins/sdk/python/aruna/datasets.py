@@ -60,14 +60,13 @@ class Dataset:
         """Sends the fields that changed with the revision read and answers their names; nothing
         changed makes no call. A change made meanwhile raises `Conflict`."""
         now = self._entity()
-        names = sorted(set(self._read) | set(now))
-        patch = {name: now.get(name) for name in names if not name.startswith("@") and self._read.get(name) != now.get(name)}
+        patch = {name: value for name, value in merge_patch(self._read, now).items() if not name.startswith("@")}
         if not patch:
             return []
         text = json.dumps(patch, sort_keys=True)
         self.revision = host().dataset_patch(self.id, text, self.revision)
         self._read = now
-        return ["identifiers" if name == "identifier" else name for name in patch]
+        return ["identifiers" if name == "identifier" else name for name in sorted(patch)]
 
     def reload(self):
         """Reads the dataset again; changes not saved are lost."""
@@ -98,6 +97,21 @@ class Dataset:
 
     def remove_file(self, id):
         self.revision = host().file_remove(self.id, id, self.revision)
+
+
+def merge_patch(old, new):
+    """The JSON merge patch that turns `old` into `new`: what changed, `None` for each name removed,
+    and the same rule inside objects on both sides, as the host applies a merge patch."""
+    patch = {name: None for name in old if name not in new}
+    for name, value in new.items():
+        before = old.get(name)
+        if isinstance(before, dict) and isinstance(value, dict):
+            inner = merge_patch(before, value)
+            if inner:
+                patch[name] = inner
+        elif name not in old or before != value:
+            patch[name] = value
+    return patch
 
 
 def get(id):

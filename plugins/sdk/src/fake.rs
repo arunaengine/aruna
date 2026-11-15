@@ -117,6 +117,26 @@ impl Fake {
     }
 }
 
+/// Applies a JSON merge patch by the host's rules; `merge_cases.json` holds both to the same cases.
+pub(crate) fn merge_into(target: &mut Value, patch: Value) {
+    let Value::Object(changes) = patch else {
+        *target = patch;
+        return;
+    };
+    if !target.is_object() {
+        *target = Value::Object(Map::new());
+    }
+    let Value::Object(fields) = target else {
+        return;
+    };
+    for (key, value) in changes {
+        match value {
+            Value::Null => drop(fields.remove(&key)),
+            value => merge_into(fields.entry(key).or_insert(Value::Null), value),
+        }
+    }
+}
+
 pub(crate) fn refusal(kind: ErrorKind, message: &str) -> HostError {
     HostError {
         kind,
@@ -194,14 +214,11 @@ impl Host for Fake {
 
     fn dataset_patch(&self, id: &str, patch: &str, expected: &str) -> Answer<String> {
         self.note(format!("patch {id} {patch} {expected}"));
-        let patch: Map<String, Value> = serde_json::from_str(patch).unwrap();
+        let patch: Value = serde_json::from_str(patch).unwrap();
         self.write(id, expected, |stored| {
-            for (name, value) in patch {
-                match value {
-                    Value::Null => drop(stored.entity.remove(&name)),
-                    value => drop(stored.entity.insert(name, value)),
-                }
-            }
+            let mut entity = Value::Object(std::mem::take(&mut stored.entity));
+            merge_into(&mut entity, patch);
+            stored.entity = entity.as_object().cloned().unwrap_or_default();
         })
     }
 

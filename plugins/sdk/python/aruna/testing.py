@@ -83,11 +83,7 @@ class Fake:
         self.calls.append(("patch", id, changes))
 
         def apply(stored):
-            for name, value in changes.items():
-                if value is None:
-                    stored["entity"].pop(name, None)
-                else:
-                    stored["entity"][name] = value
+            stored["entity"] = merged(stored["entity"], changes)
 
         return self._write(id, expected, apply)
 
@@ -191,6 +187,20 @@ class Fake:
 
     def event(self, kind, resource, path="", revision=""):
         return self._invoke(kind, {"kind": kind, "path": path, "resource": resource, "revision": revision})
+
+
+def merged(target, patch):
+    """`target` with the JSON merge patch `patch` applied, by the host's rules; the host and every
+    fake are tested against `merge_cases.json`."""
+    if not isinstance(patch, dict):
+        return patch
+    result = dict(target) if isinstance(target, dict) else {}
+    for name, value in patch.items():
+        if value is None:
+            result.pop(name, None)
+        else:
+            result[name] = merged(result.get(name), value)
+    return result
 
 
 def _json(value):

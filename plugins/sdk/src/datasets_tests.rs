@@ -39,8 +39,7 @@ fn fields_and_save() {
     let mut changed = dataset.save().unwrap();
     changed.sort();
     assert_eq!(changed, ["description", "identifiers", "publisher"]);
-    let patch =
-        r#"{"description":"gels","identifier":{"catalog":"c-1","doi":"10.1/x"},"publisher":null}"#;
+    let patch = r#"{"description":"gels","identifier":{"catalog":"c-1"},"publisher":null}"#;
     assert_eq!(fake.calls().last().unwrap(), &format!("patch D1 {patch} 1"));
     assert_eq!(dataset.revision, "2");
     // A change made meanwhile: the stale copy conflicts.
@@ -51,6 +50,40 @@ fn fields_and_save() {
     assert!(matches!(stale.save(), Err(Error::Conflict(_))));
     stale.reload().unwrap();
     assert_eq!(stale.name, "Run 8");
+}
+
+#[test]
+fn merge_cases() {
+    // The host's own merge patch is tested against the same cases.
+    let cases: Vec<(Value, Value, Value)> =
+        serde_json::from_str(include_str!("../merge_cases.json")).unwrap();
+    for (target, patch, merged) in cases {
+        let mut result = target.clone();
+        crate::host::fake::merge_into(&mut result, patch.clone());
+        assert_eq!(result, merged, "{target} {patch}");
+        if let (Value::Object(old), Value::Object(new)) = (&target, &merged) {
+            let mut again = target.clone();
+            crate::host::fake::merge_into(&mut again, Value::Object(merge_patch(old, new)));
+            assert_eq!(
+                &again, &merged,
+                "a save's patch turns {target} into {merged}"
+            );
+        }
+    }
+}
+
+#[test]
+fn removes_nested() {
+    let fake = seeded();
+    let mut dataset = get("D1").unwrap();
+    dataset.identifiers.insert("catalog".into(), "c1".into());
+    dataset.save().unwrap();
+    dataset.identifiers.remove("doi");
+    assert_eq!(dataset.save().unwrap(), ["identifiers"]);
+    let patch = r#"{"identifier":{"doi":null}}"#;
+    assert_eq!(fake.calls().last().unwrap(), &format!("patch D1 {patch} 2"));
+    let stored = get("D1").unwrap().identifiers;
+    assert_eq!(stored, BTreeMap::from([("catalog".into(), json!("c1"))]));
 }
 
 #[test]

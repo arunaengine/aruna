@@ -217,6 +217,20 @@ const isObject = (value) => value !== null && typeof value === "object" && !Arra
 const filled = (value) =>
   value !== null && value !== undefined && value !== "" && (typeof value !== "object" || Object.keys(value).length > 0);
 
+/** The JSON merge patch that turns `old` into `new`: what changed, `null` for each name removed,
+ * and the same rule inside objects on both sides, as the host applies a merge patch. */
+export function mergePatch(old, now) {
+  const patch = {};
+  for (const name of Object.keys(old)) if (!(name in now)) patch[name] = null;
+  for (const [name, value] of Object.entries(now)) {
+    if (isObject(old[name]) && isObject(value)) {
+      const inner = mergePatch(old[name], value);
+      if (Object.keys(inner).length > 0) patch[name] = inner;
+    } else if (!(name in old) || json(old[name]) !== json(value)) patch[name] = value;
+  }
+  return patch;
+}
+
 /** One dataset at the revision it was read; other properties by name with `get` and `set`. */
 export class Dataset {
   #read = {};
@@ -265,10 +279,10 @@ export class Dataset {
    * makes no call. A change made meanwhile throws `Conflict`. */
   save() {
     const now = this.#entity();
-    const names = [...new Set([...Object.keys(this.#read), ...Object.keys(now)])].sort();
-    const changed = names.filter((name) => !name.startsWith("@") && json(this.#read[name]) !== json(now[name]));
+    const patch = mergePatch(this.#read, now);
+    for (const name of Object.keys(patch)) if (name.startsWith("@")) delete patch[name];
+    const changed = Object.keys(patch).sort();
     if (changed.length === 0) return [];
-    const patch = Object.fromEntries(changed.map((name) => [name, now[name] ?? null]));
     this.revision = calls().datasetPatch(this.id, json(patch), this.revision);
     this.#read = now;
     return changed.map((name) => (name === "identifier" ? "identifiers" : name));

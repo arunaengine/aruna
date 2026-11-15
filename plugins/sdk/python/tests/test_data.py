@@ -3,12 +3,16 @@ listings, creates, small reads, a marked version, and both as subjects."""
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import aruna
-from aruna.testing import Fake
+from aruna.datasets import merge_patch
+from aruna.testing import Fake, merged
+
+CASES = Path(__file__).resolve().parents[2] / "merge_cases.json"
 
 
 class DataTest(unittest.TestCase):
@@ -26,7 +30,7 @@ class DataTest(unittest.TestCase):
         dataset.identifiers["catalog"] = "c-1"
         del dataset["publisher"]
         self.assertEqual(dataset.save(), ["identifiers", "publisher"])
-        self.assertEqual(self.fake.calls[-1], ("patch", "D1", {"identifier": {"catalog": "c-1", "doi": "10.1/x"}, "publisher": None}))
+        self.assertEqual(self.fake.calls[-1], ("patch", "D1", {"identifier": {"catalog": "c-1"}, "publisher": None}))
         stale = aruna.datasets.get("D1")
         dataset.name = "Run 8"
         dataset.save()
@@ -35,6 +39,22 @@ class DataTest(unittest.TestCase):
             stale.save()
         stale.reload()
         self.assertEqual(stale.name, "Run 8")
+
+    def test_merge_cases(self):
+        # The host's own merge patch is tested against the same cases.
+        for target, patch, result in json.loads(CASES.read_text()):
+            self.assertEqual(merged(target, patch), result, (target, patch))
+            if isinstance(target, dict) and isinstance(result, dict):
+                self.assertEqual(merged(target, merge_patch(target, result)), result)
+
+    def test_remove_nested(self):
+        dataset = aruna.datasets.get("D1")
+        dataset.identifiers["catalog"] = "c1"
+        dataset.save()
+        del dataset.identifiers["doi"]
+        self.assertEqual(dataset.save(), ["identifiers"])
+        self.assertEqual(self.fake.calls[-1], ("patch", "D1", {"identifier": {"doi": None}}))
+        self.assertEqual(aruna.datasets.get("D1").identifiers, {"catalog": "c1"})
 
     def test_clear_fields(self):
         dataset = aruna.datasets.get("D1")

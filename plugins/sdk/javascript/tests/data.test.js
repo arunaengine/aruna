@@ -6,8 +6,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import aruna from "../aruna.js";
-import { Fake } from "./fake.js";
+import { readFileSync } from "node:fs";
+
+import aruna, { mergePatch } from "../aruna.js";
+import { Fake, merged } from "./fake.js";
+
+const CASES = JSON.parse(readFileSync(new URL("../../merge_cases.json", import.meta.url), "utf8"));
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
 function seeded(types) {
   const fake = new Fake(types);
@@ -27,7 +32,7 @@ test("saves changes", () => {
   dataset.identifiers.catalog = "c-1";
   dataset.remove("publisher");
   assert.deepEqual(dataset.save(), ["identifiers", "publisher"]);
-  const patch = { identifier: { catalog: "c-1", doi: "10.1/x" }, publisher: null };
+  const patch = { identifier: { catalog: "c-1" }, publisher: null };
   assert.deepEqual(fake.calls.at(-1), ["patch", "D1", patch]);
   const stale = aruna.datasets.get("D1");
   dataset.name = "Run 8";
@@ -39,6 +44,25 @@ test("saves changes", () => {
   stale.keywords = [];
   assert.deepEqual(stale.save(), ["keywords"]);
   assert.deepEqual(aruna.datasets.get("D1").keywords, []);
+});
+
+test("applies merge cases", () => {
+  // The host's own merge patch is tested against the same cases.
+  for (const [target, patch, result] of CASES) {
+    assert.deepEqual(merged(target, patch), result, JSON.stringify([target, patch]));
+    if (isObject(target) && isObject(result)) assert.deepEqual(merged(target, mergePatch(target, result)), result);
+  }
+});
+
+test("removes nested values", () => {
+  const fake = seeded();
+  const dataset = aruna.datasets.get("D1");
+  dataset.identifiers.catalog = "c1";
+  dataset.save();
+  delete dataset.identifiers.doi;
+  assert.deepEqual(dataset.save(), ["identifiers"]);
+  assert.deepEqual(fake.calls.at(-1), ["patch", "D1", { identifier: { doi: null } }]);
+  assert.deepEqual(aruna.datasets.get("D1").identifiers, { catalog: "c1" });
 });
 
 test("links files", () => {

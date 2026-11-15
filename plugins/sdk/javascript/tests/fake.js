@@ -8,6 +8,20 @@ import { Conflict, NotAllowed, NotFound, handle, use } from "../aruna.js";
 const encoder = new TextEncoder();
 const text = (value) => JSON.stringify(value);
 
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** `target` with the JSON merge patch `patch` applied, by the host's rules; the host and every fake
+ * are tested against `merge_cases.json`. */
+export function merged(target, patch) {
+  if (!isObject(patch)) return patch;
+  const result = isObject(target) ? { ...target } : {};
+  for (const [name, value] of Object.entries(patch)) {
+    if (value === null) delete result[name];
+    else result[name] = merged(result[name], value);
+  }
+  return result;
+}
+
 export class Fake {
   // Items of one page of a listing.
   page = 2;
@@ -85,8 +99,7 @@ export class Fake {
   datasetPatch(id, patch, expected) {
     this.calls.push(["patch", id, JSON.parse(patch)]);
     return this.write(id, expected, (stored) => {
-      const entity = { ...stored.entity, ...JSON.parse(patch) };
-      stored.entity = Object.fromEntries(Object.entries(entity).filter(([, value]) => value !== null));
+      stored.entity = merged(stored.entity, JSON.parse(patch));
     });
   }
 

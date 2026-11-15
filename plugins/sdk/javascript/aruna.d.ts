@@ -97,6 +97,9 @@ export declare class Dataset {
   removeFile(id: string): void;
 }
 
+/** The JSON merge patch that turns `old` into `now`, with `null` for each name removed. */
+export declare function mergePatch(old: object, now: object): { [name: string]: unknown };
+
 export declare const datasets: {
   get(id: string): Dataset;
   list(): Iterable<Dataset>;

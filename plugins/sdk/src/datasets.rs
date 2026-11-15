@@ -148,13 +148,8 @@ impl Dataset {
     /// changed makes no call. A change made meanwhile is a `Conflict`.
     pub fn save(&mut self) -> Result<Vec<String>> {
         let now = self.entity();
-        let mut patch = Map::new();
-        for name in self.read.keys().chain(now.keys()) {
-            let value = now.get(name).cloned().unwrap_or(Value::Null);
-            if !name.starts_with('@') && self.read.get(name) != now.get(name) {
-                patch.insert(name.clone(), value);
-            }
-        }
+        let mut patch = merge_patch(&self.read, &now);
+        patch.retain(|name, _| !name.starts_with('@'));
         if patch.is_empty() {
             return Ok(Vec::new());
         }
@@ -228,6 +223,29 @@ impl Dataset {
         self.revision = host::with(|host| host.file_remove(&self.id, id, &self.revision))?;
         Ok(())
     }
+}
+
+/// The JSON merge patch that turns `old` into `new`: what changed, `null` for each name removed,
+/// and the same rule inside objects on both sides, as the host applies a merge patch.
+pub(crate) fn merge_patch(
+    old: &Map<String, Value>,
+    new: &Map<String, Value>,
+) -> Map<String, Value> {
+    let removed = (old.keys()).filter(|name| !new.contains_key(*name));
+    let mut patch: Map<String, Value> = removed.map(|name| (name.clone(), Value::Null)).collect();
+    for (name, value) in new {
+        match (old.get(name), value) {
+            (Some(Value::Object(before)), Value::Object(after)) => {
+                let inner = merge_patch(before, after);
+                if !inner.is_empty() {
+                    patch.insert(name.clone(), Value::Object(inner));
+                }
+            }
+            (Some(before), after) if before == after => {}
+            _ => drop(patch.insert(name.clone(), value.clone())),
+        }
+    }
+    patch
 }
 
 fn keywords(value: &Value) -> Vec<String> {

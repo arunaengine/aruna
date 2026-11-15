@@ -337,6 +337,18 @@ async fn dataset_patches() {
 }
 
 #[test]
+fn merge_cases() {
+    // The plugin libraries' test fakes apply the same cases, so their patches cannot drift.
+    let cases = include_str!("../../../plugins/sdk/merge_cases.json");
+    let cases: Vec<(Value, Value, Value)> = serde_json::from_str(cases).unwrap();
+    for (target, patch, merged) in cases {
+        let mut result = target.clone();
+        merge_into(&mut result, patch.clone());
+        assert_eq!(result, merged, "{target} {patch}");
+    }
+}
+
+#[test]
 fn change_patch() {
     let crate_json = r#"{"@graph":[{"@id":"ro-crate-metadata.json","about":{"@id":"./"}},{"@id":"./","@type":"Dataset","name":"a","keywords":["x"],"description":"kept","identifier":{"@type":"http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON","@value":"{\"doi\":\"d\"}"}}]}"#;
     let patch = r#"{"identifier":{"catalog":"c"},"keywords":null}"#;
