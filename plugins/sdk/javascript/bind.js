@@ -70,7 +70,7 @@ export default {
   },
 
   objectInfo(path) {
-    return object(call(() => info(path)));
+    return object(call(() => info(path, undefined)));
   },
 
   objectList(prefix, cursor) {

@@ -78,7 +78,7 @@ class Imports:
         return created.resource, created.revision
 
     def object_info(self, path):
-        return _info(self.call(self.imports.objects_read.info, path))
+        return _info(self.call(self.imports.objects_read.info, path, None))
 
     def object_list(self, prefix, cursor):
         page = self.call(self.imports.objects_read.list, prefix, cursor)

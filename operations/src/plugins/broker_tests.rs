@@ -136,7 +136,11 @@ async fn object_calls() {
     let (fixture, broker, _, _dir) = broker().await;
     let data = format!("/{}/g/{}/data", fixture.actor.realm_id, fixture.group_id);
     let path = format!("{data}/{}/bucket/a.txt", fixture.actor.node_id);
-    let refused = broker.objects_info(&cx(), &path).await.unwrap_err();
+    let refused = broker.objects_info(&cx(), &path, None).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::NotGranted);
+    // A named version needs the same grant as the current one.
+    let pinned = Some(Ulid::from_parts(1, 1).to_string());
+    let refused = broker.objects_info(&cx(), &path, pinned).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::NotGranted);
     let meta = format!("/{}/g/{}/meta/x", fixture.actor.realm_id, fixture.group_id);
     assert!(
@@ -161,7 +165,7 @@ async fn object_calls() {
     scope.run.install_id = installed.install_id;
     scope.run.digest = installed.digest;
     let objects = RunBroker::new(broker.ctx.clone(), scope);
-    let missing = objects.objects_info(&cx(), &path).await.unwrap_err();
+    let missing = objects.objects_info(&cx(), &path, None).await.unwrap_err();
     assert_eq!(missing.kind, ErrorKind::NotFound);
     let remote = format!(
         "{data}/{}/bucket/a.txt",
@@ -292,7 +296,7 @@ async fn listings_authorize() {
     assert_eq!(shown.len(), 1);
     fixture.deny(&["operation == 'plugin.objects.read'"]).await;
     let path = format!("/{realm}/g/{group}/data/{node}/data/a.txt");
-    let refused = objects.objects_info(&cx(), &path).await.unwrap_err();
+    let refused = objects.objects_info(&cx(), &path, None).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::Denied);
     assert!(
         objects

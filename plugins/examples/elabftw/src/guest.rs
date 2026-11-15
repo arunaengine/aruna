@@ -182,7 +182,7 @@ impl Host for Guest {
     }
 
     fn object_size(&self, path: &str) -> Result<u64> {
-        objects_read::info(path)
+        objects_read::info(path, None)
             .map(|info| info.size)
             .map_err(fault)
     }

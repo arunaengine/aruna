@@ -962,15 +962,21 @@ impl Broker for RunBroker {
         self.file_write(cx, &change, mutation, None).await
     }
 
-    async fn objects_info(&self, _cx: &CallContext, text: &str) -> Result<ObjectInfo, HostError> {
+    async fn objects_info(
+        &self,
+        _cx: &CallContext,
+        text: &str,
+        version: Option<String>,
+    ) -> Result<ObjectInfo, HostError> {
         let path = self.expand(text)?;
         let (install, _) = self.checked(Permission::ObjectsRead, &path).await?;
         let (bucket, key) = self.object_at(&install, &path).await?;
         let short = format!("{bucket}/{key}");
+        // A given version is checked as the current one: the same grant, and its own mark.
         let input = HeadObjectInput {
             bucket: bucket.clone(),
             key: key.clone(),
-            version_id: None,
+            version_id: (version.as_deref()).map(version_id).transpose()?,
         };
         let head = drive(HeadObjectOperation::new(input), &self.ctx).await;
         let head =

@@ -183,7 +183,13 @@ pub trait Broker: Send + Sync {
             "dataset creates are not served here",
         ))
     }
-    async fn objects_info(&self, cx: &CallContext, path: &str) -> Result<ObjectInfo, HostError>;
+    /// The information of one object version, the current one unless `version` is given.
+    async fn objects_info(
+        &self,
+        cx: &CallContext,
+        path: &str,
+        version: Option<String>,
+    ) -> Result<ObjectInfo, HostError>;
     async fn objects_list(
         &self,
         cx: &CallContext,

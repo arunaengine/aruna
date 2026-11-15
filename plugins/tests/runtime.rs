@@ -170,12 +170,17 @@ impl Broker for Recorder {
         })
     }
 
-    async fn objects_info(&self, _: &CallContext, path: &str) -> Result<ObjectInfo, HostError> {
+    async fn objects_info(
+        &self,
+        _: &CallContext,
+        path: &str,
+        version: Option<String>,
+    ) -> Result<ObjectInfo, HostError> {
         self.note("objects_info");
         Ok(ObjectInfo {
             path: path.to_string(),
             size: 7,
-            version: "v1".into(),
+            version: version.unwrap_or_else(|| "v1".into()),
             marked: false,
         })
     }
@@ -704,6 +709,18 @@ async fn small_reads_granted() {
     assert_eq!(broker.calls(), ["read in/a V1"]);
     let refused = invoke(probe(input), Arc::default()).await;
     assert!(matches!(refused, Err(InvokeError::Guest(_))), "{refused:?}");
+}
+
+#[tokio::test]
+async fn versioned_info() {
+    // An information call reaches the broker with the version it names, or none.
+    for (version, answered) in [(Some("V7"), "V7"), (None, "v1")] {
+        let input = serde_json::json!({"call": "objects_info", "path": "in/a", "version": version});
+        let mut info = probe(input);
+        info.permissions.insert(Permission::ObjectsRead);
+        let answer = output(invoke(info, Arc::default()).await);
+        assert_eq!(answer["version"], answered);
+    }
 }
 
 #[tokio::test]

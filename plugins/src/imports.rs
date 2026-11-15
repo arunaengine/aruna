@@ -301,12 +301,17 @@ impl objects_read::Host for Session {
         .await
     }
 
-    async fn info(&mut self, path: String) -> wasmtime::Result<Result<ObjectInfo, HostError>> {
+    async fn info(
+        &mut self,
+        path: String,
+        version: Option<String>,
+    ) -> wasmtime::Result<Result<ObjectInfo, HostError>> {
+        let size = path.len() + version.as_ref().map_or(0, String::len);
         self.brokered(
-            path.len(),
+            size,
             Effect::Read,
             Needs::Permission(Permission::ObjectsRead),
-            |broker, cx| async move { broker.objects_info(&cx, &path).await },
+            |broker, cx| async move { broker.objects_info(&cx, &path, version).await },
             |info: &ObjectInfo| info.path.len() + info.version.len() + 8,
         )
         .await

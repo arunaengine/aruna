@@ -54,7 +54,7 @@ impl Host for Imports {
     }
 
     fn object_info(&self, path: &str) -> Answer<ObjectInfo> {
-        objects_read::info(path)
+        objects_read::info(path, None)
     }
 
     fn object_list(&self, prefix: &str, cursor: Option<&str>) -> Answer<ObjectPage> {

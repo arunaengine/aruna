@@ -109,7 +109,12 @@ impl Broker for Team {
         })
     }
 
-    async fn objects_info(&self, _: &CallContext, _: &str) -> Result<ObjectInfo, HostError> {
+    async fn objects_info(
+        &self,
+        _: &CallContext,
+        _: &str,
+        _: Option<String>,
+    ) -> Result<ObjectInfo, HostError> {
         Err(unused())
     }
 

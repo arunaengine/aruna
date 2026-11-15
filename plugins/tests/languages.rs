@@ -107,7 +107,12 @@ impl Broker for Catalog {
         Ok("r2".into())
     }
 
-    async fn objects_info(&self, _: &CallContext, _: &str) -> Result<ObjectInfo, HostError> {
+    async fn objects_info(
+        &self,
+        _: &CallContext,
+        _: &str,
+        _: Option<String>,
+    ) -> Result<ObjectInfo, HostError> {
         Err(unused())
     }
 

@@ -81,7 +81,8 @@ fn probe(form: Form) -> Result<Value> {
             )?))
         }
         "objects_info" => {
-            let info = objects_read::info(&text("path"))?;
+            let version = input.get("version").and_then(Value::as_str);
+            let info = objects_read::info(&text("path"), version)?;
             json!({ "path": info.path, "size": info.size, "version": info.version })
         }
         "send" => {
