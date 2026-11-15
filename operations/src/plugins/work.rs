@@ -379,7 +379,7 @@ pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, Stor
 
 /// Records the job of a reserved work whose submission committed but whose answer was lost; the
 /// job is found by the work's dedup key. `None` while no job was submitted.
-async fn reconcile(
+pub(crate) async fn reconcile(
     ctx: &DriverContext,
     install_id: Ulid,
     row: &WorkRow,
@@ -392,8 +392,8 @@ async fn reconcile(
     Ok(Some(job))
 }
 
-/// Deletes the rows nobody can ask for again: settled, no cancel open, kept past the run
-/// retention, and their run record pruned.
+/// Deletes the rows nobody can ask for again: settled and delivered, no cancel open, kept past
+/// the run retention, and their run record pruned.
 pub async fn prune_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
     let txn = Txn::direct(ctx);
     let mut dropped = Vec::new();
@@ -406,7 +406,7 @@ pub async fn prune_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, Store
         };
         let aged = (row.settled_ms)
             .is_some_and(|settled| settled.saturating_add(RUN_RETENTION_MS) <= now_ms);
-        if row.state != WorkState::Settled || row.cancel || !aged {
+        if row.state != WorkState::Settled || !row.notified || row.cancel || !aged {
             continue;
         }
         let run = run_key(install_id, run_id);

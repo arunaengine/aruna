@@ -246,6 +246,8 @@ fn row(record: AdminAuditRecord) -> AdminAuditRow {
         AdminAuditAction::PluginResumed => "plugin_resumed",
         AdminAuditAction::PluginRemoved => "plugin_removed",
         AdminAuditAction::PluginRunResolved => "plugin_run_resolved",
+        AdminAuditAction::PluginRunRetried => "plugin_run_retried",
+        AdminAuditAction::PluginCompletionDropped => "plugin_completion_dropped",
         AdminAuditAction::SecretReleased => "secret_released",
         AdminAuditAction::SecretRefused => "secret_refused",
     };

@@ -847,8 +847,10 @@ pub(crate) mod tests {
         ("GET", "/plugin-installs/{id}/runs"),
         ("GET", "/plugin-installs/{id}/runs/{run}"),
         ("POST", "/plugin-installs/{id}/runs/{run}/resolve"),
+        ("POST", "/plugin-installs/{id}/runs/{run}/retry"),
         ("GET", "/plugin-installs/{id}/work"),
         ("GET", "/plugin-installs/{id}/delivery"),
+        ("POST", "/plugin-installs/{id}/jobs/{job}/drop"),
         ("POST", "/plugin-hooks/{id}"),
     ];
 

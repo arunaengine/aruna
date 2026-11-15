@@ -44,6 +44,10 @@ pub enum AdminAuditAction {
     SecretRefused,
     /// A group administrator issued an S3 credential for a service account.
     ServiceCredentialIssued,
+    /// A group admin queued a failed plugin run again with its recorded calls.
+    PluginRunRetried,
+    /// A group admin dropped the held end of a plugin job, so no `job_finished` run follows.
+    PluginCompletionDropped,
 }
 
 /// One use of a secret by the install a row names: how it is delivered, the run it is for,

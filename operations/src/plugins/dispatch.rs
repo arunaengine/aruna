@@ -166,6 +166,7 @@ pub fn event_trigger(kind: SourceKind) -> TriggerKind {
         SourceKind::DatasetUpdated => TriggerKind::DatasetUpdated,
         SourceKind::SyncCompleted => TriggerKind::SyncCompleted,
         SourceKind::SyncFailed => TriggerKind::SyncFailed,
+        SourceKind::JobFinished => TriggerKind::JobFinished,
     }
 }
 
@@ -230,7 +231,12 @@ async fn enqueue_timer(
             Ok(()) => true,
             Err(RunError::Full(_)) => false,
             Err(RunError::Store(error)) => return Err(error),
-            Err(RunError::NotFound | RunError::NotWaiting(_)) => false,
+            Err(
+                RunError::NotFound
+                | RunError::NotWaiting(_)
+                | RunError::NotRetried(_)
+                | RunError::NotHeld,
+            ) => false,
         };
         row.last_due_ms = occurrence;
         row.skipped += u64::from(!admitted);

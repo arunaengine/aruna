@@ -28,17 +28,19 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::artifacts::fetch_artifact;
-use super::broker::RunBroker;
+use super::broker::{RunBroker, short_path};
 use super::check::{RunScope, check_call};
 use super::cleanup::sweep_events;
 use super::clock::probe_clock;
 use super::decide::{decide_batch, prune_seen};
 use super::dispatch::{enqueue_timers, event_trigger};
+use super::finished::notify_work;
 use super::forward::{Backoff, Decisions, EventBatch, send_outbox};
 use super::grants::{parse_grants, patterns_for};
 use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
+use super::marks::sweep_marks;
 use super::matcher::match_pending;
 use super::outbound::Outbound;
 use super::prune::{prune_hooks, prune_uses};
@@ -218,6 +220,14 @@ impl Worker {
             started += 1;
         }
         Ok(started)
+    }
+
+    /// Delivers the ends of jobs whose starting run succeeded as `job_finished` runs.
+    async fn notify(&self, now_ms: u64) -> Result<usize, String> {
+        let config = read_config(&self.ctx, self.realm_id).await;
+        let config = config.map_err(|error| error.to_string())?;
+        let notified = notify_work(&self.ctx, &config, self.local, now_ms).await;
+        notified.map_err(|error| error.to_string())
     }
 
     async fn sweep(&self, now_ms: u64) -> Result<usize, String> {
@@ -493,14 +503,6 @@ fn invocation(
     }
 }
 
-/// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
-/// text stays as it is.
-fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
-    let realm = install.account.realm_id;
-    let root = format!("/{realm}/g/{}/data/{local}/", install.group_id);
-    path.strip_prefix(&root).unwrap_or(path).to_string()
-}
-
 /// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown
 /// makes it need attention, and unreadable intents keep it queued without using an attempt.
 /// The attempt's end with every value handed to the code removed from the text the run keeps.
@@ -593,6 +595,9 @@ pub fn spawn_worker(
                 if let Err(error) = settle_work(&worker.ctx, now).await {
                     warn!(%error, "Could not keep the summaries of finished plugin work");
                 }
+                if let Err(error) = worker.notify(now).await {
+                    warn!(%error, "Could not deliver finished plugin jobs");
+                }
             }
             if now.saturating_sub(pruned_at) >= PRUNE_MS {
                 pruned_at = now;
@@ -610,6 +615,9 @@ pub fn spawn_worker(
                 }
                 if let Err(error) = prune_work(&worker.ctx, now).await {
                     warn!(%error, "Could not prune settled plugin work");
+                }
+                if let Err(error) = sweep_marks(&worker.ctx).await {
+                    warn!(%error, "Could not drop the marks of absent object versions");
                 }
                 if let Err(error) = worker.sweep(now).await {
                     warn!(%error, "Could not delete stale plugin event rows");

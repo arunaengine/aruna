@@ -270,7 +270,10 @@ async fn unreadable(
         return Ok(false);
     };
     let applied = match event.kind {
-        SourceKind::DataUploaded | SourceKind::SyncCompleted | SourceKind::SyncFailed => {
+        SourceKind::DataUploaded
+        | SourceKind::SyncCompleted
+        | SourceKind::SyncFailed
+        | SourceKind::JobFinished => {
             return Ok(false);
         }
         SourceKind::DatasetCreated => materialized(txn, document, |id| id >= event_id).await?,

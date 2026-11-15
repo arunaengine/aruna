@@ -236,6 +236,20 @@ pub enum PluginCommand {
         #[arg(long)]
         done: bool,
     },
+    /// Queue a failed or cancelled run again; its jobs keep their ids.
+    Retry {
+        /// The install id.
+        id: String,
+        /// The run id.
+        run: String,
+    },
+    /// Drop the held end of a finished job, so no `job_finished` run follows for it.
+    Drop {
+        /// The install id.
+        id: String,
+        /// The job id.
+        job: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -621,6 +635,17 @@ mod tests {
         };
         assert!(done);
         assert!(parse(&["plugin", "resolve", "i1"]).is_err());
+        let line = ["plugin", "retry", "i1", "r1"];
+        let Command::Plugin(PluginCommand::Retry { run, .. }) = parse(&line).unwrap().command
+        else {
+            panic!("expected plugin retry");
+        };
+        assert_eq!(run, "r1");
+        let line = ["plugin", "drop", "i1", "j1"];
+        let Command::Plugin(PluginCommand::Drop { job, .. }) = parse(&line).unwrap().command else {
+            panic!("expected plugin drop");
+        };
+        assert_eq!(job, "j1");
         let line = ["plugin", "delivery", "i1"];
         let parsed = parse(&line).unwrap().command;
         assert!(matches!(parsed, Command::Plugin(PluginCommand::Delivery { id }) if id == "i1"));

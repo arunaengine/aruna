@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use aruna_core::NodeId;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::PluginRun;
-use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_plugins::broker::{ErrorKind, HostError};
@@ -130,29 +130,56 @@ pub async fn authorize_call(
     target: &str,
     patterns: &BTreeSet<String>,
 ) -> Result<(), HostError> {
-    let realm_id = install.account.realm_id;
     for access in accesses(permission) {
-        let restrictions = (patterns.iter())
-            .map(|pattern| PathRestriction {
-                pattern: pattern.clone(),
-                permission: access.clone(),
-            })
-            .collect();
-        let auth = AuthContext {
-            user_id: install.account,
-            realm_id,
-            path_restrictions: Some(restrictions),
-            session: None,
-        };
-        let extras = PolicyRequestExtras::operation(format!("plugin.{permission}"));
-        match authorize(ctx, realm_id, &auth, target, access, extras).await {
-            Ok(()) => {}
-            Err(AuthorizeError::Storage(error)) => return Err(unavailable(error.to_string())),
-            Err(AuthorizeError::CheckFailed(error)) => return Err(unavailable(error)),
-            Err(error) => return Err(HostError::new(ErrorKind::Denied, error.to_string())),
-        }
+        authorize_access(ctx, install, (permission, access.clone()), target, patterns).await?;
     }
     Ok(())
+}
+
+/// One access on `target` under the operation `plugin.<permission>`, such as READ on the source
+/// of a copy, whose target needs WRITE.
+pub async fn authorize_access(
+    ctx: &DriverContext,
+    install: &PluginInstall,
+    (permission, access): (Permission, Access),
+    target: &str,
+    patterns: &BTreeSet<String>,
+) -> Result<(), HostError> {
+    let realm_id = install.account.realm_id;
+    let restrictions = (patterns.iter())
+        .map(|pattern| PathRestriction {
+            pattern: pattern.clone(),
+            permission: access.clone(),
+        })
+        .collect();
+    let auth = AuthContext {
+        user_id: install.account,
+        realm_id,
+        path_restrictions: Some(restrictions),
+        session: None,
+    };
+    let extras = PolicyRequestExtras::operation(format!("plugin.{permission}"));
+    match authorize(ctx, realm_id, &auth, target, &access, extras).await {
+        Ok(()) => Ok(()),
+        Err(AuthorizeError::Storage(error)) => Err(unavailable(error.to_string())),
+        Err(AuthorizeError::CheckFailed(error)) => Err(unavailable(error)),
+        Err(error) => Err(HostError::new(ErrorKind::Denied, error.to_string())),
+    }
+}
+
+/// The patterns a copy reads `source` and writes `target` under: read on the source and write
+/// on the target, each authorized with the operation `plugin.objects.copy`.
+pub async fn copy_grants(
+    ctx: &DriverContext,
+    install: &PluginInstall,
+    (source, target): (&str, &str),
+) -> Result<BTreeSet<String>, HostError> {
+    let copy = Permission::ObjectsCopy;
+    let read = matching(install, Permission::ObjectsRead, source)?;
+    authorize_access(ctx, install, (copy, Access::READ), source, &read).await?;
+    let write = matching(install, copy, target)?;
+    authorize_access(ctx, install, (copy, Access::WRITE), target, &write).await?;
+    Ok(read.into_iter().chain(write).collect())
 }
 
 /// Steps 0 to 4 for one call; `target` is the permission and resource a guarded call names.

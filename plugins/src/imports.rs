@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use crate::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, Listing, MetadataCreate, MetadataPatch, Method, ObjectInfo, ObjectPage,
-    Response, SendRequest, StatePut,
+    HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, Method,
+    ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
 use crate::host::wit::aruna::plugin::{
-    log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services, state,
-    types,
+    jobs, log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services,
+    state, types,
 };
 use crate::host::{Needs, Session};
 use crate::permission::Permission;
@@ -285,6 +285,22 @@ impl metadata_create::Host for Session {
 }
 
 impl objects_read::Host for Session {
+    async fn read(
+        &mut self,
+        path: String,
+        version: Option<String>,
+    ) -> wasmtime::Result<Result<Vec<u8>, HostError>> {
+        let size = path.len() + version.as_ref().map_or(0, String::len);
+        self.brokered(
+            size,
+            Effect::Read,
+            Needs::Permission(Permission::ObjectsRead),
+            |broker, cx| async move { broker.objects_read(&cx, &path, version).await },
+            Vec::len,
+        )
+        .await
+    }
+
     async fn info(&mut self, path: String) -> wasmtime::Result<Result<ObjectInfo, HostError>> {
         self.brokered(
             path.len(),
@@ -307,17 +323,99 @@ impl objects_read::Host for Session {
             Effect::Read,
             Needs::Permission(Permission::ObjectsRead),
             |broker, cx| async move { broker.objects_list(&cx, &prefix, cursor).await },
-            |page: &ObjectPage| {
-                let items: usize = page
-                    .objects
-                    .iter()
-                    .map(|o| o.path.len() + o.version.len() + 8)
-                    .sum();
-                items + page.cursor.as_ref().map_or(0, String::len)
-            },
+            page_size,
         )
         .await
     }
+}
+
+impl jobs::Host for Session {
+    async fn copy(
+        &mut self,
+        source: String,
+        version: Option<String>,
+        target: String,
+    ) -> wasmtime::Result<Result<String, HostError>> {
+        let size = source.len() + version.as_ref().map_or(0, String::len) + target.len();
+        let pinned = version.as_deref().unwrap_or_default().as_bytes();
+        let parts: [&[u8]; 4] = [b"copy", source.as_bytes(), pinned, target.as_bytes()];
+        let intent = Intent::new(self.next_ordinal(), &parts);
+        let effect = Effect::Write(intent.clone());
+        let copy = JobCopy {
+            source,
+            version,
+            target,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Permission(Permission::ObjectsCopy),
+            |broker, cx| async move { broker.jobs_copy(&cx, copy).await },
+            String::len,
+        )
+        .await
+    }
+
+    async fn get(&mut self, id: String) -> wasmtime::Result<Result<JobStatus, HostError>> {
+        self.brokered(
+            id.len(),
+            Effect::Read,
+            Needs::Free,
+            |broker, cx| async move { broker.jobs_get(&cx, &id).await },
+            status_size,
+        )
+        .await
+    }
+
+    async fn outputs(
+        &mut self,
+        id: String,
+        cursor: Option<String>,
+    ) -> wasmtime::Result<Result<ObjectPage, HostError>> {
+        let size = id.len() + cursor.as_ref().map_or(0, String::len);
+        self.brokered(
+            size,
+            Effect::Read,
+            Needs::Free,
+            |broker, cx| async move { broker.jobs_outputs(&cx, &id, cursor).await },
+            page_size,
+        )
+        .await
+    }
+
+    /// A cancel changes the job, so it takes its ordinal in the run.
+    async fn cancel(&mut self, id: String) -> wasmtime::Result<Result<(), HostError>> {
+        let parts: [&[u8]; 2] = [b"cancel", id.as_bytes()];
+        let intent = Intent::new(self.next_ordinal(), &parts);
+        self.brokered(
+            id.len(),
+            Effect::Write(intent.clone()),
+            Needs::Free,
+            |broker, cx| async move { broker.jobs_cancel(&cx, &id, intent).await },
+            |_| 0,
+        )
+        .await
+    }
+}
+
+fn status_size(status: &JobStatus) -> usize {
+    let texts = [&status.id, &status.kind, &status.path, &status.state];
+    let optional = [&status.message, &status.version, &status.report];
+    let body = status.reply_body.as_ref().map_or(0, Vec::len);
+    let fixed: usize = texts.iter().map(|text| text.len()).sum();
+    let rest: usize = optional
+        .iter()
+        .map(|text| text.as_ref().map_or(0, String::len))
+        .sum();
+    fixed + rest + body + fields_len(&status.reply_headers) + 16
+}
+
+fn page_size(page: &ObjectPage) -> usize {
+    let items: usize = (page.objects.iter())
+        .map(|object| object.path.len() + object.version.len() + 8)
+        .sum();
+    items + page.cursor.as_ref().map_or(0, String::len)
 }
 
 impl services::Host for Session {
@@ -416,6 +514,30 @@ impl state::Host for Session {
             Needs::Free,
             |broker, cx| async move { broker.state_put(&cx, put).await },
             |_| 8,
+        )
+        .await
+    }
+
+    async fn remove(
+        &mut self,
+        key: String,
+        expected: u64,
+    ) -> wasmtime::Result<Result<(), HostError>> {
+        let version = expected.to_le_bytes();
+        let parts: [&[u8]; 3] = [b"remove", key.as_bytes(), &version];
+        let intent = Intent::new(self.next_ordinal(), &parts);
+        let size = key.len();
+        let remove = StateRemove {
+            key,
+            expected,
+            intent: intent.clone(),
+        };
+        self.brokered(
+            size,
+            Effect::Write(intent),
+            Needs::Free,
+            |broker, cx| async move { broker.state_remove(&cx, remove).await },
+            |_| 0,
         )
         .await
     }

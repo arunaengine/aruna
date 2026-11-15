@@ -1,10 +1,10 @@
-//! Private state of an install on its receiver: values by install and key, changed by compare
-//! and swap, with the install's byte count and the call's settled reply in the same transaction.
+//! Private state of an install on its receiver: values by install and key, changed and removed by
+//! compare and swap, with the install's byte count and the call's settled reply in one transaction.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::keyspaces::PLUGIN_STATE_KEYSPACE;
-use aruna_plugins::broker::{Entry, ErrorKind, HostError, StatePut};
+use aruna_plugins::broker::{Entry, ErrorKind, HostError, StatePut, StateRemove};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -19,6 +19,8 @@ pub const MAX_STATE_BYTES: u64 = 16 << 20;
 
 const VALUE_ROW: u8 = b'k';
 const BYTES_ROW: u8 = b'b';
+/// The last version the install's state handed out, kept across removals.
+const VERSION_ROW: u8 = b'v';
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StateRow {
@@ -44,6 +46,12 @@ fn value_key(install_id: Ulid, key: &str) -> Vec<u8> {
 
 fn bytes_key(install_id: Ulid) -> Vec<u8> {
     let mut row = vec![BYTES_ROW];
+    row.extend_from_slice(&install_id.to_bytes());
+    row
+}
+
+fn version_key(install_id: Ulid) -> Vec<u8> {
+    let mut row = vec![VERSION_ROW];
     row.extend_from_slice(&install_id.to_bytes());
     row
 }
@@ -75,7 +83,8 @@ pub async fn read_state(
 }
 
 /// Writes the value if the stored version is still `expected` (`None`: no value yet) and the
-/// install stays within its bytes, and settles the call's intent with the new version.
+/// install stays within its bytes, and settles the call's intent with the new version. Versions
+/// never repeat within an install, so one read before a removal never matches a later value.
 pub async fn put_state(
     ctx: &DriverContext,
     run_id: Ulid,
@@ -111,7 +120,14 @@ pub async fn put_state(
             let message = "the install's state would exceed 16 MiB".to_string();
             return Err(PutError::Refused(message, ErrorKind::Limit));
         }
-        let next = version.map_or(1, |version| version + 1);
+        let last = match txn
+            .read(PLUGIN_STATE_KEYSPACE, &version_key(install_id))
+            .await?
+        {
+            Some(bytes) => decode::<u64>(&bytes)?,
+            None => 0,
+        };
+        let next = last.max(version.unwrap_or_default()) + 1;
         let row = StateRow {
             version: next,
             value: put.value.clone(),
@@ -119,10 +135,46 @@ pub async fn put_state(
         let rows = vec![
             (key, encode(&row)?),
             (bytes_key(install_id), encode(&total)?),
+            (version_key(install_id), encode(&next)?),
         ];
         txn.write(PLUGIN_STATE_KEYSPACE, rows).await?;
         settle_in(txn, run_id, &put.intent, next.to_string()).await?;
         Ok(next)
+    })
+    .await
+}
+
+/// Removes the value if the stored version is still `expected`, frees its bytes, and settles the
+/// call's intent; an absent value is a conflict, as it was not at that version.
+pub async fn remove_state(
+    ctx: &DriverContext,
+    run_id: Ulid,
+    install_id: Ulid,
+    remove: &StateRemove,
+) -> Result<(), PutError> {
+    transact(ctx, async |txn: &Txn<'_>| {
+        let key = value_key(install_id, &remove.key);
+        let current = match txn.read(PLUGIN_STATE_KEYSPACE, &key).await? {
+            Some(bytes) => Some(decode::<StateRow>(&bytes)?),
+            None => None,
+        };
+        let Some(row) = current.filter(|row| row.version == remove.expected) else {
+            let message = format!("the value is not at version {}", remove.expected);
+            return Err(PutError::Refused(message, ErrorKind::Conflict));
+        };
+        let total = match txn
+            .read(PLUGIN_STATE_KEYSPACE, &bytes_key(install_id))
+            .await?
+        {
+            Some(bytes) => decode::<u64>(&bytes)?,
+            None => 0,
+        };
+        let freed = (remove.key.len() + row.value.len()) as u64;
+        txn.delete(PLUGIN_STATE_KEYSPACE, vec![key]).await?;
+        let total = vec![(bytes_key(install_id), encode(&total.saturating_sub(freed))?)];
+        txn.write(PLUGIN_STATE_KEYSPACE, total).await?;
+        settle_in(txn, run_id, &remove.intent, String::new()).await?;
+        Ok(())
     })
     .await
 }
@@ -189,5 +241,85 @@ mod tests {
                 .is_ok()
         );
         assert!(check_key("").is_err() && check_key(&"k".repeat(257)).is_err());
+    }
+
+    #[tokio::test]
+    async fn versions_never_repeat() {
+        // A key removed and written again gets a new version, so the old one cannot change it.
+        let (_dir, ctx) = opened();
+        let (run, install) = (Ulid::from_parts(9, 1), Ulid::from_parts(1, 1));
+        let first = put_state(&ctx, run, install, &put("k", b"a", None, 1))
+            .await
+            .unwrap();
+        let remove = StateRemove {
+            key: "k".into(),
+            expected: first,
+            intent: Intent::new(2, &[b"k"]),
+        };
+        remove_state(&ctx, run, install, &remove).await.unwrap();
+        assert_eq!(read_state(&ctx, install, "k").await.unwrap(), None);
+        let again = put_state(&ctx, run, install, &put("k", b"b", None, 3))
+            .await
+            .unwrap();
+        assert!(again > first, "{again} after {first}");
+        let stale = put_state(&ctx, run, install, &put("k", b"c", Some(first), 4)).await;
+        assert!(matches!(
+            stale,
+            Err(PutError::Refused(_, ErrorKind::Conflict))
+        ));
+        let old = StateRemove {
+            intent: Intent::new(5, &[b"k"]),
+            ..remove
+        };
+        let refused = remove_state(&ctx, run, install, &old).await;
+        assert!(matches!(
+            refused,
+            Err(PutError::Refused(_, ErrorKind::Conflict))
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_frees_bytes() {
+        // A removal at the stored version frees the value's bytes; another version conflicts.
+        let (_dir, ctx) = opened();
+        let (run, install) = (Ulid::from_parts(9, 1), Ulid::from_parts(1, 1));
+        let big = vec![0u8; MAX_STATE_VALUE];
+        let count = MAX_STATE_BYTES as usize / MAX_STATE_VALUE;
+        for n in 1..count {
+            let key = format!("k{n}");
+            put_state(&ctx, run, install, &put(&key, &big, None, n as u32))
+                .await
+                .unwrap();
+        }
+        let full = put_state(&ctx, run, install, &put("last", &big, None, 900)).await;
+        assert!(matches!(full, Err(PutError::Refused(_, ErrorKind::Limit))));
+        let remove = |expected, ordinal| StateRemove {
+            key: "k1".into(),
+            expected,
+            intent: Intent::new(ordinal, &[b"k1"]),
+        };
+        let stale = remove_state(&ctx, run, install, &remove(2, 901)).await;
+        assert!(matches!(
+            stale,
+            Err(PutError::Refused(_, ErrorKind::Conflict))
+        ));
+        remove_state(&ctx, run, install, &remove(1, 902))
+            .await
+            .unwrap();
+        assert_eq!(read_state(&ctx, install, "k1").await.unwrap(), None);
+        assert_eq!(
+            begin(&ctx, run, &remove(1, 902).intent).await.unwrap(),
+            Begun::Settled(String::new())
+        );
+        let again = remove_state(&ctx, run, install, &remove(1, 903)).await;
+        assert!(matches!(
+            again,
+            Err(PutError::Refused(_, ErrorKind::Conflict))
+        ));
+        assert!(
+            put_state(&ctx, run, install, &put("last", &big, None, 904))
+                .await
+                .is_ok()
+        );
     }
 }

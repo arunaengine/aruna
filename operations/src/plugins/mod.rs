@@ -13,14 +13,17 @@ pub mod copies;
 pub mod creates;
 pub mod decide;
 pub mod dispatch;
+pub mod finished;
 pub mod forward;
 pub mod grants;
 pub mod held;
 pub mod hooks;
 pub mod install;
 pub mod intents;
+pub mod jobs;
 pub mod journal;
 pub mod lifecycle;
+pub mod marks;
 pub mod matcher;
 pub mod outbound;
 pub mod prune;
@@ -41,6 +44,9 @@ pub mod waiting;
 pub mod work;
 pub mod worker;
 
+#[cfg(test)]
+#[path = "delivery_tests.rs"]
+mod delivery_tests;
 #[cfg(test)]
 #[path = "events_tests.rs"]
 mod events_tests;

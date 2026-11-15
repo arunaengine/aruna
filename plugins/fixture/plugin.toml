@@ -5,7 +5,7 @@
 name = "fixture"
 version = "0.2.0"
 title = "Runtime test guest"
-on = ["manual", "timer", "dataset_created", "dataset_updated", "data_uploaded", "sync_completed", "sync_failed"]
+on = ["manual", "timer", "dataset_created", "dataset_updated", "data_uploaded", "sync_completed", "sync_failed", "job_finished"]
 access = "write"
 
 [settings]

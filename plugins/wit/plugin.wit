@@ -145,7 +145,7 @@ interface metadata-create {
   create: func(path: string, dataset: string) -> result<created, host-error>;
 }
 
-/// Reads object information and listings of the group, never bytes (`objects.read`).
+/// Reads object information, listings and the bytes of small objects of the group (`objects.read`).
 interface objects-read {
   use types.{host-error};
 
@@ -153,6 +153,8 @@ interface objects-read {
     path: string,
     size: u64,
     version: string,
+    /// A job with a secret wrote this version: a plugin cannot read, copy or upload it.
+    marked: bool,
   }
 
   record object-page {
@@ -161,6 +163,9 @@ interface objects-read {
   }
 
   info: func(path: string) -> result<object-info, host-error>;
+  /// The bytes of one version, the current one unless `version` is given, within the call's
+  /// byte bound; a marked version is refused.
+  read: func(path: string, version: option<string>) -> result<list<u8>, host-error>;
   %list: func(prefix: string, cursor: option<string>) -> result<object-page, host-error>;
 }
 
@@ -208,6 +213,8 @@ interface state {
 
   get: func(key: string) -> result<option<entry>, host-error>;
   put: func(key: string, value: list<u8>, expected: option<u64>) -> result<u64, host-error>;
+  /// Removes the value if it is still at version `expected`.
+  remove: func(key: string, expected: u64) -> result<_, host-error>;
 }
 
 /// The fields of a secret slot granted through `secrets.value`; they are the code's data then.
@@ -215,6 +222,41 @@ interface secrets {
   use types.{field, host-error};
 
   value: func(slot: string) -> result<list<field>, host-error>;
+}
+
+/// Native work of the install that runs without the run; each start answers the job's id at once,
+/// and a rerun of the same call gets the same id.
+interface jobs {
+  use types.{field, host-error};
+  use objects-read.{object-page};
+
+  /// What a job did, read from its row after its record is gone too. `kind` is copy, download,
+  /// upload or task; `path` is the bucket path it wrote or read; `state` is queued, running,
+  /// succeeded, failed, error, cancelled or unknown.
+  record status {
+    id: string,
+    kind: string,
+    path: string,
+    state: string,
+    message: option<string>,
+    bytes: option<u64>,
+    version: option<string>,
+    reply-status: option<u16>,
+    reply-headers: list<field>,
+    reply-body: option<list<u8>>,
+    exit-code: option<s32>,
+    report: option<string>,
+  }
+
+  /// Copies an object, pinned to `version` when given, to `target`; needs read on the source and
+  /// write on the target.
+  copy: func(source: string, version: option<string>, target: string) -> result<string, host-error>;
+  /// Any job of the install.
+  get: func(id: string) -> result<status, host-error>;
+  /// One page of the objects a task wrote.
+  outputs: func(id: string, cursor: option<string>) -> result<object-page, host-error>;
+  /// Asks a job of the install to stop; a job that already ended stays as it ended.
+  cancel: func(id: string) -> result<_, host-error>;
 }
 
 interface log {
@@ -239,6 +281,7 @@ world plugin {
   import services;
   import state;
   import secrets;
+  import jobs;
   import log;
 
   export handle: func(invocation: invocation) -> result<option<string>, failure>;

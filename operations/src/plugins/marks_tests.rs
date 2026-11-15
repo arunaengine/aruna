@@ -1,0 +1,71 @@
+//! Tests the sweep of secret marks: a mark stays while its work may write, goes once the version
+//! is absent and the work ended, stays on a present version, and outlives the install's removal.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::structs::execution::job::{PluginWorkAction, PluginWorkSpec};
+
+use super::*;
+use crate::jobs::plugin_work::tests::ready_copy;
+use crate::plugins::install::read_config;
+use crate::plugins::install::tests::Fixture;
+use crate::plugins::work::{retire_work, update_work};
+
+/// The current version of the copy's source object `in/a.txt`.
+async fn source_version(ctx: &DriverContext) -> Ulid {
+    let head = HeadObjectInput {
+        bucket: "in".into(),
+        key: "a.txt".into(),
+        version_id: None,
+    };
+    let head = drive(HeadObjectOperation::new(head), ctx).await.unwrap();
+    head.resolved_version_id.unwrap()
+}
+
+async fn mark(ctx: &DriverContext, version: Version<'_>, (install_id, work_id): (Ulid, Ulid)) {
+    let mark = Mark {
+        install_id,
+        work_id,
+        job: None,
+        kind: WorkKind::Download,
+        at_ms: 1,
+    };
+    let write = transact(ctx, async |txn: &Txn<'_>| {
+        mark_in(txn, version, &mark).await
+    });
+    write.await.unwrap();
+}
+
+fn work_of(spec: &PluginWorkSpec) -> (Ulid, Ulid) {
+    let PluginWorkAction::Copy { .. } = &spec.action;
+    (spec.install_id, spec.work_id)
+}
+
+#[tokio::test]
+async fn sweep_awaits_work() {
+    let fixture = Fixture::new().await;
+    let (_root, blob, install, spec) = ready_copy(&fixture).await;
+    let present = source_version(&blob).await;
+    let (absent, orphan) = (Ulid::from_parts(3, 3), Ulid::from_parts(4, 4));
+    mark(&blob, ("in", "a.txt", present), work_of(&spec)).await;
+    mark(&blob, ("in", "a.txt", absent), work_of(&spec)).await;
+    let unknown = (install.install_id, Ulid::from_parts(5, 5));
+    mark(&blob, ("in", "b.txt", orphan), unknown).await;
+    // The orphan's work is gone and its version absent; the copy's work may still write.
+    assert_eq!(sweep_marks(&blob).await.unwrap(), 1);
+    assert!(!is_marked(&blob, ("in", "b.txt", orphan)).await.unwrap());
+    assert!(is_marked(&blob, ("in", "a.txt", absent)).await.unwrap());
+    let settle = update_work(&blob, work_of(&spec), |row| row.state = WorkState::Settled);
+    settle.await.unwrap();
+    assert_eq!(sweep_marks(&blob).await.unwrap(), 1);
+    assert!(!is_marked(&blob, ("in", "a.txt", absent)).await.unwrap());
+    assert!(is_marked(&blob, ("in", "a.txt", present)).await.unwrap());
+
+    // Removing the install deletes its work rows, never its marks; a written version keeps its
+    // mark for any later install.
+    let mut config = read_config(&blob, fixture.actor.realm_id).await.unwrap();
+    config.installs.clear();
+    assert_eq!(retire_work(&blob, &config, 9).await.unwrap(), 1);
+    assert_eq!(sweep_marks(&blob).await.unwrap(), 0);
+    assert!(is_marked(&blob, ("in", "a.txt", present)).await.unwrap());
+}

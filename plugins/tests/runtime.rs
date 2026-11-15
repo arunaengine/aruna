@@ -11,8 +11,8 @@ use std::time::Duration;
 use aruna_plugins::artifact::read_manifest;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, FileChange, FilePage, HostError,
-    Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest,
-    StatePut,
+    Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage,
+    Response, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::manifest::Manifest;
@@ -176,7 +176,18 @@ impl Broker for Recorder {
             path: path.to_string(),
             size: 7,
             version: "v1".into(),
+            marked: false,
         })
+    }
+
+    async fn objects_read(
+        &self,
+        _: &CallContext,
+        path: &str,
+        version: Option<String>,
+    ) -> Result<Vec<u8>, HostError> {
+        self.note(&format!("read {path} {}", version.unwrap_or_default()));
+        Ok(b"small".to_vec())
     }
 
     async fn objects_list(
@@ -219,6 +230,67 @@ impl Broker for Recorder {
         self.note("state_put");
         self.intents.lock().unwrap().push(put.intent);
         Ok(1)
+    }
+
+    async fn jobs_copy(&self, _: &CallContext, copy: JobCopy) -> Result<String, HostError> {
+        let version = copy.version.unwrap_or_default();
+        self.note(&format!("copy {} {version} {}", copy.source, copy.target));
+        self.intents.lock().unwrap().push(copy.intent);
+        Ok("job-1".into())
+    }
+
+    async fn jobs_get(&self, _: &CallContext, id: &str) -> Result<JobStatus, HostError> {
+        self.note(&format!("job {id}"));
+        Ok(JobStatus {
+            id: id.into(),
+            kind: "copy".into(),
+            path: "out/a".into(),
+            state: "succeeded".into(),
+            message: None,
+            bytes: Some(5),
+            version: None,
+            reply_status: None,
+            reply_headers: Vec::new(),
+            reply_body: None,
+            exit_code: None,
+            report: None,
+        })
+    }
+
+    async fn jobs_cancel(
+        &self,
+        _: &CallContext,
+        id: &str,
+        intent: Intent,
+    ) -> Result<(), HostError> {
+        self.note(&format!("cancel {id}"));
+        self.intents.lock().unwrap().push(intent);
+        Ok(())
+    }
+
+    async fn jobs_outputs(
+        &self,
+        _: &CallContext,
+        id: &str,
+        _: Option<String>,
+    ) -> Result<ObjectPage, HostError> {
+        self.note(&format!("outputs {id}"));
+        let object = ObjectInfo {
+            path: "out/b".into(),
+            size: 1,
+            version: "v".into(),
+            marked: true,
+        };
+        Ok(ObjectPage {
+            objects: vec![object],
+            cursor: None,
+        })
+    }
+
+    async fn state_remove(&self, _: &CallContext, remove: StateRemove) -> Result<(), HostError> {
+        self.note(&format!("state_remove {} {}", remove.key, remove.expected));
+        self.intents.lock().unwrap().push(remove.intent);
+        Ok(())
     }
 
     async fn abandoned(&self, _: &CallContext, intent: &Intent) {
@@ -545,6 +617,7 @@ async fn narrow_requests_compile() {
         "data_uploaded",
         "dataset_created",
         "dataset_updated",
+        "job_finished",
         "manual",
     ];
     assert_eq!(
@@ -602,6 +675,82 @@ async fn state_put_ordinal() {
     let intents = broker.intents();
     assert_eq!(intents.iter().map(|i| i.ordinal).collect::<Vec<_>>(), [1]);
     assert_eq!(rerun.intents(), intents, "a rerun asks for the same write");
+}
+
+#[tokio::test]
+async fn copy_answers_id() {
+    // A copy reaches the broker with its paths and pinned version, as a write with an ordinal,
+    // and needs the copy permission.
+    let input =
+        serde_json::json!({"call": "copy", "source": "in/a", "version": "V1", "target": "out/a"});
+    let mut copy = probe(input.clone());
+    copy.permissions.insert(Permission::ObjectsCopy);
+    let broker = Arc::new(Recorder::default());
+    assert_eq!(output(invoke(copy, broker.clone()).await), "job-1");
+    assert_eq!(broker.calls(), ["copy in/a V1 out/a"]);
+    assert_eq!(broker.intents()[0].ordinal, 1);
+    let refused = invoke(probe(input), Arc::default()).await;
+    assert!(matches!(refused, Err(InvokeError::Guest(_))), "{refused:?}");
+}
+
+#[tokio::test]
+async fn small_reads_granted() {
+    // A read needs `objects.read` and returns the bytes the broker read.
+    let input = serde_json::json!({"call": "read", "path": "in/a", "version": "V1"});
+    let mut read = probe(input.clone());
+    read.permissions.insert(Permission::ObjectsRead);
+    let broker = Arc::new(Recorder::default());
+    assert_eq!(output(invoke(read, broker.clone()).await), "small");
+    assert_eq!(broker.calls(), ["read in/a V1"]);
+    let refused = invoke(probe(input), Arc::default()).await;
+    assert!(matches!(refused, Err(InvokeError::Guest(_))), "{refused:?}");
+}
+
+#[tokio::test]
+async fn remove_after_put() {
+    // A removal is a write after the put, at the version the put answered.
+    let broker = Arc::new(Recorder::default());
+    let reply = invoke(
+        probe(serde_json::json!({"call": "state_remove", "key": "k"})),
+        broker.clone(),
+    );
+    assert_eq!(output(reply.await), false);
+    assert_eq!(
+        broker.calls(),
+        ["state_put", "state_remove k 1", "state_get"]
+    );
+    let ordinals: Vec<u32> = broker
+        .intents()
+        .iter()
+        .map(|intent| intent.ordinal)
+        .collect();
+    assert_eq!(ordinals, [1, 2]);
+}
+
+#[tokio::test]
+async fn cancel_takes_ordinal() {
+    let broker = Arc::new(Recorder::default());
+    let reply = invoke(
+        probe(serde_json::json!({"call": "cancel", "id": "j1"})),
+        broker.clone(),
+    );
+    assert_eq!(output(reply.await), true);
+    assert_eq!(broker.calls(), ["cancel j1"]);
+    assert_eq!(broker.intents()[0].ordinal, 1);
+}
+
+#[tokio::test]
+async fn job_status_read() {
+    // Status and outputs need no grant beyond the install's own jobs.
+    let broker = Arc::new(Recorder::default());
+    let reply = invoke(
+        probe(serde_json::json!({"call": "job", "id": "j1"})),
+        broker.clone(),
+    );
+    let expected = serde_json::json!({"kind": "copy", "state": "succeeded", "path": "out/a",
+        "bytes": 5, "outputs": ["out/b"]});
+    assert_eq!(output(reply.await), expected);
+    assert_eq!(broker.calls(), ["job j1", "outputs j1"]);
 }
 
 #[tokio::test]

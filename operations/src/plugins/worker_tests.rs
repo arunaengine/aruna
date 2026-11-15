@@ -56,6 +56,17 @@ pub(crate) fn echoed_sync() -> Vec<u8> {
     attach_manifest(component, &manifest).unwrap()
 }
 
+/// The runnable fixture with only its manual and `job_finished` triggers, so no timer or event
+/// of the test's own writes starts a run.
+pub(crate) fn job_guest() -> Vec<u8> {
+    use aruna_plugins::trigger::TriggerKind;
+    let (component, mut manifest) = bare();
+    (manifest.connections, manifest.secrets) = (BTreeMap::new(), BTreeMap::new());
+    let kept = [TriggerKind::Manual, TriggerKind::JobFinished];
+    manifest.triggers.retain(|kind, _| kept.contains(kind));
+    attach_manifest(component, &manifest).unwrap()
+}
+
 /// The fixture's component without its manifest section, and that manifest.
 fn bare() -> (&'static [u8], aruna_plugins::manifest::Manifest) {
     let manifest = read_manifest(FIXTURE).unwrap();
@@ -159,7 +170,12 @@ async fn admitted(
 
 /// A worker whose guests may spin until they are cancelled, however slow the machine is.
 pub(crate) fn worker(fixture: &Fixture) -> Arc<Worker> {
-    let ctx = Arc::new(fixture.ctx.clone());
+    worker_on(&fixture.ctx, fixture)
+}
+
+/// The same worker on `ctx`, such as one with a blob store.
+pub(crate) fn worker_on(ctx: &DriverContext, fixture: &Fixture) -> Arc<Worker> {
+    let ctx = Arc::new(ctx.clone());
     let mut config = RuntimeConfig::default();
     config.ceiling.fuel = u64::MAX;
     config.ceiling.wall = Duration::from_secs(3600);

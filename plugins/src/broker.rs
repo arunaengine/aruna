@@ -5,12 +5,23 @@
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
+pub use crate::host::wit::aruna::plugin::jobs::Status as JobStatus;
 pub use crate::host::wit::aruna::plugin::metadata_create::Created;
 pub use crate::host::wit::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 pub use crate::host::wit::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
 pub use crate::host::wit::aruna::plugin::services::{Method, Response};
 pub use crate::host::wit::aruna::plugin::state::Entry;
 pub use crate::host::wit::aruna::plugin::types::{ErrorKind, Field, HostError};
+
+/// A copy a run starts: object paths as the plugin gave them, the source pinned when a version
+/// is given. The ordinal names the job across reruns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobCopy {
+    pub source: String,
+    pub version: Option<String>,
+    pub target: String,
+    pub intent: Intent,
+}
 
 /// Identity of the run that issued a host call.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +104,14 @@ pub struct StatePut {
     pub intent: Intent,
 }
 
+/// A version-checked removal of a private state value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateRemove {
+    pub key: String,
+    pub expected: u64,
+    pub intent: Intent,
+}
+
 /// Runs host calls under the install's current grants and authority. The runtime has
 /// already checked that the permission or connection is granted at all and the budgets.
 #[async_trait]
@@ -171,6 +190,18 @@ pub trait Broker: Send + Sync {
         prefix: &str,
         cursor: Option<String>,
     ) -> Result<ObjectPage, HostError>;
+    /// The bytes of a small object; a broker that serves no reads refuses it.
+    async fn objects_read(
+        &self,
+        _cx: &CallContext,
+        _path: &str,
+        _version: Option<String>,
+    ) -> Result<Vec<u8>, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "object reads are not served here",
+        ))
+    }
     /// Sends to a declared service; the reply is what the guest may read of the answer.
     async fn connection_send(
         &self,
@@ -184,8 +215,53 @@ pub trait Broker: Send + Sync {
             "secret values are not served here",
         ))
     }
+    /// Starts a copy and answers its job id; a broker that runs no jobs refuses it.
+    async fn jobs_copy(&self, _cx: &CallContext, _copy: JobCopy) -> Result<String, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "jobs are not run here",
+        ))
+    }
+    /// The status of a job of the install; a broker that runs no jobs refuses it.
+    async fn jobs_get(&self, _cx: &CallContext, _id: &str) -> Result<JobStatus, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "jobs are not run here",
+        ))
+    }
+    /// Asks a job of the install to stop; a broker that runs no jobs refuses it.
+    async fn jobs_cancel(
+        &self,
+        _cx: &CallContext,
+        _id: &str,
+        _intent: Intent,
+    ) -> Result<(), HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "jobs are not run here",
+        ))
+    }
+    /// One page of the objects a task of the install wrote.
+    async fn jobs_outputs(
+        &self,
+        _cx: &CallContext,
+        _id: &str,
+        _cursor: Option<String>,
+    ) -> Result<ObjectPage, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "jobs are not run here",
+        ))
+    }
     async fn state_get(&self, cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError>;
     async fn state_put(&self, cx: &CallContext, put: StatePut) -> Result<u64, HostError>;
+    /// Removes a state value at its expected version; a broker without removals refuses it.
+    async fn state_remove(&self, _cx: &CallContext, _remove: StateRemove) -> Result<(), HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "state removals are not served here",
+        ))
+    }
     /// Records that a write did not finish within its deadline, so its outcome is unknown.
     /// The run's slot is held until this returns or its own deadline passes.
     async fn abandoned(&self, cx: &CallContext, intent: &Intent);

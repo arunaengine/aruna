@@ -10,6 +10,16 @@ use std::hint::black_box;
 use aruna_plugin::{Context, Error, Event, Level, Method, Result};
 use serde_json::{Value, json};
 
+use aruna_plugin::bindings::aruna::plugin::jobs;
+
+/// A host error of a call the SDK does not wrap yet.
+fn host(error: aruna_plugin::bindings::aruna::plugin::types::HostError) -> Error {
+    Error::Host {
+        kind: error.kind,
+        message: error.message,
+    }
+}
+
 mod wasi {
     wit_bindgen::generate!({ path: "wit", world: "aruna-test:wasi/probe", generate_all });
 }
@@ -72,6 +82,12 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             let metadata = ctx.metadata();
             json!(metadata.remove_file(&resource, &id, &expected).await?)
         }
+        "read" => {
+            let version = input.get("version").and_then(Value::as_str);
+            let read =
+                aruna_plugin::bindings::aruna::plugin::objects_read::read(&text("path"), version);
+            json!(String::from_utf8_lossy(&read.map_err(host)?))
+        }
         "objects_info" => {
             let info = ctx.objects().info(&text("path")).await?;
             json!({ "path": info.path, "size": info.size, "version": info.version })
@@ -93,6 +109,36 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             // A status-only answer has no body; it reads as no fields.
             let fields = reply.json::<Value>().unwrap_or_else(|_| json!({}));
             json!({ "status": reply.status, "fields": fields })
+        }
+        "copy" => {
+            let version = input.get("version").and_then(Value::as_str);
+            let copied = jobs::copy(&text("source"), version, &text("target"));
+            json!(copied.map_err(host)?)
+        }
+        "state_remove" => {
+            let key = text("key");
+            let state = ctx.state();
+            let version = state.put(&key, b"v".to_vec(), None).await?;
+            aruna_plugin::bindings::aruna::plugin::state::remove(&key, version).map_err(host)?;
+            json!(state.get(&key).await?.is_none())
+        }
+        "cancel" => {
+            jobs::cancel(&text("id")).map_err(host)?;
+            json!(true)
+        }
+        "copy_mapped" => {
+            // A copy, then the mapping its `job_finished` run reads, as a plugin keeps it.
+            let id = jobs::copy(&text("source"), None, &text("target")).map_err(host)?;
+            let key = format!("job/{id}");
+            ctx.state().put(&key, b"mapped".to_vec(), None).await?;
+            json!(id)
+        }
+        "job" => {
+            let status = jobs::get(&text("id")).map_err(host)?;
+            let page = jobs::outputs(&text("id"), None).map_err(host)?;
+            let outputs: Vec<_> = page.objects.into_iter().map(|object| object.path).collect();
+            json!({ "kind": status.kind, "state": status.state, "path": status.path,
+                "bytes": status.bytes, "outputs": outputs })
         }
         "random" => {
             let len = input.get("len").and_then(Value::as_u64).unwrap_or_default();
@@ -159,6 +205,16 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
 }
 
 /// Returns the run identity, settings and trigger it was called with.
+/// A finished job with the mapping the run that started it kept under `job/<id>`.
+async fn finished(ctx: Context, event: Event) -> Result<Value> {
+    let Event::Change(change) = event else {
+        return Err(Error::Input("job_finished needs a job".into()));
+    };
+    let mapping = ctx.state().get(&format!("job/{}", change.resource)).await?;
+    let mapping = mapping.map(|entry| String::from_utf8_lossy(&entry.value).into_owned());
+    Ok(json!({ "job": change.resource, "state": change.revision, "mapping": mapping }))
+}
+
 async fn echo(ctx: Context, event: Event) -> Result<String> {
     let trigger = match event {
         Event::Change(change) => format!(
@@ -202,4 +258,5 @@ aruna_plugin::export! {
     data_uploaded => hoard,
     sync_completed => echo,
     sync_failed => echo,
+    job_finished => finished,
 }

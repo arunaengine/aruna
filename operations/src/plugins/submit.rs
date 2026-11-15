@@ -8,11 +8,11 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{ErrorKind, HostError};
-use aruna_plugins::permission::Permission;
 use ulid::Ulid;
 
 use super::broker::local_object;
-use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
+use super::check::{RunScope, check_call, copy_grants, unavailable};
+use super::marks::unmarked;
 use super::work::{
     Identity, WorkError, WorkKind, WorkRow, WorkState, dedup_key, dispatched, reserve,
 };
@@ -39,15 +39,15 @@ pub async fn start_copy(
     scope: &RunScope,
     request: CopyRequest,
 ) -> Result<Ulid, HostError> {
-    let copy = Permission::ObjectsCopy;
-    let install = check_call(ctx, scope, Some((copy, &request.source))).await?;
-    let patterns = matching(&install, copy, &request.target)?;
-    authorize_call(ctx, &install, copy, &request.target, &patterns).await?;
+    let install = check_call(ctx, scope, None).await?;
+    copy_grants(ctx, &install, (&request.source, &request.target)).await?;
     if install.paused {
         return Err(HostError::new(ErrorKind::Denied, "the install is paused"));
     }
     let place = (scope.realm_id, scope.local);
-    local_object(ctx, place, &install, &request.source).await?;
+    let (bucket, key) = local_object(ctx, place, &install, &request.source).await?;
+    // Every attempt checks the version it reads again; a source that is missing now fails there.
+    unmarked(ctx, (&bucket, &key), request.source_version).await?;
     local_object(ctx, place, &install, &request.target).await?;
     let identity = Identity::Call {
         run_id: scope.run.run_id,
@@ -145,4 +145,4 @@ fn digest(parts: &[&[u8]]) -> [u8; 32] {
 
 #[cfg(test)]
 #[path = "submit_tests.rs"]
-mod tests;
+pub(crate) mod tests;

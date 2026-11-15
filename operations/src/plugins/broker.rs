@@ -24,14 +24,15 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, Listing, MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response,
-    SendRequest, StatePut,
+    HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
+    ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::connection::relative_path;
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
 use base64::Engine;
 use craqle::GraphId;
+use futures_util::StreamExt;
 use oxrdf::Term;
 use serde_json::Value;
 use tracing::warn;
@@ -43,11 +44,14 @@ use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
+use super::jobs::{cancel_job, job_outputs, job_status};
+use super::marks::{is_marked, unmarked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
-use super::state::{PutError, check_key, put_state, read_state};
+use super::state::{PutError, check_key, put_state, read_state, remove_state};
 use super::store::{StoreError, Txn, transact};
+use super::submit::{CopyRequest, start_copy};
 use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
@@ -64,6 +68,7 @@ use crate::metadata::forward::{
 use crate::metadata::handle::craqle_patch_request;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
 
@@ -532,6 +537,26 @@ impl RunBroker {
         }
     }
 
+    /// Starts native work through the run's call history: other arguments at a known ordinal are
+    /// refused before any work is reserved, a settled call answers its job id again, and an earlier
+    /// attempt is safe to repeat, as the work row names the job by run and ordinal.
+    async fn native(
+        &self,
+        intent: &Intent,
+        start: impl std::future::Future<Output = Result<Ulid, HostError>>,
+    ) -> Result<String, HostError> {
+        match self.begun(intent).await {
+            Ok(Some(reply)) => return Ok(reply),
+            Ok(None) => {}
+            Err(error) if error.kind == ErrorKind::UnknownOutcome => {}
+            Err(error) => return Err(error),
+        }
+        // A refused start leaves no job, or one its work row finds again, so the call may be made
+        // again; its intent goes.
+        let outcome = start.await.map(|work_id| work_id.to_string());
+        self.record(intent, outcome.map_err(Outcome::None)).await
+    }
+
     /// The full permission path of an object path the plugin gave; see [`object_path`].
     fn expand(&self, text: &str) -> Result<String, HostError> {
         let place = (self.scope.realm_id, self.scope.local);
@@ -568,6 +593,15 @@ impl RunBroker {
         }
     }
 
+    /// Whether a job with a secret wrote this version of `bucket/key`.
+    async fn marked(&self, bucket: &str, key: &str, version: &str) -> Result<bool, HostError> {
+        let Ok(version_id) = Ulid::from_string(version) else {
+            return Ok(false);
+        };
+        let marked = is_marked(&self.ctx, (bucket, key, version_id)).await;
+        marked.map_err(|error| unavailable(error.0))
+    }
+
     /// The listed objects of a local bucket the account may read, each named by the permission
     /// path of its own bucket and key, never by the text of the listing prefix.
     async fn visible(
@@ -584,10 +618,12 @@ impl RunBroker {
                 .authorized(install, Permission::ObjectsRead, &path)
                 .await?
             {
+                let marked = self.marked(bucket, &key, &version).await?;
                 visible.push(ObjectInfo {
                     path: format!("{bucket}/{key}"),
                     size,
                     version,
+                    marked,
                 });
             }
         }
@@ -620,6 +656,28 @@ pub(crate) fn object_path(
         return Err(invalid());
     }
     Ok(object_permission_path(realm_id, group, local, bucket, key))
+}
+
+/// The version id a plugin gave as text.
+fn version_id(text: &str) -> Result<Ulid, HostError> {
+    let invalid = || HostError::new(ErrorKind::Invalid, format!("`{text}` is not a version id"));
+    Ulid::from_string(text).map_err(|_| invalid())
+}
+
+/// A byte bound as people read it: `1 MiB` rather than `1048576 bytes`.
+fn byte_size(bytes: usize) -> String {
+    match bytes % (1 << 20) {
+        0 => format!("{} MiB", bytes >> 20),
+        _ => format!("{bytes} bytes"),
+    }
+}
+
+/// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
+/// text stays as it is.
+pub(crate) fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
+    let realm = install.account.realm_id;
+    let root = format!("/{realm}/g/{}/data/{local}/", install.group_id);
+    path.strip_prefix(&root).unwrap_or(path).to_string()
 }
 
 /// Refuses a `contentUrl` that names nothing readers can resolve, such as a short bucket path:
@@ -909,21 +967,20 @@ impl Broker for RunBroker {
         let (install, _) = self.checked(Permission::ObjectsRead, &path).await?;
         let (bucket, key) = self.object_at(&install, &path).await?;
         let short = format!("{bucket}/{key}");
-        let head = HeadObjectInput {
-            bucket,
-            key,
+        let input = HeadObjectInput {
+            bucket: bucket.clone(),
+            key: key.clone(),
             version_id: None,
         };
-        let head = drive(HeadObjectOperation::new(head), &self.ctx).await;
+        let head = drive(HeadObjectOperation::new(input), &self.ctx).await;
         let head =
             head.map_err(|_| HostError::new(ErrorKind::NotFound, format!("no object at {path}")))?;
+        let version = (head.resolved_version_id.map(|id| id.to_string())).unwrap_or_default();
         Ok(ObjectInfo {
             path: short,
             size: head.location.map_or(0, |location| location.blob_size),
-            version: head
-                .resolved_version_id
-                .map(|id| id.to_string())
-                .unwrap_or_default(),
+            marked: self.marked(&bucket, &key, &version).await?,
+            version,
         })
     }
 
@@ -972,6 +1029,53 @@ impl Broker for RunBroker {
         Ok(ObjectPage { objects, cursor })
     }
 
+    async fn objects_read(
+        &self,
+        cx: &CallContext,
+        text: &str,
+        version: Option<String>,
+    ) -> Result<Vec<u8>, HostError> {
+        let path = self.expand(text)?;
+        let (install, auth) = self.checked(Permission::ObjectsRead, &path).await?;
+        let (bucket, key) = self.object_at(&install, &path).await?;
+        let version = (version.as_deref()).map(version_id).transpose()?;
+        let missing = || HostError::new(ErrorKind::NotFound, format!("no object at {path}"));
+        let version = unmarked(&self.ctx, (&bucket, &key), version).await?;
+        let input = GetObjectInput {
+            bucket,
+            key,
+            version_id: Some(version.ok_or_else(missing)?),
+            range: None,
+            group_id: install.group_id,
+            user_identity: install.account,
+            realm_id: self.scope.realm_id,
+            node_id: self.scope.local,
+        };
+        let read = GetObjectOperation::new(input).with_restrictions(auth.path_restrictions);
+        let mut got = drive(read, &self.ctx).await.map_err(|error| match error {
+            GetObjectError::NoSuchKey | GetObjectError::NoSuchVersion => missing(),
+            other => unavailable(other.to_string()),
+        })?;
+        let too_large = || {
+            let message = format!(
+                "objects larger than {} cannot be read by a plugin; give them to a task",
+                byte_size(cx.max_bytes)
+            );
+            HostError::new(ErrorKind::Limit, message)
+        };
+        if got.info.size > cx.max_bytes as u64 {
+            return Err(too_large());
+        }
+        let mut bytes = Vec::with_capacity(got.info.size as usize);
+        while let Some(chunk) = got.blob.next().await {
+            bytes.extend_from_slice(&chunk.map_err(|error| unavailable(error.to_string()))?);
+            if bytes.len() > cx.max_bytes {
+                return Err(too_large());
+            }
+        }
+        Ok(bytes)
+    }
+
     async fn connection_send(
         &self,
         cx: &CallContext,
@@ -979,6 +1083,51 @@ impl Broker for RunBroker {
     ) -> Result<Response, HostError> {
         let ready = self.ready(request).await?;
         self.send_whole(cx, ready).await
+    }
+
+    async fn jobs_copy(&self, _cx: &CallContext, copy: JobCopy) -> Result<String, HostError> {
+        self.admitted(None).await?;
+        let version = (copy.version.as_deref()).map(version_id).transpose()?;
+        let request = CopyRequest {
+            source: self.expand(&copy.source)?,
+            source_version: version,
+            target: self.expand(&copy.target)?,
+            ordinal: copy.intent.ordinal,
+        };
+        let started = self.native(&copy.intent, start_copy(&self.ctx, &self.scope, request));
+        match started.await {
+            Err(error) if error.kind == ErrorKind::Conflict => {
+                self.changed.store(true, Ordering::Relaxed);
+                Err(error)
+            }
+            answered => answered,
+        }
+    }
+
+    async fn jobs_get(&self, _cx: &CallContext, id: &str) -> Result<JobStatus, HostError> {
+        let install = self.admitted(None).await?;
+        job_status(&self.ctx, (&install, self.scope.local), id).await
+    }
+
+    async fn jobs_outputs(
+        &self,
+        _cx: &CallContext,
+        id: &str,
+        cursor: Option<String>,
+    ) -> Result<ObjectPage, HostError> {
+        let install = self.admitted(None).await?;
+        job_outputs(&self.ctx, (&install, self.scope.local), id, cursor).await
+    }
+
+    async fn jobs_cancel(
+        &self,
+        _cx: &CallContext,
+        id: &str,
+        _intent: Intent,
+    ) -> Result<(), HostError> {
+        // Asking again changes nothing, so a rerun cancels again instead of reading an intent.
+        let install = self.admitted(None).await?;
+        cancel_job(&self.ctx, &install, id, unix_timestamp_millis()).await
     }
 
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {
@@ -1007,6 +1156,26 @@ impl Broker for RunBroker {
                 Err(HostError::new(kind, message))
             }
             Err(PutError::Store(error)) => Err(self.unknown(&put.intent, &error.0).await),
+        }
+    }
+
+    async fn state_remove(&self, _cx: &CallContext, remove: StateRemove) -> Result<(), HostError> {
+        check_key(&remove.key)?;
+        let install = self.admitted(None).await?;
+        if self.begun(&remove.intent).await?.is_some() {
+            return Ok(());
+        }
+        let run_id = self.scope.run.run_id;
+        match remove_state(&self.ctx, run_id, install.install_id, &remove).await {
+            Ok(()) => Ok(()),
+            Err(PutError::Refused(message, kind)) => {
+                let clear = async |txn: &Txn<'_>| clear_in(txn, run_id, &remove.intent).await;
+                transact::<(), StoreError>(&self.ctx, clear)
+                    .await
+                    .map_err(|error| unavailable(error.0))?;
+                Err(HostError::new(kind, message))
+            }
+            Err(PutError::Store(error)) => Err(self.unknown(&remove.intent, &error.0).await),
         }
     }
 
