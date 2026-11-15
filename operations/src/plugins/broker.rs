@@ -13,7 +13,7 @@ use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scr
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun};
-use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields, header_name};
+use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
@@ -27,7 +27,6 @@ use aruna_plugins::broker::{
     HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
     ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
-use aruna_plugins::connection::relative_path;
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
 use base64::Engine;
@@ -47,6 +46,7 @@ use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
 use super::jobs::{cancel_job, job_outputs, job_status};
 use super::marks::{is_marked, unmarked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
+use super::outgoing::{outgoing, request_context};
 use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
 use super::state::{PutError, check_key, put_state, read_state, remove_state};
@@ -1625,46 +1625,25 @@ impl RunBroker {
         let current = self.admitted(None).await?;
         let path = install_scope(&current).connection(&request.connection);
         let (install, _) = self.checked(Permission::ConnectionsSend, &path).await?;
-        let invalid = |why: &str| HostError::new(ErrorKind::Invalid, why);
         let config = read_config(&self.ctx, self.scope.realm_id).await;
         let config = config.map_err(|error| unavailable(error.to_string()))?;
         let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
         let manifest = plugin.and_then(|plugin| read_manifest(&plugin));
         let manifest = manifest.map_err(|error| unavailable(error.to_string()))?;
-        let connection = manifest.connections.get(&request.connection);
-        let connection =
-            connection.ok_or_else(|| invalid("the manifest has no such connection"))?;
-        let method = declared_method(request.method);
-        if !connection.methods.contains(&method) {
-            return Err(invalid("the connection does not allow this method"));
-        }
-        if !relative_path(&request.path) {
-            return Err(invalid("the path must stay below the connection's address"));
-        }
         // The guest built its request from the settings saved at admission; the address follows
         // them, while the grant and release checks use the current install.
-        let saved = &self.scope.run.settings;
-        let settings: Value = serde_json::from_str(saved).unwrap_or(Value::Null);
-        let mut url = connection.base(&settings).map_err(invalid)?;
-        let joined = format!("{}/{}", url.path().trim_end_matches('/'), request.path);
-        url.set_path(&joined);
-        if !request.query.is_empty() {
-            let pairs = request
-                .query
+        let pairs = |fields: &[Field]| -> Vec<(String, String)> {
+            let pairs = fields
                 .iter()
-                .map(|field| (&field.name, &field.value));
-            url.query_pairs_mut().extend_pairs(pairs);
-        }
-        let headers = (request.headers.iter())
-            .filter(|field| header_name(&field.name) && !credential(&field.name))
-            .map(|field| (field.name.to_ascii_lowercase(), field.value.clone()))
-            .collect();
-        let mut outgoing = OutgoingRequest {
-            method: method.as_str().to_string(),
-            url,
-            headers,
+                .map(|field| (field.name.clone(), field.value.clone()));
+            pairs.collect()
         };
-        let (exposure, fields) = match &connection.auth {
+        let (query, headers) = (pairs(&request.query), pairs(&request.headers));
+        let called = (request.connection.as_str(), declared_method(request.method));
+        let parts = (request.path.as_str(), &query[..], &headers[..]);
+        let context = request_context(&manifest, called, &self.scope.run.settings, parts)?;
+        let (mut outgoing, slot) = outgoing(&manifest, &context)?;
+        let (exposure, fields) = match &slot {
             None => (ResponseExposure::Full, None),
             Some(slot) => {
                 let (released, fields) =
@@ -1761,11 +1740,6 @@ fn declared_method(method: aruna_plugins::broker::Method) -> aruna_plugins::conn
         Called::Patch => Method::Patch,
         Called::Delete => Method::Delete,
     }
-}
-
-/// Headers a guest may never set; the host owns credentials.
-fn credential(name: &str) -> bool {
-    ["authorization", "cookie", "proxy-authorization"].contains(&name.to_ascii_lowercase().as_str())
 }
 
 /// The whole answer as the code may see it, with echoes of the secret removed.
