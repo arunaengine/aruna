@@ -856,3 +856,47 @@ async fn link_uploads() {
     assert_eq!(elsewhere.await.unwrap(), Value::Null);
     assert_eq!(group.files("D1").len(), 1);
 }
+
+#[tokio::test]
+async fn upload_counter() {
+    // Each bucket keeps its own count across runs.
+    let Some(example) = example("upload-counter").await else {
+        return;
+    };
+    let group = Group::new();
+    for (path, content) in [("raw/a", "ab"), ("raw/b", "abc"), ("other/c", "a")] {
+        group.object(path, "v1", content.as_bytes());
+        example
+            .run(&group, json!({}), event("data_uploaded", path, "v1"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        group.value("bucket/raw"),
+        Some(json!({ "uploads": 2, "bytes": 5 }))
+    );
+    assert_eq!(
+        group.value("bucket/other"),
+        Some(json!({ "uploads": 1, "bytes": 1 }))
+    );
+}
+
+#[tokio::test]
+async fn object_report() {
+    // The report reads every page of the listing; an empty path reports no objects.
+    let Some(example) = example("object-report").await else {
+        return;
+    };
+    let group = Group::new();
+    for (name, content) in [("a.fq", "ACGT"), ("b.fq", "ACGTACGT"), ("c.fq", "AC")] {
+        group.object(&format!("raw/run-7/{name}"), "v1", content.as_bytes());
+    }
+    let report = example.run(&group, json!({}), manual(json!({ "prefix": "raw/run-7/" })));
+    let answer = json!({ "objects": 3, "bytes": 14, "largest": "raw/run-7/b.fq" });
+    assert_eq!(report.await.unwrap(), answer);
+    let empty = example.run(&group, json!({}), manual(json!({ "prefix": "none/" })));
+    assert_eq!(
+        empty.await.unwrap(),
+        json!({ "objects": 0, "bytes": 0, "largest": null })
+    );
+}

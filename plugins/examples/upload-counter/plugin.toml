@@ -1,0 +1,8 @@
+# Example plugin: counts the uploads and bytes of each bucket in the plugin's state.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "upload-counter"
+version = "0.1.0"
+title = "Count uploads per bucket"
+on = ["data_uploaded"]
