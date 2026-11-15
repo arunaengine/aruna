@@ -13,7 +13,7 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::secrets::{ResponseExposure, SecretFields};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::execution::job::{JobError, JobResultPayload, PluginWorkSpec};
+use aruna_core::structs::execution::job::{JobError, JobResultPayload, PluginWorkSpec, UploadForm};
 use aruna_core::structs::identity::auth::Permission as Access;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
@@ -190,10 +190,12 @@ pub async fn download_work(
     }
 }
 
-/// What an upload sends: the object at `source`, pinned to `version` when given.
+/// What an upload sends: the object at `source`, pinned to `version` when given, as the body or
+/// as the file part of a form.
 pub struct Upload<'a> {
     pub source: &'a str,
     pub version: Option<Ulid>,
+    pub form: Option<&'a UploadForm>,
 }
 
 /// Bytes of an upload's answer the work keeps at most.
@@ -275,9 +277,20 @@ pub async fn upload_work(
         builder.header(name, value)
     });
     let body = reqwest::Body::wrap_stream(source.blob);
-    let builder = builder
-        .header(reqwest::header::CONTENT_LENGTH, size)
-        .body(body);
+    let builder = match upload.form {
+        None => builder
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .body(body),
+        Some(form) => {
+            let file = reqwest::multipart::Part::stream_with_length(body, size);
+            let file = file.file_name(form.file_name.clone());
+            let multipart = (form.fields.iter()).fold(
+                reqwest::multipart::Form::new(),
+                |multipart, (name, value)| multipart.text(name.clone(), value.clone()),
+            );
+            builder.multipart(multipart.part(form.file_field.clone(), file))
+        }
+    };
     let response = tokio::select! {
         sent = builder.send() => sent,
         _ = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,

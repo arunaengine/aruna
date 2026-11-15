@@ -294,11 +294,22 @@ pub enum PluginWorkAction {
         checksums: Vec<(ChecksumAlgorithm, Vec<u8>)>,
         max_bytes: Option<u64>,
     },
-    /// Sends one object version as the body of the work row's request; `version` pins it.
+    /// Sends one object version as the body of the work row's request, or as the file part of
+    /// `form`; `version` pins it.
     Upload {
         source: String,
         version: Option<Ulid>,
+        form: Option<UploadForm>,
     },
+}
+
+/// A multipart form an upload sends: the object as the file part `file_field`, named
+/// `file_name`, beside small text fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadForm {
+    pub file_field: String,
+    pub file_name: String,
+    pub fields: Vec<(String, String)>,
 }
 
 /// One server-side object copy run outside a request, for a source whose bytes

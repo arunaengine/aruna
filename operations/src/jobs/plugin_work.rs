@@ -66,10 +66,15 @@ pub async fn run_plugin_work(ctx: &JobContext, spec: &PluginWorkSpec) -> JobRunO
             let admitted = (&install, &config, &row);
             download_work(ctx, spec, admitted, (download, &keys)).await
         }
-        PluginWorkAction::Upload { source, version } => {
+        PluginWorkAction::Upload {
+            source,
+            version,
+            form,
+        } => {
             let upload = Upload {
                 source,
                 version: *version,
+                form: form.as_ref(),
             };
             let keys = node_keys(&ctx.driver);
             let admitted = (&install, &config, &row);

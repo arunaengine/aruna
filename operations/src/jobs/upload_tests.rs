@@ -6,8 +6,9 @@
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 
+use aruna_core::structs::execution::job::UploadForm;
 use aruna_core::structs::execution::job::{JobErrorKind, PluginWorkAction};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use serde_json::json;
 
 use super::*;
@@ -23,30 +24,36 @@ use crate::s3::object::put::PutObjectOperation;
 
 const CONTENT: &[u8] = b"ACGTACGT";
 
-/// What the server got: the request count and the last body.
+/// What the server got: the request count, and the last body and content type.
 #[derive(Default)]
 struct Seen {
     hits: AtomicUsize,
     body: Mutex<Vec<u8>>,
+    kind: Mutex<String>,
 }
 
 /// A server that answers `status` with a small JSON reply and keeps what it got.
 async fn server(status: u16) -> (String, Arc<Seen>) {
     let seen = Arc::new(Seen::default());
     let kept = seen.clone();
-    let router = axum::Router::new().fallback(move |body: axum::body::Bytes| {
-        let kept = kept.clone();
-        async move {
-            kept.hits.fetch_add(1, Ordering::SeqCst);
-            *kept.body.lock().unwrap() = body.to_vec();
-            let reply = r#"{"checksum":"md5:1"}"#;
-            (
-                StatusCode::from_u16(status).unwrap(),
-                [("content-type", "application/json")],
-                reply,
-            )
-        }
-    });
+    let router =
+        axum::Router::new().fallback(move |headers: HeaderMap, body: axum::body::Bytes| {
+            let kept = kept.clone();
+            async move {
+                kept.hits.fetch_add(1, Ordering::SeqCst);
+                *kept.body.lock().unwrap() = body.to_vec();
+                let kind = headers
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok());
+                *kept.kind.lock().unwrap() = kind.unwrap_or_default().to_string();
+                let reply = r#"{"checksum":"md5:1"}"#;
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    [("content-type", "application/json")],
+                    reply,
+                )
+            }
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -112,6 +119,7 @@ async fn recorded(
         action: PluginWorkAction::Upload {
             source,
             version: None,
+            form: None,
         },
     };
     (row, spec)
@@ -247,4 +255,37 @@ async fn refused_connect_reopens() {
         boundary(&fixture, (install.install_id, row.work_id)).await,
         None
     );
+}
+
+#[tokio::test]
+async fn multipart_form() {
+    // A form sends the object as its named file part beside the text fields.
+    let fixture = Fixture::new().await;
+    let install = uploader(&fixture).await;
+    let (_root, blob) = ready(&fixture, &install).await;
+    let (base, seen) = server(201).await;
+    let (_, mut spec) = recorded(&fixture, &install, (&base, "POST")).await;
+    let form = UploadForm {
+        file_field: "file".into(),
+        file_name: "reads.fq".into(),
+        fields: vec![("title".into(), "Run 7".into())],
+    };
+    if let PluginWorkAction::Upload { form: sent, .. } = &mut spec.action {
+        *sent = Some(form);
+    }
+    let ctx = job_context(&blob, &fixture);
+    assert_eq!(name(&run_plugin_work(&ctx, &spec).await).0, "succeeded");
+    assert!(
+        seen.kind
+            .lock()
+            .unwrap()
+            .starts_with("multipart/form-data; boundary=")
+    );
+    let body = String::from_utf8(seen.body.lock().unwrap().clone()).unwrap();
+    assert!(
+        body.contains(r#"name="title""#) && body.contains("Run 7"),
+        "{body}"
+    );
+    let file = r#"name="file"; filename="reads.fq""#;
+    assert!(body.contains(file) && body.contains("ACGTACGT"), "{body}");
 }
