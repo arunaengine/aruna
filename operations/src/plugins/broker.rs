@@ -43,7 +43,7 @@ use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
-use super::jobs::{cancel_job, job_outputs, job_status};
+use super::jobs::{cancel_job, job_outputs, job_row, job_status};
 use super::marks::{is_marked, unmarked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::outgoing::{node_keys, outgoing, request_context};
@@ -1148,7 +1148,20 @@ impl Broker for RunBroker {
 
     async fn jobs_get(&self, _cx: &CallContext, id: &str) -> Result<JobStatus, HostError> {
         let install = self.admitted(None).await?;
-        job_status(&self.ctx, (&install, self.scope.local), id).await
+        let mut status = job_status(&self.ctx, (&install, self.scope.local), id).await?;
+        if status.reply_status.is_some() {
+            let row = job_row(&self.ctx, &install, id).await?;
+            let shown = match &row.context {
+                Some(context) => self.reply_shown(&install, context).await,
+                None => false,
+            };
+            // A refused check answers the state without the reply.
+            if !shown {
+                (status.reply_status, status.reply_body) = (None, None);
+                status.reply_headers.clear();
+            }
+        }
+        Ok(status)
     }
 
     async fn jobs_outputs(
@@ -1699,6 +1712,36 @@ impl RunBroker {
             intent: request.intent,
             context,
         })
+    }
+
+    /// Whether a kept reply of `context` may be shown now: the connection is still granted and
+    /// declared, and its secret's rule still releases for the request and shows it whole.
+    async fn reply_shown(&self, install: &PluginInstall, context: &RequestContext) -> bool {
+        let path = install_scope(install).connection(&context.connection);
+        if self
+            .checked(Permission::ConnectionsSend, &path)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(config) = read_config(&self.ctx, self.scope.realm_id).await else {
+            return false;
+        };
+        let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
+        let Ok(manifest) = plugin.and_then(|plugin| read_manifest(&plugin)) else {
+            return false;
+        };
+        let Ok((mut request, slot)) = outgoing(&manifest, context) else {
+            return false;
+        };
+        match slot {
+            None => true,
+            Some(slot) => {
+                let released = self.inject(install, &slot, &config, &mut request).await;
+                released.is_ok_and(|(released, _)| released.exposure == ResponseExposure::Full)
+            }
+        }
     }
 
     /// Releases the slot's secret for this request and adds it as its kind says.

@@ -6,6 +6,7 @@
 use aruna_core::plugin_installs::PluginInstall;
 
 use super::*;
+use crate::driver::DriverContext;
 use crate::jobs::plugin_work::tests::copier;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::install::tests::Fixture;
@@ -471,4 +472,159 @@ async fn narrowed_download_refused() {
         .await
         .unwrap();
     assert!(works.is_empty());
+}
+
+/// A blob context with the object `in/a.txt` of the fetcher's group.
+async fn stored_object(
+    fixture: &Fixture,
+    install: &PluginInstall,
+) -> (tempfile::TempDir, DriverContext) {
+    use crate::driver::drive;
+    use crate::s3::object::copy::test::{put_config, with_blob};
+    use crate::s3::object::put::PutObjectOperation;
+    let root = tempfile::tempdir().unwrap();
+    let blob = with_blob(&fixture.ctx, root.path()).await;
+    let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
+    let put = put_config(realm, install.group_id, node, "in", "a.txt", b"ACGT");
+    drive(PutObjectOperation::new(put), &blob).await.unwrap();
+    (root, blob)
+}
+
+fn send(fixture: &Fixture, install: &PluginInstall, version: Option<Ulid>) -> UploadRequest {
+    UploadRequest {
+        context: RequestContext {
+            connection: "catalog".into(),
+            base: "https://api.example.org/api/".into(),
+            method: "PUT".into(),
+            path: "a.txt".into(),
+            query: Vec::new(),
+            headers: Vec::new(),
+        },
+        source: path(fixture, install, "in/a.txt"),
+        version,
+        form: None,
+        ordinal: 0,
+    }
+}
+
+#[tokio::test]
+async fn upload_started() {
+    // An upload needs a readable, unmarked source; the same call finds the same work.
+    use crate::plugins::marks::{Mark, mark_in, unmarked};
+    use crate::plugins::store::{Txn, transact};
+    let fixture = Fixture::keyed().await;
+    let install = fetcher(&fixture).await;
+    let (_root, blob) = stored_object(&fixture, &install).await;
+    let scope = scope(&fixture, &install);
+    let work_id = start_upload(&blob, &scope, send(&fixture, &install, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        start_upload(&blob, &scope, send(&fixture, &install, None)).await,
+        Ok(work_id)
+    );
+    let version = unmarked(&blob, ("in", "a.txt"), None)
+        .await
+        .unwrap()
+        .unwrap();
+    let pinned = start_upload(&blob, &scope, send(&fixture, &install, Some(version))).await;
+    assert_eq!(pinned.unwrap_err().kind, ErrorKind::Conflict);
+    let mut missing = send(&fixture, &install, None);
+    (missing.source, missing.ordinal) = (path(&fixture, &install, "in/none"), 1);
+    assert_eq!(
+        start_upload(&blob, &scope, missing).await.unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+    let mark = Mark {
+        install_id: Ulid::from_parts(8, 8),
+        work_id: Ulid::from_parts(8, 9),
+        job: None,
+        kind: WorkKind::Download,
+        at_ms: 1,
+    };
+    let marked = async |txn: &Txn<'_>| mark_in(txn, ("in", "a.txt", version), &mark).await;
+    transact(&blob, marked).await.unwrap();
+    let mut later = send(&fixture, &install, None);
+    later.ordinal = 2;
+    assert_eq!(
+        start_upload(&blob, &scope, later).await.unwrap_err().kind,
+        ErrorKind::Denied
+    );
+}
+
+#[tokio::test]
+async fn reply_rechecked() {
+    // A kept upload answer is shown while the secret's rule shows whole answers, and dropped,
+    // with the state kept, once the rule shows the status only.
+    use std::sync::Arc;
+
+    use aruna_core::secrets::{ResponseExposure, SecretName};
+    use aruna_plugins::broker::{Broker, CallContext};
+
+    use crate::plugins::bound::tests::{ORIGIN, keys, rule_for, secret_with};
+    use crate::plugins::broker::RunBroker;
+    use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
+    use crate::plugins::work::{record_sent, reserve};
+    let fixture = Fixture::keyed().await;
+    fetcher(&fixture).await;
+    let puts = serde_json::json!({
+        "secrets": { "api_key": { "title": "API key", "kind": "bearer" } },
+        "connections": { "catalog": { "url": "{catalog_url}/api/", "auth": "api_key",
+            "methods": ["GET", "PUT"] } }
+    });
+    let digest = fixture.publish("0.3.0", "ef", puts).await;
+    edit_config(&fixture, |config| {
+        (config.installs[0].digest, config.installs[0].version) = (digest, "0.3.0".into());
+    })
+    .await;
+    let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let install = config.await.unwrap().installs.remove(0);
+    secret_with(&fixture, &install, ResponseExposure::Full).await;
+    let mut row = WorkRow::reserved(&install, WorkKind::Upload, Ulid::from_parts(9, 9), 1);
+    let mut context = send(&fixture, &install, None).context;
+    context.base = format!("{ORIGIN}/api/");
+    row.context = Some(context);
+    let identity = Identity::Call {
+        run_id: row.run_id,
+        ordinal: 0,
+    };
+    let (row, _) = reserve(&fixture.ctx, (&install, &identity), row)
+        .await
+        .unwrap();
+    let reply = r#"{"status":201,"headers":[["etag","e1"]],"body":"eyJpZCI6N30="}"#;
+    let ids = (install.install_id, row.work_id);
+    record_sent(&fixture.ctx, ids, (201, Some(reply.into())))
+        .await
+        .unwrap();
+    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope(&fixture, &install));
+    let broker = broker.with_keys(keys());
+    let cx = CallContext {
+        run: "run".into(),
+        install: install.install_id.to_string(),
+        max_bytes: 1 << 20,
+    };
+    let id = row.work_id.to_string();
+    let shown = broker.jobs_get(&cx, &id).await.unwrap();
+    assert_eq!(shown.reply_status, Some(201));
+    assert_eq!(shown.reply_body.as_deref(), Some(&br#"{"id":7}"#[..]));
+    assert_eq!(shown.reply_headers[0].value, "e1");
+    let name = SecretName::try_from("api-key".to_string()).unwrap();
+    let guard = RuleGuard::Revision {
+        install_id: install.install_id,
+        revision: install.revision,
+    };
+    let rule = rule_for(&install, ResponseExposure::Status);
+    let target = (install.group_id, &name);
+    edit_rules(
+        &fixture.ctx,
+        &fixture.actor,
+        target,
+        (&consumer(&install), vec![rule]),
+        guard,
+    )
+    .await
+    .unwrap();
+    let narrowed = broker.jobs_get(&cx, &id).await.unwrap();
+    assert_eq!((narrowed.reply_status, narrowed.reply_body), (None, None));
+    assert_eq!(narrowed.state, shown.state);
 }

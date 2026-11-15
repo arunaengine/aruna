@@ -3,17 +3,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::job::{
-    JobPayload, PluginWorkAction, PluginWorkSpec, RETENTION_MS, WorkspaceMode,
+    JobPayload, PluginWorkAction, PluginWorkSpec, RETENTION_MS, UploadForm, WorkspaceMode,
 };
+use aruna_core::structs::identity::auth::Permission as Access;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{ErrorKind, HostError};
 use aruna_plugins::permission::Permission;
 use ulid::Ulid;
 
 use super::broker::local_object;
-use super::check::{RunScope, authorize_call, check_call, copy_grants, matching, unavailable};
+use super::check::{
+    RunScope, authorize_access, authorize_call, check_call, copy_grants, matching, unavailable,
+};
 use super::grants::InstallScope;
 use super::marks::unmarked;
 use super::store::encode;
@@ -120,15 +124,7 @@ pub async fn start_download(
     request: DownloadRequest,
 ) -> Result<Ulid, HostError> {
     let install = check_call(ctx, scope, None).await?;
-    let connection = InstallScope {
-        realm_id: scope.realm_id,
-        group_id: install.group_id,
-        install_id: install.install_id,
-    };
-    let connection = connection.connection(&request.context.connection);
-    let send = Permission::ConnectionsSend;
-    let patterns = matching(&install, send, &connection)?;
-    authorize_call(ctx, &install, send, &connection, &patterns).await?;
+    connection_granted(ctx, (scope, &install), &request.context.connection).await?;
     let download = Permission::TransfersDownload;
     let patterns = matching(&install, download, &request.target)?;
     authorize_call(ctx, &install, download, &request.target, &patterns).await?;
@@ -180,6 +176,102 @@ pub async fn start_download(
         action,
     };
     submit(ctx, scope, (&install.account, spec)).await
+}
+
+/// An upload a run asks for: the request resolved when the call came, and the object it sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadRequest {
+    pub context: RequestContext,
+    pub source: String,
+    pub version: Option<Ulid>,
+    pub form: Option<UploadForm>,
+    /// The call's ordinal in its run; with the run it names the work.
+    pub ordinal: u32,
+}
+
+/// Starts or finds the upload of `request` and answers its work id. It needs the connection's
+/// grant and read on the source, whose version must not be marked; a paused install starts nothing.
+pub async fn start_upload(
+    ctx: &DriverContext,
+    scope: &RunScope,
+    request: UploadRequest,
+) -> Result<Ulid, HostError> {
+    let install = check_call(ctx, scope, None).await?;
+    connection_granted(ctx, (scope, &install), &request.context.connection).await?;
+    let upload = Permission::TransfersUpload;
+    let patterns = matching(&install, upload, &request.source)?;
+    let read = (upload, Access::READ);
+    authorize_access(ctx, &install, read, &request.source, &patterns).await?;
+    if install.paused {
+        return Err(HostError::new(ErrorKind::Denied, "the install is paused"));
+    }
+    let place = (scope.realm_id, scope.local);
+    let (bucket, key) = local_object(ctx, place, &install, &request.source).await?;
+    // Every attempt checks the version it sends again; one marked meanwhile fails there.
+    if unmarked(ctx, (&bucket, &key), request.version)
+        .await?
+        .is_none()
+    {
+        let message = format!("no object at {}", request.source);
+        return Err(HostError::new(ErrorKind::NotFound, message));
+    }
+    let identity = Identity::Call {
+        run_id: scope.run.run_id,
+        ordinal: request.ordinal,
+    };
+    let stable = (
+        &request.context,
+        &request.source,
+        request.version,
+        &request.form,
+    );
+    let stable = encode(&stable).map_err(|error| unavailable(error.0))?;
+    let now_ms = unix_timestamp_millis();
+    let mut proposed = WorkRow::reserved(&install, WorkKind::Upload, scope.run.run_id, now_ms);
+    proposed.digest = digest(&[b"upload", &stable]);
+    proposed.source = Some(request.source.clone());
+    proposed.context = Some(request.context);
+    let (row, _) = match reserve(ctx, (&install, &identity), proposed).await {
+        Ok(found) => found,
+        Err(WorkError::Conflict) => {
+            let message = "this call started an upload with other arguments";
+            return Err(HostError::new(ErrorKind::Conflict, message));
+        }
+        Err(WorkError::Store(error)) => return Err(unavailable(error.0)),
+    };
+    if row.state != WorkState::Reserved {
+        return Ok(row.work_id);
+    }
+    let action = PluginWorkAction::Upload {
+        source: request.source,
+        version: request.version,
+        form: request.form,
+    };
+    let spec = PluginWorkSpec {
+        realm_id: scope.realm_id,
+        install_id: install.install_id,
+        work_id: row.work_id,
+        group_id: install.group_id,
+        action,
+    };
+    submit(ctx, scope, (&install.account, spec)).await
+}
+
+/// Whether the install may send through connection `name`: its grant and its authorization.
+async fn connection_granted(
+    ctx: &DriverContext,
+    (scope, install): (&RunScope, &PluginInstall),
+    name: &str,
+) -> Result<(), HostError> {
+    let connection = InstallScope {
+        realm_id: scope.realm_id,
+        group_id: install.group_id,
+        install_id: install.install_id,
+    };
+    let connection = connection.connection(name);
+    let send = Permission::ConnectionsSend;
+    let patterns = matching(install, send, &connection)?;
+    authorize_call(ctx, install, send, &connection, &patterns).await
 }
 
 /// Submits the job of a reserved work and records it. The dedup key is the work id, so a
