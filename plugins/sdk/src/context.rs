@@ -6,10 +6,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use super::error::{Error, Result};
 use crate::bindings::aruna::plugin::{
     log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services, state,
 };
-use crate::error::{Error, Result};
 
 pub use log::Level;
 pub use metadata_create::Created;
