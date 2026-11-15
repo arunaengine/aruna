@@ -40,11 +40,8 @@ class Dataset:
         entity = dict(self._properties)
         fields = {"name": self.name, "description": self.description, "keywords": [*self.keywords],
                   "license": self.license, "identifier": dict(self.identifiers)}
-        for name, value in fields.items():
-            if value:
-                entity[name] = value
-            elif name in self._read:
-                entity[name] = self._read[name]
+        # An empty field is left out, so a save removes it.
+        entity.update((name, value) for name, value in fields.items() if value)
         return entity
 
     def __getitem__(self, name):

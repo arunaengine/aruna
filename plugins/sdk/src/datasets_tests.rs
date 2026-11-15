@@ -54,6 +54,18 @@ fn fields_and_save() {
 }
 
 #[test]
+fn clears_fields() {
+    let fake = seeded();
+    let mut dataset = get("D1").unwrap();
+    dataset.keywords.clear();
+    dataset.license = None;
+    assert_eq!(dataset.save().unwrap(), ["keywords", "license"]);
+    let patch = r#"{"keywords":null,"license":null}"#;
+    assert_eq!(fake.calls().last().unwrap(), &format!("patch D1 {patch} 1"));
+    assert!(get("D1").unwrap().keywords.is_empty());
+}
+
+#[test]
 fn file_entities() {
     let fake = seeded();
     let mut dataset = get("D1").unwrap();

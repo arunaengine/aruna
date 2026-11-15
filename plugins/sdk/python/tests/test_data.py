@@ -36,6 +36,13 @@ class DataTest(unittest.TestCase):
         stale.reload()
         self.assertEqual(stale.name, "Run 8")
 
+    def test_clear_fields(self):
+        dataset = aruna.datasets.get("D1")
+        dataset.keywords, dataset.license = [], None
+        self.assertEqual(dataset.save(), ["keywords", "license"])
+        self.assertEqual(self.fake.calls[-1], ("patch", "D1", {"keywords": None, "license": None}))
+        self.assertEqual(aruna.datasets.get("D1").keywords, [])
+
     def test_files_and_listings(self):
         dataset = aruna.datasets.get("D1")
         dataset.add_file("raw/reads.fq", id="reads/x", encodingFormat="text/plain")

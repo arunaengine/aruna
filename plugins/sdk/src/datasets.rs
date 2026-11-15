@@ -72,7 +72,7 @@ impl Dataset {
             license: None,
             identifiers: BTreeMap::new(),
             properties: Map::new(),
-            read: entity.clone(),
+            read: Map::new(),
         };
         for (name, value) in entity {
             dataset.put(&name, value);
@@ -135,15 +135,10 @@ impl Dataset {
                 (!self.identifiers.is_empty()).then(|| json!(self.identifiers)),
             ),
         ];
+        // An empty field is left out, so a save removes it.
         for (name, value) in fields {
-            match value {
-                Some(value) => drop(entity.insert(name.into(), value)),
-                // An unchanged field keeps the form it was read in.
-                None => drop(
-                    self.read
-                        .get(name)
-                        .map(|old| entity.insert(name.into(), old.clone())),
-                ),
+            if let Some(value) = value {
+                entity.insert(name.into(), value);
             }
         }
         entity
