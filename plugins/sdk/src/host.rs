@@ -5,9 +5,13 @@
 use std::cell::RefCell;
 
 use crate::Level;
+use crate::bindings::aruna::plugin::metadata_create::Created;
+use crate::bindings::aruna::plugin::metadata_read::{Document, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
 use crate::bindings::aruna::plugin::types::HostError;
-use crate::bindings::aruna::plugin::{log, objects_read};
+use crate::bindings::aruna::plugin::{
+    log, metadata_create, metadata_read, metadata_write, objects_read,
+};
 
 /// One host call's answer.
 pub(crate) type Answer<T> = Result<T, HostError>;
@@ -18,6 +22,11 @@ pub(crate) trait Host {
     fn object_info(&self, path: &str) -> Answer<ObjectInfo>;
     fn object_list(&self, prefix: &str, cursor: Option<&str>) -> Answer<ObjectPage>;
     fn object_read(&self, path: &str, version: Option<&str>) -> Answer<Vec<u8>>;
+    /// The dataset entity without its file links, or with them when `whole`.
+    fn dataset_get(&self, id: &str, whole: bool) -> Answer<Document>;
+    fn dataset_list(&self, cursor: Option<&str>) -> Answer<Listing>;
+    fn dataset_patch(&self, id: &str, patch: &str, expected: &str) -> Answer<String>;
+    fn dataset_create(&self, path: &str, dataset: &str) -> Answer<Created>;
 }
 
 /// The component's own imports.
@@ -38,6 +47,25 @@ impl Host for Imports {
 
     fn object_read(&self, path: &str, version: Option<&str>) -> Answer<Vec<u8>> {
         objects_read::read(path, version)
+    }
+
+    fn dataset_get(&self, id: &str, whole: bool) -> Answer<Document> {
+        match whole {
+            true => metadata_read::get(id),
+            false => metadata_read::summary(id),
+        }
+    }
+
+    fn dataset_list(&self, cursor: Option<&str>) -> Answer<Listing> {
+        metadata_read::list(cursor)
+    }
+
+    fn dataset_patch(&self, id: &str, patch: &str, expected: &str) -> Answer<String> {
+        metadata_write::patch(id, patch, expected)
+    }
+
+    fn dataset_create(&self, path: &str, dataset: &str) -> Answer<Created> {
+        metadata_create::create(path, dataset)
     }
 }
 

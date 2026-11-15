@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod datasets;
 mod form;
 mod host;
 #[doc(hidden)]
@@ -13,6 +14,7 @@ mod run;
 
 pub use bindings::aruna::plugin::log::Level;
 pub use bindings::aruna::plugin::types::WatchEvent;
+pub use datasets::Dataset;
 pub use form::Form;
 pub use objects::Object;
 pub use outcome::{Error, Result, fail, retry};

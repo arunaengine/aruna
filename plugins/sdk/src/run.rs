@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::bindings::aruna::plugin::types::{Failure, FailureKind, Invocation, Trigger};
+use crate::datasets::{self, Dataset};
 use crate::objects::{self, Object};
 use crate::{Error, Form, Result, WatchEvent};
 
@@ -131,6 +132,18 @@ impl Subject for SyncEvent {
                 job: event.revision,
             }),
             other => Err(mismatch("a sync event", &other)),
+        }
+    }
+}
+
+/// The created or updated dataset, loaded.
+impl Subject for Dataset {
+    fn from_trigger(trigger: Trigger) -> Result<Self> {
+        match trigger {
+            Trigger::Event(event) if event.kind.starts_with("dataset_") => {
+                datasets::get(&event.resource)
+            }
+            other => Err(mismatch("a dataset", &other)),
         }
     }
 }

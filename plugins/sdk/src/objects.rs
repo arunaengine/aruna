@@ -6,6 +6,7 @@
 use serde::de::DeserializeOwned;
 
 use crate::bindings::aruna::plugin::objects_read::ObjectInfo;
+use crate::datasets::Pages;
 use crate::host;
 use crate::{Error, Result};
 
@@ -57,49 +58,13 @@ pub fn get(path: &str) -> Result<Object> {
 }
 
 /// Every object below `prefix` the install may read, fetched one page at a time.
-pub fn list(prefix: &str) -> Listing {
-    Listing {
-        prefix: prefix.to_string(),
-        page: Vec::new(),
-        cursor: None,
-        done: false,
-    }
-}
-
-/// The objects below a prefix; each page is one host call.
-pub struct Listing {
-    prefix: String,
-    page: Vec<Object>,
-    cursor: Option<String>,
-    done: bool,
-}
-
-impl Iterator for Listing {
-    type Item = Result<Object>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.page.is_empty() && !self.done {
-            let cursor = self.cursor.take();
-            let page = host::with(|host| host.object_list(&self.prefix, cursor.as_deref()));
-            match page {
-                Ok(page) => {
-                    self.done = page.cursor.is_none();
-                    self.cursor = page.cursor;
-                    self.page = page
-                        .objects
-                        .into_iter()
-                        .rev()
-                        .map(Object::from_info)
-                        .collect();
-                }
-                Err(error) => {
-                    self.done = true;
-                    return Some(Err(error.into()));
-                }
-            }
-        }
-        self.page.pop().map(Ok)
-    }
+pub fn list(prefix: &str) -> impl Iterator<Item = Result<Object>> + use<> {
+    let prefix = prefix.to_string();
+    Pages::new(move |cursor| {
+        let page = host::with(|host| host.object_list(&prefix, cursor.as_deref()))?;
+        let objects = page.objects.into_iter().map(Object::from_info).collect();
+        Ok((objects, page.cursor))
+    })
 }
 
 #[cfg(test)]

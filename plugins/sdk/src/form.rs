@@ -5,6 +5,7 @@
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
+use crate::datasets::{self, Dataset};
 use crate::objects::{self, Object};
 use crate::{Error, Result};
 
@@ -33,6 +34,11 @@ impl Form {
 
     pub fn text(&self, name: &str) -> Result<String> {
         self.get(name)
+    }
+
+    /// The dataset a field of type `dataset` names, loaded.
+    pub fn dataset(&self, name: &str) -> Result<Dataset> {
+        datasets::get(&self.text(name)?)
     }
 
     /// The object a field of type `object` names, loaded.

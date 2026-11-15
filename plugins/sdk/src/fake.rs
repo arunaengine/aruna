@@ -1,4 +1,5 @@
-//! A fake host for the library's tests: objects and their contents in memory, every call noted.
+//! A fake host for the library's tests: datasets, objects and their contents in memory, every
+//! call noted.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -6,7 +7,11 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use serde_json::{Map, Value};
+
 use crate::Level;
+use crate::bindings::aruna::plugin::metadata_create::Created;
+use crate::bindings::aruna::plugin::metadata_read::{Document, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
 use crate::bindings::aruna::plugin::types::{ErrorKind, HostError};
 use crate::host::{Answer, Host, replace};
@@ -17,7 +22,16 @@ pub(crate) struct State {
     pub calls: Vec<String>,
     /// Content and version by bucket path; a version starting with `m` is marked.
     pub objects: BTreeMap<String, (Vec<u8>, String)>,
+    pub datasets: BTreeMap<String, Stored>,
     pub page: usize,
+}
+
+/// One dataset: its revision, entity and file entities.
+#[derive(Default)]
+pub(crate) struct Stored {
+    pub revision: u64,
+    pub entity: Map<String, Value>,
+    pub files: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -41,6 +55,39 @@ pub(crate) fn install(objects: &[(&str, &[u8], &str)]) -> Fake {
 impl Fake {
     pub fn calls(&self) -> Vec<String> {
         self.0.borrow().calls.clone()
+    }
+
+    /// Stores dataset `id` at revision 1.
+    pub fn dataset(&self, id: &str, entity: Value) {
+        let entity = entity.as_object().cloned().unwrap_or_default();
+        let stored = Stored {
+            revision: 1,
+            entity,
+            files: Vec::new(),
+        };
+        self.0.borrow_mut().datasets.insert(id.into(), stored);
+    }
+
+    /// Runs `change` on dataset `id` at revision `expected`, as a write does.
+    fn write(&self, id: &str, expected: &str, change: impl FnOnce(&mut Stored)) -> Answer<String> {
+        let mut state = self.0.borrow_mut();
+        let stored =
+            (state.datasets.get_mut(id)).ok_or_else(|| refusal(ErrorKind::NotFound, id))?;
+        if stored.revision.to_string() != expected {
+            return Err(refusal(ErrorKind::Conflict, "changed meanwhile"));
+        }
+        change(stored);
+        stored.revision += 1;
+        Ok(stored.revision.to_string())
+    }
+
+    /// Items after `cursor`, a page of them, and the cursor of the next page.
+    fn paged<T: Clone>(&self, items: &[T], cursor: Option<&str>) -> (Vec<T>, Option<String>) {
+        let start: usize = cursor.map_or(0, |cursor| cursor.parse().unwrap());
+        let page = self.0.borrow().page;
+        let taken = items.iter().skip(start).take(page).cloned().collect();
+        let next = start + page;
+        (taken, (next < items.len()).then(|| next.to_string()))
     }
 
     fn note(&self, call: String) {
@@ -95,6 +142,58 @@ impl Host for Fake {
         Ok(ObjectPage {
             objects,
             cursor: cursor.flatten(),
+        })
+    }
+
+    fn dataset_get(&self, id: &str, whole: bool) -> Answer<Document> {
+        self.note(format!("get {id} {whole}"));
+        let state = self.0.borrow();
+        let stored = (state.datasets.get(id)).ok_or_else(|| refusal(ErrorKind::NotFound, id))?;
+        let mut entity = stored.entity.clone();
+        if whole {
+            let parts: Vec<Value> = stored
+                .files
+                .iter()
+                .map(|file| serde_json::json!({ "@id": file["@id"] }))
+                .collect();
+            entity.insert("hasPart".into(), parts.into());
+        }
+        Ok(Document {
+            resource: id.into(),
+            revision: stored.revision.to_string(),
+            json: Value::Object(entity).to_string(),
+        })
+    }
+
+    fn dataset_list(&self, cursor: Option<&str>) -> Answer<Listing> {
+        self.note(format!("datasets {}", cursor.unwrap_or("-")));
+        let ids: Vec<String> = self.0.borrow().datasets.keys().cloned().collect();
+        let (resources, cursor) = self.paged(&ids, cursor);
+        Ok(Listing { resources, cursor })
+    }
+
+    fn dataset_patch(&self, id: &str, patch: &str, expected: &str) -> Answer<String> {
+        self.note(format!("patch {id} {patch} {expected}"));
+        let patch: Map<String, Value> = serde_json::from_str(patch).unwrap();
+        self.write(id, expected, |stored| {
+            for (name, value) in patch {
+                match value {
+                    Value::Null => drop(stored.entity.remove(&name)),
+                    value => drop(stored.entity.insert(name, value)),
+                }
+            }
+        })
+    }
+
+    fn dataset_create(&self, path: &str, dataset: &str) -> Answer<Created> {
+        self.note(format!("create {path}"));
+        let id = format!("D-{path}");
+        if !self.0.borrow().datasets.contains_key(&id) {
+            self.dataset(&id, serde_json::from_str(dataset).unwrap());
+        }
+        Ok(Created {
+            resource: id,
+            revision: "1".into(),
         })
     }
 
