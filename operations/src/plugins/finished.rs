@@ -4,9 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
+use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
-use aruna_core::plugin_runs::{RunState, SourceEvent, SourceKind};
+use aruna_core::plugin_runs::{PluginRun, RunState, SourceEvent, SourceKind, run_key};
+use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use tracing::warn;
 use ulid::Ulid;
@@ -87,6 +88,74 @@ pub async fn notify_work(
         }
     }
     Ok(notified)
+}
+
+/// The run a settled, undelivered job waits for: one that ended without success, so an admin
+/// retries it or drops the completion. `None` once delivered, or while the run may still succeed.
+pub fn waits_for(row: &WorkRow, run: Option<RunState>) -> Option<Ulid> {
+    let held = matches!(
+        run,
+        Some(RunState::Failed | RunState::Cancelled | RunState::NeedsAttention)
+    );
+    (row.state == WorkState::Settled && !row.notified && held).then_some(row.run_id)
+}
+
+/// Queues a failed or cancelled run again with its intents kept, so its calls reach the same
+/// ordinals and its jobs the same ids; the audit row commits with it.
+pub async fn retry_run(
+    ctx: &DriverContext,
+    (install_id, run_id): (Ulid, Ulid),
+    audit: &AdminAuditRecord,
+    now_ms: u64,
+) -> Result<PluginRun, RunError> {
+    let _admitting = ADMISSIONS.lock().await;
+    transact(ctx, async |txn: &Txn<'_>| {
+        let row = txn
+            .read(PLUGIN_RUNS_KEYSPACE, &run_key(install_id, run_id))
+            .await?;
+        let mut run = decode::<PluginRun>(&row.ok_or(RunError::NotFound)?)?;
+        if !matches!(run.state, RunState::Failed | RunState::Cancelled) {
+            return Err(RunError::NotRetried(run.state.as_str()));
+        }
+        (run.state, run.attempts, run.due_ms) = (RunState::Queued, 0, now_ms);
+        (run.finished_ms, run.message, run.output) = (None, None, None);
+        run.log.clear();
+        admit_in(txn, &run).await?;
+        audited(txn, audit).await?;
+        Ok(run)
+    })
+    .await
+}
+
+/// Marks the held end of job `work_id` delivered without a run; the audit row commits with it.
+pub async fn drop_completion(
+    ctx: &DriverContext,
+    (install_id, work_id): (Ulid, Ulid),
+    audit: &AdminAuditRecord,
+) -> Result<WorkRow, RunError> {
+    transact(ctx, async |txn: &Txn<'_>| {
+        let Some((key, mut row)) = read_in(txn, install_id, work_id).await? else {
+            return Err(RunError::NotFound);
+        };
+        if row.state != WorkState::Settled || row.notified {
+            return Err(RunError::NotHeld);
+        }
+        row.notified = true;
+        txn.write(PLUGIN_WORK_KEYSPACE, vec![(key, encode(&row)?)])
+            .await?;
+        audited(txn, audit).await?;
+        Ok(row)
+    })
+    .await
+}
+
+async fn audited(txn: &Txn<'_>, audit: &AdminAuditRecord) -> Result<(), RunError> {
+    let entries = (audit.entries()).map_err(|error| StoreError(error.to_string()))?;
+    for (space, key, value) in entries {
+        txn.write(&space, vec![(key.to_vec(), value.to_vec())])
+            .await?;
+    }
+    Ok(())
 }
 
 /// The event a `job_finished` run gets: the job's id, the object path it wrote or read, and

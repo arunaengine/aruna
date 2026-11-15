@@ -162,6 +162,23 @@ pub async fn plugin(context: &mut Context<'_>, command: PluginCommand) -> Result
                 .await?;
             show_run(context, &run)
         }
+        PluginCommand::Retry { id, run } => {
+            let path = format!("plugin-installs/{id}/runs/{run}/retry");
+            let run: RunView = (context.api()?)
+                .send(reqwest::Method::POST, &path, &serde_json::json!({}))
+                .await?;
+            show_run(context, &run)
+        }
+        PluginCommand::Drop { id, job } => {
+            let path = format!("plugin-installs/{id}/jobs/{job}/drop");
+            let dropped: Value = (context.api()?)
+                .send(reqwest::Method::POST, &path, &serde_json::json!({}))
+                .await?;
+            match context.out.json {
+                true => context.out.json(&dropped),
+                false => context.out.line(format!("dropped the end of job {job}")),
+            }
+        }
         PluginCommand::Build { path } => {
             let built = build_project(&path).map_err(|err| CliError::usage(err.to_string()))?;
             let summary = Built {

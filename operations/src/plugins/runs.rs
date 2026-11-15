@@ -31,6 +31,10 @@ pub enum RunError {
     NotFound,
     #[error("the run is {0}, not waiting for a resolution")]
     NotWaiting(&'static str),
+    #[error("the run is {0}; only a failed or cancelled run is retried")]
+    NotRetried(&'static str),
+    #[error("no job end of the install waits to be delivered")]
+    NotHeld,
 }
 
 /// Stores a new queued run, unless its install already has `RUNS_QUEUED` unfinished ones.
@@ -39,7 +43,7 @@ pub async fn admit(ctx: &DriverContext, run: &PluginRun) -> Result<(), RunError>
     transact(ctx, async |txn: &Txn<'_>| admit_in(txn, run).await).await
 }
 
-/// Admits the run in `txn`; the caller holds `ADMISSIONS`.
+/// Admits the run in `txn`, a new one or one queued again; the caller holds `ADMISSIONS`.
 pub async fn admit_in(txn: &Txn<'_>, run: &PluginRun) -> Result<(), RunError> {
     let prefix = run.install_id.to_bytes();
     let queued = txn.scan(PLUGIN_QUEUE_KEYSPACE, &prefix).await?.len();

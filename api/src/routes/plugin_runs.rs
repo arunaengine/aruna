@@ -1,5 +1,5 @@
-//! Serves the runs of a plugin install: start, list, read and resolve runs, list its native work,
-//! and show how its events are delivered. The install's receiver keeps this data and answers.
+//! Serves the runs of a plugin install: start, list, read, resolve and retry runs, list its native
+//! work and drop held job ends, and show how its events are delivered. The receiver answers.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -15,10 +15,13 @@ use aruna_core::types::GroupId;
 use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::plugins::decide::event_delivery;
 use aruna_operations::plugins::dispatch::{StartError, start_run};
+use aruna_operations::plugins::finished::{drop_completion, retry_run, waits_for};
 use aruna_operations::plugins::install::{InstallError, read_config};
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::runs::{RunError, list_runs, read_run, resolve_run};
-use aruna_operations::plugins::work::{WorkKind, list_work as list_work_rows, work_state};
+use aruna_operations::plugins::work::{
+    WorkKind, WorkRow, list_work as list_work_rows, read_work, work_state,
+};
 use aruna_operations::users::service_account::group_admin_path;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, State};
@@ -49,6 +52,8 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(start, list))
         .routes(routes!(get_run))
         .routes(routes!(resolve))
+        .routes(routes!(retry))
+        .routes(routes!(drop_job))
         .routes(routes!(delivery))
         .routes(routes!(list_work))
 }
@@ -151,6 +156,9 @@ pub struct WorkView {
     pub cancelled: bool,
     pub created_ms: u64,
     pub settled_ms: Option<u64>,
+    /// The job finished, but the run that started it did not succeed, so no `job_finished` run
+    /// follows until an admin retries that run or drops this job's end.
+    pub waits_for: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -320,7 +328,9 @@ fn lost(receiver: NodeId, reason: &str) -> Response {
 fn run_error(error: RunError) -> Response {
     match error {
         RunError::NotFound => ServerError::NotFound.into_response(),
-        RunError::NotWaiting(_) => ServerError::Conflict(error.to_string()).into_response(),
+        RunError::NotWaiting(_) | RunError::NotRetried(_) | RunError::NotHeld => {
+            ServerError::Conflict(error.to_string()).into_response()
+        }
         RunError::Full(_) => {
             let full = StatusCode::TOO_MANY_REQUESTS;
             let mut refused =
@@ -636,28 +646,43 @@ pub async fn list_work(
     };
     let mut work = Vec::with_capacity(rows.len());
     for row in rows {
-        let record = match (row.job, &row.summary) {
-            (Some(job), None) => match read_job_record(&ctx.storage_handle, job, None).await {
-                Ok(record) => record,
-                Err(error) => return unavailable(error),
-            },
-            _ => None,
-        };
-        work.push(WorkView {
-            id: row.work_id.to_string(),
-            kind: work_kind(row.kind).into(),
-            source: row.source.clone(),
-            target: row.target.clone(),
-            state: work_state(&row, record.as_ref()).into(),
-            job: row.job.map(|job| job.to_string()),
-            run: row.run_id.to_string(),
-            cancelled: row.cancel,
-            created_ms: row.created_ms,
-            settled_ms: row.settled_ms,
-        });
+        match work_view(&ctx, install_id, row).await {
+            Ok(view) => work.push(view),
+            Err(error) => return unavailable(error),
+        }
     }
     let next = next.map(|id| id.to_string());
     Json(WorkPage { work, next }).into_response()
+}
+
+/// One work as the routes show it: its state from the summary or the job record, and the run
+/// its held end waits for.
+async fn work_view(
+    ctx: &aruna_operations::driver::DriverContext,
+    install_id: Ulid,
+    row: WorkRow,
+) -> Result<WorkView, String> {
+    let record = match (row.job, &row.summary) {
+        (Some(job), None) => read_job_record(&ctx.storage_handle, job, None).await?,
+        _ => None,
+    };
+    let run = match row.notified {
+        true => None,
+        false => read_run(ctx, install_id, row.run_id).await.ok(),
+    };
+    Ok(WorkView {
+        id: row.work_id.to_string(),
+        kind: work_kind(row.kind).into(),
+        source: row.source.clone(),
+        target: row.target.clone(),
+        state: work_state(&row, record.as_ref()).into(),
+        job: row.job.map(|job| job.to_string()),
+        run: row.run_id.to_string(),
+        cancelled: row.cancel,
+        created_ms: row.created_ms,
+        settled_ms: row.settled_ms,
+        waits_for: waits_for(&row, run.map(|run| run.state)).map(|run| run.to_string()),
+    })
 }
 
 fn work_kind(kind: WorkKind) -> &'static str {
@@ -681,7 +706,8 @@ fn work_example() -> Value {
         "run": "01JBX7Y3S5M3Q8Y1V9K2T4R6Q1",
         "cancelled": false,
         "created_ms": 1762700000000u64,
-        "settled_ms": 1762700030000u64
+        "settled_ms": 1762700030000u64,
+        "waits_for": null
     })
 }
 
@@ -809,6 +835,162 @@ pub async fn resolve(
     };
     match resolve_run(&ctx, served.install_id, run_id, parsed.done, &audit).await {
         Ok(run) => Json(view(run)).into_response(),
+        Err(error) => run_error(error),
+    }
+}
+
+/// The audit row of an admin action on install `install_id`'s run `run_id`.
+async fn run_audit(
+    ctx: &aruna_operations::driver::DriverContext,
+    served: &Served,
+    (run_id, action): (Ulid, AdminAuditAction),
+) -> Result<AdminAuditRecord, Response> {
+    let kept = read_run(ctx, served.install_id, run_id).await;
+    let kept = kept.map_err(run_error)?;
+    let actor = served.auth.user_id;
+    let target = served
+        .install
+        .as_ref()
+        .map_or(actor, |install| install.account);
+    Ok(AdminAuditRecord {
+        group_id: Some(kept.group_id),
+        plugin: Some(PluginAudit {
+            plugin: kept.plugin,
+            version: kept.version,
+            install_id: served.install_id,
+        }),
+        ..AdminAuditRecord::new(action, actor, target)
+    })
+}
+
+#[utoipa::path(
+    post,
+    path = "/plugin-installs/{id}/runs/{run}/retry",
+    tag = "plugins",
+    summary = "Retry a plugin run",
+    description = r#"Queues a failed or cancelled run again with its recorded calls, and audits it.
+
+**Authentication**: realm bearer token of an admin of the install's group.
+
+**Behavior**
+- The run reaches the same calls in the same order: a job it started has the same id, and a
+  call that settled answers its stored reply again.
+- When the run succeeds, the held ends of the jobs it started are delivered as `job_finished`
+  runs.
+- The install's receiver keeps its runs and answers; every other node relays the call there."#,
+    params(
+        ("id" = String, Path, description = "The install id"),
+        ("run" = String, Path, description = "The run id")
+    ),
+    responses(
+        (status = 200, description = "The queued run", body = RunView, example = json!(queued_example())),
+        (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
+        (status = 404, description = "No install or run has this id", body = ErrorResponse),
+        (status = 409, description = "The run is not failed or cancelled", body = ErrorResponse),
+        (status = 429, description = "The install has its limit of unfinished and unresolved runs", body = ErrorResponse,
+            headers(("Retry-After" = u32, description = "Seconds before retrying again"))),
+        (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn retry(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((id, run)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let call = Call {
+        method,
+        uri,
+        headers,
+        body: Bytes::new(),
+    };
+    let served = match serve(&state, auth, &id, Some(&run), call).await {
+        Ok(served) => served,
+        Err(response) => return response,
+    };
+    let Ok(run_id) = parse_id(&run) else {
+        return ServerError::BadRequestReason("the run id is not valid".into()).into_response();
+    };
+    let ctx = state.get_ctx();
+    let action = (run_id, AdminAuditAction::PluginRunRetried);
+    let audit = match run_audit(&ctx, &served, action).await {
+        Ok(audit) => audit,
+        Err(response) => return response,
+    };
+    let ids = (served.install_id, run_id);
+    match retry_run(&ctx, ids, &audit, unix_timestamp_millis()).await {
+        Ok(run) => Json(view(run)).into_response(),
+        Err(error) => run_error(error),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/plugin-installs/{id}/jobs/{job}/drop",
+    tag = "plugins",
+    summary = "Drop a held plugin job end",
+    description = r#"Marks the end of a finished job delivered without a run, and audits it.
+
+**Authentication**: realm bearer token of an admin of the install's group.
+
+**Behavior**
+- A job's end waits while the run that started it ended without success (`waits_for` in the
+  work list); after a drop no `job_finished` run follows for it.
+- The install's receiver keeps its work and answers; every other node relays the call there."#,
+    params(
+        ("id" = String, Path, description = "The install id"),
+        ("job" = String, Path, description = "The job id a run got, the work id of the work list")
+    ),
+    responses(
+        (status = 200, description = "The work, delivered", body = WorkView, example = json!(work_example())),
+        (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
+        (status = 404, description = "No install or job has this id", body = ErrorResponse),
+        (status = 409, description = "The job did not finish, or its end was delivered", body = ErrorResponse),
+        (status = 503, description = "The install's receiver is unavailable", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn drop_job(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path((id, job)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let call = Call {
+        method,
+        uri,
+        headers,
+        body: Bytes::new(),
+    };
+    let served = match serve(&state, auth, &id, None, call).await {
+        Ok(served) => served,
+        Err(response) => return response,
+    };
+    let Ok(work_id) = parse_id(&job) else {
+        return ServerError::BadRequestReason("the job id is not valid".into()).into_response();
+    };
+    let ctx = state.get_ctx();
+    let unavailable = |error: String| ServerError::ServiceUnavailableReason(error).into_response();
+    let row = match read_work(&ctx, served.install_id, work_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return ServerError::NotFound.into_response(),
+        Err(error) => return unavailable(error.to_string()),
+    };
+    let action = (row.run_id, AdminAuditAction::PluginCompletionDropped);
+    let audit = match run_audit(&ctx, &served, action).await {
+        Ok(audit) => audit,
+        Err(response) => return response,
+    };
+    match drop_completion(&ctx, (served.install_id, work_id), &audit).await {
+        Ok(row) => match work_view(&ctx, served.install_id, row).await {
+            Ok(view) => Json(view).into_response(),
+            Err(error) => unavailable(error),
+        },
         Err(error) => run_error(error),
     }
 }

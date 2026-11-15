@@ -1,9 +1,10 @@
-//! Tests delivering finished jobs: after the starting run succeeded one `job_finished` run, a
-//! failed starting run holds the completion and its rows, and no trigger means no run.
+//! Tests delivering finished jobs: one `job_finished` run after the starting run succeeded, a held
+//! end with its rows kept, no run without the trigger, and an admin's retry or drop.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::plugin_runs::{RUN_RETENTION_MS, RunTrigger};
+use aruna_core::structs::identity::admin_audit::AdminAuditAction;
 use serde_json::json;
 
 use super::*;
@@ -130,4 +131,54 @@ async fn notifies_without_trigger() {
         .await
         .unwrap();
     assert!(row.is_some_and(|row| row.notified));
+}
+
+fn audit(fixture: &Fixture, action: AdminAuditAction) -> AdminAuditRecord {
+    let actor = fixture.actor.user_id;
+    AdminAuditRecord::new(action, actor, actor)
+}
+
+#[tokio::test]
+async fn retry_releases_held() {
+    // A retry queues the failed run again with its calls kept; once it succeeds, the held end
+    // is delivered.
+    let fixture = Fixture::new().await;
+    let install = finisher(&fixture).await;
+    let work_id = settled(&fixture, &install, RunState::Failed).await;
+    let row = read_work(&fixture.ctx, install.install_id, work_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(waits_for(&row, Some(RunState::Failed)), Some(row.run_id));
+    let retried = audit(&fixture, AdminAuditAction::PluginRunRetried);
+    let ids = (install.install_id, row.run_id);
+    let mut run = retry_run(&fixture.ctx, ids, &retried, 9).await.unwrap();
+    assert_eq!(
+        (run.state, run.attempts, run.due_ms),
+        (RunState::Queued, 0, 9)
+    );
+    let again = retry_run(&fixture.ctx, ids, &retried, 9).await;
+    assert_eq!(again.map(drop), Err(RunError::NotRetried("queued")));
+    assert_eq!(notify(&fixture).await, 0);
+    run.finish(RunState::Succeeded, None, 10);
+    save_run(&fixture.ctx, &run).await.unwrap();
+    assert_eq!(notify(&fixture).await, 1);
+    assert_eq!(finish_runs(&fixture, &install).await.len(), 1);
+}
+
+#[tokio::test]
+async fn drop_delivers_none() {
+    let fixture = Fixture::new().await;
+    let install = finisher(&fixture).await;
+    let work_id = settled(&fixture, &install, RunState::Cancelled).await;
+    let dropped = audit(&fixture, AdminAuditAction::PluginCompletionDropped);
+    let ids = (install.install_id, work_id);
+    let row = drop_completion(&fixture.ctx, ids, &dropped).await.unwrap();
+    assert_eq!(waits_for(&row, Some(RunState::Cancelled)), None);
+    let twice = drop_completion(&fixture.ctx, ids, &dropped).await;
+    assert_eq!(twice.map(drop), Err(RunError::NotHeld));
+    assert_eq!(notify(&fixture).await, 0);
+    assert!(finish_runs(&fixture, &install).await.is_empty());
+    let missing = drop_completion(&fixture.ctx, (install.install_id, Ulid::nil()), &dropped);
+    assert_eq!(missing.await.map(drop), Err(RunError::NotFound));
 }

@@ -125,7 +125,13 @@ async fn decide(
             Verdict::Run(run) => match admit_in(txn, run).await {
                 Err(RunError::Full(_)) => return Ok(Outcome::Busy),
                 Err(RunError::Store(error)) => return Err(error),
-                Ok(()) | Err(RunError::NotFound | RunError::NotWaiting(_)) => Outcome::Queued,
+                Ok(())
+                | Err(
+                    RunError::NotFound
+                    | RunError::NotWaiting(_)
+                    | RunError::NotRetried(_)
+                    | RunError::NotHeld,
+                ) => Outcome::Queued,
             },
             Verdict::Unready if !hold(txn, row, now_ms).await? => return Ok(Outcome::Busy),
             Verdict::Unready => Outcome::Waiting,
