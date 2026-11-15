@@ -5,10 +5,11 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::bindings::aruna::plugin::jobs::{DownloadRequest, UploadRequest};
 use crate::bindings::aruna::plugin::services::{Method, Request};
 use crate::bindings::aruna::plugin::types::Field;
 use crate::host;
-use crate::{Error, Result};
+use crate::{Error, Job, Result};
 
 /// The service the manifest declares as `[services.<name>]`.
 pub fn service(name: &str) -> Service {
@@ -62,6 +63,122 @@ impl Service {
             check: true,
             invalid: None,
         }
+    }
+
+    /// A job that stores the whole answer at `path` as a new version of `to`; it needs write on
+    /// `to`.
+    pub fn download(&self, path: &str, to: &str) -> Download {
+        Download(DownloadRequest {
+            service: self.name.clone(),
+            path: path.to_string(),
+            query: Vec::new(),
+            headers: Vec::new(),
+            target: to.to_string(),
+            size_limit: None,
+            checksums: Vec::new(),
+        })
+    }
+
+    /// A job that sends the object at `source` with PUT unless set otherwise; it needs read on
+    /// `source`.
+    pub fn upload(&self, source: &str) -> Upload {
+        Upload(UploadRequest {
+            service: self.name.clone(),
+            method: Method::Put,
+            path: String::new(),
+            query: Vec::new(),
+            headers: Vec::new(),
+            source: source.to_string(),
+            version: None,
+            file_field: None,
+            fields: Vec::new(),
+        })
+    }
+}
+
+/// A download to start: `service("ena").download("x", "raw/x").size_limit(n).start()?`.
+#[derive(Debug, Clone)]
+pub struct Download(DownloadRequest);
+
+impl Download {
+    pub fn query(mut self, name: &str, value: &str) -> Self {
+        self.0.query.push(field(name, value));
+        self
+    }
+
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.0.headers.push(field(name, value));
+        self
+    }
+
+    /// Fails the job when the answer has more bytes.
+    pub fn size_limit(mut self, bytes: u64) -> Self {
+        self.0.size_limit = Some(bytes);
+        self
+    }
+
+    /// Fails the job unless the answer has this hex digest; `md5`, `sha1`, `sha256`, `crc32` or
+    /// `crc32c`.
+    pub fn checksum(mut self, algorithm: &str, hex: &str) -> Self {
+        self.0.checksums.push(field(algorithm, hex));
+        self
+    }
+
+    /// Starts the download; a rerun of the run gets the same job back.
+    pub fn start(self) -> Result<Job> {
+        let id = host::with(|host| host.job_download(&self.0))?;
+        Ok(Job::started(id, "download", &self.0.target))
+    }
+}
+
+/// An upload to start: `service("zenodo").upload("raw/x").path("files/x").start()?`.
+#[derive(Debug, Clone)]
+pub struct Upload(UploadRequest);
+
+impl Upload {
+    /// A path relative to the service's address.
+    pub fn path(mut self, path: &str) -> Self {
+        self.0.path = path.to_string();
+        self
+    }
+
+    /// `Method::Put` or `Method::Post`; a POST is sent at most once.
+    pub fn method(mut self, method: Method) -> Self {
+        self.0.method = method;
+        self
+    }
+
+    /// Sends this version of the source instead of its current one.
+    pub fn version(mut self, version: &str) -> Self {
+        self.0.version = Some(version.to_string());
+        self
+    }
+
+    /// Sends a form with the object as its file part `name` beside the `field` values.
+    pub fn file_field(mut self, name: &str) -> Self {
+        self.0.file_field = Some(name.to_string());
+        self
+    }
+
+    pub fn field(mut self, name: &str, value: &str) -> Self {
+        self.0.fields.push(field(name, value));
+        self
+    }
+
+    pub fn query(mut self, name: &str, value: &str) -> Self {
+        self.0.query.push(field(name, value));
+        self
+    }
+
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.0.headers.push(field(name, value));
+        self
+    }
+
+    /// Starts the upload; the service's answer is the job's `reply`.
+    pub fn start(self) -> Result<Job> {
+        let id = host::with(|host| host.job_upload(&self.0))?;
+        Ok(Job::started(id, "upload", &self.0.source))
     }
 }
 

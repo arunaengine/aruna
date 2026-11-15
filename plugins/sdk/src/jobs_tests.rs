@@ -1,5 +1,5 @@
-//! Tests jobs: a copy answers its job at once, a job read by id with its upload answer and report,
-//! outputs across pages, cancel, and the finished job as the subject of `job_finished`.
+//! Tests jobs: a copy, download or upload answers at once, a job read by id with its reply and
+//! report, outputs across pages, cancel, and the finished job as the subject of `job_finished`.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -9,7 +9,7 @@ use super::*;
 use crate::bindings::aruna::plugin::objects_read::ObjectInfo;
 use crate::bindings::aruna::plugin::types::{Field, Invocation, Trigger};
 use crate::host::fake::{Fake, install};
-use crate::{WatchEvent, handle, objects};
+use crate::{Method, WatchEvent, handle, objects, service};
 
 fn status(id: &str, state: &str) -> Status {
     Status {
@@ -65,6 +65,41 @@ fn copy_starts_job() {
         fake.calls(),
         ["copy in/a v7 out/a"],
         "a start makes no other call"
+    );
+}
+
+#[test]
+fn transfers_start() {
+    let fake = install(&[]);
+    let download = service("ena")
+        .download("files/r1", "raw/r1.fq")
+        .size_limit(64)
+        .checksum("md5", "00ff")
+        .start()
+        .unwrap();
+    assert_eq!(
+        (download.kind.as_str(), download.path.as_str()),
+        ("download", "raw/r1.fq")
+    );
+    let upload = service("zenodo")
+        .upload("raw/r1.fq")
+        .path("deposit")
+        .method(Method::Post)
+        .version("v2")
+        .file_field("file")
+        .field("title", "r1")
+        .start()
+        .unwrap();
+    assert_eq!(
+        (upload.kind.as_str(), upload.path.as_str()),
+        ("upload", "raw/r1.fq")
+    );
+    assert_eq!(
+        fake.calls(),
+        [
+            "download ena files/r1 raw/r1.fq 64 md5=00ff",
+            "upload zenodo Method::Post deposit raw/r1.fq v2 file title=r1"
+        ]
     );
 }
 

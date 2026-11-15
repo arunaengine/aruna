@@ -479,6 +479,25 @@ export class Service {
     return this.#call("delete", path, options);
   }
 
+  /** Starts a download of the service's answer into a new version at the bucket path `to` and
+   * answers its `Job`; it needs write on `to`. `checksums` maps algorithms to hex digests. */
+  download(path, options) {
+    const [where, given] = typeof path === "string" ? [path, options] : ["", path];
+    const { to, query, headers, sizeLimit = null, checksums } = given ?? {};
+    const request = { service: this.name, path: where, query: pairs(query), headers: pairs(headers) };
+    const id = calls().jobDownload({ ...request, target: to, sizeLimit, checksums: pairs(checksums) });
+    return new Job({ id, kind: "download", path: to });
+  }
+
+  /** Starts an upload of the object at `source`, pinned to `version`, with PUT or POST and answers
+   * its `Job`; with `fileField` the object is the file part of a form beside `fields`. It needs
+   * read on `source`; the service's answer is `job.reply`. */
+  upload(source, { path = "", method = "PUT", version = null, fileField = null, fields, query, headers } = {}) {
+    const request = { service: this.name, method: method.toLowerCase(), path, query: pairs(query) };
+    const sent = { ...request, headers: pairs(headers), source, version, fileField, fields: pairs(fields) };
+    return new Job({ id: calls().jobUpload(sent), kind: "upload", path: source });
+  }
+
   // The path may be left out: `catalog.post({ json })`.
   #call(method, path, options) {
     return typeof path === "string" ? this.request(method, path, options) : this.request(method, "", path);
@@ -572,7 +591,7 @@ export class Job {
   }
 }
 
-/** Jobs the install started: copies now, downloads, uploads and tasks later. A start answers the
+/** Jobs the install started: copies, downloads and uploads now, tasks later. A start answers the
  * job at once; `job_finished` delivers it once it ended and the run that started it succeeded. */
 export const jobs = {
   /** The job `id` of the install, as it stands now. */

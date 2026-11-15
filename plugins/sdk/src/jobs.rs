@@ -1,4 +1,4 @@
-//! Jobs the install started: copies now, downloads, uploads and tasks later. A start answers the
+//! Jobs the install started: copies, downloads and uploads now, tasks later. A start answers the
 //! job at once; `job_finished` delivers it once it ended and the run that started it succeeded.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0

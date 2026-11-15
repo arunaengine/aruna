@@ -149,6 +149,27 @@ export interface RequestOptions {
   check?: boolean;
 }
 
+export interface DownloadOptions {
+  to: string;
+  query?: { [name: string]: unknown };
+  headers?: { [name: string]: unknown };
+  /** Bytes the answer may have at most. */
+  sizeLimit?: number;
+  /** Expected digests by algorithm, hex encoded, such as `{ md5: "..." }`. */
+  checksums?: { [algorithm: string]: string };
+}
+
+export interface UploadOptions {
+  path?: string;
+  method?: "PUT" | "POST";
+  version?: string;
+  /** The form field of the file part; without one the object is the whole body. */
+  fileField?: string;
+  fields?: { [name: string]: unknown };
+  query?: { [name: string]: unknown };
+  headers?: { [name: string]: unknown };
+}
+
 export declare class Service {
   name: string;
   request(method: string, path?: string, options?: RequestOptions): Reply;
@@ -158,6 +179,10 @@ export declare class Service {
   put(path?: string | RequestOptions, options?: RequestOptions): Reply;
   patch(path?: string | RequestOptions, options?: RequestOptions): Reply;
   delete(path?: string | RequestOptions, options?: RequestOptions): Reply;
+  /** Starts a download of the answer into a new version at `to`; it needs write on `to`. */
+  download(path: string | DownloadOptions, options?: DownloadOptions): Job;
+  /** Starts an upload of the object at `source`; it needs read on `source`. */
+  upload(source: string, options?: UploadOptions): Job;
 }
 
 export declare function service(name: string): Service;

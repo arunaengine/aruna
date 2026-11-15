@@ -155,6 +155,19 @@ class Fake:
         self.job(id, path=target, state="queued")
         return id
 
+    def job_download(self, service, path, query, headers, target, size_limit, checksums):
+        self.calls.append(("download", service, path, target, size_limit, dict(checksums)))
+        id = f"job-{len(self.jobs) + 1}"
+        self.job(id, kind="download", path=target, state="queued")
+        return id
+
+    def job_upload(self, service, request, source, form):
+        (method, path, _, _), (source, version), (file_field, fields) = request, source, form
+        self.calls.append(("upload", service, method, path, source, version, file_field, dict(fields)))
+        id = f"job-{len(self.jobs) + 1}"
+        self.job(id, kind="upload", path=source, state="queued")
+        return id
+
     def job_get(self, id):
         if id not in self.jobs:
             raise NotFound(f"the install has no job {id}")
