@@ -12,8 +12,9 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Map, Value, json};
 
 use aruna_plugins::broker::{
-    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, HostError, Intent, Listing,
-    MetadataCreate, MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
+    HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
+    ObjectPage, Response, SendRequest, StatePut,
 };
 use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
@@ -30,6 +31,14 @@ mod common;
 /// Items of one page of a fake listing.
 const PAGE: usize = 2;
 
+/// One stored object version; a `marked` one was written by a job with a secret.
+#[derive(Clone)]
+struct Version {
+    id: String,
+    content: Vec<u8>,
+    marked: bool,
+}
+
 /// One dataset: its revision, entity and file entities.
 #[derive(Clone, Default)]
 struct Stored {
@@ -41,11 +50,16 @@ struct Stored {
 #[derive(Default)]
 struct State {
     datasets: BTreeMap<String, Stored>,
+    /// Versions of each object by bucket path, the current one last.
+    objects: BTreeMap<String, Vec<Version>>,
     /// Service answers by connection and path: status and body.
     replies: BTreeMap<(String, String), (u16, Vec<u8>)>,
     sent: Vec<SendRequest>,
     values: BTreeMap<String, (u64, Vec<u8>)>,
     versions: u64,
+    /// Copies by job id, and the id each run's call ordinal got.
+    copies: BTreeMap<String, JobCopy>,
+    ids: BTreeMap<(String, u32), String>,
     lines: Vec<String>,
     runs: u64,
 }
@@ -99,6 +113,24 @@ impl Group {
         sent.collect()
     }
 
+    /// Stores a new current version `id` of the object at `path`.
+    fn object(&self, path: &str, id: &str, content: &[u8]) {
+        let version = Version {
+            id: id.into(),
+            content: content.to_vec(),
+            marked: false,
+        };
+        self.with(|state| state.objects.entry(path.into()).or_default().push(version));
+    }
+
+    fn files(&self, id: &str) -> Vec<Value> {
+        self.with(|state| state.datasets[id].files.clone())
+    }
+
+    fn copies(&self) -> Vec<JobCopy> {
+        self.with(|state| state.copies.values().cloned().collect())
+    }
+
     fn stored(&self, id: &str) -> Result<Stored, HostError> {
         let stored = self.with(|state| state.datasets.get(id).cloned());
         stored.ok_or_else(|| HostError::new(ErrorKind::NotFound, format!("no dataset {id}")))
@@ -120,6 +152,27 @@ impl Group {
         change(stored);
         stored.revision += 1;
         Ok(stored.revision.to_string())
+    }
+
+    fn version(&self, path: &str, version: Option<&str>) -> Result<(String, Version), HostError> {
+        let versions = self
+            .with(|state| state.objects.get(path).cloned())
+            .unwrap_or_default();
+        let found = match version {
+            Some(id) => versions.into_iter().find(|kept| kept.id == id),
+            None => versions.into_iter().last(),
+        };
+        let missing = || HostError::new(ErrorKind::NotFound, format!("no object at {path}"));
+        Ok((path.to_string(), found.ok_or_else(missing)?))
+    }
+}
+
+fn info((path, version): (String, Version)) -> ObjectInfo {
+    ObjectInfo {
+        path,
+        size: version.content.len() as u64,
+        version: version.id,
+        marked: version.marked,
     }
 }
 
@@ -191,6 +244,19 @@ impl Broker for Group {
         Ok(Listing { resources, cursor })
     }
 
+    async fn metadata_files(
+        &self,
+        _: &CallContext,
+        resource: &str,
+        cursor: Option<String>,
+    ) -> Result<FilePage, HostError> {
+        let files: Vec<String> = (self.stored(resource)?.files.iter())
+            .map(Value::to_string)
+            .collect();
+        let (files, cursor) = paged(&files, cursor);
+        Ok(FilePage { files, cursor })
+    }
+
     async fn metadata_patch(
         &self,
         _: &CallContext,
@@ -201,6 +267,30 @@ impl Broker for Group {
             let mut entity = Value::Object(std::mem::take(&mut stored.entity));
             merge_into(&mut entity, changes);
             stored.entity = entity.as_object().cloned().unwrap_or_default();
+        })
+    }
+
+    async fn metadata_put_file(
+        &self,
+        _: &CallContext,
+        change: FileChange,
+    ) -> Result<String, HostError> {
+        let file: Value = serde_json::from_str(&change.file).unwrap();
+        self.write(&change.resource, &change.expected, |stored| {
+            stored.files.retain(|kept| kept["@id"] != file["@id"]);
+            stored.files.push(file);
+        })
+    }
+
+    async fn metadata_remove_file(
+        &self,
+        _: &CallContext,
+        change: FileChange,
+    ) -> Result<String, HostError> {
+        self.write(&change.resource, &change.expected, |stored| {
+            stored
+                .files
+                .retain(|kept| kept["@id"] != change.file.as_str());
         })
     }
 
@@ -225,22 +315,40 @@ impl Broker for Group {
         &self,
         _: &CallContext,
         path: &str,
-        _: Option<String>,
+        version: Option<String>,
     ) -> Result<ObjectInfo, HostError> {
-        Err(HostError::new(
-            ErrorKind::NotFound,
-            format!("no object at {path}"),
-        ))
+        Ok(info(self.version(path, version.as_deref())?))
     }
 
     async fn objects_list(
         &self,
         _: &CallContext,
-        _: &str,
-        _: Option<String>,
+        prefix: &str,
+        cursor: Option<String>,
     ) -> Result<ObjectPage, HostError> {
-        let (objects, cursor) = (Vec::new(), None);
+        let paths: Vec<String> = self.with(|state| state.objects.keys().cloned().collect());
+        let below = paths.iter().filter(|path| path.starts_with(prefix));
+        let infos: Vec<ObjectInfo> = below
+            .map(|path| info(self.version(path, None).unwrap()))
+            .collect();
+        let (objects, cursor) = paged(&infos, cursor);
         Ok(ObjectPage { objects, cursor })
+    }
+
+    async fn objects_read(
+        &self,
+        _: &CallContext,
+        path: &str,
+        version: Option<String>,
+    ) -> Result<Vec<u8>, HostError> {
+        let (_, version) = self.version(path, version.as_deref())?;
+        if version.marked {
+            return Err(HostError::new(
+                ErrorKind::Denied,
+                "written by a job with a secret",
+            ));
+        }
+        Ok(version.content)
     }
 
     async fn connection_send(
@@ -262,6 +370,41 @@ impl Broker for Group {
             status,
             headers,
             body,
+        })
+    }
+
+    /// A rerun of the same run reaches the same call ordinal, so it gets the same job back.
+    async fn jobs_copy(&self, cx: &CallContext, copy: JobCopy) -> Result<String, HostError> {
+        Ok(self.with(|state| {
+            let count = state.copies.len() + 1;
+            let key = (cx.run.clone(), copy.intent.ordinal);
+            let id = state
+                .ids
+                .entry(key)
+                .or_insert_with(|| format!("job-{count}"))
+                .clone();
+            state.copies.insert(id.clone(), copy);
+            id
+        }))
+    }
+
+    async fn jobs_get(&self, _: &CallContext, id: &str) -> Result<JobStatus, HostError> {
+        let copy = self.with(|state| state.copies.get(id).cloned());
+        let copy =
+            copy.ok_or_else(|| HostError::new(ErrorKind::NotFound, format!("no job {id}")))?;
+        Ok(JobStatus {
+            id: id.into(),
+            kind: "copy".into(),
+            path: copy.target,
+            state: "succeeded".into(),
+            message: None,
+            bytes: None,
+            version: None,
+            reply_status: None,
+            reply_headers: Vec::new(),
+            reply_body: None,
+            exit_code: None,
+            report: None,
         })
     }
 
@@ -547,4 +690,65 @@ async fn fill_defaults() {
     assert_eq!(entity["keywords"], json!(["gel", "pcr"]));
     let again = example.run(&group, settings, manual(json!({ "dataset": "D1" })));
     assert_eq!(again.await.unwrap(), json!({ "changed": [] }));
+}
+
+#[tokio::test]
+async fn link_objects() {
+    // Every object below the path is linked once, by its `s3://` address, across listing pages.
+    let Some(example) = example("link-objects").await else {
+        return;
+    };
+    let group = Group::new();
+    group.dataset("D1", json!({ "name": "Run 7" }));
+    for (name, content) in [("a.fq", "ACGT"), ("b.fq", "ACGTAC"), ("c.fq", "AC")] {
+        group.object(&format!("raw/run-7/{name}"), "v1", content.as_bytes());
+    }
+    group.object("raw/other.fq", "v1", b"A");
+    let form = manual(json!({ "dataset": "D1", "prefix": "raw/run-7/" }));
+    let linked = example.run(&group, json!({}), form.clone()).await.unwrap();
+    assert_eq!(linked, json!({ "added": 3, "bytes": 12 }));
+    let files = group.files("D1");
+    let first = json!({ "@id": "objects/raw/run-7/a.fq", "@type": "File", "name": "a.fq",
+        "contentSize": 4, "contentUrl": "s3://raw/run-7/a.fq" });
+    assert_eq!((files.len(), &files[0]), (3, &first));
+    let again = example.run(&group, json!({}), form).await.unwrap();
+    assert_eq!(again, json!({ "added": 0, "bytes": 12 }));
+}
+
+#[tokio::test]
+async fn archive_uploads() {
+    // The copy is pinned to the uploaded version, also when a newer one came since; a rerun of
+    // the run gets the same job, and an upload elsewhere is left alone.
+    let Some(example) = example("archive-uploads").await else {
+        return;
+    };
+    let settings = json!({ "incoming": "lab-incoming/", "archive": "lab-archive/" });
+    let group = Group::new();
+    group.object("lab-incoming/run/a.txt", "v1", b"first");
+    group.object("lab-incoming/run/a.txt", "v2", b"second");
+    let upload = event("data_uploaded", "lab-incoming/run/a.txt", "v1");
+    let copied = example
+        .rerun(&group, "run-1", settings.clone(), upload.clone())
+        .await;
+    let answer = json!({ "job": "job-1", "target": "lab-archive/run/a.txt" });
+    assert_eq!(copied.unwrap(), answer);
+    let again = example
+        .rerun(&group, "run-1", settings.clone(), upload)
+        .await;
+    assert_eq!(again.unwrap(), answer, "a rerun gets the same job");
+    let copies = group.copies();
+    let pinned = (
+        copies[0].source.as_str(),
+        copies[0].version.as_deref(),
+        copies.len(),
+    );
+    assert_eq!(pinned, ("lab-incoming/run/a.txt", Some("v1"), 1));
+    group.object("other/b.txt", "v1", b"b");
+    let elsewhere = example.run(
+        &group,
+        settings,
+        event("data_uploaded", "other/b.txt", "v1"),
+    );
+    assert_eq!(elsewhere.await.unwrap(), Value::Null);
+    assert_eq!(group.copies().len(), 1);
 }

@@ -1,0 +1,13 @@
+# Example plugin: links every object below a bucket path into a dataset as a file.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "link-objects"
+version = "0.1.0"
+title = "Link stored objects into a dataset"
+on = ["manual"]
+access = "write"
+
+[manual]
+dataset = { type = "dataset" }
+prefix = "Bucket path, such as raw-data/run-7/"
