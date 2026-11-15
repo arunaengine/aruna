@@ -7,7 +7,6 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,12 +16,16 @@ use aruna_plugins::broker::{
     Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
     ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
 };
-use aruna_plugins::limits::{Limits, RuntimeConfig};
+use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
 use aruna_plugins::permission::Permission;
 use aruna_plugins::{
     CancellationToken, Compiled, FailureKind, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
 };
+
+use common::{available, limits};
+
+mod common;
 
 /// Generous deadline for one case, build with downloads, compile and runs together.
 const HANG_CAP: Duration = Duration::from_secs(1800);
@@ -153,50 +156,6 @@ impl Broker for Catalog {
     async fn abandoned(&self, _: &CallContext, _: &Intent) {}
 }
 
-/// Whether the opt-in is exactly `1` and `program` runs; prints why a language is skipped.
-fn available(language: &str, program: &str) -> bool {
-    if std::env::var("ARUNA_PLUGIN_LANGUAGES").as_deref() != Ok("1") {
-        eprintln!("skipping {language}: set ARUNA_PLUGIN_LANGUAGES=1 to build the examples");
-        return false;
-    }
-    let runs = Command::new(program)
-        .arg("--version")
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if !runs {
-        eprintln!("skipping {language}: `{program}` is not installed");
-    }
-    runs && (language != "rust" || wasm_target())
-}
-
-/// Whether the toolchain has the `wasm32-unknown-unknown` standard library.
-fn wasm_target() -> bool {
-    let libdir = Command::new("rustc")
-        .args([
-            "--print",
-            "target-libdir",
-            "--target",
-            "wasm32-unknown-unknown",
-        ])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()));
-    let installed = libdir.is_some_and(|dir| dir.is_dir());
-    if !installed {
-        eprintln!("skipping rust: the wasm32-unknown-unknown target is not installed");
-    }
-    installed
-}
-
-fn limits() -> Limits {
-    Limits {
-        memory: 512 << 20,
-        fuel: 1 << 40,
-        ..Limits::default()
-    }
-}
-
 /// A built and compiled plugin and the deadline its case must end by.
 struct Plugin {
     runtime: Runtime,
@@ -277,7 +236,7 @@ async fn stop_tree(child: &mut tokio::process::Child) {
     #[cfg(windows)]
     if let Some(pid) = child.id() {
         let tree = ["/F", "/T", "/PID", &pid.to_string()];
-        let _ = Command::new("taskkill").args(tree).status();
+        let _ = std::process::Command::new("taskkill").args(tree).status();
     }
     let _ = child.kill().await;
 }
