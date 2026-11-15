@@ -31,6 +31,8 @@ type Handler<T> = ((subject: T) => unknown) | (() => unknown);
 export declare function on(trigger: "manual", handler: Handler<Form>): typeof handler;
 export declare function on(trigger: "timer", handler: Handler<Date>): typeof handler;
 export declare function on(trigger: "webhook", handler: Handler<Request>): typeof handler;
+export declare function on(trigger: "dataset_created" | "dataset_updated", handler: Handler<Dataset>): typeof handler;
+export declare function on(trigger: "data_uploaded", handler: Handler<BucketObject>): typeof handler;
 export declare function on(trigger: "sync_completed" | "sync_failed", handler: Handler<SyncEvent>): typeof handler;
 export declare function on(trigger: string | string[], handler: Handler<any>): typeof handler;
 
@@ -72,6 +74,52 @@ export declare class SyncEvent {
   job: string;
 }
 
+/** One dataset at the revision it was read; other properties by name with `get` and `set`. */
+export declare class Dataset {
+  id: string;
+  revision: string;
+  name: string;
+  description: string;
+  keywords: string[];
+  license: string | null;
+  identifiers: { [scheme: string]: any };
+  get(name: string): any;
+  set(name: string, value: unknown): void;
+  remove(name: string): void;
+  /** Sends what changed and answers the changed names; a change made meanwhile throws `Conflict`. */
+  save(): string[];
+  reload(): void;
+  crate(): any;
+  files(): Iterable<any>;
+  addFile(object: BucketObject | string, properties?: { id?: string; [name: string]: unknown }): void;
+  putFile(file: object): void;
+  removeFile(id: string): void;
+}
+
+export declare const datasets: {
+  get(id: string): Dataset;
+  list(): Iterable<Dataset>;
+  create(path: string, fields: { [name: string]: unknown }): Dataset;
+};
+
+/** One object version; a `marked` one was written by a job with a secret and cannot be read. */
+declare class BucketObject {
+  path: string;
+  size: number;
+  version: string;
+  marked: boolean;
+  readonly url: string;
+  read(): Uint8Array;
+  readText(): string;
+  readJson(): any;
+}
+export { BucketObject as Object };
+
+export declare const objects: {
+  get(path: string): BucketObject;
+  list(prefix: string): Iterable<BucketObject>;
+};
+
 /** Puts a host in place of the component's imports; for the build's entry and tests. */
 export declare function use(host: object, types?: { [field: string]: string }): void;
 
@@ -80,6 +128,10 @@ declare const aruna: {
   run: typeof run;
   settings: typeof settings;
   log: typeof log;
+  datasets: typeof datasets;
+  objects: typeof objects;
+  Dataset: typeof Dataset;
+  Object: typeof BucketObject;
   Request: typeof Request;
   SyncEvent: typeof SyncEvent;
   ArunaError: typeof ArunaError;

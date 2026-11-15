@@ -202,8 +202,183 @@ export async function handle(invocation) {
   }
 }
 
+// The items of paged host answers, one page fetched at a time.
+function* pages(fetch) {
+  let cursor = null;
+  do {
+    const page = fetch(cursor);
+    yield* page.items;
+    cursor = page.cursor ?? null;
+  } while (cursor !== null);
+}
+
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+const filled = (value) =>
+  value !== null && value !== undefined && value !== "" && (typeof value !== "object" || Object.keys(value).length > 0);
+
+/** One dataset at the revision it was read; other properties by name with `get` and `set`. */
+export class Dataset {
+  #read = {};
+  #properties = {};
+
+  constructor(id, revision, entity) {
+    this.id = id;
+    this.revision = revision;
+    Object.assign(this, { name: "", description: "", keywords: [], license: null, identifiers: {} });
+    for (const [name, value] of Object.entries(entity)) this.set(name, value);
+    // Compared in the form a save writes, so a field read as text is unchanged until changed.
+    this.#read = this.#entity();
+  }
+
+  get(name) {
+    return this.#entity()[name];
+  }
+
+  set(name, value) {
+    if (name === "name" || name === "description") this[name] = typeof value === "string" ? value : "";
+    else if (name === "keywords") {
+      const words = typeof value === "string" ? value.split(",") : Array.isArray(value) ? value : [];
+      this.keywords = words.filter((word) => typeof word === "string" && word.trim()).map((word) => word.trim());
+    } else if (name === "license") {
+      const id = isObject(value) ? value["@id"] : value;
+      this.license = typeof id === "string" && id ? id : null;
+    } else if (name === "identifier" || name === "identifiers") this.identifiers = isObject(value) ? { ...value } : {};
+    else if (value === null || value === undefined) delete this.#properties[name];
+    else this.#properties[name] = value;
+  }
+
+  remove(name) {
+    this.set(name, null);
+  }
+
+  #entity() {
+    const entity = { ...this.#properties };
+    const own = { name: this.name, description: this.description, keywords: [...this.keywords] };
+    Object.assign(own, { license: this.license, identifier: { ...this.identifiers } });
+    // An empty field is left out, so a save removes it.
+    for (const [name, value] of Object.entries(own)) if (filled(value)) entity[name] = value;
+    return entity;
+  }
+
+  /** Sends the fields that changed with the revision read and answers their names; nothing changed
+   * makes no call. A change made meanwhile throws `Conflict`. */
+  save() {
+    const now = this.#entity();
+    const names = [...new Set([...Object.keys(this.#read), ...Object.keys(now)])].sort();
+    const changed = names.filter((name) => !name.startsWith("@") && json(this.#read[name]) !== json(now[name]));
+    if (changed.length === 0) return [];
+    const patch = Object.fromEntries(changed.map((name) => [name, now[name] ?? null]));
+    this.revision = calls().datasetPatch(this.id, json(patch), this.revision);
+    this.#read = now;
+    return changed.map((name) => (name === "identifier" ? "identifiers" : name));
+  }
+
+  /** Reads the dataset again; changes not saved are lost. */
+  reload() {
+    const fresh = datasets.get(this.id);
+    Object.assign(this, fresh);
+    this.#read = fresh.#read;
+    this.#properties = fresh.#properties;
+  }
+
+  /** The dataset entity with its file links. */
+  crate() {
+    return JSON.parse(calls().datasetGet(this.id, true).json);
+  }
+
+  /** The dataset's `File` entities, one page at a time. */
+  *files() {
+    for (const file of pages((cursor) => calls().datasetFiles(this.id, cursor))) yield JSON.parse(file);
+  }
+
+  /** Links an `Object`, or the object at a bucket path, as a `File` entity whose `contentUrl` is its
+   * `s3://` address; named by `id`, else by that address. */
+  addFile(object, { id, ...properties } = {}) {
+    const linked = typeof object === "string" ? objects.get(object) : object;
+    const name = linked.path.split("/").pop();
+    const file = { "@id": id ?? linked.url, "@type": "File", name, contentSize: linked.size, contentUrl: linked.url };
+    this.putFile({ ...file, ...properties });
+  }
+
+  /** Adds or replaces one `File` entity the plugin built itself. */
+  putFile(file) {
+    this.revision = calls().filePut(this.id, json(file), this.revision);
+  }
+
+  removeFile(id) {
+    this.revision = calls().fileRemove(this.id, id, this.revision);
+  }
+}
+
+export const datasets = {
+  /** The dataset `id`, without its file links. */
+  get(id) {
+    const document = calls().datasetGet(id, false);
+    return new Dataset(id, document.revision, JSON.parse(document.json));
+  },
+
+  /** Every dataset of the group the install may read, each loaded, one page of ids at a time. */
+  *list() {
+    for (const id of pages((cursor) => calls().datasetList(cursor))) yield datasets.get(id);
+  },
+
+  /** Creates the dataset at `path` below the group's metadata root; the path names it, so creating
+   * it again answers the same dataset. */
+  create(path, { identifiers, ...fields } = {}) {
+    const given = identifiers === undefined ? fields : { ...fields, identifier: identifiers };
+    const entity = Object.fromEntries(Object.entries(given).filter(([, value]) => value != null));
+    if (Object.keys(entity).length === 0) throw new InvalidCall("a dataset needs at least one field");
+    const created = calls().datasetCreate(path, json(entity));
+    return new Dataset(created.id, created.revision, entity);
+  },
+};
+loaders.set("dataset_created", datasets.get).set("dataset_updated", datasets.get);
+fieldLoaders.set("dataset", datasets.get);
+
+/** One object version. A `marked` version was written by a job with a secret: a plugin cannot read,
+ * copy or upload it, though it may still link it into a dataset. */
+class BucketObject {
+  constructor({ path, size, version, marked = false }) {
+    Object.assign(this, { path, size, version, marked });
+  }
+
+  /** The canonical address, `s3://bucket/key`. */
+  get url() {
+    return `s3://${this.path}`;
+  }
+
+  /** The bytes of this version, at most 1 MiB; a larger object is for a task. */
+  read() {
+    return calls().objectRead(this.path, this.version || null);
+  }
+
+  readText() {
+    return decoder.decode(this.read());
+  }
+
+  readJson() {
+    return JSON.parse(this.readText());
+  }
+}
+export { BucketObject as Object };
+
+export const objects = {
+  /** The current version of the object at `path`. */
+  get(path) {
+    return new BucketObject(calls().objectInfo(path));
+  },
+
+  /** Every object below `prefix` the install may read, one page at a time. */
+  *list(prefix) {
+    for (const info of pages((cursor) => calls().objectList(prefix, cursor))) yield new BucketObject(info);
+  },
+};
+loaders.set("data_uploaded", objects.get);
+fieldLoaders.set("object", objects.get);
+
 export default {
-  on, run, settings, log, Request, SyncEvent,
+  on, run, settings, log, datasets, objects,
+  Dataset, Object: BucketObject, Request, SyncEvent,
   ArunaError, Conflict, Fail, InvalidCall, InvalidInput, LimitReached, NotAllowed, NotFound, Retry,
   ServiceError, Unavailable, UnknownOutcome,
 };
