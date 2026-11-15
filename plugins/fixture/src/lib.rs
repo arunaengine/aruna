@@ -7,7 +7,7 @@
 
 use std::hint::black_box;
 
-use aruna_plugin::{Context, Error, Event, Level, Method, Result};
+use aruna_plugin::legacy::{Context, Error, Event, Level, Method, Result};
 use serde_json::{Value, json};
 
 use aruna_plugin::bindings::aruna::plugin::jobs;

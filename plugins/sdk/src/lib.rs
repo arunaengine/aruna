@@ -1,14 +1,24 @@
-//! Rust SDK for Aruna plugins: the generated host interface, and the first SDK of async handlers
-//! over a context, listed by trigger with [`export!`].
+//! The Rust library for Aruna plugins: handlers are plain functions of their trigger's subject,
+//! listed by trigger with [`plugin!`], over module functions for every host call.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod form;
+mod host;
 #[doc(hidden)]
 pub mod legacy;
+mod outcome;
+mod run;
 
-pub use legacy::*;
+pub use bindings::aruna::plugin::log::Level;
+pub use bindings::aruna::plugin::types::WatchEvent;
+pub use form::Form;
+pub use outcome::{Error, Result, fail, retry};
+#[doc(hidden)]
+pub use run::{Handler, handle, trigger_name, unhandled};
+pub use run::{Run, Subject, run, settings};
 
-/// The generated host interface. Code may call it directly; the SDK is only a convenience.
+/// The generated host interface. Code may call it directly; the library is only a convenience.
 #[doc(hidden)]
 pub mod bindings {
     wit_bindgen::generate!({
@@ -20,4 +30,50 @@ pub mod bindings {
         additional_derives: [PartialEq, Eq],
         generate_all,
     });
+}
+
+/// Keeps one line in the run's log: `log!("{n} done")` at info, or `log!(warn, "...")`.
+pub fn log(level: Level, message: &str) {
+    host::with(|host| host.log(level, message));
+}
+
+#[macro_export]
+macro_rules! log {
+    (debug, $($arg:tt)+) => { $crate::log($crate::Level::Debug, &format!($($arg)+)) };
+    (info, $($arg:tt)+) => { $crate::log($crate::Level::Info, &format!($($arg)+)) };
+    (warn, $($arg:tt)+) => { $crate::log($crate::Level::Warn, &format!($($arg)+)) };
+    (error, $($arg:tt)+) => { $crate::log($crate::Level::Error, &format!($($arg)+)) };
+    ($($arg:tt)+) => { $crate::log($crate::Level::Info, &format!($($arg)+)) };
+}
+
+/// Lists a plugin's handlers by trigger, such as `plugin! { dataset_created => announce }`. A
+/// handler takes its trigger's subject, or nothing, and returns `Result<T>` for any serializable
+/// `T`; `aruna-cli plugin build` checks the triggers against the manifest's `on`.
+#[macro_export]
+macro_rules! plugin {
+    ($($trigger:ident => $handler:path),+ $(,)?) => {
+        const _: () = {
+            struct Plugin;
+
+            impl $crate::bindings::Guest for Plugin {
+                fn handle(
+                    invocation: $crate::bindings::aruna::plugin::types::Invocation,
+                ) -> ::std::result::Result<
+                    Option<String>,
+                    $crate::bindings::aruna::plugin::types::Failure,
+                > {
+                    match $crate::trigger_name(&invocation.trigger) {
+                        $(stringify!($trigger) => $crate::handle(invocation, $handler),)+
+                        other => Err($crate::unhandled(other)),
+                    }
+                }
+
+                fn triggers() -> Vec<String> {
+                    vec![$(stringify!($trigger).to_string()),+]
+                }
+            }
+
+            $crate::bindings::export_guest!(Plugin with_types_in $crate::bindings);
+        };
+    };
 }

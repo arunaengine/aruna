@@ -5,7 +5,7 @@
 use std::future::Future;
 use std::task::{Context as Task, Poll, Waker};
 
-use aruna_plugin::{Context, Error, ErrorKind, Event, Level, Method as Verb};
+use aruna_plugin::legacy::{Context, Error, ErrorKind, Event, Level, Method as Verb};
 use serde_json::Value;
 
 use crate::host::{
@@ -15,7 +15,7 @@ use crate::sync::Sync;
 use crate::values::Settings;
 
 /// The timer: the quick pass, failed links and a chunk of the full reconciliation.
-async fn poll(ctx: Context, event: Event) -> aruna_plugin::Result<Value> {
+async fn poll(ctx: Context, event: Event) -> aruna_plugin::legacy::Result<Value> {
     let (guest, settings) = (Guest::new(&ctx), ctx.settings::<Settings>()?);
     let meter = Meter::new(&guest);
     let sync = Sync::new(&meter, &settings, ctx.run(), clock(ctx.run(), &event));
@@ -23,7 +23,7 @@ async fn poll(ctx: Context, event: Event) -> aruna_plugin::Result<Value> {
 }
 
 /// `dataset_created` and `dataset_updated`.
-async fn changed(ctx: Context, event: Event) -> aruna_plugin::Result<()> {
+async fn changed(ctx: Context, event: Event) -> aruna_plugin::legacy::Result<()> {
     let Event::Change(change) = &event else {
         return Err(Error::Input("expected a dataset event".into()));
     };
@@ -34,7 +34,7 @@ async fn changed(ctx: Context, event: Event) -> aruna_plugin::Result<()> {
 }
 
 /// A manual run: `report`, `resolve`, `resolve_create`, `reconcile` or `experiment`.
-async fn manual(ctx: Context, event: Event) -> aruna_plugin::Result<Value> {
+async fn manual(ctx: Context, event: Event) -> aruna_plugin::legacy::Result<Value> {
     let Event::Manual(input) = &event else {
         return Err(Error::Input("expected manual input".into()));
     };
@@ -105,7 +105,7 @@ fn fault(error: Error) -> Fault {
 }
 
 /// Every SDK call finishes on its first poll; a pending one is reported, never awaited.
-fn ready<T>(future: impl Future<Output = aruna_plugin::Result<T>>) -> Result<T> {
+fn ready<T>(future: impl Future<Output = aruna_plugin::legacy::Result<T>>) -> Result<T> {
     let mut future = std::pin::pin!(future);
     match future.as_mut().poll(&mut Task::from_waker(Waker::noop())) {
         Poll::Ready(result) => result.map_err(fault),

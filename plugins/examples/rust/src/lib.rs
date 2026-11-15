@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_plugin::{Context, DatasetEvent, Result};
+use aruna_plugin::legacy::{Context, DatasetEvent, Result};
 use serde_json::json;
 
 async fn dataset_created(ctx: Context, event: DatasetEvent) -> Result<()> {
