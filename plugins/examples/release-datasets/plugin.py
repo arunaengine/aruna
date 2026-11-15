@@ -16,6 +16,7 @@ def published(request):
         f"releases/{repository}/{release['tag_name']}",
         name=release["name"] or release["tag_name"],
         description=release.get("body") or "",
+        datePublished=release["published_at"],
         url=release["html_url"],
         identifiers={"github_release": str(release["id"])},
     )

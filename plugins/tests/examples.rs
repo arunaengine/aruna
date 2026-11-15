@@ -323,12 +323,20 @@ impl Broker for Group {
         })
     }
 
-    /// The path names the dataset, so a repeat answers the stored one.
+    /// The path names the dataset, so a repeat answers the stored one. A new dataset needs a
+    /// name, a description and one publication date, as Craqle's import check requires.
     async fn metadata_create(
         &self,
         _: &CallContext,
         create: MetadataCreate,
     ) -> Result<Created, HostError> {
+        let dataset: Value = serde_json::from_str(&create.dataset).unwrap();
+        for field in ["name", "description", "datePublished"] {
+            if !dataset[field].is_string() {
+                let message = format!("missing required property `schema:{field}`");
+                return Err(HostError::new(ErrorKind::Invalid, message));
+            }
+        }
         let id = format!("D-{}", create.path);
         if self.stored(&id).is_err() {
             self.dataset(&id, serde_json::from_str(&create.dataset).unwrap());
@@ -980,7 +988,8 @@ async fn release_datasets() {
     };
     let group = Group::new();
     let release = json!({ "id": 7, "tag_name": "v1.0", "name": "First", "body": "Notes",
-        "html_url": "https://github.com/lab/tool/releases/v1.0" });
+        "html_url": "https://github.com/lab/tool/releases/v1.0",
+        "published_at": "2026-01-02T10:00:00Z" });
     let body = json!({ "action": "published", "release": release,
         "repository": { "full_name": "lab/tool" } });
     let created = example
@@ -993,6 +1002,7 @@ async fn release_datasets() {
         (&entity["name"], &entity["identifier"]),
         (&json!("First"), &json!({ "github_release": "7" }))
     );
+    assert_eq!(entity["datePublished"], "2026-01-02T10:00:00Z");
     let again = example.run(&group, json!({}), webhook("d-1", body)).await;
     assert_eq!(again.unwrap()["dataset"], "D-releases/lab/tool/v1.0");
     let other = example.run(
