@@ -11,6 +11,7 @@ use aruna_core::injection::OutgoingRequest;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::secrets::{ResponseExposure, SecretFields};
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::execution::job::{JobError, JobResultPayload, PluginWorkSpec};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
@@ -34,10 +35,12 @@ use crate::plugins::release::ReleaseKeys;
 use crate::plugins::work::WorkRow;
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 
-/// What a download writes: its target and the version minted once.
+/// What a download writes: its target, the version minted once, expected digests and a bound.
 pub struct Download<'a> {
     pub target: &'a str,
     pub version_id: Ulid,
+    pub checksums: &'a [(ChecksumAlgorithm, Vec<u8>)],
+    pub max_bytes: Option<u64>,
 }
 
 /// Downloads the answer of the row's request into a new version of the target, as the account
@@ -92,12 +95,20 @@ pub async fn download_work(
         _ => return permanent(format!("the service answered {status}")),
     }
     let length = response.content_length();
+    if let (Some(length), Some(bound)) = (length, download.max_bytes)
+        && length > bound
+    {
+        return permanent(too_large(bound));
+    }
     let content_type = (response.headers().get(reqwest::header::CONTENT_TYPE))
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let pulled = Arc::new(AtomicU64::new(0));
-    let broken = Arc::new(AtomicBool::new(false));
-    let counted = counted(response, &pulled, &broken);
+    let (over, broken) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let counted = counted(response, download.max_bytes, &pulled, (&over, &broken));
     let routing = match routing_snapshot(&ctx.driver, install.group_id, &bucket).await {
         Ok(routing) => routing,
         Err(error) => return retryable(error.to_string()),
@@ -106,6 +117,12 @@ pub async fn download_work(
         Ok(gate) => gate,
         Err(error) => return retryable(error.to_string()),
     };
+    let expected_checksums = (download.checksums.iter())
+        .map(|(algorithm, digest)| ExpectedChecksum {
+            algorithm: *algorithm,
+            digest: digest.clone(),
+        })
+        .collect();
     let metadata: HashMap<String, String> = content_type
         .map(|kind| (CONTENT_TYPE_KEY.to_string(), kind))
         .into_iter()
@@ -122,7 +139,7 @@ pub async fn download_work(
             content_length: length,
             body: Some(counted),
         },
-        expected_checksums: Vec::new(),
+        expected_checksums,
         checksum_type: None,
         exists: false,
         version_source: None,
@@ -157,6 +174,9 @@ pub async fn download_work(
                 bytes: put.location.blob_size,
                 version_id: Some(put.version_id),
             })
+        }
+        Err(_) if over.load(Ordering::Relaxed) => {
+            permanent(too_large(download.max_bytes.unwrap_or_default()))
         }
         Err(error) if broken.load(Ordering::Relaxed) => retryable(error.to_string()),
         Err(error @ PutObjectError::StorageError(_)) => retryable(error.to_string()),
@@ -214,22 +234,34 @@ async fn prepared(
     Ok((request, exposure, fields))
 }
 
-/// The answer's body as a put stream that counts its bytes and notes a broken transfer.
+/// The answer's body as a put stream that counts its bytes, ends with an error past `bound`, and
+/// notes a broken transfer apart from a refused one.
 fn counted(
     response: reqwest::Response,
+    bound: Option<u64>,
     pulled: &Arc<AtomicU64>,
-    broken: &Arc<AtomicBool>,
+    (over, broken): (&Arc<AtomicBool>, &Arc<AtomicBool>),
 ) -> BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>> {
-    let (pulled, broken) = (pulled.clone(), broken.clone());
+    let (pulled, over, broken) = (pulled.clone(), over.clone(), broken.clone());
     let stream = response.bytes_stream().map(move |chunk| {
         let chunk = chunk.map_err(|error| {
             broken.store(true, Ordering::Relaxed);
             std::io::Error::other(error.without_url().to_string())
         })?;
-        pulled.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-        Ok::<_, std::io::Error>(chunk)
+        let total = pulled.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
+        if bound.is_some_and(|bound| total > bound) {
+            over.store(true, Ordering::Relaxed);
+            return Err(std::io::Error::other(
+                "the answer is larger than its size limit",
+            ));
+        }
+        Ok(chunk)
     });
     BackendStream::new(stream)
+}
+
+fn too_large(bound: u64) -> String {
+    format!("the answer is larger than its size limit of {bound} bytes")
 }
 
 fn retryable(message: impl Into<String>) -> JobRunOutcome {

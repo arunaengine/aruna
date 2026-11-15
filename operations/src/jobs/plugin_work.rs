@@ -51,11 +51,16 @@ pub async fn run_plugin_work(ctx: &JobContext, spec: &PluginWorkSpec) -> JobRunO
     match &spec.action {
         PluginWorkAction::Copy { .. } => copy_work(ctx, spec, (&install, &config)).await,
         PluginWorkAction::Download {
-            target, version_id, ..
+            target,
+            version_id,
+            checksums,
+            max_bytes,
         } => {
             let download = Download {
                 target,
                 version_id: *version_id,
+                checksums,
+                max_bytes: *max_bytes,
             };
             let keys = node_keys(&ctx.driver);
             let admitted = (&install, &config, &row);

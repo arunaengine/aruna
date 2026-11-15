@@ -1,6 +1,5 @@
-//! Tests download attempts against a local server: a 2xx answer becomes the minted version once,
-//! a redirect or client error fails without a second request, a server error is retried, and a
-//! bound, a checksum or a narrowed rule refuses before the version counts.
+//! Tests download attempts against a local server: the answer becomes the version once, a
+//! redirect or client error fails, a server error is retried, a bound or narrowed rule refuses.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -183,6 +182,39 @@ async fn answers_classified() {
 }
 
 #[tokio::test]
+async fn bound_and_checksum() {
+    // An answer past its bound or with another digest than expected never becomes a version.
+    let fixture = Fixture::new().await;
+    let install = downloader(&fixture).await;
+    let (_root, blob) = ready(&fixture, &install).await;
+    let ctx = job_context(&blob, &fixture);
+    let (base, _) = server(200).await;
+    let (_, small) = recorded(&fixture, &install, &base, (Vec::new(), Some(4))).await;
+    let (kind, message) = failed(run_plugin_work(&ctx, &small).await);
+    assert_eq!(kind, JobErrorKind::Permanent);
+    assert!(message.contains("size limit of 4 bytes"), "{message}");
+    let wrong = vec![(ChecksumAlgorithm::Md5, vec![0u8; 16])];
+    let (_, mismatch) = recorded(&fixture, &install, &base, (wrong, None)).await;
+    let (kind, message) = failed(run_plugin_work(&ctx, &mismatch).await);
+    assert_eq!(kind, JobErrorKind::Permanent, "{message}");
+    let missing = GetObjectInput {
+        bucket: "in".to_string(),
+        key: "reads.fq".to_string(),
+        version_id: None,
+        range: None,
+        group_id: install.group_id,
+        user_identity: install.account,
+        realm_id: fixture.actor.realm_id,
+        node_id: fixture.actor.node_id,
+    };
+    assert!(
+        drive(GetObjectOperation::new(missing), &blob)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn ungranted_target() {
     // A target outside the install's write patterns ends the work before any request.
     let fixture = Fixture::new().await;
@@ -231,6 +263,8 @@ async fn narrowed_rule() {
     let download = Download {
         target,
         version_id: *version_id,
+        checksums: &[],
+        max_bytes: None,
     };
     let ctx = job_context(&blob, &fixture);
     let outcome = download_work(&ctx, &spec, (&install, &config, &row), (download, &keys())).await;
