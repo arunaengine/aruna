@@ -13,7 +13,9 @@ use crate::Level;
 use crate::bindings::aruna::plugin::metadata_create::Created;
 use crate::bindings::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
-use crate::bindings::aruna::plugin::types::{ErrorKind, HostError};
+use crate::bindings::aruna::plugin::services::{Request, Response};
+use crate::bindings::aruna::plugin::state::Entry;
+use crate::bindings::aruna::plugin::types::{ErrorKind, Field, HostError};
 use crate::host::{Answer, Host, replace};
 
 /// What the fake holds and what it was asked, shared with the test.
@@ -23,6 +25,12 @@ pub(crate) struct State {
     /// Content and version by bucket path; a version starting with `m` is marked.
     pub objects: BTreeMap<String, (Vec<u8>, String)>,
     pub datasets: BTreeMap<String, Stored>,
+    /// Answers by request path: status and body.
+    pub replies: BTreeMap<String, (u16, Vec<u8>)>,
+    pub secrets: BTreeMap<String, Vec<(String, String)>>,
+    /// Values by key with their version; versions never repeat.
+    pub state: BTreeMap<String, (u64, Vec<u8>)>,
+    pub versions: u64,
     pub page: usize,
 }
 
@@ -220,6 +228,74 @@ impl Host for Fake {
             resource: id,
             revision: "1".into(),
         })
+    }
+
+    fn send(&self, request: &Request) -> Answer<Response> {
+        let body = String::from_utf8_lossy(&request.body);
+        self.note(format!(
+            "send {} {:?} {} {body}",
+            request.service, request.method, request.path
+        ));
+        let state = self.0.borrow();
+        let (status, body) = state
+            .replies
+            .get(&request.path)
+            .cloned()
+            .unwrap_or((404, Vec::new()));
+        Ok(Response {
+            status,
+            headers: vec![Field {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            }],
+            body,
+        })
+    }
+
+    fn secret(&self, name: &str) -> Answer<Vec<Field>> {
+        let state = self.0.borrow();
+        let fields =
+            (state.secrets.get(name)).ok_or_else(|| refusal(ErrorKind::NotGranted, name))?;
+        let fields = fields.iter().map(|(name, value)| Field {
+            name: name.clone(),
+            value: value.clone(),
+        });
+        Ok(fields.collect())
+    }
+
+    fn state_get(&self, key: &str) -> Answer<Option<Entry>> {
+        self.note(format!("state get {key}"));
+        let state = self.0.borrow();
+        let entry = state.state.get(key).map(|(version, value)| Entry {
+            version: *version,
+            value: value.clone(),
+        });
+        Ok(entry)
+    }
+
+    fn state_put(&self, key: &str, value: &[u8], expected: Option<u64>) -> Answer<u64> {
+        self.note(format!(
+            "state put {key} {}",
+            String::from_utf8_lossy(value)
+        ));
+        let mut state = self.0.borrow_mut();
+        if state.state.get(key).map(|(version, _)| *version) != expected {
+            return Err(refusal(ErrorKind::Conflict, key));
+        }
+        state.versions += 1;
+        let version = state.versions;
+        state.state.insert(key.into(), (version, value.to_vec()));
+        Ok(version)
+    }
+
+    fn state_remove(&self, key: &str, expected: u64) -> Answer<()> {
+        self.note(format!("state remove {key} {expected}"));
+        let mut state = self.0.borrow_mut();
+        if state.state.get(key).map(|(version, _)| *version) != Some(expected) {
+            return Err(refusal(ErrorKind::Conflict, key));
+        }
+        state.state.remove(key);
+        Ok(())
     }
 
     fn object_read(&self, path: &str, version: Option<&str>) -> Answer<Vec<u8>> {

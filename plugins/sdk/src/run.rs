@@ -213,6 +213,7 @@ pub fn handle<A, H: Handler<A>>(
         event,
     };
     CURRENT.with(|current| *current.borrow_mut() = (run, invocation.settings));
+    crate::state::forget();
     let ended = handler.call(invocation.trigger);
     CURRENT.with(|current| *current.borrow_mut() = Default::default());
     ended.map_err(Error::failure)

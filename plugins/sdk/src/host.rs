@@ -8,9 +8,11 @@ use crate::Level;
 use crate::bindings::aruna::plugin::metadata_create::Created;
 use crate::bindings::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
-use crate::bindings::aruna::plugin::types::HostError;
+use crate::bindings::aruna::plugin::services::{Request, Response};
+use crate::bindings::aruna::plugin::state::Entry;
+use crate::bindings::aruna::plugin::types::{Field, HostError};
 use crate::bindings::aruna::plugin::{
-    log, metadata_create, metadata_read, metadata_write, objects_read,
+    log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services, state,
 };
 
 /// One host call's answer.
@@ -30,6 +32,11 @@ pub(crate) trait Host {
     fn file_put(&self, id: &str, file: &str, expected: &str) -> Answer<String>;
     fn file_remove(&self, id: &str, file: &str, expected: &str) -> Answer<String>;
     fn dataset_create(&self, path: &str, dataset: &str) -> Answer<Created>;
+    fn send(&self, request: &Request) -> Answer<Response>;
+    fn secret(&self, name: &str) -> Answer<Vec<Field>>;
+    fn state_get(&self, key: &str) -> Answer<Option<Entry>>;
+    fn state_put(&self, key: &str, value: &[u8], expected: Option<u64>) -> Answer<u64>;
+    fn state_remove(&self, key: &str, expected: u64) -> Answer<()>;
 }
 
 /// The component's own imports.
@@ -81,6 +88,26 @@ impl Host for Imports {
 
     fn dataset_create(&self, path: &str, dataset: &str) -> Answer<Created> {
         metadata_create::create(path, dataset)
+    }
+
+    fn send(&self, request: &Request) -> Answer<Response> {
+        services::send(request)
+    }
+
+    fn secret(&self, name: &str) -> Answer<Vec<Field>> {
+        secrets::value(name)
+    }
+
+    fn state_get(&self, key: &str) -> Answer<Option<Entry>> {
+        state::get(key)
+    }
+
+    fn state_put(&self, key: &str, value: &[u8], expected: Option<u64>) -> Answer<u64> {
+        state::put(key, value, expected)
+    }
+
+    fn state_remove(&self, key: &str, expected: u64) -> Answer<()> {
+        state::remove(key, expected)
     }
 }
 
