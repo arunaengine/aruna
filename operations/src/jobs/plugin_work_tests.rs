@@ -352,7 +352,10 @@ async fn small_reads_unmarked() {
         Err(ErrorKind::NotFound)
     );
     let context = cx(1 << 20);
-    let info = broker.objects_info(&context, "in/a.txt", None).await.unwrap();
+    let info = broker
+        .objects_info(&context, "in/a.txt", None)
+        .await
+        .unwrap();
     let version = Ulid::from_string(&info.version).unwrap();
     let mark = Mark {
         install_id: Ulid::from_parts(8, 8),
