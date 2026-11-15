@@ -859,6 +859,13 @@ async fn archive_inside() {
         Value::Null
     );
     assert_eq!(group.copies().len(), 1);
+    // An archive above the watched path still gets every upload.
+    let settings = json!({ "incoming": "lab/incoming/", "archive": "lab/" });
+    let group = Group::new();
+    group.object("lab/incoming/a.txt", "v1", b"first");
+    let upload = event("data_uploaded", "lab/incoming/a.txt", "v1");
+    let copied = example.run(&group, settings, upload).await.unwrap();
+    assert_eq!(copied["target"], "lab/a.txt");
 }
 
 #[tokio::test]
