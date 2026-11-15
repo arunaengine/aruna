@@ -219,6 +219,19 @@ fn merge_into(target: &mut Value, patch: Value) {
     }
 }
 
+/// An entity id as the node stores it, by the rule of `normalize_entity_id` in
+/// `operations/src/metadata/handle/entity_convert.rs`: a relative id gets a leading `./`.
+fn entity_id(id: &str) -> String {
+    let kept = ["./", "../", "#", "_:"]
+        .iter()
+        .any(|start| id.starts_with(start));
+    let named = id.contains("://") || (id.contains(':') && !id.contains('/'));
+    match kept || named || id == "ro-crate-metadata.json" {
+        true => id.to_string(),
+        false => format!("./{id}"),
+    }
+}
+
 fn document(id: &str, stored: &Stored, whole: bool) -> Document {
     let mut entity = stored.entity.clone();
     if whole {
@@ -290,7 +303,8 @@ impl Broker for Group {
         _: &CallContext,
         change: FileChange,
     ) -> Result<String, HostError> {
-        let file: Value = serde_json::from_str(&change.file).unwrap();
+        let mut file: Value = serde_json::from_str(&change.file).unwrap();
+        file["@id"] = entity_id(file["@id"].as_str().unwrap_or_default()).into();
         self.write(&change.resource, &change.expected, |stored| {
             stored.files.retain(|kept| kept["@id"] != file["@id"]);
             stored.files.push(file);
@@ -723,11 +737,16 @@ async fn link_objects() {
     let linked = example.run(&group, json!({}), form.clone()).await.unwrap();
     assert_eq!(linked, json!({ "added": 3, "bytes": 12 }));
     let files = group.files("D1");
-    let first = json!({ "@id": "objects/raw/run-7/a.fq", "@type": "File", "name": "a.fq",
+    let first = json!({ "@id": "./objects/raw/run-7/a.fq", "@type": "File", "name": "a.fq",
         "contentSize": 4, "contentUrl": "s3://raw/run-7/a.fq" });
     assert_eq!((files.len(), &files[0]), (3, &first));
+    // A second run finds every file by its stored id, so a description added since stays.
+    group.with(|state| {
+        state.datasets.get_mut("D1").unwrap().files[0]["description"] = "kept".into()
+    });
     let again = example.run(&group, json!({}), form).await.unwrap();
     assert_eq!(again, json!({ "added": 0, "bytes": 12 }));
+    assert_eq!(group.files("D1")[0]["description"], "kept");
 }
 
 #[tokio::test]

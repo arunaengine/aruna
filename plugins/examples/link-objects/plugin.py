@@ -12,7 +12,8 @@ def link(form):
     added, total = 0, 0
     for item in aruna.objects.list(form.prefix):
         total += item.size
-        file_id = f"objects/{item.path}"
+        # The node stores a relative id with a leading `./`, so the check uses that form.
+        file_id = f"./objects/{item.path}"
         if file_id in linked:
             continue
         dataset.add_file(item, id=file_id)
