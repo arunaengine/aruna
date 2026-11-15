@@ -45,6 +45,9 @@ pub mod work;
 pub mod worker;
 
 #[cfg(test)]
+#[path = "delivery_tests.rs"]
+mod delivery_tests;
+#[cfg(test)]
 #[path = "events_tests.rs"]
 mod events_tests;
 

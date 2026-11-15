@@ -126,6 +126,13 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             jobs::cancel(&text("id")).map_err(host)?;
             json!(true)
         }
+        "copy_mapped" => {
+            // A copy, then the mapping its `job_finished` run reads, as a plugin keeps it.
+            let id = jobs::copy(&text("source"), None, &text("target")).map_err(host)?;
+            let key = format!("job/{id}");
+            ctx.state().put(&key, b"mapped".to_vec(), None).await?;
+            json!(id)
+        }
         "job" => {
             let status = jobs::get(&text("id")).map_err(host)?;
             let page = jobs::outputs(&text("id"), None).map_err(host)?;
