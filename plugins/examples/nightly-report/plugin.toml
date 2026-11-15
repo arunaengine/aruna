@@ -1,0 +1,19 @@
+# Example plugin: tells a chat channel each day which datasets still have no description.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "nightly-report"
+version = "0.1.0"
+title = "Report datasets without a description"
+on = ["timer"]
+
+[timer]
+every = "1d"
+
+[settings]
+chat_url = { type = "url" }
+channel = "Channel id"
+
+[services.chat]
+url = "{chat_url}/api/v4/posts"
+secret = "Chat bot token"

@@ -131,6 +131,11 @@ impl Group {
         self.with(|state| state.copies.values().cloned().collect())
     }
 
+    fn value(&self, key: &str) -> Option<Value> {
+        let value = self.with(|state| state.values.get(key).cloned());
+        value.map(|(_, value)| serde_json::from_slice(&value).unwrap())
+    }
+
     fn stored(&self, id: &str) -> Result<Stored, HostError> {
         let stored = self.with(|state| state.datasets.get(id).cloned());
         stored.ok_or_else(|| HostError::new(ErrorKind::NotFound, format!("no dataset {id}")))
@@ -751,4 +756,54 @@ async fn archive_uploads() {
     );
     assert_eq!(elsewhere.await.unwrap(), Value::Null);
     assert_eq!(group.copies().len(), 1);
+}
+
+#[tokio::test]
+async fn nightly_report() {
+    // Datasets without a description are reported once; the next night reports nothing new.
+    let Some(example) = example("nightly-report").await else {
+        return;
+    };
+    let settings = json!({ "chat_url": "https://chat.example.org", "channel": "c-9" });
+    let group = Group::new();
+    group.dataset("D1", json!({ "name": "Run 7" }));
+    group.dataset(
+        "D2",
+        json!({ "name": "Run 8", "description": "Gel images" }),
+    );
+    group.dataset("D3", json!({}));
+    group.reply("chat", "", 201, json!({}));
+    let night = Trigger::Timer(1_762_700_000_000);
+    let reported = example.run(&group, settings.clone(), night.clone()).await;
+    assert_eq!(reported.unwrap(), json!({ "reported": 2 }));
+    let message = "Datasets without a description on 2025-11-09: Run 7, D3";
+    let sent = json!({ "channel_id": "c-9", "message": message });
+    assert_eq!(group.sent(), [("chat".into(), String::new(), sent)]);
+    assert_eq!(group.value("reported"), Some(json!(["D1", "D3"])));
+    let next = example.run(&group, settings, night).await;
+    assert_eq!(next.unwrap(), json!({ "reported": 0 }));
+    assert_eq!(group.sent().len(), 1);
+}
+
+#[tokio::test]
+async fn set_keywords() {
+    // Keywords are added once each, or replace the old ones; an empty form is invalid input.
+    let Some(example) = example("set-keywords").await else {
+        return;
+    };
+    let group = Group::new();
+    group.dataset("D1", json!({ "name": "Run 7", "keywords": ["seq", "pcr"] }));
+    let form = |keywords: &str, replace: bool| {
+        manual(json!({ "dataset": "D1", "keywords": keywords, "replace": replace }))
+    };
+    let added = example
+        .run(&group, json!({}), form("pcr, gel", false))
+        .await;
+    let keywords = json!({ "dataset": "D1", "keywords": ["seq", "pcr", "gel"] });
+    assert_eq!(added.unwrap(), keywords);
+    assert_eq!(group.entity("D1")["keywords"], json!(["seq", "pcr", "gel"]));
+    let replaced = example.run(&group, json!({}), form("lab", true)).await;
+    assert_eq!(replaced.unwrap()["keywords"], json!(["lab"]));
+    let empty = example.run(&group, json!({}), form(" , ", false)).await;
+    assert_eq!(empty.unwrap_err().kind, FailureKind::InvalidInput);
 }
