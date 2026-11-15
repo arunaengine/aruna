@@ -32,6 +32,7 @@ use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
 use base64::Engine;
 use craqle::GraphId;
+use futures_util::StreamExt;
 use oxrdf::Term;
 use serde_json::Value;
 use tracing::warn;
@@ -44,7 +45,7 @@ use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
 use super::jobs::{cancel_job, job_outputs, job_status};
-use super::marks::is_marked;
+use super::marks::{is_marked, unmarked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
@@ -67,6 +68,7 @@ use crate::metadata::forward::{
 use crate::metadata::handle::craqle_patch_request;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
 
@@ -636,6 +638,20 @@ pub(crate) fn object_path(
     Ok(object_permission_path(realm_id, group, local, bucket, key))
 }
 
+/// The version id a plugin gave as text.
+fn version_id(text: &str) -> Result<Ulid, HostError> {
+    let invalid = || HostError::new(ErrorKind::Invalid, format!("`{text}` is not a version id"));
+    Ulid::from_string(text).map_err(|_| invalid())
+}
+
+/// A byte bound as people read it: `1 MiB` rather than `1048576 bytes`.
+fn byte_size(bytes: usize) -> String {
+    match bytes % (1 << 20) {
+        0 => format!("{} MiB", bytes >> 20),
+        _ => format!("{bytes} bytes"),
+    }
+}
+
 /// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
 /// text stays as it is.
 pub(crate) fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
@@ -993,6 +1009,53 @@ impl Broker for RunBroker {
         Ok(ObjectPage { objects, cursor })
     }
 
+    async fn objects_read(
+        &self,
+        cx: &CallContext,
+        text: &str,
+        version: Option<String>,
+    ) -> Result<Vec<u8>, HostError> {
+        let path = self.expand(text)?;
+        let (install, auth) = self.checked(Permission::ObjectsRead, &path).await?;
+        let (bucket, key) = self.object_at(&install, &path).await?;
+        let version = (version.as_deref()).map(version_id).transpose()?;
+        let missing = || HostError::new(ErrorKind::NotFound, format!("no object at {path}"));
+        let version = unmarked(&self.ctx, (&bucket, &key), version).await?;
+        let input = GetObjectInput {
+            bucket,
+            key,
+            version_id: Some(version.ok_or_else(missing)?),
+            range: None,
+            group_id: install.group_id,
+            user_identity: install.account,
+            realm_id: self.scope.realm_id,
+            node_id: self.scope.local,
+        };
+        let read = GetObjectOperation::new(input).with_restrictions(auth.path_restrictions);
+        let mut got = drive(read, &self.ctx).await.map_err(|error| match error {
+            GetObjectError::NoSuchKey | GetObjectError::NoSuchVersion => missing(),
+            other => unavailable(other.to_string()),
+        })?;
+        let too_large = || {
+            let message = format!(
+                "objects larger than {} cannot be read by a plugin; give them to a task",
+                byte_size(cx.max_bytes)
+            );
+            HostError::new(ErrorKind::Limit, message)
+        };
+        if got.info.size > cx.max_bytes as u64 {
+            return Err(too_large());
+        }
+        let mut bytes = Vec::with_capacity(got.info.size as usize);
+        while let Some(chunk) = got.blob.next().await {
+            bytes.extend_from_slice(&chunk.map_err(|error| unavailable(error.to_string()))?);
+            if bytes.len() > cx.max_bytes {
+                return Err(too_large());
+            }
+        }
+        Ok(bytes)
+    }
+
     async fn connection_send(
         &self,
         cx: &CallContext,
@@ -1004,13 +1067,7 @@ impl Broker for RunBroker {
 
     async fn jobs_copy(&self, _cx: &CallContext, copy: JobCopy) -> Result<String, HostError> {
         self.admitted(None).await?;
-        let version = (copy.version.as_deref())
-            .map(|text| {
-                Ulid::from_string(text).map_err(|_| {
-                    HostError::new(ErrorKind::Invalid, format!("`{text}` is not a version id"))
-                })
-            })
-            .transpose()?;
+        let version = (copy.version.as_deref()).map(version_id).transpose()?;
         let request = CopyRequest {
             source: self.expand(&copy.source)?,
             source_version: version,

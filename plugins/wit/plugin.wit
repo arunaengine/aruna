@@ -145,7 +145,7 @@ interface metadata-create {
   create: func(path: string, dataset: string) -> result<created, host-error>;
 }
 
-/// Reads object information and listings of the group, never bytes (`objects.read`).
+/// Reads object information, listings and the bytes of small objects of the group (`objects.read`).
 interface objects-read {
   use types.{host-error};
 
@@ -163,6 +163,9 @@ interface objects-read {
   }
 
   info: func(path: string) -> result<object-info, host-error>;
+  /// The bytes of one version, the current one unless `version` is given, within the call's
+  /// byte bound; a marked version is refused.
+  read: func(path: string, version: option<string>) -> result<list<u8>, host-error>;
   %list: func(prefix: string, cursor: option<string>) -> result<object-page, host-error>;
 }
 

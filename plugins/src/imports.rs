@@ -285,6 +285,22 @@ impl metadata_create::Host for Session {
 }
 
 impl objects_read::Host for Session {
+    async fn read(
+        &mut self,
+        path: String,
+        version: Option<String>,
+    ) -> wasmtime::Result<Result<Vec<u8>, HostError>> {
+        let size = path.len() + version.as_ref().map_or(0, String::len);
+        self.brokered(
+            size,
+            Effect::Read,
+            Needs::Permission(Permission::ObjectsRead),
+            |broker, cx| async move { broker.objects_read(&cx, &path, version).await },
+            Vec::len,
+        )
+        .await
+    }
+
     async fn info(&mut self, path: String) -> wasmtime::Result<Result<ObjectInfo, HostError>> {
         self.brokered(
             path.len(),

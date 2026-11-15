@@ -190,6 +190,18 @@ pub trait Broker: Send + Sync {
         prefix: &str,
         cursor: Option<String>,
     ) -> Result<ObjectPage, HostError>;
+    /// The bytes of a small object; a broker that serves no reads refuses it.
+    async fn objects_read(
+        &self,
+        _cx: &CallContext,
+        _path: &str,
+        _version: Option<String>,
+    ) -> Result<Vec<u8>, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "object reads are not served here",
+        ))
+    }
     /// Sends to a declared service; the reply is what the guest may read of the answer.
     async fn connection_send(
         &self,

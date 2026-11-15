@@ -313,3 +313,58 @@ async fn marked_source_refused() {
     };
     assert!(broker.objects_info(&cx, "in/a.txt").await.unwrap().marked);
 }
+
+#[tokio::test]
+async fn small_reads_unmarked() {
+    // An unmarked object is read within the call's bound; a marked version is refused, whoever's
+    // job wrote it.
+    use aruna_plugins::broker::{Broker, CallContext, ErrorKind};
+
+    use crate::plugins::broker::RunBroker;
+    use crate::plugins::marks::{MARKED, Mark, mark_in};
+    use crate::plugins::store::{Txn, transact};
+    use crate::plugins::submit::tests::scope;
+    use crate::plugins::work::WorkKind;
+    let fixture = Fixture::new().await;
+    let (_root, blob, install, _) = ready_copy(&fixture).await;
+    let broker = RunBroker::new(Arc::new(blob.clone()), scope(&fixture, &install));
+    let cx = |max_bytes| CallContext {
+        run: "run".into(),
+        install: install.install_id.to_string(),
+        max_bytes,
+    };
+    let read = broker.objects_read(&cx(1 << 20), "in/a.txt", None).await;
+    assert_eq!(read.unwrap(), b"bytes");
+    let large = broker
+        .objects_read(&cx(3), "in/a.txt", None)
+        .await
+        .unwrap_err();
+    assert_eq!(large.kind, ErrorKind::Limit);
+    assert!(
+        large.message.contains("3 bytes cannot be read"),
+        "{}",
+        large.message
+    );
+    let missing = broker.objects_read(&cx(1 << 20), "in/none", None).await;
+    assert_eq!(
+        missing.map_err(|error| error.kind),
+        Err(ErrorKind::NotFound)
+    );
+    let info = broker.objects_info(&cx(1 << 20), "in/a.txt").await.unwrap();
+    let version = Ulid::from_string(&info.version).unwrap();
+    let mark = Mark {
+        install_id: Ulid::from_parts(8, 8),
+        work_id: Ulid::from_parts(8, 9),
+        job: None,
+        kind: WorkKind::Download,
+        at_ms: 1,
+    };
+    let marked = async |txn: &Txn<'_>| mark_in(txn, ("in", "a.txt", version), &mark).await;
+    transact(&blob, marked).await.unwrap();
+    let pinned = Some(version.to_string());
+    let refused = broker.objects_read(&cx(1 << 20), "in/a.txt", pinned).await;
+    assert_eq!(
+        refused.map_err(|error| error.message),
+        Err(MARKED.to_string())
+    );
+}

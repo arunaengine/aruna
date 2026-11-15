@@ -180,6 +180,16 @@ impl Broker for Recorder {
         })
     }
 
+    async fn objects_read(
+        &self,
+        _: &CallContext,
+        path: &str,
+        version: Option<String>,
+    ) -> Result<Vec<u8>, HostError> {
+        self.note(&format!("read {path} {}", version.unwrap_or_default()));
+        Ok(b"small".to_vec())
+    }
+
     async fn objects_list(
         &self,
         _: &CallContext,
@@ -679,6 +689,19 @@ async fn copy_answers_id() {
     assert_eq!(output(invoke(copy, broker.clone()).await), "job-1");
     assert_eq!(broker.calls(), ["copy in/a V1 out/a"]);
     assert_eq!(broker.intents()[0].ordinal, 1);
+    let refused = invoke(probe(input), Arc::default()).await;
+    assert!(matches!(refused, Err(InvokeError::Guest(_))), "{refused:?}");
+}
+
+#[tokio::test]
+async fn small_reads_granted() {
+    // A read needs `objects.read` and returns the bytes the broker read.
+    let input = serde_json::json!({"call": "read", "path": "in/a", "version": "V1"});
+    let mut read = probe(input.clone());
+    read.permissions.insert(Permission::ObjectsRead);
+    let broker = Arc::new(Recorder::default());
+    assert_eq!(output(invoke(read, broker.clone()).await), "small");
+    assert_eq!(broker.calls(), ["read in/a V1"]);
     let refused = invoke(probe(input), Arc::default()).await;
     assert!(matches!(refused, Err(InvokeError::Guest(_))), "{refused:?}");
 }

@@ -82,6 +82,12 @@ async fn probe(ctx: Context, event: Event) -> Result<Value> {
             let metadata = ctx.metadata();
             json!(metadata.remove_file(&resource, &id, &expected).await?)
         }
+        "read" => {
+            let version = input.get("version").and_then(Value::as_str);
+            let read =
+                aruna_plugin::bindings::aruna::plugin::objects_read::read(&text("path"), version);
+            json!(String::from_utf8_lossy(&read.map_err(host)?))
+        }
         "objects_info" => {
             let info = ctx.objects().info(&text("path")).await?;
             json!({ "path": info.path, "size": info.size, "version": info.version })
