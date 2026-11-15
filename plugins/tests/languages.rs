@@ -367,26 +367,18 @@ async fn announce(language: &str) {
     );
 }
 
-/// A project from the language's template whose `run` handler is `code`, triggered by hand and
-/// by a timer.
+/// A project whose plugin code is `code`, triggered by hand and by a timer.
 fn probe(language: &str, code: &str) -> PathBuf {
-    let templates = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("templates")
-        .join(language);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("probe-{language}"));
     std::fs::create_dir_all(&dir).unwrap();
     let manifest = "name = \"probe\"\nversion = \"0.1.0\"\non = [\"manual\", \"timer\"]\n\n\
                     [timer]\nevery = \"1h\"\n";
     std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
-    match language {
-        "javascript" => {
-            let source = std::fs::read_to_string(templates.join("plugin.js")).unwrap();
-            let end = source.find("\n};\n").unwrap() + 4;
-            let rest = &source[end..];
-            std::fs::write(dir.join("plugin.js"), format!("{code}\n{rest}")).unwrap();
-        }
-        _ => std::fs::write(dir.join("plugin.py"), code).unwrap(),
-    }
+    let file = match language {
+        "javascript" => "plugin.js",
+        _ => "plugin.py",
+    };
+    std::fs::write(dir.join(file), code).unwrap();
     dir
 }
 
@@ -416,21 +408,14 @@ async fn check_probe(language: &str, plugin: &Plugin, plain: &str, tick: &str) {
     }
 }
 
-const JAVASCRIPT_PROBE: &str = r#"import { get } from "aruna:plugin/metadata-read@0.3.0";
+const JAVASCRIPT_PROBE: &str = r#"import aruna from "aruna";
 
-async function run(ctx, event) {
-  if (event.kind === "timer") return { tick: event.tick };
-  const input = event.input.input;
-  if (input === "retry") throw { kind: "retryable", message: "try later" };
-  if (input !== "plain") return get(input).json;
-  await Promise.resolve();
-  return "awaited";
-}
-
-const handlers = {
-  manual: run,
-  timer: run,
-};
+aruna.on("manual", async (form) => {
+  if (form.input === "retry") throw new aruna.Retry("try later");
+  if (form.input !== "plain") return aruna.datasets.get(form.input).name;
+  return await Promise.resolve("awaited");
+});
+aruna.on("timer", (tick) => ({ tick: tick.getTime() }));
 "#;
 
 const PYTHON_PROBE: &str = r#"import aruna
@@ -475,8 +460,8 @@ async fn announces_python() {
 async fn probes_javascript() {
     if available("javascript", "npx") {
         let plugin = build(probe("javascript", JAVASCRIPT_PROBE)).await;
-        let tick = r#"{"tick":"1762700000000"}"#;
-        check_probe("javascript", &plugin, "awaited", tick).await;
+        let tick = r#"{"tick":1762700000000}"#;
+        check_probe("javascript", &plugin, "\"awaited\"", tick).await;
     }
 }
 
