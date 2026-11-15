@@ -170,15 +170,46 @@ jobs:
           --profile ci --run-ignored only --no-tests fail
           -E "package(aruna) & binary(integration) & test(/^git_native::/)"'
 
+  # The example's own Python tests; the plugin examples job runs it in the plugin runtime.
   elabftw-python:
     name: eLabFTW Python example
-    needs: test-build
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install uv
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: uv@0.11.28
+
+      # unittest exits with 5 when discovery finds no tests, so an empty run fails the job.
+      - name: Run the Python tests
+        working-directory: plugins/examples/elabftw-python
+        run: uv run --no-project --python 3.12 python -m unittest discover -s tests -t . -p 'test_*.py'
+
+  # Builds every plugin example with its toolchain and runs it in the plugin runtime against fakes.
+  plugin-examples:
+    name: Plugin examples
+    needs: test-build
+    runs-on: ubuntu-latest
+    # Hang cap for the example builds and runs, as for the eLabFTW job.
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # The Rust examples build with cargo for WASM inside the test run.
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: plugin-examples
+
+      - name: Add the WASM target
+        run: rustup target add wasm32-unknown-unknown
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
@@ -195,18 +226,21 @@ jobs:
         with:
           name: nextest-archive
 
-      # unittest exits with 5 when discovery finds no tests, so an empty run fails the job.
-      - name: Run the Python tests
-        working-directory: plugins/examples/elabftw-python
+      - name: Run the Python library tests
+        working-directory: plugins/sdk/python
         run: uv run --no-project --python 3.12 python -m unittest discover -s tests -t . -p 'test_*.py'
 
-      # Builds the example with componentize-py and runs one timer run in the plugin runtime.
-      - name: Run the example in the plugin runtime
+      # The runner's Node.js runs the JavaScript library tests and the pinned jco and esbuild.
+      - name: Run the JavaScript library tests
+        working-directory: plugins/sdk/javascript
+        run: node --test tests/*.test.js
+
+      - name: Run the examples in the plugin runtime
         env:
           ARUNA_PLUGIN_LANGUAGES: "1"
         run: >-
           cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
-          --profile ci --no-tests fail -E "package(aruna-plugins) & binary(elabftw_python)"
+          --profile ci --no-tests fail -E "package(aruna-plugins) & (binary(examples) | binary(elabftw_python))"
 
   restart-stress:
     name: Restart scale stress
