@@ -129,14 +129,14 @@ def list():
 
 def create(path, **fields):
     """Creates the dataset at `path` below the group's metadata root; the path names it, so creating
-    it again answers the same dataset."""
+    it again answers the same dataset as stored, read back with one more call."""
     if "identifiers" in fields:
         fields["identifier"] = fields.pop("identifiers")
     entity = {name: value for name, value in fields.items() if value is not None}
     if not entity:
         raise InvalidCall("a dataset needs at least one field")
-    id, revision = host().dataset_create(path, json.dumps(entity, sort_keys=True))
-    return Dataset(id, revision, entity)
+    id, _ = host().dataset_create(path, json.dumps(entity, sort_keys=True))
+    return get(id)
 
 
 def _pages(fetch):

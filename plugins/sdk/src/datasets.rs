@@ -43,7 +43,7 @@ pub fn list() -> impl Iterator<Item = Result<Dataset>> {
 }
 
 /// Creates the dataset at `path` below the group's metadata root from its fields; the path names
-/// it, so creating it again answers the same dataset.
+/// it, so creating it again answers the same dataset as stored, read back with one more call.
 pub fn create(path: &str, fields: Value) -> Result<Dataset> {
     let Value::Object(mut fields) = fields else {
         return Err(Error::InvalidCall(
@@ -53,9 +53,9 @@ pub fn create(path: &str, fields: Value) -> Result<Dataset> {
     if let Some(identifiers) = fields.remove("identifiers") {
         fields.insert("identifier".into(), identifiers);
     }
-    let entity = Value::Object(fields);
-    let created = host::with(|host| host.dataset_create(path, &entity.to_string()))?;
-    Dataset::parse(&created.resource, created.revision, &entity.to_string())
+    let entity = Value::Object(fields).to_string();
+    let created = host::with(|host| host.dataset_create(path, &entity))?;
+    get(&created.resource)
 }
 
 impl Dataset {

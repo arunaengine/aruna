@@ -340,13 +340,12 @@ export const datasets = {
   },
 
   /** Creates the dataset at `path` below the group's metadata root; the path names it, so creating
-   * it again answers the same dataset. */
+   * it again answers the same dataset as stored, read back with one more call. */
   create(path, { identifiers, ...fields } = {}) {
     const given = identifiers === undefined ? fields : { ...fields, identifier: identifiers };
     const entity = Object.fromEntries(Object.entries(given).filter(([, value]) => value != null));
     if (Object.keys(entity).length === 0) throw new InvalidCall("a dataset needs at least one field");
-    const created = calls().datasetCreate(path, json(entity));
-    return new Dataset(created.id, created.revision, entity);
+    return datasets.get(calls().datasetCreate(path, json(entity)).id);
   },
 };
 loaders.set("dataset_created", datasets.get).set("dataset_updated", datasets.get);

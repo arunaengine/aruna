@@ -49,6 +49,14 @@ class DataTest(unittest.TestCase):
         self.assertEqual(dataset.save(), ["author"])
         self.assertEqual(aruna.datasets.get("D2")["author"], ["Bob", "Alice", "Carol"])
 
+    def test_create_again(self):
+        aruna.datasets.create("runs/8", name="Original")
+        again = aruna.datasets.create("runs/8", name="Changed")
+        self.assertEqual(again.name, "Original", "a repeat answers the stored dataset")
+        again.name = "Changed"
+        self.assertEqual(again.save(), ["name"])
+        self.assertEqual(self.fake.calls[-1], ("patch", "D-runs/8", {"name": "Changed"}))
+
     def test_merge_cases(self):
         # The host's own merge patch is tested against the same cases.
         for target, patch, result in json.loads(CASES.read_text()):

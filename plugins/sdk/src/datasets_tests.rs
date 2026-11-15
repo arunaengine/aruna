@@ -139,6 +139,23 @@ fn list_and_create() {
 }
 
 #[test]
+fn creates_again() {
+    let fake = seeded();
+    create("runs/8", json!({ "name": "Original" })).unwrap();
+    let mut again = create("runs/8", json!({ "name": "Changed" })).unwrap();
+    assert_eq!(
+        again.name, "Original",
+        "a repeat answers the stored dataset"
+    );
+    again.name = "Changed".into();
+    assert_eq!(again.save().unwrap(), ["name"]);
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        r#"patch D-runs/8 {"name":"Changed"} 1"#
+    );
+}
+
+#[test]
 fn dataset_subject() {
     seeded();
     let event = WatchEvent {
