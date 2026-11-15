@@ -12,7 +12,7 @@ from .errors import Conflict, NotAllowed, NotFound
 class Fake:
     """A fake host: what the plugin logged, and runs of its handlers by trigger. Give `manifest`,
     a plugin.toml path, so the form's `dataset` and `object` fields load as they do on the node.
-    Datasets and objects live in its dicts."""
+    Datasets, objects, service answers, secrets and state live in its dicts."""
 
     #: Items of one page of a listing.
     page = 2
@@ -20,7 +20,8 @@ class Fake:
     def __init__(self, settings=None, manifest=None):
         self.settings = dict(settings or {})
         self.lines, self.calls, self.runs = [], [], 0
-        self.datasets, self.objects = {}, {}
+        self.datasets, self.objects, self.replies, self.secrets = {}, {}, {}, {}
+        self.values, self.versions = {}, 0
         _run.fields.clear()
         if manifest is not None:
             with open(manifest, "rb") as file:
@@ -36,6 +37,10 @@ class Fake:
 
     def object(self, path, content=b"", version="v1", marked=False):
         self.objects[path] = (content, version, marked)
+
+    def reply(self, service, path="", status=200, json=None, body=b""):
+        """What `service` answers for `path`."""
+        self.replies[(service, path)] = (status, body if json is None else _json(json))
 
     def log(self, level, message):
         self.lines.append((level, message))
@@ -118,6 +123,31 @@ class Fake:
         if self.object_info(path)["marked"]:
             raise NotAllowed("this object was written by a job with a secret; plugins cannot read it")
         return self.objects[path][0]
+
+    def send(self, service, method, path, query, headers, body):
+        self.calls.append(("send", service, method, path, body))
+        status, answer = self.replies.get((service, path), (404, b"not found"))
+        return status, [("Content-Type", "application/json")], answer
+
+    def secret(self, name):
+        if name not in self.secrets:
+            raise NotAllowed(f"the install may not read the secret {name}")
+        return list(self.secrets[name].items())
+
+    def state_get(self, key):
+        return self.values.get(key)
+
+    def state_put(self, key, value, expected):
+        if (self.values[key][0] if key in self.values else None) != expected:
+            raise Conflict(f"the value of {key} changed meanwhile")
+        self.versions += 1
+        self.values[key] = (self.versions, bytes(value))
+        return self.versions
+
+    def state_remove(self, key, expected):
+        if key not in self.values or self.values[key][0] != expected:
+            raise Conflict(f"the value of {key} changed meanwhile")
+        del self.values[key]
 
     def _invoke(self, trigger, payload):
         self.runs += 1

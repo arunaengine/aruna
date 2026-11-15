@@ -87,6 +87,27 @@ class Imports:
     def object_read(self, path, version):
         return bytes(self.call(self.imports.objects_read.read, path, version))
 
+    def send(self, service, method, path, query, headers, body):
+        services, field = self.imports.services, self.imports.types.Field
+        method = getattr(services.Method, method.upper())
+        query, headers = [field(*pair) for pair in query], [field(*pair) for pair in headers]
+        request = services.Request(service, method, path, query, headers, body)
+        response = self.call(services.send, request)
+        answer_headers = [(header.name, header.value) for header in response.headers]
+        return response.status, answer_headers, bytes(response.body)
+
+    def secret(self, name):
+        return [(field.name, field.value) for field in self.call(self.imports.secrets.value, name)]
+
+    def state_get(self, key):
+        entry = self.call(self.imports.state.get, key)
+        return None if entry is None else (entry.version, bytes(entry.value))
+
+    def state_put(self, key, value, expected):
+        return self.call(self.imports.state.put, key, value, expected)
+
+    def state_remove(self, key, expected):
+        self.call(self.imports.state.remove, key, expected)
 
 
 def _info(info):
