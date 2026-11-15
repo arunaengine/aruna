@@ -67,6 +67,18 @@ test("creates again", () => {
   assert.deepEqual(fake.calls.at(-1), ["patch", "D-runs/8", { name: "Changed" }]);
 });
 
+test("loads the uploaded version", async () => {
+  // Two versions reached the key before the run: the subject is the one the event names.
+  const fake = new Fake();
+  fake.object("raw/a", "first", { version: "v1" });
+  fake.object("raw/a", "second version", { version: "v2" });
+  assert.equal(aruna.objects.get("raw/a").version, "v2");
+  assert.equal(aruna.objects.get("raw/a", { version: "v1" }).size, 5);
+  aruna.on("data_uploaded", (upload) => [upload.version, upload.size, upload.readText()]);
+  const event = { kind: "data_uploaded", path: "/r/g/x/data/n/raw/a", resource: "raw/a", revision: "v1" };
+  assert.deepEqual(JSON.parse(await fake.invoke("event", event)), ["v1", 5, "first"]);
+});
+
 test("applies merge cases", () => {
   // The host's own merge patch is tested against the same cases.
   for (const [target, patch, result] of CASES) {
@@ -125,7 +137,7 @@ test("loads subjects", async () => {
   assert.deepEqual(JSON.parse(await fake.invoke("manual", form)), ["Run 7", 4, "D1"]);
   aruna.on("dataset_created", (dataset) => dataset.name);
   aruna.on("data_uploaded", (object) => object.url);
-  const event = (kind, resource) => ({ kind, path: `meta/${resource}`, resource, revision: "1" });
+  const event = (kind, resource, revision = "1") => ({ kind, path: `meta/${resource}`, resource, revision });
   assert.equal(await fake.invoke("event", event("dataset_created", "D1")), '"Run 7"');
-  assert.equal(await fake.invoke("event", event("data_uploaded", "raw/reads.fq")), '"s3://raw/reads.fq"');
+  assert.equal(await fake.invoke("event", event("data_uploaded", "raw/reads.fq", "v1")), '"s3://raw/reads.fq"');
 });

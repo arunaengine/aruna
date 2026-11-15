@@ -21,6 +21,8 @@ class Fake:
         self.settings = dict(settings or {})
         self.lines, self.calls, self.runs = [], [], 0
         self.datasets, self.objects, self.replies, self.secrets = {}, {}, {}, {}
+        #: Earlier object versions by path and version.
+        self.earlier = {}
         self.values, self.versions = {}, 0
         #: Jobs by id: their status, as `aruna.jobs.get` answers it, and their outputs.
         self.jobs = {}
@@ -38,6 +40,9 @@ class Fake:
         self.datasets[id] = {"revision": 1, "entity": entity, "files": []}
 
     def object(self, path, content=b"", version="v1", marked=False):
+        """Stores a new current version of the object at `path`; the one before stays readable."""
+        if path in self.objects:
+            self.earlier[(path, self.objects[path][1])] = self.objects[path]
         self.objects[path] = (content, version, marked)
 
     def reply(self, service, path="", status=200, json=None, body=b"", headers=(("Content-Type", "application/json"),)):
@@ -107,10 +112,17 @@ class Fake:
             self.dataset(id, **json.loads(dataset))
         return id, "1"
 
-    def object_info(self, path):
-        if path not in self.objects:
+    def _version(self, path, version):
+        """The content, version and mark of the object at `path`: the current one, or `version`."""
+        found = self.objects.get(path)
+        if found is not None and version not in (None, found[1]):
+            found = self.earlier.get((path, version))
+        if found is None:
             raise NotFound(f"no object at {path}")
-        content, version, marked = self.objects[path]
+        return found
+
+    def object_info(self, path, version=None):
+        content, version, marked = self._version(path, version)
         return {"path": path, "size": len(content), "version": version, "marked": marked}
 
     def object_list(self, prefix, cursor):
@@ -118,9 +130,10 @@ class Fake:
         return self._paged(infos, cursor)
 
     def object_read(self, path, version):
-        if self.object_info(path)["marked"]:
+        content, _, marked = self._version(path, version)
+        if marked:
             raise NotAllowed("this object was written by a job with a secret; plugins cannot read it")
-        return self.objects[path][0]
+        return content
 
     def send(self, service, method, path, query, headers, body):
         self.calls.append(("send", service, method, path, body))
@@ -186,6 +199,10 @@ class Fake:
         return self._invoke("webhook", (method, query, list(headers), body, delivery_id))
 
     def event(self, kind, resource, path="", revision=""):
+        """Runs the handler of event `kind`; an upload names the object's current version unless
+        `revision` is given."""
+        if kind == "data_uploaded" and not revision and resource in self.objects:
+            revision = self.objects[resource][1]
         return self._invoke(kind, {"kind": kind, "path": path, "resource": resource, "revision": revision})
 
 

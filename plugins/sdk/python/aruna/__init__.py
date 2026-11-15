@@ -27,7 +27,7 @@ from .errors import (
 
 _loaders.update(dataset_created=lambda event: datasets.get(event["resource"]),
                 dataset_updated=lambda event: datasets.get(event["resource"]),
-                data_uploaded=lambda event: objects.get(event["resource"]),
+                data_uploaded=lambda event: objects.get(event["resource"], event["revision"]),
                 job_finished=lambda event: jobs.get(event["resource"]))
 _field_loaders.update(dataset=datasets.get, object=objects.get)
 starts.append(state.forget)

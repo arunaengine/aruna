@@ -54,7 +54,7 @@ impl Object {
 /// The current version of the object at `path`.
 pub fn get(path: &str) -> Result<Object> {
     Ok(Object::from_info(host::with(|host| {
-        host.object_info(path)
+        host.object_info(path, None)
     })?))
 }
 

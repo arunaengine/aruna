@@ -57,6 +57,15 @@ class DataTest(unittest.TestCase):
         self.assertEqual(again.save(), ["name"])
         self.assertEqual(self.fake.calls[-1], ("patch", "D-runs/8", {"name": "Changed"}))
 
+    def test_uploaded_version(self):
+        # Two versions reached the key before the run: the subject is the one the event names.
+        self.fake.object("raw/a", b"first", version="v1")
+        self.fake.object("raw/a", b"second version", version="v2")
+        self.assertEqual(aruna.objects.get("raw/a").version, "v2")
+        aruna.on("data_uploaded")(lambda upload: [upload.version, upload.size, upload.read_text()])
+        self.assertEqual(self.fake.event("data_uploaded", "raw/a", revision="v1"), ["v1", 5, "first"])
+        self.assertEqual(aruna.objects.get("raw/a", "v1").size, 5)
+
     def test_merge_cases(self):
         # The host's own merge patch is tested against the same cases.
         for target, patch, result in json.loads(CASES.read_text()):

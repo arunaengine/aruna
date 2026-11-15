@@ -30,6 +30,8 @@ export class Fake {
   constructor(types = {}) {
     Object.assign(this, { lines: [], calls: [], settings: {}, secrets: {}, version: 0n });
     Object.assign(this, { datasets: new Map(), objects: new Map(), replies: new Map(), values: new Map() });
+    // Earlier object versions by path and version.
+    this.earlier = new Map();
     // Jobs by id: their status, as `aruna.jobs.get` answers it, and their outputs.
     this.jobs = new Map();
     use(this, types);
@@ -40,8 +42,20 @@ export class Fake {
     this.datasets.set(id, { revision: 1, entity, files: [] });
   }
 
+  /** Stores a new current version of the object at `path`; the one before stays readable. */
   object(path, content = "", { version = "v1", marked = false } = {}) {
+    const before = this.objects.get(path);
+    if (before) this.earlier.set(`${path} ${before.version}`, before);
     this.objects.set(path, { content: encoder.encode(content), version, marked });
+  }
+
+  // The object at `path`: the current version, or `version`.
+  objectAt(path, version) {
+    const current = this.objects.get(path);
+    const older = current && version && version !== current.version;
+    const found = older ? this.earlier.get(`${path} ${version}`) : current;
+    if (!found) throw new NotFound(`no object ${path}`);
+    return found;
   }
 
   /** What `service` answers for `path`. */
@@ -124,9 +138,8 @@ export class Fake {
     return { id, revision: String(this.datasets.get(id).revision) };
   }
 
-  objectInfo(path) {
-    const stored = this.objects.get(path);
-    if (!stored) throw new NotFound(`no object ${path}`);
+  objectInfo(path, version = null) {
+    const stored = this.objectAt(path, version);
     return { path, size: stored.content.length, version: stored.version, marked: stored.marked };
   }
 
@@ -136,10 +149,10 @@ export class Fake {
   }
 
   objectRead(path, version) {
-    const info = this.objectInfo(path);
-    if (info.marked) throw new NotAllowed("this object was written by a job with a secret");
+    const stored = this.objectAt(path, version);
+    if (stored.marked) throw new NotAllowed("this object was written by a job with a secret");
     this.calls.push(["read", path, version]);
-    return this.objects.get(path).content;
+    return stored.content;
   }
 
   send(request) {

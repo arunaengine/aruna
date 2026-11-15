@@ -25,6 +25,8 @@ pub(crate) struct State {
     pub calls: Vec<String>,
     /// Content and version by bucket path; a version starting with `m` is marked.
     pub objects: BTreeMap<String, (Vec<u8>, String)>,
+    /// Content of earlier versions, by bucket path and version.
+    pub earlier: BTreeMap<(String, String), Vec<u8>>,
     pub datasets: BTreeMap<String, Stored>,
     /// Answers by request path: status and body.
     pub replies: BTreeMap<String, (u16, Vec<u8>)>,
@@ -101,18 +103,42 @@ impl Fake {
         (taken, (next < items.len()).then(|| next.to_string()))
     }
 
+    /// Stores a new current version of the object at `path`; the one before stays readable.
+    pub fn put(&self, path: &str, content: &[u8], version: &str) {
+        let mut state = self.0.borrow_mut();
+        let entry = (content.to_vec(), version.to_string());
+        if let Some((content, version)) = state.objects.insert(path.into(), entry) {
+            state.earlier.insert((path.into(), version), content);
+        }
+    }
+
     fn note(&self, call: String) {
         self.0.borrow_mut().calls.push(call);
     }
 
-    fn info(&self, path: &str) -> Option<ObjectInfo> {
+    /// The content and version of the object at `path`: the current one, or `version`.
+    fn version(&self, path: &str, version: Option<&str>) -> Option<(Vec<u8>, String)> {
         let state = self.0.borrow();
-        let (content, version) = state.objects.get(path)?;
+        let current = state.objects.get(path)?;
+        match version {
+            Some(wanted) if wanted != current.1 => {
+                let key = (path.to_string(), wanted.to_string());
+                state
+                    .earlier
+                    .get(&key)
+                    .map(|content| (content.clone(), key.1))
+            }
+            _ => Some(current.clone()),
+        }
+    }
+
+    fn info(&self, path: &str, version: Option<&str>) -> Option<ObjectInfo> {
+        let (content, version) = self.version(path, version)?;
         Some(ObjectInfo {
             path: path.into(),
             size: content.len() as u64,
-            version: version.clone(),
             marked: version.starts_with('m'),
+            version,
         })
     }
 }
@@ -149,9 +175,12 @@ impl Host for Fake {
         self.note(format!("log {level:?} {message}"));
     }
 
-    fn object_info(&self, path: &str) -> Answer<ObjectInfo> {
-        self.note(format!("info {path}"));
-        self.info(path)
+    fn object_info(&self, path: &str, version: Option<&str>) -> Answer<ObjectInfo> {
+        match version {
+            Some(version) => self.note(format!("info {path} {version}")),
+            None => self.note(format!("info {path}")),
+        }
+        self.info(path, version)
             .ok_or_else(|| refusal(ErrorKind::NotFound, path))
     }
 
@@ -167,7 +196,7 @@ impl Host for Fake {
         let objects: Vec<ObjectInfo> = paths
             .iter()
             .take(page)
-            .filter_map(|path| self.info(path))
+            .filter_map(|path| self.info(path, None))
             .collect();
         let cursor = (paths.len() > page).then(|| objects.last().map(|object| object.path.clone()));
         Ok(ObjectPage {
@@ -353,12 +382,11 @@ impl Host for Fake {
 
     fn object_read(&self, path: &str, version: Option<&str>) -> Answer<Vec<u8>> {
         self.note(format!("read {path} {}", version.unwrap_or("-")));
-        let info = self
-            .info(path)
-            .ok_or_else(|| refusal(ErrorKind::NotFound, path))?;
-        if info.marked {
+        let (content, version) =
+            (self.version(path, version)).ok_or_else(|| refusal(ErrorKind::NotFound, path))?;
+        if version.starts_with('m') {
             return Err(refusal(ErrorKind::Denied, "written by a job with a secret"));
         }
-        Ok(self.0.borrow().objects[path].0.clone())
+        Ok(content)
     }
 }

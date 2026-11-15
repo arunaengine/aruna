@@ -69,8 +69,8 @@ export default {
     return { id: created.resource, revision: created.revision };
   },
 
-  objectInfo(path) {
-    return object(call(() => info(path, undefined)));
+  objectInfo(path, version) {
+    return object(call(() => info(path, some(version))));
   },
 
   objectList(prefix, cursor) {

@@ -13,8 +13,8 @@ use serde_json::Value;
 use crate::bindings::aruna::plugin::types::{Failure, FailureKind, Invocation, Trigger};
 use crate::datasets::{self, Dataset};
 use crate::jobs::{self, Job};
-use crate::objects::{self, Object};
-use crate::{Error, Form, Result, WatchEvent};
+use crate::objects::Object;
+use crate::{Error, Form, Result, WatchEvent, host};
 
 /// Who runs the handler, and the raw event of an event trigger.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -159,11 +159,15 @@ impl Subject for Job {
     }
 }
 
-/// The uploaded object, as it is when the run starts.
+/// The uploaded object: the version the event names, also when a newer one came since.
 impl Subject for Object {
     fn from_trigger(trigger: Trigger) -> Result<Self> {
         match trigger {
-            Trigger::Event(event) if event.kind == "data_uploaded" => objects::get(&event.resource),
+            Trigger::Event(event) if event.kind == "data_uploaded" => {
+                let version = Some(event.revision.as_str());
+                let info = host::with(|host| host.object_info(&event.resource, version))?;
+                Ok(Object::from_info(info))
+            }
             other => Err(mismatch("an uploaded object", &other)),
         }
     }

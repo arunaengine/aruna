@@ -35,9 +35,9 @@ class Object:
         return f"Object({self.path!r}, version={self.version!r})"
 
 
-def get(path):
-    """The current version of the object at `path`."""
-    return Object(**host().object_info(path))
+def get(path, version=None):
+    """The object at `path`: its current version, or `version`."""
+    return Object(**host().object_info(path, version))
 
 
 def copy(source, target, version=None):

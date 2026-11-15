@@ -77,8 +77,8 @@ class Imports:
         created = self.call(self.imports.metadata_create.create, path, dataset)
         return created.resource, created.revision
 
-    def object_info(self, path):
-        return _info(self.call(self.imports.objects_read.info, path, None))
+    def object_info(self, path, version=None):
+        return _info(self.call(self.imports.objects_read.info, path, version))
 
     def object_list(self, prefix, cursor):
         page = self.call(self.imports.objects_read.list, prefix, cursor)

@@ -64,7 +64,7 @@ export function raised(kind, message) {
 let host = null;
 const handlers = new Map();
 const fields = new Map();
-// How an event trigger's subject is loaded from its resource, by trigger.
+// How an event trigger's subject is loaded from its event, by trigger.
 const loaders = new Map();
 // How a typed form field is loaded from its value, by field type.
 const fieldLoaders = new Map();
@@ -157,7 +157,7 @@ function subject({ tag, val }) {
   if (tag === "webhook") return new Request(val);
   if (val.kind.startsWith("sync_")) return new SyncEvent(val);
   const loader = loaders.get(val.kind);
-  return loader ? loader(val.resource) : { ...val };
+  return loader ? loader(val) : { ...val };
 }
 
 /** Lines of the run's log; `console` writes to it too while a handler runs. */
@@ -357,7 +357,8 @@ export const datasets = {
     return datasets.get(calls().datasetCreate(path, json(entity)).id);
   },
 };
-loaders.set("dataset_created", datasets.get).set("dataset_updated", datasets.get);
+const changed = (event) => datasets.get(event.resource);
+loaders.set("dataset_created", changed).set("dataset_updated", changed);
 fieldLoaders.set("dataset", datasets.get);
 
 /** One object version. A `marked` version was written by a job with a secret: a plugin cannot read,
@@ -388,9 +389,9 @@ class BucketObject {
 export { BucketObject as Object };
 
 export const objects = {
-  /** The current version of the object at `path`. */
-  get(path) {
-    return new BucketObject(calls().objectInfo(path));
+  /** The object at `path`: its current version, or `version`. */
+  get(path, { version = null } = {}) {
+    return new BucketObject(calls().objectInfo(path, version));
   },
 
   /** Every object below `prefix` the install may read, one page at a time. */
@@ -403,7 +404,8 @@ export const objects = {
     return jobs.copy(source, target, options);
   },
 };
-loaders.set("data_uploaded", objects.get);
+// The uploaded version the event names, also when a newer one came since.
+loaders.set("data_uploaded", (event) => objects.get(event.resource, { version: event.revision }));
 fieldLoaders.set("object", objects.get);
 
 /** A service's whole answer; `headers` holds every header as a name and value pair, in order. */
@@ -584,7 +586,7 @@ export const jobs = {
     return new Job({ id: calls().jobCopy(source, version, target), kind: "copy", path: target });
   },
 };
-loaders.set("job_finished", jobs.get);
+loaders.set("job_finished", (event) => jobs.get(event.resource));
 
 export default {
   on, run, settings, log, datasets, objects, jobs, service, secret, state,

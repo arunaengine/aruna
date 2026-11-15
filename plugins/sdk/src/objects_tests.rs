@@ -48,6 +48,30 @@ fn list_pages() {
 }
 
 #[test]
+fn uploaded_version() {
+    // Two versions reached the key before the run: the subject is the one the event names.
+    let fake = install(&[("raw/a", b"first", "v1")]);
+    fake.put("raw/a", b"second version", "v2");
+    let upload = WatchEvent {
+        kind: "data_uploaded".into(),
+        path: "/r/g/x/data/n/raw/a".into(),
+        resource: "raw/a".into(),
+        revision: "v1".into(),
+    };
+    let invocation = Invocation {
+        run: "run-1".into(),
+        install: "i".into(),
+        group: "g".into(),
+        settings: "{}".into(),
+        trigger: Trigger::Event(upload),
+    };
+    let seen = |object: Object| Ok((object.version.clone(), object.size, object.read_text()?));
+    let answer = handle(invocation, seen).unwrap().unwrap();
+    assert_eq!(answer, r#"["v1",5,"first"]"#);
+    assert_eq!(fake.calls(), ["info raw/a v1", "read raw/a v1"]);
+}
+
+#[test]
 fn subjects_load_objects() {
     install(&[("raw/a", b"abc", "v2")]);
     let upload = WatchEvent {

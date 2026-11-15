@@ -123,7 +123,7 @@ declare class BucketObject {
 export { BucketObject as Object };
 
 export declare const objects: {
-  get(path: string): BucketObject;
+  get(path: string, options?: { version?: string }): BucketObject;
   list(prefix: string): Iterable<BucketObject>;
   copy(source: string, target: string, options?: { version?: string }): Job;
 };

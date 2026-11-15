@@ -23,7 +23,8 @@ pub(crate) type Answer<T> = Result<T, HostError>;
 /// Every host call of the library; the component's imports, or a fake in tests.
 pub(crate) trait Host {
     fn log(&self, level: Level, message: &str);
-    fn object_info(&self, path: &str) -> Answer<ObjectInfo>;
+    /// The information of one object version, the current one unless `version` is given.
+    fn object_info(&self, path: &str, version: Option<&str>) -> Answer<ObjectInfo>;
     fn object_list(&self, prefix: &str, cursor: Option<&str>) -> Answer<ObjectPage>;
     fn object_read(&self, path: &str, version: Option<&str>) -> Answer<Vec<u8>>;
     /// The dataset entity without its file links, or with them when `whole`.
@@ -53,8 +54,8 @@ impl Host for Imports {
         log::log(level, message);
     }
 
-    fn object_info(&self, path: &str) -> Answer<ObjectInfo> {
-        objects_read::info(path, None)
+    fn object_info(&self, path: &str, version: Option<&str>) -> Answer<ObjectInfo> {
+        objects_read::info(path, version)
     }
 
     fn object_list(&self, prefix: &str, cursor: Option<&str>) -> Answer<ObjectPage> {
