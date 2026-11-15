@@ -286,6 +286,14 @@ pub enum PluginWorkAction {
         target: String,
         version_id: Ulid,
     },
+    /// Downloads the answer of the work row's request into `target` as the version `version_id`,
+    /// minted once; `checksums` are expected digests, `max_bytes` an optional bound.
+    Download {
+        target: String,
+        version_id: Ulid,
+        checksums: Vec<(ChecksumAlgorithm, Vec<u8>)>,
+        max_bytes: Option<u64>,
+    },
 }
 
 /// One server-side object copy run outside a request, for a source whose bytes

@@ -17,6 +17,7 @@ use crate::compute::ExecutionTargetId;
 use crate::compute::runtimes::{SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use crate::errors::ConversionError;
 use crate::structs::MintPersistentSpec;
+use crate::structs::checksum::ChecksumAlgorithm;
 use crate::structs::execution::harvest::HarvestJobSpec;
 use crate::structs::execution::notification::invert_timestamp_ms;
 use crate::structs::execution::staging::StagingStrategy;
