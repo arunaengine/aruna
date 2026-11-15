@@ -1,9 +1,9 @@
-//! Plugin handlers: each trigger in plugin.toml runs the function export! lists for it.
+//! Plugin handlers: `aruna::plugin!` lists the function each trigger in plugin.toml runs.
 
-use aruna_plugin::{Context, Event, Result};
+use aruna::Result;
 
-async fn run(ctx: Context, _event: Event) -> Result<String> {
-    Ok(format!("hello from {}", ctx.install()))
+fn hello() -> Result<String> {
+    Ok(format!("hello from {}", aruna::run().install))
 }
 
-aruna_plugin::export! { manual => run }
+aruna::plugin! { manual => hello }

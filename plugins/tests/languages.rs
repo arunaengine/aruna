@@ -527,6 +527,38 @@ async fn probes_python() {
     }
 }
 
+/// Copies the folder `from` to `to`, naming the plugin `starter` as `plugin new` would.
+fn copy_template(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let path = entry.unwrap().path();
+        let target = to.join(path.file_name().unwrap());
+        if path.is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+            copy_template(&path, &target);
+        } else {
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(target, text.replace("{{name}}", "starter")).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn builds_templates() {
+    // Each language's starter project builds on its library and answers a manual run.
+    for (language, program) in [("rust", "cargo"), ("javascript", "npx"), ("python", "uv")] {
+        if !available(language, program) {
+            continue;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let template = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        copy_template(&template.join(language), project.path());
+        let plugin = build(project.path().to_path_buf()).await;
+        let answer = run(&plugin, Trigger::Manual("{}".into()), Catalog::new(RECORD)).await;
+        let hello = "\"hello from install-1\"";
+        assert_eq!(answer.unwrap().as_deref(), Some(hello), "{language}");
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn kills_stuck_builds() {

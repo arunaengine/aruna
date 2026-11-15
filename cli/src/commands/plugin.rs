@@ -49,12 +49,8 @@ fn template(language: Language) -> Vec<(&'static str, &'static str)> {
                 include_str!("../../../plugins/templates/python/plugin.toml"),
             ),
             (
-                "app.py",
-                include_str!("../../../plugins/templates/python/app.py"),
-            ),
-            (
-                "aruna.py",
-                include_str!("../../../plugins/templates/python/aruna.py"),
+                "plugin.py",
+                include_str!("../../../plugins/templates/python/plugin.py"),
             ),
         ],
     }
@@ -640,7 +636,9 @@ mod tests {
         }
         let rust = dir.path().join("rust");
         let code = std::fs::read_to_string(rust.join("src").join("lib.rs")).unwrap();
-        assert!(code.contains("aruna_plugin::export! { manual => run }"));
+        assert!(code.contains("aruna::plugin! { manual => hello }"));
+        let python = std::fs::read_to_string(dir.path().join("python/plugin.py")).unwrap();
+        assert!(python.contains("@aruna.on(\"manual\")"));
         assert!(rust.join(".aruna/rust/aruna-plugin/src/lib.rs").is_file());
         assert!(
             create("lab-sync", Language::Rust, &rust).is_err(),
