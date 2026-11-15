@@ -12,5 +12,6 @@ target/
 /docker/*
 /portal*
 aruna/compute-state/
+plugins/fixture/.aruna/
 __pycache__/
 /.prebuilt/
