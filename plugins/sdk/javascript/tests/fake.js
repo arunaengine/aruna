@@ -15,6 +15,8 @@ export class Fake {
   constructor(types = {}) {
     Object.assign(this, { lines: [], calls: [], settings: {}, secrets: {}, version: 0n });
     Object.assign(this, { datasets: new Map(), objects: new Map(), replies: new Map(), values: new Map() });
+    // Jobs by id: their status, as `aruna.jobs.get` answers it, and their outputs.
+    this.jobs = new Map();
     use(this, types);
   }
 
@@ -30,6 +32,11 @@ export class Fake {
   /** What `service` answers for `path`. */
   reply(service, path, { status = 200, json, body = "" } = {}) {
     this.replies.set(`${service} ${path}`, { status, body: json === undefined ? body : text(json) });
+  }
+
+  /** Stores job `id` as it stands, with the paths of its outputs. */
+  job(id, { outputs = [], ...status } = {}) {
+    this.jobs.set(id, { status: { id, kind: "copy", path: "", state: "succeeded", ...status }, outputs });
   }
 
   /** Runs the handler of `tag` with `val`, as the node would. */
@@ -130,6 +137,25 @@ export class Fake {
   secret(name) {
     if (!(name in this.secrets)) throw new NotAllowed(`the install has no secret ${name}`);
     return Object.entries(this.secrets[name]);
+  }
+
+  jobCopy(source, version, target) {
+    this.calls.push(["copy", source, version, target]);
+    return `job-${this.calls.length}`;
+  }
+
+  jobGet(id) {
+    if (!this.jobs.has(id)) throw new NotFound(`the install has no job ${id}`);
+    return this.jobs.get(id).status;
+  }
+
+  jobOutputs(id, cursor) {
+    const infos = this.jobs.get(id).outputs.map((path) => ({ path, size: 0, version: "v1", marked: false }));
+    return this.paged(infos, cursor);
+  }
+
+  jobCancel(id) {
+    this.calls.push(["cancel", id]);
   }
 
   stateGet(key) {

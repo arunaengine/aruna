@@ -34,6 +34,7 @@ export declare function on(trigger: "webhook", handler: Handler<Request>): typeo
 export declare function on(trigger: "dataset_created" | "dataset_updated", handler: Handler<Dataset>): typeof handler;
 export declare function on(trigger: "data_uploaded", handler: Handler<BucketObject>): typeof handler;
 export declare function on(trigger: "sync_completed" | "sync_failed", handler: Handler<SyncEvent>): typeof handler;
+export declare function on(trigger: "job_finished", handler: Handler<Job>): typeof handler;
 export declare function on(trigger: string | string[], handler: Handler<any>): typeof handler;
 
 export interface WatchEvent {
@@ -118,6 +119,7 @@ export { BucketObject as Object };
 export declare const objects: {
   get(path: string): BucketObject;
   list(prefix: string): Iterable<BucketObject>;
+  copy(source: string, target: string, options?: { version?: string }): Job;
 };
 
 /** A service's whole answer. */
@@ -159,6 +161,31 @@ export declare const state: {
   remove(key: string): void;
 };
 
+/** One job of the install; `state` is queued, running, succeeded, failed, error, cancelled or
+ * unknown. */
+export declare class Job {
+  id: string;
+  kind: string;
+  path: string;
+  state: string;
+  readonly ok: boolean;
+  message: string | null;
+  bytes: number | null;
+  version: string | null;
+  exitCode: number | null;
+  reply: Reply | null;
+  report: string | null;
+  refresh(): void;
+  cancel(): void;
+  outputs(): Iterable<BucketObject>;
+  reportJson(): any;
+}
+
+export declare const jobs: {
+  get(id: string): Job;
+  copy(source: string, target: string, options?: { version?: string }): Job;
+};
+
 /** Puts a host in place of the component's imports; for the build's entry and tests. */
 export declare function use(host: object, types?: { [field: string]: string }): void;
 
@@ -169,10 +196,12 @@ declare const aruna: {
   log: typeof log;
   datasets: typeof datasets;
   objects: typeof objects;
+  jobs: typeof jobs;
   service: typeof service;
   secret: typeof secret;
   state: typeof state;
   Dataset: typeof Dataset;
+  Job: typeof Job;
   Object: typeof BucketObject;
   Reply: typeof Reply;
   Request: typeof Request;

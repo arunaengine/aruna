@@ -373,6 +373,11 @@ export const objects = {
   *list(prefix) {
     for (const info of pages((cursor) => calls().objectList(prefix, cursor))) yield new BucketObject(info);
   },
+
+  /** Starts a copy of the object at `source` to `target` and answers its `Job`. */
+  copy(source, target, options) {
+    return jobs.copy(source, target, options);
+  },
 };
 loaders.set("data_uploaded", objects.get);
 fieldLoaders.set("object", objects.get);
@@ -502,9 +507,59 @@ export const state = {
 };
 starts.push(() => versions.clear());
 
+/** One job of the install. `state` is queued, running, succeeded, failed, error (an attempt failed
+ * and is retried), cancelled or unknown. */
+export class Job {
+  constructor({ id, kind, path = "", state = "queued", message = null, bytes = null, version = null,
+    exitCode = null, reply = null, report = null }) {
+    Object.assign(this, { id, kind, path, state, message, bytes, version, exitCode, report });
+    this.reply = reply === null ? null : new Reply(reply);
+  }
+
+  get ok() {
+    return this.state === "succeeded";
+  }
+
+  /** Reads the job again. */
+  refresh() {
+    Object.assign(this, jobs.get(this.id));
+  }
+
+  /** Asks the job to stop; a job that ended stays as it ended. */
+  cancel() {
+    calls().jobCancel(this.id);
+  }
+
+  /** The objects a task wrote, one page at a time. */
+  *outputs() {
+    for (const info of pages((cursor) => calls().jobOutputs(this.id, cursor))) yield new BucketObject(info);
+  }
+
+  /** The report as JSON, or null when it was left out. */
+  reportJson() {
+    return this.report === null ? null : JSON.parse(this.report);
+  }
+}
+
+/** Jobs the install started: copies now, downloads, uploads and tasks later. A start answers the
+ * job at once; `job_finished` delivers it once it ended and the run that started it succeeded. */
+export const jobs = {
+  /** The job `id` of the install, as it stands now. */
+  get(id) {
+    return new Job(calls().jobGet(id));
+  },
+
+  /** Copies the object at `source`, pinned to `version` when given, to `target`; it needs read on
+   * the source and write on the target. A rerun of the run gets the same job back. */
+  copy(source, target, { version = null } = {}) {
+    return new Job({ id: calls().jobCopy(source, version, target), kind: "copy", path: target });
+  },
+};
+loaders.set("job_finished", jobs.get);
+
 export default {
-  on, run, settings, log, datasets, objects, service, secret, state,
-  Dataset, Object: BucketObject, Reply, Request, Service, SyncEvent,
+  on, run, settings, log, datasets, objects, jobs, service, secret, state,
+  Dataset, Job, Object: BucketObject, Reply, Request, Service, SyncEvent,
   ArunaError, Conflict, Fail, InvalidCall, InvalidInput, LimitReached, NotAllowed, NotFound, Retry,
   ServiceError, Unavailable, UnknownOutcome,
 };
