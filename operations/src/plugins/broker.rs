@@ -537,6 +537,26 @@ impl RunBroker {
         }
     }
 
+    /// Starts native work through the run's call history: other arguments at a known ordinal are
+    /// refused before any work is reserved, a settled call answers its job id again, and an earlier
+    /// attempt is safe to repeat, as the work row names the job by run and ordinal.
+    async fn native(
+        &self,
+        intent: &Intent,
+        start: impl std::future::Future<Output = Result<Ulid, HostError>>,
+    ) -> Result<String, HostError> {
+        match self.begun(intent).await {
+            Ok(Some(reply)) => return Ok(reply),
+            Ok(None) => {}
+            Err(error) if error.kind == ErrorKind::UnknownOutcome => {}
+            Err(error) => return Err(error),
+        }
+        // A refused start leaves no job, or one its work row finds again, so the call may be made
+        // again; its intent goes.
+        let outcome = start.await.map(|work_id| work_id.to_string());
+        self.record(intent, outcome.map_err(Outcome::None)).await
+    }
+
     /// The full permission path of an object path the plugin gave; see [`object_path`].
     fn expand(&self, text: &str) -> Result<String, HostError> {
         let place = (self.scope.realm_id, self.scope.local);
@@ -1074,14 +1094,13 @@ impl Broker for RunBroker {
             target: self.expand(&copy.target)?,
             ordinal: copy.intent.ordinal,
         };
-        // The work row names the copy by run and ordinal, so a rerun gets the same id back.
-        match start_copy(&self.ctx, &self.scope, request).await {
-            Ok(work_id) => Ok(work_id.to_string()),
+        let started = self.native(&copy.intent, start_copy(&self.ctx, &self.scope, request));
+        match started.await {
             Err(error) if error.kind == ErrorKind::Conflict => {
                 self.changed.store(true, Ordering::Relaxed);
                 Err(error)
             }
-            Err(error) => Err(error),
+            answered => answered,
         }
     }
 

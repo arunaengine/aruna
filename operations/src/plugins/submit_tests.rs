@@ -161,3 +161,46 @@ async fn broker_starts_copies() {
     let bad = broker.jobs_copy(&cx, copy(Some("v1"))).await;
     assert_eq!(bad.map_err(|error| error.kind), Err(ErrorKind::Invalid));
 }
+
+#[tokio::test]
+async fn shifted_copy_refused() {
+    // A retried run that reaches its copy at the ordinal of an earlier state write changed: the
+    // call is refused before any work is reserved, and the run fails as changed.
+    use std::sync::Arc;
+
+    use aruna_plugins::broker::{Broker, CallContext, Intent, JobCopy, StatePut};
+
+    use crate::plugins::broker::RunBroker;
+    use crate::plugins::work::list_work;
+    let fixture = Fixture::new().await;
+    let install = ready(&fixture).await;
+    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope(&fixture, &install));
+    let cx = CallContext {
+        run: "run".into(),
+        install: install.install_id.to_string(),
+        max_bytes: 1 << 20,
+    };
+    let put = StatePut {
+        key: "init".into(),
+        value: b"1".to_vec(),
+        expected: None,
+        intent: Intent::new(1, &[b"init"]),
+    };
+    broker.state_put(&cx, put).await.unwrap();
+    let copy = JobCopy {
+        source: "in/a.txt".into(),
+        version: None,
+        target: "out/a.txt".into(),
+        intent: Intent::new(1, &[b"copy"]),
+    };
+    let refused = broker.jobs_copy(&cx, copy).await;
+    assert_eq!(
+        refused.map_err(|error| error.kind),
+        Err(ErrorKind::Conflict)
+    );
+    assert!(broker.changed());
+    let (rows, _) = list_work(&fixture.ctx, install.install_id, None, 10)
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+}
