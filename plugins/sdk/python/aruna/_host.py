@@ -49,4 +49,45 @@ class Imports:
 
     def log(self, level, message):
         log = self.imports.log
-        self.imports.log.log(getattr(log.Level, level.upper()), message)
+        log.log(getattr(log.Level, level.upper()), message)
+
+    def dataset_get(self, id, whole):
+        read = self.imports.metadata_read
+        document = self.call(read.get if whole else read.summary, id)
+        return document.revision, document.json
+
+    def dataset_list(self, cursor):
+        listing = self.call(self.imports.metadata_read.list, cursor)
+        return listing.resources, listing.cursor
+
+    def dataset_files(self, id, cursor):
+        page = self.call(self.imports.metadata_read.files, id, cursor)
+        return page.files, page.cursor
+
+    def dataset_patch(self, id, patch, expected):
+        return self.call(self.imports.metadata_write.patch, id, patch, expected)
+
+    def file_put(self, id, file, expected):
+        return self.call(self.imports.metadata_write.put_file, id, file, expected)
+
+    def file_remove(self, id, file, expected):
+        return self.call(self.imports.metadata_write.remove_file, id, file, expected)
+
+    def dataset_create(self, path, dataset):
+        created = self.call(self.imports.metadata_create.create, path, dataset)
+        return created.resource, created.revision
+
+    def object_info(self, path):
+        return _info(self.call(self.imports.objects_read.info, path))
+
+    def object_list(self, prefix, cursor):
+        page = self.call(self.imports.objects_read.list, prefix, cursor)
+        return [_info(info) for info in page.objects], page.cursor
+
+    def object_read(self, path, version):
+        return bytes(self.call(self.imports.objects_read.read, path, version))
+
+
+
+def _info(info):
+    return {"path": info.path, "size": info.size, "version": info.version, "marked": info.marked}
