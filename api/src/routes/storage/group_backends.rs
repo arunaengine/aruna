@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::routing::ensure_group_admin;
 use crate::server::state::ServerState;
@@ -20,9 +21,9 @@ use aruna_operations::groups::backends::query::{
     GetBackendOperation, ListBackendsOperation, check_bucket,
 };
 use aruna_operations::groups::backends::replace::ReplaceBackendOperation;
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -205,10 +206,9 @@ fn map_create_error(error: CreateBackendError) -> ServerError {
 
 async fn admin_of_group(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     group_id: &str,
 ) -> ServerResult<(Ulid, AuthContext)> {
-    let auth = require_realm_auth(state, auth)?;
     let group_id = parse_group_id(group_id)?;
     ensure_group_admin(state, &auth, group_id).await?;
     Ok((group_id, auth))
@@ -317,7 +317,7 @@ group's data, so the group write rights that suffice for objects are not enough.
 )]
 pub async fn create_group_backend(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<CreateBackendRequest>,
 ) -> ServerResult<(StatusCode, Json<GroupBackendResponse>)> {
@@ -384,7 +384,7 @@ administrator right that listing backends takes.
 )]
 pub async fn list_import_roots(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<Json<ImportRootsResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -453,7 +453,7 @@ administrator right that registration takes.
 )]
 pub async fn list_group_backends(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<Json<ListBackendsResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -522,7 +522,7 @@ pub async fn list_group_backends(
 )]
 pub async fn get_group_backend(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id)): Path<(String, String)>,
 ) -> ServerResult<Json<GroupBackendResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -629,7 +629,7 @@ pub async fn get_group_backend(
 )]
 pub async fn replace_group_backend(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id)): Path<(String, String)>,
     Json(request): Json<CreateBackendRequest>,
 ) -> ServerResult<Json<GroupBackendResponse>> {
@@ -712,7 +712,7 @@ pub async fn replace_group_backend(
 )]
 pub async fn delete_group_backend(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
     set_disabled(&state, auth, &group_id, &backend_id, true).await?;
@@ -781,7 +781,7 @@ pub async fn delete_group_backend(
 )]
 pub async fn enable_group_backend(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id)): Path<(String, String)>,
 ) -> ServerResult<Json<GroupBackendResponse>> {
     let record = set_disabled(&state, auth, &group_id, &backend_id, false).await?;
@@ -846,7 +846,7 @@ pub async fn enable_group_backend(
 )]
 pub async fn backend_reclaim_status(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id)): Path<(String, String)>,
 ) -> ServerResult<Json<ReclaimStatusResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -917,7 +917,7 @@ pub async fn backend_reclaim_status(
 )]
 pub async fn check_provider_bucket(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id, bucket)): Path<(String, String, String)>,
 ) -> ServerResult<Json<ProviderBucketResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -950,7 +950,7 @@ pub async fn check_provider_bucket(
 
 async fn set_disabled(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     group_id: &str,
     backend_id: &str,
     disabled: bool,

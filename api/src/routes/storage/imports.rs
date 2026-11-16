@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::compression::MigrationProgress;
 use crate::routes::storage::moves::{BucketMoveStarted, move_refusal};
@@ -168,10 +169,9 @@ pub(super) fn map_error(error: ImportRuleError) -> ServerError {
 
 pub(super) async fn admin_of_group(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     group_id: &str,
 ) -> ServerResult<(Ulid, AuthContext)> {
-    let auth = require_realm_auth(state, auth)?;
     let group_id = parse_group_id(group_id)?;
     ensure_group_admin(state, &auth, group_id).await?;
     Ok((group_id, auth))
@@ -327,7 +327,7 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
 )]
 pub async fn create_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<CreateImportRequest>,
 ) -> ServerResult<(StatusCode, Json<ImportResponse>)> {
@@ -417,7 +417,7 @@ pub async fn create_import(
 )]
 pub async fn list_group_imports(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<Json<ListImportsResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -479,7 +479,7 @@ pub async fn list_group_imports(
 )]
 pub async fn get_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<ImportResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -550,7 +550,7 @@ pub async fn get_import(
 )]
 pub async fn update_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     Json(request): Json<UpdateImportRequest>,
 ) -> ServerResult<Json<ImportResponse>> {
@@ -603,7 +603,7 @@ pub async fn update_import(
 )]
 pub async fn delete_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -665,7 +665,7 @@ pub async fn delete_import(
 )]
 pub async fn run_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<RunImportResponse>)> {
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
@@ -816,7 +816,7 @@ key the caller may read are counted and listed.
 )]
 pub async fn get_renames(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     axum::extract::Query(page): axum::extract::Query<RenamePageQuery>,
 ) -> ServerResult<Json<ImportRenamesResponse>> {
@@ -954,7 +954,7 @@ restrictions are refused.
 )]
 pub async fn start_renames(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<BucketMoveStarted>)> {

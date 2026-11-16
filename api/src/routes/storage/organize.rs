@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::imports::{admin_of_group, existing_rule, map_error};
+use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -248,7 +249,7 @@ fn job_error(error: LinkedError) -> ServerError {
 /// The rule, the caller and the caller's WRITE on its bucket; restricted tokens are refused.
 async fn caller(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     (group_id, import_id): (&str, &str),
 ) -> ServerResult<(BackendImport, AuthContext, BucketAccess)> {
     let (group_id, auth) = admin_of_group(state, auth, group_id).await?;
@@ -396,7 +397,7 @@ including request policies. Tokens with path restrictions are refused.
 )]
 pub async fn preview_move(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     Json(request): Json<MovePreviewRequest>,
 ) -> ServerResult<Json<MovePreview>> {
@@ -464,7 +465,7 @@ the job ends as aborted.
 )]
 pub async fn start_move(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, import_id)): Path<(String, String)>,
     Json(request): Json<MoveRequest>,
@@ -521,7 +522,7 @@ pub async fn start_move(
 )]
 pub async fn preview_duplicates(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     Json(page): Json<PageRequest>,
 ) -> ServerResult<Json<DuplicatePreview>> {
@@ -598,7 +599,7 @@ pub async fn preview_duplicates(
 )]
 pub async fn start_duplicates(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<OrganizeJob>)> {
@@ -646,7 +647,7 @@ pub async fn start_duplicates(
 )]
 pub async fn get_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<Option<OrganizeJob>>> {
     let (rule, ..) = caller(&state, auth, (&group_id, &import_id)).await?;
@@ -715,7 +716,7 @@ async fn shown(
 )]
 pub async fn control_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id, action)): Path<(String, String, String)>,
 ) -> ServerResult<Json<OrganizeJob>> {
     let (rule, ..) = caller(&state, auth, (&group_id, &import_id)).await?;
@@ -759,7 +760,7 @@ A file is shown only when the caller may read every key the rule may give it: it
 )]
 pub async fn link_status(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<LinkStatus>> {
     let (rule, _, access) = caller(&state, auth, (&group_id, &import_id)).await?;
