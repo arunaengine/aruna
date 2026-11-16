@@ -19,7 +19,7 @@ use aruna_operations::metadata::api::{
     search_buckets_distributed, search_metadata as run_search_metadata, search_objects,
 };
 use aruna_operations::s3::bucket::metadata::dataset_description;
-use aruna_operations::s3::object::search_scan::ObjectKeyMatch;
+use aruna_operations::s3::object::search::ObjectKeyMatch;
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;

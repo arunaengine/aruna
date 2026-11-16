@@ -938,19 +938,17 @@ fn search_maps_partiality() {
     let healthy = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
     let failed = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
     let result = ObjectExecution {
-        hits: vec![
-            aruna_operations::s3::object::search_scan::ObjectInventoryHit {
-                node_id: healthy,
-                group_id: Ulid::from_bytes([23u8; 16]),
-                bucket: "data".to_string(),
-                key: "reads/a.fastq".to_string(),
-                content_w3id: Some(format!("https://w3id.org/aruna/data/{}", "01".repeat(32))),
-                checksum: None,
-                size: Some(42),
-                updated_at: Some(SystemTime::UNIX_EPOCH),
-                metadata: Default::default(),
-            },
-        ],
+        hits: vec![aruna_operations::s3::object::search::ObjectInventoryHit {
+            node_id: healthy,
+            group_id: Ulid::from_bytes([23u8; 16]),
+            bucket: "data".to_string(),
+            key: "reads/a.fastq".to_string(),
+            content_w3id: Some(format!("https://w3id.org/aruna/data/{}", "01".repeat(32))),
+            checksum: None,
+            size: Some(42),
+            updated_at: Some(SystemTime::UNIX_EPOCH),
+            metadata: Default::default(),
+        }],
         next_cursor: Some("opaque".to_string()),
         as_of: SystemTime::UNIX_EPOCH,
         partitions: vec![aruna_operations::metadata::api::ObjectPartitionCoverage {

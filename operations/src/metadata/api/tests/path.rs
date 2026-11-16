@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::metadata::api::path_types::{
+    merge_path_views, reduce_path_candidates, select_path_holders,
+};
 use aruna_core::StructuredId;
 
 #[test]

@@ -38,7 +38,8 @@ use crate::metadata::protocol::{AuthToken, MetadataReadError, MetadataTransportM
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::publish::{PublishError, holder_answer};
 use crate::s3::bucket::search::{SearchBucketsInput, search_local_buckets};
-use crate::s3::object::search_scan::{SearchObjectsInput, search_local_objects};
+use crate::s3::object::search::SearchObjectsInput;
+use crate::s3::object::search_scan::search_local_objects;
 use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,

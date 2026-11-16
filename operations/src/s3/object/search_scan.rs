@@ -2,16 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::s3::object::search::{
+    ObjectInventoryChecksum, ObjectInventoryHit, ObjectKeyMatch, SEARCH_MAX_LIMIT, SearchNodeHit,
+    SearchNodePage, SearchObjectsError, SearchObjectsInput,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
-use aruna_core::NodeId;
 use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::structs::execution::table::{metadata_matches, query_terms};
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer,
@@ -19,14 +21,11 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_core::types::{GroupId, Key, TxnId};
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
-use crate::distribution::index_feed::IndexProgress;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
@@ -37,117 +36,10 @@ pub use index_search::sealed_position;
 pub(crate) use index_search::{open_position, seal_position};
 
 const HEAD_SCAN_BATCH: usize = 1_000;
-pub const SEARCH_MAX_LIMIT: usize = 100;
 /// Changed keys one node page passes at most; the page then ends at the last of them.
 const CHANGED_PAGE_CAP: usize = SEARCH_MAX_LIMIT;
 /// Versions one read returns while learning whether a changed key existed at the snapshot.
 const VERSION_BATCH: usize = 64;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ObjectKeyMatch {
-    Substring,
-    Prefix,
-    /// Matches searchable object metadata instead of keys: free text plus `column=value` terms.
-    Metadata,
-}
-
-impl ObjectKeyMatch {
-    fn matches(self, key: &str, query: &str) -> bool {
-        match self {
-            Self::Substring => key.contains(query),
-            Self::Prefix => key.starts_with(query),
-            Self::Metadata => true,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct SearchObjectsInput {
-    pub auth: AuthContext,
-    pub realm_id: RealmId,
-    pub node_id: NodeId,
-    pub query: String,
-    pub key_match: ObjectKeyMatch,
-    pub bucket: Option<String>,
-    pub limit: usize,
-    pub start_after: Option<Vec<u8>>,
-    pub as_of: SystemTime,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ObjectInventoryChecksum {
-    pub algorithm: String,
-    pub value: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ObjectInventoryHit {
-    pub node_id: NodeId,
-    pub group_id: GroupId,
-    pub bucket: String,
-    pub key: String,
-    pub content_w3id: Option<String>,
-    pub checksum: Option<ObjectInventoryChecksum>,
-    pub size: Option<u64>,
-    pub updated_at: Option<SystemTime>,
-    /// A metadata search hit's kept columns, without the search selections.
-    #[serde(default)]
-    pub metadata: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SearchNodeHit {
-    pub hit: ObjectInventoryHit,
-    pub cursor_key: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SearchNodePage {
-    pub hits: Vec<SearchNodeHit>,
-    pub next_start_after: Option<Vec<u8>>,
-    pub observed_at: SystemTime,
-    /// Ranges of a distributed bucket this node coordinates whose index is missing or still
-    /// being built, and distributed buckets a realm-wide scan skipped; the page does not
-    /// cover their keys.
-    #[serde(default)]
-    pub incomplete_ranges: usize,
-    /// Ranges of a distributed bucket another member coordinates; their keys come from
-    /// that member's page.
-    #[serde(default)]
-    pub remote_ranges: usize,
-    /// This node's index progress of the incomplete ranges it coordinates.
-    #[serde(default)]
-    pub index_progress: Vec<(ulid::Ulid, IndexProgress)>,
-    /// Incomplete ranges whose building index answered for the keys up to a key, named only
-    /// if the caller may read it.
-    #[serde(default)]
-    pub partial_ranges: Vec<(ulid::Ulid, Option<String>)>,
-    /// The distributed buckets this realm-wide page skipped, each counted in `incomplete_ranges`.
-    #[serde(default)]
-    pub skipped_buckets: Vec<String>,
-    /// Cursor keys of readable keys this page passed whose head was replaced or deleted after
-    /// `as_of`; they are counted, not shown. `None` when a searched range index changed since.
-    #[serde(default)]
-    pub changed: Option<Vec<Vec<u8>>>,
-    /// The distributed set this page searched and a digest of its key ranges and their
-    /// coordinators; `None` for other buckets.
-    #[serde(default)]
-    pub layout: Option<(ulid::Ulid, [u8; 32])>,
-}
-
-#[derive(Debug, Error)]
-pub enum SearchObjectsError {
-    #[error(transparent)]
-    Conversion(#[from] ConversionError),
-    #[error(transparent)]
-    Policy(#[from] PolicyEnforcementError),
-    #[error("object inventory storage failed: {0}")]
-    Storage(String),
-    #[error("object inventory scan budget exhausted")]
-    Unavailable,
-    #[error("the search position is no longer valid")]
-    Position,
-}
 
 #[derive(Debug)]
 struct LiveHead {
@@ -756,6 +648,8 @@ fn storage_event_error(event: Event) -> SearchObjectsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::NodeId;
+    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;

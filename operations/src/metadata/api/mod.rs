@@ -110,9 +110,10 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::search::{
     BucketPage, BucketSearchHit, SearchBucketsInput, search_local_buckets,
 };
-use crate::s3::object::search_scan::{
-    ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput, search_local_objects,
+use crate::s3::object::search::{
+    ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput,
 };
+use crate::s3::object::search_scan::search_local_objects;
 
 mod bucket_page;
 mod distributed;
@@ -158,9 +159,7 @@ pub use self::path::lookup_metadata_path;
 pub(crate) use self::path::resolve_local_path;
 #[cfg(test)]
 use self::path_types::PathShardView;
-use self::path_types::select_path_holders;
 pub use self::path_types::{MetadataLookupRequest, MetadataLookupResult};
-use self::path_types::{merge_path_views, reduce_path_candidates};
 pub use self::preflight::references_preflight;
 pub use self::preflight_types::{
     MetadataExcludedForm, MetadataIndexState, MetadataNodeFreshness, MetadataPreflightLocation,

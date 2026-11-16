@@ -8,19 +8,17 @@ use super::search_types::{
     ObjectQueryMode, PendingBucket, RangeLayout, SearchQueryRequest,
 };
 use super::{
-    ApiQueryMode, AuthContext, BlobHeadKey, BucketSearchHit, CursorEnvelopeError,
-    DISTRIBUTED_QUERY_DEADLINE, Deserialize, DriverContext, GroupId, HashMap, HashSet,
-    MetadataApiError, MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats,
-    MetadataNodeCall, MetadataReadError, MetadataSearchHit, NodeId, ObjectInventoryHit,
+    ApiQueryMode, AuthContext, BlobHeadKey, CursorEnvelopeError, DISTRIBUTED_QUERY_DEADLINE,
+    DriverContext, HashMap, HashSet, MetadataApiError, MetadataFanoutOperation,
+    MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataReadError, NodeId,
     ObjectKeyMatch, QUERY_MAX_NODES, RealmId, RealmNodeDiscovery, SearchCursor, SearchCursorError,
-    SearchNodePage, SearchObjectsInput, Serialize, SignedCursor, SystemTime,
-    deduplicate_fanout_nodes, discover_realm_nodes, fanout_bearer, load_realm_config,
-    map_read_error, metadata_node_call, object_search_fingerprint, query_fingerprint,
-    record_object_result, run_metadata_fanout, search_local_objects, select_fanout_nodes,
+    SearchNodePage, SearchObjectsInput, SignedCursor, SystemTime, deduplicate_fanout_nodes,
+    discover_realm_nodes, fanout_bearer, load_realm_config, map_read_error, metadata_node_call,
+    object_search_fingerprint, query_fingerprint, record_object_result, run_metadata_fanout,
+    search_local_objects, select_fanout_nodes,
 };
 
 use super::distributed::run_search_distributed;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::index_feed::IndexProgress;
 use crate::metadata::search_cursor::{SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE};
 use crate::s3::object::search_scan::changed_until;
@@ -364,7 +362,7 @@ pub(super) fn plan_object_search(
     }
     let limit = request
         .limit
-        .clamp(1, crate::s3::object::search_scan::SEARCH_MAX_LIMIT);
+        .clamp(1, crate::s3::object::search::SEARCH_MAX_LIMIT);
     let fingerprint = object_search_fingerprint(
         realm_id,
         &request.query,

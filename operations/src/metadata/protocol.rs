@@ -45,7 +45,7 @@ use crate::metadata::api::{ReferenceNodeExecution, ReferenceNodeRequest, RoCrate
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::s3::bucket::search::BucketPage;
-use crate::s3::object::search_scan::{ObjectKeyMatch, SearchNodePage};
+use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
 pub use aruna_core::metadata::{AuthToken, AuthTokenError};
