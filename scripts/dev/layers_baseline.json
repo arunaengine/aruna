@@ -1,0 +1,43 @@
+{
+  "clean_domains": [],
+  "structural": {
+    "mixed_files": 57,
+    "pure_async_refs": 499,
+    "upward_refs": 599,
+    "group_mutual_pairs": 41,
+    "group_cycle_modules": 26,
+    "runner_refs": 20
+  },
+  "async_lines": {
+    "abe": 1446,
+    "auth": 1814,
+    "blob": 9628,
+    "connectors": 304,
+    "device": 6936,
+    "distribution": 8335,
+    "driver": 644,
+    "effect_adapters": 636,
+    "federation": 1238,
+    "forward": 727,
+    "git": 4622,
+    "groups": 3171,
+    "jobs": 40606,
+    "metadata": 33364,
+    "node": 5073,
+    "notifications": 6455,
+    "onboarding": 324,
+    "placement": 2710,
+    "plugins": 9924,
+    "realm": 1760,
+    "realm_vault": 275,
+    "replication": 9336,
+    "s3": 15388,
+    "session": 478,
+    "shard": 1159,
+    "staging": 2568,
+    "storage_read": 95,
+    "sync": 3689,
+    "tasks": 3544,
+    "users": 349
+  }
+}
