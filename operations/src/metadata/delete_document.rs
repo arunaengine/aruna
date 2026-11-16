@@ -119,6 +119,8 @@ pub enum DeleteDocumentError {
     PlacementFenced,
     #[error("document delete sync failed: {0}")]
     SyncDelete(String),
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -1027,7 +1029,9 @@ impl Operation for DeleteDocumentOperation {
             DeleteDocumentState::ScheduleDeleteSync => self.schedule_delete_sync(event),
             DeleteDocumentState::Finish
             | DeleteDocumentState::Error
-            | DeleteDocumentState::Init => smallvec![],
+            | DeleteDocumentState::Init => {
+                self.unexpected_event("no event in a terminal state", format!("{event:?}"))
+            }
         }
     }
 
@@ -1039,7 +1043,7 @@ impl Operation for DeleteDocumentOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Ok(()))
+        self.output.unwrap_or(Err(DeleteDocumentError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -1876,5 +1880,34 @@ mod pure_tests {
             Some(Err(DeleteDocumentError::UnexpectedEvent { .. }))
         ));
         assert_eq!(operation.state, DeleteDocumentState::Error);
+    }
+
+    // An unfinished delete reports no success, and a finished one rejects a late event.
+    #[test]
+    fn rejects_early_finalize() {
+        let actor = actor();
+        let record = record(&actor);
+        let new =
+            || DeleteDocumentOperation::new(actor.clone(), record.group_id, record.document_id);
+        let mut operation = new();
+        operation.start();
+        assert!(!operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(DeleteDocumentError::NotFinished)
+        ));
+
+        let mut operation = new();
+        operation.state = DeleteDocumentState::Finish;
+        operation.output = Some(Ok(()));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        assert!(effects.is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(DeleteDocumentError::UnexpectedEvent { .. })
+        ));
     }
 }
