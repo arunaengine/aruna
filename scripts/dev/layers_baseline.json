@@ -34,9 +34,9 @@
     "trigger_arms": 68,
     "state_clones": 49,
     "async_parallel": 17,
-    "test_sleeps": 67,
+    "test_sleeps": 66,
     "silent_skips": 9,
-    "duplicate_groups": 180
+    "duplicate_groups": 175
   },
   "async_lines": {
     "abe": 1446,
