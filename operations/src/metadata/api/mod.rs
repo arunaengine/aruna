@@ -49,11 +49,9 @@ pub use self::export::{export_metadata_rocrate, get_visible_document};
 pub(crate) use self::export_types::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
 pub use self::fanout::forwarded_bearer;
 pub(crate) use self::fanout::pattern_contains_service;
-use self::fanout::{
-    MetadataFanoutOperation, MetadataNodeCall, fanout_bearer, metadata_node_call, query_union_safe,
-    run_metadata_fanout,
-};
+use self::fanout::{fanout_bearer, metadata_node_call, query_union_safe, run_metadata_fanout};
 pub use self::fanout::{lookup_identifier_distributed, search_buckets_distributed};
+use self::fanout_types::{MetadataFanoutOperation, MetadataNodeCall};
 use self::list::{load_group_records, load_pending_records};
 #[cfg(test)]
 use self::list_types::{
@@ -118,6 +116,7 @@ mod distributed;
 mod export;
 mod export_types;
 mod fanout;
+mod fanout_types;
 mod join;
 mod links;
 mod links_types;
@@ -136,9 +135,9 @@ pub use self::distributed::MetadataQueryForm;
 pub use self::export_types::{
     ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
 };
-use self::fanout::MetadataFanoutScope;
-pub use self::fanout::MetadataFanoutStats;
-pub(crate) use self::fanout::RealmNodeDiscovery;
+use self::fanout_types::MetadataFanoutScope;
+pub use self::fanout_types::MetadataFanoutStats;
+pub(crate) use self::fanout_types::RealmNodeDiscovery;
 pub use self::links::{
     file_queries, links_distributed, links_local, part_of, resolve_part, set_preview_distributed,
     set_preview_local,
