@@ -9,7 +9,7 @@ use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionSnapshot, KeyRange,
 };
-use aruna_operations::distribution::guard::upload_tags;
+use aruna_operations::distribution::routing::upload_tags;
 use aruna_operations::distribution::uploads::{InventoryUploadsInput, InventoryUploadsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::multipart::uploads::ListUploadsResult;

@@ -15,7 +15,7 @@ use aruna_core::structs::storage::distribution::delegation::{COPY_CONTEXT_HEADER
 use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute, RouteError};
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
-use aruna_operations::distribution::guard::read_coordinator;
+use aruna_operations::distribution::routing::read_coordinator;
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::s3::object::copy::{CopySourceConditions, read_copy_source, source_origin};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult, ObjectRangeRequest};

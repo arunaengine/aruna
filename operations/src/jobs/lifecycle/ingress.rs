@@ -524,7 +524,7 @@ async fn range_holder(
     let Some(binding) = info.distribution else {
         return Ok(input);
     };
-    let coordinator = crate::distribution::guard::read_coordinator(context, &binding, key)
+    let coordinator = crate::distribution::routing::read_coordinator(context, &binding, key)
         .await
         .map_err(|error| {
             let reference = input_reference(bucket, key, version_id.as_deref());

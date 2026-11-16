@@ -29,7 +29,8 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::distribution::guard::{GuardError, local_fence};
+use crate::distribution::guard::GuardError;
+use crate::distribution::routing::local_fence;
 use crate::distribution::routing::{bound_view, route_write};
 use crate::distribution::versions::{InventoryVersionsInput, InventoryVersionsOperation};
 use crate::driver::{DriverContext, drive, routing_snapshot};

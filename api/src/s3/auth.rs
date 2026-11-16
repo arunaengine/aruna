@@ -30,7 +30,7 @@ use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
 use aruna_operations::distribution::delegate::{DelegateError, accept_delegation};
-use aruna_operations::distribution::guard::{delegated_range, delegated_read};
+use aruna_operations::distribution::routing::{delegated_range, delegated_read};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::workflow::input_view::view_job;
 use aruna_operations::realm::get_config::GetConfigOperation;

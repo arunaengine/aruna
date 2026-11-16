@@ -18,11 +18,12 @@ use aruna_core::structs::storage::origin::{
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_operations::auth::request_authorization::BucketAccess;
-use aruna_operations::distribution::guard::{GuardError, copy_readers, read_coordinator};
+use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::resolve::{
     GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version,
 };
 use aruna_operations::distribution::routing::route_read;
+use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
 use aruna_operations::s3::bucket::sources::{FileSource, bucket_sources};
 use aruna_operations::s3::object::origin::{OriginError, OriginView, bucket_runs, read_origin};
 use axum::extract::{Path, Query, State};

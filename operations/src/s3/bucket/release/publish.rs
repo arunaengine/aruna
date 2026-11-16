@@ -39,7 +39,7 @@ use super::{
 };
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::distribution::guard::local_fence;
+use crate::distribution::routing::local_fence;
 use crate::distribution::status::read_view;
 use crate::driver::{DriverContext, bucket_snapshot, drive, gate_context, now_ms};
 use crate::forward::authorize::is_sync_eligible;

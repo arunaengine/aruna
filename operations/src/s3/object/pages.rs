@@ -22,8 +22,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::request_authorization::BucketAccess;
-use crate::distribution::guard::{GuardError, local_fence};
+use crate::distribution::guard::GuardError;
 use crate::distribution::routing::bound_view;
+use crate::distribution::routing::local_fence;
 use crate::driver::{DriverContext, drive};
 use crate::s3::object::link::{LinkCaller, target_visible};
 use crate::s3::object::list::{
