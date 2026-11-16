@@ -3,16 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{map_error, repository_id};
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::LfsLock;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::git::{self, locks::LockOutcome};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -52,11 +51,10 @@ pub struct CreateLock {
                example = json!({"lock":{"id":"01M000000000000000000000002","path":"assays/assay/dataset/measurements.bin","locked_at":"2026-09-25T10:00:00+00:00","owner":{"name":"01M000000000000000000000003"}},"message":"already locked"}))))]
 pub async fn create(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(repository): Path<String>,
     Json(request): Json<CreateLock>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let id = repository_id(&repository)?;
     Ok(
         match git::locks::create(&state.get_ctx(), &auth, id, request.path)
@@ -90,11 +88,10 @@ pub struct LockFilter {
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied")))]
 pub async fn list(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(repository): Path<String>,
     Query(filter): Query<LockFilter>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let locks = git::locks::list(&state.get_ctx(), &auth, repository_id(&repository)?)
         .await
         .map_err(map_error)?;
@@ -126,10 +123,9 @@ pub async fn list(
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied")))]
 pub async fn verify(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(repository): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let id = repository_id(&repository)?;
     git::repository(
         &state.get_ctx(),
@@ -170,11 +166,10 @@ pub struct Unlock {
               (status = 404, description = "No such lock"), (status = 409, description = "Owned by another user; use force")))]
 pub async fn unlock(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((repository, lock)): Path<(String, String)>,
     body: Option<Json<Unlock>>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let lock: Ulid = lock.parse().map_err(|_| ServerError::BadRequest)?;
     let force = body.is_some_and(|Json(body)| body.force);
     let released = git::locks::unlock(

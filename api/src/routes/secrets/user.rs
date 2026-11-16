@@ -9,13 +9,13 @@ use std::sync::Arc;
 use aruna_core::realm_vault::RealmSealKey;
 use aruna_core::secret_registers::SecretOwner;
 use aruna_core::secrets::SecretFields;
-use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
+use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_operations::driver::drive;
 use aruna_operations::secrets::SecretChange;
 use aruna_operations::secrets::owner::{OwnerSecretError, ReadbackOperation, open_value};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
@@ -26,7 +26,7 @@ use super::{
     SecretView, change_error, entry_example, entry_view, expected, owner_change, owner_create,
     owner_error, owner_for, owner_list, owner_read, parse_name, replace_change, rotate_change,
 };
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -72,7 +72,7 @@ the call."#,
     security(("bearer_auth" = [])))]
 pub async fn list_user_secrets(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<SecretListQuery>,
 ) -> ServerResult<Json<SecretPage>> {
     let (_, secret_owner) = owner_for(&state, auth, None).await?;
@@ -95,7 +95,7 @@ the call."#,
     security(("bearer_auth" = [])))]
 pub async fn get_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
 ) -> ServerResult<Json<SecretView>> {
     let (_, secret_owner) = owner_for(&state, auth, None).await?;
@@ -126,7 +126,7 @@ the call.
     security(("bearer_auth" = [])))]
 pub async fn create_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<CreateSecretRequest>,
 ) -> ServerResult<(StatusCode, Json<SecretView>)> {
     let (auth, secret_owner) = owner_for(&state, auth, None).await?;
@@ -156,7 +156,7 @@ the call."#,
     security(("bearer_auth" = [])))]
 pub async fn replace_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
     Json(request): Json<ReplaceSecretRequest>,
@@ -188,7 +188,7 @@ the call."#,
     security(("bearer_auth" = [])))]
 pub async fn rotate_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
     Json(request): Json<RotateSecretRequest>,
@@ -222,7 +222,7 @@ the call.
     security(("bearer_auth" = [])))]
 pub async fn delete_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> ServerResult<StatusCode> {
@@ -257,10 +257,9 @@ serves the call and checks the token itself; every other node relays it to one.
     security(("bearer_auth" = [])))]
 pub async fn read_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
 ) -> ServerResult<Json<SecretValueView>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let NodeCapabilities::Management {
         realm_signing_key, ..
     } = state.node_capabilities()

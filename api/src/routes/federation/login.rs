@@ -3,13 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::{CreateSessionResponse, map_create_error, unix_rfc3339};
 use crate::server::state::ServerState;
 use aruna_core::federation::{RealmDescriptor, Signed};
 use aruna_core::handoff::{HandoffError, LoginHandoff};
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::drive;
 use aruna_operations::federation::login::{
@@ -159,10 +158,9 @@ sessions and other session kinds are refused, so a login cannot chain to a third
 )]
 pub async fn create_login_handoff(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<LoginHandoffRequest>,
 ) -> ServerResult<Json<Signed<LoginHandoff>>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let nonce_valid = hex::decode(&request.nonce).is_ok_and(|bytes| bytes.len() == SECRET_LEN);
     if !nonce_valid {
         return Err(ServerError::BadRequestReason(
@@ -334,6 +332,7 @@ async fn name_hint(state: &ServerState, name: &str) -> ServerResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::RealmAuth;
     use crate::auth::handle_token;
     use crate::routes::access::sessions::{CreateSessionRequest, create_session};
     use crate::tests::routes::{test_context, test_state, test_storage};
@@ -344,6 +343,7 @@ mod tests {
     use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
     use aruna_core::handoff::secret_nonce;
     use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
+    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
     use aruna_operations::auth::bearer_token::{
@@ -511,7 +511,7 @@ mod tests {
 
         let child = create_session(
             State(state.clone()),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(Some(crate::auth::ValidatedBearer::new_for_test(
                 created.session.token,
             ))),
@@ -583,7 +583,7 @@ mod tests {
         };
         let error = create_login_handoff(
             State(state.clone()),
-            Extension(Some(federated)),
+            UnrestrictedAuth(federated),
             Json(request()),
         )
         .await
@@ -597,7 +597,7 @@ mod tests {
         };
         let Json(signed) = create_login_handoff(
             State(state.clone()),
-            Extension(Some(local)),
+            UnrestrictedAuth(local),
             Json(request()),
         )
         .await

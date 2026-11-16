@@ -5,11 +5,10 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::secrets::SecretChange;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -18,6 +17,7 @@ use super::{
     SecretView, entry_example, entry_view, expected, owner_change, owner_create, owner_for,
     owner_list, owner_read, parse_name, replace_change, rotate_change,
 };
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -47,7 +47,7 @@ groups administrator. User devices refuse the call."#,
     security(("bearer_auth" = [])))]
 pub async fn list_group_secrets(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<String>,
     Query(query): Query<SecretListQuery>,
 ) -> ServerResult<Json<SecretPage>> {
@@ -71,7 +71,7 @@ groups administrator. User devices refuse the call."#,
     security(("bearer_auth" = [])))]
 pub async fn get_group_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, name)): Path<(String, String)>,
 ) -> ServerResult<Json<SecretView>> {
     let (_, secret_owner) = owner_for(&state, auth, Some(&group_id)).await?;
@@ -104,7 +104,7 @@ groups administrator. User devices refuse the call.
     security(("bearer_auth" = [])))]
 pub async fn create_group_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<String>,
     Json(request): Json<CreateSecretRequest>,
 ) -> ServerResult<(StatusCode, Json<SecretView>)> {
@@ -140,7 +140,7 @@ groups administrator. User devices refuse the call."#,
     security(("bearer_auth" = [])))]
 pub async fn replace_group_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, name)): Path<(String, String)>,
     headers: HeaderMap,
     Json(request): Json<ReplaceSecretRequest>,
@@ -175,7 +175,7 @@ groups administrator. User devices refuse the call.
     security(("bearer_auth" = [])))]
 pub async fn rotate_group_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, name)): Path<(String, String)>,
     headers: HeaderMap,
     Json(request): Json<RotateSecretRequest>,
@@ -210,7 +210,7 @@ groups administrator. User devices refuse the call.
     security(("bearer_auth" = [])))]
 pub async fn delete_group_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, name)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ServerResult<StatusCode> {

@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
+use crate::auth::ValidatedBearer;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::credentials::{
     CreatePathRestriction, build_credential_restrictions, serialize_restrictions,
@@ -201,11 +202,10 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
 )]
 pub async fn create_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateSessionRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateSessionResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let kind = parse_session_kind(&request.kind)?;
     // A federated session can neither renew itself nor create children of any kind.
@@ -284,9 +284,8 @@ pub async fn create_session(
 )]
 pub async fn list_sessions(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<ListSessionsResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let current_sid = auth.session.as_ref().map(|session| session.sid.as_str());
     let sessions = drive(ListSessionOperation::new(auth.user_id), &state.get_ctx())
         .await
@@ -321,10 +320,9 @@ pub async fn list_sessions(
 )]
 pub async fn delete_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(session_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if Ulid::from_string(&session_id).is_err() {
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -406,7 +404,7 @@ mod tests {
         let (_dir, state, auth) = setup_state().await;
         let error = create_session(
             State(state),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "unknown".to_string(),
@@ -431,7 +429,7 @@ mod tests {
         });
         let error = create_session(
             State(state.clone()),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "portal".to_string(),
@@ -484,7 +482,7 @@ mod tests {
     ) -> ServerResult<CreateSessionResponse> {
         create_session(
             State(state.clone()),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "api".to_string(),
@@ -632,7 +630,7 @@ mod tests {
         });
         let (_, Json(created)) = create_session(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "assistant".to_string(),
@@ -645,7 +643,7 @@ mod tests {
         .unwrap();
         delete_session(
             State(state.clone()),
-            Extension(Some(auth)),
+            UnrestrictedAuth(auth),
             Path(created.session_id),
         )
         .await
@@ -662,7 +660,7 @@ mod tests {
         let (_dir, state, auth) = setup_state().await;
         let (_, Json(created)) = create_session(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "api".to_string(),
@@ -679,7 +677,7 @@ mod tests {
         };
         let error = delete_session(
             State(state),
-            Extension(Some(stranger)),
+            UnrestrictedAuth(stranger),
             Path(created.session_id),
         )
         .await

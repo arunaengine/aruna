@@ -13,9 +13,9 @@ use aruna_operations::secrets::SecretChange;
 use aruna_operations::secrets::node::{
     NodeChange, NodeSecretError, NodeSecretOperation, NodeSecretsOperation,
 };
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use ulid::Ulid;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -25,7 +25,8 @@ use super::{
     SecretView, change_error, create_change, expected, page, parse_name, replace_change,
     rotate_change, view,
 };
-use crate::auth::{ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -41,8 +42,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 }
 
 /// Realm admins manage the secrets of every node, each on the node it lives on.
-async fn manager(state: &Arc<ServerState>, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
-    let auth = require_unrestricted_auth(state, auth)?;
+async fn manager(state: &Arc<ServerState>, auth: AuthContext) -> ServerResult<AuthContext> {
     let path = policy_admin_path(state.get_realm_id());
     ensure_permission(state, &auth, path, Permission::WRITE).await?;
     Ok(auth)
@@ -106,7 +106,7 @@ const SECRET_EXAMPLE: &str = r#"{"name": "catalog-key", "kind": "bearer", "descr
 )]
 pub async fn list_node_secrets(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<SecretListQuery>,
 ) -> ServerResult<Json<SecretPage>> {
     manager(&state, auth).await?;
@@ -136,7 +136,7 @@ pub async fn list_node_secrets(
 )]
 pub async fn get_node_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
 ) -> ServerResult<Json<SecretView>> {
     manager(&state, auth).await?;
@@ -185,7 +185,7 @@ pub async fn get_node_secret(
 )]
 pub async fn create_node_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<CreateSecretRequest>,
 ) -> ServerResult<(StatusCode, Json<SecretView>)> {
     let auth = manager(&state, auth).await?;
@@ -225,7 +225,7 @@ pub async fn create_node_secret(
 )]
 pub async fn replace_node_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
     Json(request): Json<ReplaceSecretRequest>,
@@ -269,7 +269,7 @@ pub async fn replace_node_secret(
 )]
 pub async fn rotate_node_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
     Json(request): Json<RotateSecretRequest>,
@@ -305,7 +305,7 @@ pub async fn rotate_node_secret(
 )]
 pub async fn delete_node_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> ServerResult<StatusCode> {

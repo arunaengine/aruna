@@ -2,9 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{
-    ensure_permission, parse_group_id, permission_granted, require_unrestricted_auth,
-};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ensure_permission, parse_group_id, permission_granted};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::groups::ensure_group_admin;
 use crate::routes::access::sessions::unix_rfc3339;
@@ -22,9 +21,9 @@ use aruna_operations::groups::tokens::revoke::{
 };
 use aruna_operations::groups::tokens::{GroupToken, GroupTokensError, TokenKind, TokenStatus};
 use aruna_operations::users::revoke_all::{RevokeAllConfig, RevokeAllError, RevokeAllOperation};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -239,11 +238,10 @@ async fn run_revocation(
 )]
 pub async fn list_group_tokens(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<String>,
     Query(query): Query<TokenPageQuery>,
 ) -> ServerResult<(StatusCode, Json<GroupTokensResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let cursor = parse_cursor(query.cursor.as_deref())?;
     let (default, largest) = TOKEN_PAGE;
@@ -307,10 +305,9 @@ pub async fn list_group_tokens(
 )]
 pub async fn revoke_group_token(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, kind, token_id)): Path<(String, String, String)>,
 ) -> ServerResult<(StatusCode, Json<RevocationResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let kind = parse_kind(&kind)?;
     let target = RevokeTarget::Token { kind, id: token_id };
@@ -353,10 +350,9 @@ pub async fn revoke_group_token(
 )]
 pub async fn revoke_member_tokens(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, user_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<RevocationResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let member = UserId::from_string(&user_id).map_err(|_| ServerError::BadRequest)?;
     let path = format!("/{}/admin/u/{member}", auth.realm_id);
@@ -398,10 +394,9 @@ pub async fn revoke_member_tokens(
 )]
 pub async fn revoke_user_tokens(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let target = UserId::from_string(&id).map_err(|_| ServerError::BadRequest)?;
     let path = format!("/{}/admin/u/{target}", auth.realm_id);
     ensure_permission(&state, &auth, path, Permission::WRITE).await?;

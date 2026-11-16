@@ -4,11 +4,13 @@
 
 use super::{
     AddMemberRequest, CreateGroupRequest, DataPathKind, DataPathsQuery, GroupInfoResponse,
-    ListGroupsQuery, UpdateGroupRequest, add_group_member, create_group, get_group,
-    get_group_usage, list_data_paths, list_group_members, list_groups, run_get_group,
-    run_group_members, run_group_usage, update_group,
+    UpdateGroupRequest, add_group_member, create_group, get_group, get_group_usage,
+    list_data_paths, list_group_members, run_get_group, run_group_members, run_group_usage,
+    update_group,
 };
+use crate::auth::UnrestrictedAuth;
 use crate::auth::ValidatedBearer;
+use crate::auth::extract;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use crate::tests::routes::{seed_realm_auth, test_context, test_state, test_storage};
@@ -544,24 +546,17 @@ async fn directory_requires_realm() {
     let (state, _tempdir) = setup_state().await;
     let group_id = Ulid::generate().to_string();
 
-    assert!(matches!(
-        list_groups(
-            State(state.clone()),
-            Extension(None),
-            Query(ListGroupsQuery::default())
-        )
-        .await,
-        Err(ServerError::Unauthorized)
-    ));
-    assert!(matches!(
-        list_groups(
-            State(state.clone()),
-            Extension(Some(foreign_auth())),
-            Query(ListGroupsQuery::default())
-        )
-        .await,
-        Err(ServerError::Forbidden)
-    ));
+    // `list_groups` takes `UnrestrictedAuth`, so its refusals are the extractor's.
+    assert_eq!(
+        extract::<UnrestrictedAuth>(&state, None).await.err(),
+        Some(StatusCode::UNAUTHORIZED)
+    );
+    assert_eq!(
+        extract::<UnrestrictedAuth>(&state, Some(foreign_auth()))
+            .await
+            .err(),
+        Some(StatusCode::FORBIDDEN)
+    );
 
     for auth in [None, Some(foreign_auth())] {
         let expected = if auth.is_none() {
@@ -754,7 +749,7 @@ async fn realm_admin_statistics() {
     let stats = |user: UserId| {
         get_group_statistics(
             State(state.clone()),
-            Extension(Some(member_auth(user))),
+            UnrestrictedAuth(member_auth(user)),
             Path(group_id.to_string()),
         )
     };
@@ -763,7 +758,7 @@ async fn realm_admin_statistics() {
     let overview = |user: UserId, offset: u32| {
         list_group_statistics(
             State(state.clone()),
-            Extension(Some(member_auth(user))),
+            UnrestrictedAuth(member_auth(user)),
             Query(super::PaginationParams {
                 limit: Some(1),
                 offset: Some(offset),
@@ -822,14 +817,14 @@ async fn policy_denies_admins() {
     let stats = |user: UserId| {
         get_group_statistics(
             State(state.clone()),
-            Extension(Some(member_auth(user))),
+            UnrestrictedAuth(member_auth(user)),
             Path(group_id.to_string()),
         )
     };
     let tokens = |user: UserId| {
         list_group_tokens(
             State(state.clone()),
-            Extension(Some(member_auth(user))),
+            UnrestrictedAuth(member_auth(user)),
             Path(group_id.to_string()),
             Query(Default::default()),
         )
@@ -837,14 +832,14 @@ async fn policy_denies_admins() {
     let overview = || {
         list_group_statistics(
             State(state.clone()),
-            Extension(Some(member_auth(admin))),
+            UnrestrictedAuth(member_auth(admin)),
             Query(Default::default()),
         )
     };
     let revoke_all = || {
         revoke_user_tokens(
             State(state.clone()),
-            Extension(Some(member_auth(admin))),
+            UnrestrictedAuth(member_auth(admin)),
             Path(owner.to_string()),
         )
     };
@@ -978,7 +973,7 @@ async fn folds_group_buckets() {
 
     let (status, Json(body)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
@@ -1022,7 +1017,7 @@ async fn bucket_folds_objects() {
 
     let (status, Json(body)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
@@ -1076,7 +1071,7 @@ async fn round_trips_bucket() {
 
     let (_status, Json(listing)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
@@ -1091,7 +1086,7 @@ async fn round_trips_bucket() {
 
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(bucket_path.clone()))),
@@ -1136,7 +1131,7 @@ async fn paginates_object_pages() {
     loop {
         let (_status, Json(body)) = list_data_paths(
             State(state.clone()),
-            Extension(Some(member_auth(owner))),
+            UnrestrictedAuth(member_auth(owner)),
             Extension(None),
             Path(group_id.to_string()),
             Query(DataPathsQuery {
@@ -1179,7 +1174,7 @@ async fn path_matches_helper() {
 
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
@@ -1212,7 +1207,7 @@ async fn hides_foreign_bucket() {
 
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
@@ -1232,7 +1227,7 @@ async fn non_member_forbidden() {
 
     let result = list_data_paths(
         State(state),
-        Extension(Some(outsider)),
+        UnrestrictedAuth(outsider),
         Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
@@ -1276,7 +1271,7 @@ async fn empty_role_forbidden() {
 
     let result = list_data_paths(
         State(state),
-        Extension(Some(member_auth(limited))),
+        UnrestrictedAuth(member_auth(limited)),
         Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
@@ -1288,15 +1283,9 @@ async fn empty_role_forbidden() {
 #[tokio::test]
 async fn rejects_anonymous_caller() {
     let (state, _tempdir) = setup_state().await;
-    let result = list_data_paths(
-        State(state),
-        Extension(None),
-        Extension(None),
-        Path(Ulid::generate().to_string()),
-        Query(DataPathsQuery::default()),
-    )
-    .await;
-    assert!(matches!(result, Err(ServerError::Unauthorized)));
+    // `list_data_paths` takes `UnrestrictedAuth`, so the refusal is the extractor's.
+    let result = extract::<UnrestrictedAuth>(&state, None).await;
+    assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -1419,6 +1408,7 @@ async fn prefix_hides_keys() {
 
 mod distributed {
     use super::{DataPathKind, DataPathsQuery, list_data_paths};
+    use crate::auth::UnrestrictedAuth;
     use crate::auth::ValidatedBearer;
     use crate::mcp::data::{WriteObjectInput, store_text};
     use crate::routes::storage::deletion::bucket_info;
@@ -1505,7 +1495,7 @@ mod distributed {
         for _ in 0..6 {
             let (_, Json(paths)) = list_data_paths(
                 State(state.clone()),
-                Extension(Some(node.owner.clone())),
+                UnrestrictedAuth(node.owner.clone()),
                 Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
                 Path(node.group_id.to_string()),
                 Query(DataPathsQuery {
@@ -1565,7 +1555,7 @@ mod distributed {
 
         let (status, Json(paths)) = list_data_paths(
             State(state.clone()),
-            Extension(Some(node.owner.clone())),
+            UnrestrictedAuth(node.owner.clone()),
             Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
             Path(node.group_id.to_string()),
             Query(DataPathsQuery {

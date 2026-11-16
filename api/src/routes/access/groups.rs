@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::UnrestrictedAuth;
 use crate::auth::{
     ValidatedBearer, ensure_permission, permission_granted, require_unrestricted_auth,
 };
@@ -630,10 +631,9 @@ because every realm member sees each group's id, realm and display name.
 )]
 pub async fn list_groups(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<ListGroupsQuery>,
 ) -> ServerResult<(StatusCode, Json<ListGroupsResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let include_roles = parse_group_include(query.include.as_deref())?;
     let limit = query.limit_or(100).clamp(1, 1_000);
     let offset = query.offset_or(0);
@@ -2078,12 +2078,11 @@ bucket level and READ on the bucket or listed prefix inside one.
 )]
 pub async fn list_data_paths(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
     Path(group_id): Path<String>,
     Query(query): Query<DataPathsQuery>,
 ) -> ServerResult<(StatusCode, Json<DataPathsResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let (_, auth_doc) = load_group(&state, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
