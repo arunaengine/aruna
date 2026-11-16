@@ -584,6 +584,9 @@ fn summary_lines(summary: &Value) -> Vec<String> {
             "  service {name}: {url}, {methods}; the plugin reads everything this service \
              answers, and can send there anything it may read"
         ));
+        if line["stored"].as_bool() == Some(true) {
+            lines.push(format!("  answers of service {name} are stored in buckets"));
+        }
     }
     lines
 }
@@ -608,7 +611,7 @@ mod tests {
             "secrets": [{"slot": "key", "kind": "bearer", "secret": "group:key", "value": true}],
             "connections": [
                 {"name": "catalog", "url": "https://c.example.org", "methods": ["GET", "POST"]},
-                {"name": "mirror", "url": "https://m.example.org", "methods": all}
+                {"name": "mirror", "url": "https://m.example.org", "methods": all, "stored": true}
             ]
         });
         let tail = "the plugin reads everything this service answers, and can send there \
@@ -620,6 +623,7 @@ mod tests {
                 "  secret key (bearer) uses group:key, and the code can read its value".into(),
                 format!("  service catalog: https://c.example.org, GET, POST; {tail}"),
                 format!("  service mirror: https://m.example.org, any method; {tail}"),
+                "  answers of service mirror are stored in buckets".into(),
             ]
         );
     }
