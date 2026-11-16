@@ -736,7 +736,9 @@ mod tests {
         FailureCache::new(cooldown, capacity, Arc::new(PoolCounters::default()))
     }
 
-    async fn pending_endpoint(peer: NodeId) -> (Endpoint, tokio::net::UdpSocket) {
+    /// An endpoint whose dial to the gate's peer targets a silent socket and waits at the gate.
+    async fn pending_endpoint(gate: DialGate) -> (Endpoint, tokio::net::UdpSocket) {
+        let peer = gate.peer;
         let lookup = iroh::address_lookup::memory::MemoryLookup::new();
         let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
@@ -750,6 +752,7 @@ mod tests {
         let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .relay_mode(iroh::RelayMode::Disabled)
             .address_lookup(lookup)
+            .hooks(gate)
             .bind_addr(
                 "127.0.0.1:0"
                     .parse::<std::net::SocketAddr>()
@@ -783,16 +786,6 @@ mod tests {
             .expect("pool actor");
         held.await.expect("pool hold");
         release
-    }
-
-    async fn wait_dial(pool: &ConnectionPool, before: u64) {
-        for _ in 0..1024 {
-            if pool.counts().dials > before {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("connection actor did not start");
     }
 
     fn fill_mailbox(pool: &ConnectionPool, key: ConnectionKey) {
@@ -1105,7 +1098,13 @@ mod tests {
     async fn clear_after_pressure() {
         let blocked = make_repeated_node(20);
         let target = make_repeated_node(21);
-        let (endpoint, _blackhole) = pending_endpoint(blocked).await;
+        let gate = DialGate {
+            peer: blocked,
+            accept: false,
+            entered: Arc::new(Notify::new()),
+            open: Arc::new(Notify::new()),
+        };
+        let (endpoint, _blackhole) = pending_endpoint(gate.clone()).await;
         tokio::time::pause();
         let options = ConnectionPoolOptions {
             connect_timeout: Duration::from_secs(30),
@@ -1125,11 +1124,10 @@ mod tests {
         .expect("record failure");
         actor_barrier(&pool).await;
 
-        let before = pool.counts();
         let blocked_pool = pool.clone();
         let blocked_task =
             tokio::spawn(async move { blocked_pool.get_or_connect(blocked, Alpn::Bao).await });
-        wait_dial(&pool, before.dials).await;
+        gate.entered.notified().await;
         let release = hold_actor(&pool).await;
         fill_mailbox(
             &pool,
@@ -1189,14 +1187,17 @@ mod tests {
             counters: Arc::new(PoolCounters::default()),
         };
 
-        let pending = tokio::spawn(async move { pool.clear_failures(second).await });
-        tokio::task::yield_now().await;
-        assert!(!pending.is_finished());
+        // One poll shows the clear waits for a free slot instead of failing or dropping it.
+        let mut pending = Box::pin(tokio::task::unconstrained(pool.clear_failures(second)));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
         assert!(matches!(
             rx.recv().await,
             Some(ActorMessage::ClearFailures { node_id }) if node_id == first
         ));
-        pending.await.unwrap().unwrap();
+        tokio::time::timeout(HANG_CAP, pending)
+            .await
+            .expect("clear request made progress")
+            .unwrap();
         assert!(matches!(
             rx.recv().await,
             Some(ActorMessage::ClearFailures { node_id }) if node_id == second
