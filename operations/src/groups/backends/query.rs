@@ -225,6 +225,7 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::BACKEND_INDEX_KEYSPACE;
     use aruna_core::operation::Operation;
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -299,27 +300,36 @@ mod pure_tests {
                 value: None,
             })
         };
-
-        let mut get = GetBackendOperation::new(Ulid::from_bytes([9u8; 16]));
-        get.start();
-        get.step(stray());
-        get.step(stray());
-        assert!(matches!(
-            get.finalize(),
-            Err(GroupQueryError::Read(RecordReadError::Unexpected))
-        ));
+        let get = || {
+            let mut get = GetBackendOperation::new(Ulid::from_bytes([9u8; 16]));
+            get.start();
+            get.step(stray());
+            get
+        };
+        for (_, effects, error) in rejects_events(get, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(error, GroupQueryError::Read(RecordReadError::Unexpected)),
+                "{error:?}"
+            );
+        }
 
         let group_id = Ulid::from_bytes([1u8; 16]);
-        let mut list = ListBackendsOperation::new(group_id);
-        list.start();
-        list.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        list.step(stray());
-        assert!(matches!(
-            list.finalize(),
-            Err(GroupQueryError::Read(RecordReadError::Unexpected))
-        ));
+        let list = || {
+            let mut list = ListBackendsOperation::new(group_id);
+            list.start();
+            list.step(Event::Storage(StorageEvent::IterResult {
+                values: Vec::new(),
+                next_start_after: None,
+            }));
+            list
+        };
+        for (_, effects, error) in rejects_events(list, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(error, GroupQueryError::Read(RecordReadError::Unexpected)),
+                "{error:?}"
+            );
+        }
     }
 }

@@ -377,6 +377,7 @@ mod pure_tests {
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::operation::Operation;
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::types::{Effects, TxnId};
@@ -685,25 +686,35 @@ mod pure_tests {
     #[test]
     fn terminal_rejects_event() {
         let backend_id = Ulid::from_bytes([9u8; 16]);
-        let mut operation =
-            ReplaceBackendOperation::new(backend_id, input(Ulid::from_bytes([1u8; 16])));
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(
-                existing(Ulid::from_bytes([2u8; 16]), backend_id)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            ),
-        }));
-
-        let effects = operation.step(Event::Blob(BlobEvent::GroupBackendChecked));
-
-        assert!(effects.is_empty());
-        assert!(matches!(
-            operation.finalize(),
-            Err(CreateBackendError::InvalidStateEvent { .. })
-        ));
+        let make = || {
+            let mut operation =
+                ReplaceBackendOperation::new(backend_id, input(Ulid::from_bytes([1u8; 16])));
+            operation.start();
+            operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: b"x".to_vec().into(),
+                value: Some(
+                    existing(Ulid::from_bytes([2u8; 16]), backend_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                ),
+            }));
+            operation
+        };
+        for (_, effects, error) in rejects_events(
+            make,
+            || {
+                let mut events = sample_events();
+                events.push(Event::Blob(BlobEvent::GroupBackendChecked));
+                events
+            },
+            |_| false,
+        ) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(error, CreateBackendError::InvalidStateEvent { .. }),
+                "{error:?}"
+            );
+        }
     }
 }

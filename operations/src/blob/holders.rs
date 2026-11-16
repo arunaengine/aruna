@@ -468,6 +468,7 @@ impl Operation for GetHoldersOperation {
 mod pure_tests {
     use aruna_core::events::DhtEntry;
     use aruna_core::operation::Operation;
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::format::EncodingClass;
 
     use super::*;
@@ -736,30 +737,53 @@ mod pure_tests {
     #[test]
     fn terminal_rejects_event() {
         let realm_id = RealmId::from_bytes([1; 32]);
-        let mut refresh = RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
+        let refresh = || RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
+        let put = || {
+            Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
+                key: DhtKeyId::from_bytes([1; 32]),
+                remote_attempt_count: 1,
+                remote_store_count: 1,
+            }))
+        };
+        for (_, effects, error) in rejects_events(
+            refresh,
+            || {
+                let mut events = sample_events();
+                events.push(put());
+                events
+            },
+            |_| false,
+        ) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    RefreshHoldersError::UnexpectedEvent { .. } | RefreshHoldersError::Storage(_)
+                ),
+                "{error:?}"
+            );
+        }
 
-        let effects = refresh.step(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
-            key: DhtKeyId::from_bytes([1; 32]),
-            remote_attempt_count: 1,
-            remote_store_count: 1,
-        })));
-
-        assert!(effects.is_empty());
-        assert!(matches!(
-            refresh.finalize(),
-            Err(RefreshHoldersError::UnexpectedEvent { .. })
-        ));
-
-        let mut get = GetHoldersOperation::new([4; 32], realm_id, node(9));
-
-        let effects = get.step(Event::Net(NetEvent::Dht(DhtEvent::Error {
-            error: DhtError::Other("offline".to_string()),
-        })));
-
-        assert!(effects.is_empty());
-        assert!(matches!(
-            get.finalize(),
-            Err(GetHoldersError::UnexpectedEvent { .. })
-        ));
+        let get = || GetHoldersOperation::new([4; 32], realm_id, node(9));
+        let offline = || {
+            Event::Net(NetEvent::Dht(DhtEvent::Error {
+                error: DhtError::Other("offline".to_string()),
+            }))
+        };
+        for (_, effects, error) in rejects_events(
+            get,
+            || {
+                let mut events = sample_events();
+                events.push(offline());
+                events
+            },
+            |_| false,
+        ) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(error, GetHoldersError::UnexpectedEvent { .. }),
+                "{error:?}"
+            );
+        }
     }
 }

@@ -316,6 +316,7 @@ mod test {
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
     use aruna_core::UserId;
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
@@ -381,21 +382,21 @@ mod test {
     // A state that expects no event must reject one instead of ignoring it.
     #[test]
     fn terminal_rejects_event() {
-        use aruna_core::events::{Event, StorageEvent};
-        use aruna_core::operation::Operation;
-
-        let mut operation = GetGroupOperation::new(GetGroupConfig {
-            group_id: Ulid::from_bytes([1u8; 16]),
-        });
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([3u8; 16]),
-        }));
-
-        assert!(effects.is_empty());
-        assert!(matches!(
-            operation.finalize(),
-            Err(crate::groups::get_group::GetGroupError::UnexpectedEvent { .. })
-        ));
+        let make = || {
+            GetGroupOperation::new(GetGroupConfig {
+                group_id: Ulid::from_bytes([1u8; 16]),
+            })
+        };
+        for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    crate::groups::get_group::GetGroupError::UnexpectedEvent { .. }
+                        | crate::groups::get_group::GetGroupError::StorageError(_)
+                ),
+                "{error:?}"
+            );
+        }
     }
 }

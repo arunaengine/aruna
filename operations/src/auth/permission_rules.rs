@@ -780,6 +780,7 @@ impl Operation for PermissionRulesOperation {
 
 #[cfg(test)]
 mod pure_tests {
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::UserId;
@@ -1276,21 +1277,23 @@ mod pure_tests {
     #[test]
     fn terminal_rejects_event() {
         let realm_id = RealmId([6u8; 32]);
-        let mut operation = PermissionRulesOperation::new(PermissionRulesConfig {
-            auth_context: AuthContext::anonymous(realm_id),
-            path: format!("/{realm_id}/admin"),
-        });
-
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        }));
-
-        assert!(effects.is_empty());
-        assert!(matches!(
-            operation.finalize(),
-            Err(AuthorizationError::UnexpectedEvent { .. })
-        ));
+        let make = || {
+            PermissionRulesOperation::new(PermissionRulesConfig {
+                auth_context: AuthContext::anonymous(realm_id),
+                path: format!("/{realm_id}/admin"),
+            })
+        };
+        for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    AuthorizationError::UnexpectedEvent { .. }
+                        | AuthorizationError::StorageError(_)
+                ),
+                "{error:?}"
+            );
+        }
     }
 
     // A completed collection must reject a late event without aborting the

@@ -245,6 +245,7 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
     use aruna_core::operation::Operation;
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::types::{Effects, TxnId};
     use std::collections::HashMap;
@@ -412,18 +413,20 @@ mod pure_tests {
     #[test]
     fn terminal_rejects_event() {
         let group_id = Ulid::from_bytes([1u8; 16]);
-        let mut operation = SetDisabledOperation::new(group_id, backend_id(), true);
-        reading(&mut operation);
-        operation.step(read_result(record(group_id, false)));
-        written(&mut operation);
-        committed(&mut operation);
-
-        let effects = written(&mut operation);
-
-        assert!(effects.is_empty());
-        assert!(matches!(
-            operation.finalize(),
-            Err(SetDisabledError::InvalidStateEvent { .. })
-        ));
+        let make = || {
+            let mut operation = SetDisabledOperation::new(group_id, backend_id(), true);
+            reading(&mut operation);
+            operation.step(read_result(record(group_id, false)));
+            written(&mut operation);
+            committed(&mut operation);
+            operation
+        };
+        for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(error, SetDisabledError::InvalidStateEvent { .. }),
+                "{error:?}"
+            );
+        }
     }
 }

@@ -437,6 +437,7 @@ impl Operation for RemoveBackendOperation {
 mod tests {
     use super::*;
     use aruna_core::handle::Handle;
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::blob::BackendLocation;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::format::EncodingClass;
@@ -737,27 +738,28 @@ mod tests {
     #[test]
     fn terminal_rejects_event() {
         let backend_id = Ulid::from_bytes([8u8; 16]);
-        let mut operation = RemoveBackendOperation::new(Ulid::from_bytes([1u8; 16]), backend_id);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([9u8; 16]),
-        }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(record(backend_id, false).to_bytes().unwrap().into()),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from_bytes([9u8; 16]),
-        }));
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from_bytes([9u8; 16]),
-        }));
-
-        assert!(effects.is_empty());
-        assert!(matches!(
-            operation.finalize(),
-            Err(RemoveBackendError::InvalidStateEvent { .. })
-        ));
+        let make = || {
+            let mut operation =
+                RemoveBackendOperation::new(Ulid::from_bytes([1u8; 16]), backend_id);
+            operation.start();
+            operation.step(Event::Storage(StorageEvent::TransactionStarted {
+                txn_id: Ulid::from_bytes([9u8; 16]),
+            }));
+            operation.step(Event::Storage(StorageEvent::ReadResult {
+                key: b"x".to_vec().into(),
+                value: Some(record(backend_id, false).to_bytes().unwrap().into()),
+            }));
+            operation.step(Event::Storage(StorageEvent::TransactionAborted {
+                txn_id: Ulid::from_bytes([9u8; 16]),
+            }));
+            operation
+        };
+        for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(error, RemoveBackendError::InvalidStateEvent { .. }),
+                "{error:?}"
+            );
+        }
     }
 }

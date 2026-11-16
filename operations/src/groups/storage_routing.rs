@@ -567,6 +567,7 @@ mod pure_tests {
         STORAGE_ROUTING_KEYSPACE,
     };
     use aruna_core::operation::Operation;
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::backend_import::BackendImport;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
@@ -888,49 +889,99 @@ mod pure_tests {
                 key: routing_key(group()),
             })
         };
+        let missing = || {
+            Event::Storage(StorageEvent::ReadResult {
+                key: routing_key(group()),
+                value: None,
+            })
+        };
+        let inputs = || {
+            let mut inputs = GroupInputsOperation::new(group());
+            inputs.start();
+            inputs.step(missing());
+            inputs.step(Event::Storage(StorageEvent::IterResult {
+                values: Vec::new(),
+                next_start_after: None,
+            }));
+            inputs
+        };
+        for (_, effects, error) in rejects_events(
+            inputs,
+            || {
+                let mut events = sample_events();
+                events.push(stray());
+                events
+            },
+            |event| matches!(event, Event::Storage(StorageEvent::IterResult { .. })),
+        ) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    GroupInputsError::Read(
+                        RecordReadError::Unexpected | RecordReadError::Storage(_)
+                    )
+                ),
+                "{error:?}"
+            );
+        }
 
-        let mut inputs = GroupInputsOperation::new(group());
-        inputs.start();
-        inputs.step(Event::Storage(StorageEvent::ReadResult {
-            key: routing_key(group()),
-            value: None,
-        }));
-        inputs.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        inputs.step(stray());
-        assert!(matches!(
-            inputs.finalize(),
-            Err(GroupInputsError::Read(RecordReadError::Unexpected))
-        ));
+        let put = || {
+            let mut put = PutGroupOperation::new(
+                group(),
+                None,
+                aruna_core::UserId::default(),
+                SystemTime::UNIX_EPOCH,
+            );
+            loaded(&mut put, BTreeSet::new());
+            put.step(Event::Storage(StorageEvent::WriteResult {
+                key: routing_key(group()),
+            }));
+            put
+        };
+        for (_, effects, error) in rejects_events(
+            put,
+            || {
+                let mut events = sample_events();
+                events.push(stray());
+                events
+            },
+            |_| false,
+        ) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    PutGroupError::InvalidStateEvent { .. } | PutGroupError::StorageError(_)
+                ),
+                "{error:?}"
+            );
+        }
 
-        let mut put = PutGroupOperation::new(
-            group(),
-            None,
-            aruna_core::UserId::default(),
-            SystemTime::UNIX_EPOCH,
-        );
-        loaded(&mut put, BTreeSet::new());
-        put.step(Event::Storage(StorageEvent::WriteResult {
-            key: routing_key(group()),
-        }));
-        put.step(stray());
-        assert!(matches!(
-            put.finalize(),
-            Err(PutGroupError::InvalidStateEvent { .. })
-        ));
-
-        let mut get = GroupRoutingOperation::new(group());
-        get.start();
-        get.step(Event::Storage(StorageEvent::ReadResult {
-            key: routing_key(group()),
-            value: None,
-        }));
-        get.step(stray());
-        assert!(matches!(
-            get.finalize(),
-            Err(GroupRoutingError::InvalidStateEvent { .. })
-        ));
+        let get = || {
+            let mut get = GroupRoutingOperation::new(group());
+            get.start();
+            get.step(missing());
+            get
+        };
+        for (_, effects, error) in rejects_events(
+            get,
+            || {
+                let mut events = sample_events();
+                events.push(stray());
+                events
+            },
+            |_| false,
+        ) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    GroupRoutingError::InvalidStateEvent { .. }
+                        | GroupRoutingError::StorageError(_)
+                ),
+                "{error:?}"
+            );
+        }
     }
 }
