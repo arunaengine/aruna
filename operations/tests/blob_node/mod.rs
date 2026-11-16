@@ -9,10 +9,16 @@ use std::time::UNIX_EPOCH;
 
 use aruna_blob::blob::{BlobHandle, BlobHandler};
 use aruna_core::UserId;
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+use byteview::ByteView;
+
+use crate::convergence::TestResult;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
+    REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::realm::RealmId;
@@ -226,4 +232,41 @@ pub fn blob_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     files
+}
+
+/// Stores a single-node realm config, with the actor's node as a server, on that node.
+pub async fn seed_config(storage: &StorageHandle, actor: &Actor) -> TestResult<()> {
+    let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
+    config.seed_default_placement();
+    config.ensure_node(actor.node_id, RealmNodeKind::Server);
+    config.seed_job_control(actor.node_id, 0);
+    write_value(
+        storage,
+        REALM_CONFIG_KEYSPACE,
+        actor.realm_id.as_bytes().to_vec(),
+        config.to_bytes(actor)?,
+    )
+    .await
+}
+
+/// Writes one row and fails on any answer other than a write result.
+pub async fn write_value(
+    storage: &StorageHandle,
+    key_space: &str,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> TestResult<()> {
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: ByteView::from(key),
+            value: ByteView::from(value),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        event => Err(format!("unexpected storage write event: {event:?}").into()),
+    }
 }

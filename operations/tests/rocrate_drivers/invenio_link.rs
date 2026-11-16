@@ -4,10 +4,12 @@
 
 use super::remote::{RemoteServer, remote};
 use super::*;
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::repository::{
     LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, RepositoryLink, link_key,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 use aruna_operations::jobs::repository::link_queue::drain_links;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange, list_links};

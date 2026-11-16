@@ -21,7 +21,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE, GROUP_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
+    ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
@@ -32,9 +32,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-use aruna_core::structs::identity::realm::{
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
-};
+use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo, VersionKey};
 use aruna_core::structs::storage::bucket_metadata::release_marker;
@@ -80,6 +78,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use crate::blob_node::{seed_config, write_value};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::{MetaResourceId, StructuredId};
 
@@ -1548,23 +1547,6 @@ fn version_txn(effect: &StorageEffect) -> Option<Ulid> {
     }
 }
 
-async fn seed_config(
-    storage: &StorageHandle,
-    actor: &Actor,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
-    config.seed_default_placement();
-    config.ensure_node(actor.node_id, RealmNodeKind::Server);
-    config.seed_job_control(actor.node_id, 0);
-    write_value(
-        storage,
-        REALM_CONFIG_KEYSPACE,
-        actor.realm_id.as_bytes().to_vec(),
-        config.to_bytes(actor)?,
-    )
-    .await
-}
-
 async fn seed_auth(
     storage: &StorageHandle,
     actor: &Actor,
@@ -1602,27 +1584,6 @@ async fn seed_auth(
         group_doc.to_bytes(actor)?,
     )
     .await
-}
-
-async fn write_value(
-    storage: &StorageHandle,
-    key_space: &str,
-    key: Vec<u8>,
-    value: Vec<u8>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: ByteView::from(key),
-            value: ByteView::from(value),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        event => Err(format!("unexpected storage write event: {event:?}").into()),
-    }
 }
 
 async fn create_bucket(
