@@ -262,7 +262,7 @@ fn map_policy(policy: &RequestPolicy) -> PolicyBody {
 }
 
 fn set_hash_hex(policies: &[RequestPolicy]) -> String {
-    hex_encode(&policy_set_hash(policies))
+    hex::encode(policy_set_hash(policies))
 }
 
 /// Decodes a client-supplied `expected_hash` into the 32-byte digest the set
@@ -272,16 +272,6 @@ fn parse_expected_hash(hash: &str) -> ServerResult<[u8; 32]> {
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(ServerError::BadRequest)
-}
-
-fn hex_encode(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(64), |mut out, byte| {
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
 }
 
 fn policies_response(policies: &[RequestPolicy]) -> PoliciesResponse {
