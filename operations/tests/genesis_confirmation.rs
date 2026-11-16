@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -15,30 +14,17 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::{PlacementOverride, PlacementRef};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_net::NetHandle;
-use aruna_operations::driver::DriverContext;
 use aruna_operations::node::startup::{ShardRestoreCursor, ShardRestorePass, restore_shard_pass};
 use aruna_operations::placement::process_placements::process_shard_placements;
 use aruna_operations::placement::{resolve_shard_holders, shard_subject_bytes};
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
-use aruna_operations::tasks::incoming::start_task_queues;
-use aruna_storage::FjallStorage;
-use aruna_tasks::TaskHandle;
 use irokle::oplog::Oplog;
 use irokle::storage::Storage;
 use irokle::{ReplicationPolicy, TopicGenesis};
-use tempfile::TempDir;
 
-use crate::convergence;
-use crate::topology::local_net;
+use crate::convergence::wait_for_convergence;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
-use convergence::wait_for_convergence;
-
-struct TestNode {
-    _temp_dir: TempDir,
-    net: NetHandle,
-    context: Arc<DriverContext>,
-}
+use crate::topology::{TestNode, spawn_replica};
 
 // If the final ensure/create step fails after the topic was selected for ensuring, no pending
 // placement record exists yet.
@@ -346,38 +332,9 @@ async fn build_realm_nodes(
 ) -> Result<Vec<TestNode>, Box<dyn std::error::Error>> {
     let mut nodes = Vec::with_capacity(count);
     for _ in 0..count {
-        nodes.push(spawn_node(*realm_id).await?);
+        nodes.push(spawn_replica(*realm_id, false, false).await?);
     }
     Ok(nodes)
-}
-
-async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
-    let temp_dir = tempfile::tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
-    let net = local_net(realm_id, storage.clone()).await?;
-    let task_handle = TaskHandle::new();
-    let context = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: Some(net.clone()),
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: Some(task_handle.clone()),
-        compute_handle: None,
-    });
-    initialize_incoming_fixture(context.clone());
-    let shutdown = aruna_core::shutdown::Shutdown::new();
-    start_task_queues(
-        context.clone(),
-        task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
-        &shutdown,
-    )
-    .await;
-    Ok(TestNode {
-        _temp_dir: temp_dir,
-        net,
-        context,
-    })
 }
 
 async fn install_realm_config(

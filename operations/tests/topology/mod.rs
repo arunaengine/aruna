@@ -51,6 +51,7 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::projector::{project_logged_events, replay_event_log};
 use aruna_operations::metadata::{AuthToken, MetadataHandle};
+use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::placement::expand_placement::expand_realm_placement;
 use aruna_operations::placement::transition::{TransitionRequest, plan_transition};
 use aruna_operations::placement::{
@@ -1899,4 +1900,119 @@ pub fn rocrate_payload(document_id: Ulid) -> CreateDocumentPayload {
 }}"#
     );
     CreateDocumentPayload::RoCrate { jsonld }
+}
+
+/// A replica node in its own temporary folder, with storage at the folder root and a
+/// loopback net. `metadata` adds a metadata store; `holder` installs the production net
+/// holder under a kept `Shutdown` in place of the test inbound handler.
+pub async fn spawn_replica(
+    realm_id: RealmId,
+    metadata: bool,
+    holder: bool,
+) -> TestResult<TestNode> {
+    spawn_replica_with(realm_id, None, metadata, holder, true).await
+}
+
+/// [`spawn_replica`] with a fixed node key, and without task queues when `start_tasks` is
+/// false, so a test drives every timer by hand.
+pub async fn spawn_replica_with(
+    realm_id: RealmId,
+    secret_key: Option<iroh::SecretKey>,
+    metadata: bool,
+    holder: bool,
+    start_tasks: bool,
+) -> TestResult<TestNode> {
+    let temp_dir = tempfile::tempdir()?;
+    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
+    let net_config = NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        realm_id,
+        secret_key,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+    let net = NetHandle::new(net_config, storage.clone()).await?;
+    let task_handle = TaskHandle::new();
+    let metadata_handle = match metadata {
+        true => Some(MetadataHandle::new(
+            temp_dir.path().join("metadata"),
+            net.node_id(),
+            storage.clone(),
+            Some(net.clone()),
+            Some(net.document_sync_node()),
+            Some(net.document_sync_database()),
+        )?),
+        false => None,
+    };
+    let context = Arc::new(DriverContext {
+        storage_handle: storage,
+        net_handle: Some(net.clone()),
+        blob_handle: None,
+        metadata_handle,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+    });
+    let jobs_runtime = JobsRuntime::new();
+    let shutdown = Shutdown::new();
+    if holder {
+        let limits = RoCrateLimits::default();
+        initialize_net_holder(context.clone(), limits, jobs_runtime.clone(), &shutdown);
+    } else {
+        initialize_incoming_fixture(context.clone());
+    }
+    if start_tasks {
+        start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
+    }
+    Ok(TestNode {
+        temp_dir: Some(temp_dir),
+        net,
+        context,
+        kind: RealmNodeKind::Management,
+        shutdown: holder.then_some(shutdown),
+    })
+}
+
+/// Spawns `count` meshed replicas; see [`spawn_replica`].
+pub async fn spawn_replicas(
+    realm_id: RealmId,
+    count: usize,
+    metadata: bool,
+    holder: bool,
+) -> TestResult<Vec<TestNode>> {
+    let mut nodes = Vec::with_capacity(count);
+    for _ in 0..count {
+        nodes.push(spawn_replica(realm_id, metadata, holder).await?);
+    }
+    mesh(nodes.iter().map(|node| &node.net)).await;
+    Ok(nodes)
+}
+
+/// The default realm config with each of `nets` as a management node.
+pub fn realm_config_for<'a>(
+    nets: impl IntoIterator<Item = &'a NetHandle>,
+    realm_id: RealmId,
+) -> RealmConfigDocument {
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.seed_default_placement();
+    for net in nets {
+        config.ensure_node(net.node_id(), RealmNodeKind::Management);
+    }
+    config
+}
+
+/// A local user of `realm_id` whose notification inbox `holder` holds under `realm_config`.
+pub fn user_with_holder(
+    realm_config: &RealmConfigDocument,
+    holder: NodeId,
+    realm_id: RealmId,
+) -> UserId {
+    for _ in 0..10_000 {
+        let candidate = UserId::local(Ulid::generate(), realm_id);
+        if matches!(resolve_inbox_holder(&candidate, realm_config), Ok(Some(node)) if node == holder)
+        {
+            return candidate;
+        }
+    }
+    panic!("no user hashed to holder {holder} within the sampling bound");
 }
