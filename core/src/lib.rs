@@ -8,6 +8,7 @@ pub mod admin_documents;
 pub mod alpn;
 pub mod audit;
 pub mod auth;
+pub mod backoff;
 pub mod compute;
 pub mod crate_merge;
 pub mod credential_encryption;

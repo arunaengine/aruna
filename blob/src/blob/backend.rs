@@ -24,6 +24,8 @@ use opendal::Operator;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+
+use aruna_core::backoff::capped_backoff;
 use ulid::Ulid;
 
 impl From<BlobError> for BlobLibError {
@@ -82,9 +84,7 @@ impl ReservationGuard {
 
 // Ulid randomness spreads retry storms without pulling in an rng dependency.
 fn conflict_backoff(attempt: u32) -> Duration {
-    let base = BUCKET_STATS_BACKOFF
-        .saturating_mul(1u32 << attempt.min(6))
-        .min(STATS_BACKOFF_CAP);
+    let base = capped_backoff(BUCKET_STATS_BACKOFF, STATS_BACKOFF_CAP, attempt, 0);
     let micros = base.as_micros() as u64;
     let spread = u64::from(Ulid::generate().to_bytes()[15]);
     Duration::from_micros(micros / 2 + micros * spread / 510)

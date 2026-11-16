@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::backoff::capped_backoff;
 use aruna_core::document::{
     DocumentNetEvent, DocumentReconcileResult, DocumentTarget, shard_topic_id,
 };
@@ -447,7 +448,7 @@ async fn finish_recovery_step(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Remote recovery left retryable work behind"
             );
-            let after = recovery_backoff(*attempts);
+            let after = capped_backoff(RECOVERY_RETRY_BASE, RECOVERY_RETRY_MAX, *attempts, 0);
             *attempts = (*attempts).saturating_add(1);
             tokio::select! {
                 _ = cancelled.cancelled() => true,
@@ -455,13 +456,6 @@ async fn finish_recovery_step(
             }
         }
     }
-}
-
-/// Doubles from [`RECOVERY_RETRY_BASE`] up to [`RECOVERY_RETRY_MAX`].
-fn recovery_backoff(attempts: u32) -> Duration {
-    let base = RECOVERY_RETRY_BASE.as_millis() as u64;
-    let max = RECOVERY_RETRY_MAX.as_millis() as u64;
-    Duration::from_millis(base.saturating_mul(1u64 << attempts.min(16)).min(max))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2683,6 +2677,8 @@ mod tests {
     // stays down cannot keep the driver hot.
     #[test]
     fn recovery_backoff_caps() {
+        let recovery_backoff =
+            |attempts| capped_backoff(RECOVERY_RETRY_BASE, RECOVERY_RETRY_MAX, attempts, 0);
         assert_eq!(recovery_backoff(0), RECOVERY_RETRY_BASE);
         assert!(recovery_backoff(1) > recovery_backoff(0));
         assert_eq!(recovery_backoff(40), RECOVERY_RETRY_MAX);

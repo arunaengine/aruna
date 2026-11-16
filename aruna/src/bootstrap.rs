@@ -34,6 +34,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+
+use aruna_core::backoff::capped_backoff;
 use tracing::{info, warn};
 
 const PLACEMENT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -47,9 +49,7 @@ const DEVICE_FETCH_BUDGET: Duration = Duration::from_secs(10);
 
 /// Delay before retry `attempt`, doubling from the base interval up to the cap.
 fn backoff(attempt: u32) -> Duration {
-    PLACEMENT_RETRY_INTERVAL
-        .saturating_mul(2u32.saturating_pow(attempt.min(16)))
-        .min(PLACEMENT_RETRY_MAX)
+    capped_backoff(PLACEMENT_RETRY_INTERVAL, PLACEMENT_RETRY_MAX, attempt, 0)
 }
 
 pub async fn realm_bootstrap_exists(

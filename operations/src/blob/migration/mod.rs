@@ -55,6 +55,8 @@ use smallvec::smallvec;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
+
+use aruna_core::backoff::capped_backoff;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -1836,13 +1838,6 @@ async fn read_progress(
     }
 }
 
-/// Wait before retry pass `retries + 1`.
-fn retry_delay(retries: u32) -> Duration {
-    RETRY_BASE
-        .saturating_mul(1 << retries.min(16))
-        .min(RETRY_MAX)
-}
-
 /// Migrates one page of a bucket's versions and stores the progress, unless a newer
 /// setting replaced the record meanwhile. A run that worked for `budget` starts no more
 /// versions. Returns when the bucket needs the next run.
@@ -2047,7 +2042,7 @@ async fn migrate_page(
         (true, _) => Some(Duration::ZERO),
         // Successful versions are already in the target, so a retry pass reads no blob for them.
         (false, true) if record.retries < MIGRATION_RETRIES => {
-            let wait = retry_delay(record.retries);
+            let wait = capped_backoff(RETRY_BASE, RETRY_MAX, record.retries, 0);
             record.retries += 1;
             record.cursor = None;
             record.retry_at_ms = Some(now.saturating_add(wait.as_millis() as u64));
@@ -2943,6 +2938,7 @@ mod tests {
 
     #[test]
     fn retry_waits_double() {
+        let retry_delay = |retries| capped_backoff(RETRY_BASE, RETRY_MAX, retries, 0);
         assert_eq!(retry_delay(0), RETRY_BASE);
         assert_eq!(retry_delay(1), 2 * RETRY_BASE);
         assert_eq!(retry_delay(6), RETRY_MAX);
@@ -3204,7 +3200,7 @@ mod tests {
         assert_eq!(stored.cursor, Some(last));
         let after = migrate_page(&context, "b", stored, Duration::MAX).await;
         let after = after.unwrap();
-        assert_eq!(after, Some(retry_delay(0)));
+        assert_eq!(after, Some(capped_backoff(RETRY_BASE, RETRY_MAX, 0, 0)));
         let stored = read_progress(&context, &key).await.unwrap().unwrap();
         assert_eq!(stored.failed, MIGRATION_WORK as u64 + 44);
         assert!(stored.retry_at_ms.is_some());

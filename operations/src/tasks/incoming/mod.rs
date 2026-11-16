@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use aruna_core::backoff::capped_backoff;
 use aruna_core::document::{
     DocumentOutboxEvent, DocumentOutboxRecord, DocumentSyncPublish, DocumentTarget,
 };
@@ -116,7 +117,7 @@ use crate::sync::outbox_record::OUTBOX_DRAIN_SIZE;
 use crate::sync::shard_placement::{
     DEFER_RETRY_AFTER, PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
 };
-use crate::tasks::queue_backoff::{retry_after_ms, retry_delay_ms};
+use crate::tasks::queue_backoff::retry_delay_ms;
 use crate::tasks::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_task_timers,
 };
@@ -610,11 +611,8 @@ impl OperationsTaskHandler {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 let attempts = entry.get().saturating_add(1);
                 entry.insert(attempts);
-                Duration::from_millis(retry_after_ms(
-                    attempts,
-                    base.as_millis() as u64,
-                    max.as_millis() as u64,
-                ))
+                // The former helper stopped doubling after seven attempts; that stays.
+                capped_backoff(base, max, attempts.min(7), 0)
             }
         }
     }

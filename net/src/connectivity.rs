@@ -6,6 +6,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aruna_core::backoff::capped_backoff;
+
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
@@ -194,10 +196,8 @@ fn merge_source(existing: &mut String, source: &str) {
 }
 
 fn peer_retry_delay(node_id: NodeId, consecutive_failures: u64) -> Duration {
-    let exponent = consecutive_failures.saturating_sub(1).min(8) as u32;
-    let base = INITIAL_RETRY_DELAY
-        .saturating_mul(2u32.saturating_pow(exponent))
-        .min(MAX_RETRY_DELAY);
+    let exponent = u32::try_from(consecutive_failures.saturating_sub(1)).unwrap_or(u32::MAX);
+    let base = capped_backoff(INITIAL_RETRY_DELAY, MAX_RETRY_DELAY, exponent, 0);
     let base_ms = base.as_millis() as i128;
     let jitter_window = (base_ms / 5).max(1);
     let jitter_range = (jitter_window * 2 + 1) as u64;

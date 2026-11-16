@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
+use aruna_core::backoff::capped_backoff;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -41,7 +42,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 
-use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_after_ms, retry_delay_ms};
+use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
 
 use super::data_links::DataLinkError;
 use super::iri_index::MetadataIriError;
@@ -643,7 +644,11 @@ async fn plan_finish_chunk(
                 // A dependency that stays missing is checked rarely, not every two seconds.
                 let delay = if waiting {
                     let cap = if attempts > 30 { 300_000 } else { 2_000 };
-                    retry_after_ms(attempts, RETRY_BASE_MS, cap)
+                    // The former helper stopped doubling after seven attempts; that stays.
+                    let base = Duration::from_millis(RETRY_BASE_MS);
+                    let delay =
+                        capped_backoff(base, Duration::from_millis(cap), attempts.min(7), 0);
+                    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
                 } else {
                     retry_delay_ms(attempts)
                 };
@@ -854,11 +859,10 @@ fn parked_dead_letter(
 }
 
 fn requeue_after_ms(parks: u32) -> u64 {
-    crate::tasks::queue_backoff::retry_after_ms(
-        parks.saturating_sub(1),
-        REQUEUE_BASE_MS,
-        REQUEUE_MAX_MS,
-    )
+    let base = Duration::from_millis(REQUEUE_BASE_MS);
+    let cap = Duration::from_millis(REQUEUE_MAX_MS);
+    let delay = capped_backoff(base, cap, parks.saturating_sub(1), 0);
+    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

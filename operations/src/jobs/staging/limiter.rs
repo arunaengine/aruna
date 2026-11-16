@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use aruna_core::backoff::capped_backoff;
+
 use aruna_core::structs::execution::job::StagingJobSpec;
 use rand::RngExt;
 use tokio_util::sync::CancellationToken;
@@ -17,9 +19,7 @@ const BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 fn backoff(attempt: u32) -> Duration {
-    let base = BACKOFF
-        .saturating_mul(1 << attempt.min(16))
-        .min(MAX_BACKOFF);
+    let base = capped_backoff(BACKOFF, MAX_BACKOFF, attempt, 0);
     let jitter = rand::rng().random_range(0..=base.as_millis() as u64 / 2);
     base + Duration::from_millis(jitter)
 }

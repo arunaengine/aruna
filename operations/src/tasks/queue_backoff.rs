@@ -4,17 +4,15 @@
 
 use std::time::Duration;
 
+use aruna_core::backoff::capped_backoff;
+
 pub(crate) const RETRY_BASE_MS: u64 = 250;
 pub(crate) const RETRY_MAX_MS: u64 = 30_000;
 
 pub(crate) fn retry_delay_ms(attempts: u32) -> u64 {
-    retry_after_ms(attempts, RETRY_BASE_MS, RETRY_MAX_MS)
-}
-
-pub(crate) fn retry_after_ms(attempts: u32, base_ms: u64, max_ms: u64) -> u64 {
-    let shift = attempts.min(7);
-    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-    base_ms.saturating_mul(multiplier).min(max_ms)
+    let base = Duration::from_millis(RETRY_BASE_MS);
+    let delay = capped_backoff(base, Duration::from_millis(RETRY_MAX_MS), attempts, 0);
+    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn min_due_at(current: Option<u64>, due_at_ms: u64) -> Option<u64> {
@@ -28,11 +26,11 @@ pub(crate) fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
 // Deterministic jitter from the caller's own id decorrelates the retries of
 // drivers that conflict on one record, and the wait lets the winner commit.
 pub(crate) fn conflict_backoff(attempt: usize, seed: &[u8]) -> Duration {
-    let base = retry_after_ms(attempt as u32, 25, 250);
     let mut head = [0u8; 8];
     head.copy_from_slice(&seed[..8]);
-    let jitter = u64::from_le_bytes(head) % base;
-    Duration::from_millis(base.saturating_add(jitter))
+    let attempt = u32::try_from(attempt).unwrap_or(u32::MAX);
+    let (base, cap) = (Duration::from_millis(25), Duration::from_millis(250));
+    capped_backoff(base, cap, attempt, u64::from_le_bytes(head))
 }
 
 #[cfg(test)]
@@ -43,7 +41,7 @@ mod pure_tests {
     fn backoff_jitters() {
         // Backoff is deterministic per seed and stays within [base, 2*base).
         let seed = [7u8; 16];
-        let base = retry_after_ms(0, 25, 250);
+        let base = 25;
         let first = conflict_backoff(0, &seed);
         assert_eq!(first, conflict_backoff(0, &seed));
         let ms = first.as_millis() as u64;
