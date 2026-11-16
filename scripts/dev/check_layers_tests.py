@@ -16,6 +16,8 @@ import check_layers
 import check_style
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+WORKSPACE = '[workspace]\nmembers = ["operations"]\n'
+MANIFEST = '[package]\nname = "aruna-operations"\n\n[dependencies]\naruna-core = { workspace = true }\n'
 PURE_OP = "pub struct Plan;\nimpl Operation for Plan {}\n"
 SIX_LINES = "    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n    let e = 5;\n    let f = a + b + c + d + e;\n"
 
@@ -30,6 +32,8 @@ def write_tree(root, files):
 
 def base_tree(extra=None):
     files = {
+        "Cargo.toml": WORKSPACE,
+        "operations/Cargo.toml": MANIFEST,
         "operations/src/lib.rs": "pub mod abe;\npub mod jobs;\n",
         "operations/src/abe/mod.rs": PURE_OP,
         "operations/src/jobs/mod.rs": "pub async fn run() {}\n",
@@ -41,6 +45,7 @@ def base_tree(extra=None):
 def zero_baseline(clean=()):
     return {
         "clean_domains": list(clean),
+        "crate_allow": {},
         "structural": {key: 0 for key, _ in check_layers.COUNTS},
         "async_lines": {},
     }
@@ -180,6 +185,22 @@ class ReferencesTest(unittest.TestCase):
         )
         self.assertEqual(counts["runner_refs"], 1)
         self.assertEqual(details["runner_refs"], ["driver -> jobs: 1"])
+
+
+class CratesTest(unittest.TestCase):
+    def test_outside_target(self):
+        manifest = MANIFEST + "aruna-storage = { workspace = true }\n"
+        files = {
+            "Cargo.toml": '[workspace]\nmembers = ["operations", "storage", "core"]\n',
+            "operations/Cargo.toml": manifest,
+            "storage/Cargo.toml": '[package]\nname = "aruna-storage"\n',
+            "core/Cargo.toml": '[package]\nname = "aruna-core"\n',
+        }
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, files)
+            self.assertEqual(check_layers.crate_findings(root, {}), (["aruna-operations -> aruna-storage"], []))
+            allow = {"aruna-operations": ["aruna-storage", "aruna-graph"]}
+            self.assertEqual(check_layers.crate_findings(root, allow), ([], ["aruna-operations -> aruna-graph"]))
 
 
 class GuardTest(unittest.TestCase):

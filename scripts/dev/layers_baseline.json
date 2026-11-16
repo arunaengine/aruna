@@ -1,5 +1,29 @@
 {
   "clean_domains": [],
+  "crate_allow": {
+    "aruna-api": [
+      "aruna-blob",
+      "aruna-compute",
+      "aruna-plugins",
+      "aruna-tasks"
+    ],
+    "aruna-doctor": [
+      "aruna",
+      "aruna-api",
+      "aruna-net",
+      "aruna-tasks"
+    ],
+    "aruna-operations": [
+      "aruna-blob",
+      "aruna-compute",
+      "aruna-graph",
+      "aruna-net",
+      "aruna-outbound",
+      "aruna-plugins",
+      "aruna-storage",
+      "aruna-tasks"
+    ]
+  },
   "structural": {
     "mixed_files": 57,
     "pure_async_refs": 499,

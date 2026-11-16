@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Layer guard: counts async code and references in operations against layers_baseline.json.
-A structural count above its baseline or async code in a clean domain fails."""
+A structural count above its baseline, async code in a clean domain or a new crate dependency fails."""
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 import argparse
@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import tomllib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -30,6 +31,44 @@ GROUPS = (
     ("data", frozenset("s3 blob staging replication distribution metadata git shares connectors".split())),
     ("work and integrations", frozenset("jobs plugins assistant notifications federation harvest node".split())),
 )
+ANY_CRATE = "*"
+# Internal normal dependencies the target table (target-architecture.md section 2) allows.
+CRATE_TARGETS = {
+    "aruna": ANY_CRATE,
+    "aruna-api": ("aruna-core", "aruna-operations", "aruna-drivers", "aruna-wire"),
+    "aruna-doctor": ("aruna-core", "aruna-storage", "aruna-blob", "aruna-operations", "aruna-drivers"),
+    "aruna-cli": ("aruna-wire", "aruna-plugins"),
+    "aruna-operations": ("aruna-core",),
+    "aruna-drivers": (
+        "aruna-core",
+        "aruna-storage",
+        "aruna-net",
+        "aruna-blob",
+        "aruna-tasks",
+        "aruna-compute",
+        "aruna-plugins",
+        "aruna-graph",
+        "aruna-outbound",
+    ),
+    "aruna-storage": ("aruna-core",),
+    "aruna-net": ("aruna-core", "aruna-storage"),
+    "aruna-blob": ("aruna-core", "aruna-kpabe", "aruna-storage", "aruna-net"),
+    "aruna-tasks": ("aruna-core",),
+    "aruna-compute": ("aruna-core",),
+    "aruna-plugins": (),
+    "aruna-graph": ("aruna-core",),
+    "aruna-outbound": ("aruna-core",),
+    "aruna-core": ("aruna-kpabe",),
+    "aruna-kpabe": (),
+    "aruna-kpabe-wasm": ("aruna-kpabe",),
+    "aruna-wire": ("aruna-core",),
+    "aruna-plugin": (),
+    "aruna-plugin-fixture": ("aruna-plugin",),
+    "elabftw-sync": ("aruna-plugin",),
+    "dataset-announcer": ("aruna-plugin",),
+    "aruna-registry": ("aruna-core", "aruna-blob"),
+    "aruna-compute-helper": (),
+}
 COUNTS = (
     ("mixed_files", "mixed files (an operation plus async code)"),
     ("pure_async_refs", "references from pure files to items defined only in async files"),
@@ -382,6 +421,50 @@ def async_lines(ops):
     return dict(sorted(lines.items()))
 
 
+def crate_manifests(root):
+    """Map each workspace crate name to its set of internal normal dependencies."""
+    with open(os.path.join(root, "Cargo.toml"), "rb") as handle:
+        workspace = tomllib.load(handle).get("workspace", {})
+    renames = {
+        key: value.get("package", key)
+        for key, value in workspace.get("dependencies", {}).items()
+        if isinstance(value, dict)
+    }
+    manifests = {}
+    for member in workspace.get("members", []):
+        with open(os.path.join(root, member, "Cargo.toml"), "rb") as handle:
+            manifests[member] = tomllib.load(handle)
+    names = {data["package"]["name"] for data in manifests.values()}
+    result = {}
+    for data in manifests.values():
+        tables = [data.get("dependencies", {})]
+        tables.extend(target.get("dependencies", {}) for target in data.get("target", {}).values())
+        deps = set()
+        for table in tables:
+            for key, value in table.items():
+                name = value.get("package", renames.get(key, key)) if isinstance(value, dict) else key
+                if name in names:
+                    deps.add(name)
+        result[data["package"]["name"]] = deps
+    return result
+
+
+def crate_findings(root, allow):
+    """Return (outside, unused): dependencies outside target and allow list, and unused allow entries."""
+    outside_deps, used = [], set()
+    for crate, deps in sorted(crate_manifests(root).items()):
+        target = CRATE_TARGETS.get(crate, ())
+        for dep in sorted(deps):
+            if target == ANY_CRATE or dep in target:
+                continue
+            if dep in allow.get(crate, ()):
+                used.add((crate, dep))
+                continue
+            outside_deps.append(f"{crate} -> {dep}")
+    unused = [f"{crate} -> {dep}" for crate, deps in sorted(allow.items()) for dep in deps if (crate, dep) not in used]
+    return outside_deps, unused
+
+
 def measure(root):
     """Measure every count; returns (counts, details, async lines per module, operations, sources)."""
     sources = [load_source(root, rel) for rel in rust_files(root)]
@@ -407,7 +490,7 @@ def load_baseline(path):
     except FileNotFoundError:
         baseline = {}
     missing = [key for key, _ in COUNTS if key not in baseline.get("structural", {})]
-    for key in ("clean_domains", "async_lines"):
+    for key in ("clean_domains", "crate_allow", "async_lines"):
         if key not in baseline:
             missing.append(key)
     return baseline, missing
@@ -440,6 +523,13 @@ def report(root, baseline, show_all):
     for hit in dirty:
         errors += 1
         print(f"  error: async code in a clean domain at {hit}")
+    outside_deps, unused = crate_findings(root, baseline["crate_allow"])
+    print(f"crate dependencies outside the target table and allow list: {len(outside_deps)}")
+    for dep in outside_deps:
+        errors += 1
+        print(f"  error: {dep}")
+    for dep in unused:
+        print(f"  note: allow list entry not used: {dep}")
     print(f"errors: {errors}")
     return errors
 
@@ -448,6 +538,7 @@ def current_json(root, baseline):
     counts, _, lines, _, _ = measure(root)
     result = {
         "clean_domains": baseline.get("clean_domains", []),
+        "crate_allow": baseline.get("crate_allow", {}),
         "structural": {key: counts[key] for key, _ in COUNTS},
         "async_lines": lines,
     }
