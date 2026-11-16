@@ -59,7 +59,7 @@ use aruna_operations::realm::mutate_placement::{
 };
 use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::tasks::incoming::start_task_queues;
-use aruna_storage::FjallStorage;
+use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
@@ -971,6 +971,21 @@ impl Topology {
         }))
         .await;
     }
+}
+
+/// Opens a loopback net handle for `realm_id` with discovery and relays turned off.
+pub async fn local_net(realm_id: RealmId, storage: StorageHandle) -> aruna_net::Result<NetHandle> {
+    NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+            realm_id,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        storage,
+    )
+    .await
 }
 
 pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<TestNode> {

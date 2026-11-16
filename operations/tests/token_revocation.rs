@@ -18,7 +18,7 @@ use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::NodePlacementEntry;
 use aruna_core::{DocumentEffect, DocumentNetEvent};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
 use aruna_operations::auth::bearer_token::{
     ArunaBearerError, ArunaValidationState, decode_bearer_token, realm_token_revoked,
     realm_user_cutoff,
@@ -39,6 +39,7 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::convergence;
+use crate::topology::local_net;
 use crate::topology::store_realm_config;
 use convergence::wait_for_convergence;
 
@@ -280,17 +281,7 @@ async fn build_realm_nodes(realm_id: RealmId, count: usize) -> TestResult<Vec<Te
 async fn spawn_node(realm_id: RealmId) -> TestResult<TestNode> {
     let temp_dir = tempfile::tempdir()?;
     let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
-    let net = NetHandle::new(
-        NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-            realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
-        },
-        storage.clone(),
-    )
-    .await?;
+    let net = local_net(realm_id, storage.clone()).await?;
     let task_handle = aruna_tasks::TaskHandle::new();
     let context = Arc::new(DriverContext {
         storage_handle: storage,

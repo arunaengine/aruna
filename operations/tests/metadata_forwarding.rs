@@ -32,7 +32,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
@@ -77,6 +77,7 @@ use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
+use crate::topology::local_net;
 use convergence::wait_for_convergence;
 
 // Every wait below polls to a condition; the ceiling only bounds a genuine hang.
@@ -1145,17 +1146,7 @@ async fn spawn_node(
 ) -> Result<TestNode, Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
-    let net = NetHandle::new(
-        NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-            realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
-        },
-        storage.clone(),
-    )
-    .await?;
+    let net = local_net(realm_id, storage.clone()).await?;
     let task_handle = TaskHandle::new();
     let metadata_handle = MetadataHandle::new(
         temp_dir.path().join("metadata"),

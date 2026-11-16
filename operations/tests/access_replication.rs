@@ -5,11 +5,12 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use crate::topology::local_net;
 use crate::topology::store_realm_config;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::access::create::{CreateUserConfig, CreateUserOperation};
 use aruna_operations::s3::access::get::GetAccessOperation;
@@ -128,17 +129,7 @@ async fn build_realm_nodes(
 async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
-    let net = NetHandle::new(
-        NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-            realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
-        },
-        storage.clone(),
-    )
-    .await?;
+    let net = local_net(realm_id, storage.clone()).await?;
     let task_handle = TaskHandle::new();
     let context = Arc::new(DriverContext {
         storage_handle: storage,
