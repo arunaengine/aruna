@@ -475,24 +475,7 @@ impl GetAttributesOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(GetAttributesError::NoTransactionFound);
         };
-        let checksum_type = self
-            .summary
-            .as_ref()
-            .map(|summary| summary.checksum_type)
-            .unwrap_or(MultipartChecksumType::FullObject);
-
         self.state = GetAttributesState::CommitTransaction;
-        self.output = Some(Ok(GetAttributesResult {
-            location: self.location.clone(),
-            source_metadata: self.source_metadata.clone(),
-            version_created_at: self.version_created_at,
-            version_id: self.resolved_version_id.or(self.input.version_id),
-            resolved_version_id: self.resolved_version_id,
-            checksum_type,
-            summary: self.summary.clone(),
-            parts: std::mem::take(&mut self.parts),
-        }));
-
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -505,7 +488,22 @@ impl GetAttributesOperation {
             });
         };
 
+        let checksum_type = self
+            .summary
+            .as_ref()
+            .map(|summary| summary.checksum_type)
+            .unwrap_or(MultipartChecksumType::FullObject);
         self.state = GetAttributesState::Finish;
+        self.output = Some(Ok(GetAttributesResult {
+            location: self.location.clone(),
+            source_metadata: self.source_metadata.clone(),
+            version_created_at: self.version_created_at,
+            version_id: self.resolved_version_id.or(self.input.version_id),
+            resolved_version_id: self.resolved_version_id,
+            checksum_type,
+            summary: self.summary.clone(),
+            parts: std::mem::take(&mut self.parts),
+        }));
         smallvec![]
     }
 }
@@ -630,6 +628,45 @@ mod tests {
         operation.step(read(Some(sealed.to_bytes().unwrap())));
         operation.step(read(None));
         assert_eq!(operation.location, Some(sealed));
+    }
+
+    // A result exists only once the read transaction committed, so an aborted read never succeeds.
+    #[test]
+    fn output_after_commit() {
+        let stored = location();
+        let version_id = Ulid::generate();
+        let looked_up = || {
+            let mut operation = GetAttributesOperation::new(GetAttributesInput {
+                bucket: "bucket".to_string(),
+                key: "object.bin".to_string(),
+                version_id: Some(version_id),
+                include_parts: false,
+            });
+            let txn_id = Ulid::generate();
+            operation.txn_id = Some(txn_id);
+            operation.location = Some(stored.clone());
+            let effects = operation.finish_lookup();
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit })]
+                    if *commit == txn_id
+            ));
+            (operation, txn_id)
+        };
+
+        let (early, _) = looked_up();
+        assert!(!early.is_complete());
+        assert!(matches!(
+            early.finalize(),
+            Err(GetAttributesError::NotFinished)
+        ));
+
+        let (mut operation, txn_id) = looked_up();
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize().unwrap().location, Some(stored));
     }
 
     fn location() -> BackendLocation {
