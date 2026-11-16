@@ -8,6 +8,7 @@
 mod access_replication;
 mod audit_topology;
 mod auth_validation;
+mod blob_node;
 mod cold_start;
 mod compression_migration;
 mod convergence;
