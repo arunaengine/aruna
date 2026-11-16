@@ -17,7 +17,7 @@ use aruna_operations::node::startup::{RecoveryConfig, RecoveryStatus};
 use aruna_operations::plugins::artifacts::spawn_repair;
 use aruna_operations::plugins::worker::spawn_worker;
 use aruna_operations::s3::access::cutoff::spawn_cutoff_sweep;
-use aruna_operations::s3::session::spawn_session_sweep;
+use aruna_operations::s3::session::sweep::spawn_session_sweep;
 use aruna_operations::tasks::incoming::TaskQueues;
 use aruna_tasks::TaskHandle;
 use tracing::warn;

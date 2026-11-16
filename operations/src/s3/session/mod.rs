@@ -9,6 +9,7 @@ mod list;
 mod purge;
 mod refresh;
 mod revoke;
+pub mod sweep;
 mod touch;
 
 pub use create::{CreateS3Config, CreateS3Operation};
@@ -19,7 +20,6 @@ pub use refresh::{RefreshS3Config, RefreshS3Operation};
 pub use revoke::{RevokeS3Config, RevokeS3Operation};
 pub use touch::{TouchS3Config, TouchS3Operation};
 
-use crate::driver::{DriverContext, drive};
 use aruna_core::UserId;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{
@@ -28,7 +28,6 @@ use aruna_core::credential_encryption::{
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::types::{GroupId, Key, Value};
@@ -36,15 +35,12 @@ use byteview::ByteView;
 use rand::distr::Alphanumeric;
 use rand::{RngExt, rng};
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 pub const MAX_GROUP_SESSIONS: usize = 4;
 pub const PURGE_BATCH: usize = 256;
-const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const SIGNING_SECRET_LEN: usize = 30;
 const SESSION_TOKEN_LEN: usize = 64;
 
@@ -245,38 +241,10 @@ fn build_session(
     })
 }
 
-pub fn spawn_session_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
-    let token = shutdown.token();
-    shutdown.spawn(async move {
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => return,
-                _ = tokio::time::sleep(SWEEP_INTERVAL) => {}
-            }
-            loop {
-                match drive(
-                    PurgeSessionsOperation::new(SystemTime::now()),
-                    context.as_ref(),
-                )
-                .await
-                {
-                    Ok(result) if result.scanned == PURGE_BATCH && result.removed > 0 => {
-                        tokio::task::yield_now().await
-                    }
-                    Ok(_) => break,
-                    Err(error) => {
-                        warn!(error = ?error, "S3 session expiry sweep failed");
-                        break;
-                    }
-                }
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
     use crate::s3::access::list::{ListUserInput, ListUserOperation};
     use aruna_core::effects::StorageEffect;
@@ -285,6 +253,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::s3_session::SESSION_MAX_TTL;
     use aruna_storage::FjallStorage;
+    use std::time::Duration;
     use tempfile::TempDir;
     use ulid::Ulid;
 
