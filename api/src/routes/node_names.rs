@@ -268,6 +268,6 @@ fn map_name_error(error: NodeNameError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }

@@ -791,7 +791,7 @@ async fn load_bucket(
     {
         Ok(info) => Ok(info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -838,7 +838,7 @@ pub(crate) fn map_upload_error(error: CreateRoCrateError) -> ServerError {
         CreateRoCrateError::Blob(BlobError::HandleMissing) => {
             ServerError::ServiceUnavailableReason("blob storage is unavailable".to_string())
         }
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -880,7 +880,7 @@ fn map_head_error(error: HeadObjectError) -> ServerError {
         HeadObjectError::NoSuchKey
         | HeadObjectError::NoSuchVersion
         | HeadObjectError::DeleteMarker => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -893,7 +893,7 @@ fn map_source_error(error: HeadSourceError) -> ServerError {
             | SourceResolutionError::UnsupportedConnectorKind(_),
         ) => ServerError::BadRequest,
         HeadSourceError::Staging(_) => ServerError::BadGateway,
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

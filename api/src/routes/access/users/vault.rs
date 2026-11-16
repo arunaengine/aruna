@@ -91,7 +91,7 @@ fn map_read_error(error: ReadVaultError) -> ServerError {
         | ReadVaultError::RealmConfigMissing => {
             ServerError::ServiceUnavailableReason("vault_unavailable".to_string())
         }
-        error => ServerError::InternalError(error.to_string().into()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -122,7 +122,7 @@ fn map_route_error(error: VaultRouteError) -> ServerError {
             | AppendVaultError::PlacementFenced
             | AppendVaultError::RealmConfigMissing,
         ) => ServerError::ServiceUnavailableReason("vault_unavailable".to_string()),
-        error => ServerError::InternalError(error.to_string().into()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 

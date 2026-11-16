@@ -909,7 +909,7 @@ fn encode_report_cursor(
                 last_key,
             })
             .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
-            .map_err(|error| ServerError::InternalError(error.to_string().into()))
+            .map_err(|error| ServerError::InternalError(error.into()))
         })
         .transpose()
 }
@@ -971,10 +971,10 @@ pub(crate) fn map_submit_error(
                 UploadClaimError::WrongOwner => ServerError::Forbidden,
                 UploadClaimError::Expired => ServerError::BadRequestReason(error.to_string()),
                 UploadClaimError::AlreadyClaimed => ServerError::Conflict(error.to_string()),
-                other => ServerError::InternalError(other.to_string().into()),
+                other => ServerError::InternalError(other.into()),
             }
         }
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1596,7 +1596,7 @@ fn decode_report_row(
     let row = match kind {
         JobKind::ImportRoCrate => {
             let row: ImportReportRow = postcard::from_bytes(value)
-                .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+                .map_err(|error| ServerError::InternalError(error.into()))?;
             let visible_key = entry_key
                 .strip_prefix(&[SYSTEM_ENTRY_PREFIX])
                 .unwrap_or(entry_key);
@@ -1611,7 +1611,7 @@ fn decode_report_row(
         }
         JobKind::ExportRoCrate => {
             let row: ExportReportRow = postcard::from_bytes(value)
-                .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+                .map_err(|error| ServerError::InternalError(error.into()))?;
             if row.entry_key.as_bytes() != entry_key {
                 return Err(ServerError::InternalError(
                     "stored export report entry key does not match its row"
@@ -1625,7 +1625,7 @@ fn decode_report_row(
             use aruna_core::structs::execution::job::{SessionReportDetail, SessionReportRow};
 
             let row: SessionReportRow = postcard::from_bytes(value)
-                .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+                .map_err(|error| ServerError::InternalError(error.into()))?;
             if row.entry_key.as_bytes() != entry_key {
                 return Err(ServerError::InternalError(
                     "stored session report entry key does not match its row"
@@ -1656,7 +1656,7 @@ fn decode_report_row(
         }
         _ => return Err(ServerError::NotFound),
     };
-    row.map_err(|error| ServerError::InternalError(error.to_string().into()))
+    row.map_err(|error| ServerError::InternalError(error.into()))
 }
 
 #[utoipa::path(
@@ -1860,7 +1860,7 @@ fn artifact_headers(owned: &OwnedArtifact) -> ServerResult<HeaderMap> {
     headers.insert(
         ETAG,
         HeaderValue::from_str(&format!("\"{}\"", hex::encode(owned.blake3)))
-            .map_err(|error| ServerError::InternalError(error.to_string().into()))?,
+            .map_err(|error| ServerError::InternalError(error.into()))?,
     );
     let encoded = utf8_percent_encode(&owned.filename, NON_ALPHANUMERIC);
     let fallback = ascii_filename(&owned.filename);
@@ -1869,7 +1869,7 @@ fn artifact_headers(owned: &OwnedArtifact) -> ServerResult<HeaderMap> {
         HeaderValue::from_str(&format!(
             "attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
         ))
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?,
+        .map_err(|error| ServerError::InternalError(error.into()))?,
     );
     Ok(headers)
 }
@@ -1976,13 +1976,13 @@ async fn artifact_response(
     response_headers.insert(
         CONTENT_LENGTH,
         HeaderValue::from_str(&content_length.to_string())
-            .map_err(|error| ServerError::InternalError(error.to_string().into()))?,
+            .map_err(|error| ServerError::InternalError(error.into()))?,
     );
     if let Some(content_range) = content_range {
         response_headers.insert(
             CONTENT_RANGE,
             HeaderValue::from_str(&content_range)
-                .map_err(|error| ServerError::InternalError(error.to_string().into()))?,
+                .map_err(|error| ServerError::InternalError(error.into()))?,
         );
     }
     let body = if download && content_length > 0 {
@@ -2216,7 +2216,7 @@ pub async fn delete_job(
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
     let outcome = delete_owned_run(&state.get_ctx(), &auth, job_id)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     match outcome {
         RunDelete::Deleted => Ok(StatusCode::NO_CONTENT),
         RunDelete::Unrecorded(error) => Err(ServerError::ServiceUnavailableReason(format!(

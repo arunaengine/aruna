@@ -526,7 +526,7 @@ async fn canonicalize_watch_path(
             &key_prefix,
         )),
         Err(GetBucketError::NotFound) => Ok(path_prefix),
-        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 

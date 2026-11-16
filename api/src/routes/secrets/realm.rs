@@ -62,7 +62,7 @@ async fn records(state: &Arc<ServerState>) -> ServerResult<Vec<SecretRecord>> {
     .await
     .map_err(|error| match error {
         GetConfigError::DocumentNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     })?;
     Ok(config.secrets)
 }
@@ -103,7 +103,7 @@ fn realm_error(error: RealmSecretError) -> ServerError {
         RealmSecretError::Storage(StorageError::TransactionConflict) => ServerError::Conflict(
             "concurrent realm configuration update conflict; retry".to_string(),
         ),
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

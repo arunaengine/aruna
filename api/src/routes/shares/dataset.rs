@@ -196,8 +196,8 @@ async fn local_parts(
     let (record, jsonld) = export_here(state, dataset_reader(link, state), document_id)
         .await
         .map_err(|_| unavailable())?;
-    let rocrate: serde_json::Value = serde_json::from_str(&jsonld)
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    let rocrate: serde_json::Value =
+        serde_json::from_str(&jsonld).map_err(|error| ServerError::InternalError(error.into()))?;
     let (realm, node) = (state.get_realm_id(), state.get_node_id());
     let named = named_sets(&rocrate, &record.graph_iri, realm);
     let sets = member_sets(state, named).await;

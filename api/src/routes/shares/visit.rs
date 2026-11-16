@@ -189,7 +189,7 @@ pub(crate) fn visit_error(error: ShareError) -> ServerError {
         ),
         ShareError::Denied => ServerError::Forbidden,
         ShareError::Rule(error) => ServerError::BadRequestReason(error.to_string()),
-        error => ServerError::InternalError(error.to_string().into()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -237,7 +237,7 @@ pub(crate) fn event(action: ShareAction, key: Option<String>, ip: IpAddr) -> Sha
 async fn active_link(state: &ServerState, id: Ulid, now: u64) -> ServerResult<ShareLink> {
     let link = drive(GetShareOperation::new(id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|link| link.active(now))
         .ok_or_else(unavailable)?;
     // A deactivated creator ends every link at once.
@@ -401,7 +401,7 @@ pub async fn open_share(
         runtime.block_on(drive(OpenShareOperation::new(config), &context))
     })
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string().into()))?
+    .map_err(|error| ServerError::InternalError(error.into()))?
     .map_err(visit_error)?;
     let OpenedShare {
         link,
@@ -566,7 +566,7 @@ pub(crate) fn sign_ticket(
     };
     let ticket = link
         .ticket(&body)
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(TicketResponse {
         path: format!("/api/v1/shares/download?ticket={ticket}"),
         expires_at: rfc3339(expires_at),
@@ -591,7 +591,7 @@ pub(crate) async fn current_version(
             | HeadObjectError::NoSuchVersion
             | HeadObjectError::DeleteMarker,
         ) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 

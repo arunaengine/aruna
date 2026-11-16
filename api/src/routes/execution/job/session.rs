@@ -937,7 +937,7 @@ async fn bucket_info(
     match drive(GetBucketOperation::new(bucket.to_string()), context).await {
         Ok(info) => Ok(info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -1003,7 +1003,7 @@ async fn stage_one(
     }
     let realm_config = drive(GetConfigOperation::new(state.get_realm_id()), &context)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let input = CopyObjectInput {
         source_bucket: item.bucket,
         source_key: item.key,
@@ -1105,7 +1105,7 @@ fn head_error(error: HeadObjectError) -> ServerError {
         HeadObjectError::NoSuchKey
         | HeadObjectError::NoSuchVersion
         | HeadObjectError::DeleteMarker => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

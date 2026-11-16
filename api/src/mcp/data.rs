@@ -1462,7 +1462,7 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
         | PutObjectError::ImportRemoved
         | PutObjectError::VersionExists
         | PutObjectError::HistoryDeleted
-        | PutObjectError::FenceTaken) => ServerError::InternalError(error.to_string().into()),
+        | PutObjectError::FenceTaken) => ServerError::InternalError(error.into()),
     }
 }
 

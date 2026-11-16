@@ -76,7 +76,7 @@ pub(crate) const INTENT_HEADER: &str = "x-aruna-import-intent";
 const PUSH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) fn encode_header<T: Serialize>(value: &T) -> ServerResult<String> {
-    header_value(value).map_err(|e| ServerError::InternalError(e.to_string().into()))
+    header_value(value).map_err(|e| ServerError::InternalError(e.into()))
 }
 
 pub(crate) fn decode_header<T: DeserializeOwned>(
@@ -436,7 +436,7 @@ pub async fn push_export(
     }
     let url = url
         .join("metadata/rocrate/uploads")
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let blob = context
         .blob_handle
         .as_ref()

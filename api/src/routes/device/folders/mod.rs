@@ -209,7 +209,7 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
         | FolderError::DeleteObject(_)
         | FolderError::DeleteBucket(_)
         | FolderError::ListUploads(_)
-        | FolderError::AbortUpload(_) => ServerError::InternalError(error.to_string().into()),
+        | FolderError::AbortUpload(_) => ServerError::InternalError(error.into()),
     }
 }
 
@@ -229,7 +229,7 @@ fn map_offer_error(error: OfferedDirectoryError) -> ServerError {
             | StagingSourceError::AccessDenied
             | StagingSourceError::CheckError(_)),
         ) => ServerError::BadRequestReason(format!("the directory is unusable: {source}")),
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -243,7 +243,7 @@ fn map_action_error(error: ActionError) -> ServerError {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
         ActionError::Folder(folder) => map_folder_error(folder),
-        ActionError::Storage(error) => ServerError::InternalError(error.to_string().into()),
+        ActionError::Storage(error) => ServerError::InternalError(error.into()),
     }
 }
 

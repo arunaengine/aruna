@@ -269,7 +269,7 @@ fn map_publish_error(error: PublishError) -> ServerError {
         PublishError::Artifact(ArtifactError::Unavailable(_)) => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

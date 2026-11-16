@@ -122,7 +122,7 @@ impl RealmFederation {
             accepted_realms: AcceptedRealmsSetting::from(&settings.accepted_realms),
             descriptor: Some(
                 serde_json::to_value(&settings.descriptor)
-                    .map_err(|error| ServerError::InternalError(error.to_string().into()))?,
+                    .map_err(|error| ServerError::InternalError(error.into()))?,
             ),
         })
     }
@@ -149,7 +149,7 @@ async fn read_config(state: &ServerState) -> ServerResult<RealmConfigDocument> {
     .await
     .map_err(|error| match error {
         GetConfigError::DocumentNotFound => config_missing(),
-        error => ServerError::InternalError(error.to_string().into()),
+        error => ServerError::InternalError(error.into()),
     })
 }
 
@@ -159,9 +159,9 @@ fn settings_response(
 ) -> ServerResult<(HeaderMap, Json<RealmFederation>)> {
     let digest = settings
         .digest()
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let etag = HeaderValue::from_str(&format!("\"{digest}\""))
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok((
         HeaderMap::from_iter([(header::ETAG, etag)]),
         Json(RealmFederation::from_settings(settings)?),
@@ -430,7 +430,7 @@ fn map_federation_error(error: SetFederationError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -481,7 +481,7 @@ pub(crate) async fn descriptor_response(state: &ServerState) -> Response {
     {
         Ok(config) => config,
         Err(GetConfigError::DocumentNotFound) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return ServerError::InternalError(error.to_string().into()).into_response(),
+        Err(error) => return ServerError::InternalError(error.into()).into_response(),
     };
     let Some(settings) = config.federation else {
         return StatusCode::NOT_FOUND.into_response();

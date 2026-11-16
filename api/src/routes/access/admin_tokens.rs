@@ -150,7 +150,7 @@ fn map_tokens_error(error: GroupTokensError) -> ServerError {
                 .to_string(),
         ),
         GroupTokensError::Revocation(message) => map_revocation(message),
-        error => ServerError::InternalError(error.to_string().into()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -425,7 +425,7 @@ pub async fn revoke_user_tokens(
     .map_err(|error| match error {
         RevokeAllError::Refused => ServerError::Forbidden,
         RevokeAllError::Cutoff(message) => map_revocation(message),
-        error => ServerError::InternalError(error.to_string().into()),
+        error => ServerError::InternalError(error.into()),
     })?;
     Ok(StatusCode::NO_CONTENT)
 }

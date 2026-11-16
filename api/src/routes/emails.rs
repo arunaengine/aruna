@@ -228,7 +228,7 @@ fn map_error(error: EmailError) -> ServerError {
         EmailError::NotConfigured => ServerError::Conflict(error.to_string()),
         EmailError::Setting(error) => setting_error(error),
         EmailError::Storage(_) | EmailError::Conversion(_) => {
-            ServerError::InternalError(error.to_string().into())
+            ServerError::InternalError(error.into())
         }
     }
 }
@@ -239,7 +239,7 @@ pub(crate) fn setting_error(error: SettingError) -> ServerError {
         SettingError::Register(_) => ServerError::Conflict(error.to_string()),
         // The write is one local batch, so a failed one stored nothing.
         SettingError::Build(_) | SettingError::Storage(_) => {
-            ServerError::InternalError(error.to_string().into())
+            ServerError::InternalError(error.into())
         }
     }
 }

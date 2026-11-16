@@ -1226,7 +1226,7 @@ pub async fn list_references(
     // Denies and path restrictions below the bucket hide single keys from the page.
     let rules = permission_rules(&state.get_ctx(), &auth, &bucket_path)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
 
     let continuation_token = decode_reference_cursor(query.cursor.as_deref())?;
     let limit = query
@@ -1256,7 +1256,7 @@ pub async fn list_references(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
 
     let entries = result
         .objects
@@ -1487,7 +1487,7 @@ fn encode_reference_cursor(token: ListContinuationToken) -> ServerResult<String>
     token
         .to_bytes()
         .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))
+        .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 fn normalize_prefix(prefix: &str) -> ServerResult<String> {
@@ -1690,7 +1690,7 @@ async fn local_connector(
                  the same connector_id"
             ),
         )),
-        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -1787,7 +1787,7 @@ async fn resolve_quota_ceiling(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
+    .map_err(|err| ServerError::InternalError(err.into()))?;
     Ok(config.quota.effective_group_ceiling(&group_id))
 }
 
@@ -1829,7 +1829,7 @@ async fn load_bucket_info(state: &ServerState, bucket: &str) -> ServerResult<Buc
     {
         Ok(bucket_info) => Ok(bucket_info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.to_string().into())),
+        Err(err) => Err(ServerError::InternalError(err.into())),
     }
 }
 
@@ -1916,18 +1916,10 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
         MaterializeSnapshotError::Write(PutObjectError::QuotaExceeded { .. }) => {
             ServerError::Forbidden
         }
-        MaterializeSnapshotError::Write(error) => {
-            ServerError::InternalError(error.to_string().into())
-        }
-        MaterializeSnapshotError::Storage(error) => {
-            ServerError::InternalError(error.to_string().into())
-        }
-        MaterializeSnapshotError::Conversion(error) => {
-            ServerError::InternalError(error.to_string().into())
-        }
-        MaterializeSnapshotError::Routing(error) => {
-            ServerError::InternalError(error.to_string().into())
-        }
+        MaterializeSnapshotError::Write(error) => ServerError::InternalError(error.into()),
+        MaterializeSnapshotError::Storage(error) => ServerError::InternalError(error.into()),
+        MaterializeSnapshotError::Conversion(error) => ServerError::InternalError(error.into()),
+        MaterializeSnapshotError::Routing(error) => ServerError::InternalError(error.into()),
         // A node revalidating its inventory admits nothing governed; the client
         // learns only that this node is busy, never which rule applies.
         MaterializeSnapshotError::Gate(_) => ServerError::ServiceUnavailable,
@@ -1937,15 +1929,9 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
 fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
     match error {
         MaterializeReferenceError::Head(error) => map_head_error(error),
-        MaterializeReferenceError::Storage(error) => {
-            ServerError::InternalError(error.to_string().into())
-        }
-        MaterializeReferenceError::Conversion(error) => {
-            ServerError::InternalError(error.to_string().into())
-        }
-        MaterializeReferenceError::Usage(error) => {
-            ServerError::InternalError(error.to_string().into())
-        }
+        MaterializeReferenceError::Storage(error) => ServerError::InternalError(error.into()),
+        MaterializeReferenceError::Conversion(error) => ServerError::InternalError(error.into()),
+        MaterializeReferenceError::Usage(error) => ServerError::InternalError(error.into()),
         // A policy error names the ids it conflicts on, which a client must
         // never learn: the refusal is reported without them.
         MaterializeReferenceError::Policy(_) => ServerError::Forbidden,
@@ -1960,7 +1946,7 @@ fn map_head_error(error: HeadSourceError) -> ServerError {
     match error {
         HeadSourceError::Resolve(error) => map_resolution_error(error),
         HeadSourceError::Staging(error) => map_source_error(error),
-        _ => ServerError::InternalError(error.to_string().into()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 
@@ -1968,7 +1954,7 @@ fn map_read_error(error: ReadSourceError) -> ServerError {
     match error {
         ReadSourceError::Resolve(error) => map_resolution_error(error),
         ReadSourceError::Staging(error) => map_source_error(error),
-        _ => ServerError::InternalError(error.to_string().into()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 
@@ -1977,7 +1963,7 @@ fn map_resolution_error(error: SourceResolutionError) -> ServerError {
         SourceResolutionError::NotFound => ServerError::NotFound,
         SourceResolutionError::InvalidSourcePath
         | SourceResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
-        _ => ServerError::InternalError(error.to_string().into()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 
@@ -1992,7 +1978,7 @@ fn map_list_error(error: ListStagingError) -> ServerError {
     match error {
         ListStagingError::Resolve(error) => map_resolution_error(error),
         ListStagingError::Staging(error) => map_source_error(error),
-        _ => ServerError::InternalError(error.to_string().into()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 

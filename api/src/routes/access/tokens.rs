@@ -168,7 +168,7 @@ fn map_revoke_error(error: RevokeTokenError) -> ServerError {
             ServerError::ServiceUnavailableReason("token_revocation_capacity_reached".to_string())
         }
         RevokeTokenError::InvalidTokenExpiry => ServerError::BadRequest,
-        error => ServerError::InternalError(error.to_string().into()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 

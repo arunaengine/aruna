@@ -347,7 +347,7 @@ fn share_error(error: ShareError) -> ServerError {
         ShareError::Rule(error) => ServerError::BadRequestReason(error.to_string()),
         ShareError::Denied => ServerError::Forbidden,
         ShareError::Unavailable => ServerError::NotFound,
-        error => ServerError::InternalError(error.to_string().into()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -410,8 +410,8 @@ pub async fn create_share(
             let hash =
                 tokio::task::spawn_blocking(move || PasswordHash::new(&password, Kdf::SHARE, salt))
                     .await
-                    .map_err(|error| ServerError::InternalError(error.to_string().into()))?
-                    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+                    .map_err(|error| ServerError::InternalError(error.into()))?
+                    .map_err(|error| ServerError::InternalError(error.into()))?;
             Some(hash)
         }
         None => None,

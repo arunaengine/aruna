@@ -330,7 +330,7 @@ async fn attach_subject(
             UpdateUserError::StorageError(_) | UpdateUserError::PlacementFenced => {
                 ServerError::ServiceUnavailableReason(error.to_string())
             }
-            other => ServerError::InternalError(other.to_string().into()),
+            other => ServerError::InternalError(other.into()),
         })?;
     Ok(Json(user.into()))
 }

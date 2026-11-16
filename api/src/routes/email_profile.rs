@@ -163,7 +163,7 @@ pub async fn get_email_profile(
         .await
         .map_err(|error| match error {
             GetConfigError::DocumentNotFound => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string().into()),
+            other => ServerError::InternalError(other.into()),
         })?;
     let admin = config.email.is_some()
         && ensure_permission(
@@ -335,7 +335,7 @@ fn map_email_error(error: SetEmailError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

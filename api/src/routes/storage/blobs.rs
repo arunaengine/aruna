@@ -101,7 +101,7 @@ async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketIn
     {
         Ok(bucket_info) => Ok(bucket_info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.to_string().into())),
+        Err(err) => Err(ServerError::InternalError(err.into())),
     }
 }
 
@@ -239,7 +239,7 @@ pub async fn replicate_blob(
     let operation = QueueBlobOperation::new(input, None).with_plaintext(plaintext);
     let queue_result = drive(operation, &state.get_ctx())
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
+        .map_err(|err| ServerError::InternalError(err.into()))?;
     if !queue_result.scheduled {
         warn!(
             bucket = %response.bucket,
@@ -623,7 +623,7 @@ pub async fn blob_locations(
     .map_err(|error| match error {
         LocationSummaryError::Denied => ServerError::Forbidden,
         LocationSummaryError::BucketNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     })?;
     let Some(resolved) = local.summary.version_id else {
         let Some(coordinator) = copy_miss(&state, &info, &query.path, &headers).await? else {

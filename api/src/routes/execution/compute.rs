@@ -286,7 +286,7 @@ fn compute_config(body: ComputeConfigBody) -> ServerResult<RealmComputeConfig> {
 fn map_config_error(error: GetConfigError) -> ServerError {
     match error {
         GetConfigError::DocumentNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -517,7 +517,7 @@ fn map_compute_error(error: SetComputeError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -618,7 +618,7 @@ pub async fn get_compute_snapshots(
         .map_err(map_config_error)?;
     let members = config
         .node_ids()
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let documents = read_info_documents(&context, &members)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
@@ -666,7 +666,7 @@ pub async fn get_compute_snapshots(
             let quota = config
                 .compute
                 .effective_quota(&group_id)
-                .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+                .map_err(|error| ServerError::InternalError(error.into()))?;
             Some(GroupDemandBody {
                 group_id: group_id.to_string(),
                 demand: demand.into(),

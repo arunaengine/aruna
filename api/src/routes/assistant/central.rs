@@ -89,7 +89,7 @@ fn map_central_error(error: CentralStoreError) -> ServerError {
         CentralStoreError::Stale => {
             ServerError::Conflict("central assistant changed concurrently".to_string())
         }
-        error => ServerError::InternalError(error.to_string().into()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 

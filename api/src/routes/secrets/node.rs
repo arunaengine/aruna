@@ -74,7 +74,7 @@ async fn change(
 fn node_error(error: NodeSecretError) -> ServerError {
     match error {
         NodeSecretError::Change(error) => change_error(error),
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

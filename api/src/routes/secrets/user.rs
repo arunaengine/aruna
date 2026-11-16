@@ -291,12 +291,12 @@ pub async fn read_user_secret(
             OwnerSecretError::Storage(_) => {
                 ServerError::ServiceUnavailableReason("the audit row was not written".to_string())
             }
-            other => ServerError::InternalError(other.to_string().into()),
+            other => ServerError::InternalError(other.into()),
         })?;
     let key = RealmSealKey::derive(realm_signing_key);
     let bytes = open_value(&key, &state.get_realm_id(), &entry).map_err(owner_error)?;
-    let fields = SecretFields::decode(&bytes)
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    let fields =
+        SecretFields::decode(&bytes).map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(Json(SecretValueView {
         fields: (fields.names().zip(fields.values()))
             .map(|(name, value)| (name.to_string(), value.to_string()))

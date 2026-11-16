@@ -299,7 +299,7 @@ pub async fn start_login(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok((
         StatusCode::CREATED,
         Json(ChatgptLoginResponse {

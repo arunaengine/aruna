@@ -296,7 +296,7 @@ async fn realm_policies(
         Err(aruna_operations::realm::get_config::GetConfigError::DocumentNotFound) => {
             Ok(Vec::new())
         }
-        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -317,7 +317,7 @@ async fn group_policies(
             aruna_operations::groups::get_group::GetGroupError::GroupNotFound
             | aruna_operations::groups::get_group::GetGroupError::DocNotFound,
         ) => Ok(Vec::new()),
-        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -531,7 +531,7 @@ pub async fn set_realm_policies(
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     })?;
     crate::routes::storage::abe::epoch_due(&state, &auth, None).await;
 
@@ -710,7 +710,7 @@ pub async fn set_group_policies(
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     })?;
     crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
 

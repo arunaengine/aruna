@@ -186,7 +186,7 @@ pub async fn create_login_handoff(
         .map_err(|error| match error {
             IssueHandoffError::Refused | IssueHandoffError::Deactivated => ServerError::Forbidden,
             IssueHandoffError::Invalid(error) => ServerError::BadRequestReason(error.to_string()),
-            error => ServerError::InternalError(error.to_string().into()),
+            error => ServerError::InternalError(error.into()),
         })?;
     Ok(Json(signed))
 }
@@ -296,7 +296,7 @@ pub async fn create_federated_session(
                 ServerError::Refused(StatusCode::FORBIDDEN, "login_cut_off", error.to_string())
             }
             FederatedLoginError::Session(error) => map_create_error(error),
-            error => ServerError::InternalError(error.to_string().into()),
+            error => ServerError::InternalError(error.into()),
         })?;
     let account = created.session.user_id;
     info!(%handoff_id, %user_id, %account, "Federated login accepted");
@@ -332,7 +332,7 @@ async fn name_hint(state: &ServerState, name: &str) -> ServerResult<bool> {
     });
     let found = drive(search, &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(!found.users.is_empty())
 }
 

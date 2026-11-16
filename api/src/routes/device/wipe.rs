@@ -109,7 +109,7 @@ async fn wipe_device(
     .await
     .map_err(|error| match error {
         WipeDeviceError::ConfirmationMismatch => ServerError::BadRequestReason(error.to_string()),
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     })?;
     wipe.arm();
     // A backend this process cannot erase is known before the wipe runs, so the

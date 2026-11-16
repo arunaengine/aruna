@@ -355,7 +355,7 @@ fn map_store_error(error: ProviderStoreError) -> ServerError {
         ProviderStoreError::Stale => {
             ServerError::Conflict("provider changed concurrently".to_string())
         }
-        error => ServerError::InternalError(error.to_string().into()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
