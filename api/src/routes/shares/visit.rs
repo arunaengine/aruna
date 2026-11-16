@@ -46,7 +46,7 @@ use utoipa_axum::routes;
 use super::relay::{
     ShareRelay, UploadStream, counted_blob, member_error, share_access, upload_error,
 };
-use super::{ShareModeBody, log_event, rfc3339, unix_now};
+use super::{ShareModeBody, log_event, rfc3339};
 use crate::auth::ensure_permission_with;
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -58,6 +58,7 @@ use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::objects::page_error;
 use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::s3::object::pages::{self, ListRequest, PageError, PageScope};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -256,7 +257,7 @@ pub(crate) async fn visited_link(
     let ShareToken::Visit { expires_at, .. } = token else {
         return Err(unavailable());
     };
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let link = active_link(state, token.share_id(), now).await?;
     match link.admits(&token, now) {
         true => Ok((link, expires_at)),
@@ -389,7 +390,7 @@ pub async fn open_share(
     let config = OpenShareConfig {
         token,
         password: request.and_then(|Json(request)| request.password),
-        now: unix_now(),
+        now: unix_timestamp_secs(),
         entry_id: Ulid::generate(),
         client: client_network(ip),
     };
@@ -554,7 +555,7 @@ pub(crate) fn sign_ticket(
     (bucket, key): (&str, &str),
     version_id: Option<Ulid>,
 ) -> ServerResult<TicketResponse> {
-    let expires_at = (unix_now() + TICKET_SECS).min(visit_end);
+    let expires_at = (unix_timestamp_secs() + TICKET_SECS).min(visit_end);
     let body = TicketBody {
         share_id: link.id,
         bucket: bucket.to_string(),
@@ -710,7 +711,7 @@ pub async fn download_file(
     Query(query): Query<DownloadQuery>,
 ) -> ServerResult<Response> {
     let ip = visitor_ip(&state, peer, &headers);
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let share_id = ticket_share(&query.ticket).ok_or_else(unavailable)?;
     let link = active_link(&state, share_id, now).await?;
     let ticket = link
@@ -813,7 +814,7 @@ async fn claim_key(
     wanted: &str,
     user: &UserAccess,
 ) -> ServerResult<String> {
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let until = now + UPLOAD_SECS.as_secs();
     let mut number = 0;
     loop {

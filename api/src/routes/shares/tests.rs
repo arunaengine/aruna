@@ -481,8 +481,8 @@ async fn unique_upload_names() {
     let claim = aruna_operations::shares::names::ClaimNameOperation::new(
         BUCKET,
         "drop/a.txt",
-        unix_now(),
-        unix_now() + 60,
+        unix_timestamp_secs(),
+        unix_timestamp_secs() + 60,
     );
     assert!(drive(claim, &node.state.get_ctx()).await.unwrap());
     assert_eq!(
@@ -564,7 +564,7 @@ async fn visit_ends_ticket() {
         .await
         .unwrap()
         .unwrap();
-    let visit_end = unix_now() + 5;
+    let visit_end = unix_timestamp_secs() + 5;
     let short_visit = stored.visit_token(visit_end);
     let Json(ticket) = create_ticket(
         State(node.state.clone()),

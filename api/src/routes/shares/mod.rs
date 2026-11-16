@@ -11,6 +11,7 @@ use aruna_core::structs::storage::blob::{bucket_permission_path, object_permissi
 use aruna_core::structs::storage::share::{
     ShareAction, ShareEvent, ShareLink, ShareMode, ShareTarget, ShareUses,
 };
+use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::request_authorization::AuthorizeError;
 use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
@@ -211,10 +212,6 @@ pub struct ShareLogQuery {
     pub limit: Option<usize>,
 }
 
-pub(crate) fn unix_now() -> u64 {
-    Utc::now().timestamp().max(0) as u64
-}
-
 pub(crate) fn rfc3339(secs: u64) -> String {
     DateTime::<Utc>::from_timestamp(secs as i64, 0)
         .unwrap_or_default()
@@ -400,7 +397,7 @@ pub async fn create_share(
     Json(request): Json<CreateShareRequest>,
 ) -> ServerResult<(StatusCode, Json<ShareDetails>)> {
     let auth = require_creator(&state, auth)?;
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let password = match request.password.as_deref() {
         Some(password) if password.is_empty() || password.len() > MAX_PASSWORD => {
             return Err(ServerError::BadRequestReason(format!(
@@ -483,7 +480,7 @@ pub async fn list_shares(
         .await
         .map_err(store_error)?;
     let uses = link_uses(&state, &links).await?;
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let shares = links
         .iter()
         .zip(uses)
@@ -520,7 +517,7 @@ pub async fn get_share(
     let uses = link_uses(&state, std::slice::from_ref(&link)).await?;
     let uses = uses.first().copied().unwrap_or_default();
     Ok(Json(ShareDetails {
-        share: share_info(&link, uses, unix_now()),
+        share: share_info(&link, uses, unix_timestamp_secs()),
         token: link.link_token(),
     }))
 }
@@ -554,7 +551,7 @@ pub async fn revoke_share(
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_auth(&state, auth)?;
     let id = Ulid::from_string(&id).map_err(|_| ServerError::NotFound)?;
-    let revoke = RevokeShareOperation::new(auth.user_id, id, unix_now());
+    let revoke = RevokeShareOperation::new(auth.user_id, id, unix_timestamp_secs());
     drive(revoke, &state.get_ctx()).await.map_err(share_error)?;
     tracing::info!(share_id = %id, "Revoked share link");
     Ok(StatusCode::NO_CONTENT)

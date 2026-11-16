@@ -37,10 +37,11 @@ use crate::download::{self, AdmissionError, DownloadPermit};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
 use crate::routes::federation::import::shared_stream;
-use crate::routes::shares::{rfc3339, unix_now};
+use crate::routes::shares::rfc3339;
 use crate::routes::storage::objects::BearerRelay;
 use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
+use aruna_core::time::unix_timestamp_secs;
 
 /// Bytes buffered between the archive writer and the response body.
 const PIPE_BYTES: usize = 128 * 1024;
@@ -288,7 +289,7 @@ pub async fn create_link(
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let grant = token_grant(bearer.as_str()).map_err(|_| ServerError::Unauthorized)?;
     let entries = selection(request)?;
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let link = PendingLink {
         auth,
         grant,
@@ -333,7 +334,7 @@ pub async fn download_link(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<LinkQuery>,
 ) -> ServerResult<Response> {
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let links = state.archive_links();
     let creator = links
         .creator(&query.ticket, now)

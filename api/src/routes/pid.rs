@@ -162,8 +162,13 @@ async fn document_landing(
         if let Some(page) = page {
             return redirect(&page);
         }
-        if let Some(holder) =
-            choose_holder(ctx.as_ref(), state.get_node_id(), document_id, now_ms()).await
+        if let Some(holder) = choose_holder(
+            ctx.as_ref(),
+            state.get_node_id(),
+            document_id,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .await
         {
             let api = holder.urls.api.as_deref().unwrap_or_default();
             return redirect(&rocrate_url(api, document_id));
@@ -177,12 +182,6 @@ async fn document_landing(
 fn rocrate_url(api: &str, document_id: Ulid) -> String {
     let path = format!("/metadata/{document_id}/rocrate?here=true");
     crate::routes::storage::relay::relay_url(api, &path)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 #[utoipa::path(

@@ -1133,7 +1133,7 @@ mod global {
             session: None,
             object_id: id.clone(),
         };
-        let now = now_millis() / 1000;
+        let now = unix_timestamp_millis() / 1000;
         let ticket = issue_ticket(&node.state.get_ctx(), input, now).unwrap();
         let ticket = ticket.encode().unwrap();
         let first = download(&node, None, &id, Some(ticket.clone())).await;

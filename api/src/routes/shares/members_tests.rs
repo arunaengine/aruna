@@ -488,7 +488,7 @@ async fn ended_link_refused() {
         .await
         .unwrap()
         .unwrap();
-    stored.expires_at = Some(unix_now() - 1);
+    stored.expires_at = Some(unix_timestamp_secs() - 1);
     let Effect::Storage(write) = save_effect(&stored).unwrap() else {
         panic!("a link record is one storage write");
     };

@@ -381,7 +381,10 @@ async fn revoked_token_refused() {
     };
     let mut link = pending(&foreign, u64::MAX);
     link.auth = node.owner.clone();
-    let (ticket, _) = node.state.archive_links().create(link, unix_now());
+    let (ticket, _) = node
+        .state
+        .archive_links()
+        .create(link, unix_timestamp_secs());
     assert!(matches!(
         redeem(&node, &ticket).await,
         Err(ServerError::Unauthorized)
