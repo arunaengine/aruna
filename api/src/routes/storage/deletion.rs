@@ -332,7 +332,7 @@ pub async fn deletion_preflight(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let uploads = drive(
         ListUploadsOperation::new(ListUploadsInput {
             bucket: scope.bucket().to_string(),
@@ -346,7 +346,7 @@ pub async fn deletion_preflight(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
 
     let (items, versions_truncated, next_version_key, next_version_marker) =
         scoped_version_page(&scope, versions);
@@ -777,7 +777,7 @@ pub async fn delete_preview(
                 (cut, more) = (true, false);
                 break;
             }
-            Err(error) => return Err(ServerError::InternalError(error.to_string())),
+            Err(error) => return Err(ServerError::InternalError(error.to_string().into())),
         };
         let (page, truncated, next_key, next_version) = scoped_version_page(&scope, page);
         passed += page.len();
@@ -966,7 +966,7 @@ pub async fn control_purge(
     if record.state.is_terminal() {
         return Err(ServerError::Conflict("the purge already ended".to_string()));
     }
-    let failed = |error: String| ServerError::InternalError(error);
+    let failed = |error: String| ServerError::InternalError(error.into());
     let id = job_id.as_ulid();
     match action.as_str() {
         "pause" | "resume" => {
@@ -1097,7 +1097,7 @@ pub(crate) async fn bucket_info(
     {
         Ok(info) => Ok(info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
     }
 }
 
@@ -1177,7 +1177,7 @@ async fn list_sync_effects(
             &state.get_ctx(),
         )
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
         for relationship in relationships {
             if !seen.insert((relationship.id, label)) {
                 continue;

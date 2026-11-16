@@ -203,7 +203,7 @@ async fn may_read(
     let context = state.get_ctx();
     let access = BucketAccess::load(&context, auth, (realm_id, group_id, node_id), bucket)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     // A prefix shows only when the caller may read every key the job may touch below it.
     let path = path.as_deref().unwrap_or_default();
     Ok(match exact {

@@ -154,7 +154,7 @@ pub async fn get_source_health(
     .await
     .map_err(|error| match error {
         OriginError::BucketMissing | OriginError::VersionMissing => ServerError::NotFound,
-        OriginError::Storage(reason) => ServerError::InternalError(reason),
+        OriginError::Storage(reason) => ServerError::InternalError(reason.into()),
     })?;
     Ok(Json(SourceHealthResponse {
         sources: sources.into_iter().map(Into::into).collect(),

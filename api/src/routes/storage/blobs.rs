@@ -101,7 +101,7 @@ async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketIn
     {
         Ok(bucket_info) => Ok(bucket_info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
+        Err(err) => Err(ServerError::InternalError(err.to_string().into())),
     }
 }
 
@@ -239,7 +239,7 @@ pub async fn replicate_blob(
     let operation = QueueBlobOperation::new(input, None).with_plaintext(plaintext);
     let queue_result = drive(operation, &state.get_ctx())
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
     if !queue_result.scheduled {
         warn!(
             bucket = %response.bucket,
@@ -273,7 +273,7 @@ pub(crate) async fn plaintext_holder(
             "not_holder",
             format!("the caller holds no key of bucket {bucket}"),
         )),
-        Err(error) => Err(ServerError::InternalError(error)),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -623,7 +623,7 @@ pub async fn blob_locations(
     .map_err(|error| match error {
         LocationSummaryError::Denied => ServerError::Forbidden,
         LocationSummaryError::BucketNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     let Some(resolved) = local.summary.version_id else {
         let Some(coordinator) = copy_miss(&state, &info, &query.path, &headers).await? else {

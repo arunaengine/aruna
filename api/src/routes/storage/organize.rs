@@ -245,7 +245,7 @@ fn job_error(error: LinkedError) -> ServerError {
         LinkedError::Storage(aruna_core::errors::StorageError::TransactionConflict) => {
             ServerError::Conflict("the bucket job changed meanwhile; try again".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -838,10 +838,10 @@ async fn file_keys(
             value,
             ..
         }) => value,
-        other => return Err(ServerError::InternalError(format!("{other:?}"))),
+        other => return Err(ServerError::InternalError(format!("{other:?}").into())),
     };
     let row = row.as_deref().map(ImportedObject::from_bytes).transpose();
-    let row = row.map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let row = row.map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let mut keys: Vec<String> = row.and_then(|row| row.key).into_iter().collect();
     keys.extend(rule.aruna_key(path));
     // A pending write to the path names its key too.
@@ -862,7 +862,8 @@ async fn file_keys(
     }
     for (_, value) in intents {
         let intent = aruna_core::structs::storage::backend_import::WriteIntent::from_bytes(&value);
-        let intent = intent.map_err(|error| ServerError::InternalError(error.to_string()))?;
+        let intent =
+            intent.map_err(|error| ServerError::InternalError(error.to_string().into()))?;
         keys.push(intent.key);
     }
     // A pending write to the path names its key too.
@@ -883,7 +884,8 @@ async fn file_keys(
     }
     for (_, value) in intents {
         let intent = aruna_core::structs::storage::backend_import::WriteIntent::from_bytes(&value);
-        let intent = intent.map_err(|error| ServerError::InternalError(error.to_string()))?;
+        let intent =
+            intent.map_err(|error| ServerError::InternalError(error.to_string().into()))?;
         keys.push(intent.key);
     }
     match file_identity(rule, earlier, rules, path) {

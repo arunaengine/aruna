@@ -658,7 +658,9 @@ pub(crate) fn map_error(error: InstallError) -> ServerError {
             RecordError::Stale(_) | RecordError::StorageError(StorageError::TransactionConflict),
         ) => ServerError::Conflict(message),
         InstallError::Unavailable(_) => ServerError::ServiceUnavailableReason(message),
-        InstallError::Manifest(_) | InstallError::Record(_) => ServerError::InternalError(message),
+        InstallError::Manifest(_) | InstallError::Record(_) => {
+            ServerError::InternalError(message.into())
+        }
     }
 }
 
@@ -672,7 +674,7 @@ pub(crate) async fn refuse_plugin_account(
         Ok(true) => Err(ServerError::Conflict(
             "the account acts for a plugin install; change the install instead".into(),
         )),
-        Err(error) => Err(ServerError::InternalError(error)),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 

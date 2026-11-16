@@ -66,7 +66,7 @@ pub async fn get_portal_features(
         .await
         .map_err(|error| match error {
             GetConfigError::DocumentNotFound => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.to_string().into()),
         })?;
     Ok(Json(PortalFeatures {
         features: config.portal_features,
@@ -152,7 +152,7 @@ fn map_portal_error(error: SetPortalError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 

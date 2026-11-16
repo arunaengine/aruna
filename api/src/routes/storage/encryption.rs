@@ -265,7 +265,7 @@ pub(crate) fn key_refusal(error: &BucketKeyError) -> ServerError {
         BucketKeyError::Capacity => (StatusCode::SERVICE_UNAVAILABLE, "unlock_capacity"),
         BucketKeyError::InvalidDuration => (StatusCode::BAD_REQUEST, "invalid_duration"),
         BucketKeyError::ManagedLimit => (StatusCode::BAD_REQUEST, "managed_limit"),
-        BucketKeyError::Seal => return ServerError::InternalError(message),
+        BucketKeyError::Seal => return ServerError::InternalError(message.into()),
         BucketKeyError::Unsupported => (StatusCode::NOT_IMPLEMENTED, "not_supported"),
         BucketKeyError::InvalidToken => (StatusCode::FORBIDDEN, "invalid_token"),
     };
@@ -356,7 +356,7 @@ pub async fn list_bucket_tokens(
     let operation = ListTokensOperation::new(bucket_id, std::time::SystemTime::now());
     let entries = drive(operation, &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let active = snapshot.settings.active_key();
     let tokens = entries
         .into_iter()
@@ -396,7 +396,7 @@ pub(crate) fn blob_refusal(error: BlobError) -> ServerError {
         BlobError::SizeLimitExceeded { limit } => {
             refused(StatusCode::CONFLICT, "object_too_large", &too_large(limit))
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -410,7 +410,7 @@ pub(crate) fn settings_refusal(error: SettingsError) -> ServerError {
     match error {
         SettingsError::NoSuchBucket | SettingsError::GroupMismatch => ServerError::NotFound,
         SettingsError::MissingAuthority => ServerError::ServiceUnavailable,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -431,7 +431,7 @@ pub(crate) async fn bucket_group(state: &ServerState, bucket: &str) -> ServerRes
     .map(|info| info.group_id)
     .map_err(|error| match error {
         GetBucketError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })
 }
 
@@ -456,7 +456,7 @@ pub(crate) async fn read_snapshot(
         .map_err(|error| match error {
             KeyStatusError::Settings(error) => settings_refusal(error),
             KeyStatusError::Blob(error) => blob_refusal(error),
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.to_string().into()),
         })
 }
 
@@ -905,7 +905,7 @@ async fn set_unlock_limit(
             UnlockLimitError::Key(error) => key_refusal(&error),
             UnlockLimitError::NotEncrypted => not_encrypted(),
             UnlockLimitError::NotAdmin => ServerError::Forbidden,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.to_string().into()),
         })
 }
 
@@ -985,7 +985,7 @@ fn change_refusal(error: ChangeError) -> ServerError {
             "the key holders do not meet the recovery rule",
         ),
         ChangeError::TransitionRunning => transition_running(),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -1066,7 +1066,7 @@ pub(crate) fn enable_refusal(error: EnableError) -> ServerError {
             "mapped_bucket",
             aruna_operations::groups::imports::MAPPED_REASON,
         ),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 

@@ -300,7 +300,7 @@ async fn owner_change(
 fn owner_error(error: OwnerSecretError) -> ServerError {
     match error {
         OwnerSecretError::Change(error) => change_error(error),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 

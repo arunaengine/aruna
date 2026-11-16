@@ -253,7 +253,7 @@ async fn link_uses(state: &ServerState, links: &[ShareLink]) -> ServerResult<Vec
 }
 
 fn store_error(error: impl std::fmt::Display) -> ServerError {
-    ServerError::InternalError(error.to_string())
+    ServerError::InternalError(error.to_string().into())
 }
 
 /// Only a full portal or API session may act for its user beyond its own lifetime.
@@ -347,7 +347,7 @@ fn share_error(error: ShareError) -> ServerError {
         ShareError::Rule(error) => ServerError::BadRequestReason(error.to_string()),
         ShareError::Denied => ServerError::Forbidden,
         ShareError::Unavailable => ServerError::NotFound,
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -410,8 +410,8 @@ pub async fn create_share(
             let hash =
                 tokio::task::spawn_blocking(move || PasswordHash::new(&password, Kdf::SHARE, salt))
                     .await
-                    .map_err(|error| ServerError::InternalError(error.to_string()))?
-                    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                    .map_err(|error| ServerError::InternalError(error.to_string().into()))?
+                    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
             Some(hash)
         }
         None => None,

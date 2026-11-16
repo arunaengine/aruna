@@ -248,7 +248,7 @@ async fn prune_stale_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
     let now = now_timestamp();
     let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
 
     for secret in secrets {
         if secret.record.expires_at < now
@@ -382,7 +382,7 @@ pub async fn create_onboarding_secret(
     };
     let encoded_secret = onboarding_secret
         .encode()
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
     let record = OnboardingSecretRecord {
         enrollment_id: onboarding_secret.enrollment_id,
         secret_hash: onboarding_secret.secret_hash(),
@@ -443,8 +443,8 @@ async fn seed_url(state: &Arc<ServerState>, requested: String) -> ServerResult<S
 /// app and the portal wizard both parse: scheme `aruna`, host `enroll`, and the
 /// query keys `secret`, `seed` and `realm`.
 fn enroll_url(secret: &str, seed_url: &str, realm_id: RealmId) -> ServerResult<String> {
-    let mut url =
-        Url::parse("aruna://enroll").map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let mut url = Url::parse("aruna://enroll")
+        .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
     url.query_pairs_mut()
         .append_pair("secret", secret)
         .append_pair("seed", seed_url)
@@ -504,7 +504,7 @@ pub async fn list_onboarding_secrets(
     prune_stale_secrets(&state).await?;
     let mut secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
     secrets.sort_by_key(|entry| entry.record.expires_at);
 
     Ok((
@@ -612,7 +612,7 @@ pub async fn get_secret_status(
     let caller = auth.clone().ok_or(ServerError::Unauthorized)?;
     let entry = drive(ListSecretsOperation::new(), &state.get_ctx())
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?
+        .map_err(|err| ServerError::InternalError(err.to_string().into()))?
         .into_iter()
         .find(|entry| entry.record.enrollment_id == enrollment_id)
         .ok_or(ServerError::NotFound)?;
@@ -778,7 +778,7 @@ pub async fn bootstrap_onboarding(
 
     let bootstrap_endpoint = state
         .bootstrap_endpoint()
-        .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
+        .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string().into()))?;
     let wrapped_management_key = if matches!(record.mode, OnboardingMode::Management) {
         Some(wrap_realm_key(
             &state,
@@ -881,7 +881,7 @@ async fn realm_endpoints(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
     Ok(declared_endpoints(&config, &joiner.to_string()))
 }
 
@@ -911,7 +911,7 @@ fn map_consume_error(error: ConsumeSecretError) -> ServerError {
         | ConsumeSecretError::Expired
         | ConsumeSecretError::AlreadyClaimed
         | ConsumeSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -948,7 +948,7 @@ fn map_finalize_error(error: BootstrapFinalizeError) -> ServerError {
         }
         BootstrapFinalizeError::ReservedNodeLabel(label) => ServerError::ReservedLabel(label),
         BootstrapFinalizeError::LongNodeLocation => ServerError::BadRequest,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -958,7 +958,7 @@ fn map_inspect_error(error: InspectSecretError) -> ServerError {
         | InspectSecretError::Expired
         | InspectSecretError::AlreadyClaimed
         | InspectSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -973,14 +973,14 @@ fn map_create_error(error: CreateSecretError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
 fn map_delete_error(error: DeleteSecretError) -> ServerError {
     match error {
         DeleteSecretError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -1054,7 +1054,7 @@ fn wrap_realm_key(
     let nonce = SalsaBox::generate_nonce(&mut CryptoOsRng);
     let ciphertext = cipher
         .encrypt(&nonce, realm_key_pem.as_bytes())
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
 
     Ok((
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ciphertext),

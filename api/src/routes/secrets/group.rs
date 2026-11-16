@@ -123,7 +123,8 @@ pub async fn create_group_secret(
     }
     let (create, _) = owner_create(request)?;
     let stored = owner_change(&state, &auth, secret_owner, create, false).await?;
-    let entry = stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string()))?;
+    let entry =
+        stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string().into()))?;
     Ok((StatusCode::CREATED, Json(entry_view(entry))))
 }
 

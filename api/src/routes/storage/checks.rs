@@ -153,7 +153,7 @@ async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::U
     .await;
     info.map(|info| info.group_id).map_err(|error| match error {
         GetBucketError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })
 }
 
@@ -289,7 +289,7 @@ async fn visible_page(
             }
             next = Some(
                 key.to_bytes()
-                    .map_err(|e| ServerError::InternalError(e.to_string()))?,
+                    .map_err(|e| ServerError::InternalError(e.to_string().into()))?,
             );
             broken.push(BrokenFile {
                 key: key.key,
@@ -382,7 +382,7 @@ pub async fn start_bucket_check(
         .await
         .map_err(|error| match error {
             StartCheckError::NoSuchBucket => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.to_string().into()),
         })?;
     Ok((StatusCode::ACCEPTED, Json(record.into())))
 }

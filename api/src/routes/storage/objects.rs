@@ -160,7 +160,7 @@ pub(crate) fn page_error(error: PageError<ServerError>) -> ServerError {
         PageError::Cursor => ServerError::BadRequestReason(error.to_string()),
         PageError::Unanswered { .. } => ServerError::ServiceUnavailableReason(error.to_string()),
         PageError::Guard(error) => map_guard_error(error),
-        PageError::Internal(error) => ServerError::InternalError(error),
+        PageError::Internal(error) => ServerError::InternalError(error.into()),
         PageError::Relay(error) => error,
     }
 }

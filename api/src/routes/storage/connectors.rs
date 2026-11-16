@@ -1221,7 +1221,7 @@ async fn connector_has_secret(state: &ServerState, connector_id: Ulid) -> Server
 }
 
 fn map_secret_error(error: HasConfigError) -> ServerError {
-    ServerError::InternalError(error.to_string())
+    ServerError::InternalError(error.to_string().into())
 }
 
 fn map_connector_response(
@@ -1249,12 +1249,12 @@ fn map_create_error(error: SourceConnectorError) -> ServerError {
     match error {
         SourceConnectorError::ValidationError(_) => ServerError::BadRequest,
         SourceConnectorError::IdTaken => ServerError::Conflict(error.to_string()),
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.to_string().into()),
     }
 }
 
 fn map_connector_list(error: ListSourceError) -> ServerError {
-    ServerError::InternalError(error.to_string())
+    ServerError::InternalError(error.to_string().into())
 }
 
 fn map_get_error(
@@ -1264,7 +1264,9 @@ fn map_get_error(
         GetSourceError::NotFound => ServerError::NotFound,
         GetSourceError::StorageError(_)
         | GetSourceError::ConversionError(_)
-        | GetSourceError::GetConnectorFailed => ServerError::InternalError(error.to_string()),
+        | GetSourceError::GetConnectorFailed => {
+            ServerError::InternalError(error.to_string().into())
+        }
     }
 }
 
@@ -1276,7 +1278,7 @@ fn map_replace_error(error: ReplaceSourceError) -> ServerError {
         ReplaceSourceError::ReferencesPending => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -1287,7 +1289,7 @@ fn map_delete_error(error: DeleteSourceError) -> ServerError {
         DeleteSourceError::ReferencesPending => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -1296,7 +1298,7 @@ fn map_resolution_error(error: SourceResolutionError) -> ServerError {
         SourceResolutionError::NotFound => ServerError::NotFound,
         SourceResolutionError::InvalidSourcePath
         | SourceResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -1310,7 +1312,7 @@ fn map_list_error(error: ListStagingError) -> ServerError {
             reason,
         )) => ServerError::BadRequestReason(reason),
         ListStagingError::Staging(error) => ServerError::BadGatewayReason(error.to_string()),
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.to_string().into()),
     }
 }
 

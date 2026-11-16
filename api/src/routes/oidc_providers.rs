@@ -214,7 +214,7 @@ fn map_provider_error(error: SetProviderError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 

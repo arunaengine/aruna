@@ -114,9 +114,9 @@ pub struct CheckResponse {
 fn kind_view(descriptor: &KindDescriptor) -> ServerResult<RepositoryKindResponse> {
     let rules = descriptor
         .rules()
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let targets = serde_json::to_value(&rules.targets)
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let profiles = descriptor
         .profiles
         .iter()

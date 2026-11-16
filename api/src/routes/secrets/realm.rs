@@ -62,7 +62,7 @@ async fn records(state: &Arc<ServerState>) -> ServerResult<Vec<SecretRecord>> {
     .await
     .map_err(|error| match error {
         GetConfigError::DocumentNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     Ok(config.secrets)
 }
@@ -103,7 +103,7 @@ fn realm_error(error: RealmSecretError) -> ServerError {
         RealmSecretError::Storage(StorageError::TransactionConflict) => ServerError::Conflict(
             "concurrent realm configuration update conflict; retry".to_string(),
         ),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -234,7 +234,8 @@ pub async fn create_realm_secret(
 ) -> ServerResult<(StatusCode, Json<SecretView>)> {
     let auth = manager(&state, auth).await?;
     let stored = change(&state, &auth, create_change(request)?).await?;
-    let info = stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string()))?;
+    let info =
+        stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string().into()))?;
     Ok((StatusCode::CREATED, Json(view(info))))
 }
 

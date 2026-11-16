@@ -74,7 +74,7 @@ async fn change(
 fn node_error(error: NodeSecretError) -> ServerError {
     match error {
         NodeSecretError::Change(error) => change_error(error),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -198,7 +198,8 @@ pub async fn create_node_secret(
 ) -> ServerResult<(StatusCode, Json<SecretView>)> {
     let auth = manager(&state, auth).await?;
     let stored = change(&state, &auth, create_change(request)?).await?;
-    let info = stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string()))?;
+    let info =
+        stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string().into()))?;
     Ok((StatusCode::CREATED, Json(view(info))))
 }
 

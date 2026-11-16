@@ -166,7 +166,7 @@ pub(super) fn map_error(error: ImportRuleError) -> ServerError {
         ImportRuleError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
         ImportRuleError::NotFound => ServerError::NotFound,
         ImportRuleError::Forbidden => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -871,7 +871,7 @@ pub async fn get_renames(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let last = status.filter(|record| record.moving && record.prefix == rule.key_prefix);
     let (files, plan) = (found.entries.into_iter(), found.plan);
     Ok(Json(ImportRenamesResponse {

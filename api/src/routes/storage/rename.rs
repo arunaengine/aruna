@@ -107,7 +107,7 @@ pub(super) fn map_error(error: RenameError) -> ServerError {
         RenameError::Storage(StorageError::TransactionConflict) => {
             ServerError::Conflict("the bucket changed during the rename; try again".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -130,7 +130,7 @@ async fn authorize(
     {
         Ok(info) => info.group_id,
         Err(GetBucketError::NotFound) => return Err(ServerError::NotFound),
-        Err(other) => return Err(ServerError::InternalError(other.to_string())),
+        Err(other) => return Err(ServerError::InternalError(other.to_string().into())),
     };
     ensure_group_admin(state, &auth, group_id).await?;
     let path = bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket);

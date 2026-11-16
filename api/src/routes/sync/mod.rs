@@ -458,7 +458,7 @@ pub async fn create_sync(
     let context = state.get_ctx();
     stage_mirror_reconcile(&context, &relationship)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     if let Err(error) = create_mirror(
         &state,
         &auth,
@@ -846,7 +846,7 @@ pub async fn update_sync(
     let context = state.get_ctx();
     stage_mirror_reconcile(&context, &relationship)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     if let Err(error) = create_mirror(
         &state,
         &auth,
@@ -942,7 +942,7 @@ pub async fn run_sync(
         let context = state.get_ctx();
         if !store_sync_status(&context, &relationship)
             .await
-            .map_err(|error| ServerError::InternalError(error.to_string()))?
+            .map_err(|error| ServerError::InternalError(error.to_string().into()))?
         {
             return Err(ServerError::NotFound);
         }
@@ -1002,13 +1002,13 @@ pub async fn delete_sync(
     let context = state.get_ctx();
     stage_mirror_delete(&context, &relationship)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     match direction {
         // References retain a serving stub for target-held data; other modes are removed.
         SyncRelationshipDirection::Outgoing => {
             remove_outgoing_relationship(&context, relationship.clone())
                 .await
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
         }
         SyncRelationshipDirection::Incoming => {
             delete_relationship(&state, relationship.clone(), direction).await?;
@@ -1072,7 +1072,7 @@ async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketIn
     {
         Ok(bucket_info) => Ok(bucket_info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
     }
 }
 
@@ -1239,7 +1239,7 @@ fn map_create_error(error: SyncRelationshipError) -> ServerError {
         SyncRelationshipError::RolledBack => ServerError::BadGatewayReason(
             "the target did not confirm the mirror and it was rolled back".to_string(),
         ),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -1274,7 +1274,7 @@ async fn queue_relationship(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     Ok(result.queued)
 }
 
@@ -1288,7 +1288,7 @@ async fn store_relationship(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))
 }
 
 async fn delete_relationship(
@@ -1301,7 +1301,7 @@ async fn delete_relationship(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))
 }
 
 async fn list_relationships(
@@ -1314,7 +1314,7 @@ async fn list_relationships(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))
 }
 
 /// Detached stubs only keep retained reference data readable; the management
@@ -1338,7 +1338,7 @@ async fn get_relationship(
     .await
     .map_err(|error| match error {
         SyncRelationshipError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })
     .and_then(visible)
 }
@@ -1359,14 +1359,14 @@ async fn load_relationship(
                 .await
                 .map(|relationship| (relationship, SyncRelationshipDirection::Incoming))
         }
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
     }
 }
 
 async fn load_job_stats(state: &ServerState, id: Ulid) -> ServerResult<(usize, Option<u64>)> {
     let (pending, oldest) = relationship_job_stats(&state.get_ctx(), id)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     Ok((
         pending,
         oldest.map(|oldest| unix_timestamp_millis().saturating_sub(oldest)),
@@ -1471,7 +1471,7 @@ async fn annotate(
     response.plaintext = consent.map_err(ServerError::InternalError)?.is_some();
     let awaiting = awaiting_jobs(&context, id).await;
     response.status.awaiting_key =
-        awaiting.map_err(|error| ServerError::InternalError(error.to_string()))?;
+        awaiting.map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     Ok(())
 }
 

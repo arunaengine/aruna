@@ -88,7 +88,7 @@ fn map_error(error: ImportRuleError) -> ServerError {
         ImportRuleError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
         ImportRuleError::NotFound => ServerError::NotFound,
         ImportRuleError::Forbidden => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 

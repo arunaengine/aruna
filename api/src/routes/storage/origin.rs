@@ -550,7 +550,7 @@ async fn origin_answer(
     let view = view.map_err(|error| match (error, stale) {
         (OriginError::VersionMissing, Some(range_id)) => stale_miss(range_id),
         (OriginError::BucketMissing | OriginError::VersionMissing, _) => ServerError::NotFound,
-        (OriginError::Storage(reason), _) => ServerError::InternalError(reason),
+        (OriginError::Storage(reason), _) => ServerError::InternalError(reason.into()),
     })?;
     let version_id = view.version_id;
     let token = forwarded_auth_token(bearer.clone())?;
@@ -986,12 +986,12 @@ pub async fn get_bucket_runs(
     let context = state.get_ctx();
     let access = BucketAccess::load(&context, &auth, (realm_id, info.group_id, node_id), &bucket)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     // A file the caller may not read, as a listing hides it, names no run.
     let read = |key: &str| access.allows(Some(key), &Permission::READ);
     let found = bucket_runs(context.as_ref(), &bucket, &params.prefix, read)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let runs = found.run_ids.iter().map(|run_id| BucketRunBody {
         run_id: run_id.to_string(),
     });

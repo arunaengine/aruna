@@ -121,8 +121,12 @@ async fn authorize_quarantine_admin(
 
 fn map_admin_error(error: QuarantineAdminError) -> ServerError {
     match error {
-        QuarantineAdminError::Storage(error) => ServerError::InternalError(error.to_string()),
-        QuarantineAdminError::Conversion(error) => ServerError::InternalError(error.to_string()),
+        QuarantineAdminError::Storage(error) => {
+            ServerError::InternalError(error.to_string().into())
+        }
+        QuarantineAdminError::Conversion(error) => {
+            ServerError::InternalError(error.to_string().into())
+        }
         QuarantineAdminError::Unexpected { .. } => ServerError::ServiceUnavailable,
     }
 }

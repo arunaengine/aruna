@@ -305,7 +305,7 @@ pub(in crate::routes) fn link_error(error: LinkError) -> ServerError {
         LinkError::ForeignToken
         | LinkError::Storage(_)
         | LinkError::Conversion(_)
-        | LinkError::Unexpected(_) => ServerError::InternalError(error.to_string()),
+        | LinkError::Unexpected(_) => ServerError::InternalError(error.to_string().into()),
     }
 }
 

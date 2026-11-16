@@ -78,7 +78,7 @@ async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::U
     .await;
     info.map(|info| info.group_id).map_err(|error| match error {
         GetBucketError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })
 }
 
@@ -152,7 +152,7 @@ pub async fn get_bucket_move(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let last = status.filter(|record| record.moving);
     Ok(Json(BucketMoveResponse {
         bucket,
@@ -277,7 +277,7 @@ pub(crate) fn move_refusal(error: StartMoveError) -> ServerError {
             "bucket_encrypted",
             "an encrypted bucket keeps its stored files where they are".to_string(),
         ),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 

@@ -196,7 +196,7 @@ fn start_export(caller: Caller, start: Start) -> ServerResult<Response> {
             "attachment; filename=\"provenance.zip\"",
         )
         .body(Body::from_stream(body))
-        .map_err(|error| ServerError::InternalError(error.to_string()))
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))
 }
 
 enum Start {
@@ -545,7 +545,7 @@ async fn release_crate(
     match read_crate(context.as_ref(), read).await {
         Ok(found) if found.metadata.contains_key(RELEASE_TAG) => {
             serde_json::from_slice(&found.bytes)
-                .map_err(|error| ServerError::InternalError(error.to_string()))
+                .map_err(|error| ServerError::InternalError(error.to_string().into()))
         }
         Ok(_) | Err(CrateReadError::Missing) => Err(ServerError::NotFound),
         Err(CrateReadError::Failed(reason)) => Err(ServerError::ServiceUnavailableReason(reason)),
@@ -582,7 +582,8 @@ async fn remote_crate(
             break;
         }
     }
-    serde_json::from_slice(&bytes).map_err(|error| ServerError::InternalError(error.to_string()))
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))
 }
 
 fn holder_silent() -> ServerError {
@@ -618,7 +619,8 @@ fn classify(answer: ServerResult<serde_json::Value>) -> Read {
 }
 
 fn to_value(answer: &impl serde::Serialize) -> ServerResult<serde_json::Value> {
-    serde_json::to_value(answer).map_err(|error| ServerError::InternalError(error.to_string()))
+    serde_json::to_value(answer)
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))
 }
 
 /// A run crate read under the token as it holds now, checked again after the run read;
@@ -644,7 +646,9 @@ async fn crate_document(caller: &Caller, auth: &AuthContext, document_id: &str) 
     .await;
     classify(answer.and_then(|(_, Json(answer))| match answer {
         MetadataRoCrateResponse::Projected(projected) => Ok(projected.rocrate),
-        MetadataRoCrateResponse::Raw(_) => Err(ServerError::InternalError("raw view".to_string())),
+        MetadataRoCrateResponse::Raw(_) => {
+            Err(ServerError::InternalError("raw view".to_string().into()))
+        }
     }))
 }
 

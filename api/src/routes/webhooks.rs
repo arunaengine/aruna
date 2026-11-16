@@ -213,7 +213,7 @@ fn map_error(error: WebhookError) -> ServerError {
     match error {
         WebhookError::InvalidUrl => ServerError::BadRequestReason(error.to_string()),
         WebhookError::Setting(error) => setting_error(error),
-        WebhookError::Conversion(_) => ServerError::InternalError(error.to_string()),
+        WebhookError::Conversion(_) => ServerError::InternalError(error.to_string().into()),
     }
 }
 

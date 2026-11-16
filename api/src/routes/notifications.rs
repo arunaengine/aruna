@@ -199,7 +199,7 @@ pub struct CreateWatchRequest {
 fn map_dispatch_error(error: NotificationDispatchError, operation: &str) -> ServerError {
     match error {
         NotificationDispatchError::Unavailable => ServerError::ServiceUnavailable,
-        NotificationDispatchError::Internal(reason) => ServerError::InternalError(reason),
+        NotificationDispatchError::Internal(reason) => ServerError::InternalError(reason.into()),
         NotificationDispatchError::Remote(reason) => {
             warn!(operation, reason = %reason, "notification holder proxy failed");
             ServerError::BadGateway
@@ -216,7 +216,7 @@ fn map_watch_error(error: WatchDispatchError, operation: &str) -> ServerError {
         // A holder-side denial answers exactly as the create-time check does, so
         // an unreadable path never separates into a distinct existence signal.
         WatchDispatchError::Unauthorized(_) => ServerError::Forbidden,
-        WatchDispatchError::Internal(reason) => ServerError::InternalError(reason),
+        WatchDispatchError::Internal(reason) => ServerError::InternalError(reason.into()),
         WatchDispatchError::Remote(reason) => {
             warn!(operation, reason = %reason, "notification holder proxy failed");
             ServerError::BadGateway
@@ -493,7 +493,7 @@ async fn authorize_watch(
         }
         Err(error) => {
             record_watch_denial(state, WatchMetricReason::AuthorizationUnavailable);
-            Err(ServerError::InternalError(error))
+            Err(ServerError::InternalError(error.into()))
         }
     }
 }
@@ -526,7 +526,7 @@ async fn canonicalize_watch_path(
             &key_prefix,
         )),
         Err(GetBucketError::NotFound) => Ok(path_prefix),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
     }
 }
 

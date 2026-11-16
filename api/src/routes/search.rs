@@ -1121,7 +1121,7 @@ async fn run_groups(
             &state.get_ctx(),
         )
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
         let raw_next = output.next_start_after;
         let total = output.groups.len();
         for (index, group) in output.groups.into_iter().enumerate() {
@@ -1192,7 +1192,7 @@ async fn run_users(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
     Ok(Some(UsersSection {
         hits: output
             .users

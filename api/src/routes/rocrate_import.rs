@@ -243,7 +243,7 @@ pub async fn upload_rocrate(
     };
     let expires_at_ms = aruna_core::time::unix_timestamp_millis()
         .checked_add(state.rocrate_limits().upload_retention_ms)
-        .ok_or_else(|| ServerError::InternalError("upload expiry overflow".to_string()))?;
+        .ok_or_else(|| ServerError::InternalError("upload expiry overflow".to_string().into()))?;
     let owner_node_url = timeout_at(deadline, owner_node_url(&state))
         .await
         .map_err(|_| {
@@ -286,7 +286,7 @@ pub(crate) fn upload_response(
     let timestamp = i64::try_from(record.expires_at_ms)
         .ok()
         .and_then(DateTime::<Utc>::from_timestamp_millis)
-        .ok_or_else(|| ServerError::InternalError("upload expiry is invalid".to_string()))?;
+        .ok_or_else(|| ServerError::InternalError("upload expiry is invalid".to_string().into()))?;
     Ok(UploadRoCrateResponse {
         upload_id: record.upload_id.to_string(),
         blake3: hex::encode(record.blake3),
@@ -791,7 +791,7 @@ async fn load_bucket(
     {
         Ok(info) => Ok(info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
     }
 }
 
@@ -838,7 +838,7 @@ pub(crate) fn map_upload_error(error: CreateRoCrateError) -> ServerError {
         CreateRoCrateError::Blob(BlobError::HandleMissing) => {
             ServerError::ServiceUnavailableReason("blob storage is unavailable".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -880,7 +880,7 @@ fn map_head_error(error: HeadObjectError) -> ServerError {
         HeadObjectError::NoSuchKey
         | HeadObjectError::NoSuchVersion
         | HeadObjectError::DeleteMarker => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -893,7 +893,7 @@ fn map_source_error(error: HeadSourceError) -> ServerError {
             | SourceResolutionError::UnsupportedConnectorKind(_),
         ) => ServerError::BadRequest,
         HeadSourceError::Staging(_) => ServerError::BadGateway,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -917,7 +917,11 @@ pub(crate) async fn owner_node_url(state: &ServerState) -> ServerResult<String> 
         .rest
         .map(|rest| rest.api_base_url)
         .ok_or_else(|| {
-            ServerError::InternalError("REST interface public URL is unavailable".to_string())
+            ServerError::InternalError(
+                "REST interface public URL is unavailable"
+                    .to_string()
+                    .into(),
+            )
         })
 }
 

@@ -382,7 +382,7 @@ async fn named_refs(
 ) -> ServerResult<Vec<PolicyRefBody>> {
     let names = drive(PolicyNamesOperation::new(realm_id, &refs), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     Ok(refs
         .into_iter()
         .map(|policy_ref| {
@@ -459,7 +459,7 @@ fn decode_cursor(cursor: Option<String>) -> ServerResult<Option<aruna_core::type
 fn policy_response(document: &PlacementPolicyDocument) -> ServerResult<PolicyResponse> {
     let policy_ref = document
         .policy_ref()
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     Ok(PolicyResponse {
         policy_id: policy_ref.policy_id.to_string(),
         digest: hex::encode(policy_ref.digest),
@@ -507,7 +507,7 @@ fn map_read_error(error: ReadPolicyError) -> ServerError {
         ReadPolicyError::Authority(_) => {
             ServerError::ServiceUnavailableReason("placement_policy_unverified".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -523,7 +523,7 @@ fn map_default_error(error: PutPlacementError) -> ServerError {
         }
         PutPlacementError::Policy(_) => policy_denied(),
         PutPlacementError::ForeignPolicy { .. } => foreign_policy(),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -544,7 +544,7 @@ fn map_successor_error(error: SuccessorError) -> ServerError {
             ServerError::ServiceUnavailableReason("placement_subject_drift".to_string())
         }
         SuccessorError::Gate(error) => map_gate_error(error),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -603,7 +603,7 @@ fn map_gate_error(error: PolicyGateError) -> ServerError {
         | PolicyGateError::Read(_) => {
             ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -615,7 +615,7 @@ fn map_mutation_error(error: PolicyMutationError) -> ServerError {
         }
         PolicyMutationError::Successor(error) => map_successor_error(error),
         PolicyMutationError::ForeignPolicy { .. } => foreign_policy(),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -628,7 +628,7 @@ fn map_bulk_error(error: BulkError) -> ServerError {
         BulkError::Distribution(error) => {
             crate::routes::storage::distributed::map_guard_error(error)
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -691,7 +691,7 @@ async fn local_subject(
 ) -> ServerResult<aruna_core::structs::placement::policy::PlacementSubject> {
     let gate = gate_context(&state.get_ctx(), realm_id, now_ms())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
         .ok_or_else(|| ServerError::ServiceUnavailableReason("no_placement_subject".to_string()))?;
     if !gate.admitting {
         return Err(ServerError::ServiceUnavailableReason(
@@ -713,7 +713,7 @@ async fn bucket_info(
     {
         Ok(info) => Ok(info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
     }
 }
 
@@ -950,7 +950,7 @@ pub async fn list_placement_policies(
     .await
     .map_err(|error| match error {
         ListPoliciesError::Unauthorized => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     Ok(Json(PolicyListResponse {
         policies: page
@@ -1190,7 +1190,7 @@ pub async fn get_object_placement(
     .await
     .map_err(|error| match error {
         ObjectPlacementError::NoSuchKey => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     });
     if matches!(placement, Err(ServerError::NotFound))
         && let Some(coordinator) = copy_miss(&state, &info, &query.key, &headers).await?
@@ -1666,7 +1666,7 @@ async fn coverage_here(
         CoverageError::Distribution(error) => {
             crate::routes::storage::distributed::map_guard_error(error)
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     Ok(coverage_response(bucket, report))
 }
@@ -1807,7 +1807,7 @@ pub async fn get_placement_diagnostics(
     .await
     .map_err(|error| match error {
         DiagnosticsError::Unauthorized => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     Ok(Json(DiagnosticsResponse {
         subject_generation: report.subject.as_ref().map(|subject| subject.generation),
@@ -1946,7 +1946,7 @@ pub async fn resolve_placement_quarantine(
     .await
     .map_err(|error| match error {
         QuarantineError::Unauthorized => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     Ok(Json(QuarantineResolveResponse {
         released: resolution.released,

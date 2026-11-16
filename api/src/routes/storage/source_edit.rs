@@ -128,7 +128,7 @@ async fn authorize(
     {
         Ok(info) => info,
         Err(GetBucketError::NotFound) => return Err(ServerError::NotFound),
-        Err(other) => return Err(ServerError::InternalError(other.to_string())),
+        Err(other) => return Err(ServerError::InternalError(other.to_string().into())),
     };
     let path = bucket_permission_path(
         state.get_realm_id(),
@@ -177,7 +177,7 @@ async fn edit(
         Err(error @ (SourceEditError::BucketChanged | SourceEditError::ConnectorChanged)) => {
             Err(ServerError::Conflict(error.to_string()))
         }
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
     }
 }
 
@@ -251,7 +251,7 @@ pub async fn add_sources(
     let connector = match drive(GetSourceOperation::new(input), &state.get_ctx()).await {
         Ok(found) => found.connector,
         Err(GetSourceError::NotFound) => return Err(ServerError::NotFound),
-        Err(error) => return Err(ServerError::InternalError(error.to_string())),
+        Err(error) => return Err(ServerError::InternalError(error.to_string().into())),
     };
     let mapping = SourceMapping {
         connector_id,
@@ -266,7 +266,7 @@ pub async fn add_sources(
     );
     let rules = permission_rules(&state.get_ctx(), &auth, &read_root)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let change = SourceChange::Add {
         mapping,
         connector,

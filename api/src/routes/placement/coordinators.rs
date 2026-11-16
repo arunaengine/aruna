@@ -38,7 +38,7 @@ impl SpreadCursor {
 
     fn encode(&self) -> ServerResult<String> {
         let bytes = serde_json::to_vec(self)
-            .map_err(|error| ServerError::InternalError(error.to_string()))?;
+            .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
         Ok(hex::encode(bytes))
     }
 }

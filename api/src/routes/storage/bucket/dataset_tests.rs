@@ -178,7 +178,7 @@ fn keeps_uncertain_links() {
     }
     for unknown in [
         ServerError::ServiceUnavailableReason("publisher node is unreachable".to_string()),
-        ServerError::InternalError("status".to_string()),
+        ServerError::InternalError("status".to_string().into()),
     ] {
         assert!(!refused(&unknown), "{unknown:?}");
     }
