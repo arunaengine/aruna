@@ -551,12 +551,7 @@ async fn rescue_displaced(spool: &Path, target: &Path) -> Result<(), PlaceError>
         ));
     };
     let relative = target.to_string_lossy().to_string();
-    let stamp = conflict_stamp(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_millis() as u64)
-            .unwrap_or_default(),
-    );
+    let stamp = conflict_stamp(aruna_core::time::unix_timestamp_millis());
     for attempt in 1..=MAX_COPY_ATTEMPTS {
         let candidate = parent.join(copy_name(&relative, &stamp, attempt));
         if place_new(spool, &candidate).is_ok() {

@@ -584,10 +584,7 @@ async fn emit_replication_watch(
         return;
     }
     let size_bytes = manifest.blob.as_ref().map_or(0, |blob| blob.size);
-    let occurred_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let occurred_at_ms = aruna_core::time::unix_timestamp_millis();
     emit_watch_event(
         context,
         WatchEvent {

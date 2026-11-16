@@ -20,6 +20,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, ResolvedBackend,
 };
 use aruna_core::structs::storage::format::{Compression, StoredFormat, StoredLayout};
+use aruna_core::time::unix_timestamp_millis;
 use bytes::Bytes;
 use futures::StreamExt;
 use opendal::{ErrorKind, Operator};
@@ -567,9 +568,7 @@ impl BlobHandler {
         let space = BLOB_CLEANUP_KEYSPACE.to_string();
         let effect = match upload {
             Some((location, upload_id)) => {
-                let since_ms = SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| since.as_millis() as u64);
+                let since_ms = unix_timestamp_millis();
                 let work = BlobCleanupWork::SettleUpload {
                     attempt,
                     location: location.clone(),
