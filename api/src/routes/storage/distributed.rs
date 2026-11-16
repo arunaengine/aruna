@@ -31,6 +31,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::routing::ensure_group_admin;
+use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::bucket::usage::range_sizes;
@@ -705,12 +706,11 @@ pub(super) fn admission_example() -> serde_json::Value {
 )]
 pub async fn create_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(group_id): Path<Ulid>,
     Json(request): Json<CreateDistributedRequest>,
 ) -> ServerResult<(StatusCode, Json<AdmissionResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     ensure_group_admin(&state, &auth, group_id).await?;
     let input = create_input(group_id, request)?;
     let bearer = crate::metadata::forwarded_auth_token(bearer)?;
@@ -749,11 +749,10 @@ pub async fn create_distributed(
 )]
 pub async fn retry_admission(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<Json<AdmissionResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     ensure_group_admin(&state, &auth, group_id).await?;
     owned_status(&state, group_id, set_id).await?;
     let sizes = range_sizes(&state, bearer.as_ref(), set_id).await?;
@@ -816,10 +815,9 @@ pub(crate) async fn owned_status(
 )]
 pub async fn get_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<Json<DistributedResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let mut status = owned_status(&state, group_id, set_id).await?;
     let path = bucket_permission_path(
         state.get_realm_id(),

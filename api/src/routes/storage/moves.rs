@@ -4,10 +4,10 @@
 
 use super::compression::MigrationProgress;
 use super::routing::ensure_group_admin;
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::format::CompressionMigration;
 use aruna_operations::blob::migration::misplaced::count_misplaced;
@@ -15,9 +15,9 @@ use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::s3::bucket::compression::MigrationStatusOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::storage_move::{StartMoveError, StartMoveOperation};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
@@ -130,11 +130,10 @@ async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::U
 )]
 pub async fn get_bucket_move(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Query(query): Query<BucketMoveQuery>,
 ) -> ServerResult<Json<BucketMoveResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = bucket_group(&state, &bucket).await?;
     let path = bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), &bucket);
     crate::auth::ensure_permission(&state, &auth, path, Permission::READ).await?;
@@ -219,11 +218,10 @@ pub async fn get_bucket_move(
 )]
 pub async fn start_bucket_move(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     request: Option<Json<BucketMoveRequest>>,
 ) -> ServerResult<(StatusCode, Json<BucketMoveStarted>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let prefix = request
         .map(|Json(request)| request.prefix)
         .unwrap_or_default();

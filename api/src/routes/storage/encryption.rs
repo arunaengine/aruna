@@ -5,7 +5,7 @@
 
 use super::abe::ScopeView;
 use super::routing::ensure_group_admin;
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::BlobError;
@@ -44,9 +44,9 @@ use aruna_operations::s3::key_status::{
 use aruna_operations::s3::unlock_limit::{
     UnlockLimitError, UnlockLimitInput, UnlockLimitOperation,
 };
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
@@ -336,10 +336,9 @@ owning group's admin path.
 )]
 pub async fn list_bucket_tokens(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<TokenListView>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = bucket_group(&state, &bucket).await?;
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;
     if !is_holder(&snapshot, auth.user_id) {
@@ -710,10 +709,9 @@ pub(crate) async fn current_status(
 )]
 pub async fn get_bucket_encryption(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<EncryptionStatus>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = bucket_group(&state, &bucket).await?;
     ensure_bucket_read(&state, &auth, group_id, &bucket).await?;
     let status = current_status(&state, bucket, group_id, auth.user_id).await?;
@@ -758,11 +756,10 @@ pub async fn get_bucket_encryption(
 )]
 pub async fn put_bucket_encryption(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Json(request): Json<EncryptionRequest>,
 ) -> ServerResult<Json<EncryptionStatus>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = bucket_group(&state, &bucket).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;

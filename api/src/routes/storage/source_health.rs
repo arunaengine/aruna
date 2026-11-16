@@ -4,18 +4,19 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_operations::s3::object::origin::{OriginError, SourceHealth, source_health};
+use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
@@ -125,11 +126,10 @@ impl From<SourceHealth> for SourceHealthBody {
 )]
 pub async fn get_source_health(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Query(params): Query<SourceHealthParams>,
 ) -> ServerResult<Json<SourceHealthResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let path = object_permission_path(
         state.get_realm_id(),

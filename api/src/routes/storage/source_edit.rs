@@ -17,15 +17,16 @@ use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::source::edit::{
     SourceChange, SourceEditError, SourceEditInput, SourceEditOperation, SourceEditResult,
 };
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -109,13 +110,9 @@ impl From<SourceEditResult> for SourceEditResponse {
 /// coordinators change its rows.
 async fn authorize(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     bucket: &str,
 ) -> ServerResult<(AuthContext, BucketInfo)> {
-    let auth = require_realm_auth(state, auth)?;
-    if auth.path_restrictions.is_some() {
-        return Err(ServerError::Forbidden);
-    }
     let info = match drive(
         GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
@@ -232,7 +229,7 @@ A version whose new source the caller may not read, or whose new path is not can
 )]
 pub async fn add_sources(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<AddSourcesRequest>,
 ) -> ServerResult<Json<SourceEditResponse>> {
@@ -314,7 +311,7 @@ pub async fn add_sources(
 )]
 pub async fn remove_sources(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<RemoveSourcesRequest>,
 ) -> ServerResult<Json<SourceEditResponse>> {

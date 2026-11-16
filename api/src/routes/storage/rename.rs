@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::routing::ensure_group_admin;
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
@@ -14,8 +15,8 @@ use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::rename::{
     RenameError, RenameInput, RenameItem, RenamePlan, authorized_rename,
 };
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -111,13 +112,9 @@ pub(super) fn map_error(error: RenameError) -> ServerError {
 /// A restricted token could reach keys outside its paths, so it is refused.
 async fn authorize(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     bucket: &str,
 ) -> ServerResult<(AuthContext, ulid::Ulid)> {
-    let auth = require_realm_auth(state, auth)?;
-    if auth.path_restrictions.is_some() {
-        return Err(ServerError::Forbidden);
-    }
     let group_id = match drive(
         GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
@@ -214,7 +211,7 @@ fn rename_input(
 )]
 pub async fn preview_rename(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<RenamePreviewRequest>,
 ) -> ServerResult<Json<RenameResponse>> {
@@ -285,7 +282,7 @@ pub async fn preview_rename(
 )]
 pub async fn rename_keys(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<RenameRequest>,
 ) -> ServerResult<Json<RenameResponse>> {

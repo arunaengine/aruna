@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::auth::{parse_group_id, require_realm_auth, require_unrestricted_auth};
+use crate::auth::parse_group_id;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::SourceResolutionError;
@@ -39,9 +40,9 @@ use aruna_operations::staging::check_source::CheckSourceOperation;
 use aruna_operations::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation,
 };
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -352,11 +353,10 @@ pub struct ListSourceResponse {
 )]
 pub async fn create_source_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<CreateConnectorRequest>,
 ) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let chosen_id = request.connector_id.as_deref().map(parse_connector_id);
     let chosen_id = chosen_id.transpose()?;
@@ -438,10 +438,9 @@ pub async fn create_source_connector(
 )]
 pub async fn list_source_connectors(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ListSourceResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
 
@@ -522,10 +521,9 @@ pub async fn list_source_connectors(
 )]
 pub async fn get_source_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
@@ -642,11 +640,10 @@ pub async fn get_source_connector(
 )]
 pub async fn replace_source_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
     Json(request): Json<ReplaceConnectorRequest>,
 ) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
@@ -728,10 +725,9 @@ pub async fn replace_source_connector(
 )]
 pub async fn delete_source_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
@@ -831,11 +827,10 @@ because the body carries credentials the node then opens a connection with.
 )]
 pub async fn check_source_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<SourceConnectorRequest>,
 ) -> ServerResult<Json<ConnectorCheckResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
@@ -920,10 +915,9 @@ mean the stored record must be replaced."#,
 )]
 pub async fn check_stored_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
 ) -> ServerResult<Json<ConnectorCheckResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
@@ -1037,11 +1031,10 @@ path.
 )]
 pub async fn list_connector_entries(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
     Query(query): Query<ConnectorEntriesQuery>,
 ) -> ServerResult<Json<ConnectorEntriesResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;

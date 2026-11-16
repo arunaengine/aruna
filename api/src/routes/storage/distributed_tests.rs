@@ -12,6 +12,7 @@ use aruna_operations::distribution::status::{
 use aruna_operations::replication::members::CopyLag;
 
 use super::*;
+use crate::auth::RealmAuth;
 
 fn node_text(seed: u8) -> String {
     iroh::SecretKey::from_bytes(&[seed; 32])
@@ -443,7 +444,7 @@ mod routes {
     ) -> ServerResult<Json<DistributedResponse>> {
         get_distributed(
             State(node.state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Path((group_id, set_id)),
         )
         .await
@@ -537,7 +538,7 @@ mod routes {
         let retry = |auth: &AuthContext, set_id: Ulid| {
             retry_admission(
                 State(node.state.clone()),
-                Extension(Some(auth.clone())),
+                RealmAuth(auth.clone()),
                 Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
                 Path((node.group_id, set_id)),
             )
@@ -561,7 +562,7 @@ mod routes {
         let create = |auth: &AuthContext, request: CreateDistributedRequest| {
             create_distributed(
                 State(node.state.clone()),
-                Extension(Some(auth.clone())),
+                RealmAuth(auth.clone()),
                 Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
                 Path(node.group_id),
                 Json(request),

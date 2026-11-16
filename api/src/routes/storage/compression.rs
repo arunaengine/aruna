@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::routing::ensure_group_admin;
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
 use aruna_operations::driver::{drive, now_ms};
@@ -16,9 +16,9 @@ use aruna_operations::s3::bucket::compression::{
 };
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::key_status::bucket_settings;
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -181,10 +181,9 @@ impl TryFrom<BucketCompressionRequest> for Compression {
 )]
 pub async fn get_bucket_compression(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketCompressionResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = drive(GetBucketOperation::new(bucket.clone()), &state.get_ctx())
         .await
         .map_err(|error| match error {
@@ -268,11 +267,10 @@ pub async fn get_bucket_compression(
 )]
 pub async fn put_bucket_compression(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Json(request): Json<BucketCompressionRequest>,
 ) -> ServerResult<Json<BucketCompressionResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let compression = Compression::try_from(request)?;
     let group_id = drive(GetBucketOperation::new(bucket.clone()), &state.get_ctx())
         .await

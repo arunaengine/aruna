@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::routing::ensure_group_admin;
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -14,9 +14,9 @@ use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::storage_check::{StartCheckError, StartCheckOperation};
 use aruna_operations::s3::object::delete::DeleteObjectInput;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
@@ -222,11 +222,10 @@ async fn ensure_bucket(
 )]
 pub async fn get_bucket_check(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Query(query): Query<BucketCheckQuery>,
 ) -> ServerResult<Json<BucketCheckResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let limit = query.limit.unwrap_or(100);
     if !(1..=PAGE_MAX).contains(&limit) {
         return Err(ServerError::BadRequestReason(
@@ -365,10 +364,9 @@ async fn visible(
 )]
 pub async fn start_bucket_check(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<(StatusCode, Json<CheckProgress>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = bucket_group(&state, &bucket).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
     let operation = StartCheckOperation::new(bucket, group_id, now_ms());
@@ -420,11 +418,10 @@ on the owning group's admin path, as for the bucket's storage settings.
 )]
 pub async fn clean_bucket_check(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Query(query): Query<CleanupQuery>,
 ) -> ServerResult<Json<BucketCleanupResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let after = parse_after(query.after.as_deref())?;
     let group_id = bucket_group(&state, &bucket).await?;
     ensure_bucket(&state, &auth, &bucket, group_id, Permission::WRITE).await?;

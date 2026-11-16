@@ -27,7 +27,8 @@ use super::distributed::{
     admission_response, behaviour, map_create_error, node, owned_status, settings_of, strategy,
 };
 use super::routing::ensure_group_admin;
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::bucket::usage::range_sizes;
 use crate::server::state::ServerState;
@@ -141,11 +142,10 @@ fn change_response(set_id: Ulid, revision: DistributionRevision) -> ChangeRespon
 /// The caller after the group admin check, with the bearer token the publisher checks again.
 async fn admin(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     bearer: Option<ValidatedBearer>,
     (group_id, set_id): (Ulid, Ulid),
 ) -> ServerResult<(AuthContext, Option<aruna_operations::metadata::AuthToken>)> {
-    let auth = require_realm_auth(state, auth)?;
     ensure_group_admin(state, &auth, group_id).await?;
     owned_status(state, group_id, set_id).await?;
     let bearer = crate::metadata::forwarded_auth_token(bearer)?;
@@ -202,7 +202,7 @@ async fn admin(
 )]
 pub async fn join_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
     Json(request): Json<JoinRequest>,
@@ -261,7 +261,7 @@ pub async fn join_distributed(
 )]
 pub async fn leave_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id, member_id)): Path<(Ulid, Ulid, Ulid)>,
 ) -> ServerResult<Json<ChangeResponse>> {
@@ -318,7 +318,7 @@ pub async fn leave_distributed(
 )]
 pub async fn copy_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
     Json(request): Json<CopyRequest>,
@@ -383,7 +383,7 @@ pub async fn copy_distributed(
 )]
 pub async fn split_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
     Json(request): Json<SplitRequest>,
@@ -451,7 +451,7 @@ pub async fn split_distributed(
 )]
 pub async fn transfer_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
     Json(request): Json<TransferRequest>,
@@ -506,7 +506,7 @@ pub async fn transfer_distributed(
 )]
 pub async fn settings_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
     Json(request): Json<SettingsRequest>,
@@ -551,7 +551,7 @@ pub async fn settings_distributed(
 )]
 pub async fn delete_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<(StatusCode, Json<ChangeResponse>)> {
