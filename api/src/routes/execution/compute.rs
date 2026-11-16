@@ -512,11 +512,7 @@ fn map_compute_error(error: SetComputeError) -> ServerError {
         SetComputeError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
             "concurrent realm configuration update conflict; retry".to_string(),
         ),
-        SetComputeError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        SetComputeError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }
 }

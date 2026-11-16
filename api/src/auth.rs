@@ -5,7 +5,7 @@
 use crate::error::{OidcError, ServerError, ServerResult, TokenError};
 use crate::server::state::ServerState;
 use crate::telemetry::record_auth_context;
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission, TokenClaims};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::blob::object_permission_path;
@@ -636,12 +636,7 @@ pub(crate) async fn ensure_permission_with(
 /// fault stays internal, and only real denials become `Forbidden`.
 pub(crate) fn map_authorize_error(error: AuthorizeError) -> ServerError {
     match error {
-        AuthorizeError::Storage(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        AuthorizeError::Storage(error) => ServerError::InternalError(error.into()),
+        AuthorizeError::Storage(error) => error.into(),
         AuthorizeError::CheckFailed(message) => ServerError::InternalError(message.into()),
         AuthorizeError::PermissionDenied | AuthorizeError::Policy(_) => ServerError::Forbidden,
     }

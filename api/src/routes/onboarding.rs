@@ -931,11 +931,7 @@ fn map_finalize_error(error: BootstrapFinalizeError) -> ServerError {
         BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(
             StorageError::TransactionConflict,
         )) => ServerError::Conflict("concurrent enrollment conflict; retry".to_string()),
-        BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(
-            StorageError::CleanupCapacity,
-        )) => ServerError::ServiceUnavailableReason(
-            "storage cleanup capacity exhausted; retry".to_string(),
-        ),
+        BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(error)) => error.into(),
         BootstrapFinalizeError::Consume(error) => map_consume_error(error),
         BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::DeletionPending) => {
             ServerError::Conflict("group deletion is pending; retry enrollment".into())
@@ -968,11 +964,7 @@ fn map_create_error(error: CreateSecretError) -> ServerError {
         CreateSecretError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent enrollment secret conflict; retry".to_string())
         }
-        CreateSecretError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        CreateSecretError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }
 }

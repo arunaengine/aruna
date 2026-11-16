@@ -159,11 +159,7 @@ fn map_admin_error(error: SetAdminError) -> ServerError {
         SetAdminError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
             "concurrent realm authorization update conflict; retry".to_string(),
         ),
-        SetAdminError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        SetAdminError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }
 }

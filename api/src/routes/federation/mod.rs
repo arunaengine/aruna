@@ -425,11 +425,7 @@ fn map_federation_error(error: SetFederationError) -> ServerError {
         SetFederationError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm federation update conflict; retry".to_string())
         }
-        SetFederationError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        SetFederationError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }
 }

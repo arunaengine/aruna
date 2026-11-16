@@ -6,7 +6,6 @@ use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::groups::refuse_group_edit;
 use crate::server::state::ServerState;
-use aruna_core::errors::StorageError;
 use aruna_core::request_policy::{
     CompiledPolicySet, PolicyDecision, PolicyKind, PolicyRequest, PolicySession, PolicyTraceEntry,
     RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
@@ -526,11 +525,7 @@ pub async fn set_realm_policies(
         SetPoliciesError::StaleHash => {
             ServerError::Conflict("stored realm policy set changed".to_string())
         }
-        SetPoliciesError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        SetPoliciesError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     })?;
     crate::routes::storage::abe::epoch_due(&state, &auth, None).await;
@@ -705,11 +700,7 @@ pub async fn set_group_policies(
         SetGroupError::StaleHash => {
             ServerError::Conflict("stored group policy set changed".to_string())
         }
-        SetGroupError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        SetGroupError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     })?;
     crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;

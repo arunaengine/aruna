@@ -134,11 +134,7 @@ fn map_promote_error(error: PromoteNodeError) -> ServerError {
         PromoteNodeError::Ensure(EnsureConfigError::StorageError(
             StorageError::TransactionConflict,
         )) => ServerError::Conflict("concurrent realm configuration update; retry".to_string()),
-        PromoteNodeError::Ensure(EnsureConfigError::StorageError(
-            StorageError::CleanupCapacity,
-        )) => ServerError::ServiceUnavailableReason(
-            "storage cleanup capacity exhausted; retry".to_string(),
-        ),
+        PromoteNodeError::Ensure(EnsureConfigError::StorageError(error)) => error.into(),
         other => ServerError::InternalError(other.into()),
     }
 }

@@ -1950,11 +1950,7 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
         HandleAllocationError::Storage(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent placement provisioning conflict; retry".to_string())
         }
-        HandleAllocationError::Storage(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        HandleAllocationError::Storage(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }
 }
@@ -1982,11 +1978,7 @@ fn map_placement_error(error: MutatePlacementError) -> ServerError {
         MutatePlacementError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm placement update conflict; retry".to_string())
         }
-        MutatePlacementError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        MutatePlacementError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }
 }
@@ -2124,11 +2116,7 @@ fn map_quota_error(error: SetQuotaError) -> ServerError {
         SetQuotaError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm quota update conflict; retry".to_string())
         }
-        SetQuotaError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        SetQuotaError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }
 }

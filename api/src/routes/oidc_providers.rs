@@ -209,11 +209,7 @@ fn map_provider_error(error: SetProviderError) -> ServerError {
         SetProviderError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
             "concurrent realm configuration update conflict; retry".to_string(),
         ),
-        SetProviderError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        SetProviderError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }
 }

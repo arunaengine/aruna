@@ -330,11 +330,7 @@ fn map_email_error(error: SetEmailError) -> ServerError {
         SetEmailError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
             "concurrent realm configuration update conflict; retry".to_string(),
         ),
-        SetEmailError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        SetEmailError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }
 }

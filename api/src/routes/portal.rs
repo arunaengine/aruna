@@ -147,11 +147,7 @@ fn map_portal_error(error: SetPortalError) -> ServerError {
         SetPortalError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
             "concurrent realm configuration update conflict; retry".to_string(),
         ),
-        SetPortalError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
+        SetPortalError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }
 }
