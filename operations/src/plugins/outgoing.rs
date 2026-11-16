@@ -25,7 +25,7 @@ use crate::driver::DriverContext;
 type Pairs<'a> = &'a [(String, String)];
 
 /// The request a run asks for, with the connection's address resolved from the settings the run
-/// was admitted with; a work row keeps it, so its job needs no run.
+/// was admitted with; a work row keeps it, so its job needs no run. No credential header is kept.
 pub fn request_context(
     manifest: &Manifest,
     (connection, method): (&str, Method),
@@ -42,7 +42,10 @@ pub fn request_context(
         method: method.as_str().to_string(),
         path: path.to_string(),
         query: query.to_vec(),
-        headers: headers.to_vec(),
+        headers: (headers.iter())
+            .filter(|(name, _)| guest_header(name))
+            .cloned()
+            .collect(),
     })
 }
 
@@ -68,7 +71,7 @@ pub fn outgoing(
         url.query_pairs_mut().extend_pairs(context.query.iter());
     }
     let headers = (context.headers.iter())
-        .filter(|(name, _)| header_name(name) && !credential(name))
+        .filter(|(name, _)| guest_header(name))
         .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
         .collect();
     let outgoing = OutgoingRequest {
@@ -125,9 +128,10 @@ fn method_named(name: &str) -> Option<Method> {
         .find(|method| method.as_str() == name)
 }
 
-/// Headers a guest may never set; the host owns credentials.
-fn credential(name: &str) -> bool {
-    ["authorization", "cookie", "proxy-authorization"].contains(&name.to_ascii_lowercase().as_str())
+/// Whether a guest may set header `name`: a valid name and no credential, which the host owns.
+fn guest_header(name: &str) -> bool {
+    let credential = ["authorization", "cookie", "proxy-authorization"];
+    header_name(name) && !credential.contains(&name.to_ascii_lowercase().as_str())
 }
 
 fn invalid(why: &str) -> HostError {

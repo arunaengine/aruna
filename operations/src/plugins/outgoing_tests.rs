@@ -89,6 +89,7 @@ fn drops_credentials() {
     ]);
     let parts = ("", &[][..], &headers[..]);
     let context = request_context(&manifest, ("public", Method::Get), "{}", parts).unwrap();
+    assert_eq!(context.headers, pairs(&[("X-Run", "7")]));
     let (request, slot) = outgoing(&manifest, &context).unwrap();
     assert_eq!(request.headers, pairs(&[("x-run", "7")]));
     assert_eq!(request.url.as_str(), "https://public.example.org/v1/");
