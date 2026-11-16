@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
@@ -621,11 +622,10 @@ restrictions and request policies before it can be returned.
 )]
 pub async fn object_search(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<ObjectParams>,
 ) -> ServerResult<(StatusCode, Json<ObjectResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let query = params.q.trim();
     if query.chars().count() < MIN_QUERY_CHARS {
         return Err(ServerError::BadRequest);
@@ -865,11 +865,10 @@ so a caller never learns of a group it may not read, and the user directory sear
 )]
 pub async fn unified_search(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<SearchParams>,
 ) -> ServerResult<(StatusCode, Json<SearchResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer_token.map(|carrier| carrier.as_str().to_string());
     Ok((
         StatusCode::OK,

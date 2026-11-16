@@ -6,21 +6,22 @@ use std::sync::Arc;
 
 use aruna_core::structs::execution::harvest::{HarvestJobSpec, HarvestSelector};
 use aruna_core::structs::execution::job::JobPayload;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_operations::driver::drive;
 use aruna_operations::harvest::create_source::{
     CreateSourceError, CreateSourceInput, CreateSourceOperation,
 };
 use aruna_operations::jobs::service::{lookup_job_dedup, submit_harvest_job};
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 
-use crate::auth::{parse_group_id, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::ensure_metadata_scope;
 use crate::routes::execution::jobs::{job_urls, map_submit_error};
@@ -99,11 +100,10 @@ pub struct HarvestResponse {
 )]
 pub async fn submit_harvest(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
     Json(request): Json<HarvestRequest>,
 ) -> ServerResult<(StatusCode, Json<HarvestResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = Ulid::from_string(&connector_id)
         .map_err(|_| ServerError::BadRequestReason("connector_id is not a ULID".to_string()))?;

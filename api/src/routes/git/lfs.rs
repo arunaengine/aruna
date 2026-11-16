@@ -3,17 +3,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{base_url, map_error, repository_id};
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::LfsObject;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_operations::git::{self, GitError};
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -31,11 +31,10 @@ const MEDIA: &str = "application/vnd.git-lfs+json";
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied")))]
 pub async fn batch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(repository): Path<String>,
     Json(body): Json<Value>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let id = repository_id(&repository)?;
     let operation = body["operation"].as_str().ok_or(ServerError::BadRequest)?;
     let permission = match operation {
@@ -103,12 +102,11 @@ pub async fn batch(
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied")))]
 pub async fn upload(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((repository, oid)): Path<(String, String)>,
     headers: HeaderMap,
     body: Body,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
     let size: u64 = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -145,10 +143,9 @@ pub async fn upload(
               (status = 404, description = "Object missing")))]
 pub async fn download(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((repository, oid)): Path<(String, String)>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let (blob, size) =
         git::lfs::download(&state.get_ctx(), &auth, repository_id(&repository)?, &oid)
             .await

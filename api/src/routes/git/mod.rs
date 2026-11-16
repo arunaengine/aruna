@@ -12,12 +12,11 @@ mod versions;
 
 pub(crate) use versions::expected;
 
-use crate::auth::{map_authorize_error, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::map_authorize_error;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::git::{self, GitError};
-use axum::Extension;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
@@ -136,12 +135,11 @@ async fn base_url(state: &ServerState, id: Ulid) -> ServerResult<String> {
               (status = 503, description = "Records or storage unavailable")))]
 pub async fn push(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<Ulid>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (request, pack) = git::push::decode(body).map_err(map_error)?;
     let key = headers
         .get("x-aruna-push-key")

@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
     CreateMetadataRequest, CreateMetadataResponse, ListMetadataQuery, ListMetadataResponse,
@@ -141,11 +142,10 @@ text of at most 4096 bytes after trimming; an empty message counts as none."#,
 )]
 pub async fn create_metadata_document(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateMetadataRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateMetadataResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let message = commit_message(match &request {
         CreateMetadataRequest::Scaffold(request) => request.message.clone(),
         CreateMetadataRequest::RoCrate(request) => request.message.clone(),
@@ -550,11 +550,10 @@ caller's own token.
 )]
 pub async fn delete_metadata_document(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
     let record =

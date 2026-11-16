@@ -7,6 +7,7 @@ use super::query::*;
 use super::references::*;
 use super::rocrate::*;
 use super::validation::*;
+use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
 use crate::metadata::*;
@@ -132,7 +133,7 @@ async fn public_routes_work() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -550,7 +551,7 @@ async fn portal_searches_description() {
     let test = setup_state().await;
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
             group_id: test.group_id.to_string(),
@@ -626,7 +627,7 @@ async fn rocrate_routes_work() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
             group_id: test.group_id.to_string(),
@@ -866,7 +867,7 @@ async fn list_uses_registry() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -899,7 +900,7 @@ async fn list_uses_registry() {
 
     let status = delete_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(created.summary.document_id.clone()),
     )
@@ -926,7 +927,7 @@ async fn tombstone_hides_listing() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1037,7 +1038,7 @@ async fn private_metadata_hidden() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1085,7 +1086,7 @@ async fn hides_document_existence() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1252,7 +1253,7 @@ async fn preview_refuses_stranger() {
 
     let result = preview_profile_validation(
         State(test.state.clone()),
-        Extension(Some(stranger)),
+        RealmAuth(stranger),
         Json(ProfilePreviewRequest {
             rocrate: draft_crate(),
             group_id: Some(test.group_id.to_string()),
@@ -1270,7 +1271,7 @@ async fn preview_admits_member() {
 
     let (status, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Json(ProfilePreviewRequest {
             rocrate: draft_crate(),
             group_id: Some(test.group_id.to_string()),
@@ -1381,7 +1382,7 @@ async fn preview_lists_restricted() {
 
     let (_, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Json(ProfilePreviewRequest {
             rocrate,
             group_id: Some(test.group_id.to_string()),
@@ -1420,7 +1421,7 @@ async fn preview_skips_readable() {
 
     let (_, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Json(ProfilePreviewRequest {
             rocrate,
             group_id: Some(test.group_id.to_string()),
@@ -1441,7 +1442,7 @@ async fn preview_skips_private() {
 
     let (_, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Json(ProfilePreviewRequest {
             rocrate,
             group_id: Some(test.group_id.to_string()),
@@ -1462,7 +1463,7 @@ async fn pending_export_unavailable() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1521,7 +1522,7 @@ async fn pending_summary_tolerated() {
 
     let (_, Json(_created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1575,7 +1576,7 @@ async fn replacement_summary_withheld() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1795,7 +1796,7 @@ async fn local_partition_executes() {
 
     let _ = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1849,7 +1850,7 @@ async fn query_applies_visibility() {
     ] {
         let _ = create_metadata_document(
             State(test.state.clone()),
-            Extension(Some(test.auth.clone())),
+            RealmAuth(test.auth.clone()),
             Extension(None),
             Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
                 group_id: test.group_id.to_string(),
@@ -2035,7 +2036,7 @@ async fn user_writes_forward() {
     let test = setup_access_state().await;
     let denied = create_metadata_document(
         State(test.coordinator.state.clone()),
-        Extension(Some(test.denied_auth.clone())),
+        RealmAuth(test.denied_auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test(
             test.denied_bearer_token.clone(),
         ))),
@@ -2074,7 +2075,7 @@ async fn user_writes_forward() {
     .await;
     let unpermitted = create_metadata_document(
         State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         bearer(),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: foreign_group.to_string(),
@@ -2099,7 +2100,7 @@ async fn user_writes_forward() {
     .unwrap();
     let missing_result = delete_metadata_document(
         State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         bearer(),
         Path(missing.to_string()),
     )
@@ -2108,7 +2109,7 @@ async fn user_writes_forward() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         bearer(),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -2143,7 +2144,7 @@ async fn user_writes_forward() {
     assert_eq!(
         delete_metadata_document(
             State(test.coordinator.state.clone()),
-            Extension(Some(test.auth.clone())),
+            RealmAuth(test.auth.clone()),
             bearer(),
             Path(document_id),
         )
@@ -2174,7 +2175,7 @@ async fn missing_config_fails() {
 
     let result = create_metadata_document(
         State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test(
             test.valid_bearer_token.clone(),
         ))),
@@ -2529,7 +2530,7 @@ async fn discovery_failure_partial() {
     let test = setup_state().await;
     let _ = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -2587,7 +2588,7 @@ async fn invalid_cursor_rejected() {
     let test = setup_network_state().await;
     let _ = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -2680,7 +2681,7 @@ async fn cursor_suppresses_churn() {
     for index in 0..5 {
         let _ = create_metadata_document(
             State(test.state.clone()),
-            Extension(Some(test.auth.clone())),
+            RealmAuth(test.auth.clone()),
             Extension(None),
             Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
                 group_id: test.group_id.to_string(),
@@ -2724,7 +2725,7 @@ async fn cursor_suppresses_churn() {
     // Introduce a matching document between pages (churn).
     let _ = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -2788,7 +2789,7 @@ async fn page_size_clamped() {
     let test = setup_network_state().await;
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -3035,7 +3036,7 @@ async fn search_tolerates_pending() {
     let test = setup_state().await;
     let _ = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -3337,7 +3338,7 @@ async fn references_route(
 ) -> ServerResult<MetadataReferencesResponse> {
     metadata_references(
         State(test.state.clone()),
-        Extension(auth),
+        RealmAuth(crate::auth::require_realm_auth(&test.state, auth)?),
         Query(MetadataReferencesParams {
             iri: iri.to_string(),
             predicate: predicate.map(str::to_string),
@@ -3361,7 +3362,7 @@ async fn preflight_route(
 ) -> ServerResult<PreflightResponse> {
     metadata_reference_preflight(
         State(test.state.clone()),
-        Extension(auth),
+        RealmAuth(crate::auth::require_realm_auth(&test.state, auth)?),
         Extension(None),
         Json(PreflightBody {
             target,
@@ -3415,7 +3416,7 @@ async fn create_linking_doc(
     });
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(auth)),
+        RealmAuth(auth),
         Extension(None),
         Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
             group_id: group_id.to_string(),
@@ -4122,7 +4123,7 @@ async fn create_test_document(
 ) {
     let _ = create_metadata_document(
         State(state),
-        Extension(Some(auth)),
+        RealmAuth(auth),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: group_id.to_string(),
@@ -4582,7 +4583,7 @@ mod authorization {
     ) -> ServerResult<(StatusCode, Json<CreateMetadataResponse>)> {
         create_metadata_document(
             State(test.state.clone()),
-            Extension(auth),
+            RealmAuth(crate::auth::require_realm_auth(&test.state, auth)?),
             Extension(None),
             Json(scaffold(test.group_id, path, public)),
         )
@@ -4656,7 +4657,7 @@ mod authorization {
 
         let denied = delete_metadata_document(
             State(test.state.clone()),
-            Extension(Some(stranger_auth(&test.state))),
+            RealmAuth(stranger_auth(&test.state)),
             Extension(None),
             Path(document_id.clone()),
         )
@@ -4722,7 +4723,7 @@ async fn lookup_hides_private() {
     let test = setup_network_state().await;
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),

@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
+use crate::auth::extract;
 use crate::error::ServerError;
 use crate::metadata::{
     CreateMetadataRequest, CreateScaffoldRequest, MetadataQueryMode, ReplaceRoCrateRequest,
@@ -32,6 +34,7 @@ use aruna_operations::metadata::projector::{drain_projection_queue, replay_event
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use axum::extract::Path;
+use axum::http::StatusCode;
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use std::time::SystemTime;
@@ -266,7 +269,7 @@ async fn setup() -> Fixture {
 async fn create_doc(fx: &Fixture, group_id: Ulid, path: &str, name: &str) -> String {
     let (_, Json(response)) = create_metadata_document(
         State(fx.state.clone()),
-        Extension(Some(fx.auth.clone())),
+        RealmAuth(fx.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: group_id.to_string(),
@@ -358,7 +361,7 @@ fn params(q: &str) -> SearchParams {
 async fn search(fx: &Fixture, params: SearchParams) -> ServerResult<SearchResponse> {
     unified_search(
         State(fx.state.clone()),
-        Extension(Some(fx.auth.clone())),
+        RealmAuth(fx.auth.clone()),
         Extension(None),
         Query(params),
     )
@@ -552,7 +555,7 @@ async fn filters_group_hits() {
     };
     let (_, Json(resp)) = unified_search(
         State(fx.state.clone()),
-        Extension(Some(stranger)),
+        RealmAuth(stranger),
         Extension(None),
         Query(SearchParams {
             types: Some("groups".to_string()),
@@ -889,14 +892,9 @@ async fn filters_documents_group() {
 #[tokio::test]
 async fn requires_auth() {
     let fx = setup().await;
-    let unauthenticated = unified_search(
-        State(fx.state.clone()),
-        Extension(None),
-        Extension(None),
-        Query(params("alpha")),
-    )
-    .await;
-    assert!(matches!(unauthenticated, Err(ServerError::Unauthorized)));
+    // `unified_search` takes `RealmAuth`, so these refusals are the extractor's.
+    let unauthenticated = extract::<RealmAuth>(&fx.state, None).await;
+    assert_eq!(unauthenticated.err(), Some(StatusCode::UNAUTHORIZED));
 
     let foreign = AuthContext {
         user_id: UserId::local(Ulid::from_bytes([9u8; 16]), realm_id(9)),
@@ -905,32 +903,16 @@ async fn requires_auth() {
         session: None,
     };
     assert_ne!(foreign.realm_id, fx.realm_id);
-    let wrong_realm = unified_search(
-        State(fx.state.clone()),
-        Extension(Some(foreign)),
-        Extension(None),
-        Query(params("alpha")),
-    )
-    .await;
-    assert!(matches!(wrong_realm, Err(ServerError::Forbidden)));
+    let wrong_realm = extract::<RealmAuth>(&fx.state, Some(foreign)).await;
+    assert_eq!(wrong_realm.err(), Some(StatusCode::FORBIDDEN));
 }
 
 #[tokio::test]
 async fn search_requires_auth() {
     let fx = setup().await;
-    let result = object_search(
-        State(fx.state.clone()),
-        Extension(None),
-        Extension(None),
-        Query(ObjectParams {
-            q: "reads".to_string(),
-            mode: Some(ObjectMode::Local),
-            ..Default::default()
-        }),
-    )
-    .await;
-
-    assert!(matches!(result, Err(ServerError::Unauthorized)));
+    // `object_search` takes `RealmAuth`, so the refusal is the extractor's.
+    let result = extract::<RealmAuth>(&fx.state, None).await;
+    assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[test]

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::metadata::{CreateMetadataRequest, CreateRoCrateRequest};
 use crate::routes::link_routes::*;
 use crate::routes::metadata::documents::create_metadata_document;
@@ -14,6 +15,8 @@ use aruna_core::keyspaces::{LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::driver::drive;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
+use axum::Extension;
+use axum::http::StatusCode;
 use std::collections::HashMap;
 
 const TOKEN: &str = "personal-link-token";
@@ -40,7 +43,7 @@ pub(crate) async fn setup_crate(root: serde_json::Value, endpoint: &str) -> Link
         .await;
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
             group_id: test.group_id.to_string(),
@@ -295,7 +298,7 @@ async fn connector_delete_conflicts() {
     let remove_connector = || {
         delete_repository(
             State(linked.test.state.clone()),
-            Extension(Some(linked.test.auth.clone())),
+            RealmAuth(linked.test.auth.clone()),
             Path((
                 linked.test.group_id.to_string(),
                 linked.connector_id.to_string(),

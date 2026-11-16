@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 
+use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{bearer_token_string, map_api_error};
@@ -183,11 +184,10 @@ permission; unreadable matches only set `hidden_references_exist`.
 )]
 pub async fn data_links(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<DataLinksParams>,
 ) -> ServerResult<Json<DataLinksResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let link = DataLink::parse(params.id.trim()).ok_or_else(|| {
         ServerError::BadRequestReason("id names no Aruna data identifier".to_string())
     })?;
@@ -238,12 +238,11 @@ pub async fn data_links(
 )]
 pub async fn bucket_links(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     Query(params): Query<BucketLinksParams>,
 ) -> ServerResult<Json<DataLinksResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     let queries = match (params.key, params.prefix) {
@@ -388,12 +387,11 @@ caller's READ permission; unreadable ones only set `hidden_references_exist`.
 )]
 pub async fn file_part_of(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     Query(params): Query<PartOfParams>,
 ) -> ServerResult<Json<PartOfResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     let path = object_permission_path(realm_id, info.group_id, node_id, &bucket, &params.key);

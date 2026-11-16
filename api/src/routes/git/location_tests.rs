@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::error::ServerError;
 use crate::metadata::{CreateMetadataRequest, CreateScaffoldRequest};
 use crate::routes::metadata::documents::create_metadata_document;
@@ -20,7 +21,7 @@ use ulid::Ulid;
 async fn create(test: &TestState, chosen: Option<StorageLocationRequest>) -> Ulid {
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -63,13 +64,9 @@ async fn read(
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<StorageLocation, ServerError> {
-    get_location(
-        State(test.state.clone()),
-        Extension(Some(auth.clone())),
-        Path(id),
-    )
-    .await
-    .map(|Json(location)| location)
+    get_location(State(test.state.clone()), RealmAuth(auth.clone()), Path(id))
+        .await
+        .map(|Json(location)| location)
 }
 
 async fn choose(
@@ -84,7 +81,7 @@ async fn choose(
     };
     put_location(
         State(test.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Path(id),
         Json(request),
     )

@@ -4,15 +4,14 @@
 
 use super::location::StorageLocation;
 use super::{base_url, map_error};
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::repo_layout::Layout;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::dataset_location::default_bucket;
 use aruna_operations::git;
+use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -67,10 +66,9 @@ impl From<Layout> for RepositoryLayout {
               (status = 503, description = "Metadata or conversion runtime unavailable")))]
 pub async fn repository_status(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Json<RepositoryStatus>> {
-    let auth = require_realm_auth(&state, auth)?;
     let (status, projection, layout, document, pending) = git::snapshot::status(
         &state.get_ctx(),
         state.git().ok_or(ServerError::ServiceUnavailable)?,
@@ -124,11 +122,10 @@ pub struct RevisionQuery {
               (status = 503, description = "Git revision or converter unavailable")))]
 pub async fn export_revision(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
     Query(query): Query<RevisionQuery>,
 ) -> ServerResult<Json<Value>> {
-    let auth = require_realm_auth(&state, auth)?;
     let bytes = git::snapshot::export(
         &state.get_ctx(),
         state.git().ok_or(ServerError::ServiceUnavailable)?,

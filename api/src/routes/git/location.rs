@@ -3,15 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::map_error;
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use aruna_operations::git::GitError;
 use aruna_operations::git::location;
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
@@ -64,10 +63,9 @@ impl StorageLocationRequest {
               (status = 503, description = "Metadata storage unavailable")))]
 pub async fn get_location(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Json<StorageLocation>> {
-    let auth = require_realm_auth(&state, auth)?;
     let effective = location::get(&state.get_ctx(), &auth, id)
         .await
         .map_err(map_error)?;
@@ -87,11 +85,10 @@ pub async fn get_location(
               (status = 503, description = "Metadata storage unavailable")))]
 pub async fn put_location(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
     Json(request): Json<StorageLocationRequest>,
 ) -> ServerResult<Json<StorageLocation>> {
-    let auth = require_realm_auth(&state, auth)?;
     let chosen = request.location()?;
     let chosen = location::set(&state.get_ctx(), &auth, id, chosen)
         .await

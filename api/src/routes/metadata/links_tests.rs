@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::routes::metadata::tests::{TestState, setup_state};
 use crate::tests::datasets::{describe, store_bucket};
 use aruna_core::UserId;
@@ -51,7 +52,7 @@ async fn bucket(
 ) -> ServerResult<DataLinksResponse> {
     bucket_links(
         State(test.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(None),
         Path(name.to_string()),
         Query(params),
@@ -63,7 +64,7 @@ async fn bucket(
 async fn by_id(test: &TestState, id: &str, parts_only: bool) -> ServerResult<DataLinksResponse> {
     data_links(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Query(DataLinksParams {
             id: id.to_string(),
@@ -211,7 +212,7 @@ async fn part_of_file(
 ) -> ServerResult<PartOfResponse> {
     file_part_of(
         State(test.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(None),
         Path(name.to_string()),
         Query(PartOfParams {
