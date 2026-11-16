@@ -498,7 +498,7 @@ async fn names_skipped_bucket() {
     let mut input = test.input(owner(&test.fixture), "needle");
     input.bucket = None;
 
-    let page = crate::s3::object::search::search_local_objects(&test.fixture.context, input)
+    let page = crate::s3::object::search_scan::search_local_objects(&test.fixture.context, input)
         .await
         .unwrap();
 

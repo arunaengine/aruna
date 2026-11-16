@@ -19,7 +19,7 @@ use aruna_operations::metadata::api::{
     BucketSearchRequest, ObjectQueryMode, SearchQueryRequest, search_buckets_distributed,
     search_objects,
 };
-use aruna_operations::s3::object::search::ObjectKeyMatch;
+use aruna_operations::s3::object::search_scan::ObjectKeyMatch;
 use ulid::Ulid;
 
 use topology::{TestNode, TestResult, Topology};

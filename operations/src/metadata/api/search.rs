@@ -23,7 +23,7 @@ use super::distributed::run_search_distributed;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::index_feed::IndexProgress;
 use crate::metadata::search_cursor::{SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE};
-use crate::s3::object::search::changed_until;
+use crate::s3::object::search_scan::changed_until;
 
 const OBJECT_CURSOR_VERSION: u8 = 1;
 
@@ -82,7 +82,7 @@ impl SignedCursor<ObjectCursorPayload> {
             if !nodes.insert(partition.node_id)
                 || partition.start_after.as_ref().is_some_and(|key| {
                     // A sealed position is checked by the node that sealed it.
-                    let plain = !crate::s3::object::search::sealed_position(key);
+                    let plain = !crate::s3::object::search_scan::sealed_position(key);
                     key.len() > SEARCH_MAX_BYTES || plain && BlobHeadKey::from_bytes(key).is_err()
                 })
             {
@@ -364,7 +364,7 @@ pub(super) fn plan_object_search(
     }
     let limit = request
         .limit
-        .clamp(1, crate::s3::object::search::SEARCH_MAX_LIMIT);
+        .clamp(1, crate::s3::object::search_scan::SEARCH_MAX_LIMIT);
     let fingerprint = object_search_fingerprint(
         realm_id,
         &request.query,

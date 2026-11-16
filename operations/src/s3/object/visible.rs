@@ -15,7 +15,7 @@ use crate::driver::{DriverContext, drive};
 use crate::s3::object::list::{
     ListBucketError, ListBucketInput, ListBucketOperation, ListContinuationToken, ListedObject,
 };
-use crate::s3::object::search::{open_position, seal_position, sealed_position};
+use crate::s3::object::search_scan::{open_position, seal_position, sealed_position};
 
 /// Hidden entries one listing request examines at most. A page that reaches it ends early and
 /// its sealed cursor resumes there, so it bounds the work of one request, never its results.

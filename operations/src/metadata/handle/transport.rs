@@ -30,7 +30,7 @@ use crate::metadata::protocol::{
     write_message,
 };
 use crate::s3::bucket::search::BucketPage;
-use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
+use crate::s3::object::search_scan::{ObjectKeyMatch, SearchNodePage};
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
 #[tracing::instrument(

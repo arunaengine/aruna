@@ -33,7 +33,7 @@ use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
 use crate::driver::{DriverContext, drive};
-use crate::s3::object::search::{open_position, seal_position};
+use crate::s3::object::search_scan::{open_position, seal_position};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchBucketsInput {

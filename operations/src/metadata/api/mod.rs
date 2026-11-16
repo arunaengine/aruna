@@ -110,7 +110,7 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::search::{
     BucketPage, BucketSearchHit, SearchBucketsInput, search_local_buckets,
 };
-use crate::s3::object::search::{
+use crate::s3::object::search_scan::{
     ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput, search_local_objects,
 };
 

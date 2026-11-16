@@ -19,7 +19,7 @@ use ulid::Ulid;
 
 use super::*;
 use crate::jobs::executor::{JobRunOutcome, ProgressReporter};
-use crate::s3::object::search::{ObjectKeyMatch, SearchObjectsInput, search_local_objects};
+use crate::s3::object::search_scan::{ObjectKeyMatch, SearchObjectsInput, search_local_objects};
 
 const SUMMARY: &str = include_str!("../../../../core/tests/fixtures/assembly_summary.tsv");
 const COLI: &str = "all/GCF/000/005/845/GCF_000005845.2_ASM584v2/";
@@ -289,7 +289,7 @@ impl Fixture {
         hits.into_iter().map(|hit| hit.key).collect()
     }
 
-    async fn hits(&self, query: &str) -> Vec<crate::s3::object::search::ObjectInventoryHit> {
+    async fn hits(&self, query: &str) -> Vec<crate::s3::object::search_scan::ObjectInventoryHit> {
         let auth = self.spec.auth_context.clone();
         let input = SearchObjectsInput {
             realm_id: auth.realm_id,
