@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, ensure_permission_with, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ValidatedBearer, ensure_permission_with};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::execution::jobs::{decode_cursor, encode_cursor};
 use crate::server::state::ServerState;
@@ -595,10 +596,9 @@ honor a delegated token's confinement.
 )]
 pub async fn list_notifications(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<ListNotificationsQuery>,
 ) -> ServerResult<(StatusCode, Json<NotificationListResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let limit = query
         .limit
@@ -661,10 +661,8 @@ path-restricted token is refused.
 )]
 pub async fn unread_count(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<UnreadCountResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-
     let (count, capped) = unread_for_user(&state.get_ctx(), state.get_node_id(), auth.user_id)
         .await
         .map_err(|error| map_dispatch_error(error, "unread"))?;
@@ -1009,9 +1007,8 @@ path-restricted token is refused.
 )]
 pub async fn stream_notifications(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<Sse<impl Stream<Item = Result<Event, Infallible>> + Send>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let context = state.get_ctx();
     let local_node_id = state.get_node_id();
     let recipient = auth.user_id;
@@ -1098,10 +1095,9 @@ path-restricted token is refused.
 )]
 pub async fn mark_read(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<MarkReadRequest>,
 ) -> ServerResult<(StatusCode, Json<MarkReadResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if request.ids.len() > MARK_MAX_IDS {
         return Err(ServerError::BadRequest);
     }
@@ -1178,10 +1174,8 @@ user's own subscriptions and a path-restricted token is refused.
 )]
 pub async fn list_watches(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<WatchListResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-
     let subscriptions = dispatch::list_watches(&state.get_ctx(), state.get_node_id(), auth.user_id)
         .await
         .map_err(|error| map_watch_error(error, "list_watches"))?;
@@ -1251,11 +1245,10 @@ permission path, evaluated against the caller's current grants at creation time.
 )]
 pub async fn create_watch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(_bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateWatchRequest>,
 ) -> ServerResult<(StatusCode, Json<WatchResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if request.path_prefix.is_empty()
         || request.path_prefix.starts_with('/')
         || request.path_prefix.len() > MAX_PREFIX_LEN
@@ -1328,10 +1321,9 @@ refused.
 )]
 pub async fn delete_watch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let watch_id = Ulid::from_str(&id).map_err(|_| ServerError::BadRequest)?;
 
     delete_for_user(

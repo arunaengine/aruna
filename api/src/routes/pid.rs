@@ -39,7 +39,8 @@ use aruna_operations::metadata::persistent_id::forward::{
 use aruna_operations::metadata::secondary_ids::IdentifierMatch;
 use aruna_operations::realm::get_config::GetConfigOperation;
 
-use crate::auth::{ValidatedBearer, ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ValidatedBearer, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{forwarded_auth_token, map_api_error};
 use crate::server::state::ServerState;
@@ -834,12 +835,11 @@ fn validated_withdrawal_reason(request: &WithdrawPersistentRequest) -> ServerRes
 )]
 async fn withdraw_pid(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Json(request): Json<WithdrawPersistentRequest>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
     let reason = validated_withdrawal_reason(&request)?;
     let ctx = state.get_ctx();

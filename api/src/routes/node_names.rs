@@ -3,7 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ensure_permission, require_realm_auth, require_unrestricted_auth};
+use crate::auth::ensure_permission;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
@@ -15,10 +16,10 @@ use aruna_operations::driver::drive;
 use aruna_operations::realm::node_name::{
     NameScope, NodeChange, NodeNameConfig, NodeNameError, NodeNameOperation,
 };
+use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -137,11 +138,10 @@ management node serves the call and every other node relays it to one.
 )]
 pub async fn name_realm_node(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(node_id): Path<String>,
     request: Result<Json<NodeNameRequest>, JsonRejection>,
 ) -> ServerResult<(StatusCode, Json<NodeNameResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     // Request policies live at this boundary; the operation only checks roles.
@@ -191,11 +191,10 @@ the call and every other node relays it to one.
 )]
 pub async fn name_own_device(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
     request: Result<Json<NodeNameRequest>, JsonRejection>,
 ) -> ServerResult<(StatusCode, Json<NodeNameResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     set_name(&state, auth, &id, request, NameScope::Owner).await

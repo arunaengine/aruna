@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::RealmAuth;
 use crate::auth::{
     ValidatedBearer, blob_permission_path, ensure_permission, parse_connector_id, parse_group_id,
     require_realm_auth,
@@ -359,12 +360,11 @@ connector's source path, both checked against the concrete path rather than a pr
 )]
 pub async fn stage_blob(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<StageRequest>,
 ) -> ServerResult<(StatusCode, Json<StageResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     // A member that does not coordinate the key's range relays the write with the bearer.
     if let StageRequest::Snapshot(target) | StageRequest::Reference(target) = &request {
         let bucket_info = load_bucket_info(&state, &target.bucket).await?;
@@ -772,12 +772,11 @@ Nothing is authorized later while the job runs.
 )]
 pub async fn submit_staging(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<StageBatchRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitStagingResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let relayed = StageBatchRequest {
         node_id: None,
         ..request.clone()
@@ -1019,10 +1018,9 @@ exactly the same restrictions.
 )]
 pub async fn list_staging_jobs(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<StagingJobQuery>,
 ) -> ServerResult<(StatusCode, Json<StagingListResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let cursor = decode_job_cursor(query.cursor.as_deref())?;
     let limit = query
         .limit
@@ -1111,11 +1109,10 @@ pub async fn list_staging_jobs(
 )]
 pub async fn get_staging_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     AxumPath(job_id): AxumPath<String>,
 ) -> ServerResult<(StatusCode, Json<StagingJobResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let job_id = aruna_core::structs::execution::job::JobId::from_str(&job_id)
         .map_err(|_| ServerError::BadRequest)?;
     // The owner is the sole 404 authority; a non-owner routes or reports 503.
@@ -1197,10 +1194,9 @@ outside a path restriction, are left out of the page.
 )]
 pub async fn list_references(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<ReferenceListQuery>,
 ) -> ServerResult<(StatusCode, Json<ReferenceListResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let bucket_info = load_bucket_info(&state, &query.bucket).await?;
     let bucket_path = bucket_permission_path(
         state.get_realm_id(),

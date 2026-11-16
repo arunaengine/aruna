@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 
 use crate::metadata::{SubmitExportResponse, load_document_record, parse_document_id};
@@ -22,9 +22,9 @@ use aruna_operations::federation::export::{
 };
 use aruna_operations::federation::import::header_value;
 use aruna_operations::jobs::service::{read_artifact_routed, read_owned_job, submit_export_job};
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::de::DeserializeOwned;
@@ -172,10 +172,9 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
 )]
 pub async fn create_export(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<FederatedExportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitExportResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let local = state.get_realm_id();
     check_remote(
         &request.intent,
@@ -288,10 +287,9 @@ that owns the job.
 )]
 pub async fn create_grant(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Json<Signed<ExportGrant>>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (job_id, spec) = owned_export(&state, &auth, &job_id).await?;
     let Some(selection) = spec.selection.as_ref() else {
         return Err(ServerError::NotFound);
@@ -341,10 +339,9 @@ that owns the job.
 )]
 pub async fn delete_grant(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (job_id, _) = owned_export(&state, &auth, &job_id).await?;
     match revoke_grant(&state.get_ctx(), job_id).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
@@ -393,11 +390,10 @@ that owns the job.
 )]
 pub async fn push_export(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Json(request): Json<PushExportRequest>,
 ) -> ServerResult<Json<serde_json::Value>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (job_id, _) = owned_export(&state, &auth, &job_id).await?;
     let (local, now) = (state.get_realm_id(), unix_timestamp_secs());
     let context = state.get_ctx();
@@ -467,6 +463,7 @@ mod tests {
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::transfer::MAX_TRANSFER_SECS;
+    use axum::Extension;
     use axum::http::HeaderValue;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;

@@ -3,7 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::federation::login::SECRET_LEN;
 use crate::server::state::ServerState;
@@ -134,11 +135,10 @@ A provider token without `auth_time` and child sessions give none and are refuse
 )]
 pub async fn create_confirmation(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<LinkConfirmationRequest>,
 ) -> ServerResult<Json<Signed<LinkConfirmation>>> {
-    let auth = require_realm_auth(&state, auth)?;
     let auth_time = bearer_auth_time(&state, bearer).await?;
     let secret = hex::decode(&request.secret)
         .ok()
@@ -191,11 +191,10 @@ account the confirmation names.
 )]
 pub async fn create_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<LinkRequest>,
 ) -> ServerResult<Json<LinkedLoginsResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let auth_time = bearer_auth_time(&state, bearer).await?;
     let link = LinkLoginOperation::new(LinkLoginConfig {
         actor: actor(&state, &auth),
@@ -240,9 +239,8 @@ pub(crate) fn linked_logins(user: &User) -> LinkedLoginsResponse {
 )]
 pub async fn list_links(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
 ) -> ServerResult<Json<LinkedLoginsResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     if auth.user_id.realm_id != state.get_realm_id() || auth.path_restrictions.is_some() {
         return Err(ServerError::Forbidden);
     }
@@ -282,10 +280,9 @@ pub async fn list_links(
 )]
 pub async fn delete_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((user_id, login)): Path<(String, String)>,
 ) -> ServerResult<Json<LinkedLoginsResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let parse = |value: &str| {
         UserId::from_string(value)
             .map_err(|_| ServerError::BadRequestReason("malformed user id".to_string()))

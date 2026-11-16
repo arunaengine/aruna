@@ -7,13 +7,14 @@ pub mod import;
 pub mod link;
 pub mod login;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ServerError, ServerResult};
 use crate::routes::git::expected;
 use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{Actor, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::time::unix_timestamp_secs;
@@ -22,10 +23,10 @@ use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_federation::{
     SetFederationConfig, SetFederationError, SetFederationOperation,
 };
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -232,9 +233,8 @@ fn expected_settings(headers: &HeaderMap) -> ServerResult<Option<String>> {
 )]
 pub async fn get_realm_federation(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
 ) -> ServerResult<(HeaderMap, Json<RealmFederation>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let config = read_config(&state).await?;
     ensure_permission(
         &state,
@@ -345,11 +345,10 @@ management node serves the call and signs the descriptor; every other node relay
 )]
 pub async fn set_realm_federation(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     headers: HeaderMap,
     Json(request): Json<RealmFederation>,
 ) -> ServerResult<(HeaderMap, Json<RealmFederation>)> {
-    let auth = require_realm_auth(&state, auth)?;
     read_config(&state).await?;
     ensure_permission(
         &state,

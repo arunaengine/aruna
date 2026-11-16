@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{
-    ensure_permission, permission_granted, require_realm_auth, require_unrestricted_auth,
-};
+use crate::auth::RealmAuth;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ensure_permission, permission_granted};
 use crate::error::{ServerError, ServerResult};
 use crate::routes::federation::AcceptedRealmsSetting;
 use crate::routes::node_names::CoordinatesBody;
@@ -1858,17 +1858,15 @@ management node serves the call and every other node relays it to one.
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "The strategy is still referenced by a binding or override (`StrategyReferenced`), so removing it would leave a dangling reference, the placement handle space is exhausted, or another update of the realm configuration won the race; the caller may retry", body = crate::error::ErrorResponse),
         (status = 500, description = "The realm configuration could not be read or written here", body = crate::error::ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn mutate_realm_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     request: Result<Json<RealmPlacementRequest>, JsonRejection>,
 ) -> ServerResult<(StatusCode, Json<RealmPlacementResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     let action = request.into_core()?;
@@ -2056,17 +2054,15 @@ management node serves the call and every other node relays it to one.
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = crate::error::ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn set_realm_quota(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<RealmQuotaConfig>,
 ) -> ServerResult<(StatusCode, Json<RealmQuotaConfig>)> {
-    let auth = require_realm_auth(&state, auth)?;
     // Request policies live at this boundary; the operation only checks roles.
     ensure_permission(
         &state,
@@ -2364,9 +2360,8 @@ checked, because the figures are realm-wide totals and not per-caller views.
 )]
 pub async fn get_usage(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<UsageResponse>)> {
-    require_unrestricted_auth(&state, auth)?;
     let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
     let realm = load_realm_usage(&state, RealmUsageScope::Global).await?;
     let mut response = UsageResponse::new(local, realm.counters);
