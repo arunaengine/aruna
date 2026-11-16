@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
+use crate::auth::extract;
 use crate::mcp::data::{WriteObjectInput, store_text};
 use crate::routes::storage::deletion::bucket_info;
 use crate::tests::assistant::spawn_mock;
@@ -15,6 +17,7 @@ use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_operations::s3::object::archive::{EntryStatus, REPORT_PATH, Report};
+use axum::http::StatusCode;
 use std::io::Read;
 
 fn request(entries: Vec<ArchiveEntry>) -> ArchiveRequest {
@@ -116,7 +119,7 @@ async fn archive(node: &Node, auth: &AuthContext, body: ArchiveRequest) -> Serve
     let state = node.state.clone();
     download_selection(
         State(state),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(bearer),
         Json(body),
     )
@@ -128,7 +131,7 @@ async fn link(node: &Node, auth: &AuthContext, body: ArchiveRequest) -> ServerRe
     let state = node.state.clone();
     create_link(
         State(state),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(bearer),
         Json(body),
     )
@@ -159,14 +162,9 @@ async fn ticket_of(response: Response) -> String {
 async fn refuses_bad_selections() {
     let node = node_state().await;
     let auth = node.owner.clone();
-    let anonymous = download_selection(
-        State(node.state.clone()),
-        Extension(None),
-        Extension(None),
-        Json(whole_bucket()),
-    )
-    .await;
-    assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+    // `download_selection` takes `RealmAuth`, so the refusal is the extractor's.
+    let anonymous = extract::<RealmAuth>(&node.state, None).await;
+    assert_eq!(anonymous.err(), Some(StatusCode::UNAUTHORIZED));
     let refused = [
         request(Vec::new()),
         request(vec![entry(Some("a"), Some("b"), None)]),
@@ -193,7 +191,7 @@ async fn refuses_bad_selections() {
     }
     let no_bearer = create_link(
         State(node.state.clone()),
-        Extension(Some(auth)),
+        RealmAuth(auth),
         Extension(None),
         Json(whole_bucket()),
     )

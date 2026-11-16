@@ -28,7 +28,8 @@ use utoipa_axum::routes;
 use super::super::deletion::bucket_info;
 use super::super::distributed::map_create_error;
 use super::super::routing::ensure_group_admin;
-use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::routes::identifiers::IdentifierParserBody;
@@ -269,11 +270,10 @@ caller's own access to the dataset.
 )]
 pub async fn get_bucket_metadata(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketMetadataResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let path = bucket_permission_path(
         state.get_realm_id(),
@@ -338,12 +338,11 @@ the linked dataset. For a distributed bucket the set's publisher checks the forw
 )]
 pub async fn put_bucket_metadata(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     request: Result<Json<PutMetadataRequest>, JsonRejection>,
 ) -> ServerResult<Json<BucketMetadataResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     let metadata = request.metadata.map(BucketMetadata::try_from).transpose()?;

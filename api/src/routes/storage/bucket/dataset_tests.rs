@@ -11,6 +11,7 @@ use aruna_core::structs::storage::format::Compression;
 use axum::extract::FromRequest;
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::routes::metadata::tests::{TestState, drain_metadata_background, setup_network_state};
 use crate::routes::storage::bucket::metadata::get_bucket_metadata;
 
@@ -54,7 +55,7 @@ async fn post(test: &TestState, body: Value) -> ServerResult<DescribeBucketRespo
     let parsed = Json::<DescribeBucketRequest>::from_request(http, &()).await;
     describe_bucket(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(BUCKET.to_string()),
         parsed,
@@ -114,7 +115,7 @@ async fn describe_then_link() {
     drain_metadata_background(test.state.as_ref()).await;
     let Json(read) = get_bucket_metadata(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(BUCKET.to_string()),
     )
@@ -155,7 +156,7 @@ async fn unlinked_dataset_removed() {
     drain_metadata_background(test.state.as_ref()).await;
     let Json(read) = get_bucket_metadata(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(BUCKET.to_string()),
     )

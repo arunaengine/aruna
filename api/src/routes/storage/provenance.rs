@@ -47,7 +47,8 @@ use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, bearer_auth, ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, bearer_auth, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{MetadataRoCrateResponse, RoCrateExportParams};
 use crate::routes::execution::runs::run_answer;
@@ -114,11 +115,10 @@ it, as the origin and run routes do.
 )]
 pub async fn export_provenance(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Query(params): Query<ExportParams>,
 ) -> ServerResult<Response> {
-    require_realm_auth(&state, auth)?;
     // Every hop checks this token again, so an export needs one.
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let start = match (params.version, params.dataset) {

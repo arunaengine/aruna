@@ -34,6 +34,7 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{bearer_token_string, map_api_error};
@@ -282,11 +283,10 @@ separately whether the same caller may run the purge.
 )]
 pub async fn deletion_preflight(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<DeletionPreflightRequest>,
 ) -> ServerResult<(StatusCode, Json<DeletionPreflightResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let scope = request.scope.to_core()?;
     let info = bucket_info(&state, scope.bucket()).await?;
     let path = scope_permission_path(&state, info.group_id, &scope);
@@ -521,10 +521,9 @@ async fn set_coverage(
 )]
 pub async fn submit_purge(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<SubmitPurgeRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitPurgeResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     if request
         .idempotency_key
         .as_ref()
@@ -702,11 +701,10 @@ pub struct DeleteImpact {
 )]
 pub async fn delete_preview(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     axum::extract::Path(bucket): axum::extract::Path<String>,
     Json(request): Json<DeleteImpactRequest>,
 ) -> ServerResult<Json<DeleteImpact>> {
-    let auth = require_realm_auth(&state, auth)?;
     let scope = match request.kind.as_str() {
         "file" => PurgeScopeRequest::File {
             bucket: bucket.clone(),
@@ -1045,10 +1043,9 @@ async fn purge_job(
 )]
 pub async fn get_purge(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     axum::extract::Path(job_id): axum::extract::Path<String>,
 ) -> ServerResult<Json<PurgeJobResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let storage = &state.get_ctx().storage_handle;
     let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)

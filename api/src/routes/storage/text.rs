@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use axum::extract::{Path, State};
@@ -14,7 +14,8 @@ use axum::{Extension, Json};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::mcp::data::{TextObjectRequest, WriteObjectInput, WriteObjectOutput, store_text};
 use crate::routes::storage::deletion::bucket_info;
@@ -70,13 +71,12 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 )]
 pub async fn write_text_object(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Path(bucket): Path<String>,
     Json(request): Json<TextObjectRequest>,
 ) -> ServerResult<Json<WriteObjectOutput>> {
-    let auth = require_realm_auth(&state, auth)?;
     crate::s3::util::validate_object_key(&request.key)
         .map_err(|_| ServerError::BadRequestReason("the key is not a valid object key".into()))?;
     if request.text.len() > MAX_TEXT_BYTES {

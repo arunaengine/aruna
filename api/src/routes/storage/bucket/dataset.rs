@@ -34,7 +34,8 @@ use super::super::routing::ensure_group_admin;
 use super::metadata::{
     BucketIdentifierBody, BucketMetadataBody, DatasetDescriptionBody, write_metadata,
 };
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{forwarded_auth_token, local_write_record, run_create_metadata};
 use crate::server::state::ServerState;
@@ -117,12 +118,11 @@ group's metadata path.
 )]
 pub async fn describe_bucket(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     request: Result<Json<DescribeBucketRequest>, JsonRejection>,
 ) -> ServerResult<(StatusCode, Json<DescribeBucketResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     let identifiers = checked_identifiers(&request)?;

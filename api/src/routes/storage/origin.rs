@@ -36,6 +36,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
@@ -417,13 +418,12 @@ impl From<OriginView> for OriginResponse {
 )]
 pub async fn get_origin(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Path(bucket): Path<String>,
     Query(params): Query<OriginParams>,
 ) -> ServerResult<Json<OriginResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     origin_answer(&state, &auth, bearer, &headers, bucket, params).await
 }
 
@@ -658,12 +658,11 @@ pub struct VersionOriginParams {
 )]
 pub async fn get_version_origin(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Query(params): Query<VersionOriginParams>,
 ) -> ServerResult<Json<OriginResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let deadline = tokio::time::Instant::now() + RELAY_DEADLINE;
     version_answer(&state, &auth, bearer, &headers, (&params.version, deadline)).await
 }
@@ -849,10 +848,9 @@ pub struct FileSourcesResponse {
 )]
 pub async fn get_sources(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<FileSourcesResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let path = bucket_permission_path(
         state.get_realm_id(),

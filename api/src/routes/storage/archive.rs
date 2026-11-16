@@ -32,7 +32,8 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::download::{self, AdmissionError, DownloadPermit};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
@@ -236,11 +237,10 @@ READ on its prefix, as the object listing requires.
 )]
 pub async fn download_selection(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<ArchiveRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let entries = selection(request)?;
     let permit = admitted(&state, auth.user_id)?;
     Ok(archive_response(state, (auth, bearer), entries, permit))
@@ -275,11 +275,10 @@ pub async fn download_selection(
 )]
 pub async fn create_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<ArchiveRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let grant = token_grant(bearer.as_str()).map_err(|_| ServerError::Unauthorized)?;
     let entries = selection(request)?;

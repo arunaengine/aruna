@@ -9,6 +9,7 @@ use super::super::encryption::{
     settings_refusal, unlock_view,
 };
 use super::super::routing::ensure_group_admin;
+use crate::auth::UnrestrictedAuth;
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -398,11 +399,10 @@ async fn seal_missing(state: &ServerState, bucket: &str, group_id: GroupId, key:
 )]
 pub async fn extend_unlock(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<ExtendRequest>,
 ) -> ServerResult<Json<UnlockView>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let session_id = parse_ulid(&request.session_id, "session_id")?;
     let group_id = bucket_group(&state, &bucket).await?;
     let input = ExtendInput {
@@ -451,10 +451,9 @@ pub async fn extend_unlock(
 )]
 pub async fn lock_bucket(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<UnlockView>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = bucket_group(&state, &bucket).await?;
     let now_ms = now_ms();
     let input = LockInput {
@@ -507,10 +506,9 @@ pub async fn lock_bucket(
 )]
 pub async fn list_holders(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<HoldersResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let snapshot = holder_snapshot(&state, &auth, &bucket).await?;
     let report = holder_report(&state, &snapshot)
         .await
@@ -557,11 +555,10 @@ group's admin path.
 )]
 pub async fn grant_holder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<GrantRequest>,
 ) -> ServerResult<Json<HolderView>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let user_id = parse_user(&request.user_id)?;
     // Anonymous identities of any realm never hold a key.
     if user_id.is_nil() {
@@ -644,11 +641,10 @@ group's admin path.
 )]
 pub async fn remove_holder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((bucket, user)): Path<(String, String)>,
     Query(query): Query<RemovalQuery>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let user_id = parse_user(&user)?;
     let revision: [u8; 32] = hex::decode(&query.revision)
         .ok()
@@ -730,11 +726,10 @@ pub async fn remove_holder(
 )]
 pub async fn my_copies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Query(query): Query<CopiesQuery>,
 ) -> ServerResult<Json<CopiesResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let snapshot = holder_snapshot(&state, &auth, &bucket).await?;
     let copies = snapshot
         .copies
@@ -778,11 +773,10 @@ group's admin path.
 )]
 pub async fn rotate_key(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<RotateRequest>,
 ) -> ServerResult<Json<EncryptionStatus>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = bucket_group(&state, &bucket).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;
@@ -821,11 +815,10 @@ pub async fn rotate_key(
 )]
 pub async fn bucket_audit(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<Json<AuditResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let cursor = query
         .cursor
         .as_deref()

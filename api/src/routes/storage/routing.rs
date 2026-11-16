@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::RealmAuth;
 use crate::auth::{parse_group_id, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -402,10 +403,9 @@ is part of describing the bucket; changing the rules still takes group admin wri
 )]
 pub async fn get_bucket_routing(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketRoutingResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = group_of_bucket(&state, &bucket).await?;
     ensure_bucket_read(&state, &auth, group_id, &bucket).await?;
 
@@ -500,11 +500,10 @@ pub async fn get_bucket_routing(
 )]
 pub async fn put_bucket_routing(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Json(request): Json<BucketRoutingRequest>,
 ) -> ServerResult<Json<BucketRoutingResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = group_of_bucket(&state, &bucket).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
 
@@ -565,10 +564,9 @@ pub async fn put_bucket_routing(
 )]
 pub async fn get_group_routing(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<Json<GroupRoutingResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_group_admin(&state, &auth, group_id).await?;
 
@@ -658,11 +656,10 @@ pub async fn get_group_routing(
 )]
 pub async fn put_group_routing(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<GroupRoutingRequest>,
 ) -> ServerResult<Json<GroupRoutingResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_group_admin(&state, &auth, group_id).await?;
 

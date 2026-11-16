@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::mcp::data::{WriteObjectInput, store_text};
 use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::tests::distributed::{
@@ -50,7 +51,7 @@ async fn origin(
     };
     get_origin(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         headers,
         Path(bucket.to_string()),
@@ -518,7 +519,7 @@ async fn sources(
 ) -> ServerResult<FileSourcesResponse> {
     get_sources(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Path(bucket.to_string()),
     )
     .await
@@ -584,7 +585,7 @@ async fn by_version(
     }
     get_version_origin(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         headers,
         Query(VersionOriginParams {
