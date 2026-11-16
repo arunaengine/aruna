@@ -306,3 +306,31 @@ async fn denied_connection() {
     assert_eq!(name(&outcome), ("failed", Some(JobErrorKind::Permanent)));
     assert_eq!(seen.hits.load(Ordering::SeqCst), 0);
 }
+
+/// A server that takes each request and closes the connection without an answer.
+async fn dropping() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut buffer = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer).await;
+        }
+    });
+    format!("http://{address}/deposit/")
+}
+
+#[tokio::test]
+async fn dropped_answer() {
+    // A PUT whose answer never came is tried again; a POST so cut off stays undecided.
+    let fixture = Fixture::new().await;
+    let install = uploader(&fixture).await;
+    let (_root, blob) = ready(&fixture, &install).await;
+    let base = dropping().await;
+    let ctx = job_context(&blob, &fixture);
+    let (_, put) = recorded(&fixture, &install, (&base, "PUT")).await;
+    let outcome = run_plugin_work(&ctx, &put).await;
+    assert_eq!(name(&outcome), ("failed", Some(JobErrorKind::Retryable)));
+    let (_, post) = recorded(&fixture, &install, (&base, "POST")).await;
+    assert_eq!(name(&run_plugin_work(&ctx, &post).await).0, "undecided");
+}

@@ -337,6 +337,8 @@ pub async fn upload_work(
             }
             return retryable(error.without_url().to_string());
         }
+        // A PUT may go twice, so one whose answer broke off is tried again.
+        Err(error) if again => return retryable(error.without_url().to_string()),
         Err(error) => {
             let unknown = format!("the upload may have been sent: {}", error.without_url());
             return JobRunOutcome::Undecided(JobError::retryable(unknown));
