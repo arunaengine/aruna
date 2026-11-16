@@ -187,6 +187,94 @@ class ReferencesTest(unittest.TestCase):
         self.assertEqual(details["runner_refs"], ["driver -> jobs: 1"])
 
 
+class TriggerTest(unittest.TestCase):
+    def test_arms(self):
+        text = (
+            "fn work(key: TaskKey) {\n"
+            "    match key {\n"
+            "        TaskKey::Drain { id, .. } => Box::pin(async move { drain(id).await }),\n"
+            "        TaskKey::Plain => start(Plan::new()),\n"
+            "        TaskKey::Block if ready() => {\n"
+            "            let x = match y { Some(v) => v, None => 0 };\n"
+            "            go(x).await;\n"
+            "        }\n"
+            "        _ => {}\n"
+            "    }\n"
+            "}\n"
+        )
+        _, masked = check_layers.mask_rust(text)
+        arms = [(pattern.strip(), "await" in body) for pattern, body in check_layers.match_arms(masked)]
+        self.assertEqual(
+            arms[:4],
+            [("TaskKey::Drain { id, .. }", True), ("TaskKey::Plain", False), ("TaskKey::Block if ready()", True), ("_", False)],
+        )
+
+    def test_broker_impl(self):
+        rel = "operations/src/plugins/broker.rs"
+        text = "impl Broker for RunBroker {\n    async fn get(&self) {}\n    fn sync(&self) {}\n}\nasync fn free() {}\n"
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, {rel: text})
+            source = check_layers.load_source(root, rel)
+        self.assertEqual(check_layers.trigger_arms({rel: source}), [f"{rel}: Broker::get"])
+
+
+class HabitsTest(unittest.TestCase):
+    def habits(self, text, rel="net/tests/probe.rs"):
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, {rel: text})
+            source = check_layers.load_source(root, rel)
+        return check_layers.test_habits([source])
+
+    def test_sleeps(self):
+        text = (
+            "#[tokio::test(start_paused = true)]\nasync fn paused() { tokio::time::sleep(D).await; }\n"
+            "#[tokio::test]\nasync fn manual() { tokio::time::pause(); sleep(D).await; }\n"
+            "#[tokio::test]\nasync fn real() {\n    std::thread::sleep(D);\n}\n"
+            "fn sleep(d: u8) {}\nfn other() { clock.sleep(D); }\n"
+        )
+        sleeps, _ = self.habits(text)
+        self.assertEqual(sleeps, ["net/tests/probe.rs:7"])
+
+    def test_production_ignored(self):
+        sleeps, _ = self.habits("async fn wait() { tokio::time::sleep(D).await; }\n", "net/src/lib.rs")
+        self.assertEqual(sleeps, [])
+
+    def test_silent_skip(self):
+        text = (
+            "fn docker() -> Option<u8> {\n    eprintln!(\"skipping: {e}\");\n    None\n}\n"
+            "#[test]\nfn probe() {\n    if missing() {\n        println!(\"no tool\");\n        return;\n    }\n"
+            "    eprintln!(\"logs\");\n    assert!(true);\n}\n"
+        )
+        _, skips = self.habits(text)
+        self.assertEqual(skips, ["net/tests/probe.rs:2", "net/tests/probe.rs:8"])
+
+
+class DuplicatesTest(unittest.TestCase):
+    def groups(self, files):
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, files)
+            sources = [check_layers.load_source(root, rel) for rel in check_layers.rust_files(root)]
+        return check_layers.duplicate_groups(sources)
+
+    def test_identical(self):
+        spaced = SIX_LINES.replace("= 1;", "=   1; // note")
+        groups = self.groups(
+            {"a/src/one.rs": "fn first() {\n" + SIX_LINES + "}\n", "b/src/two.rs": "fn second()\n{\n" + spaced + "}\n"}
+        )
+        self.assertEqual(groups, [["a/src/one.rs:1 first", "b/src/two.rs:2 second"]])
+
+    def test_short_differs(self):
+        five = SIX_LINES.split("\n", 1)[1]
+        changed = SIX_LINES.replace('1', '"1"')
+        groups = self.groups(
+            {
+                "a/src/one.rs": "fn first() {\n" + five + "}\nfn third() {\n" + SIX_LINES + "}\n",
+                "b/src/two.rs": "fn second() {\n" + five + "}\nfn fourth() {\n" + changed + "}\n",
+            }
+        )
+        self.assertEqual(groups, [])
+
+
 class CratesTest(unittest.TestCase):
     def test_outside_target(self):
         manifest = MANIFEST + "aruna-storage = { workspace = true }\n"

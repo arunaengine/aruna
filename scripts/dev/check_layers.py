@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Layer guard: counts async code and references in operations against layers_baseline.json.
+"""Layer guard: counts async code, references, test habits and duplicates against layers_baseline.json.
 A structural count above its baseline, async code in a clean domain or a new crate dependency fails."""
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 import argparse
 import collections
+import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -69,6 +71,22 @@ CRATE_TARGETS = {
     "aruna-registry": ("aruna-core", "aruna-blob"),
     "aruna-compute-helper": (),
 }
+TRIGGER_MATCHES = (
+    ("operations/src/tasks/incoming/mod.rs", "TaskKey::"),
+    ("operations/src/sync/incoming.rs", "Alpn::"),
+)
+TRIGGER_IMPLS = (("operations/src/plugins/broker.rs", "Broker"),)
+SIMILAR_NAMES = (
+    "*backoff*",
+    "now_ms",
+    "read_value",
+    "read_row",
+    "read_record",
+    "hex_encode",
+    "escape_xml",
+    "actor",
+    "map_*_error",
+)
 COUNTS = (
     ("mixed_files", "mixed files (an operation plus async code)"),
     ("pure_async_refs", "references from pure files to items defined only in async files"),
@@ -76,7 +94,14 @@ COUNTS = (
     ("group_mutual_pairs", "mutual module pairs inside a domain group"),
     ("group_cycle_modules", "modules in cycle groups inside a domain group"),
     ("runner_refs", "runner references into domain modules"),
+    ("trigger_arms", "trigger shell arms that call async code"),
+    ("state_clones", "match self.state.clone() in operations"),
+    ("async_parallel", "files with parallel work only through async code"),
+    ("test_sleeps", "real sleeps in tests without paused time"),
+    ("silent_skips", "tests that print and return early"),
+    ("duplicate_groups", "duplicate function bodies of six or more lines"),
 )
+DUPLICATE_LINES = 6
 
 TOKEN_RE = re.compile(r"//|/\*|(?<!\w)(?:[bc]?r#*|[bc])?\"|'")
 STRING_RE = re.compile(r'(?:[^"\\]|\\.)*"', re.S)
@@ -86,12 +111,21 @@ ATTR_RE = re.compile(r"\s*#\[")
 BRACE_RE = re.compile(r"[{}]")
 BRACKET_RE = re.compile(r"[\[\]]")
 ITEM_RE = re.compile(r"[()\[\]{};]")
+ARM_RE = re.compile(r"=>|[()\[\]{},]")
 ASYNC_RE = re.compile(r"\basync\s+(?:move\s+)?(?:fn\b|\{|\|)|\.await\b")
 OPERATION_RE = re.compile(r"\bimpl(?:\s*<[^{;]*?>)?\s+(?:[\w:]+::)?(?:Sub)?Operation\s+for\b")
 DEF_RE = re.compile(r"\b(?:struct|enum|trait|type|fn|const|static|mod|union)\s+([A-Za-z_]\w*)")
 USE_RE = re.compile(r"\buse\s+((?:crate|super|self)\b[^;]*);")
 INLINE_RE = re.compile(r"\bcrate(?:::\w+)+")
+FN_RE = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
+MATCH_RE = re.compile(r"\bmatch\b")
+STATE_CLONE = re.compile(r"\bmatch\s+self\s*\.\s*state\s*\.\s*clone\s*\(\s*\)")
+PARALLEL_RE = re.compile(r"\b(?:join_all|FuturesUnordered|buffer_unordered|JoinSet|try_join\w*)\b")
+SLEEP_RE = re.compile(r"(?<![\w.:])(?:(?:std::)?thread::|(?:tokio::)?time::)?sleep\s*\(")
+PAUSE_RE = re.compile(r"\bstart_paused\b|\bpause\s*\(\s*\)")
+SKIP_RE = re.compile(r"\be?println!\s*\([^;]*\)\s*;\s*(?:return\b|None\s*[},])")
 SPACE_RE = re.compile(r"\s+")
+COMMA_RE = re.compile(r"\s*,")
 
 
 def blank(text, spans):
@@ -421,6 +455,148 @@ def async_lines(ops):
     return dict(sorted(lines.items()))
 
 
+def depth_find(masked, pos, stop, wanted):
+    """First token in wanted at bracket depth zero between pos and stop."""
+    depth = 0
+    for found in ARM_RE.finditer(masked, pos, stop):
+        mark = found.group()
+        if mark in "([{":
+            if depth == 0 and mark in wanted:
+                return found
+            depth += 1
+        elif mark in ")]}":
+            depth -= 1
+        elif depth == 0 and mark in wanted:
+            return found
+    return None
+
+
+def match_arms(masked):
+    """Yield (pattern, body) for every arm of every match expression."""
+    for found in MATCH_RE.finditer(masked):
+        opening = depth_find(masked, found.end(), len(masked), ("{",))
+        if not opening:
+            continue
+        stop = pair_end(masked, opening.start(), BRACE_RE) - 1
+        pos = opening.end()
+        while pos < stop:
+            arrow = depth_find(masked, pos, stop, ("=>",))
+            if not arrow:
+                break
+            body_start = arrow.end()
+            while body_start < stop and masked[body_start].isspace():
+                body_start += 1
+            if masked[body_start : body_start + 1] == "{":
+                body_end = pair_end(masked, body_start, BRACE_RE)
+                comma = COMMA_RE.match(masked, body_end)
+                next_pos = comma.end() if comma else body_end
+            else:
+                comma = depth_find(masked, body_start, stop, (",",))
+                body_end = comma.start() if comma else stop
+                next_pos = comma.end() if comma else stop
+            yield masked[pos : arrow.start()], masked[body_start:body_end]
+            pos = next_pos
+
+
+def trigger_arms(sources):
+    """Arms of the trigger shells whose bodies still run async code."""
+    found = []
+    for rel, prefix in TRIGGER_MATCHES:
+        source = sources.get(rel)
+        if not source:
+            continue
+        for pattern, body in match_arms(source.masked):
+            if prefix in pattern and ASYNC_RE.search(body):
+                found.append(f"{rel}: {SPACE_RE.sub(' ', pattern.strip())}")
+    for rel, trait in TRIGGER_IMPLS:
+        source = sources.get(rel)
+        if not source:
+            continue
+        impl_re = re.compile(r"\bimpl\b[^{;]*\b" + trait + r"\s+for\b[^{;]*\{")
+        for impl in impl_re.finditer(source.masked):
+            body = source.masked[impl.end() - 1 : pair_end(source.masked, impl.end() - 1, BRACE_RE)]
+            for method in re.finditer(r"\basync\s+fn\s+(\w+)", body):
+                found.append(f"{rel}: {trait}::{method.group(1)}")
+    return found
+
+
+def function_bodies(masked):
+    """Yield (name, keyword, start, end) per fn with a body; start is the offset of its '{'."""
+    for found in FN_RE.finditer(masked):
+        opening = None
+        depth = 0
+        for mark in ITEM_RE.finditer(masked, found.end()):
+            token = mark.group()
+            if token in "([":
+                depth += 1
+            elif token in ")]":
+                depth -= 1
+            elif depth == 0:
+                opening = mark if token == "{" else None
+                break
+        if opening:
+            yield found.group(1), found.start(), opening.start(), pair_end(masked, opening.start(), BRACE_RE)
+
+
+def test_habits(sources):
+    """Real sleeps outside paused tests, and tests that print and return early."""
+    sleeps, skips = [], []
+    for source in sources:
+        text = source.test_masked
+        if "sleep" in text:
+            sleeps.extend(real_sleeps(source.rel, text))
+        if "println!" in text:
+            for found in SKIP_RE.finditer(text):
+                skips.append(f"{source.rel}:{text.count(chr(10), 0, found.start()) + 1}")
+    return sleeps, skips
+
+
+def real_sleeps(rel, text):
+    """Sleep calls whose outermost enclosing fn neither starts paused nor pauses time."""
+    outer, found_sleeps = [], []
+    for _, keyword, start, end in function_bodies(text):
+        if outer and start < outer[-1][2]:
+            continue
+        head = max(text.rfind("}", 0, keyword), text.rfind(";", 0, keyword), 0)
+        outer.append((head, start, end))
+    for found in SLEEP_RE.finditer(text):
+        if text[: found.start()].rstrip().endswith("fn"):
+            continue
+        owner = next((item for item in outer if item[0] <= found.start() < item[2]), None)
+        if owner and PAUSE_RE.search(text, owner[0], owner[2]):
+            continue
+        found_sleeps.append(f"{rel}:{text.count(chr(10), 0, found.start()) + 1}")
+    return found_sleeps
+
+
+def duplicate_groups(sources):
+    """Groups of identical fn bodies with at least DUPLICATE_LINES code lines inside the braces."""
+    groups = collections.defaultdict(list)
+    for source in sources:
+        for code, masked in ((source.code, source.masked), (source.test_code, source.test_masked)):
+            for name, _, start, end in function_bodies(masked):
+                inner = code[start + 1 : end - 1]
+                if code_lines(inner) < DUPLICATE_LINES:
+                    continue
+                digest = hashlib.sha1(SPACE_RE.sub("", inner).encode()).hexdigest()
+                line = code.count("\n", 0, start) + 1
+                groups[digest].append(f"{source.rel}:{line} {name}")
+    return sorted(sorted(members) for members in groups.values() if len(members) > 1)
+
+
+def similar_names(sources):
+    """Production fn names that match SIMILAR_NAMES, as (pattern, definitions, files)."""
+    rows = []
+    for pattern in SIMILAR_NAMES:
+        hits = []
+        for source in sources:
+            for name in FN_RE.findall(source.masked):
+                if fnmatch.fnmatchcase(name, pattern):
+                    hits.append(source.rel)
+        rows.append((pattern, len(hits), len(set(hits))))
+    return rows
+
+
 def crate_manifests(root):
     """Map each workspace crate name to its set of internal normal dependencies."""
     with open(os.path.join(root, "Cargo.toml"), "rb") as handle:
@@ -470,6 +646,20 @@ def measure(root):
     sources = [load_source(root, rel) for rel in rust_files(root)]
     ops = Operations(sources)
     counts, details = layer_counts(ops)
+    by_rel = {source.rel: source for source in sources}
+    details["trigger_arms"] = trigger_arms(by_rel)
+    operations = [ops.files[rel]["source"] for rel in sorted(ops.files)]
+    details["state_clones"] = [
+        f"{source.rel}:{source.masked.count(chr(10), 0, found.start()) + 1}"
+        for source in operations
+        for found in STATE_CLONE.finditer(source.masked)
+    ]
+    details["async_parallel"] = [source.rel for source in operations if PARALLEL_RE.search(source.masked)]
+    details["test_sleeps"], details["silent_skips"] = test_habits(sources)
+    duplicates = duplicate_groups(sources)
+    details["duplicate_groups"] = [" | ".join(group) for group in duplicates]
+    for key in ("trigger_arms", "state_clones", "async_parallel", "test_sleeps", "silent_skips", "duplicate_groups"):
+        counts[key] = len(details[key])
     return counts, details, async_lines(ops), ops, sources
 
 
@@ -530,6 +720,9 @@ def report(root, baseline, show_all):
         print(f"  error: {dep}")
     for dep in unused:
         print(f"  note: allow list entry not used: {dep}")
+    print("similar function names (report):")
+    for pattern, defs, files in similar_names(sources):
+        print(f"  {pattern}: {defs} definitions in {files} files")
     print(f"errors: {errors}")
     return errors
 

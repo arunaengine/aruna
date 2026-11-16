@@ -30,7 +30,13 @@
     "upward_refs": 599,
     "group_mutual_pairs": 41,
     "group_cycle_modules": 26,
-    "runner_refs": 20
+    "runner_refs": 20,
+    "trigger_arms": 68,
+    "state_clones": 49,
+    "async_parallel": 17,
+    "test_sleeps": 69,
+    "silent_skips": 9,
+    "duplicate_groups": 181
   },
   "async_lines": {
     "abe": 1446,
