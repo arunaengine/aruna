@@ -2216,3 +2216,13 @@ fn sync_dedupes_graphs() {
     assert_eq!(syncs[0].graph_iri, graph_iri);
     assert_eq!(syncs[0].peers, vec![node(2)]);
 }
+
+// A dependency that stays missing is checked every two seconds at first, then up to every five
+// minutes once it has waited for more than 30 attempts.
+#[test]
+fn waiting_reaches_cap() {
+    assert_eq!(waiting_delay_ms(1), 500);
+    assert_eq!(waiting_delay_ms(30), 2_000);
+    assert_eq!(waiting_delay_ms(31), 300_000);
+    assert_eq!(waiting_delay_ms(u32::MAX), 300_000);
+}

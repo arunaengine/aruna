@@ -643,12 +643,7 @@ async fn plan_finish_chunk(
                 let attempts = job.attempts.saturating_add(1);
                 // A dependency that stays missing is checked rarely, not every two seconds.
                 let delay = if waiting {
-                    let cap = if attempts > 30 { 300_000 } else { 2_000 };
-                    // The former helper stopped doubling after seven attempts; that stays.
-                    let base = Duration::from_millis(RETRY_BASE_MS);
-                    let delay =
-                        capped_backoff(base, Duration::from_millis(cap), attempts.min(7), 0);
-                    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
+                    waiting_delay_ms(attempts)
                 } else {
                     retry_delay_ms(attempts)
                 };
@@ -856,6 +851,15 @@ fn parked_dead_letter(
         parks,
         requeue_at_ms: now_ms.saturating_add(requeue_after_ms(parks)),
     }
+}
+
+/// Delay before a job that waits on a missing dependency is checked again; after 30 attempts the
+/// wait grows to five minutes.
+fn waiting_delay_ms(attempts: u32) -> u64 {
+    let cap = if attempts > 30 { 300_000 } else { 2_000 };
+    let base = Duration::from_millis(RETRY_BASE_MS);
+    let delay = capped_backoff(base, Duration::from_millis(cap), attempts, 0);
+    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn requeue_after_ms(parks: u32) -> u64 {
