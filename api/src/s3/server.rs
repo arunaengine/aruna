@@ -1753,7 +1753,7 @@ mod tests {
             .expect("server runs");
 
         // One accepted connection with a partial request keeps a connection
-        // child active; the short wait is the OS boundary, not a schedule guess.
+        // child active; its tracked task is the signal that the server accepted it.
         let mut socket = tokio::net::TcpStream::connect(address)
             .await
             .expect("connect");
@@ -1761,7 +1761,13 @@ mod tests {
             .write_all(b"GET /bucket/key HTTP/1.1\r\nHost: localhost\r\n")
             .await
             .expect("partial request");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while handle.connections.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the server accepts the connection");
 
         handle.abort();
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
