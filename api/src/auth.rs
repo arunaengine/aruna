@@ -2220,4 +2220,103 @@ mod test {
 
         assert_eq!(state.issuer_cache_len().await, 1);
     }
+
+    /// A user node with a fresh store; the routes below refuse before they read it.
+    async fn extractor_state() -> (tempfile::TempDir, std::sync::Arc<ServerState>) {
+        use crate::tests::routes::{test_context, test_state, test_storage};
+        let (dir, storage) = test_storage();
+        let realm_key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let realm_id = RealmId::from_bytes(realm_key.verifying_key().to_bytes());
+        let state = test_state(
+            std::sync::Arc::new(test_context(storage)),
+            realm_id,
+            iroh::SecretKey::from_bytes(&[6; 32]).public(),
+            NodeCapabilities::user_node(realm_id).unwrap(),
+        )
+        .await;
+        (dir, std::sync::Arc::new(state))
+    }
+
+    fn caller(realm_id: RealmId) -> aruna_core::structs::identity::auth::AuthContext {
+        aruna_core::structs::identity::auth::AuthContext {
+            user_id: UserId::local(ulid::Ulid::from_bytes([7; 16]), realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    // A request with one fault keeps its answer; only a request with two faults now
+    // meets the token check first.
+    #[tokio::test]
+    async fn realm_keeps_faults() {
+        use crate::tests::routes::send_json;
+        use axum::http::StatusCode;
+        let (_dir, state) = extractor_state().await;
+        let own = caller(state.get_realm_id());
+        let foreign = caller(RealmId::from_bytes([8; 32]));
+        let route = crate::routes::portal::router;
+        let put = |body| ("PUT", "/system/realm/portal-features", body);
+        let valid = r#"{"features":{"compute":false}}"#;
+        let cases = [
+            (None, valid, StatusCode::UNAUTHORIZED),
+            (Some(foreign), valid, StatusCode::FORBIDDEN),
+            (Some(own), "{", StatusCode::BAD_REQUEST),
+            (None, "{", StatusCode::UNAUTHORIZED),
+        ];
+        for (auth, body, expected) in cases {
+            let status = send_json(route(), state.clone(), auth, put(body)).await;
+            assert_eq!(status, expected, "body {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unrestricted_keeps_faults() {
+        use crate::tests::routes::send_json;
+        use axum::http::StatusCode;
+        let (_dir, state) = extractor_state().await;
+        let own = caller(state.get_realm_id());
+        let restricted = aruna_core::structs::identity::auth::AuthContext {
+            path_restrictions: Some(Vec::new()),
+            ..own.clone()
+        };
+        let route = crate::routes::webhooks::router;
+        let put = |body| ("PUT", "/system/notifications/webhook", body);
+        let valid = r#"{"url":"https://example.org/hook"}"#;
+        let cases = [
+            (None, valid, StatusCode::UNAUTHORIZED),
+            (
+                Some(caller(RealmId::from_bytes([8; 32]))),
+                valid,
+                StatusCode::FORBIDDEN,
+            ),
+            (Some(restricted), valid, StatusCode::FORBIDDEN),
+            (Some(own), "{", StatusCode::BAD_REQUEST),
+            (None, "{", StatusCode::UNAUTHORIZED),
+        ];
+        for (auth, body, expected) in cases {
+            let status = send_json(route(), state.clone(), auth, put(body)).await;
+            assert_eq!(status, expected, "body {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_keeps_faults() {
+        use crate::tests::routes::send_json;
+        use axum::http::StatusCode;
+        let (_dir, state) = extractor_state().await;
+        let foreign = caller(RealmId::from_bytes([8; 32]));
+        let route = crate::routes::access::credentials::router;
+        let post = |body| ("POST", "/access/credentials", body);
+        let valid = r#"{"group_id":"01JZ8Y6T0K4W7M2N9Q5R3S8V1X"}"#;
+        let cases = [
+            (None, valid, StatusCode::UNAUTHORIZED),
+            (Some(foreign), "{", StatusCode::BAD_REQUEST),
+            (None, "{", StatusCode::UNAUTHORIZED),
+        ];
+        for (auth, body, expected) in cases {
+            let status = send_json(route(), state.clone(), auth, post(body)).await;
+            assert_eq!(status, expected, "body {body}");
+        }
+    }
 }

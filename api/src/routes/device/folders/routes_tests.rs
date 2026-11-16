@@ -962,3 +962,32 @@ async fn list_actions() {
     assert_eq!(page.actions.len(), 1);
 }
 
+// A request with one fault keeps its answer; only a request with two faults now
+// meets the owner check first.
+#[tokio::test]
+async fn owner_keeps_faults() {
+    use crate::tests::routes::send_json;
+    let user = setup().await;
+    let stranger = AuthContext {
+        user_id: UserId::local(Ulid::from_bytes([1u8; 16]), user.realm_id),
+        ..owner_auth(&user)
+    };
+    let post = |body| ("POST", "/device/wipe", body);
+    let valid = r#"{"confirm_node_id":"none"}"#;
+    let cases = [
+        (None, valid, StatusCode::UNAUTHORIZED),
+        (Some(stranger), valid, StatusCode::FORBIDDEN),
+        (Some(owner_auth(&user)), "{", StatusCode::BAD_REQUEST),
+        (None, "{", StatusCode::UNAUTHORIZED),
+    ];
+    for (auth, body, expected) in cases {
+        let route = crate::routes::device::router();
+        let status = send_json(route, user.state.clone(), auth, post(body)).await;
+        assert_eq!(status, expected, "body {body}");
+    }
+    let mgmt = setup_with(NodeCapabilities::management_node(realm_key()).unwrap()).await;
+    let route = crate::routes::device::router();
+    let auth = Some(owner_auth(&mgmt));
+    let status = send_json(route, mgmt.state.clone(), auth, post(valid)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
