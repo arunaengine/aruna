@@ -327,7 +327,7 @@ pub async fn unlock_bucket(
                 "no_copy",
                 "the caller has no sealed copy of this key generation",
             ),
-            other => ServerError::InternalError(other.to_string().into()),
+            other => ServerError::InternalError(other.into()),
         })?;
     seal_missing(&state, &bucket, group_id, status.key).await;
     // An unlocked node is an issuer: a due raise happens now and its requests are issued.
@@ -429,7 +429,7 @@ pub async fn extend_unlock(
             ExtendError::Blob(error) => blob_refusal(error),
             ExtendError::NotEncrypted => not_encrypted(),
             ExtendError::NotHolder => forbidden_holder(),
-            other => ServerError::InternalError(other.to_string().into()),
+            other => ServerError::InternalError(other.into()),
         })?;
     Ok(Json(status_view(&status)))
 }
@@ -480,7 +480,7 @@ pub async fn lock_bucket(
             LockError::Blob(error) => blob_refusal(error),
             LockError::NotEncrypted => not_encrypted(),
             LockError::NotHolder => forbidden_holder(),
-            other => ServerError::InternalError(other.to_string().into()),
+            other => ServerError::InternalError(other.into()),
         })?;
     let mut view = unlock_view(None, now_ms);
     if !result.locked.is_empty() {
@@ -608,7 +608,7 @@ pub async fn grant_holder(
             GrantError::Blob(error) => blob_refusal(error),
             GrantError::NotEncrypted => not_encrypted(),
             GrantError::NotAdmin => ServerError::Forbidden,
-            other => ServerError::InternalError(other.to_string().into()),
+            other => ServerError::InternalError(other.into()),
         })?;
     let grant = result.grant;
     Ok(Json(HolderView {
@@ -709,7 +709,7 @@ pub async fn remove_holder(
                 "recovery_confirmation_required",
                 "removing this holder breaks the recovery rule",
             ),
-            other => ServerError::InternalError(other.to_string().into()),
+            other => ServerError::InternalError(other.into()),
         })?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -855,7 +855,7 @@ pub async fn bucket_audit(
     let operation = AuditPageOperation::new(bucket_id, cursor, limit);
     let (events, next) = drive(operation, &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let events = events
         .into_iter()
         .map(|event| AuditEventView {

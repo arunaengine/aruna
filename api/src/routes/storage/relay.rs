@@ -248,7 +248,7 @@ pub(crate) async fn relay_stream(
         }
         return response
             .body(Body::from_stream(answer.bytes_stream()))
-            .map_err(|error| ServerError::InternalError(error.to_string().into()));
+            .map_err(|error| ServerError::InternalError(error.into()));
     }
     Err(no_holder(holders))
 }
@@ -447,7 +447,7 @@ pub(crate) async fn node_read<T: DeserializeOwned>(
     let silent = || ServerError::ServiceUnavailableReason(format!("node {node_id} did not answer"));
     let mut sent = HeaderMap::new();
     let named = HeaderValue::try_from(node_id.to_string())
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     sent.insert(RELAY_NODE_HEADER, named);
     let forward = RestForward {
         set_id: Ulid::nil(),

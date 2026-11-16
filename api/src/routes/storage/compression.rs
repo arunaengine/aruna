@@ -195,7 +195,7 @@ pub async fn get_bucket_compression(
         .await
         .map_err(|error| match error {
             GetBucketError::NotFound => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string().into()),
+            other => ServerError::InternalError(other.into()),
         })?;
     crate::auth::ensure_permission(
         &state,
@@ -214,11 +214,11 @@ pub async fn get_bucket_compression(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let migration = migration.filter(|migration| migration.target == info.compression);
     let encrypted = bucket_settings(&state.get_ctx(), &bucket)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .is_encrypted();
     let mut response = BucketCompressionResponse::new(bucket, info.compression, migration);
     response.effective_level = info.compression.pithos_level().filter(|_| encrypted);
@@ -285,7 +285,7 @@ pub async fn put_bucket_compression(
         .await
         .map_err(|error| match error {
             GetBucketError::NotFound => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string().into()),
+            other => ServerError::InternalError(other.into()),
         })?
         .group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
@@ -336,7 +336,7 @@ fn put_refusal(error: PutCompressionError) -> ServerError {
                     .to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

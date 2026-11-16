@@ -332,7 +332,7 @@ pub async fn deletion_preflight(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let uploads = drive(
         ListUploadsOperation::new(ListUploadsInput {
             bucket: scope.bucket().to_string(),
@@ -346,7 +346,7 @@ pub async fn deletion_preflight(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
 
     let (items, versions_truncated, next_version_key, next_version_marker) =
         scoped_version_page(&scope, versions);
@@ -777,7 +777,7 @@ pub async fn delete_preview(
                 (cut, more) = (true, false);
                 break;
             }
-            Err(error) => return Err(ServerError::InternalError(error.to_string().into())),
+            Err(error) => return Err(ServerError::InternalError(error.into())),
         };
         let (page, truncated, next_key, next_version) = scoped_version_page(&scope, page);
         passed += page.len();
@@ -1097,7 +1097,7 @@ pub(crate) async fn bucket_info(
     {
         Ok(info) => Ok(info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -1177,7 +1177,7 @@ async fn list_sync_effects(
             &state.get_ctx(),
         )
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
         for relationship in relationships {
             if !seen.insert((relationship.id, label)) {
                 continue;

@@ -559,7 +559,7 @@ pub(crate) fn map_guard_error(error: GuardError) -> ServerError {
             RouteError::Pending(_) | RouteError::Moving(_) | RouteError::StaleRange(_),
         ) => ServerError::ServiceUnavailableReason(error.to_string()),
         GuardError::Route(_) | GuardError::Unbound(_) => ServerError::Conflict(error.to_string()),
-        GuardError::Conversion(error) => ServerError::InternalError(error.to_string().into()),
+        GuardError::Conversion(error) => ServerError::InternalError(error.into()),
     }
 }
 
@@ -575,7 +575,7 @@ pub(crate) fn map_create_error(error: CreateError) -> ServerError {
         CreateError::Publish(refusal) => ServerError::Conflict(refusal.to_string()),
         CreateError::UnknownSet(_) => ServerError::NotFound,
         CreateError::Conflicted => ServerError::Conflict(error.to_string()),
-        CreateError::Status(error) => ServerError::InternalError(error.to_string().into()),
+        CreateError::Status(error) => ServerError::InternalError(error.into()),
         CreateError::Blocked(message) => ServerError::ServiceUnavailableReason(message),
     }
 }
@@ -778,7 +778,7 @@ pub(crate) async fn owned_status(
 ) -> ServerResult<DistributionStatus> {
     let status = read_status(&state.get_ctx(), state.get_realm_id(), set_id)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|status| status.owner_group == group_id)
         .ok_or(ServerError::NotFound)?;
     Ok(status)

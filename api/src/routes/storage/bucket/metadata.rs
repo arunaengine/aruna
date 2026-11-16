@@ -204,7 +204,7 @@ pub(crate) async fn write_metadata(
                     }
                     PutMetadataError::Forbidden => ServerError::Forbidden,
                     PutMetadataError::Changed => ServerError::Conflict(error.to_string()),
-                    error => ServerError::InternalError(error.to_string().into()),
+                    error => ServerError::InternalError(error.into()),
                 })?;
         }
     }

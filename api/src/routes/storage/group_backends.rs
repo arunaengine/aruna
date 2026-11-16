@@ -208,7 +208,7 @@ fn map_create_error(error: CreateBackendError) -> ServerError {
         CreateBackendError::NotFound => ServerError::NotFound,
         CreateBackendError::Invalid(error) => ServerError::BadRequestMessage(error.to_string()),
         CreateBackendError::Unreachable(error) => ServerError::BadRequestMessage(error.reason()),
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -472,7 +472,7 @@ pub async fn list_group_backends(
 
     let backends = drive(ListBackendsOperation::new(group_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
 
     Ok(Json(ListBackendsResponse {
         backends: backends.into_iter().map(Into::into).collect(),
@@ -543,7 +543,7 @@ pub async fn get_group_backend(
 
     let record = drive(GetBackendOperation::new(backend_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|record| record.group_id == group_id)
         .ok_or(ServerError::NotFound)?;
 
@@ -872,7 +872,7 @@ pub async fn backend_reclaim_status(
 
     drive(GetBackendOperation::new(backend_id), &context)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|record| record.group_id == group_id)
         .ok_or(ServerError::NotFound)?;
     let status = backend_status(&context, &BackendRef::Group(backend_id))
@@ -943,7 +943,7 @@ pub async fn check_provider_bucket(
     let context = state.get_ctx();
     let record = drive(GetBackendOperation::new(backend_id), &context)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|record| record.group_id == group_id)
         .ok_or(ServerError::NotFound)?;
     if !record.splits() {
@@ -983,7 +983,7 @@ async fn set_disabled(
     .await
     .map_err(|error| match error {
         SetDisabledError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     })
 }
 

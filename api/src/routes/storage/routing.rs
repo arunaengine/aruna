@@ -213,7 +213,7 @@ async fn target_naming(
     };
     let record = drive(GetBackendOperation::new(*backend_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let record = record.filter(|record| record.group_id == group_id);
     Ok(record.map_or((None, None), |record| {
         let bucket = record.default_bucket().map(str::to_string);
@@ -283,7 +283,7 @@ fn map_group_error(error: PutGroupError) -> ServerError {
         PutGroupError::Unusable(error) => ServerError::BadRequestMessage(error.reason()),
         PutGroupError::Conflict(message) => ServerError::Conflict(message),
         PutGroupError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -291,7 +291,7 @@ fn map_put_error(error: PutRoutingError) -> ServerError {
     match error {
         PutRoutingError::NoSuchBucket | PutRoutingError::GroupMismatch => ServerError::NotFound,
         PutRoutingError::InvalidRules(reason) => ServerError::BadRequestReason(reason.to_string()),
-        other => ServerError::InternalError(other.to_string().into()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -321,7 +321,7 @@ async fn group_of_bucket(state: &ServerState, bucket: &str) -> ServerResult<Ulid
     {
         Ok(info) => Ok(info.group_id),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.to_string().into())),
+        Err(err) => Err(ServerError::InternalError(err.into())),
     }
 }
 
@@ -418,7 +418,7 @@ pub async fn get_bucket_routing(
         .await
         .map_err(|error| match error {
             GetRoutingError::NoSuchBucket => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string().into()),
+            other => ServerError::InternalError(other.into()),
         })?;
 
     let warnings = warnings_for(&state, group_id, rules.iter().map(|rule| &rule.target)).await;
@@ -581,7 +581,7 @@ pub async fn get_group_routing(
 
     let record = drive(GroupRoutingOperation::new(group_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
 
     let target = record.and_then(|record| record.default_target);
     let warnings = warnings_for(&state, group_id, target.iter()).await;
@@ -814,7 +814,7 @@ pub async fn list_group_buckets(
     let next = match (more, readable.last()) {
         (true, Some(last)) => Some(
             bucket_cursor(&last.bucket)
-                .map_err(|error| ServerError::InternalError(error.to_string().into()))?,
+                .map_err(|error| ServerError::InternalError(error.into()))?,
         ),
         _ => None,
     };

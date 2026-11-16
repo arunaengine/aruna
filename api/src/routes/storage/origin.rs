@@ -986,12 +986,12 @@ pub async fn get_bucket_runs(
     let context = state.get_ctx();
     let access = BucketAccess::load(&context, &auth, (realm_id, info.group_id, node_id), &bucket)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     // A file the caller may not read, as a listing hides it, names no run.
     let read = |key: &str| access.allows(Some(key), &Permission::READ);
     let found = bucket_runs(context.as_ref(), &bucket, &params.prefix, read)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let runs = found.run_ids.iter().map(|run_id| BucketRunBody {
         run_id: run_id.to_string(),
     });

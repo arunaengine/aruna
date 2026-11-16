@@ -196,7 +196,7 @@ fn start_export(caller: Caller, start: Start) -> ServerResult<Response> {
             "attachment; filename=\"provenance.zip\"",
         )
         .body(Body::from_stream(body))
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))
+        .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 enum Start {
@@ -545,7 +545,7 @@ async fn release_crate(
     match read_crate(context.as_ref(), read).await {
         Ok(found) if found.metadata.contains_key(RELEASE_TAG) => {
             serde_json::from_slice(&found.bytes)
-                .map_err(|error| ServerError::InternalError(error.to_string().into()))
+                .map_err(|error| ServerError::InternalError(error.into()))
         }
         Ok(_) | Err(CrateReadError::Missing) => Err(ServerError::NotFound),
         Err(CrateReadError::Failed(reason)) => Err(ServerError::ServiceUnavailableReason(reason)),
@@ -582,8 +582,7 @@ async fn remote_crate(
             break;
         }
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))
+    serde_json::from_slice(&bytes).map_err(|error| ServerError::InternalError(error.into()))
 }
 
 fn holder_silent() -> ServerError {
@@ -619,8 +618,7 @@ fn classify(answer: ServerResult<serde_json::Value>) -> Read {
 }
 
 fn to_value(answer: &impl serde::Serialize) -> ServerResult<serde_json::Value> {
-    serde_json::to_value(answer)
-        .map_err(|error| ServerError::InternalError(error.to_string().into()))
+    serde_json::to_value(answer).map_err(|error| ServerError::InternalError(error.into()))
 }
 
 /// A run crate read under the token as it holds now, checked again after the run read;

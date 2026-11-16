@@ -95,7 +95,7 @@ pub async fn write_text_object(
         .await
         .map_err(|error| match error {
             OfferedDirectoryError::ReadOnly(_) => ServerError::Forbidden,
-            error => ServerError::InternalError(error.to_string().into()),
+            error => ServerError::InternalError(error.into()),
         })?;
     let info = bucket_info(&state, &bucket).await?;
     let path = object_permission_path(
