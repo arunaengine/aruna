@@ -125,6 +125,7 @@ mod list_types;
 mod path;
 mod path_types;
 mod preflight;
+mod preflight_types;
 mod read;
 mod read_types;
 mod search;
@@ -156,14 +157,15 @@ use self::path_types::PathShardView;
 use self::path_types::select_path_holders;
 pub use self::path_types::{MetadataLookupRequest, MetadataLookupResult};
 use self::path_types::{merge_path_views, reduce_path_candidates};
-pub use self::preflight::{
+pub use self::preflight::references_preflight;
+pub use self::preflight_types::{
     MetadataExcludedForm, MetadataIndexState, MetadataNodeFreshness, MetadataPreflightLocation,
     MetadataResolvedTarget, MetadataStorageOperation, MetadataVisibleReference, ReferenceCoverage,
     ReferenceExecution, ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,
-    ReferenceRequest, ReferenceTarget, ReferenceTargetExecution, references_preflight,
+    ReferenceRequest, ReferenceTarget, ReferenceTargetExecution,
 };
 #[cfg(test)]
-use self::preflight::{authorized_realm_nodes, preflight_fingerprint};
+use self::preflight_types::{authorized_realm_nodes, preflight_fingerprint};
 pub use self::read_types::{
     ApiQueryMode, DocumentQueryRequest, MetadataQueryExecution, MetadataQueryRequest,
     MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
