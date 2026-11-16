@@ -593,7 +593,8 @@ async fn reply_rechecked() {
         .unwrap();
     let reply = r#"{"status":201,"headers":[["etag","e1"]],"body":"eyJpZCI6N30="}"#;
     let ids = (install.install_id, row.work_id);
-    record_sent(&fixture.ctx, ids, (201, Some(reply.into())))
+    let answer = (201, Some(reply.into()));
+    record_sent(&fixture.ctx, ids, answer, (8, Ulid::nil()))
         .await
         .unwrap();
     let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope(&fixture, &install));

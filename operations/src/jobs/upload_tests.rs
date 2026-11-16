@@ -159,7 +159,7 @@ async fn post_sent_once() {
     }
     assert_eq!(seen.hits.load(Ordering::SeqCst), 1);
     assert_eq!(*seen.body.lock().unwrap(), CONTENT);
-    let Some(SendBoundary::Sent { status, reply }) =
+    let Some(SendBoundary::Sent { status, reply, .. }) =
         boundary(&fixture, (install.install_id, row.work_id)).await
     else {
         panic!("the answer is kept");
@@ -348,4 +348,39 @@ async fn put_answer_reused() {
         assert_eq!(name(&run_plugin_work(&ctx, &spec).await).0, "succeeded");
     }
     assert_eq!(seen.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn recovers_without_source() {
+    // A POST begun or answered decides a rerun by its boundary, even with the source gone; an
+    // answered one keeps the bytes and version it sent.
+    let fixture = Fixture::new().await;
+    let install = uploader(&fixture).await;
+    let (_root, blob) = ready(&fixture, &install).await;
+    let (base, seen) = server(201).await;
+    let (row, mut spec) = recorded(&fixture, &install, (&base, "POST")).await;
+    if let PluginWorkAction::Upload { version, .. } = &mut spec.action {
+        *version = Some(Ulid::from_parts(5, 1));
+    }
+    let ids = (install.install_id, row.work_id);
+    let begun = |row: &mut WorkRow| row.boundary = Some(SendBoundary::Sending { attempt: 1 });
+    update_work(&fixture.ctx, ids, begun).await.unwrap();
+    let ctx = job_context(&blob, &fixture);
+    assert_eq!(name(&run_plugin_work(&ctx, &spec).await).0, "undecided");
+    let answered = |row: &mut WorkRow| {
+        row.boundary = Some(SendBoundary::Sent {
+            status: 201,
+            reply: None,
+            bytes: 8,
+            version: Ulid::from_parts(5, 2),
+        })
+    };
+    update_work(&fixture.ctx, ids, answered).await.unwrap();
+    let outcome = run_plugin_work(&ctx, &spec).await;
+    let JobRunOutcome::Succeeded(JobResultPayload::PluginWork { bytes, version_id }) = outcome
+    else {
+        panic!("the answered upload did not succeed: {:?}", name(&outcome));
+    };
+    assert_eq!((bytes, version_id), (8, Some(Ulid::from_parts(5, 2))));
+    assert_eq!(seen.hits.load(Ordering::SeqCst), 0);
 }

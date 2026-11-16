@@ -75,10 +75,13 @@ pub enum SendBoundary {
     Sending {
         attempt: u32,
     },
-    /// The answer: its status and its reply as exposed when stored, absent when too large.
+    /// The answer: its status and its reply as exposed when stored, absent when too large, and
+    /// the bytes and version sent.
     Sent {
         status: u16,
         reply: Option<String>,
+        bytes: u64,
+        version: Ulid,
     },
 }
 
@@ -90,7 +93,12 @@ pub enum Send {
     /// An earlier attempt may have sent; nothing is sent again and the outcome stays unknown.
     Undecided,
     /// An earlier attempt has the answer; it decides without a second request.
-    Answered { status: u16, reply: Option<String> },
+    Answered {
+        status: u16,
+        reply: Option<String>,
+        bytes: u64,
+        version: Ulid,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,12 +367,19 @@ pub async fn begin_send(
 
 /// What a boundary decides without a new request: a kept answer, unless it asks a request that may
 /// go twice (`again`) to try later, and a begun request that may not go twice. `None` sends.
-fn decided(boundary: Option<&SendBoundary>, again: bool) -> Option<Send> {
+pub fn decided(boundary: Option<&SendBoundary>, again: bool) -> Option<Send> {
     match boundary {
         Some(SendBoundary::Sent { status, .. }) if again && retried(*status) => None,
-        Some(SendBoundary::Sent { status, reply }) => Some(Send::Answered {
+        Some(SendBoundary::Sent {
+            status,
+            reply,
+            bytes,
+            version,
+        }) => Some(Send::Answered {
             status: *status,
             reply: reply.clone(),
+            bytes: *bytes,
+            version: *version,
         }),
         Some(SendBoundary::Sending { .. }) if !again => Some(Send::Undecided),
         _ => None,
@@ -376,14 +391,21 @@ pub fn retried(status: u16) -> bool {
     matches!(status, 408 | 429 | 500..=599)
 }
 
-/// Keeps the answer of a sent request: its status and its reply as exposed now.
+/// Keeps the answer of a sent request: its status and its reply as exposed now, with the bytes
+/// and version it sent.
 pub async fn record_sent(
     ctx: &DriverContext,
     ids: (Ulid, Ulid),
     (status, reply): (u16, Option<String>),
+    (bytes, version): (u64, Ulid),
 ) -> Result<Option<WorkRow>, StoreError> {
     update_work(ctx, ids, |row| {
-        row.boundary = Some(SendBoundary::Sent { status, reply });
+        row.boundary = Some(SendBoundary::Sent {
+            status,
+            reply,
+            bytes,
+            version,
+        });
     })
     .await
 }
@@ -458,7 +480,9 @@ pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, Stor
                 // The paths and an upload's answer stay answerable after the job record is pruned.
                 let (source, target) = (row.source.clone(), row.target.clone());
                 let (status, reply) = match &row.boundary {
-                    Some(SendBoundary::Sent { status, reply }) => (Some(*status), reply.clone()),
+                    Some(SendBoundary::Sent { status, reply, .. }) => {
+                        (Some(*status), reply.clone())
+                    }
                     _ => (None, None),
                 };
                 row.state = WorkState::Settled;

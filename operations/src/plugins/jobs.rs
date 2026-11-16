@@ -84,6 +84,7 @@ pub async fn job_status(
         Some(SendBoundary::Sent {
             status: code,
             reply,
+            ..
         }),
     ) = (status.reply_status, &row.boundary)
     {

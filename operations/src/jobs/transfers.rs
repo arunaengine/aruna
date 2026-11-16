@@ -37,7 +37,7 @@ use crate::plugins::install::{pick_version, read_manifest};
 use crate::plugins::marks::unmarked;
 use crate::plugins::outgoing::{outgoing, release_into};
 use crate::plugins::release::ReleaseKeys;
-use crate::plugins::work::{Send, WorkRow, begin_send, record_sent, retried, update_work};
+use crate::plugins::work::{Send, WorkRow, begin_send, decided, record_sent, retried, update_work};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
@@ -244,6 +244,12 @@ pub async fn upload_work(
         Ok(found) => found,
         Err(error) => return refused(error),
     };
+    let again = (row.context.as_ref()).is_some_and(|context| context.method == "PUT");
+    // A request begun or answered before decides without the source, which may be gone by now.
+    let earlier = decided(row.boundary.as_ref(), again);
+    if let Some(outcome) = earlier.and_then(|send| ended(send, again)) {
+        return outcome;
+    }
     let place = (spec.realm_id, ctx.owner_node_id);
     let (bucket, key) = match local_object(&ctx.driver, place, install, upload.source).await {
         Ok(found) => found,
@@ -283,15 +289,13 @@ pub async fn upload_work(
         Err(error) => return retryable(error.to_string()),
     };
     let size = source.info.size;
-    let again = outgoing.method == "PUT";
     let ids = (spec.install_id, spec.work_id);
     match begin_send(&ctx.driver, ids, again).await {
-        Ok(Some(Send::Now)) => {}
-        Ok(Some(Send::Undecided)) => {
-            let unknown = "the upload may have been sent; its outcome is unknown";
-            return JobRunOutcome::Undecided(JobError::retryable(unknown));
+        Ok(Some(send)) => {
+            if let Some(outcome) = ended(send, again) {
+                return outcome;
+            }
         }
-        Ok(Some(Send::Answered { status, .. })) => return sent(status, again, (size, version)),
         Ok(None) => return permanent("the plugin work is no longer recorded"),
         Err(error) => return retryable(error.0),
     }
@@ -374,10 +378,28 @@ pub async fn upload_work(
         };
         whole_text(&shown)
     });
-    if let Err(error) = record_sent(&ctx.driver, ids, (status, reply)).await {
+    if let Err(error) = record_sent(&ctx.driver, ids, (status, reply), (size, version)).await {
         return retryable(error.0);
     }
     sent(status, again, (size, version))
+}
+
+/// How an upload ends that an earlier attempt decided: unknown after a begun request that may
+/// not go twice, else by the kept answer. `None` when the attempt sends.
+fn ended(send: Send, again: bool) -> Option<JobRunOutcome> {
+    match send {
+        Send::Now => None,
+        Send::Undecided => {
+            let unknown = "the upload may have been sent; its outcome is unknown";
+            Some(JobRunOutcome::Undecided(JobError::retryable(unknown)))
+        }
+        Send::Answered {
+            status,
+            bytes,
+            version,
+            ..
+        } => Some(sent(status, again, (bytes, version))),
+    }
 }
 
 /// How an answered upload ends: a 2xx succeeds; a request that may go twice is tried again

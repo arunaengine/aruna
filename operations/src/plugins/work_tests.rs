@@ -441,12 +441,14 @@ async fn boundary_sends_once() {
         .unwrap();
     assert_eq!(stored.boundary, Some(SendBoundary::Sending { attempt: 2 }));
     let reply = Some(r#"{"status":201}"#.to_string());
-    record_sent(&fixture.ctx, ids, (201, reply.clone()))
+    record_sent(&fixture.ctx, ids, (201, reply.clone()), (8, Ulid::nil()))
         .await
         .unwrap();
     let answered = Send::Answered {
         status: 201,
         reply: reply.clone(),
+        bytes: 8,
+        version: Ulid::nil(),
     };
     assert_eq!(
         begin_send(&fixture.ctx, ids, false).await,
@@ -469,7 +471,7 @@ async fn settles_answer() {
     let ids = (install.install_id, row.work_id);
     dispatched(&fixture.ctx, ids, job(1)).await.unwrap();
     let reply = Some(r#"{"status":201}"#.to_string());
-    record_sent(&fixture.ctx, ids, (201, reply.clone()))
+    record_sent(&fixture.ctx, ids, (201, reply.clone()), (8, Ulid::nil()))
         .await
         .unwrap();
     let mut job_record = record(spec_of(&install, &row), job(1), JobState::Succeeded);
