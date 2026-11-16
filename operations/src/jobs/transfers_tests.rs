@@ -15,7 +15,7 @@ use crate::driver::DriverContext;
 use crate::jobs::plugin_work::run_plugin_work;
 use crate::jobs::plugin_work::tests::job_context;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::work::{Identity, RequestContext, WorkKind, reserve};
+use crate::plugins::work::{Identity, RequestContext, WorkKind, reserve_marked};
 use crate::s3::object::copy::test::{seed_bucket, with_blob};
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
 
@@ -60,7 +60,18 @@ async fn recorded(
     fixture: &Fixture,
     install: &PluginInstall,
     base: &str,
+    bounds: (Vec<(ChecksumAlgorithm, Vec<u8>)>, Option<u64>),
+) -> (WorkRow, PluginWorkSpec) {
+    reserved(fixture, install, base, bounds, false).await
+}
+
+/// The same, with the version it will write marked in the reservation when `marked`.
+async fn reserved(
+    fixture: &Fixture,
+    install: &PluginInstall,
+    base: &str,
     (checksums, max_bytes): (Vec<(ChecksumAlgorithm, Vec<u8>)>, Option<u64>),
+    marked: bool,
 ) -> (WorkRow, PluginWorkSpec) {
     let data = format!("/{}/g/{}/data", fixture.actor.realm_id, install.group_id);
     let target = format!("{data}/{}/in/reads.fq", fixture.actor.node_id);
@@ -79,7 +90,8 @@ async fn recorded(
         run_id: row.run_id,
         ordinal: 0,
     };
-    let (row, _) = reserve(&fixture.ctx, (install, &identity), row)
+    let marked = marked.then_some(("in", "reads.fq"));
+    let (row, _) = reserve_marked(&fixture.ctx, (install, &identity), row, marked)
         .await
         .unwrap();
     let action = PluginWorkAction::Download {
@@ -115,6 +127,31 @@ fn failed(outcome: JobRunOutcome) -> (JobErrorKind, String) {
         }
         _ => panic!("expected a failure"),
     }
+}
+
+/// Signals of a held answer: the request arrived, and the test lets the answer go.
+#[derive(Default)]
+struct Gate {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+/// A server that answers `BODY` once the test releases the request.
+async fn held() -> (String, Arc<Gate>) {
+    let gate = Arc::new(Gate::default());
+    let held = gate.clone();
+    let router = axum::Router::new().fallback(move || {
+        let held = held.clone();
+        async move {
+            held.arrived.notify_one();
+            held.release.notified().await;
+            (StatusCode::OK, BODY)
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{address}/files/"), gate)
 }
 
 async fn stored(ctx: &DriverContext, fixture: &Fixture, install: &PluginInstall) -> Vec<u8> {
@@ -236,7 +273,7 @@ async fn ungranted_target() {
 async fn narrowed_rule() {
     // A secret whose rule shows the status only would hide what the bucket keeps, so the work
     // ends after the release and before any request.
-    use crate::plugins::bound::tests::{ORIGIN, bound, edit_config, keys, secret_with};
+    use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, keys, secret_with};
     use crate::plugins::install::read_config;
     use aruna_core::secrets::ResponseExposure;
     let fixture = Fixture::keyed().await;
@@ -271,4 +308,37 @@ async fn narrowed_rule() {
     let (kind, message) = failed(outcome);
     assert_eq!(kind, JobErrorKind::Permanent);
     assert_eq!(message, "this connection does not expose its whole answer");
+    // The released token is in no row the work keeps.
+    let kept = crate::plugins::work::read_work(&fixture.ctx, install.install_id, row.work_id);
+    let kept = kept.await.unwrap().unwrap();
+    assert!(!format!("{kept:?}").contains(TOKEN));
+}
+
+#[tokio::test]
+async fn sweep_during_download() {
+    // A sweep while the answer is still on its way keeps the mark of the version not yet
+    // written; once written, the version keeps it too.
+    use crate::plugins::marks::{is_marked, sweep_marks};
+    let fixture = Fixture::new().await;
+    let install = downloader(&fixture).await;
+    let (_root, blob) = ready(&fixture, &install).await;
+    let (base, gate) = held().await;
+    let (row, spec) = reserved(&fixture, &install, &base, (Vec::new(), None), true).await;
+    let version = ("in", "reads.fq", row.version_id.unwrap());
+    let ctx = job_context(&blob, &fixture);
+    let sweep = async {
+        gate.arrived.notified().await;
+        let swept = sweep_marks(&blob).await;
+        gate.release.notify_one();
+        swept
+    };
+    let (outcome, swept) = tokio::join!(run_plugin_work(&ctx, &spec), sweep);
+    assert_eq!(swept, Ok(0), "the download may still write");
+    let JobRunOutcome::Succeeded(JobResultPayload::PluginWork { version_id, .. }) = outcome else {
+        panic!("the held download did not succeed");
+    };
+    assert_eq!(version_id, row.version_id);
+    assert_eq!(sweep_marks(&blob).await, Ok(0), "the version exists");
+    assert!(is_marked(&blob, version).await.unwrap());
+    assert_eq!(stored(&blob, &fixture, &install).await, BODY);
 }
