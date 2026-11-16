@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::schedule::parse_schedule;
+use super::cron::parse_schedule;
 use super::{ImportRuleError, folders_overlap, validate_folder};
 use crate::groups::backends::{backend_key, record_writes};
 use crate::groups::fence::group_fence_key;

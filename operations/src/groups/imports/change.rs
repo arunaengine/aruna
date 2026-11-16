@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::ImportRuleError;
-use super::schedule::{is_running, parse_schedule};
+use super::cron::{is_running, parse_schedule};
 use crate::groups::backends::backend_key;
 use crate::groups::fence::{parse_group_record, read_group_record};
 use crate::jobs::store::decode_job_record;

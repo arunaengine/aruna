@@ -1,7 +1,8 @@
-//! Reads import schedules, five-field cron expressions in UTC, and starts due runs.
+//! Reads import schedules and starts their due runs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::cron::next_due;
 use super::remove::RemoveImportOperation;
 use super::{ImportRuleError, all_imports};
 use crate::driver::{DriverContext, drive};
@@ -14,13 +15,10 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::IMPORT_REMOVAL_KEYSPACE;
-use aruna_core::structs::execution::job::{JobId, JobState};
+use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::{BackendImport, BackendImportSpec};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use chrono::{DateTime, Utc};
-use croner::Cron;
-use croner::parser::{CronParser, Seconds, Year};
 use std::time::{Duration, UNIX_EPOCH};
 use tracing::warn;
 use ulid::Ulid;
@@ -30,29 +28,6 @@ const BUSY_RETRY_MS: u64 = 60_000;
 
 /// Interrupted removals finished per schedule run; the rest wait for the next one.
 const REMOVAL_PAGE: usize = 64;
-
-/// Seconds and years are refused, so no schedule fires more than once a minute.
-pub fn parse_schedule(pattern: &str) -> Result<Cron, ImportRuleError> {
-    CronParser::builder()
-        .seconds(Seconds::Disallowed)
-        .year(Year::Disallowed)
-        .build()
-        .parse(pattern)
-        .map_err(|error| ImportRuleError::Invalid(format!("schedule is not valid cron: {error}")))
-}
-
-/// The first time strictly after `after_ms` that `schedule` fires, in Unix milliseconds.
-pub fn next_due(schedule: &str, after_ms: u64) -> Option<u64> {
-    let cron = parse_schedule(schedule).ok()?;
-    let after = DateTime::<Utc>::from_timestamp_millis(i64::try_from(after_ms).ok()?)?;
-    let next = cron.find_next_occurrence(&after, false).ok()?;
-    u64::try_from(next.timestamp_millis()).ok()
-}
-
-/// A run counts as going until it ends; an undecided run does not hold the schedule.
-pub fn is_running(state: JobState) -> bool {
-    !state.is_terminal() && state != JobState::Indeterminate
-}
 
 /// Starts one run unless the last one is still going. The job and the rule's record of
 /// it commit in one transaction. Answers `None` while a run is going.
@@ -185,6 +160,7 @@ pub async fn wake_schedule(context: &DriverContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::groups::imports::cron::parse_schedule;
 
     const HOUR_MS: u64 = 3_600_000;
 

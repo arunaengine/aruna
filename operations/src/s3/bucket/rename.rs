@@ -5,7 +5,7 @@
 
 use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
 use crate::driver::{DriverContext, drive};
-use crate::groups::imports::schedule::is_running;
+use crate::groups::imports::cron::is_running;
 use crate::groups::imports::validate_folder;
 use crate::jobs::store::decode_job_record;
 use crate::replication::queue::queued_prefixes;
