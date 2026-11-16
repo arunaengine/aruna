@@ -500,21 +500,6 @@ impl HeadObjectOperation {
             return self.emit_error(HeadObjectError::NoTransactionFound);
         };
         self.state = HeadObjectState::CommitTransaction;
-        self.output = Some(Ok(HeadObjectResult {
-            location: self.location.clone(),
-            metadata: self.metadata.clone(),
-            source_metadata: self.source_metadata.clone(),
-            last_refresh: self.last_refresh,
-            version_created_at: self.version_created_at,
-            version_id: self.resolved_version_id.or(self.input.version_id),
-            resolved_version_id: self.resolved_version_id,
-            checksum_type: self.checksum_type,
-            composite_hashes: self.composite_hashes.clone(),
-            part_count: self.part_count,
-            source_policies: self.source_policies.clone(),
-            source_binding: self.source_binding.clone(),
-        }));
-
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -529,6 +514,20 @@ impl HeadObjectOperation {
                 },)];
             }
             self.state = HeadObjectState::Finish;
+            self.output = Some(Ok(HeadObjectResult {
+                location: self.location.clone(),
+                metadata: self.metadata.clone(),
+                source_metadata: self.source_metadata.clone(),
+                last_refresh: self.last_refresh,
+                version_created_at: self.version_created_at,
+                version_id: self.resolved_version_id.or(self.input.version_id),
+                resolved_version_id: self.resolved_version_id,
+                checksum_type: self.checksum_type,
+                composite_hashes: self.composite_hashes.clone(),
+                part_count: self.part_count,
+                source_policies: self.source_policies.clone(),
+                source_binding: self.source_binding.clone(),
+            }));
             smallvec![]
         } else {
             self.emit_error(HeadObjectError::InvalidStateEvent {
@@ -746,6 +745,10 @@ mod tests {
         };
         operation.step(read(Some(location.to_bytes().unwrap())));
         operation.step(read(None));
+        let txn_id = operation.txn_id.unwrap();
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
         let found = matches!(&operation.output, Some(Ok(output)) if output.location == Some(location.clone()));
         assert!(found);
 
@@ -813,6 +816,64 @@ mod tests {
                 ManagedCopyError::Mismatched
             )))
         ));
+    }
+
+    // A result exists only once the read transaction committed, so an aborted head never succeeds.
+    #[test]
+    fn output_after_commit() {
+        use aruna_core::structs::storage::blob::ArchiveKey;
+        use aruna_core::structs::storage::encryption::BucketKeyRef;
+        use aruna_core::structs::storage::format::PithosLayout;
+
+        let mut location = location_with_hash();
+        location.hashes.remove(HASH_BLAKE3);
+        let layout = PithosLayout {
+            stored_size: 70,
+            metadata_digest: [3; 32],
+            storage_generation: 0,
+        };
+        location.format = StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1));
+        let archive = ArchiveKey::of(&location);
+        let version_id = Ulid::generate();
+        let version = BlobVersion::pending(archive, location.created_at, location.created_by, None);
+        let read = |value: Option<Vec<u8>>| {
+            Event::Storage(StorageEvent::ReadResult {
+                key: Vec::<u8>::new().into(),
+                value: value.map(Into::into),
+            })
+        };
+        let looked_up = || {
+            let mut operation = HeadObjectOperation::new(HeadObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "hello.txt".to_string(),
+                version_id: Some(version_id),
+            });
+            let txn_id = Ulid::generate();
+            operation.txn_id = Some(txn_id);
+            operation.read_version(version_id, version.clone(), true);
+            operation.step(read(Some(location.to_bytes().unwrap())));
+            let effects = operation.step(read(None));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit })]
+                    if *commit == txn_id
+            ));
+            (operation, txn_id)
+        };
+
+        let (early, _) = looked_up();
+        assert!(!early.is_complete());
+        assert!(matches!(
+            early.finalize(),
+            Err(HeadObjectError::NotFinished)
+        ));
+
+        let (mut operation, txn_id) = looked_up();
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize().unwrap().location, Some(location));
     }
 
     #[tokio::test]
