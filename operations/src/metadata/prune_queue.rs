@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::metadata::materialization_queue::metadata_graph_deleted;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,6 @@ use super::queue_storage::{
     MetadataQueueError, abort_storage_transaction, commit_storage_transaction,
     start_write_transaction,
 };
-use super::repository::{StorageReadError, parse_lifecycle_read, read_lifecycle_effect};
 
 const PRUNE_PAGE: usize = 512;
 const PRUNE_BATCH_SIZE: usize = 128;
@@ -340,7 +340,7 @@ async fn process_prune_job(
 ) -> Result<ProcessedJobGroup, MetadataGraphError> {
     let job_keys = jobs.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
     let job = representative_job(&graph_iri, &jobs);
-    if !metadata_graph_deleted(&context.storage_handle, &graph_iri).await? {
+    if !metadata_graph_deleted::<MetadataGraphError>(&context.storage_handle, &graph_iri).await? {
         return Ok(ProcessedJobGroup {
             completed_keys: job_keys,
             processed: 0,
@@ -487,21 +487,6 @@ async fn scan_due_prune(
             None => return Ok((jobs, false, next_due_ms)),
         }
     }
-}
-
-async fn metadata_graph_deleted(
-    storage: &StorageHandle,
-    graph_iri: &str,
-) -> Result<bool, MetadataGraphError> {
-    let event = storage
-        .send_effect(read_lifecycle_effect(graph_iri, None))
-        .await;
-    parse_lifecycle_read(event)
-        .map(|record| record.is_some_and(|record| record.is_deleted()))
-        .map_err(|error| match error {
-            StorageReadError::Storage(error) => error.into(),
-            StorageReadError::Conversion(error) => error.into(),
-        })
 }
 
 async fn write_prune_job(

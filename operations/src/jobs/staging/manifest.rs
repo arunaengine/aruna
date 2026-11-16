@@ -194,7 +194,7 @@ pub(super) fn lasting_head(error: &HeadSourceError) -> bool {
     }
 }
 
-fn lasting_read(error: &ReadSourceError) -> bool {
+pub(super) fn lasting_read(error: &ReadSourceError) -> bool {
     match error {
         ReadSourceError::Resolve(error) => lasting_resolution(error),
         ReadSourceError::Staging(error) => lasting_source(error),

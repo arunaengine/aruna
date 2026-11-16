@@ -455,7 +455,7 @@ pub(super) async fn read_value(
     }
 }
 
-async fn page(
+pub(super) async fn page(
     context: &DriverContext,
     key_space: &str,
     prefix: Option<Vec<u8>>,

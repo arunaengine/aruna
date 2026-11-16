@@ -4,6 +4,7 @@
 
 use super::*;
 use aruna_core::structs::storage::data::identity::ObjectLocation;
+use serde::Serialize;
 
 pub(super) fn plan_export(
     spec: &ExportRoCrateSpec,
@@ -1409,9 +1410,9 @@ pub(crate) async fn stored_checkpoint(
     .await
 }
 
-pub(crate) async fn persist_checkpoint(
+pub(crate) async fn persist_checkpoint<T: Serialize>(
     ctx: &JobContext,
-    checkpoint: &ExportCheckpoint,
+    checkpoint: &T,
 ) -> Result<(), String> {
     put_state(
         &ctx.driver.storage_handle,

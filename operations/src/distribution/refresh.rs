@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::imports::read_value;
+use super::imports::{page, read_value};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -20,7 +20,6 @@ use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionView, KeyRange, WriteRoute,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -270,30 +269,6 @@ async fn write_round(
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         other => Err(format!("refresh round not written: {other:?}")),
-    }
-}
-
-/// One page of `key_space` and whether more rows may follow.
-async fn page(
-    context: &DriverContext,
-    key_space: &str,
-    prefix: Option<Vec<u8>>,
-    start: Option<IterStart>,
-    limit: usize,
-) -> Result<(Vec<(Key, Value)>, Option<Key>), String> {
-    let iter = StorageEffect::Iter {
-        key_space: key_space.to_string(),
-        prefix: prefix.map(Into::into),
-        start,
-        limit,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(iter).await {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Ok((values, next_start_after)),
-        other => Err(format!("unexpected page answer {other:?}")),
     }
 }
 

@@ -18,6 +18,7 @@ pub use upload::{
 };
 pub(crate) use upload::{claim_upload, upload_key, upload_stale};
 
+use crate::jobs::export::persist_checkpoint;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::pin::Pin;
@@ -1915,19 +1916,6 @@ async fn read_plan(ctx: &JobContext) -> Result<Option<ImportPlan>, String> {
         "import plan",
     )
     .await
-}
-
-async fn persist_checkpoint(ctx: &JobContext, checkpoint: &ImportCheckpoint) -> Result<(), String> {
-    put_state(
-        &ctx.driver.storage_handle,
-        ctx.job_id,
-        ctx.claim_token,
-        JOB_STATE_KEYSPACE,
-        ByteView::from(ctx.job_id.to_bytes().to_vec()),
-        checkpoint,
-    )
-    .await
-    .map_err(|error| error.to_string())
 }
 
 async fn persist_plan(ctx: &JobContext, plan: &ImportPlan) -> Result<(), String> {

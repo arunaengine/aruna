@@ -1516,7 +1516,12 @@ async fn process_materialization_job(
         }
         Err(error) => return Err(error),
     };
-    if metadata_graph_deleted(&context.storage_handle, &event.record.graph_iri).await? {
+    if metadata_graph_deleted::<MetadataMaterializationError>(
+        &context.storage_handle,
+        &event.record.graph_iri,
+    )
+    .await?
+    {
         return Ok(ProcessedMaterializationJob::completed(
             CompletedMaterializationJob {
                 job_key,
@@ -2121,10 +2126,10 @@ fn job_key_parts(key: &[u8]) -> Option<(u64, Ulid, Ulid)> {
     ))
 }
 
-async fn metadata_graph_deleted(
+pub(crate) async fn metadata_graph_deleted<E: From<StorageError> + From<ConversionError>>(
     storage: &StorageHandle,
     graph_iri: &str,
-) -> Result<bool, MetadataMaterializationError> {
+) -> Result<bool, E> {
     let event = storage
         .send_effect(read_lifecycle_effect(graph_iri, None))
         .await;

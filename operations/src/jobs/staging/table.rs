@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::manifest::lasting_read;
 use std::collections::{BTreeMap, HashMap};
 
 use aruna_core::errors::StagingSourceError;
@@ -25,7 +26,7 @@ use byteview::ByteView;
 use futures_util::StreamExt;
 
 use super::limiter::retried;
-use super::manifest::{lasting_head, lasting_resolution, lasting_source};
+use super::manifest::lasting_head;
 use super::walk::{
     PageFailure, StagedFile, access_rules, commit_rows, import_page, key_turns, own_ranges,
     record_failure, source_permission_path,
@@ -548,14 +549,6 @@ async fn decode_chunk(gzip: &mut GzipStream) -> Result<(), Broken> {
         }
     }
     Ok(())
-}
-
-fn lasting_read(error: &ReadSourceError) -> bool {
-    match error {
-        ReadSourceError::Resolve(error) => lasting_resolution(error),
-        ReadSourceError::Staging(error) => lasting_source(error),
-        ReadSourceError::UnexpectedEvent { .. } | ReadSourceError::ReadSourceFailed => false,
-    }
 }
 
 /// Registers the files of file and record rows as references carrying their row metadata, and
