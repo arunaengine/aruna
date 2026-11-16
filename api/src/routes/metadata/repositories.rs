@@ -418,7 +418,7 @@ fn create_error(error: CreateConnectorError) -> ServerError {
         | CreateConnectorError::Conversion(_)
         | CreateConnectorError::Failed
         | CreateConnectorError::InvalidStateEvent { .. } => {
-            ServerError::InternalError(error.to_string())
+            ServerError::InternalError(error.to_string().into())
         }
         CreateConnectorError::EmptyName
         | CreateConnectorError::EmptyEndpoint
@@ -444,7 +444,7 @@ fn update_error(error: UpdateConnectorError) -> ServerError {
         }
         UpdateConnectorError::GroupWrite(_)
         | UpdateConnectorError::Storage(_)
-        | UpdateConnectorError::Unexpected => ServerError::InternalError(error.to_string()),
+        | UpdateConnectorError::Unexpected => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -452,7 +452,7 @@ fn read_error(error: ReadConnectorError) -> ServerError {
     match error {
         ReadConnectorError::NotFound => ServerError::NotFound,
         ReadConnectorError::Storage(_) | ReadConnectorError::Unexpected => {
-            ServerError::InternalError(error.to_string())
+            ServerError::InternalError(error.to_string().into())
         }
     }
 }

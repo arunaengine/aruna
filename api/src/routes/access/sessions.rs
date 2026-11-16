@@ -104,7 +104,7 @@ pub(crate) fn map_create_error(error: CreateSessionError) -> ServerError {
         CreateSessionError::Token(CreateTokenError::RestrictionsTooLarge) => {
             ServerError::BadRequestReason("path restrictions exceed the allowed size".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -136,7 +136,7 @@ pub(crate) async fn session_restrictions(
 fn map_revoke_error(error: RevokeSessionError) -> ServerError {
     match error {
         RevokeSessionError::NotFound => ServerError::NotFound,
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -296,7 +296,7 @@ pub async fn list_sessions(
     let current_sid = auth.session.as_ref().map(|session| session.sid.as_str());
     let sessions = drive(ListSessionOperation::new(auth.user_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
         .into_iter()
         .map(|session| session_summary(session, current_sid))
         .collect();

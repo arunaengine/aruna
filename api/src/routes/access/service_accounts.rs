@@ -100,7 +100,7 @@ fn map_check_error(error: ServiceCheckError) -> ServerError {
         ServiceCheckError::Deactivated => {
             ServerError::Conflict("the service account is deactivated".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -169,7 +169,7 @@ async fn create_account(
         CreateServiceError::InvalidName => {
             ServerError::BadRequestReason("the name must be 1 to 256 bytes".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     })?;
     Ok((StatusCode::CREATED, Json(account_response(user))))
 }
@@ -208,7 +208,7 @@ async fn list_accounts(
         .await
         .map_err(|error| match error {
             ListServiceError::Unauthorized => ServerError::Forbidden,
-            error => ServerError::InternalError(error.to_string()),
+            error => ServerError::InternalError(error.to_string().into()),
         })?;
     let accounts = accounts.into_iter().map(account_response).collect();
     Ok((StatusCode::OK, Json(ListServiceResponse { accounts })))
@@ -440,7 +440,7 @@ async fn create_credential(
                 CreateUserError::LimitReached => {
                     ServerError::Conflict("active credential limit reached".to_string())
                 }
-                error => ServerError::InternalError(error.to_string()),
+                error => ServerError::InternalError(error.to_string().into()),
             })?;
     Ok((
         StatusCode::CREATED,

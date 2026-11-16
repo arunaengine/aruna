@@ -575,7 +575,7 @@ pub(crate) async fn require_owner(
         GetConfigError::DocumentNotFound => ServerError::ServiceUnavailableReason(
             "the realm configuration has not reached this device yet".to_string(),
         ),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     let node_id = state.get_node_id().to_string();
     let owner = config
@@ -641,8 +641,8 @@ pub(crate) fn map_authorize_error(error: AuthorizeError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        AuthorizeError::Storage(error) => ServerError::InternalError(error.to_string()),
-        AuthorizeError::CheckFailed(message) => ServerError::InternalError(message),
+        AuthorizeError::Storage(error) => ServerError::InternalError(error.to_string().into()),
+        AuthorizeError::CheckFailed(message) => ServerError::InternalError(message.into()),
         AuthorizeError::PermissionDenied | AuthorizeError::Policy(_) => ServerError::Forbidden,
     }
 }

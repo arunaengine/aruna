@@ -1183,7 +1183,8 @@ pub(crate) async fn store_stream(
     (metadata, create_only): (HashMap<String, String>, bool),
 ) -> Result<PutObjectResult, crate::error::ServerError> {
     use crate::error::ServerError;
-    let internal = |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string());
+    let internal =
+        |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string().into());
     let realm = drive(
         GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
@@ -1423,19 +1424,19 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
             crate::routes::storage::distributed::map_guard_error(error)
         }
         PutObjectError::InvalidOperationState => {
-            ServerError::InternalError("invalid object write state".to_string())
+            ServerError::InternalError("invalid object write state".to_string().into())
         }
         PutObjectError::NoTransactionFound => {
-            ServerError::InternalError("object write transaction is missing".to_string())
+            ServerError::InternalError("object write transaction is missing".to_string().into())
         }
         PutObjectError::MissingOutput => {
-            ServerError::InternalError("object write output is missing".to_string())
+            ServerError::InternalError("object write output is missing".to_string().into())
         }
         PutObjectError::MissingHash(hash) => {
-            ServerError::InternalError(format!("object hash is missing: {hash}"))
+            ServerError::InternalError(format!("object hash is missing: {hash}").into())
         }
         PutObjectError::InvalidPreassignedVersion => {
-            ServerError::InternalError("invalid object version".to_string())
+            ServerError::InternalError("invalid object version".to_string().into())
         }
         PutObjectError::ObjectExists => ServerError::Refused(
             http::StatusCode::CONFLICT,
@@ -1443,7 +1444,7 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
             "another file took this name during the upload; upload again".to_string(),
         ),
         PutObjectError::PutObjectFailed => {
-            ServerError::InternalError("object write failed".to_string())
+            ServerError::InternalError("object write failed".to_string().into())
         }
         error @ (PutObjectError::StorageError(_)
         | PutObjectError::WriteFailed(_)
@@ -1461,7 +1462,7 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
         | PutObjectError::ImportRemoved
         | PutObjectError::VersionExists
         | PutObjectError::HistoryDeleted
-        | PutObjectError::FenceTaken) => ServerError::InternalError(error.to_string()),
+        | PutObjectError::FenceTaken) => ServerError::InternalError(error.to_string().into()),
     }
 }
 

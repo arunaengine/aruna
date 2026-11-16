@@ -582,7 +582,7 @@ async fn reported_reason_wins() {
 fn failed_item_redacted() {
     let failed = failed_input(
         "data/b.txt".to_string(),
-        &ServerError::InternalError("private backend detail".to_string()),
+        &ServerError::InternalError("private backend detail".to_string().into()),
     );
     assert!(!failed.error.contains("private backend detail"));
 }

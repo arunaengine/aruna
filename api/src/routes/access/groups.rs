@@ -370,7 +370,7 @@ pub(crate) async fn load_group(
 fn map_group_error(error: GetGroupError) -> ServerError {
     match error {
         GetGroupError::GroupNotFound | GetGroupError::DocNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -526,7 +526,7 @@ pub async fn create_group(
     } else {
         let realm_config = drive(GetConfigOperation::new(realm_id), &state.get_ctx())
             .await
-            .map_err(|err| ServerError::InternalError(err.to_string()))?;
+            .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
         realm_config.quota.max_groups_for(&auth.user_id)
     };
 
@@ -568,7 +568,7 @@ pub async fn create_group(
             ServerError::Conflict("concurrent group creation conflict; retry".to_string())
         }
         CreateGroupError::InvalidDisplayName => ServerError::BadRequest,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     create_span.record("group_id", field::display(result.0.group_id));
     request_span.record("group_id", field::display(result.0.group_id));
@@ -650,7 +650,7 @@ pub async fn list_groups(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
     Ok((
         StatusCode::OK,
         Json(ListGroupsResponse {
@@ -692,7 +692,7 @@ async fn build_api_groups(
                 &state.get_ctx(),
             )
             .await
-            .map_err(|err| ServerError::InternalError(err.to_string()))?;
+            .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
             let is_member = is_group_member(&auth_doc, caller);
             Some(map_visible_roles(auth_doc, group.realm_id, is_member))
         } else {
@@ -1201,7 +1201,7 @@ fn map_rename_error(error: UpdateGroupError) -> ServerError {
         UpdateGroupError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent group update conflict; retry".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -1210,7 +1210,7 @@ fn map_member_error(error: AddUserError) -> ServerError {
         AddUserError::Unauthorized => ServerError::Forbidden,
         AddUserError::InvalidUserId => ServerError::BadRequest,
         AddUserError::RoleNotFound | AddUserError::DocNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -1225,7 +1225,7 @@ fn map_role_error(error: AddRoleError) -> ServerError {
         AddRoleError::CheckPermissionsError(
             AuthorizationError::GroupNotFound | AuthorizationError::DocNotFound,
         ) => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -1237,7 +1237,7 @@ fn map_removal_error(error: RemoveFromError) -> ServerError {
         RemoveFromError::LastAdmin => {
             ServerError::Conflict("the last admin of a group cannot be removed".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -1924,7 +1924,7 @@ pub async fn create_group_role(
     let role = map_roles(auth_doc, realm_id)
         .into_iter()
         .find(|role| role.role_id == role_id.to_string())
-        .ok_or_else(|| ServerError::InternalError("created role missing".to_string()))?;
+        .ok_or_else(|| ServerError::InternalError("created role missing".to_string().into()))?;
 
     // A DENY rule can narrow existing READ scopes.
     if narrows {
@@ -2004,7 +2004,7 @@ pub async fn delete_group_role(
         RemoveGroupError::AdminRoleUndeletable => {
             ServerError::Conflict("the admin role cannot be deleted".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
 
@@ -2212,7 +2212,7 @@ async fn list_group_buckets(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
 
     let entries = result
         .buckets
@@ -2294,7 +2294,7 @@ async fn listed_bucket(
     {
         Ok(info) => Ok(Some(info)),
         Err(GetBucketError::NotFound) => Ok(None),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
+        Err(err) => Err(ServerError::InternalError(err.to_string().into())),
     }
 }
 
@@ -2310,7 +2310,7 @@ pub(crate) async fn get_bucket_group(
     {
         Ok(info) => Ok(Some(info.group_id)),
         Err(GetBucketError::NotFound) => Ok(None),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
+        Err(err) => Err(ServerError::InternalError(err.to_string().into())),
     }
 }
 

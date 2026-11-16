@@ -38,7 +38,7 @@ fn map_status_error(error: AccountStatusError) -> ServerError {
         AccountStatusError::Administrator => ServerError::Conflict(
             "a realm administrator cannot be deactivated; remove the role first".to_string(),
         ),
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 

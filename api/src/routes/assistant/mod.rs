@@ -355,7 +355,7 @@ fn map_store_error(error: ProviderStoreError) -> ServerError {
         ProviderStoreError::Stale => {
             ServerError::Conflict("provider changed concurrently".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -614,7 +614,9 @@ pub async fn patch_provider(
     }
     let mut secret = provider
         .open_secret(state.credential_encryption_key())
-        .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
+        .map_err(|_| {
+            ServerError::InternalError("provider secret unavailable".to_string().into())
+        })?;
     if let Some(api_key) = request.api_key {
         secret.api_key = Some(Secret::new(api_key));
     }
@@ -622,12 +624,14 @@ pub async fn patch_provider(
         Some(headers) => headers_from_input(headers)?,
         None => provider
             .open_headers(state.credential_encryption_key())
-            .map_err(|_| ServerError::InternalError("provider headers unavailable".to_string()))?,
+            .map_err(|_| {
+                ServerError::InternalError("provider headers unavailable".to_string().into())
+            })?,
     };
     provider
         .encrypt_secret(state.credential_encryption_key(), &secret)
         .and_then(|_| provider.encrypt_headers(state.credential_encryption_key(), &headers))
-        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string()))?;
+        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     let provider = save_provider(&state, auth.user_id, expected, provider).await?;
     Ok((StatusCode::OK, Json(provider_summary(&provider))))
 }

@@ -245,7 +245,7 @@ pub async fn list_s3_sessions(
         .map(|interface| interface.base_url);
     let sessions = drive(ListSessionsOperation::new(auth.user_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
         .into_iter()
         .filter(|session| session.issued_by == issued_by && !session.is_expired(now))
         .map(|session| session_summary(session, s3_endpoint.clone()))
@@ -317,7 +317,7 @@ pub async fn refresh_s3_session(
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let session = drive(GetS3Operation::new(access_key_id.clone()), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
         .ok_or(ServerError::NotFound)?;
     if session.user_identity != auth.user_id || session.issued_by != *state.get_node_id().as_bytes()
     {
@@ -416,7 +416,7 @@ async fn ensure_membership(
     .await
     .map_err(|error| match error {
         GetGroupError::GroupNotFound | GetGroupError::DocNotFound => ServerError::Forbidden,
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.to_string().into()),
     })?;
     authorization
         .roles
@@ -429,12 +429,14 @@ async fn ensure_membership(
 fn session_expiry(now: SystemTime, bearer_expiry: u64) -> ServerResult<SystemTime> {
     let now_secs = now
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| ServerError::InternalError("system clock precedes Unix epoch".to_string()))?
+        .map_err(|_| {
+            ServerError::InternalError("system clock precedes Unix epoch".to_string().into())
+        })?
         .as_secs();
     let expires_at = now_secs
         .checked_add(60 * 60)
         .ok_or(ServerError::InternalError(
-            "session expiry overflow".to_string(),
+            "session expiry overflow".to_string().into(),
         ))?
         .min(bearer_expiry);
     if expires_at <= now_secs {
@@ -516,7 +518,7 @@ fn session_summary(session: S3Session, s3_endpoint: Option<String>) -> SessionSu
 fn map_create_error(error: S3SessionError) -> ServerError {
     match error {
         S3SessionError::InvalidExpiry => ServerError::Unauthorized,
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -536,7 +538,7 @@ fn map_refresh_error(error: S3SessionError) -> ServerError {
         S3SessionError::Idle => ServerError::Conflict("session is idle".to_string()),
         S3SessionError::Expired => ServerError::Conflict("session has expired".to_string()),
         S3SessionError::InvalidExpiry => ServerError::Unauthorized,
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -546,7 +548,7 @@ fn map_revoke_error(error: S3SessionError) -> ServerError {
         | S3SessionError::WrongIssuer
         | S3SessionError::WrongOwner
         | S3SessionError::InvalidAccessKey => ServerError::NotFound,
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 

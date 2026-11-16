@@ -827,7 +827,7 @@ pub async fn stage_inputs(
         )));
     }
     let bucket = record.workspace_bucket.clone().ok_or_else(|| {
-        ServerError::InternalError("a session has no workspace bucket".to_string())
+        ServerError::InternalError("a session has no workspace bucket".to_string().into())
     })?;
     let node_id = state.get_node_id().to_string();
     let mut items = Vec::with_capacity(request.items.len());
@@ -937,7 +937,7 @@ async fn bucket_info(
     match drive(GetBucketOperation::new(bucket.to_string()), context).await {
         Ok(info) => Ok(info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
     }
 }
 
@@ -1003,7 +1003,7 @@ async fn stage_one(
     }
     let realm_config = drive(GetConfigOperation::new(state.get_realm_id()), &context)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let input = CopyObjectInput {
         source_bucket: item.bucket,
         source_key: item.key,
@@ -1105,7 +1105,7 @@ fn head_error(error: HeadObjectError) -> ServerError {
         HeadObjectError::NoSuchKey
         | HeadObjectError::NoSuchVersion
         | HeadObjectError::DeleteMarker => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -1222,9 +1222,13 @@ pub async fn read_scratch(
     let encoded = body
         .get("base64")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| ServerError::InternalError("session read carries no bytes".to_string()))?;
+        .ok_or_else(|| {
+            ServerError::InternalError("session read carries no bytes".to_string().into())
+        })?;
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-        .map_err(|_| ServerError::InternalError("session read is not decodable".to_string()))?;
+        .map_err(|_| {
+            ServerError::InternalError("session read is not decodable".to_string().into())
+        })?;
     let content_type = key_content_type(&query.path);
     Ok((
         StatusCode::OK,

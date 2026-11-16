@@ -163,7 +163,7 @@ pub async fn get_email_profile(
         .await
         .map_err(|error| match error {
             GetConfigError::DocumentNotFound => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.to_string().into()),
         })?;
     let admin = config.email.is_some()
         && ensure_permission(
@@ -245,7 +245,7 @@ pub async fn set_email_profile(
     let stored = change_profile(&state, auth, Some(input)).await?;
     stored
         .map(|profile| Json(profile.into()))
-        .ok_or_else(|| ServerError::InternalError("the profile was not stored".to_string()))
+        .ok_or_else(|| ServerError::InternalError("the profile was not stored".to_string().into()))
 }
 
 #[utoipa::path(
@@ -335,7 +335,7 @@ fn map_email_error(error: SetEmailError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 

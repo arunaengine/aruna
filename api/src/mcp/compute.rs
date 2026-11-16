@@ -1035,7 +1035,7 @@ fn map_job_request(error: crate::jobs::JobRequestError) -> crate::error::ServerE
         JobRequestError::ServiceUnavailableReason(message) => {
             ServerError::ServiceUnavailableReason(message)
         }
-        JobRequestError::InternalError(message) => ServerError::InternalError(message),
+        JobRequestError::InternalError(message) => ServerError::InternalError(message.into()),
     }
 }
 

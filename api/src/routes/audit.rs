@@ -241,7 +241,7 @@ pub async fn list_audit(
         ListAuditError::Unavailable => ServerError::ServiceUnavailable,
         ListAuditError::Unauthorized => ServerError::Unauthorized,
         ListAuditError::InvalidCursor => ServerError::BadRequest,
-        ListAuditError::Storage(message) => ServerError::InternalError(message),
+        ListAuditError::Storage(message) => ServerError::InternalError(message.into()),
     })?;
 
     Ok((

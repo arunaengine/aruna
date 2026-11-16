@@ -185,7 +185,7 @@ fn source_error(error: CreateSourceError) -> ServerError {
         | CreateSourceError::Conversion(_)
         | CreateSourceError::Failed
         | CreateSourceError::InvalidStateEvent { .. } => {
-            ServerError::InternalError(error.to_string())
+            ServerError::InternalError(error.to_string().into())
         }
     }
 }

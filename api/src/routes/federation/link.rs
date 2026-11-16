@@ -80,7 +80,7 @@ fn link_refused(error: LinkLoginError) -> ServerError {
         LinkLoginError::Update(UpdateUserError::AliasMissing) => ServerError::NotFound,
         LinkLoginError::Update(UpdateUserError::Unauthorized) => ServerError::Forbidden,
         LinkLoginError::Storage(_) => ServerError::ServiceUnavailableReason(message),
-        _ => ServerError::InternalError(message),
+        _ => ServerError::InternalError(message.into()),
     }
 }
 

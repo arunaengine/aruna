@@ -136,7 +136,7 @@ fn token_response(token: GroupToken) -> GroupTokenResponse {
 fn map_revocation(message: String) -> ServerError {
     match message == RevokeTokenError::CapacityReached.to_string() {
         true => ServerError::ServiceUnavailableReason("token_revocation_capacity_reached".into()),
-        false => ServerError::InternalError(message),
+        false => ServerError::InternalError(message.into()),
     }
 }
 
@@ -150,7 +150,7 @@ fn map_tokens_error(error: GroupTokensError) -> ServerError {
                 .to_string(),
         ),
         GroupTokensError::Revocation(message) => map_revocation(message),
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -425,7 +425,7 @@ pub async fn revoke_user_tokens(
     .map_err(|error| match error {
         RevokeAllError::Refused => ServerError::Forbidden,
         RevokeAllError::Cutoff(message) => map_revocation(message),
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     })?;
     Ok(StatusCode::NO_CONTENT)
 }

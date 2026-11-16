@@ -336,7 +336,7 @@ fn map_consume_error(error: ConsumeSecretError) -> ServerError {
         | ConsumeSecretError::Expired
         | ConsumeSecretError::AlreadyClaimed
         | ConsumeSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -346,7 +346,7 @@ fn map_inspect_error(error: InspectSecretError) -> ServerError {
         | InspectSecretError::Expired
         | InspectSecretError::AlreadyClaimed
         | InspectSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -380,7 +380,7 @@ async fn issue_user_session(
             CreateSessionError::LimitReached { .. } => {
                 ServerError::Conflict("active session limit reached".to_string())
             }
-            error => ServerError::InternalError(error.to_string()),
+            error => ServerError::InternalError(error.to_string().into()),
         })?;
     Ok(created.token.expose().to_string())
 }
@@ -396,7 +396,7 @@ pub(crate) async fn ensure_active(state: &ServerState, user_id: UserId) -> Serve
     match drive(ReadUserOperation::new(user_id), &state.get_ctx()).await {
         Ok(user) if user.is_deactivated() => Err(ServerError::Forbidden),
         Ok(_) | Err(ReadUserError::NotFound) => Ok(()),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.to_string().into())),
     }
 }
 
@@ -421,19 +421,19 @@ fn map_subject_error(error: SubjectCheckError) -> ServerError {
     match error {
         SubjectCheckError::Unauthorized => ServerError::Unauthorized,
         SubjectCheckError::Forbidden => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
 fn map_user_error(error: ReadUserError) -> ServerError {
     match error {
         ReadUserError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
 fn map_realm_error(error: ReadAuthorizationError) -> ServerError {
-    ServerError::InternalError(error.to_string())
+    ServerError::InternalError(error.to_string().into())
 }
 
 fn collect_realm_roles(
@@ -466,7 +466,7 @@ async fn collect_group_memberships(
 ) -> ServerResult<Vec<UserGroupResponse>> {
     let groups = drive(ListGroupOperation::new(), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let mut memberships = Vec::new();
     for Group { group_id, .. } in groups {
         let (group, auth_doc) = drive(
@@ -474,7 +474,7 @@ async fn collect_group_memberships(
             &state.get_ctx(),
         )
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
         let roles = collect_group_roles(auth_doc, user_id);
         if roles.is_empty() {
             continue;
@@ -634,7 +634,7 @@ async fn register_admin(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
 
     claim_initial_admin(state, user.user_id).await;
     Ok(user)
@@ -765,7 +765,7 @@ async fn register_user(
                 ResolveOidcError::MatchPending => {
                     ServerError::Refused(StatusCode::CONFLICT, "account_match", err.to_string())
                 }
-                other => ServerError::InternalError(other.to_string()),
+                other => ServerError::InternalError(other.to_string().into()),
             })?
         }
     };
@@ -863,7 +863,7 @@ async fn get_token(
                     "account_missing",
                     "no account is registered for this sign-in".to_string(),
                 ),
-                other => ServerError::InternalError(other.to_string()),
+                other => ServerError::InternalError(other.to_string().into()),
             })?;
             (
                 user.user_id,
@@ -1113,7 +1113,7 @@ async fn patch_user_info(
         aruna_operations::users::update_user::UpdateUserError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
 
     Ok((
@@ -1212,7 +1212,7 @@ async fn list_users(
         aruna_operations::users::list_users::ListUsersError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
 
     Ok((
@@ -1253,7 +1253,7 @@ pub(crate) async fn authorize_directory(
         aruna_operations::auth::request_policy::PolicyEnforcementError::Denied { .. } => {
             ServerError::Forbidden
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })
 }
 
@@ -1332,7 +1332,7 @@ async fn search_users(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
 
     Ok((
         StatusCode::OK,
@@ -1427,7 +1427,7 @@ async fn resolve_users(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
 
     Ok((
         StatusCode::OK,
@@ -1513,7 +1513,7 @@ async fn get_user(
             .await
             .map_err(|error| match error {
                 ReadUserError::NotFound => ServerError::NotFound,
-                other => ServerError::InternalError(other.to_string()),
+                other => ServerError::InternalError(other.to_string().into()),
             })?;
         let response = if auth.user_id == target {
             user.into()
@@ -1540,7 +1540,7 @@ async fn get_user(
     .map_err(|err| match err {
         aruna_operations::users::get_user::GetUserError::Unauthorized => ServerError::Forbidden,
         aruna_operations::users::get_user::GetUserError::UserNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
 
     Ok((StatusCode::OK, Json(user.into())))
@@ -1664,7 +1664,7 @@ async fn update_user(
         aruna_operations::users::update_user::UpdateUserError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
 
     Ok((StatusCode::OK, Json(user.into())))
@@ -1695,7 +1695,7 @@ async fn owned_devices(
     .await
     .map_err(|err| match err {
         GetConfigError::DocumentNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     let mut devices = config
         .nodes
@@ -1712,7 +1712,7 @@ async fn owned_devices(
 
     let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
     let now = aruna_core::time::unix_timestamp_secs();
     for entry in secrets {
         if entry.record.mode.owner() != Some(owner) {
@@ -1927,7 +1927,7 @@ async fn evict_node(
         RemoveNodeError::DeletionPending => {
             ServerError::Conflict("group deletion is pending; retry device removal".into())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     Ok(())
 }
@@ -1936,7 +1936,7 @@ async fn evict_node(
 async fn claimed_enrollment(state: &Arc<ServerState>, node_id: &str) -> ServerResult<Option<Ulid>> {
     let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
     Ok(secrets
         .into_iter()
         .find(|entry| entry.state.claimed_node_id() == Some(node_id))
@@ -1951,7 +1951,7 @@ async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> Ser
     .await
     .map_err(|err| match err {
         DeleteSecretError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     Ok(())
 }

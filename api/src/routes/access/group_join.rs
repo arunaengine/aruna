@@ -131,7 +131,7 @@ fn map_error(error: GroupJoinError) -> ServerError {
             ServerError::Conflict("concurrent membership update; refresh and retry".into())
         }
         GroupJoinError::InvalidMessage | GroupJoinError::InvalidRoles => ServerError::BadRequest,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -156,7 +156,7 @@ async fn authorize_join(
     .await
     .map_err(|error| match error {
         PolicyEnforcementError::Denied { .. } => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })
 }
 
@@ -230,7 +230,7 @@ async fn list(
     .await
     .map_err(|error| match error {
         ListJoinError::Unauthorized => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     let names = drive(
         ResolveUsersOperation::new(ResolveUsersInput {
@@ -244,7 +244,7 @@ async fn list(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))?
     .users
     .into_iter()
     .map(|user| (user.user_id.to_string(), user.name))

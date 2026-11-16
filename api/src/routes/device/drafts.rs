@@ -147,7 +147,8 @@ fn rocrate_jsonld(rocrate: &Value) -> ServerResult<String> {
             "rocrate must be a JSON-LD object".to_string(),
         ));
     }
-    serde_json::to_string(rocrate).map_err(|error| ServerError::InternalError(error.to_string()))
+    serde_json::to_string(rocrate)
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))
 }
 
 #[utoipa::path(
@@ -234,7 +235,7 @@ async fn queue_draft(
         EnqueueDraftError::MissingPath | EnqueueDraftError::MissingPayload => {
             ServerError::BadRequestReason(error.to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     Ok((StatusCode::CREATED, Json(queued.into())))
 }
@@ -280,7 +281,7 @@ async fn list_drafts(
     require_owner(&state, auth).await?;
     let entries = drive(ListDraftsOperation::new(), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     Ok(Json(DeviceDraftList {
         drafts: entries.into_iter().map(DeviceDraft::from).collect(),
     }))
@@ -330,7 +331,7 @@ async fn get_draft(
         .await
         .map_err(|error| match error {
             InspectDraftError::NotFound => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.to_string().into()),
         })?;
     Ok(Json(entry.into()))
 }
@@ -373,7 +374,7 @@ async fn delete_draft(
         .map_err(|error| match error {
             DeleteDraftError::NotFound => ServerError::NotFound,
             DeleteDraftError::PublishInFlight => ServerError::Conflict(error.to_string()),
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.to_string().into()),
         })?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -439,7 +440,7 @@ async fn preview_draft(
     let jsonld = rocrate_jsonld(&request.rocrate)?;
     let preview = preview_submission(&state.get_ctx(), group_id, &jsonld)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let mut response = ProfilePreviewResponse::from(preview);
     if request.public {
         response.set_restricted(
@@ -451,7 +452,7 @@ async fn preview_draft(
                 &request.rocrate,
             )
             .await
-            .map_err(|error| ServerError::InternalError(error.to_string()))?,
+            .map_err(|error| ServerError::InternalError(error.to_string().into()))?,
         );
     }
     Ok((StatusCode::OK, Json(response)))

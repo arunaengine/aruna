@@ -1295,7 +1295,7 @@ pub(crate) async fn run_realm_info(
         aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     let realm_authenticated = auth.is_some_and(|auth| auth.realm_id == state.get_realm_id());
 
@@ -1357,7 +1357,7 @@ pub(crate) async fn run_realm_info(
     let (discovery, nodes, quota) = if realm_authenticated {
         let present_nodes = load_realm_presence(state).await;
         let discovery = serde_json::to_value(&config.discovery)
-            .map_err(|error| ServerError::InternalError(error.to_string()))?;
+            .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
         let contacts = state.peer_contacts();
         let names = node_names(state, config.realm_id).await;
         let nodes = map_realm_nodes(
@@ -1744,7 +1744,7 @@ pub async fn get_realm_placement(
         aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     })?;
     Ok((
         StatusCode::OK,
@@ -1925,7 +1925,7 @@ pub async fn mutate_realm_placement(
                     aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
                         ServerError::NotFound
                     }
-                    other => ServerError::InternalError(other.to_string()),
+                    other => ServerError::InternalError(other.to_string().into()),
                 })?
         }
     };
@@ -1955,7 +1955,7 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -1987,7 +1987,7 @@ fn map_placement_error(error: MutatePlacementError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -2129,7 +2129,7 @@ fn map_quota_error(error: SetQuotaError) -> ServerError {
                 "storage cleanup capacity exhausted; retry".to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -2288,7 +2288,7 @@ impl UsageResponse {
 pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerResult<UsageCounters> {
     drive(LoadCountersOperation::new(key), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))
 }
 
 /// The realm or group bucket total with each distributed bucket once; `None` when this node cannot

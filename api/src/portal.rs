@@ -181,7 +181,7 @@ async fn portal_config(State(state): State<PortalState>) -> Response {
             None => state.registry_url.clone(),
         },
         Err(GetConfigError::DocumentNotFound) => state.registry_url.clone(),
-        Err(error) => return ServerError::InternalError(error.to_string()).into_response(),
+        Err(error) => return ServerError::InternalError(error.to_string().into()).into_response(),
     };
     let config = Json(PortalRuntimeConfig {
         api_base_url: &state.api_base_url,

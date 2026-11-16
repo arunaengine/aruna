@@ -571,7 +571,11 @@ pub struct JobUrls {
 pub async fn job_urls(state: &ServerState, job_id: JobId) -> ServerResult<JobUrls> {
     let interface = state.interface_state().await;
     let rest = interface.rest.ok_or_else(|| {
-        ServerError::InternalError("REST interface public URL is unavailable".to_string())
+        ServerError::InternalError(
+            "REST interface public URL is unavailable"
+                .to_string()
+                .into(),
+        )
     })?;
     let api_base_url = rest.api_base_url.trim_end_matches('/');
     Ok(JobUrls {
@@ -905,7 +909,7 @@ fn encode_report_cursor(
                 last_key,
             })
             .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
-            .map_err(|error| ServerError::InternalError(error.to_string()))
+            .map_err(|error| ServerError::InternalError(error.to_string().into()))
         })
         .transpose()
 }
@@ -925,7 +929,7 @@ pub(crate) fn map_job_route(error: JobRouteError) -> ServerError {
         JobRouteError::Unavailable(_) => {
             ServerError::ServiceUnavailableReason("job_read_unavailable".to_string())
         }
-        JobRouteError::Internal(error) => ServerError::InternalError(error),
+        JobRouteError::Internal(error) => ServerError::InternalError(error.into()),
     }
 }
 
@@ -967,10 +971,10 @@ pub(crate) fn map_submit_error(
                 UploadClaimError::WrongOwner => ServerError::Forbidden,
                 UploadClaimError::Expired => ServerError::BadRequestReason(error.to_string()),
                 UploadClaimError::AlreadyClaimed => ServerError::Conflict(error.to_string()),
-                other => ServerError::InternalError(other.to_string()),
+                other => ServerError::InternalError(other.to_string().into()),
             }
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.to_string().into()),
     }
 }
 
@@ -988,7 +992,7 @@ pub(crate) fn map_job_request(error: JobRequestError) -> ServerError {
         JobRequestError::ServiceUnavailableReason(message) => {
             ServerError::ServiceUnavailableReason(message)
         }
-        JobRequestError::InternalError(message) => ServerError::InternalError(message),
+        JobRequestError::InternalError(message) => ServerError::InternalError(message.into()),
     }
 }
 
@@ -1592,23 +1596,27 @@ fn decode_report_row(
     let row = match kind {
         JobKind::ImportRoCrate => {
             let row: ImportReportRow = postcard::from_bytes(value)
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
             let visible_key = entry_key
                 .strip_prefix(&[SYSTEM_ENTRY_PREFIX])
                 .unwrap_or(entry_key);
             if row.entry_key.as_bytes() != visible_key {
                 return Err(ServerError::InternalError(
-                    "stored import report entry key does not match its row".to_string(),
+                    "stored import report entry key does not match its row"
+                        .to_string()
+                        .into(),
                 ));
             }
             serde_json::to_value(row)
         }
         JobKind::ExportRoCrate => {
             let row: ExportReportRow = postcard::from_bytes(value)
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
             if row.entry_key.as_bytes() != entry_key {
                 return Err(ServerError::InternalError(
-                    "stored export report entry key does not match its row".to_string(),
+                    "stored export report entry key does not match its row"
+                        .to_string()
+                        .into(),
                 ));
             }
             serde_json::to_value(row)
@@ -1617,10 +1625,12 @@ fn decode_report_row(
             use aruna_core::structs::execution::job::{SessionReportDetail, SessionReportRow};
 
             let row: SessionReportRow = postcard::from_bytes(value)
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
             if row.entry_key.as_bytes() != entry_key {
                 return Err(ServerError::InternalError(
-                    "stored session report entry key does not match its row".to_string(),
+                    "stored session report entry key does not match its row"
+                        .to_string()
+                        .into(),
                 ));
             }
             let (code, message) = match &row.detail {
@@ -1646,7 +1656,7 @@ fn decode_report_row(
         }
         _ => return Err(ServerError::NotFound),
     };
-    row.map_err(|error| ServerError::InternalError(error.to_string()))
+    row.map_err(|error| ServerError::InternalError(error.to_string().into()))
 }
 
 #[utoipa::path(
@@ -1850,7 +1860,7 @@ fn artifact_headers(owned: &OwnedArtifact) -> ServerResult<HeaderMap> {
     headers.insert(
         ETAG,
         HeaderValue::from_str(&format!("\"{}\"", hex::encode(owned.blake3)))
-            .map_err(|error| ServerError::InternalError(error.to_string()))?,
+            .map_err(|error| ServerError::InternalError(error.to_string().into()))?,
     );
     let encoded = utf8_percent_encode(&owned.filename, NON_ALPHANUMERIC);
     let fallback = ascii_filename(&owned.filename);
@@ -1859,7 +1869,7 @@ fn artifact_headers(owned: &OwnedArtifact) -> ServerResult<HeaderMap> {
         HeaderValue::from_str(&format!(
             "attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
         ))
-        .map_err(|error| ServerError::InternalError(error.to_string()))?,
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?,
     );
     Ok(headers)
 }
@@ -1966,13 +1976,13 @@ async fn artifact_response(
     response_headers.insert(
         CONTENT_LENGTH,
         HeaderValue::from_str(&content_length.to_string())
-            .map_err(|error| ServerError::InternalError(error.to_string()))?,
+            .map_err(|error| ServerError::InternalError(error.to_string().into()))?,
     );
     if let Some(content_range) = content_range {
         response_headers.insert(
             CONTENT_RANGE,
             HeaderValue::from_str(&content_range)
-                .map_err(|error| ServerError::InternalError(error.to_string()))?,
+                .map_err(|error| ServerError::InternalError(error.to_string().into()))?,
         );
     }
     let body = if download && content_length > 0 {
@@ -2005,7 +2015,9 @@ async fn artifact_response(
             ArtifactLookup::Ready(current) if owned.same_content(&current) => {
                 read.ok_or_else(|| {
                     ServerError::InternalError(
-                        "artifact owner omitted the response body".to_string(),
+                        "artifact owner omitted the response body"
+                            .to_string()
+                            .into(),
                     )
                 })?
             }
@@ -2036,7 +2048,9 @@ async fn artifact_response(
         };
         if read.stream_size != content_length {
             return Err(ServerError::InternalError(
-                "artifact reader returned an unexpected range size".to_string(),
+                "artifact reader returned an unexpected range size"
+                    .to_string()
+                    .into(),
             ));
         }
         download::body(read.blob, permit)
@@ -2202,7 +2216,7 @@ pub async fn delete_job(
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
     let outcome = delete_owned_run(&state.get_ctx(), &auth, job_id)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     match outcome {
         RunDelete::Deleted => Ok(StatusCode::NO_CONTENT),
         RunDelete::Unrecorded(error) => Err(ServerError::ServiceUnavailableReason(format!(

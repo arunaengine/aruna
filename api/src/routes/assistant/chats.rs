@@ -105,7 +105,7 @@ fn map_chat_error(error: ChatStoreError) -> ServerError {
             ServerError::Conflict("the chat is being written concurrently; retry".to_string())
         }
         ChatStoreError::TooLarge(cap) => ServerError::PayloadTooLarge(cap.to_string()),
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 

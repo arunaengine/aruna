@@ -126,7 +126,7 @@ fn admission_refused(error: TransferAdmitError) -> ServerError {
         TransferAdmitError::Config(_) => ServerError::ServiceUnavailableReason(message),
         TransferAdmitError::Sign(_)
         | TransferAdmitError::NotFinished
-        | TransferAdmitError::UnexpectedEvent => ServerError::InternalError(message),
+        | TransferAdmitError::UnexpectedEvent => ServerError::InternalError(message.into()),
     }
 }
 

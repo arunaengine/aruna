@@ -219,7 +219,7 @@ pub async fn get_group_statistics(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     if !allowed {
         return Err(ServerError::Forbidden);
     }
@@ -317,7 +317,7 @@ pub async fn list_group_statistics(
     let groups = ListGroupOperation::with_pagination(limit, offset);
     let groups = drive(groups, &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let context = stats_context(&state).await;
     let mut response = GroupStatsList { groups: Vec::new() };
     for group in groups {

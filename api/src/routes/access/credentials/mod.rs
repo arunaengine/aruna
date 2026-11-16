@@ -325,7 +325,7 @@ pub async fn list_s3_credentials(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
 
     Ok((
         StatusCode::OK,
@@ -558,7 +558,7 @@ fn token_refusal(error: CreateUserError) -> ServerError {
         CreateUserError::OtherGroup(_) => {
             ServerError::Refused(StatusCode::BAD_REQUEST, "bucket_outside_group", message)
         }
-        _ => ServerError::InternalError(message),
+        _ => ServerError::InternalError(message.into()),
     }
 }
 
@@ -601,7 +601,7 @@ pub async fn revoke_s3_credentials(
     {
         Ok(credential) => credential,
         Err(GetAccessError::NotFound) => return Err(ServerError::NotFound),
-        Err(err) => return Err(ServerError::InternalError(err.to_string())),
+        Err(err) => return Err(ServerError::InternalError(err.to_string().into())),
     };
 
     // Group write cannot revoke another member's credential without user administration.
@@ -626,7 +626,7 @@ pub async fn revoke_s3_credentials(
             Ok(StatusCode::NO_CONTENT)
         }
         Err(RevokeUserError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
+        Err(err) => Err(ServerError::InternalError(err.to_string().into())),
     }
 }
 
@@ -940,7 +940,7 @@ pub(crate) async fn authorize_credential_issuance(
             | AuthorizationError::GroupNotFound
             | AuthorizationError::InvalidRealmId
             | AuthorizationError::InvalidGroupId => ServerError::Forbidden,
-            _ => ServerError::InternalError(error.to_string()),
+            _ => ServerError::InternalError(error.to_string().into()),
         })?;
         if roots.is_empty() {
             return Err(ServerError::Forbidden);

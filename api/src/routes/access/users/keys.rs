@@ -157,7 +157,7 @@ pub async fn publish_key(
             Ok((StatusCode::CREATED, Json(key_response(*record))))
         }
         VaultAppended::Heads(_) => Err(ServerError::InternalError(
-            "key publish answered vault heads".to_string(),
+            "key publish answered vault heads".to_string().into(),
         )),
     }
 }
@@ -206,7 +206,7 @@ pub async fn list_keys(
         VaultRecords::Keys(keys) => keys,
         VaultRecords::Heads(_) => {
             return Err(ServerError::InternalError(
-                "key read answered vault heads".to_string(),
+                "key read answered vault heads".to_string().into(),
             ));
         }
     };

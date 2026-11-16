@@ -91,7 +91,7 @@ fn map_read_error(error: ReadVaultError) -> ServerError {
         | ReadVaultError::RealmConfigMissing => {
             ServerError::ServiceUnavailableReason("vault_unavailable".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -122,7 +122,7 @@ fn map_route_error(error: VaultRouteError) -> ServerError {
             | AppendVaultError::PlacementFenced
             | AppendVaultError::RealmConfigMissing,
         ) => ServerError::ServiceUnavailableReason("vault_unavailable".to_string()),
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -225,7 +225,7 @@ pub async fn get_vault(
         VaultRecords::Heads(heads) => heads,
         VaultRecords::Keys(_) => {
             return Err(ServerError::InternalError(
-                "vault read answered key records".to_string(),
+                "vault read answered key records".to_string().into(),
             ));
         }
     };
@@ -301,7 +301,7 @@ pub async fn put_vault(
     match append(&state, &auth, auth_token, change).await? {
         VaultAppended::Heads(heads) => Ok((StatusCode::OK, Json(vault_response(heads)))),
         VaultAppended::Key(_) => Err(ServerError::InternalError(
-            "vault save answered a key record".to_string(),
+            "vault save answered a key record".to_string().into(),
         )),
     }
 }

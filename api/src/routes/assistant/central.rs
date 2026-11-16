@@ -89,7 +89,7 @@ fn map_central_error(error: CentralStoreError) -> ServerError {
         CentralStoreError::Stale => {
             ServerError::Conflict("central assistant changed concurrently".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.to_string().into()),
     }
 }
 
@@ -168,7 +168,9 @@ fn central_secret(
         Some(current) => current
             .provider
             .open_secret(state.credential_encryption_key())
-            .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string())),
+            .map_err(|_| {
+                ServerError::InternalError("provider secret unavailable".to_string().into())
+            }),
         None => Ok(AssistantProviderSecret::empty()),
     }
 }
@@ -215,7 +217,7 @@ fn build_central(
     provider
         .encrypt_secret(key, &secret)
         .and_then(|_| provider.encrypt_headers(key, &AssistantHeaders(Default::default())))
-        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string()))?;
+        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     Ok(CentralAssistant {
         provider,
         daily_limit: request.daily_limit,
@@ -552,7 +554,7 @@ fn central_body(
         object.insert("user".to_string(), pseudonym);
     }
     serde_json::to_vec(&value)
-        .map_err(|_| ServerError::InternalError("proxy JSON encoding failed".to_string()))
+        .map_err(|_| ServerError::InternalError("proxy JSON encoding failed".to_string().into()))
 }
 
 fn session_id(headers: &HeaderMap) -> ServerResult<String> {
@@ -570,10 +572,12 @@ fn session_id(headers: &HeaderMap) -> ServerResult<String> {
 }
 
 fn identity_header(name: &str, value: &str) -> ServerResult<(HeaderName, HeaderValue)> {
-    let name = HeaderName::try_from(name)
-        .map_err(|_| ServerError::InternalError("stored header name is invalid".to_string()))?;
-    let value = HeaderValue::try_from(value)
-        .map_err(|_| ServerError::InternalError("identity header value is invalid".to_string()))?;
+    let name = HeaderName::try_from(name).map_err(|_| {
+        ServerError::InternalError("stored header name is invalid".to_string().into())
+    })?;
+    let value = HeaderValue::try_from(value).map_err(|_| {
+        ServerError::InternalError("identity header value is invalid".to_string().into())
+    })?;
     Ok((name, value))
 }
 

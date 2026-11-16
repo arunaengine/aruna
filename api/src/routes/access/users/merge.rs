@@ -119,7 +119,7 @@ fn map_merge_error(error: MergeError) -> ServerError {
         MergeError::Storage(_) | MergeError::Vault(_) | MergeError::PlacementFenced => {
             ServerError::ServiceUnavailableReason(message)
         }
-        _ => ServerError::InternalError(message),
+        _ => ServerError::InternalError(message.into()),
     }
 }
 
@@ -330,7 +330,7 @@ async fn attach_subject(
             UpdateUserError::StorageError(_) | UpdateUserError::PlacementFenced => {
                 ServerError::ServiceUnavailableReason(error.to_string())
             }
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.to_string().into()),
         })?;
     Ok(Json(user.into()))
 }

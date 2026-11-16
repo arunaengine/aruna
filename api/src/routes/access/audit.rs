@@ -219,7 +219,7 @@ pub async fn list_admin_audit(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     Ok(Json(AdminAuditPage {
         records: page.records.into_iter().map(row).collect(),
         next_cursor: page.next.map(|id| id.to_string()),
