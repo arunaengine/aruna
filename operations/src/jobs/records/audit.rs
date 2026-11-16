@@ -175,7 +175,9 @@ impl Operation for FamilyAuditOperation {
                 Event::Storage(StorageEvent::Error { .. }) => self.settle(Vec::new()),
                 other => self.unexpected("conflict page", format!("{other:?}")),
             },
-            AuditState::Init | AuditState::Finish | AuditState::Error => smallvec![],
+            AuditState::Init | AuditState::Finish | AuditState::Error => {
+                self.unexpected("no event in a terminal state", format!("{event:?}"))
+            }
         }
     }
 
@@ -189,5 +191,53 @@ impl Operation for FamilyAuditOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aruna_core::effects::PageLimit;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::execution::job::SubmissionId;
+
+    use super::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
+    use crate::jobs::records::RecordStoreError;
+
+    fn empty_page() -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        })
+    }
+
+    fn operation() -> FamilyAuditOperation {
+        FamilyAuditOperation::new(FamilyAuditConfig {
+            scope: AuditScope::Submission(SubmissionId([3; 32])),
+            cursor: None,
+            limit: PageLimit::try_from(3).expect("bounded limit"),
+        })
+    }
+
+    // A state that expects no event rejects one instead of ignoring it.
+    #[test]
+    fn rejects_terminal_event() {
+        let mut early = operation();
+        assert!(early.step(empty_page()).is_empty());
+        assert!(matches!(
+            early.finalize(),
+            Err(RecordStoreError::UnexpectedEvent { .. })
+        ));
+
+        let mut audit = operation();
+        audit.start();
+        audit.step(empty_page());
+        audit.step(empty_page());
+        assert!(audit.is_complete());
+        assert!(audit.step(empty_page()).is_empty());
+        assert!(matches!(
+            audit.finalize(),
+            Err(RecordStoreError::UnexpectedEvent { .. })
+        ));
     }
 }
