@@ -10,12 +10,13 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::realm::set_admin::{SetAdminConfig, SetAdminError, SetAdminOperation};
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -55,7 +56,7 @@ one.
 )]
 pub async fn grant_admin(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(user_id): Path<String>,
 ) -> ServerResult<Json<Vec<String>>> {
     change_admin(&state, auth, &user_id, true).await
@@ -93,7 +94,7 @@ one.
 )]
 pub async fn remove_admin(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(user_id): Path<String>,
 ) -> ServerResult<Json<Vec<String>>> {
     change_admin(&state, auth, &user_id, false).await
@@ -101,11 +102,10 @@ pub async fn remove_admin(
 
 async fn change_admin(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     user_id: &str,
     admin: bool,
 ) -> ServerResult<Json<Vec<String>>> {
-    let auth = require_realm_auth(state, auth)?;
     let realm_id = state.get_realm_id();
     let user_id = UserId::from_string(user_id).map_err(|_| ServerError::BadRequest)?;
     crate::routes::plugin_installs::refuse_plugin_account(state, user_id).await?;
@@ -210,17 +210,17 @@ mod tests {
         target: UserId,
         admin: bool,
     ) -> ServerResult<Vec<String>> {
-        let auth = Some(AuthContext {
+        let auth = AuthContext {
             user_id: caller,
             realm_id: state.get_realm_id(),
             path_restrictions: None,
             session: None,
-        });
+        };
         let path = Path(target.to_string());
         let route = if admin {
-            grant_admin(State(state.clone()), Extension(auth), path).await
+            grant_admin(State(state.clone()), RealmAuth(auth), path).await
         } else {
-            remove_admin(State(state.clone()), Extension(auth), path).await
+            remove_admin(State(state.clone()), RealmAuth(auth), path).await
         };
         route.map(|Json(ids)| ids)
     }

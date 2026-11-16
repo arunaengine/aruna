@@ -5,18 +5,16 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::identifier::{
     CompiledParser, Identifier, IdentifierParser, IdentifierRule, IdentifierTarget,
 };
-use axum::extract::State;
-use axum::{Extension, Json};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -171,11 +169,9 @@ pub struct ParserTestResponse {
     security(("bearer_auth" = []))
 )]
 pub async fn test_rules(
-    State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: RealmAuth,
     Json(request): Json<ParserTestRequest>,
 ) -> ServerResult<Json<ParserTestResponse>> {
-    require_realm_auth(&state, auth)?;
     let parser = CompiledParser::compile(&request.parser.into())
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
     let found = parser.find(&request.key, request.source_url.as_deref());

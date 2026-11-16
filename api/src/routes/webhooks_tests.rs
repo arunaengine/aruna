@@ -4,11 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::setting::SettingChannel;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use ed25519_dalek::SigningKey;
@@ -31,7 +33,7 @@ async fn get_hides_secret() {
     };
     let owner = auth(UserId::local(Ulid::generate(), realm_id));
     let other = auth(UserId::local(Ulid::generate(), realm_id));
-    let unreadable = get_webhook(State(state.clone()), Extension(Some(owner.clone()))).await;
+    let unreadable = get_webhook(State(state.clone()), UnrestrictedAuth(owner.clone())).await;
     assert!(matches!(
         unreadable,
         Err(ServerError::ServiceUnavailableReason(_))
@@ -78,7 +80,7 @@ async fn get_hides_secret() {
         .send_effect(Effect::Storage(write))
         .await;
 
-    let Json(read) = get_webhook(State(state.clone()), Extension(Some(owner.clone())))
+    let Json(read) = get_webhook(State(state.clone()), UnrestrictedAuth(owner.clone()))
         .await
         .unwrap();
     assert_eq!(
@@ -90,7 +92,7 @@ async fn get_hides_secret() {
         subscription.subscription_id.to_string()
     );
     assert!(!serde_json::to_string(&read).unwrap().contains("canary"));
-    let foreign = get_webhook(State(state.clone()), Extension(Some(other))).await;
+    let foreign = get_webhook(State(state.clone()), UnrestrictedAuth(other)).await;
     assert!(matches!(foreign, Err(ServerError::NotFound)));
     let restricted = AuthContext {
         path_restrictions: Some(vec![PathRestriction {
@@ -99,11 +101,12 @@ async fn get_hides_secret() {
         }]),
         ..owner.clone()
     };
-    let refused = get_webhook(State(state.clone()), Extension(Some(restricted))).await;
+    // `get_webhook` takes `UnrestrictedAuth`, so the refusal is its check.
+    let refused = crate::auth::require_unrestricted_auth(&state, Some(restricted));
     assert!(matches!(refused, Err(ServerError::Forbidden)));
     let invalid = set_webhook(
         State(state.clone()),
-        Extension(Some(owner.clone())),
+        UnrestrictedAuth(owner.clone()),
         Json(WebhookRequest {
             url: "ftp://example.org".to_string(),
         }),
@@ -111,9 +114,9 @@ async fn get_hides_secret() {
     .await;
     assert!(matches!(invalid, Err(ServerError::BadRequestReason(_))));
     // Removing is a newer local register write.
-    let removed = delete_webhook(State(state.clone()), Extension(Some(owner.clone()))).await;
+    let removed = delete_webhook(State(state.clone()), UnrestrictedAuth(owner.clone())).await;
     assert_eq!(removed.unwrap(), StatusCode::NO_CONTENT);
-    let gone = get_webhook(State(state.clone()), Extension(Some(owner.clone()))).await;
+    let gone = get_webhook(State(state.clone()), UnrestrictedAuth(owner.clone())).await;
     assert!(matches!(gone, Err(ServerError::NotFound)));
 }
 
@@ -125,19 +128,24 @@ async fn device_node_refuses() {
     let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
     let context = Arc::new(test_context(storage));
     let state = Arc::new(test_state(context, realm_id, node_id, capabilities).await);
-    let owner = Some(AuthContext {
+    let owner = AuthContext {
         user_id: UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,
-    });
-    let read = get_webhook(State(state.clone()), Extension(owner.clone())).await;
+    };
+    let read = get_webhook(State(state.clone()), UnrestrictedAuth(owner.clone())).await;
     assert!(matches!(read, Err(ServerError::Conflict(_))));
     let request = Json(WebhookRequest {
         url: "https://hooks.example.org/aruna".to_string(),
     });
-    let set = set_webhook(State(state.clone()), Extension(owner.clone()), request).await;
+    let set = set_webhook(
+        State(state.clone()),
+        UnrestrictedAuth(owner.clone()),
+        request,
+    )
+    .await;
     assert!(matches!(set, Err(ServerError::Conflict(_))));
-    let removed = delete_webhook(State(state), Extension(owner)).await;
+    let removed = delete_webhook(State(state), UnrestrictedAuth(owner)).await;
     assert!(matches!(removed, Err(ServerError::Conflict(_))));
 }

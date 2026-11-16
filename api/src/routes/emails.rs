@@ -11,15 +11,15 @@ use aruna_operations::driver::drive;
 use aruna_operations::notifications::email::{self, EmailError, read_email, remove_email};
 use aruna_operations::notifications::settings::SettingError;
 use aruna_operations::realm::get_config::GetConfigOperation;
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -74,9 +74,8 @@ is read, and its address is never returned.
 )]
 pub async fn get_email(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<Json<EmailResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
     let preference = read_email(&state.get_ctx(), auth.user_id)
         .await
@@ -132,10 +131,9 @@ caller.
 )]
 pub async fn set_email(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<EmailRequest>,
 ) -> ServerResult<Json<EmailResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
     let ctx = state.get_ctx();
     let local = state.get_node_id();
@@ -179,9 +177,8 @@ pub async fn set_email(
 )]
 pub async fn delete_email(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
     remove_email(&state.get_ctx(), state.get_node_id(), auth.user_id)
         .await

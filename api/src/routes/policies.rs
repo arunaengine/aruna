@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::groups::refuse_group_edit;
 use crate::server::state::ServerState;
@@ -18,9 +19,9 @@ use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -391,9 +392,8 @@ async fn require_group_read(
 )]
 pub async fn get_realm_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let policies = realm_policies(&state, &auth).await?;
     Ok((StatusCode::OK, Json(policies_response(&policies))))
 }
@@ -467,10 +467,9 @@ node serves it, and every other node relays the call to one.
 )]
 pub async fn set_realm_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<SetPoliciesRequest>,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     // Request policies live at this boundary; the operation only checks roles.
     ensure_permission(
         &state,
@@ -567,10 +566,9 @@ which the group's built-in `user` and `admin` roles both grant.
 )]
 pub async fn get_group_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let policies = group_policies(&state, &auth, group_id).await?;
     Ok((StatusCode::OK, Json(policies_response(&policies))))
@@ -644,11 +642,10 @@ pub async fn get_group_policies(
 )]
 pub async fn set_group_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<SetPoliciesRequest>,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     refuse_group_edit(&state).await?;
     // Request policies live at this boundary; the operation only checks roles.
@@ -748,10 +745,9 @@ additionally requires READ on that group's configuration path.
 )]
 pub async fn effective_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<EffectiveQuery>,
 ) -> ServerResult<(StatusCode, Json<EffectivePoliciesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let mut policies: Vec<ScopedPolicy> = realm_policies(&state, &auth)
         .await?
         .iter()
@@ -824,10 +820,9 @@ compiling caller-supplied expressions to policy authors.
 )]
 pub async fn validate_policy(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<ValidatePolicyRequest>,
 ) -> ServerResult<(StatusCode, Json<ValidatePolicyResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     // Validation compiles caller-supplied CEL; restrict it to policy authors.
     require_config_read(&state, &auth).await?;
     let _ = parse_kind(&request.kind)?;
@@ -916,10 +911,9 @@ as if it were read directly.
 )]
 pub async fn dry_run_policy(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<DryRunRequest>,
 ) -> ServerResult<(StatusCode, Json<DryRunResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     // Dry runs compile caller-supplied CEL; restrict them to policy authors.
     match request.group_id.as_deref() {
         Some(group_id) => {

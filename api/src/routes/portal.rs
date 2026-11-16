@@ -6,19 +6,20 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::errors::StorageError;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{Actor, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_portal::{SetPortalConfig, SetPortalError, SetPortalOperation};
+use axum::Json;
 use axum::extract::State;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -53,9 +54,8 @@ pub struct PortalFeatures {
 )]
 pub async fn get_portal_features(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
 ) -> ServerResult<Json<PortalFeatures>> {
-    let auth = require_realm_auth(&state, auth)?;
     let config = drive(GetConfigOperation::new(auth.realm_id), &state.get_ctx())
         .await
         .map_err(|error| match error {
@@ -100,10 +100,9 @@ management node serves the call and every other node relays it to one.
 )]
 pub async fn set_portal_features(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<PortalFeatures>,
 ) -> ServerResult<Json<PortalFeatures>> {
-    let auth = require_realm_auth(&state, auth)?;
     // Request policies live at this boundary; the operation only checks roles.
     ensure_permission(
         &state,

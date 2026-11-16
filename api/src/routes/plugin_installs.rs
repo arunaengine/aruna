@@ -26,10 +26,10 @@ use aruna_operations::plugins::records::RecordError;
 use aruna_operations::users::service_account::group_admin_path;
 use aruna_plugins::manifest::Manifest;
 use aruna_plugins::permission::Grant;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ulid::Ulid;
@@ -37,7 +37,8 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth, require_unrestricted_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -232,12 +233,11 @@ relays it to one.
 )]
 pub async fn install(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(name): Path<String>,
     Query(query): Query<InstallQuery>,
     Json(body): Json<InstallBody>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_id(&body.group)?;
     ensure_admin(&state, &auth, group_id).await?;
     let request = InstallRequest {
@@ -304,10 +304,9 @@ pub async fn install(
 )]
 pub async fn list_installs(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<InstallListQuery>,
 ) -> ServerResult<Json<InstallPage>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_id(&query.group)?;
     ensure_admin(&state, &auth, group_id).await?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
@@ -361,10 +360,9 @@ pub async fn list_installs(
 )]
 pub async fn get_install(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<InstallView>> {
-    let auth = require_realm_auth(&state, auth)?;
     let install_id = parse_id(&id)?;
     let config = load_config(&state).await?;
     let install = (config.installs.iter())
@@ -400,7 +398,7 @@ the call and every other node relays it to one.
 )]
 pub async fn remove(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
@@ -464,10 +462,9 @@ pub(crate) async fn secret_session(
 /// The caller and install of a change, after the caller proved admin of the install's group.
 pub(crate) async fn admin_call(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     id: &str,
 ) -> ServerResult<(AuthContext, Ulid)> {
-    let auth = require_realm_auth(state, auth)?;
     let install_id = parse_id(id)?;
     let config = load_config(state).await?;
     let install = (config.installs.iter())
@@ -779,7 +776,7 @@ mod tests {
         });
         let refused = put_grants(
             State(state.clone()),
-            Extension(Some(restricted.clone())),
+            RealmAuth(restricted.clone()),
             id,
             body,
         );

@@ -5,17 +5,16 @@
 use std::sync::Arc;
 
 use aruna_core::structs::execution::webhook::{WEBHOOK_EVENT, WebhookSubscription};
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::notifications::webhook::{self, WebhookError, read_webhook, remove_webhook};
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::emails::{setting_error, settings_node};
 use crate::server::state::ServerState;
@@ -75,9 +74,8 @@ subscription is read.
 )]
 pub async fn get_webhook(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<Json<WebhookResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
     let subscription = read_webhook(&state.get_ctx(), auth.user_id)
         .await
@@ -138,10 +136,9 @@ the caller.
 )]
 pub async fn set_webhook(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<WebhookRequest>,
 ) -> ServerResult<Json<WebhookResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
     let ctx = state.get_ctx();
     let outcome = webhook::set_webhook(&ctx, state.get_node_id(), auth.user_id, request.url)
@@ -178,9 +175,8 @@ pub async fn set_webhook(
 )]
 pub async fn delete_webhook(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
     remove_webhook(&state.get_ctx(), state.get_node_id(), auth.user_id)
         .await

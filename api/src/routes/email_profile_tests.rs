@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
@@ -74,7 +75,12 @@ fn body(password: Option<&str>) -> Json<EmailProfileRequest> {
 async fn admin_sets_profile() {
     let (_dir, state, admin) = setup_state().await;
     let member = UserId::local(Ulid::generate(), state.get_realm_id());
-    let get = |user_id| get_email_profile(State(state.clone()), Extension(auth(&state, user_id)));
+    let get = |user_id| {
+        get_email_profile(
+            State(state.clone()),
+            UnrestrictedAuth(auth(&state, user_id).expect("a signed-in caller")),
+        )
+    };
     let Json(empty) = get(member).await.unwrap();
     assert_eq!(
         empty,
@@ -86,14 +92,14 @@ async fn admin_sets_profile() {
 
     let refused = set_email_profile(
         State(state.clone()),
-        Extension(auth(&state, member)),
+        UnrestrictedAuth(auth(&state, member).expect("a signed-in caller")),
         body(Some(PASSWORD)),
     )
     .await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
     let Json(stored) = set_email_profile(
         State(state.clone()),
-        Extension(auth(&state, admin)),
+        UnrestrictedAuth(auth(&state, admin).expect("a signed-in caller")),
         body(Some(PASSWORD)),
     )
     .await
@@ -118,7 +124,7 @@ async fn admin_sets_profile() {
     });
     let refused = set_email_profile(
         State(state.clone()),
-        Extension(auth(&state, admin)),
+        UnrestrictedAuth(auth(&state, admin).expect("a signed-in caller")),
         renamed,
     );
     assert!(matches!(
@@ -131,7 +137,7 @@ async fn admin_sets_profile() {
     });
     let refused = set_email_profile(
         State(state.clone()),
-        Extension(auth(&state, admin)),
+        UnrestrictedAuth(auth(&state, admin).expect("a signed-in caller")),
         bad_sender,
     );
     assert!(matches!(
@@ -139,7 +145,11 @@ async fn admin_sets_profile() {
         Err(ServerError::BadRequestReason(_))
     ));
 
-    let removed = delete_email_profile(State(state.clone()), Extension(auth(&state, admin))).await;
+    let removed = delete_email_profile(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin).expect("a signed-in caller")),
+    )
+    .await;
     assert_eq!(removed.unwrap(), StatusCode::NO_CONTENT);
     let Json(gone) = get(admin).await.unwrap();
     assert!(!gone.configured);

@@ -23,11 +23,11 @@ use aruna_operations::plugins::work::{
     WorkKind, WorkRow, list_work as list_work_rows, read_work, work_state,
 };
 use aruna_operations::users::service_account::group_admin_path;
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ulid::Ulid;
@@ -35,7 +35,8 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError};
 use crate::routes::management_relay::relay_to_node;
 use crate::routes::plugin_installs::parse_id;
@@ -244,13 +245,12 @@ struct Served {
 /// readable and resolvable on the node that ran them.
 async fn serve(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     id: &str,
     run: Option<&str>,
     call: Call,
 ) -> Result<Served, Response> {
     let failed = IntoResponse::into_response;
-    let auth = require_realm_auth(state, auth).map_err(failed)?;
     let install_id = parse_id(id).map_err(failed)?;
     let config = read_config(&state.get_ctx(), state.get_realm_id()).await;
     let config = config.map_err(|error| {
@@ -465,7 +465,7 @@ defaults filled in.
 )]
 pub async fn start(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
     OriginalUri(uri): OriginalUri,
     method: Method,
@@ -540,7 +540,7 @@ pub async fn start(
 )]
 pub async fn list(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
     Query(query): Query<RunListQuery>,
     OriginalUri(uri): OriginalUri,
@@ -610,7 +610,7 @@ pub async fn list(
 )]
 pub async fn list_work(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
     Query(query): Query<RunListQuery>,
     OriginalUri(uri): OriginalUri,
@@ -736,7 +736,7 @@ fn work_example() -> Value {
 )]
 pub async fn get_run(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((id, run)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     method: Method,
@@ -792,7 +792,7 @@ pub async fn get_run(
 )]
 pub async fn resolve(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((id, run)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     method: Method,
@@ -892,7 +892,7 @@ async fn run_audit(
 )]
 pub async fn retry(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((id, run)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     method: Method,
@@ -952,7 +952,7 @@ pub async fn retry(
 )]
 pub async fn drop_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((id, job)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     method: Method,
@@ -1046,7 +1046,7 @@ pub struct DeliveryView {
 )]
 pub async fn delivery(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
     OriginalUri(uri): OriginalUri,
     method: Method,
@@ -1186,7 +1186,7 @@ mod tests {
             async move {
                 resolve(
                     State(state),
-                    Extension(Some(auth(user))),
+                    RealmAuth(auth(user)),
                     Path((install_id.to_string(), run.run_id.to_string())),
                     OriginalUri(path.parse().unwrap()),
                     Method::POST,
@@ -1206,7 +1206,7 @@ mod tests {
         let missing = Ulid::from_parts(9, 9);
         let unknown = get_run(
             State(state.clone()),
-            Extension(Some(auth(admin))),
+            RealmAuth(auth(admin)),
             Path((missing.to_string(), run.run_id.to_string())),
             OriginalUri(path.parse().unwrap()),
             Method::GET,
@@ -1277,7 +1277,7 @@ mod tests {
         let path = format!("/api/v1/plugin-installs/{install_id}/delivery");
         let answer = delivery(
             State(state),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Path(install_id.to_string()),
             OriginalUri(path.parse().unwrap()),
             Method::GET,
@@ -1400,7 +1400,7 @@ mod tests {
                 };
                 list_work(
                     State(state),
-                    Extension(Some(auth)),
+                    RealmAuth(auth),
                     Path(install_id.to_string()),
                     Query(RunListQuery {
                         cursor: None,

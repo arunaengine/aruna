@@ -5,12 +5,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::plugins::lifecycle::{
     pause_install, resume_install, set_grants, update_install,
 };
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use utoipa::ToSchema;
@@ -20,6 +19,7 @@ use utoipa_axum::routes;
 use super::plugin_installs::{
     InstallView, actor, admin_call, map_error, secret_session, view, view_example,
 };
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
 
@@ -84,7 +84,7 @@ the call and every other node relays it to one.
 )]
 pub async fn put_grants(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
     Json(body): Json<GrantsBody>,
 ) -> ServerResult<Json<InstallView>> {
@@ -130,7 +130,7 @@ the call and every other node relays it to one.
 )]
 pub async fn put_version(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
     Json(body): Json<VersionBody>,
 ) -> ServerResult<Json<UpdateView>> {
@@ -176,7 +176,7 @@ serves the call and every other node relays it to one.
 )]
 pub async fn pause(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<InstallView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
@@ -209,7 +209,7 @@ serves the call and every other node relays it to one.
 )]
 pub async fn resume(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<InstallView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;

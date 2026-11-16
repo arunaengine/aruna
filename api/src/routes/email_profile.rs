@@ -16,16 +16,17 @@ use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_email::{
     EmailInput, SetEmailConfig, SetEmailError, SetEmailOperation,
 };
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -151,9 +152,8 @@ impl From<RealmEmailProfile> for EmailProfileView {
 )]
 pub async fn get_email_profile(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<Json<EmailProfileResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let config = drive(GetConfigOperation::new(auth.realm_id), &state.get_ctx())
         .await
         .map_err(|error| match error {
@@ -214,7 +214,7 @@ management node serves the call and every other node relays it to one.
 )]
 pub async fn set_email_profile(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<EmailProfileRequest>,
 ) -> ServerResult<Json<EmailProfileView>> {
     let settings = SmtpSettings {
@@ -267,7 +267,7 @@ management node serves the call and every other node relays it to one.
 )]
 pub async fn delete_email_profile(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<StatusCode> {
     change_profile(&state, auth, None).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -275,10 +275,9 @@ pub async fn delete_email_profile(
 
 async fn change_profile(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     profile: Option<EmailInput>,
 ) -> ServerResult<Option<RealmEmailProfile>> {
-    let auth = require_unrestricted_auth(state, auth)?;
     // Request policies live at this boundary; the operation only checks roles.
     ensure_permission(
         state,

@@ -12,14 +12,15 @@ use aruna_operations::driver::drive;
 use aruna_operations::realm::set_provider::{
     ProviderChange, SetProviderConfig, SetProviderError, SetProviderOperation,
 };
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::info::RealmProviderResponse;
 use crate::server::state::ServerState;
@@ -88,7 +89,7 @@ management node serves the call and every other node relays it to one.
 )]
 pub async fn set_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
     Json(request): Json<ProviderRequest>,
 ) -> ServerResult<Json<Vec<RealmProviderResponse>>> {
@@ -137,7 +138,7 @@ management node serves the call and every other node relays it to one.
 )]
 pub async fn remove_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<Vec<RealmProviderResponse>>> {
     change_provider(&state, auth, ProviderChange::Remove(id)).await
@@ -145,10 +146,9 @@ pub async fn remove_provider(
 
 async fn change_provider(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     change: ProviderChange,
 ) -> ServerResult<Json<Vec<RealmProviderResponse>>> {
-    let auth = require_realm_auth(state, auth)?;
     // Request policies live at this boundary; the operation only checks roles.
     ensure_permission(
         state,
@@ -285,7 +285,7 @@ mod tests {
     ) -> ServerResult<Vec<String>> {
         let Json(list) = set_provider(
             State(state.clone()),
-            Extension(auth(state, user)),
+            RealmAuth(auth(state, user).expect("a signed-in caller")),
             Path(id.to_string()),
             body(issuer),
         )
@@ -303,7 +303,7 @@ mod tests {
 
         let Json(list) = remove_provider(
             State(state.clone()),
-            Extension(auth(&state, admin)),
+            RealmAuth(auth(&state, admin).expect("a signed-in caller")),
             Path("lifescience".to_string()),
         )
         .await
@@ -313,7 +313,7 @@ mod tests {
 
         let last = remove_provider(
             State(state.clone()),
-            Extension(auth(&state, admin)),
+            RealmAuth(auth(&state, admin).expect("a signed-in caller")),
             Path("main".to_string()),
         )
         .await;
@@ -328,7 +328,7 @@ mod tests {
         assert!(matches!(error, Err(ServerError::Forbidden)));
         let error = remove_provider(
             State(state.clone()),
-            Extension(auth(&state, member)),
+            RealmAuth(auth(&state, member).expect("a signed-in caller")),
             Path("main".to_string()),
         )
         .await;
