@@ -79,7 +79,6 @@ the call and every other node relays it to one.
     responses(
         (status = 200, description = "The changed install", body = InstallView, example = json!(view_example())),
         (status = 400, description = "A grant is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin or lacks a granted right", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 409, description = "The install changed meanwhile or is not settled", body = ErrorResponse)
@@ -126,7 +125,6 @@ the call and every other node relays it to one.
     responses(
         (status = 200, description = "The updated install", body = UpdateView, example = json!({"install": view_example(), "missing": []})),
         (status = 400, description = "The settings do not fit the new version, or it cannot be installed yet", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install or published version matches", body = ErrorResponse),
         (status = 409, description = "The install changed meanwhile or is not settled", body = ErrorResponse)
@@ -173,7 +171,6 @@ serves the call and every other node relays it to one.
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 200, description = "The paused install", body = InstallView, example = json!(view_example())),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 409, description = "The install is not active", body = ErrorResponse)
@@ -207,7 +204,6 @@ serves the call and every other node relays it to one.
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 200, description = "The active install", body = InstallView, example = json!(view_example())),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 409, description = "The install is not paused", body = ErrorResponse)

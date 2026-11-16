@@ -620,7 +620,6 @@ restrictions and request policies before it can be returned.
             })
         ),
         (status = 400, description = "Query shorter than 2 characters, or a cursor that does not match this query, bucket, match type and mode", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
         (status = 503, description = "Strict distributed coverage could not be completed, or the live-head scan was unavailable", body = ErrorResponse)
     ),
@@ -866,7 +865,6 @@ so a caller never learns of a group it may not read, and the user directory sear
             })
         ),
         (status = 400, description = "Query shorter than 2 characters, unknown type, malformed group id, or a cursor that is unsupported, sent with more than one type, or does not match the original query", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

@@ -324,7 +324,6 @@ registry view. A path-restricted delegated token is refused even when it would p
             )
         ),
         (status = 400, description = "Malformed body, unknown fields, or a document id that is not a structured metadata id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "READ denied on the document, the token belongs to another realm, or the token is path-restricted", body = ErrorResponse),
         (status = 404, description = "This node's registry view has no such metadata document", body = ErrorResponse),
         (status = 409, description = "The idempotency key is already bound to a job with a different plan, or the caller's active RO-Crate job limit is reached", body = ErrorResponse)

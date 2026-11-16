@@ -132,7 +132,6 @@ A provider token without `auth_time` and child sessions give none and are refuse
         (status = 200, description = "The signed link confirmation", body = serde_json::Value,
             example = json!({ "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "action": "Link", "local_user": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "foreign_user": { "user_ulid": "01JCNCTR0123456789ABCDEFGH", "realm_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7] }, "foreign_issued_at": 1791000000, "issued_at": 1791000010, "expires_at": 1791000310, "confirmation_id": "01J11NK0123456789ABCDEFGHJ" }, "signer": "Realm", "signature": "<hex>" })),
         (status = 400, description = "A malformed secret", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A login is too old, of the wrong kind, of an inactive or service account, or a handoff is invalid, not bound to this attempt, or of a realm no longer admitted (code `link_refused`)", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -189,7 +188,6 @@ account the confirmation names.
     responses(
         (status = 200, description = "The account with its linked logins", body = LinkedLoginsResponse,
             example = json!({ "user_id": "<local user id>", "linked_logins": ["<user id of the other realm>"] })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The confirmation or a login was refused (code `link_refused`)", body = ErrorResponse),
         (status = 409, description = "The login belongs to another account, or the account links another login of that realm (code `link_conflict`)", body = ErrorResponse)
     ),
@@ -240,7 +238,6 @@ pub(crate) fn linked_logins(user: &User) -> LinkedLoginsResponse {
     responses(
         (status = 200, description = "The caller's linked logins", body = LinkedLoginsResponse,
             example = json!({ "user_id": "<local user id>", "linked_logins": ["<user id of the other realm>"] })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller has no local account here", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -282,7 +279,6 @@ pub async fn list_links(
         (status = 200, description = "The account with its remaining linked logins", body = LinkedLoginsResponse,
             example = json!({ "user_id": "<local user id>", "linked_logins": [] })),
         (status = 400, description = "A malformed user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is neither the owner nor a realm administrator", body = ErrorResponse),
         (status = 404, description = "The account has no such linked login", body = ErrorResponse)
     ),

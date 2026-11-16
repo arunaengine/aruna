@@ -153,7 +153,6 @@ the whole bucket when it is not.
             })
         ),
         (status = 400, description = "Malformed destination node id or version id, or a version_id sent without a path", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token belongs to another realm, the caller lacks WRITE on the bucket or object, or `not_holder` when `plaintext` is set and the caller is no current key holder of the encrypted source bucket",
@@ -555,7 +554,6 @@ fn copy_response(
             })
         ),
         (status = 400, description = "Malformed version id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the object", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node, or the object has no such version", body = ErrorResponse),
         (status = 503, description = "No holder of the key's range answered", body = ErrorResponse)

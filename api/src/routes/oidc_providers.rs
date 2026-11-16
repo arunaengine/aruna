@@ -84,7 +84,6 @@ management node serves the call and every other node relays it to one.
                 "discovery_url": "https://login.aai.lifescience-ri.eu/oidc/.well-known/openid-configuration"
             }])),
         (status = 400, description = "Malformed body, id, issuer, audience or discovery URL", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),
@@ -135,7 +134,6 @@ management node serves the call and every other node relays it to one.
                 "discovery_url": "https://keycloak.example.test/realms/aruna/.well-known/openid-configuration"
             }])),
         (status = 400, description = "Malformed id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "No provider with this id, or this node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "The provider is the last one, or another update of the realm configuration won the race", body = ErrorResponse),

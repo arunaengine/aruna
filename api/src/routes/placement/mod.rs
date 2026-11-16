@@ -761,7 +761,6 @@ read, and every verifier re-runs the same check against its own replicated view.
             "created_at_ms": 1755500000000u64
         })),
         (status = 400, description = "The definition is invalid, or an id, node id or digest could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, no WRITE on the realm-configuration path for a realm-wide rule, or no WRITE on the owning group's admin path for a group-owned one", body = ErrorResponse),
         (status = 409, description = "The policy id already carries a different definition, which is never replaced", body = ErrorResponse),
         (status = 503, description = "No holder could commit the publication; nothing was written", body = ErrorResponse)
@@ -847,7 +846,6 @@ that needs no realm-configuration permission.
             "created_at_ms": 1755500000000u64
         })),
         (status = 400, description = "The id or digest could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or from another realm", body = ErrorResponse),
         (status = 404, description = "No holder has a policy with that id and digest; a mismatched digest is a 404 rather than a substituted rule", body = ErrorResponse),
         (status = 503, description = "No holder answered, or the publication could not be verified here; never a denial", body = ErrorResponse)
@@ -922,7 +920,6 @@ The check runs inside the operation, so the listing is no existence oracle.
             "complete": false
         })),
         (status = 400, description = "The cursor or limit could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the path the query names", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -998,7 +995,6 @@ ids.
             ],
             "generation": 3
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither realm-configuration read nor admin read on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),
@@ -1065,7 +1061,6 @@ operation.
             "generation": 4
         })),
         (status = 400, description = "A reference could not be parsed, the set is not a valid reference set, a referenced rule is owned by another group, or a placement rule refuses it under a fixed reason that names no policy, reference or node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 409, description = "The stored generation is not the expected one, or the counter is exhausted", body = ErrorResponse),
@@ -1143,7 +1138,6 @@ pub async fn put_bucket_placement(
                 }
             ]
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the object", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node, or the key has no current version here", body = ErrorResponse),
         (status = 503, description = "No holder of the key's range answered", body = ErrorResponse)
@@ -1267,7 +1261,6 @@ operation.
             ]
         })),
         (status = 400, description = "An id, version id or reference could not be parsed, a referenced rule is owned by another group, or a placement rule refuses the destination under a fixed reason that names no policy, reference or node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No such bucket, or the expected head version no longer exists", body = ErrorResponse),
         (status = 409, description = "The head moved, the bucket changed, the mutation id was reused with other parameters, or the assigned version id is taken", body = ErrorResponse),
@@ -1432,7 +1425,6 @@ operation.
             "complete": false
         })),
         (status = 400, description = "The operation id or cursor could not be parsed, or the captured default references a rule owned by another group", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 409, description = "The run was captured against a different bucket record, or the bucket now belongs to another group", body = ErrorResponse),
@@ -1597,7 +1589,6 @@ operation.
             ]
         })),
         (status = 400, description = "The scope, cursor or limit could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 503, description = "A distributed bucket: no pending coordinator answered, or this node has no record of the set yet", body = ErrorResponse)
@@ -1785,7 +1776,6 @@ operation.
             "complete": true
         })),
         (status = 400, description = "The cursor or limit could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1922,7 +1912,6 @@ the operation.
             "cleared": true
         })),
         (status = 400, description = "Unknown `action`, a release without an exact version, or a version that could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the realm-configuration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

@@ -135,7 +135,6 @@ fn map_check_error(error: ServiceCheckError) -> ServerError {
                 "active": true
             })),
         (status = 400, description = "The group id or the name is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or from another realm, the caller is a service account, or the caller is no group administrator", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -192,7 +191,6 @@ async fn create_account(
                 "active": true
             }] })),
         (status = 400, description = "The group id is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or from another realm, the caller is a service account, or the caller is no group administrator", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -254,7 +252,6 @@ async fn list_accounts(
                 "expires_at": "2026-04-09T12:00:00Z"
             })),
         (status = 400, description = "Invalid ids, lifetime or restrictions", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller may not administer the group's service accounts, or a scope exceeds the service account's access", body = ErrorResponse),
         (status = 404, description = "The group owns no service account with that id", body = ErrorResponse),
         (status = 409, description = "The service account is deactivated, or holds 256 active sessions", body = ErrorResponse)
@@ -371,7 +368,6 @@ async fn create_token(
                 "access_secret": "<one-time-secret-shown-only-in-this-response>"
             })),
         (status = 400, description = "Invalid ids, lifetime or restrictions", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller may not administer the group's service accounts, the account has no usable access to the group's data, or a restriction exceeds it", body = ErrorResponse),
         (status = 404, description = "The group owns no service account with that id", body = ErrorResponse),
         (status = 409, description = "The service account is deactivated, acts for a plugin install, or holds 16 active credentials", body = ErrorResponse)

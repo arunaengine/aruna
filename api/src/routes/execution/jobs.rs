@@ -1058,7 +1058,6 @@ caller's own jobs.
             })
         ),
         (status = 400, description = "Cursor is not a valid continuation token, or `state` is not a known job state", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1271,7 +1270,6 @@ additionally need WRITE on that bucket, which must belong to the same group.
         ),
         (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, an output without a `bucket` while `workspace.mode` is `none`, a workspace or output bucket that does not exist or belongs to another group, `target` `local` on a node that serves no device plane, or a local run naming an input this device cannot read", body = ErrorResponse),
         (status = 409, description = "The idempotency key is bound to a different plan, the composition conflicts on a staged key under `collision_policy` `reject`, the active RO-Crate job limit is reached, or this device's compute plane is paused, absent or already at its run ceiling, which is counted in the admitting transaction so two submissions cannot both pass it. A quota refusal carries the exact scope, dimension and numbers in `quota`; a demand view that understates the group is refused like an exceeded cap, with `observed` at the limit", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted, the caller lacks WRITE on the group, on the named existing workspace bucket or on a bucket an output writes into, or a local run was requested by someone other than this device's owner", body = ErrorResponse),
         (status = 503, description = "Retryable, and the caller may submit again with the same idempotency key: no family holder could admit the request, the demand view could not be read or kept moving under three reads, three admission transactions in a row lost to a concurrent submission of the same group, or the id clock is unhealthy. A device submission whose referenced inputs sit on no holder of its family answers the same 503 and retrying does not clear it; submit from a node that holds the inputs, or replicate them first", body = ErrorResponse)
     ),
@@ -1501,7 +1499,6 @@ the link's group, who may manage the link.
             })
         ),
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such job, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
         (status = 503, description = "The node owning this job could not be reached or is not yet known here; retryable, the caller may repeat the read", body = ErrorResponse)
@@ -1697,7 +1694,6 @@ answers 404.
             })
         ),
         (status = 400, description = "The cursor is not a decodable continuation token, or the bearer token cannot be forwarded to the owning node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (
             status = 404,
@@ -2078,7 +2074,6 @@ kind that produces no crate.
         (status = 200, description = "The complete RO-Crate as an `application/zip` byte stream, with `Content-Length`, `ETag`, `Accept-Ranges: bytes` and an attachment `Content-Disposition`"),
         (status = 206, description = "The requested byte range of the crate as `application/zip`, with `Content-Range` and a `Content-Length` covering the range only"),
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No downloadable crate: unknown job, a foreign job, a kind that produces none, or an unfinished export, coded `artifact_pending` with the job's state", body = ErrorResponse),
         (status = 410, description = "The crate's retention window has passed and it has been deleted; a retry will not bring it back", body = ErrorResponse),
@@ -2129,7 +2124,6 @@ in header `x-aruna-export-grant` is accepted as for the download.
         (status = 200, description = "Headers for the complete `application/zip` crate: `Content-Length`, `ETag`, `Accept-Ranges: bytes` and an attachment `Content-Disposition`. No body is sent"),
         (status = 206, description = "Headers for the requested byte range, including `Content-Range` and a `Content-Length` covering the range only. No body is sent"),
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No crate to describe: unknown job, a foreign job, a kind that produces none, or an unfinished export, coded `artifact_pending` with the job's state", body = ErrorResponse),
         (status = 410, description = "The crate's retention window has passed and it has been deleted; a retry will not bring it back", body = ErrorResponse),
@@ -2181,7 +2175,6 @@ Self-scoped like the status read: only the submitter may delete, and anybody els
     responses(
         (status = 204, description = "The run was removed from this node's lists"),
         (status = 400, description = "The job id is malformed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "This node lists no such run of the caller; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
         (status = 409, description = "The job is still live, named by its state, or a run's container cleanup is still queued; cancel it or retry once it settled", body = ErrorResponse),
@@ -2285,7 +2278,6 @@ Self-scoped like the status read: only the submitter may cancel, and anybody els
             })
         ),
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such job, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
         (status = 503, description = "The node owning this job could not be reached, so no cancellation was recorded; retryable, the caller may repeat the request", body = ErrorResponse)

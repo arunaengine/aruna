@@ -175,7 +175,6 @@ that account. Both prove control; a matching email or name is never enough.
                 "subjects": 1, "groups": 2, "realm_roles": 0, "devices": 1, "attributes": 3,
                 "attributes_not_copied": [],
                 "secondaries": 0, "repeated": false })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A login is too old, the other token is invalid or of another realm, both name the same account, or an account is deactivated or a service account (code `merge_refused`)", body = ErrorResponse),
         (status = 404, description = "This node holds no record of one of the accounts", body = ErrorResponse),
         (status = 409, description = "The other account holds a vault the caller's vault does not hold unchanged (code `vault_present`), or a role of it denies part of what it hands over and part of the caller's own access (code `role_conflict`, naming the role)", body = ErrorResponse),
@@ -362,7 +361,6 @@ async fn attach_subject(
     responses(
         (status = 204, description = "The node runs account merges from now on"),
         (status = 400, description = "The node id is malformed or names no management node of this realm", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller lacks the administration grant or the token is path-restricted", body = ErrorResponse),
         (status = 503, description = "This node does not coordinate merges (code `not_coordinator`) or could not pass the call on (code `no_management_node`); retry", body = ErrorResponse)
     ),

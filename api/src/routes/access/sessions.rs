@@ -198,7 +198,6 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
                 "expires_at": "2026-04-09T12:00:00Z"
             })),
         (status = 400, description = "Unknown session kind, a lifetime outside the allowed range, a malformed restriction, or restrictions without a read or write scope", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A requested scope exceeds the caller's access, the user is deactivated, the caller holds a federated session, or the token belongs to another realm", body = ErrorResponse),
         (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
     ),
@@ -283,7 +282,6 @@ pub async fn create_session(
                     "current": true
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -320,7 +318,6 @@ pub async fn list_sessions(
     params(("session_id" = String, Path, description = "Session ULID")),
     responses(
         (status = 204, description = "Session revoked, or already revoked by an earlier call"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "The session belongs to another user", body = ErrorResponse)
     ),

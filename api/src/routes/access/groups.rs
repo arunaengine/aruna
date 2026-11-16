@@ -459,7 +459,6 @@ realm's per-user group quota, from which WRITE on the realm group-admin path exe
             })
         ),
         (status = 400, description = "Malformed request body, or a name that is empty, blank or longer than 256 bytes once trimmed; the name is checked here, so a user node refuses it without forwarding", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse),
         (status = 409, description = "The caller's group quota is exhausted, or a concurrent create conflicted; the latter is retryable unchanged", body = ErrorResponse),
         (status = 503, description = "No eligible realm peer accepted the create forwarded from a user node; retryable, the response carries Retry-After", body = ErrorResponse)
@@ -631,7 +630,6 @@ because every realm member sees each group's id, realm and display name.
             })
         ),
         (status = 400, description = "The `include` parameter names an unsupported extra", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -750,7 +748,6 @@ because every realm member may look up any group in the realm.
             })
         ),
         (status = 400, description = "The path segment is not a valid ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
@@ -850,7 +847,6 @@ administrative path or on the realm group-administration path.
             })
         ),
         (status = 400, description = "The path segment is not a valid ULID, or the name is empty or longer than 256 characters", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller administers neither the group nor the realm's groups", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse),
         (status = 409, description = "This node is a device, a concurrent write conflicted, or the group's bucket cut over; the latter two are retryable unchanged", body = ErrorResponse)
@@ -948,7 +944,6 @@ prefix.
              "dataset_location": {"bucket": "lab-data", "prefix": "datasets/"}
          })),
         (status = 400, description = "Invalid group id, bucket name or prefix, or a bucket of another group or missing on this node, with the reason in the message", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, the caller administers neither the group nor the realm's groups, or WRITE is denied on the bucket", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse),
         (status = 409, description = "This node is a device, a concurrent write conflicted, or the group's bucket cut over; the latter two are retryable unchanged", body = ErrorResponse),
@@ -1021,7 +1016,6 @@ administrative path or on the realm group-administration path.
     responses(
         (status = 204, description = "Empty group deleted, or its deletion was already committed"),
         (status = 400, description = "Invalid group identifier", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller may not administer this group", body = ErrorResponse),
         (status = 404, description = "Group not found", body = ErrorResponse),
         (status = 409, description = "Group still owns resources, or deletion must be retried", body = ErrorResponse),
@@ -1133,7 +1127,6 @@ carrying WRITE on the group's administrative path or on the realm group-administ
             })
         ),
         (status = 400, description = "Invalid group identifier", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller may not administer this group", body = ErrorResponse),
         (status = 404, description = "Group not found", body = ErrorResponse),
         (status = 503, description = "This node cannot run the check", body = ErrorResponse)
@@ -1306,7 +1299,6 @@ Membership is the only permission check, so a realm administrator who is not a m
             })
         ),
         (status = 400, description = "The path segment is not a valid ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller is not a member of the group", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
@@ -1427,7 +1419,6 @@ member list is never exposed to a non-member.
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller is not a member of the group", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1565,7 +1556,6 @@ administrative path for the user being added, so authority can be granted per me
             })
         ),
         (status = 400, description = "Malformed ids, a user id standing for everyone, or no default `user` role to fall back on", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path for this member", body = ErrorResponse),
         (status = 404, description = "No such group on this node, or one of the requested roles does not exist", body = ErrorResponse),
         (status = 409, description = "This node is a device; group changes are made through the realm", body = ErrorResponse)
@@ -1669,7 +1659,6 @@ permission; removing anyone else requires WRITE on the group's administrative pa
     responses(
         (status = 204, description = "The membership or role assignment is gone"),
         (status = 400, description = "Malformed group, user or role id, or a user id standing for everyone", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path for this member", body = ErrorResponse),
         (status = 409, description = "The removal would leave the group without an administrator, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
@@ -1745,7 +1734,6 @@ because the caller is the only user affected.
     responses(
         (status = 204, description = "The caller no longer holds any role in the group"),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted", body = ErrorResponse),
         (status = 409, description = "The caller is the group's last administrator, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
@@ -1834,7 +1822,6 @@ administrative path.
             })
         ),
         (status = 400, description = "Reserved or empty name, an unknown grant value, a permission path outside the group, a malformed assigned user, or a public role asking for more than `READ`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse),
         (status = 409, description = "This node is a device; group changes are made through the realm", body = ErrorResponse)
@@ -1961,7 +1948,6 @@ administrative path.
     responses(
         (status = 204, description = "The role and all of its assignments are gone"),
         (status = 400, description = "Malformed group or role id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path", body = ErrorResponse),
         (status = 404, description = "No such role in this group, or the group is not present on this node", body = ErrorResponse),
         (status = 409, description = "The built-in `admin` role cannot be deleted, or this node is a device where group changes are made through the realm", body = ErrorResponse)
@@ -2092,7 +2078,6 @@ bucket level and READ on the bucket or listed prefix inside one.
             })
         ),
         (status = 400, description = "Malformed group id, a prefix outside this node's group data path, or an unreadable continuation token", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, the caller is not a member of the group, or the caller lacks READ on the browsed path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

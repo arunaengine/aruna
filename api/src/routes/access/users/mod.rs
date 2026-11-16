@@ -959,7 +959,6 @@ takes no user id.
                 }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse),
         (status = 404, description = "This node holds no user document for the caller, which can happen while a registration made elsewhere is still replicating", body = ErrorResponse)
     ),
@@ -1059,7 +1058,6 @@ user document and takes no user id.
             })
         ),
         (status = 400, description = "The name is out of range, an attribute key or value is rejected, or the user would hold more than 128 attributes", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse),
         (status = 404, description = "This node holds no user document for the caller", body = ErrorResponse)
     ),
@@ -1166,7 +1164,6 @@ request policies are evaluated as well and may deny a read the role grant alone 
             })
         ),
         (status = 400, description = "The `start_after` cursor is not a user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the realm's user administration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1293,7 +1290,6 @@ pub(crate) async fn authorize_directory(
             })
         ),
         (status = 400, description = "The query is shorter than 2 characters after trimming, or the `start_after` cursor is not a user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the token is path-restricted, or realm policy denies the read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1397,7 +1393,6 @@ async fn search_users(
             ])
         ),
         (status = 400, description = "More than 100 user ids were sent, or an entry is not a user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the token is path-restricted, or realm policy denies the read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1478,7 +1473,6 @@ complete document. Realm request policies may deny either read.
             })
         ),
         (status = 400, description = "Malformed user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Path-restricted token without a matching grant, or realm policy denies the read", body = ErrorResponse),
         (status = 404, description = "This node holds no user with that id, and the caller is allowed to know that", body = ErrorResponse),
         (status = 501, description = "The token was issued by another trusted realm; forwarding the read to the owning realm is not implemented", body = ErrorResponse)
@@ -1596,7 +1590,6 @@ path and additionally passes the realm request policies.
             })
         ),
         (status = 400, description = "The id is not a user id, the name is out of range, or an attribute key or value is rejected", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, a path-restricted token attempted a self-update, or the caller lacks WRITE on that user's administration path", body = ErrorResponse),
         (status = 404, description = "This node holds no user with that id", body = ErrorResponse)
     ),
@@ -1783,7 +1776,6 @@ devices and takes no user id, so it grants no view of anybody else's.
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
@@ -1821,7 +1813,6 @@ can be revoked; a device owned by anybody else answers 404 rather than admitting
     params(("id" = String, Path, description = "Enrollment id or node id of the device, as reported by `GET /access/users/me/devices`")),
     responses(
         (status = 204, description = "Device enrollment revoked, or the device evicted from the realm"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No device of the calling user carries this id, including one an earlier call already revoked", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
@@ -1874,7 +1865,6 @@ too. A management node serves it, and every other node relays the call to one.
     params(("node_id" = String, Path, description = "Node id of the enrolled device to evict, as the realm configuration lists it")),
     responses(
         (status = 204, description = "Device evicted from the realm"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller lacks WRITE on the realm's onboarding administration path", body = ErrorResponse),
         (status = 404, description = "No enrolled device carries this node id, including one an earlier call already evicted", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),

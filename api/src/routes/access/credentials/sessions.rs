@@ -226,7 +226,6 @@ group of the caller.
                 }]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -367,7 +366,6 @@ membership is not rechecked, so a session stays revocable after the caller left 
     params(("access_key_id" = String, Path, description = "Access key id returned by the session exchange")),
     responses(
         (status = 204, description = "Session deleted from this node"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "Session not found on this node, or it belongs to another user", body = ErrorResponse)
     ),

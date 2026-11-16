@@ -316,7 +316,6 @@ group's data, so the group write rights that suffice for objects are not enough.
             description = "Invalid group id, unknown kind, rejected configuration or cleanup policy, or a failed probe, including when the store was merely unreachable",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -384,7 +383,6 @@ administrator right that listing backends takes.
             })
         ),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -454,7 +452,6 @@ administrator right that registration takes.
             })
         ),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -519,7 +516,6 @@ pub async fn list_group_backends(
             description = "The group id or the backend id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -627,7 +623,6 @@ pub async fn get_group_backend(
             description = "An id is not a ULID, the configuration or cleanup policy failed validation, the request would move the backend to another store, or the probe failed, including when the store was merely unreachable",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -711,7 +706,6 @@ pub async fn replace_group_backend(
             description = "The group id or the backend id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -781,7 +775,6 @@ pub async fn delete_group_backend(
             description = "The group id or the backend id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -847,7 +840,6 @@ pub async fn enable_group_backend(
             description = "The group id or the backend id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -919,7 +911,6 @@ pub async fn backend_reclaim_status(
             description = "An id is not a ULID, the name is no valid bucket name, the storage has a fixed bucket, or the storage could not be reached",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path",

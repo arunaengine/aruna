@@ -412,7 +412,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
                     "status": "ready"
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse)
     ),
@@ -482,7 +481,6 @@ refused. The provider is registered for the calling user alone.
                 "status": "ready"
             })),
         (status = 400, description = "Unknown kind, missing or invalid base URL, or a refused custom header", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse)
     ),
@@ -582,7 +580,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
                 "status": "ready"
             })),
         (status = 400, description = "Invalid base URL or a refused custom header", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse)
@@ -653,7 +650,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
     responses(
         (status = 204, description = "Provider deleted"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse)
     ),
@@ -706,7 +702,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
                         "reasoning_efforts": ["low", "medium", "high"]}
                 ]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
@@ -758,7 +753,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     responses(
         (status = 200, description = "The verdict of the check, whether or not the provider answered", body = ProviderTestResponse,
             example = json!({"ok": true, "message": "Provider is ready"})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse)
     ),

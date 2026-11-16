@@ -198,7 +198,6 @@ refused. Chats are self-scoped, so a caller reaches only their own.
                     "revision": 7
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -261,7 +260,6 @@ refused. Chats are self-scoped, so a caller writes only their own.
                 "revision": 7
             })),
         (status = 400, description = "Invalid chat id, title or subject", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 409, description = "The chat changed in another browser", body = ErrorResponse),
         (status = 410, description = "The chat was deleted", body = ErrorResponse),
@@ -323,7 +321,6 @@ refused. Chats are self-scoped, so a caller reaches only their own.
                 }]
             })),
         (status = 400, description = "Invalid chat id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such chat for this user", body = ErrorResponse),
         (status = 410, description = "The chat was deleted", body = ErrorResponse)
@@ -402,7 +399,6 @@ refused. Chats are self-scoped, so a caller writes only their own.
                 "revision": 8
             })),
         (status = 400, description = "Invalid chat id or seq", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such chat for this user", body = ErrorResponse),
         (status = 409, description = "The seq is neither the next one nor the tail, or the revision is not the head's; the message names the current next_seq", body = ErrorResponse),
@@ -453,7 +449,6 @@ refused. Chats are self-scoped, so a caller deletes only their own.
     responses(
         (status = 204, description = "The chat is deleted or was never there"),
         (status = 400, description = "Invalid chat id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

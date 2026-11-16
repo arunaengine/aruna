@@ -177,7 +177,6 @@ pub struct AdminAuditPage {
             "partial": true
         })),
         (status = 400, description = "Invalid group id or cursor, or `me` together with a group id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or no administration grant for the scope", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

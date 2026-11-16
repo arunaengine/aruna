@@ -392,7 +392,6 @@ including request policies. Tokens with path restrictions are refused.
             ]
         })),
         (status = 400, description = "Invalid pattern, target, folder, limit or cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "Too many keys in a row are hidden from the caller", body = ErrorResponse)
@@ -461,7 +460,6 @@ the job ends as aborted.
             "total": 300000, "counted": true, "started_at_ms": 1790000000000_u64, "controls": true
         })),
         (status = 400, description = "Invalid pattern, target or folder", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "`job_running`: another job of the bucket runs", body = ErrorResponse)
@@ -520,7 +518,6 @@ pub async fn start_move(
             }]
         })),
         (status = 400, description = "Invalid limit or cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -597,7 +594,6 @@ pub async fn preview_duplicates(
             "kind": "duplicates", "state": "running", "done": 0, "skipped": 0, "failed": 0,
             "total": 1200, "counted": true, "started_at_ms": 1790000000000_u64, "controls": true
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "`job_running`: another job of the bucket runs", body = ErrorResponse)
@@ -647,7 +643,6 @@ pub async fn start_duplicates(
             "kind": "move", "state": "running", "done": 120, "skipped": 3, "failed": 0,
             "total": 300000, "counted": true, "started_at_ms": 1790000000000_u64, "controls": true
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -716,7 +711,6 @@ async fn shown(
             "total": 300000, "counted": true, "started_at_ms": 1790000000000_u64, "controls": true
         })),
         (status = 400, description = "Unknown action", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "`no_job`: no running or paused job, or the action does not fit its state", body = ErrorResponse)
@@ -762,7 +756,6 @@ A file is shown only when the caller may read every key the rule may give it: it
         (status = 200, description = "The link's last sync", body = LinkStatus, example = json!({
             "conflicts": [{"path": "raw/a.faa.gz", "reason": "another link records the file"}]
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),

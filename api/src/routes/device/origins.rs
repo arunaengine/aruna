@@ -65,7 +65,6 @@ for.
                 "fingerprint": "1000-18a2b3c4d5e6f708-18a2b3c4d5e6f708-2a"
             })),
         (status = 400, description = "The version id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This device did not publish the version, or this node is not a user node", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet, or its state could not be read", body = ErrorResponse)

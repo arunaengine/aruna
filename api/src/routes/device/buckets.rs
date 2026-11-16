@@ -80,7 +80,6 @@ bind with `create_bucket`.
                 "group_id": "01JGROUP0123456789ABCDEFGH"
             })),
         (status = 400, description = "Malformed ids, an invalid bucket name, or a node that is not a realm server", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not this device's owner, or the realm node refuses the owner", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 409, description = "The node already holds a bucket of that name", body = ErrorResponse),

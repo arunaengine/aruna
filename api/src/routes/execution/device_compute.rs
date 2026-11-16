@@ -123,7 +123,6 @@ for.
                 "running": 1,
                 "queued": 0
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
@@ -254,7 +253,6 @@ for.
                 "run_crate": {"status": "written", "resource": "01JZ7Q3V4K8M2N6P0R5S9T1W3Y"}
             })),
         (status = 400, description = "The node is no realm server, or the bucket does not exist there", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the device owner, or the realm refused the owner's write", body = ErrorResponse),
         (status = 404, description = "No such local run, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The run has not finished, two outputs share one key, or it is published to another target", body = ErrorResponse),
@@ -316,7 +314,6 @@ for.
                 {"@id": "./", "@type": "Dataset", "name": "Run bakta", "mentions": {"@id": "#run-01JZ7Q3V4K8M2N6P0R5S9T1W3X"}}
             ]
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the device owner", body = ErrorResponse),
         (status = 404, description = "No such local run or no crate for it, or this node is not a user node", body = ErrorResponse),
         (status = 503, description = "This device could not read its state now", body = ErrorResponse)

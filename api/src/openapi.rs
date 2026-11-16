@@ -2,13 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::error::ErrorResponse;
 use serde_json::json;
 use utoipa::openapi::header::Header;
 use utoipa::openapi::response::{Response, ResponseBuilder};
 use utoipa::openapi::schema::{Object, Type};
-use utoipa::openapi::security::{ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme};
+use utoipa::openapi::security::{
+    ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityRequirement, SecurityScheme,
+};
 use utoipa::openapi::{Content, Ref, RefOr};
-use utoipa::{Modify, OpenApi};
+use utoipa::{IntoResponses, Modify, OpenApi};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -36,6 +39,52 @@ Native Git/LFS also accepts HTTP Basic with an Aruna bearer token as the passwor
     ),
     servers(
         (url = "/api/v1", description = "REST API v1")
+    ),
+    tags(
+        (name = "metadata/audit", description = "Audit trail reads"),
+        (name = "system/assistant", description = "Assistant provider operations"),
+        (name = "system/info", description = "Node information and usage"),
+        (name = "system/realm", description = "Realm configuration, placement and quota"),
+        (name = "federation", description = "Native login across realms"),
+        (name = "access/onboarding", description = "Node onboarding and bootstrap operations"),
+        (name = "data/blobs", description = "Blob management and replication"),
+        (name = "drs", description = "GA4GH DRS content access"),
+        (name = "data/staging", description = "Staging source objects into buckets, inline or as background jobs"),
+        (name = "data/storage", description = "Tenant-registered write backends on a group's own object storage"),
+        (name = "data/sync", description = "S3 bucket synchronization"),
+        (name = "compute/admin", description = "Realm-admin administration of compute links, quotas, pressure and drain"),
+        (name = "data/connectors", description = "External source connector registration"),
+        (name = "access/audit", description = "Retained administrative audit rows"),
+        (name = "access/credentials", description = "User credential management"),
+        (name = "device", description = "Owner-only controls a user node serves for the machine it runs on"),
+        (name = "access/groups", description = "Group management operations"),
+        (name = "compute/sessions", description = "Interactive notebook sessions"),
+        (name = "compute/jobs", description = "Durable background jobs"),
+        (name = "metadata/documents", description = "Metadata document lifecycle"),
+        (name = "metadata/query", description = "Metadata search and SPARQL"),
+        (name = "metadata/references", description = "Metadata reference resolution"),
+        (name = "metadata/rocrate", description = "RO-Crate document operations"),
+        (name = "metadata/repository", description = "Repository search, import, publication and requirement checks"),
+        (name = "metadata/repositories", description = "Invenio and OAI-PMH repository connectors"),
+        (name = "metadata/git", description = "Native ARC repositories and Git LFS transfers"),
+        (name = "metadata/versions", description = "Dataset versions, branches, tags and merges as plain JSON"),
+        (name = "metadata/validation", description = "Metadata profile validation"),
+        (name = "oai", description = "OAI-PMH 2.0 metadata harvesting"),
+        (name = "pid", description = "w3id persistent identifier landing and lifecycle"),
+        (name = "metadata/pids", description = "Persistent identifiers for metadata documents"),
+        (name = "data/placement", description = "Placement policies, bucket defaults and their application: realm admins publish realm-wide policies, group admins the ones their own group owns"),
+        (name = "system/notifications", description = "User notification inbox"),
+        (name = "plugins", description = "WASM plugins published to the realm"),
+        (name = "access/policies", description = "Deny-only CEL request policies"),
+        (name = "search", description = "Unified realm search"),
+        (name = "system/secrets", description = "Named node, realm, group and user secrets"),
+        (name = "shares", description = "Share links for people without an account"),
+        (name = "access/service-accounts", description = "Service accounts of a group"),
+        (name = "access/sessions", description = "User bearer sessions"),
+        (name = "tes", description = "GA4GH TES v1.1 task execution facade"),
+        (name = "access/tokens", description = "Bearer token revocation"),
+        (name = "access/users", description = "User operations"),
+        (name = "access/devices", description = "User device administration")
     ),
     modifiers(&SecurityAddon)
 )]
@@ -78,6 +127,44 @@ impl Modify for SecurityAddon {
     }
 }
 
+/// The failures of a management call that a node relays when it is not a management node.
+#[derive(IntoResponses)]
+#[allow(
+    dead_code,
+    reason = "only documents responses; handlers return ServerError"
+)]
+pub(crate) enum RelayErrors {
+    #[response(
+        status = 502,
+        description = "A relayed call failed after the management node may already have applied it; code `relay_failed`"
+    )]
+    Failed(ErrorResponse),
+    #[response(
+        status = 503,
+        description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`"
+    )]
+    Unreachable(ErrorResponse),
+}
+
+/// The device plane refusals: a caller who is not the enrolled user, or no realm configuration yet.
+#[derive(IntoResponses)]
+#[allow(
+    dead_code,
+    reason = "only documents responses; handlers return ServerError"
+)]
+pub(crate) enum DeviceErrors {
+    #[response(
+        status = 403,
+        description = "The caller is not the user this device is enrolled for"
+    )]
+    NotOwner(ErrorResponse),
+    #[response(
+        status = 503,
+        description = "The realm configuration has not reached this device yet"
+    )]
+    NoConfig(ErrorResponse),
+}
+
 fn add_transport_responses(openapi: &mut utoipa::openapi::OpenApi) {
     for (path, item) in &mut openapi.paths.paths {
         for (method, operation) in [
@@ -93,6 +180,13 @@ fn add_transport_responses(openapi: &mut utoipa::openapi::OpenApi) {
             let Some(operation) = operation else {
                 continue;
             };
+            if requires_bearer(operation) {
+                operation
+                    .responses
+                    .responses
+                    .entry("401".to_string())
+                    .or_insert_with(|| unauthorized_response().into());
+            }
             operation
                 .responses
                 .responses
@@ -131,6 +225,15 @@ fn add_transport_responses(openapi: &mut utoipa::openapi::OpenApi) {
     }
 }
 
+/// Needs a bearer token: `bearer_auth` is named and no empty requirement allows anonymous calls.
+fn requires_bearer(operation: &utoipa::openapi::path::Operation) -> bool {
+    let Some(security) = operation.security.as_ref() else {
+        return false;
+    };
+    let bearer = SecurityRequirement::new("bearer_auth", Vec::<String>::new());
+    security.contains(&bearer) && !security.contains(&SecurityRequirement::default())
+}
+
 fn needs_internal(path: &str, method: &str, operation: &utoipa::openapi::path::Operation) -> bool {
     if operation.responses.responses.contains_key("500") {
         return false;
@@ -163,6 +266,16 @@ fn error_body(schema: &str, example: serde_json::Value) -> Content {
     let mut content = Content::new(Some(Ref::from_schema_name(schema)));
     content.example = Some(example);
     content
+}
+
+fn unauthorized_response() -> Response {
+    ResponseBuilder::new()
+        .description("Missing or invalid bearer token")
+        .content(
+            "application/json",
+            Content::new(Some(Ref::from_schema_name("ErrorResponse"))),
+        )
+        .build()
 }
 
 fn rate_limit_response() -> Response {

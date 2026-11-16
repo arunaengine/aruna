@@ -428,7 +428,6 @@ like cancel: only the submitter, and anybody else's job answers 404.
             "idle_after_ms": 1800000, "idle_deadline_ms": 1755501800000_u64,
             "credential_expires_at_ms": 1755503600000_u64, "last_event_id": 1, "cells": []
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "Another node runs this session; code `session_not_here`", body = ErrorResponse)
@@ -474,7 +473,6 @@ like cancel.
     ),
     responses(
         (status = 200, description = "The event stream", body = SessionResponse, content_type = "text/event-stream"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "Another node runs this session; code `session_not_here`", body = ErrorResponse)
@@ -633,7 +631,6 @@ like cancel.
     responses(
         (status = 202, description = "The cell was queued", body = SubmitCellResponse, example = json!({"cell_id": "cell-1", "position": 1})),
         (status = 400, description = "An invalid cell id or oversized code", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session is not ready, or that cell is busy", body = ErrorResponse),
@@ -685,7 +682,6 @@ like cancel.
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
     responses(
         (status = 202, description = "The interrupt was sent"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session has ended", body = ErrorResponse)
@@ -735,7 +731,6 @@ like cancel.
             "updated_at": "2025-08-18T05:33:20Z", "progress": {"current": 0, "total": null, "unit": "items"},
             "workspace_bucket": "lab-data", "workspace_mode": "existing", "locally_exhausted": false
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "Another node runs this session; code `session_not_here`", body = ErrorResponse)
@@ -800,7 +795,6 @@ like cancel, and each source additionally needs the caller's read permission on 
             "failed": []
         })),
         (status = 400, description = "An invalid destination key, too many items, or a source on another node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted, or the caller may not read a source", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session has ended", body = ErrorResponse)
@@ -1131,7 +1125,6 @@ like cancel.
             "path": "", "entries": [{"name": "result.txt", "kind": "file", "bytes": 42, "modified_ms": 1755500000000_u64}]
         })),
         (status = 400, description = "A path that leaves the working directory", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session has ended", body = ErrorResponse)
@@ -1184,7 +1177,6 @@ like cancel.
     responses(
         (status = 200, description = "The file bytes", content_type = "application/octet-stream"),
         (status = 400, description = "A path that leaves the working directory", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session has ended", body = ErrorResponse),

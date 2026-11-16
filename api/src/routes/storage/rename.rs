@@ -210,7 +210,6 @@ fn rename_input(
             })
         ),
         (status = 400, description = "`from` or `to` is not a folder, or both are equal", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path, the bucket or a key, or a restricted token", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "The bucket cannot be renamed now", body = ErrorResponse)
@@ -282,7 +281,6 @@ pub async fn preview_rename(
             })
         ),
         (status = 400, description = "Invalid folders, or keys outside `from`, repeated or too many", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path, the bucket or a key, or a restricted token", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "A key has a conflict, or the bucket cannot be renamed now", body = ErrorResponse)

@@ -399,7 +399,6 @@ is part of describing the bucket; changing the rules still takes group admin wri
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
@@ -498,7 +497,6 @@ pub async fn get_bucket_routing(
             })
         ),
         (status = 400, description = "A rule target is invalid, names a backend the group does not own, or duplicates another rule's prefix and match mode", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse)
     ),
@@ -565,7 +563,6 @@ pub async fn put_bucket_routing(
             })
         ),
         (status = 400, description = "The path segment is not a valid group ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -658,7 +655,6 @@ pub async fn get_group_routing(
             })
         ),
         (status = 400, description = "The path segment is not a valid group ULID, the target is invalid or names a backend the group does not own, or the bucket is invalid or cannot be used", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 409, description = "A linked folder uses the bucket, a bucket of the group would have no storage without a shared bucket, or the group is being deleted", body = ErrorResponse)
     ),
@@ -759,7 +755,6 @@ pub async fn put_group_routing(
             "next": null
         })),
         (status = 400, description = "Invalid group id or limit", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 409, description = "Too many buckets in a row are hidden from the caller", body = ErrorResponse)
     ),

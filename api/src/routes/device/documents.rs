@@ -128,7 +128,6 @@ for.
                 "cacheBudgetBytes": 2000000000_i64,
                 "cacheUsedBytes": 48213
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
@@ -189,7 +188,6 @@ for.
                 "realmClockSize": 1
             })),
         (status = 400, description = "The document id is not a ULID, or a holder refused the document", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such document, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The document has unpublished edits", body = ErrorResponse),

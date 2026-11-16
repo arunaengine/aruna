@@ -196,7 +196,6 @@ for.
                 "attempts": 0
             })),
         (status = 400, description = "Malformed group id, blank path or a non-object payload", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for, or READ is denied on the named group's metadata", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 409, description = "The device already holds the maximum number of queued drafts", body = ErrorResponse),
@@ -266,7 +265,6 @@ for.
                     "document_id": "01JDOCUMENT0123456789ABCDE"
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
@@ -312,7 +310,6 @@ for.
                 "retryable": true
             })),
         (status = 400, description = "The draft id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such draft, or this node is not a user node", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
@@ -353,7 +350,6 @@ for.
     responses(
         (status = 204, description = "The draft is gone from the device queue"),
         (status = 400, description = "The draft id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such draft, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "A forward for this draft is in flight", body = ErrorResponse),
@@ -413,7 +409,6 @@ for.
                 "structural_violations": []
             })),
         (status = 400, description = "The payload is not a JSON-LD object", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)

@@ -98,7 +98,6 @@ filtered by the caller's READ permission, so an unreadable referencing document 
             )
         ),
         (status = 400, description = "Missing iri, or an iri or predicate that is not a valid absolute IRI", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
         (status = 503, description = "The reference index could not answer within the page budget", body = ErrorResponse)
     ),
@@ -220,7 +219,6 @@ target names content identities directly and checks no storage permission.
                 }
             })),
         (status = 400, description = "Malformed or oversized target set, unsupported content identity, or invalid cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is missing on the bucket, prefix or a resolved key", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
         (status = 503, description = "With allow_partial=false a failed, stale or otherwise incomplete partition fails the request instead of silently downgrading it; retryable", body = ErrorResponse)

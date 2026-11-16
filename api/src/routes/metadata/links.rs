@@ -176,7 +176,6 @@ permission; unreadable matches only set `hidden_references_exist`.
     responses(
         (status = 200, description = "Readable documents that link the identifier", body = DataLinksResponse, example = json!(example())),
         (status = 400, description = "`id` names no Aruna data", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
         (status = 503, description = "No metadata node could answer", body = ErrorResponse)
     ),
@@ -231,7 +230,6 @@ pub async fn data_links(
     responses(
         (status = 200, description = "Readable documents that link the file, folder or bucket", body = DataLinksResponse, example = json!(example())),
         (status = 400, description = "Neither or both of `key` and `prefix`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file or bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "No metadata node could answer", body = ErrorResponse)
@@ -382,7 +380,6 @@ caller's READ permission; unreadable ones only set `hidden_references_exist`.
             "hidden_references_exist": false,
             "more_datasets": "/api/v1/data/buckets/lab-raw-data/links?key=raw%2F2026%2Freef-07%2Freads_R1.fastq.gz&parts_only=true"
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "No metadata node could answer", body = ErrorResponse)

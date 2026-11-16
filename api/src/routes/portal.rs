@@ -52,7 +52,6 @@ pub struct PortalFeatures {
     responses(
         (status = 200, description = "The stored feature defaults", body = PortalFeatures,
             example = json!({"features": {"compute": false}})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -97,7 +96,6 @@ management node serves the call and every other node relays it to one.
         (status = 200, description = "The stored feature defaults", body = PortalFeatures,
             example = json!({"features": {"compute": false}})),
         (status = 400, description = "Too many features or a malformed feature name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),

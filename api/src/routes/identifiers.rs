@@ -171,7 +171,6 @@ pub struct ParserTestResponse {
             }]
         })),
         (status = 400, description = "Invalid rule", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

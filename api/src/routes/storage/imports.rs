@@ -324,7 +324,6 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
             })
         ),
         (status = 400, description = "Invalid ids, prefixes, schedule, bucket or backend, or a backend bucket that cannot be found, created or written", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or on the bucket", body = ErrorResponse),
         (status = 409, description = "A routing rule for the folder names another target, another rule imports into an overlapping folder or shares a backend folder it does not both read and write, a folder lies in the default rule's bucket, or the group is being deleted", body = ErrorResponse)
     ),
@@ -416,7 +415,6 @@ pub async fn create_import(
             })
         ),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -478,7 +476,6 @@ pub async fn list_group_imports(
             })
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -549,7 +546,6 @@ pub async fn get_import(
             })
         ),
         (status = 400, description = "Invalid ids, schedule or pattern", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "The group is being deleted, a run or move has not finished, or a compressed or encrypted bucket would become a 1:1 link", body = ErrorResponse)
@@ -603,7 +599,6 @@ pub async fn update_import(
     responses(
         (status = 204, description = "The rule was removed"),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "The bucket still holds files or has no other storage, or the group is being deleted", body = ErrorResponse)
@@ -666,7 +661,6 @@ pub async fn delete_import(
             example = json!({"job_id": "01JJ0B0123456789ABCDEFGHJK"})
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "The last run of this rule has not finished", body = ErrorResponse)
@@ -819,7 +813,6 @@ key the caller may read are counted and listed.
             })
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -957,7 +950,6 @@ restrictions are refused.
             })
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path, the bucket or a key, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "`bucket_encrypted`, `move_running` or `rule_changed`", body = ErrorResponse)

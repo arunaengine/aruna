@@ -384,7 +384,6 @@ The caller needs READ on the target, or WRITE for `read_upload` and `upload`.
     responses(
         (status = 201, description = "The link and its token", body = ShareDetails, example = json!({"share": {"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active", "downloads": 12, "uploads": 0, "last_access_at": "2026-10-31T10:00:00.000Z"}, "token": "01JSHARE0123456789ABCDEFGH.<link-secret-shown-to-the-owner-only>"})),
         (status = 400, description = "Malformed target, upload mode on an object or dataset, an expiry in the past, or a label or password that is too long", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller lacks access to the target, holds a restricted, assistant or federated session, or a policy denies the link", body = ErrorResponse),
         (status = 404, description = "No such bucket or dataset on this node", body = ErrorResponse),
         (status = 409, description = "`dataset_not_here` when this node holds no copy of the dataset", body = ErrorResponse)
@@ -466,7 +465,6 @@ pub async fn create_share(
   list needs no log reads."#,
     responses(
         (status = 200, description = "The caller's links", body = ShareList, example = json!({"shares": [{"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active", "downloads": 12, "uploads": 0, "last_access_at": "2026-10-31T10:00:00.000Z"}]})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is restricted or belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -501,7 +499,6 @@ link, every other caller gets 404."#,
     params(("id" = String, Path, description = "Share link id")),
     responses(
         (status = 200, description = "The link and its token", body = ShareDetails, example = json!({"share": {"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active", "downloads": 12, "uploads": 0, "last_access_at": "2026-10-31T10:00:00.000Z"}, "token": "01JSHARE0123456789ABCDEFGH.<link-secret-shown-to-the-owner-only>"})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No link of the caller has this id", body = ErrorResponse)
     ),
@@ -538,7 +535,6 @@ pub async fn get_share(
     params(("id" = String, Path, description = "Share link id")),
     responses(
         (status = 204, description = "Revoked, or already revoked"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No link of the caller has this id", body = ErrorResponse)
     ),
@@ -571,7 +567,6 @@ pub async fn revoke_share(
     responses(
         (status = 200, description = "One page of the log", body = ShareLog, example = json!({"entries": [{"id": "01JLOG00123456789ABCDEFGHJ", "at": "2026-10-31T10:00:00.000Z", "action": "download", "key": "results/table.csv", "bytes": 2048, "client": "192.0.2.0/24"}], "next": null})),
         (status = 400, description = "Malformed `after` or a limit outside 1 to 1000", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No link of the caller has this id", body = ErrorResponse)
     ),

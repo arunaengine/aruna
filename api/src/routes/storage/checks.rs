@@ -218,7 +218,6 @@ async fn ensure_bucket(
             })
         ),
         (status = 400, description = "Invalid `after` or `limit`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "10000 recorded files were read without one this caller may see", body = ErrorResponse)
@@ -363,7 +362,6 @@ async fn visible(
                 "started_at_ms": 1790000000000_u64
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse)
     ),
@@ -418,7 +416,6 @@ on the owning group's admin path, as for the bucket's storage settings.
             example = json!({ "bucket": "research-raw", "deleted": 2, "kept": 0, "denied": 0 })
         ),
         (status = 400, description = "Invalid `after`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the bucket or the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "10000 recorded files were read without one this caller may see", body = ErrorResponse)

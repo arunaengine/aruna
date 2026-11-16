@@ -413,7 +413,6 @@ impl From<OriginView> for OriginResponse {
             "identifiers": [],
             "content_id": "https://w3id.org/aruna/data/af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
         (status = 404, description = "Bucket or version not found, or not found on a copy that may be behind", body = ErrorResponse),
         (status = 503, description = "No holder of the key's range answered", body = ErrorResponse)
@@ -654,7 +653,6 @@ pub struct VersionOriginParams {
             "content_id": null
         })),
         (status = 400, description = "Not a version id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
         (status = 404, description = "Version not found", body = ErrorResponse),
         (status = 409, description = "The read was directed at another node", body = ErrorResponse),
@@ -848,7 +846,6 @@ pub struct FileSourcesResponse {
             }],
             "complete": true
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),

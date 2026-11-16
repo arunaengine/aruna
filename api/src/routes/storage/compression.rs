@@ -179,7 +179,6 @@ impl TryFrom<BucketCompressionRequest> for Compression {
                 }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
@@ -266,7 +265,6 @@ pub async fn get_bucket_compression(
             example = json!({ "bucket": "research-raw", "mode": "zstd", "level": 9 })
         ),
         (status = 400, description = "Unknown mode, a level outside 1 to 22, or a level with `off`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse),
         (status = 409, description = "`transition_running`: an encryption transition of the bucket is unfinished; `bucket_busy`: the save kept conflicting with the running re-encoding", body = ErrorResponse)

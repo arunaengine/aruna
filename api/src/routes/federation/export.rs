@@ -167,7 +167,6 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
                 "artifact_url": "https://a.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGHJK/artifacts/rocrate"
             })),
         (status = 400, description = "A malformed document id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The intent or descriptor was refused (code `transfer_rejected`), READ or a policy denied the export (code `export_denied`), or every copy of a selected file needs a bucket key the caller lacks (code `key_holder_required`)", body = ErrorResponse),
         (status = 404, description = "No such document on this node", body = ErrorResponse),
         (status = 409, description = "The caller's active RO-Crate job limit is reached", body = ErrorResponse),
@@ -284,7 +283,6 @@ that owns the job.
     responses(
         (status = 200, description = "The signed export grant", body = serde_json::Value,
             example = json!({ "payload": { "source": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], "audience": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "intent_digest": "<hex>", "export_job_id": "<ulid>", "document_id": "<ulid>", "source_revision": "<ulid>", "dataset_digest": "<hex>", "selection_digest": "<hex>", "artifact_url": "https://a.example.org/api/v1/compute/jobs/<job id>/artifacts/rocrate", "artifact_blake3": "<hex>", "artifact_size": 2048, "issued_at": 1791000000, "expires_at": 1791086400 }, "signer": "Realm", "signature": "<hex>" })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The export is no longer allowed (code `export_denied`) or its grant expired (code `transfer_rejected`)", body = ErrorResponse),
         (status = 404, description = "No such export into another realm of the caller on this node", body = ErrorResponse),
         (status = 409, description = "The export has not succeeded or left out a selected file (code `export_unfinished`)", body = ErrorResponse),
@@ -340,7 +338,6 @@ that owns the job.
     params(("job_id" = String, Path, description = "Export job id")),
     responses(
         (status = 204, description = "The grant is revoked"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "No grant for an export of the caller on this node", body = ErrorResponse),
         (status = 409, description = "The export has not succeeded (code `export_unfinished`)", body = ErrorResponse)
     ),
@@ -391,7 +388,6 @@ that owns the job.
     responses(
         (status = 200, description = "The destination's upload answer, unverified", body = serde_json::Value,
             example = json!({ "upload_id": "01JABCDEF0123456789ABCDEFG", "blake3": "<hex>", "size": 2048, "expires_at": "2026-04-10T14:23:11.123+00:00", "owner_node_url": "https://b.example.org/api/v1" })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The intent was refused (code `transfer_rejected`) or the export is no longer allowed (code `export_denied`)", body = ErrorResponse),
         (status = 404, description = "No grant for an export of the caller on this node", body = ErrorResponse),
         (status = 410, description = "The grant was revoked (code `grant_revoked`)", body = ErrorResponse),

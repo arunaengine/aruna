@@ -701,7 +701,6 @@ pub(super) fn admission_example() -> serde_json::Value {
     responses(
         (status = 201, description = "The set and each member's admission", body = AdmissionResponse, example = admission_example),
         (status = 400, description = "Invalid layout, bucket name or node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 409, description = "The publisher refused the change", body = ErrorResponse),
         (status = 503, description = "Configuration changes unavailable", body = ErrorResponse)
@@ -745,7 +744,6 @@ pub async fn create_distributed(
     ),
     responses(
         (status = 200, description = "Each member's admission", body = AdmissionResponse, example = admission_example),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse),
         (status = 409, description = "The publisher refused the change or the record conflicts", body = ErrorResponse),
@@ -815,7 +813,6 @@ pub(crate) async fn owned_status(
     ),
     responses(
         (status = 200, description = "The set's status", body = DistributedResponse, example = status_example),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the bucket path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse)
     ),

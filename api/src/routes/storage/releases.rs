@@ -123,7 +123,6 @@ under `prefix`, or nothing is published.
             "replayed": false
         })),
         (status = 400, description = "Invalid identifier link or run id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the bucket, neither admin nor curator, or a file under the prefix is not readable", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "The key changed while the release was written", body = ErrorResponse),
@@ -220,7 +219,6 @@ fn release_spec(request: &PublishReleaseRequest) -> ServerResult<ReleaseSpec> {
             "releases": [{"key": "bakta/6.0/ro-crate-metadata.json", "version_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "label": "6.0", "prefix": "bakta/6.0/"}],
             "complete": true
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "The releases could not be read now", body = ErrorResponse)
     ),
@@ -353,7 +351,6 @@ pub struct ReleaseFilesResponse {
             "next": "db/pfam/"
         })),
         (status = 400, description = "Invalid version id, delimiter or limit", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the release crate", body = ErrorResponse),
         (status = 404, description = "Bucket not found, or the version is gone or no release", body = ErrorResponse),
         (status = 503, description = "The release crate could not be read now", body = ErrorResponse)

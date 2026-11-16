@@ -307,7 +307,6 @@ pub(crate) fn serialize_restrictions(
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -413,7 +412,6 @@ to the group data root and can never widen them.
             body = ErrorResponse,
             example = json!({"error": "bucket research-raw is not encrypted", "code": "bucket_not_encrypted"})
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token belongs to another realm, the caller may read no part of the group data path, or a restriction reaches outside the group root or the caller's own grant",
@@ -580,7 +578,6 @@ WRITE on the group the credential is bound to is deliberately not enough.
     params(("access_key_id" = String, Path, description = "Access key id of the credential to revoke, as returned when it was created or listed")),
     responses(
         (status = 204, description = "Credential revoked"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, is path-restricted, or lacks WRITE on the owning user's administration path", body = ErrorResponse),
         (status = 404, description = "This node holds no credential with that access key id", body = ErrorResponse)
     ),

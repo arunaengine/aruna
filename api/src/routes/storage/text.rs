@@ -66,7 +66,6 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
             "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"
         })),
         (status = 400, description = "The key is not a valid object key", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the object's path, or the bucket is a read-only offered directory", body = ErrorResponse),
         (status = 404, description = "No such bucket", body = ErrorResponse),
         (status = 413, description = "The text is larger than 1 MiB", body = ErrorResponse),

@@ -266,7 +266,6 @@ caller's own access to the dataset.
                 "identifiers": [{"name": "DOI", "value": "10.5281/zenodo.14916843", "url": "https://doi.org/10.5281/zenodo.14916843"}]
             }
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "The metadata could not be read now", body = ErrorResponse)
@@ -335,7 +334,6 @@ the linked dataset. For a distributed bucket the set's publisher checks the forw
             "description": {"title": "Bakta database", "description": "Annotation database for Bakta", "version": "6.0", "license": null, "identifiers": []}
         })),
         (status = 400, description = "Missing `metadata`, an unknown field such as a former `title`, `database` without `dataset`, invalid identifier rules, or a dataset that does not exist, cannot be read by the caller or is not a Dataset", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the owning group's admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the group", body = ErrorResponse),
         (status = 409, description = "The set's publisher refused the change", body = ErrorResponse),

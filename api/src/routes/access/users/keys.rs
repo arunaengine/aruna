@@ -115,7 +115,6 @@ refused. A caller publishes only their own keys.
                 "created_at": "2026-10-01T12:30:00Z"
             })),
         (status = 400, description = "The key id or public key is malformed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 409, description = "The user has published the most key records allowed", body = ErrorResponse),
         (status = 503, description = "No vault holder accepted the record", body = ErrorResponse)
@@ -190,7 +189,6 @@ pub async fn publish_key(
                 }]
             })),
         (status = 400, description = "The user id is malformed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 503, description = "No vault holder answered", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

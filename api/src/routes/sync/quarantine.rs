@@ -231,7 +231,6 @@ because a retained row carries the whole rejected document; a path-restricted to
             })
         ),
         (status = 400, description = "The cursor or topic filter is not valid hex", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -296,7 +295,6 @@ because the row carries the whole rejected document; a path-restricted token is 
             })
         ),
         (status = 400, description = "The row id is not valid hex", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no evidence under that row id; it may have been pruned, or retained by a different node", body = ErrorResponse)
     ),
@@ -360,7 +358,6 @@ path-restricted token is refused.
             })
         ),
         (status = 400, description = "The row id is not valid hex", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no evidence under that row id; it may have been pruned, or retained by a different node", body = ErrorResponse)
     ),
@@ -426,7 +423,6 @@ path-restricted token is refused.
             })
         ),
         (status = 400, description = "The cursor or topic filter is not valid hex", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

@@ -146,7 +146,6 @@ async fn admin_rule(
             example = json!({"rules": [{"pattern": "*.faa.gz", "folder": "proteins/"}]})
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -234,7 +233,6 @@ bucket, including request policies. Tokens with path restrictions are refused.
             ]})
         ),
         (status = 400, description = "Invalid ids, patterns or folders, or patterns that overlap", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "The group is being deleted", body = ErrorResponse)
@@ -318,7 +316,6 @@ bucket, including request policies. Tokens with path restrictions are refused.
             })
         ),
         (status = 400, description = "Invalid ids, patterns or folders, or patterns that overlap", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),

@@ -208,7 +208,6 @@ refused. The vault is self-scoped, so a caller reaches only their own.
                     "updated_at": "2026-10-01T12:30:00Z"
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 503, description = "No vault holder answered", body = ErrorResponse)
     ),
@@ -273,7 +272,6 @@ refused. The vault is self-scoped, so a caller writes only their own.
                 }]
             })),
         (status = 400, description = "A predecessor is not a revision id, or there are too many", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 409, description = "The holder lost a concurrent write; retry", body = ErrorResponse),
         (status = 413, description = "The payload exceeds 64 KiB", body = ErrorResponse),
@@ -322,7 +320,6 @@ refused. The vault is self-scoped, so a caller deletes only their own.
 - Deleting a vault that is not there, or one already deleted, answers 204 without a write."#,
     responses(
         (status = 204, description = "The vault is deleted or was never there"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 503, description = "No vault holder accepted the delete", body = ErrorResponse)
     ),

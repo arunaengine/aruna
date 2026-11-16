@@ -200,7 +200,6 @@ async fn group_stats(
                 "active_tokens": 3
             })),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller does not administer the group", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
@@ -300,7 +299,6 @@ async fn active_tokens(
                     "recent_jobs": 7
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller is not a realm groups administrator", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

@@ -128,7 +128,6 @@ management node serves the call and every other node relays it to one.
     responses(
         (status = 200, description = "The name and map place stored after the change", body = NodeNameResponse, example = json!({"node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978", "display_name": "Giessen storage 1", "place": "Giessen", "coordinates": {"lat": 50.5841, "lon": 8.6784}})),
         (status = 400, description = "Malformed body, a body naming no field, a name or place that is empty, longer than 64 characters or holds control characters, or coordinates out of range", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "No realm node carries this node id, or this node holds no realm configuration", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),
@@ -184,7 +183,6 @@ the call and every other node relays it to one.
     responses(
         (status = 200, description = "The name and map place stored after the change", body = NodeNameResponse, example = json!({"node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978", "display_name": "Lab laptop", "place": null, "coordinates": null})),
         (status = 400, description = "Malformed body, a body naming no field, a name or place that is empty, longer than 64 characters or holds control characters, or coordinates out of range", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No enrolled device of the calling user carries this id", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),

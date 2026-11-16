@@ -90,7 +90,6 @@ pub struct HarvestResponse {
             "report_url": "https://node-a.example.org/api/v1/compute/jobs/01JHRVST0123456789ABCDEFGH/report"
         })),
         (status = 400, description = "Invalid ids, namespace, target prefix or metadata prefix, or a connector that is not OAI-PMH", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or no WRITE on the group's metadata path", body = ErrorResponse),
         (status = 404, description = "The connector does not exist in the group", body = ErrorResponse),
         (status = 409, description = "Another source definition, an unfinished run of the source, an idempotency key bound to another job, or a group being deleted", body = ErrorResponse),

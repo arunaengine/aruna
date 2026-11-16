@@ -70,7 +70,6 @@ the call."#,
     responses(
         (status = 200, description = "One page of user secrets", body = SecretPage, example = json!({"secrets": [entry_example()]})),
         (status = 400, description = "Invalid cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse)
     ),
     security(("bearer_auth" = [])))]
@@ -93,7 +92,6 @@ the call."#,
     responses(
         (status = 200, description = "The secret", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse)
     ),
@@ -125,7 +123,6 @@ the call.
     responses(
         (status = 201, description = "The stored secret, without field values", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse),
         (status = 409, description = "The name exists in this node's view", body = ErrorResponse)
     ),
@@ -155,7 +152,6 @@ the call."#,
     responses(
         (status = 200, description = "The changed secret", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)
@@ -188,7 +184,6 @@ the call."#,
     responses(
         (status = 200, description = "The rotated secret, without field values", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)
@@ -223,7 +218,6 @@ the call.
     responses(
         (status = 204, description = "The secret is deleted in this node's view"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)
@@ -259,7 +253,6 @@ serves the call and checks the token itself; every other node relays it to one.
     responses(
         (status = 200, description = "The field values", body = SecretValueView, example = json!({"fields": {"token": "EXAMPLE-TOKEN-PLACEHOLDER"}, "revision": "01JLIFE000123456789ABCDEFG.01JINFO000123456789ABCDEFG.01JVALUE00123456789ABCDEFG"})),
         (status = 400, description = "Invalid name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, a secret that is not readable, or a node that cannot open values", body = ErrorResponse),
         (status = 404, description = "No complete secret with this name in this node's view", body = ErrorResponse),
         (status = 503, description = "The audit row could not be written, or no management node was reachable", body = ErrorResponse)

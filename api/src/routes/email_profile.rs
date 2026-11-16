@@ -148,7 +148,6 @@ impl From<RealmEmailProfile> for EmailProfileView {
     responses(
         (status = 200, description = "Whether email is configured, and the profile for realm config admins", body = EmailProfileResponse,
             example = json!({"configured": true, "profile": {"host": "smtp.example.org", "port": 587, "tls": "starttls", "username": "aruna", "from": "Aruna <aruna@example.org>", "has_password": true, "revision": "01JBX7Y3S5M3Q8Y1V9K2T4R6P0", "changed_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "changed_at_ms": 1762160400000u64}})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
@@ -209,7 +208,6 @@ management node serves the call and every other node relays it to one.
         (status = 200, description = "The stored profile, without the password", body = EmailProfileView,
             example = json!({"host": "smtp.example.org", "port": 587, "tls": "starttls", "username": "aruna", "from": "Aruna <aruna@example.org>", "has_password": true, "revision": "01JBX7Y3S5M3Q8Y1V9K2T4R6P0", "changed_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "changed_at_ms": 1762160400000u64})),
         (status = 400, description = "Invalid host or sender, a password without username, or a changed username without password", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),
@@ -263,7 +261,6 @@ management node serves the call and every other node relays it to one.
   when the change reaches them."#,
     responses(
         (status = 204, description = "No profile is left"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),

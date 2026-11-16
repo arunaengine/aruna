@@ -112,7 +112,6 @@ group's metadata path.
             "description": {"title": "Bakta database", "description": "Annotation database for Bakta", "version": "6.0", "license": "https://spdx.org/licenses/CC-BY-4.0.html", "identifiers": [{"name": "DOI", "value": "10.5281/zenodo.14916843", "url": "https://doi.org/10.5281/zenodo.14916843"}]}
         })),
         (status = 400, description = "An unknown field, an empty title or description, or an identifier without an http or https link; or the dataset was refused", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the owning group's admin or metadata path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "The bucket already links a dataset, or its metadata changed meanwhile", body = ErrorResponse),

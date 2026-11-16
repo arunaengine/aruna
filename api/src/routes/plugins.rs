@@ -125,7 +125,6 @@ management node serves the call and every other node relays it to one.
         (status = 201, description = "The published version", body = PluginView,
             example = json!({"name": "dataset-announcer", "version": "0.1.0", "title": "Announce new datasets", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "size": 98304, "published_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "published_at_ms": 1762700000000u64})),
         (status = 400, description = "The artifact is not a valid plugin", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 409, description = "The version is published with other bytes, or another realm configuration update won the race", body = ErrorResponse),
         (status = 413, description = "The artifact exceeds 64 MiB", body = ErrorResponse),
@@ -200,7 +199,6 @@ pub(crate) async fn read_upload(
         (status = 200, description = "One page of published versions", body = PluginPage,
             example = json!({"plugins": [{"name": "dataset-announcer", "version": "0.1.0", "title": "Announce new datasets", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "size": 98304, "published_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "published_at_ms": 1762700000000u64}], "next": null})),
         (status = 400, description = "The limit is outside 1 to 1000", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

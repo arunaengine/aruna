@@ -105,7 +105,6 @@ const SECRET_EXAMPLE: &str = r#"{"name": "catalog-key", "kind": "bearer", "descr
         (status = 200, description = "One page of node secrets", body = SecretPage,
             example = json!({"secrets": [serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default()], "next_cursor": "catalog-key"})),
         (status = 400, description = "Invalid cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -135,7 +134,6 @@ pub async fn list_node_secrets(
         (status = 200, description = "The secret", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No secret with this name on this node", body = ErrorResponse)
     ),
@@ -185,7 +183,6 @@ pub async fn get_node_secret(
         (status = 201, description = "The stored secret, without field values", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name, kind, fields, settings or use rules", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 409, description = "A secret with this name exists on this node", body = ErrorResponse)
     ),
@@ -225,7 +222,6 @@ pub async fn create_node_secret(
         (status = 200, description = "The changed secret", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name, settings or use rules", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No secret with this name on this node", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision", body = ErrorResponse)
@@ -270,7 +266,6 @@ pub async fn replace_node_secret(
         (status = 200, description = "The rotated secret, without field values", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name or fields", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No secret with this name on this node", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision", body = ErrorResponse)
@@ -307,7 +302,6 @@ pub async fn rotate_node_secret(
     responses(
         (status = 204, description = "The secret is gone"),
         (status = 400, description = "Invalid name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No secret with this name on this node", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision", body = ErrorResponse)

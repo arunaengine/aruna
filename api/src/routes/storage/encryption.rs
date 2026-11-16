@@ -332,7 +332,6 @@ owning group's admin path.
                 }]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither key holder nor group admin", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "An authorization document of the bucket is missing", body = ErrorResponse)
@@ -707,7 +706,6 @@ pub(crate) async fn current_status(
                 "caller": { "holder": true, "ready_copy": true, "admin": true }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "An authorization document of the bucket is missing", body = ErrorResponse)
@@ -756,7 +754,6 @@ pub async fn get_bucket_encryption(
     responses(
         (status = 200, description = "The status after the change", body = EncryptionStatus, example = json!({ "bucket": "research-raw", "mode": "node_managed", "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC", "storage_generation": 1, "key_generation": 1, "public_key": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=", "fingerprint": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5", "cipher": "chacha20_poly1305", "block_keys": "content_derived", "max_unlock_ms": null, "unlock": { "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": null, "max_deadline_ms": null }, "generations": [], "holders": { "ready": 2, "pending": 0, "missing_key": 0 }, "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 }, "transition": null, "abe": null, "caller": { "holder": true, "ready_copy": true, "admin": true } })),
         (status = 400, description = "An invalid mode, cipher or unlock maximum", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`stale_generation`, `open_uploads`, `recovery_unmet`, `bucket_locked`, `transition_running`, `object_too_large` when a stored object exceeds the encryption size limit, or `unchanged` when the settings already apply", body = ErrorResponse)

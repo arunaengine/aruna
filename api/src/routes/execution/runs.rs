@@ -77,7 +77,6 @@ restrictions; anyone else needs READ on the run crate with their own token.
             "run_crate_iri": "https://w3id.org/aruna/01K8W1C0000000000000000000",
             "run_crate_status": { "status": "written", "resource": "01K8W1C0000000000000000000" }
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "Unknown run, or not visible to the caller", body = ErrorResponse),
         (status = 409, description = "The read was directed at another node", body = ErrorResponse),
         (status = 503, description = "The node that ran the job did not answer", body = ErrorResponse)

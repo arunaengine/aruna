@@ -157,7 +157,6 @@ sessions and other session kinds are refused, so a login cannot chain to a third
         "signature": "<hex ed25519 signature>"
     })),
         (status = 400, description = "A malformed nonce, or a descriptor that does not verify", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not an unrestricted portal session of a local user, or the user is deactivated", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

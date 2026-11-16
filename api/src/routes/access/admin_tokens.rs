@@ -236,7 +236,6 @@ async fn run_revocation(
                 "next_cursor": "AQExSkFLRVkwMTIzNDU2Nzg5QUJDREVGR0hK"
             })),
         (status = 400, description = "The group id is not a ULID, or the cursor is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller does not administer the group", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -302,7 +301,6 @@ pub async fn list_group_tokens(
         (status = 200, description = "The token is revoked", body = RevocationResponse,
             example = json!({ "revoked": 1, "all_tokens": false })),
         (status = 400, description = "Invalid group id or token kind", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller does not administer the group", body = ErrorResponse),
         (status = 404, description = "This node holds no such token of the group", body = ErrorResponse),
         (status = 409, description = "The token is a bearer session, which is not confined to the group", body = ErrorResponse),
@@ -350,7 +348,6 @@ pub async fn revoke_group_token(
         (status = 200, description = "The member's group tokens are revoked", body = RevocationResponse,
             example = json!({ "revoked": 2, "all_tokens": false })),
         (status = 400, description = "Invalid group or user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller does not administer the group", body = ErrorResponse),
         (status = 409, description = "The member is a service account of the group and the caller is no user administrator", body = ErrorResponse),
         (status = 503, description = "The revocation set is at capacity; retryable", body = ErrorResponse)
@@ -397,7 +394,6 @@ pub async fn revoke_member_tokens(
     responses(
         (status = 204, description = "Every token issued so far is revoked"),
         (status = 400, description = "The id is not a user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, the target is of another realm, or the caller lacks WRITE on the user's administration path", body = ErrorResponse),
         (status = 503, description = "The revocation set is at capacity; retryable", body = ErrorResponse)
     ),

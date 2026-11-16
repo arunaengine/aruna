@@ -393,7 +393,6 @@ async fn require_group_read(
                 "set_hash": "0ce7c556ff2991526058a20c2372cae9b6ea5276638be50197e42f74aa988e18"
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -466,7 +465,6 @@ node serves it, and every other node relays the call to one.
             })
         ),
         (status = 400, description = "Unknown policy kind, malformed policy or hash, or a set that breaks the size or compile limits", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not write the realm configuration", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "The stored set no longer matches `expected_hash` and nothing was written; re-read the set and retry", body = ErrorResponse),
@@ -571,7 +569,6 @@ which the group's built-in `user` and `admin` roles both grant.
                 "set_hash": "0ce7c556ff2991526058a20c2372cae9b6ea5276638be50197e42f74aa988e18"
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not read this group's configuration", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -646,7 +643,6 @@ pub async fn get_group_policies(
             })
         ),
         (status = 400, description = "Malformed group id, unknown policy kind, malformed hash, or a set that breaks the size or compile limits", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not write this group's configuration", body = ErrorResponse),
         (status = 404, description = "This node holds no authorization document for the group", body = ErrorResponse),
         (status = 409, description = "The stored set no longer matches `expected_hash` and nothing was written, or this node is a device where group changes are made through the realm", body = ErrorResponse),
@@ -754,7 +750,6 @@ additionally requires READ on that group's configuration path.
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not read the realm or group configuration", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -831,7 +826,6 @@ compiling caller-supplied expressions to policy authors.
                 "unknown_functions": []
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -924,7 +918,6 @@ as if it were read directly.
             })
         ),
         (status = 400, description = "Malformed group id, unknown scope or policy kind, or candidate policies that break the size or compile limits", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not read the realm configuration or administer the named group", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

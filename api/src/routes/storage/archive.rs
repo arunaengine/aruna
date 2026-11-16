@@ -234,7 +234,6 @@ READ on its prefix, as the object listing requires.
     responses(
         (status = 200, description = "The archive as an `application/zip` stream with an attachment `Content-Disposition` and `Cache-Control: no-store`"),
         (status = 400, description = "An empty selection, an entry with both or neither of key and prefix, an invalid bucket name or version id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 503, description = "The node has no free download capacity right now", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -275,7 +274,6 @@ pub async fn download_selection(
     responses(
         (status = 200, description = "The download URL path", body = LinkResponse, example = json!({"path": "/api/v1/data/archives/download?ticket=<single-use-ticket>", "expires_at": "2026-11-07T10:01:00Z"})),
         (status = 400, description = "An empty selection, an entry with both or neither of key and prefix, an invalid bucket name or version id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

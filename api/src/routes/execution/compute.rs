@@ -348,7 +348,6 @@ async fn require_config_admin(
             "catch_up_after_ms": 300000,
             "session_idle_after_ms": 1800000
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 500, description = "The stored configuration could not be read or decoded here, so absence was never established", body = ErrorResponse)
@@ -467,7 +466,6 @@ node serves the call and every other node relays it to one.
             "session_idle_after_ms": 1800000
         })),
         (status = 400, description = "A malformed group id, a duplicate directed link or group entry, an empty or oversized location, a zero bandwidth, a zero witness delay, a zero catch-up wait, or a zero session idle timeout", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = ErrorResponse),
@@ -589,7 +587,6 @@ fn map_compute_error(error: SetComputeError) -> ServerError {
             }
         })),
         (status = 400, description = "`group_id` is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 500, description = "The stored configuration could not be read or decoded here, so absence was never established", body = ErrorResponse)
@@ -726,7 +723,6 @@ pub async fn get_compute_snapshots(
             "draining": true,
             "changed": true
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 503, description = "The advertisement could not be republished; retryable", body = ErrorResponse)
     ),

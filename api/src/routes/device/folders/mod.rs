@@ -340,7 +340,6 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "Malformed ids, an unusable directory, a non-realm target, or a missing remote bucket", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not this device's owner, or the remote bucket refuses the owner", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 409, description = "The root overlaps a bound folder, also one still binding, or the bucket belongs to another group", body = ErrorResponse),
@@ -434,7 +433,6 @@ for.
                 "last_reconcile_ms": 1775748191000_i64,
                 "created_at_ms": 1775748000000_i64
             }]})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
@@ -498,7 +496,6 @@ for.
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
@@ -563,7 +560,6 @@ for.
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "A download-only folder cannot propagate deletions", body = ErrorResponse),
@@ -608,7 +604,6 @@ for. Nothing outside this device is decided here, so the owner binding is the wh
         (status = 200, description = "The folder is marked `deleting` and is removed in the background", body = UnboundFolder,
             example = json!({"folder_id": "01JFOLDER0123456789ABCDEFG"})),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet, or a concurrent change to the folder caused a storage conflict; retryable", body = ErrorResponse)
@@ -671,7 +666,6 @@ for.
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The folder is still being bound", body = ErrorResponse),
@@ -730,7 +724,6 @@ for."#,
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The folder is still being bound", body = ErrorResponse),
@@ -796,7 +789,6 @@ for.
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "Malformed folder id, or the local directory is missing or unusable", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not this device's owner", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The folder is paused", body = ErrorResponse),
@@ -866,7 +858,6 @@ for.
                 "updated_at_ms": 1775748191000_i64
             }], "next_cursor": "AAAAAQ"})),
         (status = 400, description = "Malformed folder id or cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
@@ -955,7 +946,6 @@ for.
                 "updated_at_ms": 1775748191000_i64
             })),
         (status = 400, description = "Malformed ids or hashes", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder or entry, or this node is not a user node", body = ErrorResponse),
         (status = 412, description = "The bytes changed since the owner saw them, or `expected` is missing for a replacement; the file is preserved and the attempt is audited", body = ErrorResponse),
@@ -1078,7 +1068,6 @@ for.
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "Malformed folder id or an unsupported action", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The confirmation does not name this folder", body = ErrorResponse),
@@ -1153,7 +1142,6 @@ for.
                 "outcome": "applied"
             }], "next_cursor": "AAAAAQ"})),
         (status = 400, description = "Malformed folder id or cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)

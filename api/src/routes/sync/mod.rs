@@ -345,7 +345,6 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
             })
         ),
         (status = 400, description = "The endpoints are identical, a bucket name is empty or contains `/`, the bucket is a workspace bucket, the prefix is not a confined relative path, or the target node id does not parse", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm or path-restricted, no READ on the source bucket, the target node refused the mirror, `not_holder` when `plaintext` is set and the caller is no current key holder of the encrypted source bucket, or `plaintext_required` when the encrypted source would copy into a bucket of this node that does not encrypt",
@@ -566,7 +565,6 @@ pub async fn create_sync(
             })
         ),
         (status = 400, description = "The bucket or prefix filter was present but empty", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -681,7 +679,6 @@ creator may read a relationship, so one created by somebody else is refused rath
             })
         ),
         (status = 400, description = "The path segment is not a valid relationship ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, or the relationship was created by another user", body = ErrorResponse),
         (status = 404, description = "This node holds no relationship with that id, or it is a detached serving stub", body = ErrorResponse)
     ),
@@ -789,7 +786,6 @@ creator may change a relationship, and READ on the source bucket is checked as w
             })
         ),
         (status = 400, description = "The path segment is not a valid relationship ULID, or the relationship is in reference mode and the request asked for anything other than preserve", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, the relationship was created by another user, or no READ on the source bucket", body = ErrorResponse),
         (status = 404, description = "This node holds no source-side relationship with that id, or the source bucket has gone", body = ErrorResponse),
         (status = 500, description = "The change could not be stored, or a resume stored the new state but failed to queue its catch-up backfill; that backfill is then queued with the run endpoint", body = ErrorResponse),
@@ -918,7 +914,6 @@ creator may run a relationship, and READ on the source bucket is checked as well
             })
         ),
         (status = 400, description = "The path segment is not a valid relationship ULID, or the stored relationship has no usable source bucket", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, the relationship was created by another user, or no READ on the source bucket", body = ErrorResponse),
         (status = 404, description = "This node holds no source-side relationship with that id, or the source bucket has gone", body = ErrorResponse),
     ),
@@ -982,7 +977,6 @@ the source bucket for a source-side relationship, the target bucket for a mirror
     responses(
         (status = 204, description = "The relationship is removed on this node and the peer's mirror is being dropped; synchronized objects are retained on both sides"),
         (status = 400, description = "The path segment is not a valid relationship ULID, or the stored relationship has no usable bucket for this node's side", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, the relationship was created by another user, or no WRITE on this node's endpoint bucket", body = ErrorResponse),
         (status = 404, description = "This node holds no relationship with that id, it is already a detached serving stub, or the endpoint bucket has gone", body = ErrorResponse)
     ),

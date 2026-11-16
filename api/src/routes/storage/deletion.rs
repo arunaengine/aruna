@@ -279,7 +279,6 @@ separately whether the same caller may run the purge.
             })
         ),
         (status = 400, description = "Invalid scope, marker, or limit", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller cannot read the selected scope", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse)
     ),
@@ -517,7 +516,6 @@ async fn set_coverage(
             })
         ),
         (status = 400, description = "Invalid scope or idempotency key, or `confirm` does not name the bucket", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller may not delete the selected scope permanently, or a restricted token asks to delete storage files", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
         (status = 409, description = "The idempotency key is retained for a purge of a different scope, or a release pins a version in the file, folder or bucket", body = ErrorResponse),
@@ -701,7 +699,6 @@ pub struct DeleteImpact {
         })),
         (status = 400, description = "Invalid kind, key, limit or cursor", body = ErrorResponse),
         (status = 409, description = "Too many versions in a row are hidden from the caller", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller cannot read the scope", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse)
     ),
@@ -931,7 +928,6 @@ fn decode_marker(cursor: &str) -> ServerResult<(String, Ulid)> {
             "delete_storage_files": true
         })),
         (status = 400, description = "Invalid job id or unknown action", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller may not delete the purge's scope permanently", body = ErrorResponse),
         (status = 404, description = "No purge job with this id on this node", body = ErrorResponse),
         (status = 409, description = "The purge already ended", body = ErrorResponse)
@@ -1046,7 +1042,6 @@ async fn purge_job(
             "delete_storage_files": true
         })),
         (status = 400, description = "Invalid job id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller cannot read the purge's scope", body = ErrorResponse),
         (status = 404, description = "No purge job with this id on this node", body = ErrorResponse)
     ),

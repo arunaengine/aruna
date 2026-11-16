@@ -73,7 +73,6 @@ is read, and its address is never returned.
             "categories": ["share.upload"],
             "created_at_ms": 1762160400000u64
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 404, description = "The caller receives no notification emails", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
@@ -133,7 +132,6 @@ caller.
             "created_at_ms": 1762160400000u64
         })),
         (status = 400, description = "No category, an unknown one, or an address that is not the caller's verified address", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "The realm sends no email, or this node is a user device", body = ErrorResponse),
         (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
@@ -181,7 +179,6 @@ pub async fn set_email(
 - 503 when the realm configuration cannot be read now."#,
     responses(
         (status = 204, description = "This node stored that email is off"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
         (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)

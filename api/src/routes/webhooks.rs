@@ -74,7 +74,6 @@ subscription is read.
             "event": "share.upload",
             "created_at_ms": 1762160400000u64
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 404, description = "The caller has no webhook", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
@@ -139,7 +138,6 @@ the caller.
             "secret": "<hex signing secret>"
         })),
         (status = 400, description = "Not an http or https URL, a URL with credentials, or longer than 2048 bytes", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
         (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
@@ -180,7 +178,6 @@ pub async fn set_webhook(
 - 503 when the realm configuration cannot be read now."#,
     responses(
         (status = 204, description = "This node stored that the webhook is off"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
         (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)

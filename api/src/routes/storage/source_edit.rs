@@ -228,7 +228,6 @@ A version whose new source the caller may not read, or whose new path is not can
             example = json!({"scanned": 1000, "changed": 998, "kept_last": 0, "kept_unproven": 0, "denied": 0, "next": "0a6e6362692d72656673657131"})
         ),
         (status = 400, description = "Invalid connector id or `after`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "Bucket or connector not found on this node", body = ErrorResponse),
         (status = 409, description = "A distributed bucket, or the bucket or connector changed during the edit", body = ErrorResponse)
@@ -311,7 +310,6 @@ pub async fn add_sources(
             example = json!({"scanned": 2, "changed": 1, "kept_last": 1, "kept_unproven": 0, "denied": 0})
         ),
         (status = 400, description = "Invalid connector id or `after`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "A distributed bucket, or the bucket or connector changed during the edit", body = ErrorResponse)

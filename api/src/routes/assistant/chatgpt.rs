@@ -221,7 +221,6 @@ refused. The provider is registered for the calling user alone.
                 "interval_seconds": 5,
                 "expires_at": "2026-04-09T12:15:00Z"
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse),
         (status = 502, description = "The ChatGPT issuer was unreachable or refused the device login", body = ErrorResponse)
@@ -336,7 +335,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     responses(
         (status = 200, description = "How far the login has come", body = LoginPollResponse,
             example = json!({"status": "pending"})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such ChatGPT provider for this user, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),

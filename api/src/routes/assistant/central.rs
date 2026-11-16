@@ -262,7 +262,6 @@ refused.
                 "used_today": 12,
                 "resets_at": "2026-11-03T00:00:00Z"
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No central assistant is set up, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 503, description = "The holder node is not reachable", body = ErrorResponse)
@@ -336,7 +335,6 @@ pub async fn get_central(
                 }
             })),
         (status = 400, description = "Unknown or ChatGPT kind, invalid base URL, or an invalid header name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not a realm admin, or the token carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse),
         (status = 409, description = "The setup changed concurrently", body = ErrorResponse),
@@ -386,7 +384,6 @@ pub async fn put_central(
 - The removal is written to the holder node's audit log."#,
     responses(
         (status = 204, description = "Central assistant removed"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not a realm admin, or the token carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No central assistant is set up, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "The setup changed concurrently", body = ErrorResponse),
@@ -437,7 +434,6 @@ pub async fn delete_central(
                 "message": "Provider is ready",
                 "models": [{"id": "deepseek-v4.1", "static": false}]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not a realm admin, or the token carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No central assistant is set up, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 503, description = "The holder node is not reachable", body = ErrorResponse)

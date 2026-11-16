@@ -122,7 +122,6 @@ impl From<SourceHealth> for SourceHealthBody {
                 "stats": {"first_byte_ms": null, "bytes_per_sec": null, "error_rate": 0.0, "in_flight": 0, "failing": false}
             }]
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
         (status = 404, description = "Bucket or version not found on this node", body = ErrorResponse)
     ),

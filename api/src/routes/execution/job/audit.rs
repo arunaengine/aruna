@@ -308,7 +308,6 @@ surface never confirms that somebody else's job exists.
             })
         ),
         (status = 400, description = "Unknown `scope`, a cursor that is not a record key of this log, or a `limit` outside 1..=64", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "Unknown, unparseable or foreign job id, or a responder that never held the family; page the node that accepted the submission", body = ErrorResponse),
         (status = 503, description = "The log could not be reduced here; retryable, the caller may page again", body = ErrorResponse)

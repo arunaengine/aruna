@@ -139,7 +139,6 @@ pub struct RepositoryList {
             "created_at": "2026-09-23T10:00:00+00:00", "updated_at": "2026-09-23T10:00:00+00:00"
         })),
         (status = 400, description = "Invalid group id, name, endpoint or configuration", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's metadata path", body = ErrorResponse),
         (status = 409, description = "The group is being deleted", body = ErrorResponse)
     ),
@@ -200,7 +199,6 @@ pub async fn create_repository(
             }]
         })),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the group's metadata path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -245,7 +243,6 @@ pub async fn list_repositories(
             "created_at": "2026-09-23T10:00:00+00:00", "updated_at": "2026-09-23T10:00:00+00:00"
         })),
         (status = 400, description = "An id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the group's metadata path", body = ErrorResponse),
         (status = 404, description = "No such connector in this group", body = ErrorResponse)
     ),
@@ -299,7 +296,6 @@ pub async fn get_repository(
             "created_at": "2026-09-23T10:00:00+00:00", "updated_at": "2026-09-23T11:00:00+00:00"
         })),
         (status = 400, description = "Invalid id or configuration, or an endpoint change that keeps the token", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's metadata path", body = ErrorResponse),
         (status = 404, description = "No such connector in this group", body = ErrorResponse),
         (status = 409, description = "The group is being deleted", body = ErrorResponse)
@@ -354,7 +350,6 @@ pub async fn replace_repository(
     responses(
         (status = 204, description = "Connector and token deleted"),
         (status = 400, description = "An id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's metadata path", body = ErrorResponse),
         (status = 404, description = "No such connector in this group", body = ErrorResponse),
         (status = 409, description = "Repository links still use the connector", body = ErrorResponse)

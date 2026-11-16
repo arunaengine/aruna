@@ -192,7 +192,6 @@ a path-restricted delegated token are both refused.
             })
         ),
         (status = 400, description = "Content-Type is neither application/zip nor application/vnd.eln+zip", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm or is a path-restricted delegated token", body = ErrorResponse),
         (status = 409, description = "A pushed export conflicts with the upload bound to its import (code `import_conflict`)", body = ErrorResponse),
         (status = 413, description = "The archive exceeds the node's direct-upload cap; the partial spool is discarded", body = ErrorResponse),
@@ -355,7 +354,6 @@ taken: READ on the source, WRITE on the target bucket, and WRITE on the metadata
             })
         ),
         (status = 400, description = "Malformed ids, an empty or oversized bucket, prefix or metadata path, an unsafe path segment, an expired or oversized source, or a repository source whose kind cannot import (code not_supported) or does not accept the record id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, is a path-restricted delegated token, names another user's upload, or lacks READ on the source or WRITE on the target bucket or metadata path", body = ErrorResponse),
         (status = 404, description = "The upload, source object or version, connector source, repository connector, or target bucket does not exist", body = ErrorResponse),
         (status = 409, description = "Idempotency key bound to a different plan, an upload already claimed by another job, a reached active-job cap, or a standing compute quota refusal, which reports the exact scope, dimension and numbers in `quota`", body = ErrorResponse),

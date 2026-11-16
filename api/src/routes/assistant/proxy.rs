@@ -278,7 +278,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     responses(
         (status = 200, description = "Upstream response streamed unchanged"),
         (status = 400, description = "The body is not JSON a ChatGPT request can carry, the provider credentials are incomplete, or a central call lacks a valid session id or names a model that is not allowed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, a path this kind does not allow, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
@@ -328,7 +327,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     ),
     responses(
         (status = 200, description = "Upstream response streamed unchanged"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, a path this kind does not allow, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),

@@ -347,7 +347,6 @@ pub struct ListSourceResponse {
             description = "The group id is not a ULID, or the name, kind or configuration failed validation; the body names no reason",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
@@ -435,7 +434,6 @@ pub async fn create_source_connector(
             })
         ),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
@@ -515,7 +513,6 @@ pub async fn list_source_connectors(
             description = "The group id or the connector id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
@@ -626,7 +623,6 @@ pub async fn get_source_connector(
             description = "An id is not a ULID, or the new name, kind or configuration failed validation; the body names no reason",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
@@ -713,7 +709,6 @@ pub async fn replace_source_connector(
             description = "The group id or the connector id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
@@ -832,7 +827,6 @@ because the body carries credentials the node then opens a connection with.
             description = "The group id is not a ULID, or the candidate configuration failed validation; the message names the offending field",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
@@ -917,7 +911,6 @@ mean the stored record must be replaced."#,
             description = "An id is not a ULID, or the stored record names a kind that cannot be probed at all",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
@@ -1030,7 +1023,6 @@ path.
             description = "An id is not a ULID, the path escapes the connector root, the limit is zero, or the cursor is invalid or past what the source can continue",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token is path-restricted or from another realm, or no READ on the group's data path, including when the group does not exist",

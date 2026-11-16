@@ -46,7 +46,6 @@ groups administrator. User devices refuse the call."#,
     responses(
         (status = 200, description = "One page of group secrets", body = SecretPage, example = json!({"secrets": [entry_example()]})),
         (status = 400, description = "Invalid group id or cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse)
     ),
     security(("bearer_auth" = [])))]
@@ -70,7 +69,6 @@ groups administrator. User devices refuse the call."#,
     responses(
         (status = 200, description = "The secret", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid group id or name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse)
     ),
@@ -104,7 +102,6 @@ groups administrator. User devices refuse the call.
     responses(
         (status = 201, description = "The stored secret, without field values", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse),
         (status = 409, description = "The name exists in this node's view", body = ErrorResponse)
     ),
@@ -140,7 +137,6 @@ groups administrator. User devices refuse the call."#,
     responses(
         (status = 200, description = "The changed secret", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)
@@ -176,7 +172,6 @@ groups administrator. User devices refuse the call.
     responses(
         (status = 200, description = "The rotated secret, without field values", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)
@@ -212,7 +207,6 @@ groups administrator. User devices refuse the call.
     responses(
         (status = 204, description = "The secret is deleted in this node's view"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)

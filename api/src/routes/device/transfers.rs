@@ -73,7 +73,6 @@ for.
                     "next_attempt_ms": 1775748191000_i64
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)

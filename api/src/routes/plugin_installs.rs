@@ -226,7 +226,6 @@ relays it to one.
         (status = 200, description = "The summary of a preview", body = InstallSummary, example = json!(view_example()["summary"])),
         (status = 201, description = "The active install", body = InstallView, example = json!(view_example())),
         (status = 400, description = "Invalid settings or grants, or the plugin cannot be installed yet", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin or lacks a granted right", body = ErrorResponse),
         (status = 404, description = "No published version matches", body = ErrorResponse),
         (status = 409, description = "The id belongs to another request, or a step failed", body = ErrorResponse),
@@ -302,7 +301,6 @@ pub async fn install(
     responses(
         (status = 200, description = "One page of installs", body = InstallPage, example = json!({"installs": [view_example()], "next": null})),
         (status = 400, description = "The group id or the limit is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -359,7 +357,6 @@ pub async fn list_installs(
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 200, description = "The install", body = InstallView, example = json!(view_example())),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse)
     ),
@@ -398,7 +395,6 @@ the call and every other node relays it to one.
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 204, description = "The install is removed"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 409, description = "The install changed meanwhile, or a step failed", body = ErrorResponse)

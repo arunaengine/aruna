@@ -1722,7 +1722,6 @@ management node serves the call and every other node relays it to one.
                 }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 500, description = "The stored realm configuration could not be read or decoded here", body = crate::error::ErrorResponse),
@@ -1864,7 +1863,6 @@ management node serves the call and every other node relays it to one.
             })
         ),
         (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, a node the realm does not place, a location or label the placement map refuses, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "The strategy is still referenced by a binding or override (`StrategyReferenced`), so removing it would leave a dangling reference, the placement handle space is exhausted, or another update of the realm configuration won the race; the caller may retry", body = crate::error::ErrorResponse),
@@ -2064,7 +2062,6 @@ management node serves the call and every other node relays it to one.
             })
         ),
         (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a zero device cap or device limit", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = crate::error::ErrorResponse),
@@ -2370,7 +2367,6 @@ checked, because the figures are realm-wide totals and not per-caller views.
                 "metadata_documents": 4096
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token is path-restricted, or the caller is not a member of this realm", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))

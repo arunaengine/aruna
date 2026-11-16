@@ -113,7 +113,6 @@ it, as the origin and run routes do.
     responses(
         (status = 200, description = "RO-Crate ZIP stream", content_type = "application/zip"),
         (status = 400, description = "Neither or both of version and dataset given", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]

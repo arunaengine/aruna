@@ -128,7 +128,6 @@ async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::U
                 }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
@@ -217,7 +216,6 @@ pub async fn get_bucket_move(
                 }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse),
         (status = 409, description = "`bucket_encrypted`: the bucket is encrypted or changes its encryption; `move_running`: a move with another prefix is unfinished", body = ErrorResponse)

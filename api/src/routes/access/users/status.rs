@@ -74,7 +74,6 @@ A service account never changes any account's status.
     responses(
         (status = 204, description = "The account has the requested status"),
         (status = 400, description = "The id is not a user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm, the caller is a service account, or the caller lacks the administration grant", body = ErrorResponse),
         (status = 404, description = "This node holds no account with that id", body = ErrorResponse),
         (status = 409, description = "The account holds the realm administrator role", body = ErrorResponse)

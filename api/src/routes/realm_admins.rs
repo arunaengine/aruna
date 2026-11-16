@@ -51,7 +51,6 @@ one.
                 "01JC8X9Q2M0000000000000000@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA"
             ])),
         (status = 400, description = "The id is not a user id of this realm", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm administrator", body = ErrorResponse),
         (status = 404, description = "This node holds no realm configuration or authorization document", body = ErrorResponse),
         (status = 409, description = "Another update of the realm authorization won the race; retry", body = ErrorResponse),
@@ -91,7 +90,6 @@ one.
         (status = 200, description = "All realm administrators after the change, sorted", body = Vec<String>,
             example = json!(["01JC8X8Z5W0000000000000000@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA"])),
         (status = 400, description = "The id is not a user id of this realm", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm administrator", body = ErrorResponse),
         (status = 404, description = "This node holds no realm configuration or authorization document", body = ErrorResponse),
         (status = 409, description = "The user is the last realm administrator, or another update of the realm authorization won the race", body = ErrorResponse),

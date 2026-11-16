@@ -228,7 +228,6 @@ fn expected_settings(headers: &HeaderMap) -> ServerResult<Option<String>> {
                     "signature": "<hex ed25519 signature>"
                 }
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "The realm has no federation settings; code `federation_unset`", body = crate::error::ErrorResponse),
         (status = 503, description = "This node holds no configuration document for its realm; code `realm_config_missing`", body = crate::error::ErrorResponse)
@@ -339,7 +338,6 @@ management node serves the call and signs the descriptor; every other node relay
                 }
             })),
         (status = 400, description = "A malformed or non-HTTPS URL, an empty or too long name, a too long description, a malformed contact, an unknown or repeated login provider, a malformed realm id or too many accepted realms", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = crate::error::ErrorResponse),
         (status = 412, description = "The settings changed since they were read, or are already set up; code `settings_changed`", body = crate::error::ErrorResponse),

@@ -135,7 +135,6 @@ const SECRET_EXAMPLE: &str = r#"{"name": "catalog-key", "kind": "bearer", "descr
         (status = 200, description = "One page of realm secrets", body = SecretPage,
             example = json!({"secrets": [serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default()]})),
         (status = 400, description = "Invalid cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
@@ -170,7 +169,6 @@ pub async fn list_realm_secrets(
         (status = 200, description = "The secret", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No realm secret with this name", body = ErrorResponse)
     ),
@@ -219,7 +217,6 @@ pub async fn get_realm_secret(
         (status = 201, description = "The stored secret, without field values", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name, kind, fields, settings or use rules", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 409, description = "The name exists, or a concurrent realm configuration update; retry", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
@@ -258,7 +255,6 @@ pub async fn create_realm_secret(
         (status = 200, description = "The changed secret", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name, settings or use rules", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No realm secret with this name", body = ErrorResponse),
         (status = 409, description = "A concurrent realm configuration update; retry", body = ErrorResponse),
@@ -305,7 +301,6 @@ pub async fn replace_realm_secret(
         (status = 200, description = "The rotated secret, without field values", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name or fields", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No realm secret with this name", body = ErrorResponse),
         (status = 409, description = "A concurrent realm configuration update; retry", body = ErrorResponse),
@@ -347,7 +342,6 @@ pub async fn rotate_realm_secret(
     responses(
         (status = 204, description = "The secret is gone"),
         (status = 400, description = "Invalid name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No realm secret with this name", body = ErrorResponse),
         (status = 409, description = "A concurrent realm configuration update; retry", body = ErrorResponse),

@@ -835,7 +835,6 @@ fn validated_withdrawal_reason(request: &WithdrawPersistentRequest) -> ServerRes
     responses(
         (status = 204, description = "The withdrawal is durable on the PID authority"),
         (status = 400, description = "Malformed id, unsupported provider, wrong confirmation, or invalid reason", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller lacks WRITE on the realm PID administration path", body = ErrorResponse),
         (status = 404, description = "No identifier is registered for this document", body = ErrorResponse),
         (status = 503, description = "The PID authority is unreachable; retryable", body = ErrorResponse)

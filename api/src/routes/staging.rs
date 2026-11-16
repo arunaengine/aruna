@@ -358,7 +358,6 @@ connector's source path, both checked against the concrete path rather than a pr
             })
         ),
         (status = 400, description = "The group or connector id does not parse, or the source path is empty, absolute or contains a `.` or `..` segment", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, no WRITE on the target key or READ on the source path, or the snapshot would exceed the group's quota ceiling", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node or belongs to another group, the connector does not exist, or the source object is absent", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
@@ -467,7 +466,6 @@ route, and sending `prefixes` additionally requires READ on the group's data pat
             })
         ),
         (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a prefix is not a confined relative path, or the batch would exceed 1000 objects", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or prefixes were given and the caller has no READ on the group's data path", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse)
     ),
@@ -774,7 +772,6 @@ Nothing is authorized later while the job runs.
             })
         ),
         (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path, prefix or checksum manifest name is not confined, a target key is blank, neither items nor prefixes nor a table were given, or the table descriptor is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on a source path or the table, or no WRITE on a target key or the table's destination bucket", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node or belongs to another group, a source path does not exist, or the connector is not registered on this node (code `connector_not_found`)", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
@@ -1026,7 +1023,6 @@ exactly the same restrictions.
                 "next_cursor": "AAABkWPGovsBAgMEBQYHCAkKCwwNDg8Q"
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
@@ -1203,7 +1199,6 @@ outside a path restriction, are left out of the page.
             })
         ),
         (status = 400, description = "The cursor could not be decoded", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),

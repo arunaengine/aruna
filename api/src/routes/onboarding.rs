@@ -329,7 +329,6 @@ unrestricted token. A management node serves the route, and every other node rel
             })
         ),
         (status = 400, description = "No seed URL was given and this node publishes no REST interface", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm or is path-restricted, the caller lacks WRITE on the realm's onboarding admin path, or a realm policy forbids device enrollment", body = crate::error::ErrorResponse),
         (status = 409, description = "The owner is at the realm's device cap, or a concurrent mint won the transaction; retryable", body = crate::error::ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
@@ -490,7 +489,6 @@ node serves it, and every other node relays the call to one.
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
@@ -536,7 +534,6 @@ node serves it, and every other node relays the call to one.
     params(("id" = String, Path, description = "Enrollment id of the secret, as reported when it was minted and by the listing")),
     responses(
         (status = 204, description = "Secret deleted and no longer redeemable"),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
         (status = 404, description = "No onboarding secret with this id on this node, including one an earlier call already revoked", body = crate::error::ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
