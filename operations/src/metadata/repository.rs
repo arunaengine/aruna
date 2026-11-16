@@ -372,7 +372,7 @@ pub async fn delete_index_keys(
 mod pure_tests {
     use super::*;
     use crate::metadata::projector::create_outbox_record;
-    use crate::sync::document_outbox::outbox_key;
+    use crate::sync::outbox_record::outbox_key;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
     use aruna_core::keyspaces::{
         SHARD_MANIFEST_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,

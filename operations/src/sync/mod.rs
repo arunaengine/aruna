@@ -6,6 +6,7 @@ pub mod announce;
 pub mod document_outbox;
 pub mod incoming;
 pub mod mirror_repair;
+pub mod outbox_record;
 pub mod replicate_documents;
 pub mod shard_placement;
 pub mod sync_quarantine;

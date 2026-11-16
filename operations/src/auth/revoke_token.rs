@@ -30,9 +30,9 @@ use tracing::warn;
 
 use crate::placement::target_placement_ref;
 use crate::sync::document_outbox::{
-    admin_outbox_prefix, new_identified_record, outbox_write_entry, revocation_index_entry,
-    schedule_drain_effect,
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use crate::sync::outbox_record::{admin_outbox_prefix, revocation_index_entry};
 
 const PRIVILEGED_REVOCATION_RESERVE: usize = 128;
 const REVOCATION_CAP: usize = REVOCATIONS_PER_ORIGIN - PRIVILEGED_REVOCATION_RESERVE;
@@ -907,7 +907,7 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::realm::get_config::GetConfigOperation;
-    use crate::sync::document_outbox::admin_outbox_prefix;
+    use crate::sync::outbox_record::admin_outbox_prefix;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentOperation;
     use aruna_core::auth::MAX_TOKEN_LIFETIME;

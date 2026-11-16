@@ -242,7 +242,7 @@ async fn drain_blocker(
     {
         return Some(DrainBlocker::Eviction);
     }
-    for prefix in crate::sync::document_outbox::outbox_stream_prefixes() {
+    for prefix in crate::sync::outbox_record::outbox_stream_prefixes() {
         let mut start_after: Option<Vec<u8>> = None;
         loop {
             let batch = match crate::sync::document_outbox::read_outbox_records(
