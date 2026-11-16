@@ -1047,12 +1047,12 @@ pub async fn list_staging_jobs(
             matches!(record.payload, JobPayload::Staging(_)) && staging_job_visible(record, &auth)
         })
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let mut jobs = Vec::with_capacity(records.len());
     for record in records {
         let checkpoint = read_staging_checkpoint(&state.get_ctx(), record.job_id)
             .await
-            .map_err(ServerError::InternalError)?;
+            .map_err(|error| ServerError::InternalError(error.into()))?;
         jobs.push(staging_job_response(&record, checkpoint.as_ref())?);
     }
     Ok((

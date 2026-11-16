@@ -146,7 +146,7 @@ pub async fn get_bucket_move(
     crate::auth::ensure_permission(&state, &auth, path, Permission::READ).await?;
     let counted = count_misplaced(&state.get_ctx(), &bucket, &query.prefix, None)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let status = drive(
         MigrationStatusOperation::new(bucket.clone()),
         &state.get_ctx(),

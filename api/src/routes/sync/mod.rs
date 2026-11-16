@@ -474,10 +474,10 @@ pub async fn create_sync(
 
     if plaintext {
         let consent = consent_write(relationship_consent(relationship.id), auth.user_id)
-            .map_err(ServerError::InternalError)?;
+            .map_err(|error| ServerError::InternalError(error.into()))?;
         store_consent(&context, consent)
             .await
-            .map_err(ServerError::InternalError)?;
+            .map_err(|error| ServerError::InternalError(error.into()))?;
     }
     activate_sync(&state, &relationship).await?;
 
@@ -1468,7 +1468,9 @@ async fn annotate(
     let id = parse_id(&response.id)?;
     let context = state.get_ctx();
     let consent = read_consent(&context, relationship_consent(id)).await;
-    response.plaintext = consent.map_err(ServerError::InternalError)?.is_some();
+    response.plaintext = consent
+        .map_err(|error| ServerError::InternalError(error.into()))?
+        .is_some();
     let awaiting = awaiting_jobs(&context, id).await;
     response.status.awaiting_key =
         awaiting.map_err(|error| ServerError::InternalError(error.to_string().into()))?;
@@ -1481,11 +1483,11 @@ async fn refuse_plain_target(state: &ServerState, source: &str, target: &str) ->
     let encrypted = |bucket| source_encrypted(&context, bucket);
     let source = encrypted(source)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     if !source
         || encrypted(target)
             .await
-            .map_err(ServerError::InternalError)?
+            .map_err(|error| ServerError::InternalError(error.into()))?
     {
         return Ok(());
     }

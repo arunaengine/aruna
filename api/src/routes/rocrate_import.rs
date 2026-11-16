@@ -619,7 +619,7 @@ async fn fast_source_check(
         ImportRoCrateSource::Upload { upload_id } => {
             let record = load_rocrate_upload(&state.get_ctx(), *upload_id)
                 .await
-                .map_err(ServerError::InternalError)?
+                .map_err(|error| ServerError::InternalError(error.into()))?
                 .ok_or(ServerError::NotFound)?;
             if record.owner != auth.user_id {
                 return Err(ServerError::Forbidden);
@@ -628,7 +628,7 @@ async fn fast_source_check(
                 let dedup_key = idempotency_key.map(|key| user_dedup_key(auth.user_id, key));
                 let claimed = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
                     .await
-                    .map_err(ServerError::InternalError)?;
+                    .map_err(|error| ServerError::InternalError(error.into()))?;
                 let same_identity = matches!(
                     (
                         claimed.as_ref().and_then(|job| job.dedup_key.as_ref()),

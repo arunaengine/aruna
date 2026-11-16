@@ -34,8 +34,9 @@ pub enum ServerError {
     Unauthorized,
     #[error("Forbidden")]
     Forbidden,
+    /// The cause is logged when the response is built; the body never shows it.
     #[error("{0}")]
-    InternalError(String),
+    InternalError(Box<dyn std::error::Error + Send + Sync>),
     #[error("{0}")]
     Conflict(String),
     /// The bytes a caller acted on are no longer the bytes on disk. The local
@@ -359,6 +360,9 @@ pub type ServerResult<T> = Result<T, ServerError>;
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
+        if let ServerError::InternalError(source) = &self {
+            tracing::error!(error = %source, "internal server error");
+        }
         let status = self.status_code();
         let body = self.response_body();
 

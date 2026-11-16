@@ -870,7 +870,7 @@ pub async fn get_sources(
     ensure_permission(&state, &auth, path, Permission::READ).await?;
     let (sources, complete) = bucket_sources(state.get_ctx().as_ref(), info.group_id, &bucket)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(Json(FileSourcesResponse {
         sources: sources
             .into_iter()

@@ -1102,7 +1102,7 @@ pub async fn list_jobs(
         move |record| state_filter.is_none_or(|state| record.state == state),
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
 
     let jobs = records.iter().map(job_status_response).collect();
     Ok((

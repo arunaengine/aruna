@@ -621,7 +621,7 @@ pub async fn get_compute_snapshots(
         .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let documents = read_info_documents(&context, &members)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
 
     let heartbeats = held_heartbeats(context.net_handle.as_ref());
     let nodes = documents
@@ -662,7 +662,7 @@ pub async fn get_compute_snapshots(
             let (demand, truncated) =
                 group_demand(&context, auth.realm_id, state.get_node_id(), &group_id)
                     .await
-                    .map_err(ServerError::InternalError)?;
+                    .map_err(|error| ServerError::InternalError(error.into()))?;
             let quota = config
                 .compute
                 .effective_quota(&group_id)
@@ -678,7 +678,7 @@ pub async fn get_compute_snapshots(
     };
     let departure = departure_report(&context)
         .await
-        .map_err(ServerError::InternalError)?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .map(|report| DepartureBody {
             departed_at_ms: report.departed_at_ms,
             membership_generation: report.membership_generation,
@@ -692,7 +692,7 @@ pub async fn get_compute_snapshots(
     Ok(Json(ComputeSnapshotsResponse {
         operator_draining: read_operator_drain(&context)
             .await
-            .map_err(ServerError::InternalError)?,
+            .map_err(|error| ServerError::InternalError(error.into()))?,
         nodes,
         group,
         departure,

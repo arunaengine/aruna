@@ -226,7 +226,7 @@ pub(crate) async fn with_global_ids(state: &ServerState, value: &Value) -> Serve
         &mut value,
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(value)
 }
 

@@ -789,7 +789,7 @@ pub async fn list_group_buckets(
         let wanted = (after.take(), limit - readable.len());
         let (buckets, token) = list_bucket_storage(&state.get_ctx(), group_id, wanted)
             .await
-            .map_err(ServerError::InternalError)?;
+            .map_err(|error| ServerError::InternalError(error.into()))?;
         for found in buckets {
             let path = bucket_permission_path(
                 state.get_realm_id(),

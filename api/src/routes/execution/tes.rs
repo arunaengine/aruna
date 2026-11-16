@@ -2175,7 +2175,9 @@ async fn ensure_group_write(
     )
     .await
     .map_err(|error| match error {
-        crate::error::ServerError::InternalError(message) => TesError::internal(message),
+        crate::error::ServerError::InternalError(message) => {
+            TesError::internal(message.to_string())
+        }
         _ => TesError::forbidden("no write access to group"),
     })
 }

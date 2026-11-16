@@ -480,7 +480,7 @@ pub async fn start_move(
     let scope = scope(&state, (&rule, &auth), &access);
     let total = remap::count_selected(&state.get_ctx(), &plan, &scope, None)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let task = LinkedTask::Remap(plan);
     start_job(&state, (&rule, auth, bearer), (task, total)).await
 }
@@ -547,7 +547,7 @@ pub async fn preview_duplicates(
         (filter, after, limit),
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let file = |location: aruna_core::structs::storage::blob::BackendLocation| StoredFile {
         path: location.backend_path,
         bytes: location.blob_size,
@@ -618,7 +618,7 @@ pub async fn start_duplicates(
         (None, None, 1),
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let task = LinkedTask::Unify {
         prefix: String::new(),
     };
@@ -662,7 +662,7 @@ pub async fn get_job(
     let context = state.get_ctx();
     let job = read_bucket_job(&context, &rule.bucket)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     match job {
         Some(job) => Ok(Json(Some(shown(&context, &rule.bucket, job).await?))),
         None => Ok(Json(None)),
@@ -679,7 +679,7 @@ async fn shown(
     let total = match &job {
         BucketJob::Rename(record, _) => {
             let total = rename_total(context, bucket, record.started_at_ms).await;
-            total.map_err(ServerError::InternalError)?
+            total.map_err(|error| ServerError::InternalError(error.into()))?
         }
         _ => None,
     };
@@ -856,7 +856,9 @@ async fn file_keys(
         INTENT_PAGE,
         None,
     );
-    let (intents, more) = intents.await.map_err(ServerError::InternalError)?;
+    let (intents, more) = intents
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     if more.is_some() {
         return Ok(Vec::new());
     }
@@ -878,7 +880,9 @@ async fn file_keys(
         INTENT_PAGE,
         None,
     );
-    let (intents, more) = intents.await.map_err(ServerError::InternalError)?;
+    let (intents, more) = intents
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     if more.is_some() {
         return Ok(Vec::new());
     }

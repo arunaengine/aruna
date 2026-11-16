@@ -753,7 +753,7 @@ pub async fn delete_preview(
     let readable = |key: &str| access.allows(Some(key), &Permission::READ);
     let totals = aruna_operations::blob::purge::scope_totals(&context, &scope, &readable)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let (mut items, mut marker) = (Vec::new(), (key_marker, version_marker));
     let (mut next, mut more, mut passed, mut cut) = (None, false, 0, false);
     for _ in 0..HIDDEN_PAGES {
@@ -835,7 +835,7 @@ pub async fn delete_preview(
         Some(&scope),
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let kept_files = files.iter().filter(|file| file.kept.is_some()).count() as u64;
     let unchecked = aruna_operations::blob::purge::UNCHECKED_READERS;
     let unchecked = files
@@ -950,7 +950,7 @@ pub async fn control_purge(
     let record =
         aruna_operations::jobs::store::read_job_record(&context.storage_handle, job_id, None)
             .await
-            .map_err(ServerError::InternalError)?
+            .map_err(|error| ServerError::InternalError(error.into()))?
             .ok_or(ServerError::NotFound)?;
     let Some(spec) = record.payload.purge_spec() else {
         return Err(ServerError::NotFound);
@@ -1014,11 +1014,11 @@ async fn purge_job(
     let record =
         aruna_operations::jobs::store::read_job_record(&context.storage_handle, job_id, None)
             .await
-            .map_err(ServerError::InternalError)?
+            .map_err(|error| ServerError::InternalError(error.into()))?
             .ok_or(ServerError::NotFound)?;
     let paused = aruna_operations::blob::purge::is_paused(&context, job_id.as_ulid())
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let paused = paused && !record.state.is_terminal();
     Ok(Json(PurgeJobResponse {
         job_id: job_id.to_string(),
@@ -1062,7 +1062,7 @@ pub async fn get_purge(
     let storage = &state.get_ctx().storage_handle;
     let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
         .await
-        .map_err(ServerError::InternalError)?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)?;
     let Some(spec) = record.payload.purge_spec() else {
         return Err(ServerError::NotFound);
@@ -1081,7 +1081,7 @@ async fn purge_ended(
     let storage = &state.get_ctx().storage_handle;
     let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(record.is_some_and(|record| record.state.is_terminal()))
 }
 

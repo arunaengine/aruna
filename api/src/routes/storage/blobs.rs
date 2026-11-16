@@ -262,7 +262,7 @@ pub(crate) async fn plaintext_holder(
     let context = state.get_ctx();
     let encrypted = consent_required(&context, bucket)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     if !encrypted {
         return Ok(false);
     }

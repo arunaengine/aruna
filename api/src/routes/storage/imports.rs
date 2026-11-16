@@ -865,7 +865,7 @@ pub async fn get_renames(
         (page.filter.as_deref(), after, limit),
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let status = drive(
         MigrationStatusOperation::new(rule.bucket.clone()),
         &state.get_ctx(),

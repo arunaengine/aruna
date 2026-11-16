@@ -877,7 +877,7 @@ pub async fn backend_reclaim_status(
         .ok_or(ServerError::NotFound)?;
     let status = backend_status(&context, &BackendRef::Group(backend_id))
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
 
     Ok(Json(ReclaimStatusResponse {
         pending_candidates: status.pending_candidates,

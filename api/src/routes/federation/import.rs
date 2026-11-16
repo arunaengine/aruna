@@ -204,7 +204,7 @@ pub(crate) async fn pushed_upload(
     rebind(state, &push.intent, &push.grant, &push.key, upload_id).await?;
     let record = load_rocrate_upload(&context, upload_id)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let owner_node_url = owner_node_url(state).await?;
     match record {
         Some(record) => upload_response(&record, owner_node_url).map(Some),
@@ -259,7 +259,7 @@ pub(crate) async fn bind_upload(
     let bound = bound.map_err(import_refused)?;
     load_rocrate_upload(&context, bound)
         .await
-        .map_err(ServerError::InternalError)?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)
 }
 

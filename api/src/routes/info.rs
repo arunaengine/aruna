@@ -2326,7 +2326,7 @@ pub async fn load_realm_usage(
         scope,
     )
     .await
-    .map_err(ServerError::InternalError)
+    .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 #[utoipa::path(

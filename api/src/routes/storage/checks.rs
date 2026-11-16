@@ -244,7 +244,7 @@ pub async fn get_bucket_check(
     let ctx = state.get_ctx();
     let progress = read_check(&ctx, &bucket)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let (broken, next) =
         visible_page(&state, &auth, group_id, &bucket, after, limit, SCAN_MAX).await?;
     Ok(Json(BucketCheckResponse {
@@ -278,7 +278,7 @@ async fn visible_page(
         let page = limit.min(scan - examined);
         let (rows, more) = list_broken(&ctx, bucket, after.take(), page)
             .await
-            .map_err(ServerError::InternalError)?;
+            .map_err(|error| ServerError::InternalError(error.into()))?;
         for (key, row) in rows {
             if broken.len() == limit {
                 return Ok((broken, next));
@@ -321,7 +321,7 @@ async fn visible(
 ) -> ServerResult<bool> {
     if !is_current(&state.get_ctx(), key)
         .await
-        .map_err(ServerError::InternalError)?
+        .map_err(|error| ServerError::InternalError(error.into()))?
     {
         return Ok(false);
     }
@@ -454,7 +454,7 @@ pub async fn clean_bucket_check(
         SCAN_MAX,
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     if cleaned.exhausted {
         return Err(scan_limit());
     }

@@ -247,7 +247,7 @@ pub(crate) async fn owned_export(
     let job_id = crate::jobs::parse_job_id(job_id).map_err(|_| ServerError::NotFound)?;
     let record = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
         .await
-        .map_err(ServerError::InternalError)?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)?;
     let JobPayload::ExportRoCrate(spec) = record.payload else {
         return Err(ServerError::NotFound);
