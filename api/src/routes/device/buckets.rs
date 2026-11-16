@@ -5,19 +5,19 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{parse_group_id, require_owner};
+use crate::auth::OwnerAuth;
+use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::id::NodeId;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::group_backend::valid_bucket;
 use aruna_operations::device::sync::folders::{RealmBucketInput, create_realm_bucket};
 
@@ -90,10 +90,9 @@ bind with `create_bucket`.
 )]
 pub(super) async fn create_device_bucket(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Json(request): Json<CreateBucketRequest>,
 ) -> ServerResult<(StatusCode, Json<CreatedBucket>)> {
-    let auth = require_owner(&state, auth).await?;
     let group_id = parse_group_id(&request.group_id)?;
     let node_id = NodeId::from_str(&request.node_id)
         .map_err(|_| ServerError::BadRequestReason("node_id is not a node id".to_string()))?;

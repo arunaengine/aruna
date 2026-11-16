@@ -4,22 +4,20 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::realm_documents::realm_removed;
 use aruna_operations::device::sync_status::{
     DatasetRow, DocumentRow, SyncStatus, start_sync_run, sync_status,
 };
-
-use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -179,7 +177,7 @@ for.
                     "unsyncedFiles": 0,
                     "conflicts": 0,
                     "lastError": "the bucket \"lab-data\" does not exist on node k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga"
-                }]
+                }],
             })),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         crate::openapi::DeviceErrors
@@ -188,9 +186,8 @@ for.
 )]
 async fn get_sync_status(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
 ) -> ServerResult<Json<DeviceSyncStatus>> {
-    require_owner(&state, auth).await?;
     let context = state.get_ctx();
     let mut status: DeviceSyncStatus = sync_status(&context).await.into();
     status.removed_from_realm = realm_removed(&context, state.get_realm_id()).await;
@@ -223,9 +220,8 @@ for.
 )]
 async fn run_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
 ) -> ServerResult<(axum::http::StatusCode, Json<DeviceSyncRun>)> {
-    require_owner(&state, auth).await?;
     start_sync_run(&state.get_ctx()).await;
     Ok((
         axum::http::StatusCode::ACCEPTED,

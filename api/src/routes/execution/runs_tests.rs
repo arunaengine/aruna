@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use ulid::Ulid;
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::routes::storage::relay::RELAY_NODE_HEADER;
 use crate::tests::assistant::spawn_mock;
 use crate::tests::distributed::{LOCAL, Node, PEER, node_id, node_state, publish_api};
@@ -28,7 +29,7 @@ async fn run(
     );
     get_run(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         headers,
         Path(run_id.to_string()),

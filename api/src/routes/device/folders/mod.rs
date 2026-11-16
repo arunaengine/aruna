@@ -5,21 +5,21 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::Deserialize;
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::OwnerAuth;
 use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::id::NodeId;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, FolderMode, FolderState, RemoteBinding,
 };
@@ -38,7 +38,6 @@ use super::dto::{
     ActionRecordPage, ActionScopeName, EntryAction, FolderEntryPage, FolderEntryView,
     SyncedFolderList, SyncedFolderView, action_view, entry_view, folder_view,
 };
-use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -350,10 +349,9 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
 )]
 async fn bind_synced_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Json(request): Json<BindFolderRequest>,
 ) -> ServerResult<(StatusCode, Json<SyncedFolderView>)> {
-    let auth = require_owner(&state, auth).await?;
     let group_id = parse_group_id(&request.group_id)?;
     let folder_id = Ulid::generate();
     let node_id = NodeId::from_str(&request.remote_node_id).map_err(|_| {
@@ -440,9 +438,8 @@ for.
 )]
 async fn list_synced_folders(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
 ) -> ServerResult<Json<SyncedFolderList>> {
-    require_owner(&state, auth).await?;
     let bound = list_folders(&state.get_ctx())
         .await
         .map_err(map_folder_error)?;
@@ -502,10 +499,9 @@ for.
 )]
 async fn get_synced_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let folder = read_bound(&state.get_ctx(), folder_id)
         .await
@@ -567,11 +563,10 @@ for.
 )]
 async fn update_synced_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
     Json(request): Json<UpdateFolderRequest>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let folder = set_propagate_deletes(&state.get_ctx(), folder_id, request.propagate_deletes)
         .await
@@ -610,10 +605,9 @@ for. Nothing outside this device is decided here, so the owner binding is the wh
 )]
 async fn unbind_synced_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<UnboundFolder>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     unbind_folder(&state.get_ctx(), folder_id)
         .await
@@ -673,10 +667,9 @@ for.
 )]
 async fn pause_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let folder = set_folder_state(&state.get_ctx(), folder_id, FolderState::Paused)
         .await
@@ -731,10 +724,9 @@ for."#,
 )]
 async fn resume_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let folder = set_folder_state(&state.get_ctx(), folder_id, FolderState::Active)
         .await
@@ -796,10 +788,9 @@ for.
 )]
 async fn sync_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let context = state.get_ctx();
     let folder = read_bound(&context, folder_id)
@@ -863,11 +854,10 @@ for.
 )]
 async fn list_folder_entries(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
     Query(query): Query<EntryQuery>,
 ) -> ServerResult<Json<FolderEntryPage>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let cursor = decode_cursor(query.cursor)?;
     let (entries, next) = list_entries(&state.get_ctx(), folder_id, query.state.as_deref(), cursor)
@@ -952,11 +942,10 @@ for.
 )]
 async fn act_on_entry(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Path((folder_id, path)): Path<(String, String)>,
     Json(request): Json<EntryActionRequest>,
 ) -> ServerResult<Json<FolderEntryView>> {
-    let auth = require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let expected = request
         .expected
@@ -1074,11 +1063,10 @@ for.
 )]
 async fn act_on_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Path(folder_id): Path<String>,
     Json(request): Json<FolderActionRequest>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    let auth = require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     if request.action != EntryAction::ReplaceLocal || request.scope != ActionScopeName::AllPending {
         return Err(ServerError::BadRequestReason(
@@ -1146,11 +1134,10 @@ for.
 )]
 async fn list_folder_actions(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
     Query(query): Query<ActionQuery>,
 ) -> ServerResult<Json<ActionRecordPage>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let cursor = decode_cursor(query.cursor)?;
     let (actions, next) = list_actions(&state.get_ctx(), folder_id, cursor)

@@ -18,7 +18,8 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::relay::{node_directed, node_read};
 use crate::server::state::ServerState;
@@ -81,12 +82,11 @@ restrictions; anyone else needs READ on the run crate with their own token.
 )]
 pub async fn get_run(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> ServerResult<Json<RunResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let deadline = tokio::time::Instant::now() + RELAY_DEADLINE;
     run_answer(&state, &auth, bearer, &headers, (&run_id, deadline)).await
 }

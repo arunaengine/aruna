@@ -5,18 +5,17 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::require_owner;
+use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::sync::outbox::local_origin;
 
 use super::folders::map_folder_error;
@@ -73,10 +72,9 @@ for.
 )]
 async fn get_local_origin(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(version_id): Path<String>,
 ) -> ServerResult<Json<DeviceOrigin>> {
-    require_owner(&state, auth).await?;
     let version_id = Ulid::from_str(&version_id).map_err(|_| ServerError::BadRequest)?;
     let origin = local_origin(&state.get_ctx(), version_id)
         .await

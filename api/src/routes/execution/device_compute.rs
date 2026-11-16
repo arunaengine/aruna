@@ -5,22 +5,21 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use aruna_core::id::NodeId;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{RemoteBinding, SyncRefusal};
 use aruna_operations::device::compute::{ComputeStatus, compute_status};
 use aruna_operations::device::publish_run::{
     PublishRunError, PublishRunInput, PublishedRun, local_run_crate, publish_run,
 };
 
-use crate::auth::require_owner;
+use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::execution::jobs::map_local_error;
 use crate::server::state::ServerState;
@@ -125,9 +124,8 @@ for.
 )]
 async fn get_device_compute(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
 ) -> ServerResult<Json<DeviceComputeResponse>> {
-    let auth = require_owner(&state, auth).await?;
     let status = compute_status(&state.get_ctx(), auth.user_id)
         .await
         .map_err(map_local_error)?;
@@ -257,11 +255,10 @@ for.
 )]
 async fn publish_device_run(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Path(job_id): Path<String>,
     Json(request): Json<PublishRunRequest>,
 ) -> ServerResult<Json<PublishRunResponse>> {
-    let auth = require_owner(&state, auth).await?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let node_id = NodeId::from_str(&request.node_id)
         .map_err(|_| ServerError::BadRequestReason("node_id is not a node id".to_string()))?;
@@ -316,10 +313,9 @@ for.
 )]
 async fn get_local_crate(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-    let auth = require_owner(&state, auth).await?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let jsonld = local_run_crate(&state.get_ctx(), job_id, auth.user_id)
         .await

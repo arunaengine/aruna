@@ -4,23 +4,21 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::wipe::{
     INCOMPLETE_EXIT_CODE, WIPED_EXIT_CODE, WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation,
 };
 use aruna_operations::driver::drive;
-
-use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(wipe_device))
@@ -92,10 +90,9 @@ for.
 )]
 async fn wipe_device(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Json(request): Json<WipeDeviceRequest>,
 ) -> ServerResult<(StatusCode, Json<WipeDeviceResponse>)> {
-    require_owner(&state, auth).await?;
     let wipe = state.device_wipe().ok_or(ServerError::NotFound)?.clone();
     let node_id = drive(
         WipeDeviceOperation::new(WipeDeviceConfig {

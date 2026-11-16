@@ -20,16 +20,17 @@ use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_compute::{
     SetComputeConfig, SetComputeError, SetComputeOperation,
 };
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::info::TelemetryState;
 use crate::server::state::ServerState;
@@ -285,10 +286,9 @@ fn map_config_error(error: GetConfigError) -> ServerError {
 
 async fn require_config_admin(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     permission: Permission,
 ) -> ServerResult<AuthContext> {
-    let auth = require_realm_auth(state, auth)?;
     ensure_permission(state, &auth, policy_admin_path(auth.realm_id), permission).await?;
     Ok(auth)
 }
@@ -349,7 +349,7 @@ async fn require_config_admin(
 )]
 pub async fn get_compute_config(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
 ) -> ServerResult<Json<ComputeConfigBody>> {
     let auth = require_config_admin(&state, auth, Permission::READ).await?;
     let config = drive(GetConfigOperation::new(auth.realm_id), &state.get_ctx())
@@ -437,7 +437,7 @@ node serves the call and every other node relays it to one.
                     "from": "us-east",
                     "to": "eu-west",
                     "bandwidth_bytes_per_sec": 62500000_i64
-                }
+                },
             ],
             "pessimistic_bandwidth_bytes_per_sec": 12500000_i64,
             "availability_stale_after_ms": 300000,
@@ -452,8 +452,8 @@ node serves the call and every other node relays it to one.
                     "quota": {
                         "max_jobs": 8,
                         "max_job_walltime_ms": 3600000
-                    }
-                }
+                    },
+                },
             ],
             "catch_up_after_ms": 300000,
             "session_idle_after_ms": 1800000
@@ -468,7 +468,7 @@ node serves the call and every other node relays it to one.
 )]
 pub async fn put_compute_config(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<ComputeConfigBody>,
 ) -> ServerResult<Json<ComputeConfigBody>> {
     // Request policies live at this boundary; the operation only checks roles.
@@ -587,7 +587,7 @@ fn map_compute_error(error: SetComputeError) -> ServerError {
 )]
 pub async fn get_compute_snapshots(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<SnapshotQuery>,
 ) -> ServerResult<Json<ComputeSnapshotsResponse>> {
     let auth = require_config_admin(&state, auth, Permission::READ).await?;
@@ -722,7 +722,7 @@ pub async fn get_compute_snapshots(
 )]
 pub async fn set_compute_drain(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<DrainRequest>,
 ) -> ServerResult<(StatusCode, Json<DrainResponse>)> {
     let auth = require_config_admin(&state, auth, Permission::WRITE).await?;

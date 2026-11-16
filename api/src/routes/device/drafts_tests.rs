@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{DeviceDraft, preview_draft};
+use crate::auth::OwnerAuth;
 use crate::error::ServerError;
 use crate::metadata::ProfilePreviewRequest;
 use crate::server::state::ServerState;
@@ -18,8 +19,8 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use axum::Json;
 use axum::extract::State;
-use axum::{Extension, Json};
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -95,7 +96,7 @@ async fn preview_refuses_group() {
 
     let result = preview_draft(
         State(state),
-        Extension(Some(auth)),
+        OwnerAuth(auth),
         Json(ProfilePreviewRequest {
             rocrate: serde_json::json!({
                 "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -115,7 +116,7 @@ async fn preview_marks_unchecked() {
     let (_dir, state, auth) = user_node().await;
     let file = format!("https://w3id.org/aruna/data/{}", "09".repeat(32));
     let (_, Json(preview)) = preview_draft(
-            State(state), Extension(Some(auth)), Json(ProfilePreviewRequest {
+            State(state), OwnerAuth(auth), Json(ProfilePreviewRequest {
                 rocrate: serde_json::json!({
                     "@context": "https://w3id.org/ro/crate/1.3/context",
                     "@graph": [

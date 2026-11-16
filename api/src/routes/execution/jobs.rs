@@ -48,6 +48,7 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -1057,10 +1058,9 @@ caller's own jobs.
 )]
 pub async fn list_jobs(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<ListJobsQuery>,
 ) -> ServerResult<(StatusCode, Json<JobListResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let limit = query
         .limit
@@ -1501,11 +1501,10 @@ the link's group, who may manage the link.
 )]
 pub async fn get_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     // A distributed external job is answered from the replicated family; every
     // other job keeps the owner-routed view.
@@ -1710,12 +1709,11 @@ answers 404.
 )]
 pub async fn get_job_report(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(job_id): Path<String>,
     Query(query): Query<ReportQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let cursor = decode_report_cursor(query.cursor.as_deref())?;
     if cursor
@@ -2178,10 +2176,9 @@ Self-scoped like the status read: only the submitter may delete, and anybody els
 )]
 pub async fn delete_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let outcome = delete_owned_run(&state.get_ctx(), &auth, job_id)
         .await
@@ -2280,11 +2277,10 @@ Self-scoped like the status read: only the submitter may cancel, and anybody els
 )]
 pub async fn cancel_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
 
     let outcome = cancel_job_routed(

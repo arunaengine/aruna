@@ -15,13 +15,14 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::OwnerAuth;
 use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
     ProfilePreviewRequest, ProfilePreviewResponse, ensure_metadata_scope, forwarded_auth_token,
 };
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_operations::device::delete_draft::{DeleteDraftError, DeleteDraftOperation};
 use aruna_operations::device::enqueue_draft::{
     EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation,
@@ -32,8 +33,6 @@ use aruna_operations::device::publish_queue::{PublishEntry, PublishState, token_
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::profile::validation::preview_submission;
 use aruna_operations::metadata::public_preview::restricted_files;
-
-use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -205,11 +204,10 @@ for.
 )]
 async fn queue_draft(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<QueueDraftRequest>,
 ) -> ServerResult<(StatusCode, Json<DeviceDraft>)> {
-    let auth = require_owner(&state, auth).await?;
     let issued_at = token_issued_at(forwarded_auth_token(bearer)?.as_ref());
     let group_id = parse_group_id(&request.group_id)?;
     let jsonld = rocrate_jsonld(&request.rocrate)?;
@@ -272,9 +270,8 @@ for.
 )]
 async fn list_drafts(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
 ) -> ServerResult<Json<DeviceDraftList>> {
-    require_owner(&state, auth).await?;
     let entries = drive(ListDraftsOperation::new(), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
@@ -316,10 +313,9 @@ for.
 )]
 async fn get_draft(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(draft_id): Path<String>,
 ) -> ServerResult<Json<DeviceDraft>> {
-    require_owner(&state, auth).await?;
     let draft_id = parse_draft_id(&draft_id)?;
     let entry = drive(InspectDraftOperation::new(draft_id), &state.get_ctx())
         .await
@@ -356,10 +352,9 @@ for.
 )]
 async fn delete_draft(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(draft_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    require_owner(&state, auth).await?;
     let draft_id = parse_draft_id(&draft_id)?;
     drive(DeleteDraftOperation::new(draft_id), &state.get_ctx())
         .await
@@ -413,10 +408,9 @@ for.
 )]
 async fn preview_draft(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Json(request): Json<ProfilePreviewRequest>,
 ) -> ServerResult<(StatusCode, Json<ProfilePreviewResponse>)> {
-    let auth = require_owner(&state, auth).await?;
     let group_id = request
         .group_id
         .as_deref()

@@ -25,11 +25,11 @@ use aruna_operations::s3::object::copy::{
     CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use futures_util::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -41,7 +41,8 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{blob_permission_path, ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{blob_permission_path, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::owned_session_job;
 use crate::routes::execution::jobs::{
@@ -432,10 +433,9 @@ like cancel: only the submitter, and anybody else's job answers 404.
 )]
 pub async fn get_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
         .map_err(ServerError::from)?;
@@ -477,12 +477,11 @@ like cancel.
 )]
 pub async fn stream_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Query(query): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
         .map_err(ServerError::from)?;
@@ -637,11 +636,10 @@ like cancel.
 )]
 pub async fn submit_cell(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Json(request): Json<SubmitCellRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
         .map_err(ServerError::from)?;
@@ -686,10 +684,9 @@ like cancel.
 )]
 pub async fn interrupt_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
         .map_err(ServerError::from)?;
@@ -735,10 +732,9 @@ like cancel.
 )]
 pub async fn end_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
         .map_err(ServerError::from)?;
@@ -799,11 +795,10 @@ like cancel, and each source additionally needs the caller's read permission on 
 )]
 pub async fn stage_inputs(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Json(request): Json<SessionInputsRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
         .map_err(ServerError::from)?;
@@ -1129,11 +1124,10 @@ like cancel.
 )]
 pub async fn list_scratch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Query(query): Query<ScratchQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
         .map_err(ServerError::from)?;
@@ -1182,11 +1176,10 @@ like cancel.
 )]
 pub async fn read_scratch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Query(query): Query<ScratchReadQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
         .map_err(ServerError::from)?;
