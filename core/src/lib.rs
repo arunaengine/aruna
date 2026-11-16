@@ -35,6 +35,8 @@ pub mod metrics;
 pub mod node_vault;
 pub mod onboarding;
 pub mod operation;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod operation_check;
 pub mod password;
 pub mod permission_path;
 pub mod plugin_installs;

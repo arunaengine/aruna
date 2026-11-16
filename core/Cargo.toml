@@ -10,6 +10,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Shared operation test helpers; only other crates' dev-dependencies enable it.
+test-hooks = []
+
 [dependencies]
 aruna-kpabe = { workspace = true }
 bytes = { workspace = true }

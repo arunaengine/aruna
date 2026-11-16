@@ -74,6 +74,7 @@ reqwest = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+aruna-core = { workspace = true, features = ["test-hooks"] }
 axum = { workspace = true }
 flate2 = { workspace = true }
 proptest = { workspace = true }
