@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::S3SessionError;
+use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -214,11 +215,7 @@ impl Operation for TouchS3Operation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        abort_effects(&mut self.txn_id)
     }
 
     fn expected_error(error: &Self::Error) -> bool {

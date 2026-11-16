@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::index::{decode_index, encode_index, owner_key, token_deletes, token_scan};
+use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -307,11 +308,7 @@ impl Operation for RevokeUserOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        abort_effects(&mut self.txn_id)
     }
 }
 

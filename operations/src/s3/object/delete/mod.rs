@@ -19,6 +19,7 @@ use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::row_fence::{FenceError, RowFence};
 use aruna_core::UserId;
+use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -1412,11 +1413,7 @@ impl Operation for DeleteObjectOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        abort_effects(&mut self.txn_id)
     }
 }
 

@@ -8,6 +8,7 @@ use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, finish_pending_check,
     location_from_read, multipart_summary_read,
 };
+use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -552,11 +553,7 @@ impl Operation for GetAttributesOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        abort_effects(&mut self.txn_id)
     }
 }
 

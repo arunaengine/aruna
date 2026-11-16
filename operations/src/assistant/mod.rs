@@ -113,14 +113,6 @@ fn commit(txn_id: TxnId) -> Effects {
     smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
 }
 
-fn abort_effects(txn_id: &mut Option<TxnId>) -> Effects {
-    txn_id
-        .take()
-        .map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum ChatStoreError {
     #[error(transparent)]

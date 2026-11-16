@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -66,14 +67,6 @@ fn decode_usage(value: Option<&Value>) -> Result<Option<AssistantUsage>, Convers
     value
         .map(|bytes| AssistantUsage::from_bytes(bytes.as_ref()))
         .transpose()
-}
-
-fn abort_txn(txn_id: &mut Option<TxnId>) -> Effects {
-    txn_id
-        .take()
-        .map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
 }
 
 /// The central provider, if set up, and the caller's usage row.
@@ -280,7 +273,7 @@ impl Operation for SetCentralOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        abort_txn(&mut self.txn_id)
+        abort_effects(&mut self.txn_id)
     }
 }
 
@@ -394,7 +387,7 @@ impl Operation for ChargeUsageOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        abort_txn(&mut self.txn_id)
+        abort_effects(&mut self.txn_id)
     }
 }
 

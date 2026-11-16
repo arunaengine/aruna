@@ -1135,6 +1135,15 @@ pub enum StreamEffect {
     Close { stream_id: u64 },
 }
 
+/// The abort of an open storage transaction, which `take` leaves closed; none without one.
+pub fn abort_effects(txn_id: &mut Option<crate::types::TxnId>) -> crate::types::Effects {
+    txn_id
+        .take()
+        .map_or_else(smallvec::SmallVec::new, |txn_id| {
+            smallvec::smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

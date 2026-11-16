@@ -7,6 +7,7 @@ use crate::auth::revoke_token::{
 };
 use aruna_core::UserId;
 use aruna_core::auth::{user_cutoff_expiry, user_cutoff_hash};
+use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -323,11 +324,7 @@ impl Operation for RevokeSessionOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        abort_effects(&mut self.txn_id)
     }
 
     fn expected_error(error: &Self::Error) -> bool {

@@ -8,6 +8,7 @@ use super::{
 };
 use aruna_core::UserId;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
+use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
@@ -362,11 +363,7 @@ impl Operation for CreateS3Operation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        abort_effects(&mut self.txn_id)
     }
 
     fn expected_error(error: &Self::Error) -> bool {
