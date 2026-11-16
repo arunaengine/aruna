@@ -10,8 +10,8 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::share::{ShareLink, ShareTarget, TicketBody};
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
-use aruna_operations::distribution::guard::bound_view;
 use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content, resolve_version};
+use aruna_operations::distribution::routing::bound_view;
 use aruna_operations::distribution::status::read_view;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{

@@ -33,6 +33,7 @@ pub mod refill;
 mod refresh;
 pub mod resolve;
 pub mod roots;
+pub mod routing;
 pub mod sharding;
 pub mod source_keep;
 pub mod split;

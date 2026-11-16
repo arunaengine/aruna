@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::distribution::DistributionBinding;
-use aruna_operations::distribution::guard::bound_view;
+use aruna_operations::distribution::routing::bound_view;
 use serde::{Deserialize, Serialize};
 
 use super::{BulkRunRequest, BulkRunResponse, CoverageQuery, CoverageResponse};

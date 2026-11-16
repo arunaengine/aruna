@@ -32,7 +32,7 @@ use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_operations::auth::permission_rules::permission_rules;
 use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};
-use aruna_operations::distribution::guard::{bound_view, route_read};
+use aruna_operations::distribution::routing::{bound_view, route_read};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;

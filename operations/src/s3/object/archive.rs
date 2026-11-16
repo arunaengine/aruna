@@ -23,7 +23,7 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::distribution::guard::route_read;
+use crate::distribution::routing::route_read;
 use crate::driver::drive;
 use crate::jobs::export::{safe_zip_path, zip_entry};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
