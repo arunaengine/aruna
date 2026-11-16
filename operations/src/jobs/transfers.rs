@@ -37,7 +37,7 @@ use crate::plugins::install::{pick_version, read_manifest};
 use crate::plugins::marks::unmarked;
 use crate::plugins::outgoing::{outgoing, release_into};
 use crate::plugins::release::ReleaseKeys;
-use crate::plugins::work::{Send, WorkRow, begin_send, record_sent, update_work};
+use crate::plugins::work::{Send, WorkRow, begin_send, record_sent, retried, update_work};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
@@ -388,7 +388,7 @@ fn sent(status: u16, again: bool, (size, version): (u64, Ulid)) -> JobRunOutcome
             bytes: size,
             version_id: Some(version),
         }),
-        408 | 429 | 500..=599 if again => retryable(format!("the service answered {status}")),
+        _ if again && retried(status) => retryable(format!("the service answered {status}")),
         _ => permanent(format!("the service answered {status}")),
     }
 }

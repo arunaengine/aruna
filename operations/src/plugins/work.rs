@@ -331,8 +331,8 @@ pub async fn dispatched(
     .await
 }
 
-/// Moves the send boundary of work `work_id` before an attempt sends, in one transaction. A request
-/// that may be sent twice (`again`) always sends; any other never follows an earlier `Sending`.
+/// Moves the send boundary of work `work_id` before an attempt sends, in one transaction, unless
+/// the boundary earlier attempts left decides already.
 pub async fn begin_send(
     ctx: &DriverContext,
     (install_id, work_id): (Ulid, Ulid),
@@ -342,12 +342,10 @@ pub async fn begin_send(
         let Some((key, mut row)) = read_in(txn, install_id, work_id).await? else {
             return Ok(None);
         };
+        if let Some(decided) = decided(row.boundary.as_ref(), again) {
+            return Ok(Some(decided));
+        }
         let attempt = match &row.boundary {
-            Some(SendBoundary::Sent { status, reply }) if !again => {
-                let (status, reply) = (*status, reply.clone());
-                return Ok(Some(Send::Answered { status, reply }));
-            }
-            Some(SendBoundary::Sending { .. }) if !again => return Ok(Some(Send::Undecided)),
             Some(SendBoundary::Sending { attempt }) => attempt + 1,
             _ => 1,
         };
@@ -357,6 +355,25 @@ pub async fn begin_send(
         Ok(Some(Send::Now))
     })
     .await
+}
+
+/// What a boundary decides without a new request: a kept answer, unless it asks a request that may
+/// go twice (`again`) to try later, and a begun request that may not go twice. `None` sends.
+fn decided(boundary: Option<&SendBoundary>, again: bool) -> Option<Send> {
+    match boundary {
+        Some(SendBoundary::Sent { status, .. }) if again && retried(*status) => None,
+        Some(SendBoundary::Sent { status, reply }) => Some(Send::Answered {
+            status: *status,
+            reply: reply.clone(),
+        }),
+        Some(SendBoundary::Sending { .. }) if !again => Some(Send::Undecided),
+        _ => None,
+    }
+}
+
+/// Whether an answer asks to try again later: a timeout, a throttle or a server error.
+pub fn retried(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500..=599)
 }
 
 /// Keeps the answer of a sent request: its status and its reply as exposed now.

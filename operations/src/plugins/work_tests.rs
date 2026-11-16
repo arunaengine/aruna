@@ -415,7 +415,7 @@ async fn removal_keeps_finished() {
 async fn boundary_sends_once() {
     // A request that may not go twice is sent by the first attempt only; one that finds the
     // boundary left open stays undecided, one that finds the answer decides by it. A request
-    // that may go twice always sends again.
+    // that may go twice sends again until it has an answer.
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);

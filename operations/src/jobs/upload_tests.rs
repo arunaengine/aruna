@@ -334,3 +334,18 @@ async fn dropped_answer() {
     let (_, post) = recorded(&fixture, &install, (&base, "POST")).await;
     assert_eq!(name(&run_plugin_work(&ctx, &post).await).0, "undecided");
 }
+
+#[tokio::test]
+async fn put_answer_reused() {
+    // A PUT whose answer was kept decides a rerun by it, without a second request.
+    let fixture = Fixture::new().await;
+    let install = uploader(&fixture).await;
+    let (_root, blob) = ready(&fixture, &install).await;
+    let (base, seen) = server(201).await;
+    let (_, spec) = recorded(&fixture, &install, (&base, "PUT")).await;
+    let ctx = job_context(&blob, &fixture);
+    for _ in 0..2 {
+        assert_eq!(name(&run_plugin_work(&ctx, &spec).await).0, "succeeded");
+    }
+    assert_eq!(seen.hits.load(Ordering::SeqCst), 1);
+}
