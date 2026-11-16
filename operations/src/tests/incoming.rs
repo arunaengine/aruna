@@ -32,7 +32,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::jobs::runtime::JobsRuntime;
-use crate::sync::document_outbox::write_outbox_effect;
+use crate::sync::outbox_record::write_outbox_effect;
 use crate::tasks::incoming::OperationsTaskHandler;
 use aruna_tasks::InboundTaskHandler;
 
@@ -158,7 +158,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
         .await
         .expect("shared topic genesis");
     for index in 1..=2u128 {
-        let record = crate::sync::document_outbox::new_identified_record(
+        let record = crate::sync::outbox_record::new_identified_record(
             Ulid::from_parts(1, index),
             node(1),
             target.clone(),

@@ -29,10 +29,10 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::placement::target_placement_ref;
-use crate::sync::document_outbox::{
+use crate::sync::outbox_record::{admin_outbox_prefix, revocation_index_entry};
+use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
-use crate::sync::outbox_record::{admin_outbox_prefix, revocation_index_entry};
 
 const PRIVILEGED_REVOCATION_RESERVE: usize = 128;
 const REVOCATION_CAP: usize = REVOCATIONS_PER_ORIGIN - PRIVILEGED_REVOCATION_RESERVE;

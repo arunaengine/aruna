@@ -37,7 +37,7 @@ use crate::replication::protocol::{
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
-use crate::sync::document_outbox::{
+use crate::sync::outbox_record::{
     new_identified_record, schedule_drain_effect, write_outbox_effect,
 };
 use crate::tasks::queue_backoff::retry_delay_ms;

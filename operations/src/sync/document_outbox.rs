@@ -1,18 +1,15 @@
-//! Builds sync outbox keys and records and schedules drains of pending publishes.
+//! Reads, deletes and retimes the document sync outbox records waiting for publication.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
-use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::document::DocumentOutboxRecord;
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
-use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_secs;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::types::Value;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
@@ -21,121 +18,6 @@ use tracing::warn;
 use crate::sync::outbox_record::{
     ADMIN_OUTBOX_PREFIX, outbox_stream_prefixes, revocation_index_key,
 };
-use ulid::Ulid;
-
-pub fn new_outbox_record(
-    node_id: NodeId,
-    target: DocumentTarget,
-    peers: Vec<NodeId>,
-    event: DocumentOutboxEvent,
-    admin_placement: PlacementRef,
-    allow_genesis: bool,
-) -> DocumentOutboxRecord {
-    new_identified_record(
-        Ulid::generate(),
-        node_id,
-        target,
-        peers,
-        event,
-        admin_placement,
-        allow_genesis,
-    )
-}
-
-/// `admin_placement` is only consulted for `AdminOperation` records (which carry
-/// no envelope change); `Upsert`/`Delete` always take their ref from the event's
-/// change so the record and its envelope can never diverge.
-pub fn new_identified_record(
-    outbox_id: Ulid,
-    node_id: NodeId,
-    target: DocumentTarget,
-    mut peers: Vec<NodeId>,
-    event: DocumentOutboxEvent,
-    admin_placement: PlacementRef,
-    allow_genesis: bool,
-) -> DocumentOutboxRecord {
-    crate::sync::shard_placement::sort_node_ids(&mut peers);
-    let placement = match &event {
-        DocumentOutboxEvent::Upsert { change, .. } | DocumentOutboxEvent::Delete { change } => {
-            change.placement
-        }
-        DocumentOutboxEvent::AdminOperation { .. } => admin_placement,
-    };
-    DocumentOutboxRecord {
-        outbox_id,
-        node_id,
-        target,
-        peers,
-        event,
-        placement,
-        // Unfenced by default; a fence-admitted writer stamps its generation.
-        generation: 0,
-        updated_at: unix_timestamp_secs(),
-        allow_genesis,
-    }
-}
-
-pub fn write_outbox_effect(record: &DocumentOutboxRecord) -> Result<Effect, postcard::Error> {
-    write_transaction_effect(record, None)
-}
-
-#[cfg(debug_assertions)]
-fn record_ledger(record: &DocumentOutboxRecord, key: &[u8], value: &[u8]) {
-    use std::io::Write;
-    use std::sync::{Mutex, OnceLock};
-
-    let Some(path) = std::env::var_os("ARUNA_TEST_OUTBOX_LEDGER") else {
-        return;
-    };
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let Ok(_guard) = LOCK.get_or_init(|| Mutex::new(())).lock() else {
-        return;
-    };
-    let key_hash = blake3::hash(key).to_hex();
-    let value_hash = blake3::hash(value).to_hex();
-    let line = format!(
-        "target={:?} key_hash={key_hash} value_hash={value_hash}\n",
-        record.target
-    );
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(std::path::PathBuf::from(path))
-    else {
-        return;
-    };
-    let _ = file.write_all(line.as_bytes());
-}
-
-pub fn outbox_write_entry(
-    record: &DocumentOutboxRecord,
-) -> Result<(String, ByteView, ByteView), postcard::Error> {
-    let key = outbox_key(record);
-    let value = ByteView::from(postcard::to_allocvec(record)?);
-    #[cfg(debug_assertions)]
-    record_ledger(record, key.as_ref(), value.as_ref());
-    Ok((SYNC_OUTBOX_KEYSPACE.to_string(), key, value))
-}
-
-pub fn write_transaction_effect(
-    record: &DocumentOutboxRecord,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, postcard::Error> {
-    let (key_space, key, value) = outbox_write_entry(record)?;
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space,
-        key,
-        value,
-        txn_id,
-    }))
-}
-
-pub fn schedule_drain_effect() -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainSyncOutbox,
-        after: Duration::ZERO,
-    })
-}
 
 pub async fn read_outbox_record(
     storage: &StorageHandle,
@@ -357,16 +239,22 @@ mod tests {
     use crate::sync::outbox_record::{
         OUTBOX_DRAIN_SIZE, admin_outbox_prefix, outbox_key, outbox_prefix, revocation_index_entry,
     };
+    use crate::sync::outbox_record::{
+        new_identified_record, new_outbox_record, write_outbox_effect,
+    };
+    use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
+    use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
     use aruna_core::handle::Handle;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use tempfile::tempdir;
+    use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];

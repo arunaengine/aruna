@@ -30,7 +30,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::placement::target_placement_ref;
 use crate::realm::assign_role::should_seed_role;
 use crate::realm::mutate_placement::is_management;
-use crate::sync::document_outbox::{
+use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 

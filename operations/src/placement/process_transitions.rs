@@ -1132,7 +1132,7 @@ mod tests {
             kind: aruna_core::document::DocumentChangeKind::Delete,
             placement,
         };
-        let record = crate::sync::document_outbox::new_identified_record(
+        let record = crate::sync::outbox_record::new_identified_record(
             Ulid::from_bytes([seed; 16]),
             node(1),
             DocumentTarget::MetadataDocumentLifecycle {
@@ -1145,7 +1145,7 @@ mod tests {
         )
         .fenced_at(generation);
         let (key_space, key, value) =
-            crate::sync::document_outbox::outbox_write_entry(&record).expect("the row encodes");
+            crate::sync::outbox_record::outbox_write_entry(&record).expect("the row encodes");
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {

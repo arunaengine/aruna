@@ -228,7 +228,7 @@ pub fn create_outbox_entries(
         postcard::to_allocvec(audit)?.into(),
     ));
     if let Some(outbox) = outbox {
-        writes.push(crate::sync::document_outbox::outbox_write_entry(outbox)?);
+        writes.push(crate::sync::outbox_record::outbox_write_entry(outbox)?);
         if let Some((lifecycle, change)) = outbox_lifecycle_upsert(outbox)? {
             writes.push(lifecycle_revision_entry(
                 &lifecycle,

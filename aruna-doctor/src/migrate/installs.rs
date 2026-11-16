@@ -325,7 +325,7 @@ mod tests {
         use aruna_core::document::DocumentTarget;
         use aruna_core::structs::identity::auth::Actor;
         use aruna_core::structs::placement::record::PlacementRef;
-        use aruna_operations::sync::document_outbox::new_outbox_record;
+        use aruna_operations::sync::outbox_record::new_outbox_record;
         let realm_id = RealmId::from_bytes([3; 32]);
         let origin = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let stored = postcard::to_allocvec(&old_install(4, realm_id)).unwrap();

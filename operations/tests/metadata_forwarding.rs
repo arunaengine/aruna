@@ -62,11 +62,10 @@ use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
-use aruna_operations::sync::document_outbox::{
-    new_outbox_record, read_outbox_record, write_outbox_effect,
-};
+use aruna_operations::sync::document_outbox::read_outbox_record;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::sync::outbox_record::outbox_key;
+use aruna_operations::sync::outbox_record::{new_outbox_record, write_outbox_effect};
 use aruna_operations::tasks::incoming::{OutboxDrainer, start_task_queues};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;

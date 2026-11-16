@@ -28,7 +28,7 @@ use ulid::Ulid;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
-use crate::sync::document_outbox::{
+use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::users::service_account::group_admin_path;

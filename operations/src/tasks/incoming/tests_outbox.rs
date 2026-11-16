@@ -221,7 +221,7 @@ async fn topic_page_blocks() {
     net.ensure_sync_topics(&[healthy_topic], Vec::new())
         .await
         .expect("healthy topic genesis");
-    let blocked = crate::sync::document_outbox::new_identified_record(
+    let blocked = crate::sync::outbox_record::new_identified_record(
         Ulid::from_parts(1, 1),
         node(1),
         blocked_target,
@@ -233,7 +233,7 @@ async fn topic_page_blocks() {
         aruna_core::structs::placement::record::PlacementRef::NIL,
         true,
     );
-    let healthy = crate::sync::document_outbox::new_identified_record(
+    let healthy = crate::sync::outbox_record::new_identified_record(
         Ulid::from_parts(1, 2),
         node(1),
         healthy_target,
@@ -767,7 +767,7 @@ async fn blocked_keeps_backoff() {
         strategy_id: Ulid::from_bytes([48; 16]),
         shard: 1,
     };
-    let record = crate::sync::document_outbox::new_outbox_record(
+    let record = crate::sync::outbox_record::new_outbox_record(
         node(1),
         target(),
         Vec::new(),
@@ -847,7 +847,7 @@ async fn deferred_head_paginates() {
     };
     let mut writes = Vec::with_capacity(OUTBOX_DRAIN_SIZE + 1);
     for index in 0..OUTBOX_DRAIN_SIZE {
-        let record = crate::sync::document_outbox::new_identified_record(
+        let record = crate::sync::outbox_record::new_identified_record(
             Ulid::from_parts(1, index as u128),
             node(1),
             deferred_target.clone(),
@@ -859,13 +859,12 @@ async fn deferred_head_paginates() {
             aruna_core::structs::placement::record::PlacementRef::NIL,
             false,
         );
-        writes
-            .push(crate::sync::document_outbox::outbox_write_entry(&record).expect("outbox entry"));
+        writes.push(crate::sync::outbox_record::outbox_write_entry(&record).expect("outbox entry"));
     }
 
     // One later origin record for a shared (non-shard) topic, ordered
     // strictly after the head page, so only pagination reaches it.
-    let publish_record = crate::sync::document_outbox::new_identified_record(
+    let publish_record = crate::sync::outbox_record::new_identified_record(
         Ulid::from_parts(2, 0),
         node(1),
         DocumentTarget::RealmAuthorization { realm_id },
@@ -878,7 +877,7 @@ async fn deferred_head_paginates() {
         true,
     );
     let publish_key = outbox_key(&publish_record).to_vec();
-    writes.push(crate::sync::document_outbox::outbox_write_entry(&publish_record).expect("entry"));
+    writes.push(crate::sync::outbox_record::outbox_write_entry(&publish_record).expect("entry"));
 
     match storage
         .send_effect(Effect::Storage(StorageEffect::BatchWrite {
@@ -986,7 +985,7 @@ async fn rotation_streak() {
     );
     let total = u128::from(OUTBOX_CONTINUATION_STREAK) + 2;
     for index in 1..=total {
-        let record = crate::sync::document_outbox::new_identified_record(
+        let record = crate::sync::outbox_record::new_identified_record(
             Ulid::from_parts(1, index),
             node(1),
             target.clone(),
@@ -1117,7 +1116,7 @@ async fn draining_a_topics() {
         "the rank-0 shard topic must not exist before the config change is drained"
     );
 
-    let record = crate::sync::document_outbox::new_outbox_record(
+    let record = crate::sync::outbox_record::new_outbox_record(
         net.node_id(),
         DocumentTarget::RealmConfig { realm_id },
         Vec::new(),
@@ -1130,7 +1129,7 @@ async fn draining_a_topics() {
     );
     write_outbox_record(&storage, &record).await;
     task_handle
-        .send_effect(crate::sync::document_outbox::schedule_drain_effect())
+        .send_effect(crate::sync::outbox_record::schedule_drain_effect())
         .await;
 
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -1174,7 +1173,7 @@ async fn retry_publishes_once() {
     net.refresh_document_peers(&config)
         .await
         .expect("refresh peers");
-    let record = crate::sync::document_outbox::new_outbox_record(
+    let record = crate::sync::outbox_record::new_outbox_record(
         net.node_id(),
         DocumentTarget::RealmConfig { realm_id },
         Vec::new(),
@@ -1255,7 +1254,7 @@ async fn config_setup() -> ConfigHarness {
         .expect("shared topic genesis");
     let mut shard_change = change();
     shard_change.placement = placement;
-    let shared = crate::sync::document_outbox::new_identified_record(
+    let shared = crate::sync::outbox_record::new_identified_record(
         Ulid::from_parts(1, 1),
         node(1),
         shared_target,
@@ -1267,7 +1266,7 @@ async fn config_setup() -> ConfigHarness {
         aruna_core::structs::placement::record::PlacementRef::NIL,
         true,
     );
-    let shard = crate::sync::document_outbox::new_identified_record(
+    let shard = crate::sync::outbox_record::new_identified_record(
         Ulid::from_parts(1, 2),
         node(1),
         shard_target.clone(),
@@ -1402,7 +1401,7 @@ async fn pull_reaches_holder() {
 
     let mut change = change();
     change.placement = placement;
-    let record = crate::sync::document_outbox::new_outbox_record(
+    let record = crate::sync::outbox_record::new_outbox_record(
         net.node_id(),
         target,
         vec![ex_holder.node_id()],
@@ -1468,7 +1467,7 @@ fn admin_outbox(
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     let user_id = aruna_core::UserId::nil(realm_id);
-    crate::sync::document_outbox::new_outbox_record(
+    crate::sync::outbox_record::new_outbox_record(
         node(1),
         target,
         Vec::new(),
@@ -1512,7 +1511,7 @@ fn shard_change(seed: u8) -> DocumentChange {
 }
 
 fn shard_topic_record(origin_seq: u64) -> DocumentOutboxRecord {
-    crate::sync::document_outbox::new_outbox_record(
+    crate::sync::outbox_record::new_outbox_record(
         node(1),
         target(),
         vec![node(2)],
@@ -1580,7 +1579,7 @@ impl BoundaryHarness {
         target: DocumentTarget,
         event: DocumentOutboxEvent,
     ) -> DocumentOutboxRecord {
-        crate::sync::document_outbox::new_identified_record(
+        crate::sync::outbox_record::new_identified_record(
             Ulid::from_parts(1, id),
             node(1),
             target,

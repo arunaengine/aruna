@@ -105,7 +105,7 @@ mod tests {
         IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier,
     };
     use aruna_core::structs::{PersistentIdMapping, PersistentIdRevision, persistent_id_change};
-    use aruna_operations::sync::document_outbox::new_outbox_record;
+    use aruna_operations::sync::outbox_record::new_outbox_record;
     use tempfile::tempdir;
     use ulid::Ulid;
 

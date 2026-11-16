@@ -45,7 +45,7 @@ use tracing::info;
 use self::stage::Batch;
 use crate::auth::revoke_token::{RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation};
 use crate::federation::link::fresh_local;
-use crate::sync::document_outbox::schedule_drain_effect;
+use crate::sync::outbox_record::schedule_drain_effect;
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 
 /// What the realm config records about the one node that runs account merges.

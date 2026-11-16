@@ -31,7 +31,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::metadata::protocol::MetadataReadError;
-use crate::sync::document_outbox::{
+use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 

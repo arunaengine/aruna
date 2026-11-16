@@ -27,7 +27,7 @@ use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::target_placement_ref;
-use crate::sync::document_outbox::{
+use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 

@@ -26,7 +26,7 @@ use smallvec::smallvec;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::placement::target_placement_ref;
 use crate::realm::ensure_config::overlay_reducer_state;
-use crate::sync::document_outbox::schedule_drain_effect;
+use crate::sync::outbox_record::schedule_drain_effect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HandoffConfig {

@@ -21,7 +21,7 @@ use byteview::ByteView;
 use std::collections::HashMap;
 
 use crate::placement::fence::WriteFence;
-use crate::sync::document_outbox::{new_identified_record, outbox_write_entry};
+use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
 
 /// One document's reducer before and after the merge, with the events it emitted.
 #[derive(Debug)]

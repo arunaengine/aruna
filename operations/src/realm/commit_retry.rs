@@ -15,7 +15,7 @@ use std::time::Duration;
 use ulid::Ulid;
 
 use crate::realm::mutate_placement::node_kind;
-use crate::sync::document_outbox::schedule_drain_effect;
+use crate::sync::outbox_record::schedule_drain_effect;
 
 /// What another writer commits between the two attempts.
 const ELSEWHERE: &str = "changed elsewhere";

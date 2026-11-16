@@ -31,7 +31,7 @@ use super::link_queue::ACTIVE_RETRY_MS;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::persistent_id::{MappingRoute, mapping_route};
 use crate::placement::fence;
-use crate::sync::document_outbox::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 
 const LINK_PAGE: usize = 256;
 /// How long a pull check waits for a running pull before it looks again.

@@ -25,7 +25,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
-use crate::sync::document_outbox::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 
 /// One change a user makes to their own vault records.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

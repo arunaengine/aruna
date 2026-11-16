@@ -10,7 +10,7 @@ async fn restore_document_records() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    let record = crate::sync::document_outbox::new_outbox_record(
+    let record = crate::sync::outbox_record::new_outbox_record(
         node(1),
         target(),
         vec![node(2)],
@@ -34,7 +34,7 @@ async fn restore_document_timer() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    let record = crate::sync::document_outbox::new_outbox_record(
+    let record = crate::sync::outbox_record::new_outbox_record(
         node(1),
         target(),
         vec![node(2)],
@@ -153,7 +153,7 @@ async fn drain_keeps_timer() {
     let temp_dir = tempdir().expect("temp dir");
     let storage = FjallStorage::open(temp_dir.path().to_str().expect("storage opens"))
         .expect("storage opens");
-    let record = crate::sync::document_outbox::new_outbox_record(
+    let record = crate::sync::outbox_record::new_outbox_record(
         node(1),
         target(),
         vec![node(2)],
@@ -221,7 +221,7 @@ async fn outbox_sync_retry() {
         compute_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let record = crate::sync::document_outbox::new_outbox_record(
+    let record = crate::sync::outbox_record::new_outbox_record(
         node(1),
         target(),
         vec![node(2)],
@@ -270,7 +270,7 @@ async fn retained_outbox_timer() {
         compute_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let record = crate::sync::document_outbox::new_outbox_record(
+    let record = crate::sync::outbox_record::new_outbox_record(
         node(1),
         target(),
         vec![node(2)],

@@ -1074,7 +1074,7 @@ async fn seed_outbox(
         let mut writes = Vec::with_capacity(1_024);
         for index in chunk_start..(chunk_start + 1_024).min(record_count) {
             let record = incident_record(realm_id, local, target, placement, holders, index)?;
-            writes.push(aruna_operations::sync::document_outbox::outbox_write_entry(
+            writes.push(aruna_operations::sync::outbox_record::outbox_write_entry(
                 &record,
             )?);
         }
@@ -1136,7 +1136,7 @@ fn incident_record(
     };
     let registry = incident_registry(realm_id, target, placement, holders, index)?;
     Ok(
-        aruna_operations::sync::document_outbox::new_identified_record(
+        aruna_operations::sync::outbox_record::new_identified_record(
             Ulid::from_parts(1, index as u128),
             local,
             target.clone(),
@@ -1177,7 +1177,7 @@ fn incident_delete(
         graph_iri: format!("https://aruna.example/incident/graph/{index}"),
     };
     Ok(
-        aruna_operations::sync::document_outbox::new_identified_record(
+        aruna_operations::sync::outbox_record::new_identified_record(
             Ulid::from_parts(1, index as u128),
             local,
             target,

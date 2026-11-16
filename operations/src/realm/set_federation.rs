@@ -34,7 +34,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::federation::publish::PUBLISH_SOON;
 use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
-use crate::sync::document_outbox::{
+use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 

@@ -33,7 +33,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::document_repository;
-use crate::sync::document_outbox::{new_outbox_record, schedule_drain_effect, write_outbox_effect};
+use crate::sync::outbox_record::{new_outbox_record, schedule_drain_effect, write_outbox_effect};
 
 const USER_PAGE_SIZE: usize = 256;
 

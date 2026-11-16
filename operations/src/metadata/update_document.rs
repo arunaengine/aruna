@@ -51,7 +51,7 @@ use crate::metadata::projector::{create_outbox_record, registry_outbox_record};
 use crate::metadata::repository::{
     StorageReadError, event_projection_entries, parse_registry_read, read_registry_effect,
 };
-use crate::sync::document_outbox::{outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox_record::{outbox_write_entry, schedule_drain_effect};
 use crate::sync::shard_placement::sort_node_ids;
 
 const RAW_EVENT_LIMIT: usize = EVENT_LIMIT as usize;

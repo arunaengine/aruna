@@ -24,7 +24,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::sync::document_outbox::{
+use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
