@@ -54,14 +54,13 @@ use self::fanout::{
     run_metadata_fanout,
 };
 pub use self::fanout::{lookup_identifier_distributed, search_buckets_distributed};
+use self::list::{load_group_records, load_pending_records};
 #[cfg(test)]
-use self::list::{
+use self::list_types::{
     ANONYMOUS_METADATA_LIMIT, ESTIMATE_MIN_LIMIT, LIST_METADATA_LIMIT, MAX_METADATA_LIMIT,
     effective_list_limit,
 };
-use self::list::{
-    check_policy_limit, load_group_records, load_pending_records, merge_pending_records,
-};
+use self::list_types::{check_policy_limit, merge_pending_records};
 pub(crate) use self::path::local_path_candidates;
 use self::path::select_fanout_nodes;
 pub use self::path::{deduplicate_fanout_nodes, replica_query_nodes};
@@ -121,6 +120,7 @@ mod fanout;
 mod join;
 mod links;
 mod list;
+mod list_types;
 mod path;
 mod preflight;
 mod read;
@@ -141,9 +141,9 @@ pub use self::links::{
     links_local, merge_pages, merge_previews, part_of, resolve_part, set_preview_distributed,
     set_preview_local,
 };
-pub use self::list::{
+pub use self::list::list_visible_documents;
+pub use self::list_types::{
     ListVisibleRequest, ListVisibleResult, ListedMetadataDocument, MetadataListOrder,
-    list_visible_documents,
 };
 pub(crate) use self::path::resolve_local_path;
 pub use self::path::{MetadataLookupRequest, MetadataLookupResult, lookup_metadata_path};
