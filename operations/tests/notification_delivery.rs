@@ -44,6 +44,7 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::convergence;
+use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use convergence::wait_for_convergence;
 
@@ -103,7 +104,7 @@ async fn delivery_retries_outage() -> Result<(), Box<dyn std::error::Error>> {
     nodes.push(spawn_with_secret(realm_id, secrets[0]).await?);
     nodes.push(spawn_with_secret(realm_id, secrets[1]).await?);
     nodes.push(respawn_with_storage(realm_id, secrets[2], holder_storage.clone()).await?);
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
     install_realm_config(&nodes, realm_id).await?;
 
     let config = realm_config_for(&nodes, realm_id);
@@ -131,7 +132,7 @@ async fn delivery_retries_outage() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     nodes[2] = respawn_with_storage(realm_id, secrets[2], holder_storage.clone()).await?;
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
     install_realm_config(&nodes, realm_id).await?;
     drain_notification_outbox(nodes[0].context.clone()).await;
 
@@ -468,24 +469,9 @@ async fn build_realm_nodes(
     for _ in 0..count {
         nodes.push(spawn_node(*realm_id).await?);
     }
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
     install_realm_config(&nodes, *realm_id).await?;
     Ok(nodes)
-}
-
-async fn mesh_nodes(nodes: &[TestNode]) {
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
-        }
-    }
 }
 
 async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
@@ -651,7 +637,7 @@ impl SettingRealm {
             let node = realm.start(index).await?;
             realm.nodes.push(node);
         }
-        mesh_nodes(&realm.nodes).await;
+        mesh(realm.nodes.iter().map(|node| &node.net)).await;
         install_config(&realm.nodes, &realm.config()).await?;
         // Onboarding admits every infrastructure node to the shared realm topics; here S mints
         // the topic and the managers pull it from S.

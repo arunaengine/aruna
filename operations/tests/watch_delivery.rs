@@ -52,6 +52,7 @@ use ulid::Ulid;
 
 use crate::convergence;
 use crate::topology::local_net;
+use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use convergence::wait_for_convergence;
 
@@ -820,26 +821,11 @@ async fn build_realm_nodes(
     for _ in 0..count {
         nodes.push(spawn_node(*realm_id).await?);
     }
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
     install_realm_config(&nodes, *realm_id).await?;
     // Mirror production core-document announcement for every node.
     bootstrap_interest_topic(&nodes, *realm_id).await?;
     Ok(nodes)
-}
-
-async fn mesh_nodes(nodes: &[TestNode]) {
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
-        }
-    }
 }
 
 async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {

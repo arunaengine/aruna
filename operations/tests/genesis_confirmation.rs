@@ -30,6 +30,7 @@ use tempfile::TempDir;
 
 use crate::convergence;
 use crate::topology::local_net;
+use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use convergence::wait_for_convergence;
 
@@ -46,7 +47,7 @@ async fn ensure_failure_retries() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([153u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
 
     let (rank0, co_holder) = (&nodes[0], &nodes[1]);
     let placement = rank0_shard_of(&config, rank0.net.node_id(), co_holder.net.node_id());
@@ -71,7 +72,7 @@ async fn peer_allows_genesis() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([150u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
 
     let (rank0, co_holder) = (&nodes[0], &nodes[1]);
     let placement = rank0_shard_of(&config, rank0.net.node_id(), co_holder.net.node_id());
@@ -116,7 +117,7 @@ async fn unreachable_peer_retries() -> Result<(), Box<dyn std::error::Error>> {
 
     // The co-holder returns; the scheduled retry is fired immediately (instead of after the 30s
     // production delay) through the task handler.
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "genesis retry did not create topic",
         || async {
@@ -160,7 +161,7 @@ async fn nonmember_adopts_genesis() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([152u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
 
     let (rank0, co_holder) = (&nodes[0], &nodes[1]);
     let placement = rank0_shard_of(&config, rank0.net.node_id(), co_holder.net.node_id());
@@ -210,7 +211,7 @@ async fn holder_pulls_topics() -> Result<(), Box<dyn std::error::Error>> {
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let (incumbents, newcomer_nodes) = nodes.split_at(2);
     let newcomer_node = &newcomer_nodes[0];
-    mesh_nodes(incumbents).await;
+    mesh(incumbents.iter().map(|node| &node.net)).await;
 
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.seed_default_placement();
@@ -350,21 +351,6 @@ async fn build_realm_nodes(
     Ok(nodes)
 }
 
-async fn mesh_nodes(nodes: &[TestNode]) {
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
-        }
-    }
-}
-
 async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
@@ -470,7 +456,7 @@ async fn single_shared_minter() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([155u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 2).await?;
     install_realm_config(&nodes, realm_id).await?;
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
 
     let topic =
         DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
@@ -514,7 +500,7 @@ async fn concurrent_shared_restore() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([156u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     install_realm_config(&nodes, realm_id).await?;
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
 
     let topic =
         DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);

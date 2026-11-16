@@ -34,6 +34,7 @@ use ulid::Ulid;
 
 use crate::convergence;
 use crate::topology::local_net;
+use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use convergence::wait_for_convergence;
 
@@ -405,18 +406,7 @@ async fn build_realm_nodes(
         nodes.push(spawn_node(*realm_id).await?);
     }
 
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
-        }
-    }
+    mesh(nodes.iter().map(|node| &node.net)).await;
 
     install_realm_config(&nodes, realm_id).await?;
     Ok(nodes)

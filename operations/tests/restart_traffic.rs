@@ -39,6 +39,7 @@ use ulid::Ulid;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 use crate::convergence;
+use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use convergence::{
     HANG_CAP, NO_PROGRESS_TIMEOUT, wait_for_convergence, wait_for_visibility, wait_storage_released,
@@ -176,7 +177,7 @@ async fn spawn_restart_nodes(
         .spawn(async move { spawn_node_with(realm_id, Some(secret2), dir2).await })
         .await??;
     nodes.push(node2);
-    wire_peers(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
     Ok(nodes)
 }
 
@@ -501,21 +502,6 @@ async fn respawn_with_retry(
                 }
                 sleep(Duration::from_millis(250)).await;
             }
-        }
-    }
-}
-
-async fn wire_peers(nodes: &[TestNode]) {
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
         }
     }
 }
@@ -853,7 +839,7 @@ async fn spawn_incident_nodes(
         node._temp_dir = Some(dir);
         nodes.push(node);
     }
-    wire_peers(&nodes[1..]).await;
+    mesh(nodes[1..].iter().map(|node| &node.net)).await;
     assert_eq!(
         nodes.len(),
         3,
@@ -1231,7 +1217,7 @@ async fn restore_peers(
     let mut peer_two = respawn_with_retry(realm_id, secrets[2].clone(), &path_two).await?;
     peer_two._temp_dir = Some(dir_two);
     let nodes = vec![live, peer_one, peer_two];
-    wire_peers(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
     write_config(&nodes, &realm_id, config).await?;
     Ok(nodes)
 }

@@ -78,6 +78,7 @@ use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
 use crate::topology::local_net;
+use crate::topology::mesh;
 use convergence::wait_for_convergence;
 
 // Every wait below polls to a condition; the ceiling only bounds a genuine hang.
@@ -1123,18 +1124,7 @@ async fn build_realm(
         nodes.push(spawn_node(realm.realm_id, index < servers).await?);
     }
 
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
-        }
-    }
+    mesh(nodes.iter().map(|node| &node.net)).await;
 
     let config = install_realm_config(realm, &nodes).await?;
     Ok((nodes, config))

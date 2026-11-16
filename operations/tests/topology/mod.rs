@@ -156,7 +156,7 @@ impl Topology {
             };
             nodes.push(spawn_node(realm_id, kind).await?);
         }
-        mesh(&nodes).await;
+        mesh(nodes.iter().map(|node| &node.net)).await;
 
         for node in &nodes {
             hang_cap(
@@ -1056,17 +1056,13 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
     })
 }
 
-async fn mesh(nodes: &[TestNode]) {
-    for left in 0..nodes.len() {
-        for right in (left + 1)..nodes.len() {
-            nodes[left]
-                .net
-                .add_peer_addr(nodes[right].net.endpoint_addr())
-                .await;
-            nodes[right]
-                .net
-                .add_peer_addr(nodes[left].net.endpoint_addr())
-                .await;
+/// Adds the address of every net to every other net, so the nodes need no discovery.
+pub async fn mesh<'a>(nets: impl IntoIterator<Item = &'a NetHandle>) {
+    let nets: Vec<&NetHandle> = nets.into_iter().collect();
+    for left in 0..nets.len() {
+        for right in (left + 1)..nets.len() {
+            nets[left].add_peer_addr(nets[right].endpoint_addr()).await;
+            nets[right].add_peer_addr(nets[left].endpoint_addr()).await;
         }
     }
 }

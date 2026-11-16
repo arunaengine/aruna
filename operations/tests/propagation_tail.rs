@@ -37,6 +37,7 @@ use ulid::Ulid;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 use crate::convergence;
+use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use convergence::{wait_empty_queues, wait_for_convergence, wait_for_visibility};
 
@@ -402,7 +403,7 @@ async fn build_realm_nodes(realm_id: &RealmId, count: usize) -> Result<Vec<TestN
     for _ in 0..count {
         nodes.push(spawn_node(*realm_id).await?);
     }
-    wire_peers(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
 
     for node in &nodes {
         drive(
@@ -419,21 +420,6 @@ async fn build_realm_nodes(realm_id: &RealmId, count: usize) -> Result<Vec<TestN
     wait_node_convergence(&nodes, realm_id).await?;
     install_realm_config(&nodes, realm_id).await?;
     Ok(nodes)
-}
-
-async fn wire_peers(nodes: &[TestNode]) {
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
-        }
-    }
 }
 
 async fn spawn_node(realm_id: RealmId) -> Result<TestNode, BoxError> {
