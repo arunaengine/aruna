@@ -71,9 +71,9 @@ use self::preflight::{reference_document_title, resolve_graph_reference};
 use self::read::ensure_record_materialized;
 pub(crate) use self::read::{
     can_read_record, ensure_record_readable, filter_live_records, load_live_record,
-    metadata_read_request,
 };
 pub use self::read::{query_metadata, query_metadata_document, references_metadata};
+pub(crate) use self::read_types::metadata_read_request;
 use super::AuthToken;
 use super::forward::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::handle::{MAX_RESULT_BYTES, QUERY_MAX_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT};
@@ -124,6 +124,7 @@ mod list;
 mod path;
 mod preflight;
 mod read;
+mod read_types;
 mod search;
 
 pub use self::distributed::MetadataQueryForm;
@@ -155,7 +156,7 @@ pub use self::preflight::{
 };
 #[cfg(test)]
 use self::preflight::{authorized_realm_nodes, preflight_fingerprint};
-pub use self::read::{
+pub use self::read_types::{
     ApiQueryMode, DocumentQueryRequest, MetadataQueryExecution, MetadataQueryRequest,
     MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
 };
