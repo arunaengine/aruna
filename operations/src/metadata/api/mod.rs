@@ -62,8 +62,8 @@ use self::list_types::{
 };
 use self::list_types::{check_policy_limit, merge_pending_records};
 pub(crate) use self::path::local_path_candidates;
-use self::path::select_fanout_nodes;
-pub use self::path::{deduplicate_fanout_nodes, replica_query_nodes};
+use self::path_types::select_fanout_nodes;
+pub use self::path_types::{deduplicate_fanout_nodes, replica_query_nodes};
 pub(crate) use self::preflight::{discover_realm_nodes, references_preflight_local};
 pub use self::preflight::{load_realm_config, load_realm_nodes};
 use self::preflight::{reference_document_title, resolve_graph_reference};
@@ -151,9 +151,10 @@ pub use self::list_types::{
 };
 pub use self::path::lookup_metadata_path;
 pub(crate) use self::path::resolve_local_path;
-use self::path::{merge_path_views, reduce_path_candidates, select_path_holders};
+use self::path::{merge_path_views, reduce_path_candidates};
 #[cfg(test)]
 use self::path_types::PathShardView;
+use self::path_types::select_path_holders;
 pub use self::path_types::{MetadataLookupRequest, MetadataLookupResult};
 pub use self::preflight::{
     MetadataExcludedForm, MetadataIndexState, MetadataNodeFreshness, MetadataPreflightLocation,
