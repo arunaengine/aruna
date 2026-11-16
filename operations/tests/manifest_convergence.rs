@@ -2,8 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
-
 use aruna_core::document::{DocumentTarget, ShardManifest, ShardManifestEntry};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -11,9 +9,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_core::{NodeId, UserId};
-use aruna_net::NetHandle;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
@@ -23,22 +19,12 @@ use aruna_operations::placement::resolve_shard_holders;
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, strategy_for_target,
 };
-use aruna_operations::realm::announce_presence::{
-    AnnouncePresenceConfig, AnnouncePresenceOperation,
-};
-use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::shard::assemble_shard_manifest;
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
-use aruna_operations::tasks::incoming::start_task_queues;
-use aruna_storage::FjallStorage;
-use aruna_tasks::TaskHandle;
-use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::convergence;
-use crate::topology::local_net;
-use crate::topology::mesh;
 use crate::topology::store_realm_config;
+use crate::topology::{TestNode, announce_nodes, spawn_replicas};
 use convergence::wait_for_convergence;
 
 /// A fixed structured id (handle 1, bucket 0) for the strategy-resolution sample,
@@ -47,12 +33,6 @@ fn doc_id(seed: u64) -> Ulid {
     MetaResourceId::try_from((1u128 << 60) | u128::from(seed))
         .unwrap()
         .as_ulid()
-}
-
-struct TestNode {
-    _temp_dir: TempDir,
-    net: NetHandle,
-    context: Arc<DriverContext>,
 }
 
 // Two holders write documents of one shard, interleaved from both sides.
@@ -282,62 +262,10 @@ async fn build_realm_nodes(
     realm_id: &RealmId,
     count: usize,
 ) -> Result<(Vec<TestNode>, RealmConfigDocument), Box<dyn std::error::Error>> {
-    let mut nodes = Vec::with_capacity(count);
-    for _ in 0..count {
-        nodes.push(spawn_node(*realm_id).await?);
-    }
-    mesh(nodes.iter().map(|node| &node.net)).await;
-    for node in &nodes {
-        drive(
-            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
-                realm_id: *realm_id,
-                node_id: node.net.node_id(),
-                schedule_refresh: true,
-            }),
-            node.context.as_ref(),
-        )
-        .await?;
-    }
-    wait_node_convergence(&nodes, realm_id).await?;
+    let nodes = spawn_replicas(*realm_id, count, true, false).await?;
+    announce_nodes(&nodes, realm_id).await?;
     let config = install_realm_config(&nodes, realm_id).await?;
     Ok((nodes, config))
-}
-
-async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
-    let temp_dir = tempfile::tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
-    let net = local_net(realm_id, storage.clone()).await?;
-    let task_handle = TaskHandle::new();
-    let metadata_handle = MetadataHandle::new(
-        temp_dir.path().join("metadata"),
-        net.node_id(),
-        storage.clone(),
-        Some(net.clone()),
-        Some(net.document_sync_node()),
-        Some(net.document_sync_database()),
-    )?;
-    let context = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: Some(net.clone()),
-        blob_handle: None,
-        metadata_handle: Some(metadata_handle),
-        task_handle: Some(task_handle.clone()),
-        compute_handle: None,
-    });
-    initialize_incoming_fixture(context.clone());
-    let shutdown = aruna_core::shutdown::Shutdown::new();
-    start_task_queues(
-        context.clone(),
-        task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
-        &shutdown,
-    )
-    .await;
-    Ok(TestNode {
-        _temp_dir: temp_dir,
-        net,
-        context,
-    })
 }
 
 async fn install_realm_config(
@@ -365,25 +293,6 @@ async fn install_realm_config(
         .await;
     }
     Ok(config)
-}
-
-async fn wait_node_convergence(
-    nodes: &[TestNode],
-    realm_id: &RealmId,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let expected: std::collections::HashSet<NodeId> =
-        nodes.iter().map(|node| node.net.node_id()).collect();
-    wait_for_convergence("realm nodes did not converge", || async {
-        let mut pending = 0;
-        for node in nodes {
-            match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
-                Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => pending += 1,
-            }
-        }
-        Ok(pending)
-    })
-    .await
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

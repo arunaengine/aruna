@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentSyncPublish, DocumentTarget};
@@ -19,9 +18,7 @@ use aruna_core::structs::placement::record::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::{DocumentEffect, DocumentNetEvent, StructuredId};
-use aruna_net::NetHandle;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
@@ -31,30 +28,15 @@ use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };
-use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::tasks::incoming::start_task_queues;
-use aruna_storage::FjallStorage;
-use aruna_tasks::TaskHandle;
-use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::convergence;
-use crate::topology::local_net;
-use crate::topology::mesh;
 use crate::topology::store_realm_config;
+use crate::topology::{TestNode, spawn_replicas};
 use convergence::wait_for_convergence;
-
-struct TestNode {
-    _temp_dir: TempDir,
-    net: NetHandle,
-    context: Arc<DriverContext>,
-    /// Keeps the inbound handler's scheduled tasks tied to a live owner for
-    /// the node's whole lifetime.
-    _shutdown: aruna_core::shutdown::Shutdown,
-}
 
 // #261 Definition of Done: placement policy converges over the real admin topic, every node
 // derives the same weighted multi-location holder sets.
@@ -436,54 +418,9 @@ async fn build_realm_nodes(
     realm_id: &RealmId,
     count: usize,
 ) -> Result<Vec<TestNode>, Box<dyn std::error::Error>> {
-    let mut nodes = Vec::with_capacity(count);
-    for _ in 0..count {
-        nodes.push(spawn_node(*realm_id).await?);
-    }
-    mesh(nodes.iter().map(|node| &node.net)).await;
+    let nodes = spawn_replicas(*realm_id, count, true, true).await?;
     install_realm_config(&nodes, *realm_id).await?;
     Ok(nodes)
-}
-
-async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
-    let temp_dir = tempfile::tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
-    let net = local_net(realm_id, storage.clone()).await?;
-    let task_handle = TaskHandle::new();
-    let metadata_handle = MetadataHandle::new(
-        temp_dir.path().join("metadata"),
-        net.node_id(),
-        storage.clone(),
-        Some(net.clone()),
-        Some(net.document_sync_node()),
-        Some(net.document_sync_database()),
-    )?;
-
-    let context = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: Some(net.clone()),
-        blob_handle: None,
-        metadata_handle: Some(metadata_handle),
-        task_handle: Some(task_handle.clone()),
-        compute_handle: None,
-    });
-
-    let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
-    let shutdown = aruna_core::shutdown::Shutdown::new();
-    initialize_net_holder(
-        context.clone(),
-        aruna_core::structs::execution::job::RoCrateLimits::default(),
-        jobs_runtime.clone(),
-        &shutdown,
-    );
-    start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
-
-    Ok(TestNode {
-        _temp_dir: temp_dir,
-        net,
-        context,
-        _shutdown: shutdown,
-    })
 }
 
 // Four independently weighted locations; the hot label multiplies both the
