@@ -184,7 +184,7 @@ impl Operation for GetDocumentOperation {
                 other => self.unexpected_event("metadata export result", format!("{other:?}")),
             },
             GetDocumentState::Finish | GetDocumentState::Error | GetDocumentState::Init => {
-                smallvec![]
+                self.unexpected_event("no event in a terminal state", format!("{event:?}"))
             }
         }
     }
@@ -303,5 +303,38 @@ mod tests {
 
         let current = make_record(document_id, materialized_event);
         assert!(record_materialized_read(&context, &current).await.unwrap());
+    }
+
+    // A state that expects no event rejects one instead of ignoring it.
+    #[test]
+    fn rejects_terminal_event() {
+        use super::{GetDocumentError, GetDocumentOperation};
+        use aruna_core::events::{Event, StorageEvent};
+        use aruna_core::operation::Operation;
+
+        let late = || {
+            Event::Storage(StorageEvent::ReadResult {
+                key: Vec::<u8>::new().into(),
+                value: None,
+            })
+        };
+        let mut operation =
+            GetDocumentOperation::new(Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+        assert!(operation.step(late()).is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(GetDocumentError::UnexpectedEvent { .. })
+        ));
+
+        let mut operation =
+            GetDocumentOperation::new(Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+        operation.start();
+        operation.step(late());
+        assert!(operation.is_complete());
+        assert!(operation.step(late()).is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(GetDocumentError::UnexpectedEvent { .. })
+        ));
     }
 }
