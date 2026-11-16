@@ -47,11 +47,12 @@ use self::distributed::{object_search_fingerprint, record_object_result, record_
 use self::export::export_summary_jsonld;
 pub use self::export::{export_metadata_rocrate, get_visible_document};
 pub(crate) use self::export_types::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
-pub use self::fanout::forwarded_bearer;
-pub(crate) use self::fanout::pattern_contains_service;
-use self::fanout::{fanout_bearer, metadata_node_call, query_union_safe, run_metadata_fanout};
+use self::fanout::run_metadata_fanout;
 pub use self::fanout::{lookup_identifier_distributed, search_buckets_distributed};
+pub use self::fanout_types::forwarded_bearer;
+pub(crate) use self::fanout_types::pattern_contains_service;
 use self::fanout_types::{MetadataFanoutOperation, MetadataNodeCall};
+use self::fanout_types::{fanout_bearer, metadata_node_call, query_union_safe};
 use self::list::{load_group_records, load_pending_records};
 #[cfg(test)]
 use self::list_types::{
