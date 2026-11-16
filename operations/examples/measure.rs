@@ -50,8 +50,8 @@ use futures_util::StreamExt;
 use tempfile::TempDir;
 use tokio::time::{MissedTickBehavior, sleep};
 use topology::{
-    BoxError, TestNode, build_realm_nodes, init_logging, make_runtime, node_targets, run_writers,
-    scaffold_payload, shutdown_nodes,
+    BoxError, TestNode, build_realm_nodes, init_logging, make_runtime, mixed_payload, node_targets,
+    run_writers, scaffold_payload, shutdown_nodes,
 };
 use ulid::Ulid;
 
@@ -140,6 +140,7 @@ async fn measure_creates(seed: u8, writers: usize) -> Result<(), BoxError> {
         per_writer,
         &targets,
         None,
+        mixed_payload,
     )
     .await;
     let seconds = started.elapsed().as_secs_f64();
@@ -166,6 +167,7 @@ async fn measure_spread() -> Result<(), BoxError> {
         SPREAD_DOCS,
         &targets,
         None,
+        mixed_payload,
     )
     .await;
     let mut created = match created {
@@ -220,6 +222,7 @@ async fn converge_all(realm_id: RealmId, nodes: &[TestNode]) -> Result<(usize, f
         DRAIN_DOCS,
         &targets,
         None,
+        mixed_payload,
     )
     .await?;
     let pairs = pairs_of(&created);
@@ -260,6 +263,7 @@ async fn sample_tail(realm_id: RealmId, nodes: &[TestNode]) -> Result<(), BoxErr
         TAIL_DOCS,
         &targets,
         Some(TAIL_PERIOD),
+        mixed_payload,
     )
     .await;
     let ingest_seconds = started.elapsed().as_secs_f64();

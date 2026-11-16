@@ -12,8 +12,8 @@ use ulid::Ulid;
 
 use crate::convergence::{wait_empty_queues, wait_for_visibility};
 use crate::topology::{
-    BoxError, build_realm_nodes, init_logging, make_runtime, node_targets, run_writers,
-    shutdown_nodes,
+    BoxError, build_realm_nodes, init_logging, make_runtime, mixed_payload, node_targets,
+    run_writers, shutdown_nodes,
 };
 
 const WRITERS: usize = 24;
@@ -42,6 +42,7 @@ fn sustained_load_converges() -> Result<(), BoxError> {
             DOCS_PER_WRITER,
             &targets,
             Some(WRITER_PERIOD),
+            mixed_payload,
         )
         .await?;
         let pairs: Vec<(GroupId, Ulid)> = created

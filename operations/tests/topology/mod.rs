@@ -8,7 +8,7 @@ use crate::convergence;
 
 use aruna_core::keys::generate_signing_key;
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,8 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::reducer::AdminDocumentState;
+use aruna_core::shutdown::Shutdown;
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, TokenClaims};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
@@ -43,6 +45,7 @@ use aruna_operations::auth::check_permissions::{
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
@@ -62,7 +65,7 @@ use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, RealmPlacementMutation, drive_placement_mutation,
 };
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::sync::incoming::{initialize_incoming_fixture, initialize_net_holder};
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
@@ -90,10 +93,13 @@ pub const LOCATIONS: [&str; 2] = ["eu", "us"];
 pub const NODE_WEIGHT: u32 = 100;
 
 pub struct TestNode {
-    _temp_dir: Option<TempDir>,
+    /// The folder the node owns; a restart test takes it to keep the folder alive.
+    pub temp_dir: Option<TempDir>,
     pub net: NetHandle,
     pub context: Arc<DriverContext>,
     pub kind: RealmNodeKind,
+    /// Owner of the production net holder and task queues, when the node installed them.
+    pub shutdown: Option<Shutdown>,
 }
 
 impl TestNode {
@@ -1058,10 +1064,11 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
     .await;
 
     Ok(TestNode {
-        _temp_dir: Some(temp_dir),
+        temp_dir: Some(temp_dir),
         net,
         context,
         kind,
+        shutdown: None,
     })
 }
 
@@ -1546,39 +1553,31 @@ pub async fn build_realm_nodes(
 ) -> Result<Vec<TestNode>, BoxError> {
     let mut nodes = Vec::with_capacity(count);
     for _ in 0..count {
-        nodes.push(spawn_load_node(*realm_id).await?);
+        nodes.push(spawn_load_node(*realm_id, false).await?);
     }
     mesh(nodes.iter().map(|node| &node.net)).await;
-    for node in &nodes {
-        drive(
-            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
-                realm_id: *realm_id,
-                node_id: node.net.node_id(),
-                schedule_refresh: true,
-            }),
-            node.context.as_ref(),
-        )
-        .await?;
-    }
-    wait_node_convergence(&nodes, realm_id).await?;
+    announce_nodes(&nodes, realm_id).await?;
     install_load_config(&nodes, realm_id).await?;
     Ok(nodes)
 }
 
 /// A load node in its own temporary folder.
-pub async fn spawn_load_node(realm_id: RealmId) -> Result<TestNode, BoxError> {
+pub async fn spawn_load_node(realm_id: RealmId, hold_shutdown: bool) -> Result<TestNode, BoxError> {
     let temp_dir = tempfile::tempdir()?;
-    let mut node = spawn_node_with(realm_id, None, temp_dir.path().to_path_buf()).await?;
-    node._temp_dir = Some(temp_dir);
+    let dir = temp_dir.path().to_path_buf();
+    let mut node = spawn_node_with(realm_id, None, dir, hold_shutdown).await?;
+    node.temp_dir = Some(temp_dir);
     Ok(node)
 }
 
-/// A management node on `dir` with production storage pools, a metadata store and
-/// running task queues; a fixed `secret_key` lets a restart keep the node id.
+/// A management node on `dir` with production storage pools, a metadata store and running
+/// task queues; a fixed `secret_key` lets a restart keep the node id. With `hold_shutdown`
+/// the node installs the production net holder under a `Shutdown` it keeps for draining.
 pub async fn spawn_node_with(
     realm_id: RealmId,
     secret_key: Option<iroh::SecretKey>,
     dir: PathBuf,
+    hold_shutdown: bool,
 ) -> Result<TestNode, BoxError> {
     let fjall_dir = dir.join("fjall");
     std::fs::create_dir_all(&fjall_dir)?;
@@ -1615,22 +1614,49 @@ pub async fn spawn_node_with(
         compute_handle: None,
     });
 
-    initialize_incoming_fixture(context.clone());
-    let shutdown = aruna_core::shutdown::Shutdown::new();
-    start_task_queues(
-        context.clone(),
-        task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
-        &shutdown,
-    )
-    .await;
+    let shutdown = Shutdown::new();
+    if hold_shutdown {
+        let limits = RoCrateLimits::default();
+        initialize_net_holder(context.clone(), limits, JobsRuntime::new(), &shutdown);
+    } else {
+        initialize_incoming_fixture(context.clone());
+    }
+    start_task_queues(context.clone(), task_handle, JobsRuntime::new(), &shutdown).await;
 
     Ok(TestNode {
-        _temp_dir: None,
+        temp_dir: None,
         net,
         context,
         kind: RealmNodeKind::Management,
+        shutdown: hold_shutdown.then_some(shutdown),
     })
+}
+
+/// Restarts a node on its kept folder and key, retrying while the old storage lock is released.
+pub async fn respawn_with_retry(
+    realm_id: RealmId,
+    secret_key: iroh::SecretKey,
+    dir: &Path,
+    hold_shutdown: bool,
+) -> Result<TestNode, BoxError> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let spawned = spawn_node_with(
+            realm_id,
+            Some(secret_key.clone()),
+            dir.to_path_buf(),
+            hold_shutdown,
+        );
+        match spawned.await {
+            Ok(node) => return Ok(node),
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(format!("respawn failed after retries: {error}").into());
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
 }
 
 /// Installs the default realm config with every node as a management node, then runs
@@ -1656,7 +1682,22 @@ pub async fn install_load_config(nodes: &[TestNode], realm_id: &RealmId) -> Resu
     Ok(())
 }
 
-pub async fn wait_node_convergence(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), BoxError> {
+/// Announces every node's presence, then waits until each node sees all of them.
+pub async fn announce_nodes(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), String> {
+    for node in nodes {
+        let announce = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
+            realm_id: *realm_id,
+            node_id: node.net.node_id(),
+            schedule_refresh: true,
+        });
+        drive(announce, node.context.as_ref())
+            .await
+            .map_err(|error| format!("announce failed: {error:?}"))?;
+    }
+    wait_node_convergence(nodes, realm_id).await
+}
+
+pub async fn wait_node_convergence(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), String> {
     let expected: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
     wait_for_convergence("realm nodes did not converge", || async {
         let mut pending = 0;
@@ -1671,8 +1712,28 @@ pub async fn wait_node_convergence(nodes: &[TestNode], realm_id: &RealmId) -> Re
     .await
 }
 
+/// Stops one node as a restart does: drains its held shutdown owner, removes its inbound
+/// handler, stops its task queues and its net. The caller still holds the storage.
+pub async fn stop_node(node: &TestNode) {
+    if let Some(shutdown) = &node.shutdown {
+        let _ = shutdown.drain(convergence::NO_PROGRESS_TIMEOUT).await;
+    }
+    node.net.clear_inbound_handler();
+    if let Some(task_handle) = &node.context.task_handle {
+        let _ = task_handle.shutdown(convergence::NO_PROGRESS_TIMEOUT).await;
+    }
+    node.net.shutdown().await;
+}
+
+/// Drains a held shutdown owner and the task queues first, then stops the net.
 pub async fn shutdown_nodes(nodes: Vec<TestNode>) {
     for node in nodes {
+        if let Some(shutdown) = &node.shutdown {
+            let _ = shutdown.drain(convergence::NO_PROGRESS_TIMEOUT).await;
+            if let Some(task_handle) = &node.context.task_handle {
+                let _ = task_handle.shutdown(convergence::NO_PROGRESS_TIMEOUT).await;
+            }
+        }
         node.net.shutdown().await;
     }
 }
@@ -1684,7 +1745,11 @@ pub fn node_targets(nodes: &[TestNode]) -> Vec<(NodeId, Arc<DriverContext>)> {
         .collect()
 }
 
+/// Builds the payload of one created document from its label, writer, index and id.
+pub type PayloadFn = fn(&str, usize, usize, Ulid) -> CreateDocumentPayload;
+
 /// Runs `writers` writer tasks with `per_writer` creates each and returns every document.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_writers(
     realm_id: RealmId,
     group_id: GroupId,
@@ -1693,6 +1758,7 @@ pub async fn run_writers(
     per_writer: usize,
     targets: &[(NodeId, Arc<DriverContext>)],
     period: Option<Duration>,
+    payload: PayloadFn,
 ) -> Result<Vec<(GroupId, Ulid, Instant)>, BoxError> {
     let mut handles = Vec::with_capacity(writers);
     for writer in 0..writers {
@@ -1700,7 +1766,7 @@ pub async fn run_writers(
         let label = label.to_string();
         handles.push(tokio::spawn(async move {
             run_writer(
-                realm_id, group_id, &label, writer, per_writer, targets, period,
+                realm_id, group_id, &label, writer, per_writer, targets, period, payload,
             )
             .await
         }));
@@ -1712,9 +1778,9 @@ pub async fn run_writers(
     Ok(created)
 }
 
-/// Creates `count` documents round robin over `targets`, alternating a scaffold and an
-/// RO-Crate payload, and projects them in batches as the API create path does. With a
-/// `period`, one create starts per period.
+/// Creates `count` documents round robin over `targets` with the given payloads and projects
+/// them in batches as the API create path does. With a `period`, one create starts per period.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_writer(
     realm_id: RealmId,
     group_id: GroupId,
@@ -1723,6 +1789,7 @@ pub async fn run_writer(
     count: usize,
     targets: Vec<(NodeId, Arc<DriverContext>)>,
     period: Option<Duration>,
+    payload: PayloadFn,
 ) -> Result<Vec<(GroupId, Ulid, Instant)>, BoxError> {
     let mut batches: Vec<Vec<(Ulid, Ulid)>> = targets.iter().map(|_| Vec::new()).collect();
     let mut pending = 0usize;
@@ -1747,11 +1814,7 @@ pub async fn run_writer(
         let document_id = mint_local_document(&config, &actor, group_id, &document_path)
             .map_err(|error| format!("mint failed writer={writer} index={index}: {error:?}"))?
             .as_ulid();
-        let payload = if index % 2 == 0 {
-            scaffold_payload(label, writer, index)
-        } else {
-            rocrate_payload(document_id)
-        };
+        let payload = payload(label, writer, index, document_id);
         let result = drive(
             CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
                 actor,
@@ -1793,6 +1856,15 @@ pub async fn flush_projection_batches(
             .map_err(|error| format!("projection failed: {error:?}"))?;
     }
     Ok(())
+}
+
+/// The load test payload: a scaffold for even indexes and an RO-Crate otherwise.
+pub fn mixed_payload(label: &str, writer: usize, index: usize, id: Ulid) -> CreateDocumentPayload {
+    if index.is_multiple_of(2) {
+        scaffold_payload(label, writer, index)
+    } else {
+        rocrate_payload(id)
+    }
 }
 
 pub fn scaffold_payload(label: &str, writer: usize, index: usize) -> CreateDocumentPayload {

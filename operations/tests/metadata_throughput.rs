@@ -2,9 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
@@ -12,14 +11,13 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use tokio::time::sleep;
 use ulid::Ulid;
 
 use crate::convergence::{wait_empty_queues, wait_for_visibility, wait_storage_released};
 use crate::topology::{
-    BoxError, TestNode, build_realm_nodes, init_logging, install_load_config, make_runtime, mesh,
-    node_targets, run_writer, run_writers, shutdown_nodes, spawn_load_node, spawn_node_with,
-    wait_node_convergence,
+    BoxError, build_realm_nodes, init_logging, install_load_config, make_runtime, mesh,
+    mixed_payload, node_targets, respawn_with_retry, run_writer, run_writers, shutdown_nodes,
+    spawn_load_node, spawn_node_with, wait_node_convergence,
 };
 
 const TOTAL_CREATES: usize = 2000;
@@ -39,7 +37,14 @@ fn writer_levels_complete() -> Result<(), BoxError> {
             let group_id = Ulid::generate();
             let label = format!("tp{writers}");
             let created = run_writers(
-                realm_id, group_id, &label, writers, per_writer, &targets, None,
+                realm_id,
+                group_id,
+                &label,
+                writers,
+                per_writer,
+                &targets,
+                None,
+                mixed_payload,
             )
             .await;
             shutdown_nodes(nodes).await;
@@ -66,7 +71,17 @@ fn convergence_gate() -> Result<(), BoxError> {
         let targets = node_targets(&nodes);
         let group_id = Ulid::generate();
 
-        let mut created = run_writers(realm_id, group_id, "conv", 64, 16, &targets, None).await?;
+        let mut created = run_writers(
+            realm_id,
+            group_id,
+            "conv",
+            64,
+            16,
+            &targets,
+            None,
+            mixed_payload,
+        )
+        .await?;
         println!(
             "created={} docs, polling for convergence of last 100",
             created.len()
@@ -101,7 +116,17 @@ fn production_convergence_gate() -> Result<(), BoxError> {
         let targets = node_targets(&nodes);
         let group_id = Ulid::generate();
 
-        let created = run_writers(realm_id, group_id, "prod", 32, 128, &targets, None).await?;
+        let created = run_writers(
+            realm_id,
+            group_id,
+            "prod",
+            32,
+            128,
+            &targets,
+            None,
+            mixed_payload,
+        )
+        .await?;
         println!(
             "created={} docs, polling for full cluster convergence",
             created.len()
@@ -142,13 +167,13 @@ async fn churn_convergence_body() -> Result<(), BoxError> {
         .build()?;
 
     let mut nodes = Vec::with_capacity(3);
-    nodes.push(spawn_load_node(realm_id).await?);
-    nodes.push(spawn_load_node(realm_id).await?);
+    nodes.push(spawn_load_node(realm_id, false).await?);
+    nodes.push(spawn_load_node(realm_id, false).await?);
     let dir2 = node2_dir.path().to_path_buf();
     let secret2 = secret.clone();
     let node2 = aux
         .handle()
-        .spawn(async move { spawn_node_with(realm_id, Some(secret2), dir2).await })
+        .spawn(async move { spawn_node_with(realm_id, Some(secret2), dir2, false).await })
         .await??;
     nodes.push(node2);
 
@@ -177,7 +202,17 @@ async fn churn_convergence_body() -> Result<(), BoxError> {
 
     let group_id = Ulid::generate();
     let targets0 = vec![(nodes[0].net.node_id(), nodes[0].context.clone())];
-    let initial = run_writer(realm_id, group_id, "seed", 0, 1, targets0.clone(), None).await?;
+    let initial = run_writer(
+        realm_id,
+        group_id,
+        "seed",
+        0,
+        1,
+        targets0.clone(),
+        None,
+        mixed_payload,
+    )
+    .await?;
     let initial_pair = vec![(initial[0].0, initial[0].1)];
     {
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
@@ -201,11 +236,21 @@ async fn churn_convergence_body() -> Result<(), BoxError> {
     wait_storage_released(storage).await?;
     println!("node 2 shut down");
 
-    let created = run_writer(realm_id, group_id, "churn", 0, 200, targets0, None).await?;
+    let created = run_writer(
+        realm_id,
+        group_id,
+        "churn",
+        0,
+        200,
+        targets0,
+        None,
+        mixed_payload,
+    )
+    .await?;
     let pairs: Vec<(GroupId, Ulid)> = created.iter().map(|(g, d, _)| (*g, *d)).collect();
     println!("created {} docs while node 2 was down", pairs.len());
 
-    let node2 = respawn_with_retry(realm_id, secret, node2_dir.path()).await?;
+    let node2 = respawn_with_retry(realm_id, secret, node2_dir.path(), false).await?;
     for other in &nodes {
         node2.net.add_peer_addr(other.net.endpoint_addr()).await;
         other.net.add_peer_addr(node2.net.endpoint_addr()).await;
@@ -230,23 +275,4 @@ async fn churn_convergence_body() -> Result<(), BoxError> {
     nodes.push(node2);
     shutdown_nodes(nodes).await;
     Ok(result?)
-}
-
-async fn respawn_with_retry(
-    realm_id: RealmId,
-    secret_key: iroh::SecretKey,
-    dir: &Path,
-) -> Result<TestNode, BoxError> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        match spawn_node_with(realm_id, Some(secret_key.clone()), dir.to_path_buf()).await {
-            Ok(node) => return Ok(node),
-            Err(error) => {
-                if Instant::now() >= deadline {
-                    return Err(format!("respawn failed after retries: {error}").into());
-                }
-                sleep(Duration::from_millis(250)).await;
-            }
-        }
-    }
 }
