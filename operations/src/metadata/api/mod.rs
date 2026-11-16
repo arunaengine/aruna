@@ -45,8 +45,8 @@ use ulid::Ulid;
 pub use self::distributed::{aggregate_query_results, query_form, query_select_limit};
 use self::distributed::{object_search_fingerprint, record_object_result, record_preflight_node};
 use self::export::export_summary_jsonld;
-pub(crate) use self::export::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
 pub use self::export::{export_metadata_rocrate, get_visible_document};
+pub(crate) use self::export_types::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
 pub use self::fanout::forwarded_bearer;
 pub(crate) use self::fanout::pattern_contains_service;
 use self::fanout::{
@@ -116,6 +116,7 @@ use crate::s3::object::search::{
 mod bucket_page;
 mod distributed;
 mod export;
+mod export_types;
 mod fanout;
 mod join;
 mod links;
@@ -132,7 +133,7 @@ mod search;
 mod search_types;
 
 pub use self::distributed::MetadataQueryForm;
-pub use self::export::{
+pub use self::export_types::{
     ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
 };
 use self::fanout::MetadataFanoutScope;
