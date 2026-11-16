@@ -3,7 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
+use crate::auth::ValidatedBearer;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
@@ -762,11 +763,10 @@ read, and every verifier re-runs the same check against its own replicated view.
 )]
 pub async fn create_placement_policy(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreatePolicyRequest>,
 ) -> ServerResult<Json<PolicyResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let policy_id = request
         .policy_id
         .map(|policy_id| Ulid::from_string(&policy_id).map_err(|_| ServerError::BadRequest))
@@ -847,11 +847,10 @@ that needs no realm-configuration permission.
 )]
 pub async fn get_placement_policy(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(policy_id): Path<String>,
     Query(query): Query<PolicyRefQuery>,
 ) -> ServerResult<Json<PolicyResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let policy_ref = PolicyRefBody {
         policy_id,
         digest: query.digest,
@@ -919,10 +918,9 @@ The check runs inside the operation, so the listing is no existence oracle.
 )]
 pub async fn list_placement_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<PolicyListQuery>,
 ) -> ServerResult<Json<PolicyListResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let page = drive(
         ListPoliciesOperation::new(ListPoliciesInput {
             auth_context: auth,
@@ -995,10 +993,9 @@ ids.
 )]
 pub async fn get_bucket_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketPlacementResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     ensure_placement_read(&state, &auth, info.group_id).await?;
     let policies = named_refs(&state, auth.realm_id, info.placement_policies).await?;
@@ -1063,11 +1060,10 @@ operation.
 )]
 pub async fn put_bucket_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Json(request): Json<BucketPlacementRequest>,
 ) -> ServerResult<Json<BucketPlacementResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     ensure_placement_writer(&state, &auth, &bucket).await?;
     let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
@@ -1139,13 +1135,12 @@ pub async fn put_bucket_placement(
 )]
 pub async fn get_object_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: axum::http::HeaderMap,
     Path(bucket): Path<String>,
     Query(query): Query<ObjectPlacementQuery>,
 ) -> ServerResult<Json<ObjectPlacementView>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     crate::auth::ensure_permission(
         &state,
@@ -1263,13 +1258,12 @@ operation.
 )]
 pub async fn mint_object_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
     headers: axum::http::HeaderMap,
     Path(bucket): Path<String>,
     Json(request): Json<ObjectPlacementRequest>,
 ) -> ServerResult<Json<ObjectPlacementResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     ensure_placement_writer(&state, &auth, &bucket).await?;
     let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
@@ -1427,13 +1421,12 @@ operation.
 )]
 pub async fn run_bucket_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     headers: axum::http::HeaderMap,
     Json(request): Json<BulkRunRequest>,
 ) -> ServerResult<Json<BulkRunResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     ensure_placement_writer(&state, &auth, &bucket).await?;
     let info = bucket_info(&state, &bucket).await?;
     crate::routes::storage::relay::relayed_set(&info, &headers)?;
@@ -1590,13 +1583,12 @@ operation.
 )]
 pub async fn get_placement_coverage(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     headers: axum::http::HeaderMap,
     Query(query): Query<CoverageQuery>,
 ) -> ServerResult<Json<CoverageResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     // Checked before the bucket is read, so a refused caller cannot tell which buckets exist.
     crate::auth::ensure_permission(
         &state,
@@ -1775,10 +1767,9 @@ operation.
 )]
 pub async fn get_placement_diagnostics(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<DiagnosticsQuery>,
 ) -> ServerResult<Json<DiagnosticsResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let report = drive(
         PolicyDiagnosticsOperation::new(DiagnosticsInput {
             auth_context: auth,
@@ -1911,10 +1902,9 @@ the operation.
 )]
 pub async fn resolve_placement_quarantine(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<QuarantineResolveRequest>,
 ) -> ServerResult<Json<QuarantineResolveResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let release = quarantine_release(&request)?;
     let resolution = drive(
         ResolveQuarantineOperation::new(ResolveQuarantineConfig {

@@ -2,12 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{
     BucketInfo, CopyOrigin, bucket_permission_path, object_permission_path,
 };
@@ -159,14 +160,9 @@ the whole bucket when it is not.
 )]
 pub async fn replicate_blob(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<ReplicateBlobRequest>,
 ) -> ServerResult<(StatusCode, Json<ReplicateBlobResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
-    if auth.realm_id != state.get_realm_id() {
-        return Err(ServerError::Forbidden);
-    }
-
     let bucket_info = load_bucket(&state, &request.bucket).await?;
 
     let permission_path = match request.path.as_deref() {
@@ -556,15 +552,11 @@ fn copy_response(
 )]
 pub async fn blob_locations(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Query(query): Query<BlobLocationsQuery>,
 ) -> ServerResult<Json<BlobLocationsResponse>> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
-    if auth.realm_id != state.get_realm_id() {
-        return Err(ServerError::Forbidden);
-    }
     let ctx = state.get_ctx();
     let local_node = state.get_node_id();
     let version_id = query

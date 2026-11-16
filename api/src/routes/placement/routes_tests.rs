@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{ObjectPlacementQuery, get_object_placement};
+use crate::auth::RealmAuth;
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
 use crate::server::state::ServerState;
@@ -250,7 +251,7 @@ async fn reads_object_refs() {
 
     let Ok(axum::Json(view)) = get_object_placement(
         State(state),
-        Extension(Some(auth(owner))),
+        RealmAuth(auth(owner)),
         Extension(None),
         axum::http::HeaderMap::new(),
         Path(BUCKET.to_string()),
@@ -283,7 +284,7 @@ async fn unknown_key_missing() {
 
     let error = get_object_placement(
         State(state),
-        Extension(Some(auth(owner))),
+        RealmAuth(auth(owner)),
         Extension(None),
         axum::http::HeaderMap::new(),
         Path(BUCKET.to_string()),
@@ -306,7 +307,7 @@ async fn refuses_foreign_reader() {
 
     let error = get_object_placement(
         State(state),
-        Extension(Some(auth(outsider))),
+        RealmAuth(auth(outsider)),
         Extension(None),
         axum::http::HeaderMap::new(),
         Path(BUCKET.to_string()),
@@ -335,7 +336,7 @@ fn openapi_lists_objects() {
 
 mod mint {
     use super::super::{ObjectPlacementRequest, mint_object_placement};
-    use crate::auth::ValidatedBearer;
+    use crate::auth::{RealmAuth, ValidatedBearer};
     use crate::error::ServerError;
     use crate::mcp::data::{WriteObjectInput, store_text};
     use crate::routes::storage::deletion::bucket_info;
@@ -372,7 +373,7 @@ mod mint {
     ) -> Result<super::super::ObjectPlacementResponse, ServerError> {
         let minted = mint_object_placement(
             State(node.state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
             HeaderMap::new(),
             Path(BUCKET.to_string()),
@@ -482,7 +483,7 @@ mod mint {
 
 mod runs {
     use super::super::{BulkRunRequest, BulkRunResponse, run_bucket_placement};
-    use crate::auth::ValidatedBearer;
+    use crate::auth::{RealmAuth, ValidatedBearer};
     use crate::error::ServerError;
     use crate::tests::distributed::{
         BUCKET, CLOSED_API, LOCAL, Node, PEER, distribute, mock_peer, node_id, node_state,
@@ -508,7 +509,7 @@ mod runs {
     async fn run(node: &Node, request: BulkRunRequest) -> Result<BulkRunResponse, ServerError> {
         let answer = run_bucket_placement(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
             Path(BUCKET.to_string()),
             HeaderMap::new(),
@@ -579,7 +580,7 @@ mod runs {
 
 mod coverage {
     use super::super::{CoverageQuery, CoverageResponse, get_placement_coverage};
-    use crate::auth::ValidatedBearer;
+    use crate::auth::{RealmAuth, ValidatedBearer};
     use crate::error::ServerError;
     use crate::tests::distributed::{
         BUCKET, CLOSED_API, LOCAL, Node, PEER, distribute, mock_peer, node_id, node_state,
@@ -622,7 +623,7 @@ mod coverage {
         };
         let answer = get_placement_coverage(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
             Path(BUCKET.to_string()),
             HeaderMap::new(),
@@ -692,7 +693,7 @@ mod coverage {
         };
         let answer = get_placement_coverage(
             State(node.state.clone()),
-            Extension(Some(node.stranger.clone())),
+            RealmAuth(node.stranger.clone()),
             Extension(None),
             Path("no-such-bucket".to_string()),
             HeaderMap::new(),

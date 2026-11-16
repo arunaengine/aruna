@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::routes::assistant::proxy::proxy_post;
 use crate::routes::management_relay::{RELAY_HOP_HEADER, relay_middleware};
 use crate::tests::assistant::spawn_mock;
@@ -119,7 +120,7 @@ fn setup_body(base_url: &str, limit: Option<u32>) -> serde_json::Value {
 async fn set_up(fixture: &Fixture, base_url: &str, limit: Option<u32>) -> CentralResponse {
     let (_, Json(view)) = put_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.admin.clone())),
+        UnrestrictedAuth(fixture.admin.clone()),
         json_request(setup_body(base_url, limit)),
     )
     .await
@@ -210,14 +211,14 @@ async fn setup_admin_only() {
     let fixture = fixture().await;
     let refused = put_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.member.clone())),
+        UnrestrictedAuth(fixture.member.clone()),
         json_request(setup_body("http://127.0.0.1:9", None)),
     )
     .await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
     let refused = delete_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.member.clone())),
+        UnrestrictedAuth(fixture.member.clone()),
     )
     .await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
@@ -225,7 +226,7 @@ async fn setup_admin_only() {
     chatgpt["kind"] = "chatgpt".into();
     let refused = put_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.admin.clone())),
+        UnrestrictedAuth(fixture.admin.clone()),
         json_request(chatgpt),
     )
     .await;

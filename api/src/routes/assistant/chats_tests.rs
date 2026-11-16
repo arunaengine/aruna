@@ -3,15 +3,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::extract;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
     MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS, MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
 };
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -82,7 +86,7 @@ async fn save_head(
 ) -> Result<ChatHeadResponse, StatusCode> {
     put_chat(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path(id.to_string()),
         head_request(title, revision),
     )
@@ -100,7 +104,7 @@ async fn save_turn(
 ) -> Result<ChatHeadResponse, ServerError> {
     put_turn(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path((id.to_string(), seq)),
         turn_request(payload, None),
     )
@@ -116,7 +120,7 @@ async fn read_turns(
 ) -> Result<Vec<ChatTurnResponse>, StatusCode> {
     get_turns(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path(id.to_string()),
         Query(ChatTurnsQuery { after }),
     )
@@ -126,7 +130,7 @@ async fn read_turns(
 }
 
 async fn list(state: &Arc<ServerState>, auth: &AuthContext) -> Vec<ChatHeadResponse> {
-    let (status, Json(body)) = list_chats(State(state.clone()), Extension(Some(auth.clone())))
+    let (status, Json(body)) = list_chats(State(state.clone()), UnrestrictedAuth(auth.clone()))
         .await
         .unwrap();
     assert_eq!(status, StatusCode::OK);
@@ -136,7 +140,7 @@ async fn list(state: &Arc<ServerState>, auth: &AuthContext) -> Vec<ChatHeadRespo
 async fn delete(state: &Arc<ServerState>, auth: &AuthContext, id: &str) -> StatusCode {
     delete_chat(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path(id.to_string()),
     )
     .await
@@ -203,7 +207,7 @@ async fn rejects_bad_input() {
     }
     let error = put_chat(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path("c-1".to_string()),
         Json(SaveChatRequest {
             title: "Title".to_string(),
@@ -218,7 +222,7 @@ async fn rejects_bad_input() {
         read_turns(&state, &auth, "bad id", None).await.unwrap_err(),
         StatusCode::BAD_REQUEST
     );
-    let error = delete_chat(State(state), Extension(Some(auth)), Path(String::new()))
+    let error = delete_chat(State(state), UnrestrictedAuth(auth), Path(String::new()))
         .await
         .unwrap_err();
     assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
@@ -290,7 +294,7 @@ async fn refuses_stale_revision() {
         async move {
             put_turn(
                 State(state),
-                Extension(Some(auth)),
+                UnrestrictedAuth(auth),
                 Path(("c-1".to_string(), seq)),
                 turn_request("turn", revision),
             )
@@ -428,30 +432,13 @@ async fn refuses_over_budget() {
 #[tokio::test]
 async fn requires_unrestricted_token() {
     let (_dir, state, mut auth) = setup_state().await;
-    let error = list_chats(State(state.clone()), Extension(None))
-        .await
-        .unwrap_err();
-    assert_eq!(error.into_response().status(), StatusCode::UNAUTHORIZED);
+    // The chat routes take `UnrestrictedAuth`, so these refusals are the extractor's.
+    let error = extract::<UnrestrictedAuth>(&state, None).await;
+    assert_eq!(error.err(), Some(StatusCode::UNAUTHORIZED));
 
     auth.path_restrictions = Some(Vec::new());
-    assert_eq!(
-        save_head(&state, &auth, "c-1", "Chat", None)
-            .await
-            .unwrap_err(),
-        StatusCode::FORBIDDEN
-    );
-    let error = save_turn(&state, &auth, "c-1", 0, "zero")
-        .await
-        .unwrap_err();
-    assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        read_turns(&state, &auth, "c-1", None).await.unwrap_err(),
-        StatusCode::FORBIDDEN
-    );
-    let error = delete_chat(State(state), Extension(Some(auth)), Path("c-1".to_string()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    let error = extract::<UnrestrictedAuth>(&state, Some(auth)).await;
+    assert_eq!(error.err(), Some(StatusCode::FORBIDDEN));
 }
 
 #[test]

@@ -7,6 +7,7 @@ use super::{
     ModelInput, PROXY_BODY_LIMIT, ProviderModel, ensure_enabled, forbidden_header, model_ids,
     parse_json, parse_provider_kind, provider_base_url, provider_summary,
 };
+use crate::auth::UnrestrictedAuth;
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::unix_rfc3339;
@@ -99,11 +100,7 @@ async fn load_central(state: &ServerState, user_id: UserId) -> ServerResult<Cent
         .map_err(map_central_error)
 }
 
-async fn require_admin(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-) -> ServerResult<AuthContext> {
-    let auth = require_unrestricted_auth(state, auth)?;
+async fn require_admin(state: &ServerState, auth: AuthContext) -> ServerResult<AuthContext> {
     if is_realm_admin(state, &auth).await? {
         Ok(auth)
     } else {
@@ -344,7 +341,7 @@ pub async fn get_central(
 )]
 pub async fn put_central(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     request: Request,
 ) -> ServerResult<(StatusCode, Json<CentralResponse>)> {
     ensure_enabled(&state)?;
@@ -393,7 +390,7 @@ pub async fn put_central(
 )]
 pub async fn delete_central(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<StatusCode> {
     ensure_enabled(&state)?;
     let auth = require_admin(&state, auth).await?;
@@ -442,7 +439,7 @@ pub async fn delete_central(
 )]
 pub async fn test_central(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<CentralTestResponse>)> {
     ensure_enabled(&state)?;
     let auth = require_admin(&state, auth).await?;

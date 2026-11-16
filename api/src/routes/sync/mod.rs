@@ -2,9 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{
-    ValidatedBearer, ensure_permission, ensure_permission_with, require_unrestricted_auth,
-};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ValidatedBearer, ensure_permission, ensure_permission_with};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::blobs::plaintext_holder;
 use crate::server::state::ServerState;
@@ -362,11 +361,10 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
 )]
 pub async fn create_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateSyncRequest>,
 ) -> ServerResult<(StatusCode, Json<SyncRelationshipResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     validate_endpoint(&request.source.bucket, request.source.prefix.as_deref())?;
     validate_endpoint(&request.target.bucket, request.target.prefix.as_deref())?;
@@ -565,10 +563,9 @@ pub async fn create_sync(
 )]
 pub async fn list_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(params): Query<SyncListParams>,
 ) -> ServerResult<Json<SyncListResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if params.bucket.as_deref().is_some_and(str::is_empty)
         || params.prefix.as_deref().is_some_and(str::is_empty)
     {
@@ -680,10 +677,9 @@ creator may read a relationship, so one created by somebody else is refused rath
 )]
 pub async fn get_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<SyncDetailResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let (relationship, _) = load_relationship(&state, id).await?;
     ensure_creator(&auth, &relationship)?;
@@ -789,12 +785,11 @@ creator may change a relationship, and READ on the source bucket is checked as w
 )]
 pub async fn update_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(id): Path<String>,
     Json(request): Json<UpdateSyncRequest>,
 ) -> ServerResult<Json<SyncRelationshipResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let id = parse_id(&id)?;
     let mut relationship =
@@ -915,10 +910,9 @@ creator may run a relationship, and READ on the source bucket is checked as well
 )]
 pub async fn run_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<SyncRunResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let mut relationship =
         get_relationship(&state, id, SyncRelationshipDirection::Outgoing).await?;
@@ -978,10 +972,9 @@ the source bucket for a source-side relationship, the target bucket for a mirror
 )]
 pub async fn delete_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let (relationship, direction) = load_relationship(&state, id).await?;
     ensure_creator(&auth, &relationship)?;

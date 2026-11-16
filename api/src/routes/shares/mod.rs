@@ -24,9 +24,9 @@ use aruna_operations::shares::rules::required_permission;
 use aruna_operations::shares::store::{
     GetShareOperation, ListSharesOperation, ReadUsesOperation, ShareEventsOperation,
 };
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -34,7 +34,8 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{map_authorize_error, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::map_authorize_error;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
@@ -253,8 +254,7 @@ fn store_error(error: impl std::fmt::Display) -> ServerError {
 }
 
 /// Only a full portal or API session may act for its user beyond its own lifetime.
-fn require_creator(state: &ServerState, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
-    let auth = require_unrestricted_auth(state, auth)?;
+fn require_creator(auth: AuthContext) -> ServerResult<AuthContext> {
     let kind = auth.session.as_ref().map(|session| session.kind);
     match kind {
         None | Some(SessionKind::Portal | SessionKind::Api) => Ok(auth),
@@ -388,10 +388,10 @@ The caller needs READ on the target, or WRITE for `read_upload` and `upload`.
 )]
 pub async fn create_share(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<CreateShareRequest>,
 ) -> ServerResult<(StatusCode, Json<ShareDetails>)> {
-    let auth = require_creator(&state, auth)?;
+    let auth = require_creator(auth)?;
     let now = unix_timestamp_secs();
     let password = match request.password.as_deref() {
         Some(password) if password.is_empty() || password.len() > MAX_PASSWORD => {
@@ -467,9 +467,8 @@ pub async fn create_share(
 )]
 pub async fn list_shares(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<Json<ShareList>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let links = drive(ListSharesOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(store_error)?;
@@ -502,10 +501,9 @@ link, every other caller gets 404."#,
 )]
 pub async fn get_share(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<ShareDetails>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let link = own_share(&state, &auth, &id).await?;
     let uses = link_uses(&state, std::slice::from_ref(&link)).await?;
     let uses = uses.first().copied().unwrap_or_default();
@@ -538,10 +536,9 @@ pub async fn get_share(
 )]
 pub async fn revoke_share(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = Ulid::from_string(&id).map_err(|_| ServerError::NotFound)?;
     let revoke = RevokeShareOperation::new(auth.user_id, id, unix_timestamp_secs());
     drive(revoke, &state.get_ctx()).await.map_err(share_error)?;
@@ -570,11 +567,10 @@ pub async fn revoke_share(
 )]
 pub async fn share_log(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
     Query(query): Query<ShareLogQuery>,
 ) -> ServerResult<Json<ShareLog>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let link = own_share(&state, &auth, &id).await?;
     let limit = query.limit.unwrap_or(LOG_PAGE);
     if !(1..=1000).contains(&limit) {

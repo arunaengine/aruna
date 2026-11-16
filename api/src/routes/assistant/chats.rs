@@ -2,12 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{AssistantChatHead, AssistantChatTurn};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::assistant::{
@@ -15,9 +14,9 @@ use aruna_operations::assistant::{
     WriteTurnOperation,
 };
 use aruna_operations::driver::drive;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
@@ -204,9 +203,8 @@ refused. Chats are self-scoped, so a caller reaches only their own.
 )]
 pub async fn list_chats(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<ChatListResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let chats = drive(ListChatOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(map_chat_error)?
@@ -269,11 +267,10 @@ refused. Chats are self-scoped, so a caller writes only their own.
 )]
 pub async fn put_chat(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
     Json(request): Json<SaveChatRequest>,
 ) -> ServerResult<(StatusCode, Json<ChatHeadResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = check_chat_id(id)?;
     let title = check_title(&request.title)?;
     let subject = check_subject(request.subject)?;
@@ -329,11 +326,10 @@ refused. Chats are self-scoped, so a caller reaches only their own.
 )]
 pub async fn get_turns(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
     Query(query): Query<ChatTurnsQuery>,
 ) -> ServerResult<(StatusCode, Json<TurnListResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = check_chat_id(id)?;
     let turns = drive(
         ReadChatOperation::new(auth.user_id, id, query.after),
@@ -409,11 +405,10 @@ refused. Chats are self-scoped, so a caller writes only their own.
 )]
 pub async fn put_turn(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((id, seq)): Path<(String, u32)>,
     Json(request): Json<SaveTurnRequest>,
 ) -> ServerResult<(StatusCode, Json<ChatHeadResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = check_chat_id(id)?;
     let head = drive(
         WriteTurnOperation::new(
@@ -455,10 +450,9 @@ refused. Chats are self-scoped, so a caller deletes only their own.
 )]
 pub async fn delete_chat(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = check_chat_id(id)?;
     drive(
         DeleteChatOperation::new(auth.user_id, id, unix_timestamp_secs()),
