@@ -4,14 +4,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::vault::{append, read};
-use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
+use crate::auth::RealmAuth;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::VaultQuery;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::user::vault::{KEY_ID_BYTES, UserKeyRecord, VaultRecords};
 use aruna_operations::s3::holder_seal::seal_published;
 use aruna_operations::users::vault_write::{VaultAppended, VaultChange};
@@ -123,11 +124,10 @@ refused. A caller publishes only their own keys.
 )]
 pub async fn publish_key(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<PublishKeyRequest>,
 ) -> ServerResult<(StatusCode, Json<UserKeyResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if request.key_id.is_empty() || request.key_id.len() > KEY_ID_BYTES {
         return Err(ServerError::BadRequestReason(
             "key_id must hold 1 to 128 bytes".to_string(),
@@ -195,10 +195,9 @@ pub async fn publish_key(
 )]
 pub async fn list_keys(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<UserKeysResponse>)> {
-    require_realm_auth(&state, auth)?;
     let user_id = UserId::from_str(&id).map_err(|_| ServerError::BadRequest)?;
     let mut keys = match read(&state, user_id, VaultQuery::Keys).await? {
         VaultRecords::Keys(keys) => keys,
@@ -227,7 +226,7 @@ mod tests {
         let publish = |key_id: &str, public_key: String| {
             publish_key(
                 State(state.clone()),
-                Extension(Some(auth.clone())),
+                UnrestrictedAuth(auth.clone()),
                 Extension(None),
                 Json(PublishKeyRequest {
                     key_id: key_id.to_string(),
@@ -259,7 +258,7 @@ mod tests {
         let reader = realm_auth(state.get_realm_id());
         let (_, Json(listed)) = list_keys(
             State(state.clone()),
-            Extension(Some(reader)),
+            RealmAuth(reader),
             Path(auth.user_id.to_string()),
         )
         .await

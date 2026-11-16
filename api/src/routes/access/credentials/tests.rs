@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::{TokenAuth, UnrestrictedAuth};
 use crate::error::ServerError;
 use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state as build_state,
@@ -180,7 +181,7 @@ async fn create_credential(
 ) -> ServerResult<(StatusCode, Json<CreateS3Response>)> {
     create_s3_credentials(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        TokenAuth(auth.clone()),
         Extension(Some(crate::auth::ValidatedBearer::new_for_test("bearer"))),
         Json(CreateS3Request {
             group_id: group_id.to_string(),
@@ -238,7 +239,7 @@ async fn never_listed_null() {
         .await
         .unwrap();
 
-    let (_, Json(listed)) = list_s3_credentials(State(state), Extension(Some(auth)))
+    let (_, Json(listed)) = list_s3_credentials(State(state), UnrestrictedAuth(auth))
         .await
         .unwrap();
     let [entry] = listed.credentials.as_slice() else {
@@ -396,7 +397,7 @@ async fn writer_cannot_revoke() {
 
     let error = revoke_s3_credentials(
         State(state.clone()),
-        Extension(Some(auth)),
+        UnrestrictedAuth(auth),
         Path(access_key_id.clone()),
     )
     .await
@@ -597,13 +598,12 @@ async fn list_rejects_scope() {
     ] {
         let mut restricted = auth.clone();
         restricted.path_restrictions = restrictions;
-        let error = list_s3_credentials(State(state.clone()), Extension(Some(restricted)))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ServerError::Forbidden));
+        // `list_s3_credentials` takes `UnrestrictedAuth`, so the refusal is the extractor's.
+        let error = crate::auth::extract::<UnrestrictedAuth>(&state, Some(restricted)).await;
+        assert_eq!(error.err(), Some(StatusCode::FORBIDDEN));
     }
 
-    let (status, Json(response)) = list_s3_credentials(State(state), Extension(Some(auth)))
+    let (status, Json(response)) = list_s3_credentials(State(state), UnrestrictedAuth(auth))
         .await
         .unwrap();
     assert_eq!(status, StatusCode::OK);

@@ -9,19 +9,20 @@ use aruna_core::secrets::{Delivery, SecretScope};
 use aruna_core::structs::identity::admin_audit::{
     AdminAuditAction, AdminAuditRecord, AuditIndex, SecretAudit,
 };
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::placement::policy::document::policy_authority_path;
 use aruna_operations::driver::drive;
 use aruna_operations::users::admin_audit::{AuditPageInput, AuditPageOperation};
+use axum::Json;
 use axum::extract::{Query, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, parse_group_id, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -179,10 +180,9 @@ pub struct AdminAuditPage {
 )]
 pub async fn list_admin_audit(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<AdminAuditQuery>,
 ) -> ServerResult<Json<AdminAuditPage>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = query.group_id.as_deref().map(parse_group_id).transpose()?;
     let own = query.me.unwrap_or(false);
     if own && group_id.is_some() {

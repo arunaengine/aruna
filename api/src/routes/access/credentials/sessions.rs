@@ -6,7 +6,8 @@ use super::{
     authorize_credential_issuance, build_credential_restrictions, format_node_id,
     format_system_time, serialize_restrictions,
 };
-use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
+use crate::auth::ValidatedBearer;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
@@ -150,11 +151,10 @@ write scope on that group's data path. A read-only member receives a read-only s
 )]
 pub async fn create_s3_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<S3SessionRequest>,
 ) -> ServerResult<(StatusCode, Json<SessionTokenResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let group_id = request
         .group_id
@@ -232,9 +232,8 @@ group of the caller.
 )]
 pub async fn list_s3_sessions(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<S3SessionsResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let now = SystemTime::now();
     let issued_by = *state.get_node_id().as_bytes();
     let s3_endpoint = state
@@ -308,11 +307,10 @@ must still be a member of the session's group with READ or WRITE on some path un
 )]
 pub async fn refresh_s3_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(access_key_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<SessionTokenResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let session = drive(GetS3Operation::new(access_key_id.clone()), &state.get_ctx())
         .await
@@ -373,10 +371,9 @@ membership is not rechecked, so a session stays revocable after the caller left 
 )]
 pub async fn revoke_s3_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(access_key_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     drive(
         RevokeS3Operation::new(RevokeS3Config {
             access_key: access_key_id,

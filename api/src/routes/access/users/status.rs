@@ -2,19 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::UserId;
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::Actor;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::drive;
 use aruna_operations::users::account_status::{
     AccountStatusConfig, AccountStatusError, AccountStatusOperation,
 };
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -82,11 +82,10 @@ A service account never changes any account's status.
 )]
 async fn put_status(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
     Json(request): Json<AccountStatusRequest>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let target = UserId::from_string(&id).map_err(|_| ServerError::BadRequest)?;
     drive(
         AccountStatusOperation::new(AccountStatusConfig {

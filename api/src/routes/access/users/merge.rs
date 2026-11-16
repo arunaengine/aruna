@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{GetUserResponse, validate_oidc_token};
-use crate::auth::{ValidatedBearer, claims_for_revocation, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ValidatedBearer, claims_for_revocation};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::federation::link::bearer_auth_time;
 use crate::server::state::ServerState;
@@ -185,11 +186,10 @@ that account. Both prove control; a matching email or name is never enough.
 )]
 async fn merge_account(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<MergeAccountRequest>,
 ) -> ServerResult<Json<MergeAccountResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     charge(&state, auth.user_id)?;
     if !state.is_management_node() {
         return Err(not_coordinator(MergeError::NotCoordinator.to_string()));
@@ -282,11 +282,10 @@ minutes after its provider login.
 )]
 async fn attach_subject(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<AttachSubjectRequest>,
 ) -> ServerResult<Json<GetUserResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     charge(&state, auth.user_id)?;
     if !state.is_management_node() {
         return Err(not_coordinator(MergeError::NotCoordinator.to_string()));
@@ -368,10 +367,9 @@ async fn attach_subject(
 )]
 async fn hand_off(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<HandoffRequest>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if !state.is_management_node() {
         return Err(not_coordinator(MergeError::NotCoordinator.to_string()));
     }
@@ -435,7 +433,7 @@ mod tests {
         };
         let merged = merge_account(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            UnrestrictedAuth(auth.clone()),
             Extension(None),
             Json(merge),
         )
@@ -446,7 +444,7 @@ mod tests {
         };
         let attached = attach_subject(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            UnrestrictedAuth(auth.clone()),
             Extension(None),
             Json(attach),
         )
@@ -455,7 +453,7 @@ mod tests {
         let handoff = HandoffRequest {
             node_id: node_id.to_string(),
         };
-        let handed = hand_off(State(state), Extension(Some(auth)), Json(handoff)).await;
+        let handed = hand_off(State(state), UnrestrictedAuth(auth), Json(handoff)).await;
         assert_eq!(code(handed.err().unwrap()), expected);
     }
 }

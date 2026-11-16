@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{parse_group_id, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::credentials::{
     CreatePathRestriction, CreateS3Response, authorize_credential_issuance,
@@ -31,9 +32,9 @@ use aruna_operations::users::service_account::create::{
     CreateServiceConfig, CreateServiceError, CreateServiceOperation,
 };
 use aruna_operations::users::service_account::list::{ListServiceError, ListServiceOperation};
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -137,11 +138,10 @@ fn map_check_error(error: ServiceCheckError) -> ServerError {
 )]
 async fn create_account(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<String>,
     Json(request): Json<CreateServiceRequest>,
 ) -> ServerResult<(StatusCode, Json<ServiceAccountResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let user = drive(
         CreateServiceOperation::new(CreateServiceConfig {
@@ -193,10 +193,9 @@ async fn create_account(
 )]
 async fn list_accounts(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ListServiceResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let accounts = drive(ListServiceOperation::new(auth, group_id), &state.get_ctx())
         .await
@@ -256,11 +255,10 @@ async fn list_accounts(
 )]
 async fn create_token(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, account_id)): Path<(String, String)>,
     Json(request): Json<ServiceTokenRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateSessionResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let account_id = UserId::from_string(&account_id).map_err(|_| ServerError::BadRequest)?;
     crate::routes::plugin_installs::refuse_plugin_account(&state, account_id).await?;
@@ -372,11 +370,10 @@ async fn create_token(
 )]
 async fn create_credential(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, account_id)): Path<(String, String)>,
     Json(request): Json<ServiceCredentialRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateS3Response>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let account_id = UserId::from_string(&account_id).map_err(|_| ServerError::BadRequest)?;
     crate::routes::plugin_installs::refuse_plugin_account(&state, account_id).await?;

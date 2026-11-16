@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
@@ -195,7 +196,7 @@ async fn lists_own_sessions() {
     };
     let theirs = issue_session(&state, stranger.user_id, first_group, issuer).await;
 
-    let (_, Json(listed)) = list_s3_sessions(State(state.clone()), Extension(Some(auth)))
+    let (_, Json(listed)) = list_s3_sessions(State(state.clone()), UnrestrictedAuth(auth))
         .await
         .unwrap();
     let keys: Vec<&str> = listed
@@ -219,7 +220,7 @@ async fn lists_own_sessions() {
             .any(|session| session.group.id == second_group.to_string())
     );
 
-    let (_, Json(listed)) = list_s3_sessions(State(state), Extension(Some(stranger)))
+    let (_, Json(listed)) = list_s3_sessions(State(state), UnrestrictedAuth(stranger))
         .await
         .unwrap();
     assert_eq!(listed.sessions.len(), 1);
@@ -237,14 +238,14 @@ async fn revoke_prunes_index() {
 
     revoke_s3_session(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path(dropped.access_key_id),
     )
     .await
     .unwrap();
     let issued = issue_session(&state, auth.user_id, group_id, issuer).await;
 
-    let (_, Json(listed)) = list_s3_sessions(State(state), Extension(Some(auth)))
+    let (_, Json(listed)) = list_s3_sessions(State(state), UnrestrictedAuth(auth))
         .await
         .unwrap();
     let keys: Vec<&str> = listed
@@ -263,7 +264,7 @@ async fn hides_session_secrets() {
     let issuer = *state.get_node_id().as_bytes();
     let issued = issue_session(&state, auth.user_id, Ulid::generate(), issuer).await;
 
-    let (_, Json(listed)) = list_s3_sessions(State(state), Extension(Some(auth)))
+    let (_, Json(listed)) = list_s3_sessions(State(state), UnrestrictedAuth(auth))
         .await
         .unwrap();
     let body = serde_json::to_string(&listed).unwrap();
@@ -281,7 +282,7 @@ async fn revoke_drops_session() {
 
     let status = revoke_s3_session(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path(issued.access_key_id.clone()),
     )
     .await
@@ -293,13 +294,13 @@ async fn revoke_drops_session() {
             .is_none()
     );
 
-    let (_, Json(listed)) = list_s3_sessions(State(state.clone()), Extension(Some(auth.clone())))
+    let (_, Json(listed)) = list_s3_sessions(State(state.clone()), UnrestrictedAuth(auth.clone()))
         .await
         .unwrap();
     assert!(listed.sessions.is_empty());
     let refreshed = refresh_s3_session(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("bearer"))),
         Path(issued.access_key_id.clone()),
     )
@@ -307,7 +308,7 @@ async fn revoke_drops_session() {
     assert!(matches!(refreshed, Err(ServerError::NotFound)));
     let repeated = revoke_s3_session(
         State(state),
-        Extension(Some(auth)),
+        UnrestrictedAuth(auth),
         Path(issued.access_key_id),
     )
     .await
@@ -327,23 +328,9 @@ async fn restricted_cannot_manage() {
         permission: aruna_core::structs::identity::auth::Permission::READ,
     }]);
 
-    let listed = list_s3_sessions(State(state.clone()), Extension(Some(auth.clone()))).await;
-    assert!(matches!(listed, Err(ServerError::Forbidden)));
-    let refreshed = refresh_s3_session(
-        State(state.clone()),
-        Extension(Some(auth.clone())),
-        Extension(Some(ValidatedBearer::new_for_test("bearer"))),
-        Path(issued.access_key_id.clone()),
-    )
-    .await;
-    assert!(matches!(refreshed, Err(ServerError::Forbidden)));
-    let revoked = revoke_s3_session(
-        State(state.clone()),
-        Extension(Some(auth)),
-        Path(issued.access_key_id.clone()),
-    )
-    .await;
-    assert!(matches!(revoked, Err(ServerError::Forbidden)));
+    // The session routes take `UnrestrictedAuth`, so the refusal is the extractor's.
+    let refused = crate::auth::extract::<UnrestrictedAuth>(&state, Some(auth)).await;
+    assert_eq!(refused.err(), Some(StatusCode::FORBIDDEN));
     assert!(
         stored_session(&state, &issued.access_key_id)
             .await
@@ -364,7 +351,7 @@ async fn revoke_hides_foreign() {
 
     let error = revoke_s3_session(
         State(state.clone()),
-        Extension(Some(stranger)),
+        UnrestrictedAuth(stranger),
         Path(issued.access_key_id.clone()),
     )
     .await
@@ -385,7 +372,7 @@ async fn revoke_scoped_node() {
 
     let error = revoke_s3_session(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path(issued.access_key_id.clone()),
     )
     .await
@@ -397,7 +384,7 @@ async fn revoke_scoped_node() {
             .is_some()
     );
 
-    let (_, Json(listed)) = list_s3_sessions(State(state), Extension(Some(auth)))
+    let (_, Json(listed)) = list_s3_sessions(State(state), UnrestrictedAuth(auth))
         .await
         .unwrap();
     assert!(listed.sessions.is_empty());

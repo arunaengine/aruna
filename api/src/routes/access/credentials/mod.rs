@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_unrestricted_auth};
+use crate::auth::TokenAuth;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::AuthorizationError;
@@ -307,10 +309,8 @@ pub(crate) fn serialize_restrictions(
 )]
 pub async fn list_s3_credentials(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<ListS3Response>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-
     let credentials = drive(
         ListUserOperation::new(ListUserInput {
             user_identity: auth.user_id,
@@ -419,11 +419,10 @@ to the group data root and can never widen them.
 )]
 pub async fn create_s3_credentials(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    TokenAuth(auth): TokenAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateS3Request>,
 ) -> ServerResult<(StatusCode, Json<CreateS3Response>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
     let node_id = state.get_node_id();
@@ -579,11 +578,9 @@ WRITE on the group the credential is bound to is deliberately not enough.
 )]
 pub async fn revoke_s3_credentials(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(access_key_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-
     let credential = match drive(
         GetAccessOperation::new(access_key_id.clone()),
         &state.get_ctx(),

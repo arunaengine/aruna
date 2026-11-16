@@ -15,10 +15,12 @@ use aruna_operations::auth::bearer_token::{
 use aruna_operations::auth::request_authorization::AuthorizeError;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
-use axum::extract::Request;
+use axum::Extension;
+use axum::extract::{FromRequestParts, Request};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use http::HeaderMap;
+use http::request::Parts;
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
@@ -27,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -588,6 +591,101 @@ pub(crate) async fn require_owner(
         return Err(ServerError::Forbidden);
     }
     Ok(auth)
+}
+
+/// A signed-in caller of any realm; answers like a missing token otherwise.
+pub struct TokenAuth(pub AuthContext);
+
+/// A signed-in caller of this realm, checked by [`require_realm_auth`].
+pub struct RealmAuth(pub AuthContext);
+
+/// A caller of this realm without path restrictions, checked by [`require_unrestricted_auth`].
+pub struct UnrestrictedAuth(pub AuthContext);
+
+/// The bound owner of this device, checked by [`require_owner`].
+pub struct OwnerAuth(pub AuthContext);
+
+/// Reads the context the auth middleware stored; a missing one answers like `Extension` does.
+async fn request_auth(
+    parts: &mut Parts,
+    state: &Arc<ServerState>,
+) -> Result<Option<AuthContext>, Response> {
+    Extension::<Option<AuthContext>>::from_request_parts(parts, state)
+        .await
+        .map(|Extension(auth)| auth)
+        .map_err(IntoResponse::into_response)
+}
+
+impl FromRequestParts<Arc<ServerState>> for TokenAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<ServerState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = request_auth(parts, state).await?;
+        auth.map(Self)
+            .ok_or_else(|| ServerError::Unauthorized.into_response())
+    }
+}
+
+impl FromRequestParts<Arc<ServerState>> for RealmAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<ServerState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = request_auth(parts, state).await?;
+        require_realm_auth(state, auth)
+            .map(Self)
+            .map_err(IntoResponse::into_response)
+    }
+}
+
+impl FromRequestParts<Arc<ServerState>> for UnrestrictedAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<ServerState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = request_auth(parts, state).await?;
+        require_unrestricted_auth(state, auth)
+            .map(Self)
+            .map_err(IntoResponse::into_response)
+    }
+}
+
+impl FromRequestParts<Arc<ServerState>> for OwnerAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<ServerState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = request_auth(parts, state).await?;
+        require_owner(state, auth)
+            .await
+            .map(Self)
+            .map_err(IntoResponse::into_response)
+    }
+}
+
+/// Runs an auth extractor on a request that carries `auth` as the middleware leaves it.
+#[cfg(test)]
+pub(crate) async fn extract<T>(
+    state: &Arc<ServerState>,
+    auth: Option<AuthContext>,
+) -> Result<T, axum::http::StatusCode>
+where
+    T: FromRequestParts<Arc<ServerState>, Rejection = Response>,
+{
+    let (mut parts, ()) = Request::new(()).into_parts();
+    parts.extensions.insert(auth);
+    T::from_request_parts(&mut parts, state)
+        .await
+        .map_err(|response| response.status())
 }
 
 pub(crate) async fn ensure_permission(

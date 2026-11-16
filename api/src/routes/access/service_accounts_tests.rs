@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::auth::handle_token;
 use crate::routes::access::audit::{AdminAuditQuery, list_admin_audit};
 use crate::tests::routes::{seed_group_docs, test_context, test_state, test_storage, write_doc};
@@ -80,7 +81,7 @@ async fn fixture() -> Fixture {
 async fn create(fixture: &Fixture, auth: &AuthContext) -> ServerResult<ServiceAccountResponse> {
     create_account(
         State(fixture.state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path(fixture.group.clone()),
         Json(CreateServiceRequest {
             name: "Nightly import".to_string(),
@@ -97,7 +98,7 @@ async fn token(
 ) -> ServerResult<CreateSessionResponse> {
     create_token(
         State(fixture.state.clone()),
-        Extension(Some(fixture.admin.clone())),
+        UnrestrictedAuth(fixture.admin.clone()),
         Path((fixture.group.clone(), account.to_string())),
         Json(ServiceTokenRequest {
             expires_in_seconds: Some(600),
@@ -116,7 +117,7 @@ async fn credential(
 ) -> ServerResult<CreateS3Response> {
     create_credential(
         State(fixture.state.clone()),
-        Extension(Some(caller.clone())),
+        UnrestrictedAuth(caller.clone()),
         Path((fixture.group.clone(), account.to_string())),
         Json(request),
     )
@@ -176,7 +177,7 @@ async fn admin_creates_lists() {
 
     let (_, Json(listed)) = list_accounts(
         State(fixture.state.clone()),
-        Extension(Some(fixture.admin.clone())),
+        UnrestrictedAuth(fixture.admin.clone()),
         Path(fixture.group.clone()),
     )
     .await
@@ -316,7 +317,7 @@ async fn audit_rows_scoped() {
     let read = |auth: &AuthContext, group_id: Option<String>, cursor: Option<String>| {
         list_admin_audit(
             State(fixture.state.clone()),
-            Extension(Some(auth.clone())),
+            UnrestrictedAuth(auth.clone()),
             Query(AdminAuditQuery {
                 group_id,
                 cursor,
@@ -393,7 +394,7 @@ async fn credential_outlives_tokens() {
 
     let Json(page) = list_admin_audit(
         State(fixture.state.clone()),
-        Extension(Some(fixture.admin.clone())),
+        UnrestrictedAuth(fixture.admin.clone()),
         Query(AdminAuditQuery {
             group_id: Some(fixture.group.clone()),
             cursor: None,
@@ -445,8 +446,11 @@ async fn credential_callers_refused() {
         other_admin.user_id,
     )
     .await;
+    // `create_credential` takes `UnrestrictedAuth`, so the restricted refusal is its check.
+    let refused = crate::auth::require_unrestricted_auth(&fixture.state, Some(restricted));
+    assert!(matches!(refused, Err(ServerError::Forbidden)));
     let service = as_account(&fixture, &account);
-    for caller in [&restricted, &other_admin, &service] {
+    for caller in [&other_admin, &service] {
         let refused = credential(&fixture, caller, &account.id, lifetime(600)).await;
         assert!(
             matches!(refused, Err(ServerError::Forbidden)),

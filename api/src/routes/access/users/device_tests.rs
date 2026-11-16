@@ -6,6 +6,8 @@ use super::{
     UserDeviceResponse, evict_device, list_user_devices, preferences_from_attributes,
     revoke_user_device,
 };
+use crate::auth::UnrestrictedAuth;
+use crate::auth::extract;
 use crate::error::ServerError;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
@@ -160,7 +162,7 @@ fn auth(user_id: UserId) -> AuthContext {
 }
 
 async fn devices(state: &Arc<ServerState>, owner: UserId) -> Vec<UserDeviceResponse> {
-    let (_, Json(listed)) = list_user_devices(State(state.clone()), Extension(Some(auth(owner))))
+    let (_, Json(listed)) = list_user_devices(State(state.clone()), UnrestrictedAuth(auth(owner)))
         .await
         .unwrap();
     listed.devices
@@ -207,7 +209,7 @@ async fn revokes_pending_device() {
 
     let status = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.owner))),
+        UnrestrictedAuth(auth(fixture.owner)),
         Path(pending.id.clone()),
     )
     .await
@@ -218,7 +220,7 @@ async fn revokes_pending_device() {
 
     let repeated = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.owner))),
+        UnrestrictedAuth(auth(fixture.owner)),
         Path(pending.id),
     )
     .await;
@@ -239,14 +241,15 @@ async fn rejects_stranger_device() {
 
     let foreign = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.owner))),
+        UnrestrictedAuth(auth(fixture.owner)),
         Path(node(3).to_string()),
     )
     .await;
     assert!(matches!(foreign, Err(ServerError::NotFound)));
 
-    let anonymous = list_user_devices(State(fixture.state), Extension(None)).await;
-    assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+    // `list_user_devices` takes `UnrestrictedAuth`, so the refusal is the extractor's.
+    let anonymous = extract::<UnrestrictedAuth>(&fixture.state, None).await;
+    assert_eq!(anonymous.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -257,7 +260,7 @@ async fn evicts_enrolled_device() {
 
     let status = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.owner))),
+        UnrestrictedAuth(auth(fixture.owner)),
         Path(node(2).to_string()),
     )
     .await
@@ -269,7 +272,7 @@ async fn evicts_enrolled_device() {
 
     let repeated = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.owner))),
+        UnrestrictedAuth(auth(fixture.owner)),
         Path(node(2).to_string()),
     )
     .await;
@@ -307,7 +310,7 @@ async fn admin_evicts_device() {
 
     let status = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.other))),
+        UnrestrictedAuth(auth(fixture.other)),
         Path(node(3).to_string()),
     )
     .await

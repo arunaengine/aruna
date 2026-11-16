@@ -7,7 +7,9 @@ mod merge;
 mod status;
 mod vault;
 
-use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{OidcIdentity, bearer_token, ensure_permission};
+use crate::auth::{RealmAuth, TokenAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::onboarding::authorize_onboarding_admin;
 use crate::server::state::ServerState;
@@ -957,9 +959,8 @@ takes no user id.
 )]
 async fn get_user_info(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    TokenAuth(auth): TokenAuth,
 ) -> ServerResult<(StatusCode, Json<UserInfoResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     Ok((
         StatusCode::OK,
         Json(build_user_response(&state, auth).await?),
@@ -1056,14 +1057,10 @@ user document and takes no user id.
 )]
 async fn patch_user_info(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<PatchUserRequest>,
 ) -> ServerResult<(StatusCode, Json<UserInfoResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
-    if auth.realm_id != realm_id || auth.path_restrictions.is_some() {
-        return Err(ServerError::Forbidden);
-    }
 
     drive(
         UpdateUserOperation::new(UpdateUserInput {
@@ -1161,14 +1158,10 @@ request policies are evaluated as well and may deny a read the role grant alone 
 )]
 async fn list_users(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<ListUsersQuery>,
 ) -> ServerResult<(StatusCode, Json<ListUsersResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
-    if auth.realm_id != realm_id {
-        return Err(ServerError::Forbidden);
-    }
 
     let limit = query
         .limit
@@ -1287,14 +1280,10 @@ pub(crate) async fn authorize_directory(
 )]
 async fn search_users(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<SearchUsersQuery>,
 ) -> ServerResult<(StatusCode, Json<SearchUsersResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
-    if auth.realm_id != realm_id {
-        return Err(ServerError::Forbidden);
-    }
     let q = query.q.trim().to_string();
     if q.chars().count() < MIN_QUERY_CHARS {
         return Err(ServerError::BadRequest);
@@ -1390,14 +1379,10 @@ async fn search_users(
 )]
 async fn resolve_users(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<ResolveUsersRequest>,
 ) -> ServerResult<(StatusCode, Json<Vec<ResolveUserResult>>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
-    if auth.realm_id != realm_id {
-        return Err(ServerError::Forbidden);
-    }
     if request.user_ids.len() > MAX_USER_IDS {
         return Err(ServerError::BadRequest);
     }
@@ -1472,10 +1457,9 @@ complete document. Realm request policies may deny either read.
 )]
 async fn get_user(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    TokenAuth(auth): TokenAuth,
     Path(user_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GetUserResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
     if auth.realm_id != realm_id {
         // TODO: Forwarding for foreign realm users
@@ -1588,15 +1572,11 @@ path and additionally passes the realm request policies.
 )]
 async fn update_user(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(user_id): Path<String>,
     Json(request): Json<UpdateUserRequest>,
 ) -> ServerResult<(StatusCode, Json<GetUserResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
-    if auth.realm_id != realm_id {
-        return Err(ServerError::Forbidden);
-    }
 
     // A non-self update is a privileged write; run the realm policy and RBAC
     // boundary at the route before the operation repeats it as defense in depth.
@@ -1774,9 +1754,8 @@ devices and takes no user id, so it grants no view of anybody else's.
 )]
 async fn list_user_devices(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<UserDevicesResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let devices = owned_devices(&state, auth.user_id).await?;
     Ok((StatusCode::OK, Json(UserDevicesResponse { devices })))
 }
@@ -1813,10 +1792,9 @@ can be revoked; a device owned by anybody else answers 404 rather than admitting
 )]
 async fn revoke_user_device(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(device_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let device = owned_devices(&state, auth.user_id)
         .await?
         .into_iter()

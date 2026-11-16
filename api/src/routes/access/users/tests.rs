@@ -4,6 +4,7 @@
 
 use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse, enrollment_status};
 use crate::auth::{OidcValidator, handle_token};
+use crate::auth::{RealmAuth, TokenAuth};
 use crate::routes::access::sessions::{CreateSessionRequest, CreateSessionResponse};
 use crate::server::Server;
 use crate::server::ServerConfig;
@@ -1300,7 +1301,7 @@ async fn policy_denies_update() {
 
     let allowed = super::update_user(
         axum::extract::State(node.state.clone()),
-        axum::Extension(Some(admin.clone())),
+        RealmAuth(admin.clone()),
         axum::extract::Path(target.id.clone()),
         axum::Json(rename("FirstRename")),
     )
@@ -1311,7 +1312,7 @@ async fn policy_denies_update() {
 
     let denied = super::update_user(
         axum::extract::State(node.state.clone()),
-        axum::Extension(Some(admin.clone())),
+        RealmAuth(admin.clone()),
         axum::extract::Path(target.id.clone()),
         axum::Json(rename("SecondRename")),
     )
@@ -1320,7 +1321,7 @@ async fn policy_denies_update() {
 
     let fetched = super::get_user(
         axum::extract::State(node.state.clone()),
-        axum::Extension(Some(admin)),
+        TokenAuth(admin),
         axum::extract::Path(target.id.clone()),
     )
     .await
@@ -1397,7 +1398,7 @@ async fn policy_denies_reads() {
 
     let fetched = super::get_user(
         axum::extract::State(node.state.clone()),
-        axum::Extension(Some(admin.clone())),
+        TokenAuth(admin.clone()),
         axum::extract::Path(target.id.clone()),
     )
     .await
@@ -1405,7 +1406,7 @@ async fn policy_denies_reads() {
     assert_eq!(fetched.1.0.name, "Target Bob");
     let listed = super::list_users(
         axum::extract::State(node.state.clone()),
-        axum::Extension(Some(admin.clone())),
+        RealmAuth(admin.clone()),
         query(),
     )
     .await
@@ -1416,7 +1417,7 @@ async fn policy_denies_reads() {
 
     let denied_get = super::get_user(
         axum::extract::State(node.state.clone()),
-        axum::Extension(Some(admin.clone())),
+        TokenAuth(admin.clone()),
         axum::extract::Path(target.id.clone()),
     )
     .await;
@@ -1426,7 +1427,7 @@ async fn policy_denies_reads() {
     ));
     let denied_list = super::list_users(
         axum::extract::State(node.state.clone()),
-        axum::Extension(Some(admin)),
+        RealmAuth(admin),
         query(),
     )
     .await;
