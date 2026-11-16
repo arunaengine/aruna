@@ -22,7 +22,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::super::jobs::{JobOutputResponse, map_job_request, map_job_route, output_response};
+use super::super::jobs::{JobOutputResponse, map_job_route, output_response};
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::hex32;
@@ -322,7 +322,7 @@ pub async fn get_job_audit(
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<JobAuditResponse>)> {
     let auth: AuthContext = require_unrestricted_auth(&state, auth)?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let (range, scope) = parse_range(query.scope.as_deref())?;
     let paging = parse_paging(&query)?;
     let context = state.get_ctx();

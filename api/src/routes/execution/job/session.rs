@@ -45,7 +45,7 @@ use crate::auth::{blob_permission_path, ensure_permission, require_unrestricted_
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::owned_session_job;
 use crate::routes::execution::jobs::{
-    JobStatusResponse, coded_response, job_status_response, map_job_request, map_submit_error,
+    JobStatusResponse, coded_response, job_status_response, map_submit_error,
 };
 use crate::routes::staging::queue_live_replication;
 use crate::server::state::ServerState;
@@ -443,7 +443,7 @@ pub async fn get_session(
     let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => Ok(Json(session_response(&session, true)).into_response()),
         Err(response) => Ok(response),
@@ -491,7 +491,7 @@ pub async fn stream_session(
     let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -651,7 +651,7 @@ pub async fn submit_cell(
     let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -700,7 +700,7 @@ pub async fn interrupt_session(
     let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -750,7 +750,7 @@ pub async fn end_session(
     let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -816,7 +816,7 @@ pub async fn stage_inputs(
     let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -1147,7 +1147,7 @@ pub async fn list_scratch(
     let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -1201,7 +1201,7 @@ pub async fn read_scratch(
     let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),

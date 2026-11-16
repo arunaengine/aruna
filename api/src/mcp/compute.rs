@@ -419,7 +419,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(|error| job_error(map_job_request(error)))?;
+        .map_err(|error| job_error(error.into()))?;
         accepted_payload(&self.state, response).await
     }
 
@@ -442,7 +442,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(|error| job_error(map_job_request(error)))?;
+            .map_err(|error| job_error(error.into()))?;
         let position = session
             .submit_cell(&input.cell_id, &input.code)
             .map_err(bad_request)?;
@@ -475,7 +475,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(|error| job_error(map_job_request(error)))?;
+            .map_err(|error| job_error(error.into()))?;
         let (last_event_id, outputs) =
             session.cell_outputs(&input.cell_id, input.after.unwrap_or_default());
         Ok(Json(JsonPayload(json!({
@@ -504,7 +504,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(|error| job_error(map_job_request(error)))?;
+            .map_err(|error| job_error(error.into()))?;
         session.interrupt().map_err(bad_request)?;
         Ok(Json(JsonPayload(json!({ "interrupted": true }))))
     }
@@ -532,7 +532,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(|error| job_error(map_job_request(error)))?;
+            .map_err(|error| job_error(error.into()))?;
         session.end(aruna_compute::session::EndReason::Ended);
         Ok(Json(JsonPayload(json!({ "ended": true }))))
     }
@@ -600,7 +600,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(|error| submit_error(map_job_request(error)))?;
+        .map_err(|error| submit_error(error.into()))?;
         accepted_payload(&self.state, response).await
     }
 
@@ -623,7 +623,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(|error| submit_error(map_job_request(error)))?;
+        .map_err(|error| submit_error(error.into()))?;
         accepted_payload(&self.state, response).await
     }
 
@@ -1015,27 +1015,6 @@ fn submit_error(error: crate::error::ServerError) -> CallToolResult {
             "the caller needs write permission on the group and on the workspace bucket",
         ),
         error => server_error(error),
-    }
-}
-
-/// Maps the shared job outcome onto the REST status the tool explanations
-/// were written for.
-fn map_job_request(error: crate::jobs::JobRequestError) -> crate::error::ServerError {
-    use crate::error::ServerError;
-    use crate::jobs::JobRequestError;
-    match error {
-        JobRequestError::BadRequest => ServerError::BadRequest,
-        JobRequestError::BadRequestMessage(message) => ServerError::BadRequestMessage(message),
-        JobRequestError::Unauthorized => ServerError::Unauthorized,
-        JobRequestError::Forbidden => ServerError::Forbidden,
-        JobRequestError::NotFound => ServerError::NotFound,
-        JobRequestError::Conflict(message) => ServerError::Conflict(message),
-        JobRequestError::JobPlanConflict(message) => ServerError::JobPlanConflict(message),
-        JobRequestError::ComputeQuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
-        JobRequestError::ServiceUnavailableReason(message) => {
-            ServerError::ServiceUnavailableReason(message)
-        }
-        JobRequestError::InternalError(message) => ServerError::InternalError(message.into()),
     }
 }
 

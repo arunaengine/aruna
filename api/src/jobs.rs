@@ -64,6 +64,26 @@ pub(crate) enum JobRequestError {
     InternalError(String),
 }
 
+/// The REST status and body of a transport-independent job refusal.
+impl From<JobRequestError> for ServerError {
+    fn from(error: JobRequestError) -> Self {
+        match error {
+            JobRequestError::BadRequest => Self::BadRequest,
+            JobRequestError::BadRequestMessage(message) => Self::BadRequestMessage(message),
+            JobRequestError::Unauthorized => Self::Unauthorized,
+            JobRequestError::Forbidden => Self::Forbidden,
+            JobRequestError::NotFound => Self::NotFound,
+            JobRequestError::Conflict(message) => Self::Conflict(message),
+            JobRequestError::JobPlanConflict(message) => Self::JobPlanConflict(message),
+            JobRequestError::ComputeQuotaDenied(denied) => Self::ComputeQuotaDenied(denied),
+            JobRequestError::ServiceUnavailableReason(message) => {
+                Self::ServiceUnavailableReason(message)
+            }
+            JobRequestError::InternalError(message) => Self::InternalError(message.into()),
+        }
+    }
+}
+
 impl JobRequestError {
     /// Folds a refusal raised by a shared authorization or forwarding helper;
     /// the transports never see the helper's own error type.

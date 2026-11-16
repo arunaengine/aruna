@@ -51,7 +51,7 @@ use utoipa_axum::routes;
 use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::jobs::{JobRequestError, admit_execution, hex32};
+use crate::jobs::{admit_execution, hex32};
 use crate::rate_limit::LocalKey;
 use crate::server::state::{RestInterfaceRuntime, ServerState};
 
@@ -978,24 +978,6 @@ pub(crate) fn map_submit_error(
     }
 }
 
-/// The REST status and body of a transport-independent job refusal.
-pub(crate) fn map_job_request(error: JobRequestError) -> ServerError {
-    match error {
-        JobRequestError::BadRequest => ServerError::BadRequest,
-        JobRequestError::BadRequestMessage(message) => ServerError::BadRequestMessage(message),
-        JobRequestError::Unauthorized => ServerError::Unauthorized,
-        JobRequestError::Forbidden => ServerError::Forbidden,
-        JobRequestError::NotFound => ServerError::NotFound,
-        JobRequestError::Conflict(message) => ServerError::Conflict(message),
-        JobRequestError::JobPlanConflict(message) => ServerError::JobPlanConflict(message),
-        JobRequestError::ComputeQuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
-        JobRequestError::ServiceUnavailableReason(message) => {
-            ServerError::ServiceUnavailableReason(message)
-        }
-        JobRequestError::InternalError(message) => ServerError::InternalError(message.into()),
-    }
-}
-
 #[utoipa::path(
     get,
     path = "/compute/jobs",
@@ -1309,7 +1291,7 @@ pub async fn submit_job(
         PolicyRequestExtras::rest(),
     )
     .await
-    .map_err(map_job_request)?;
+    .map_err(ServerError::from)?;
     // The transport owns the HTTP status; the application outcome is `created`.
     let status = if response.created {
         StatusCode::CREATED
@@ -1533,7 +1515,7 @@ pub async fn get_job(
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     // A distributed external job is answered from the replicated family; every
     // other job keeps the owner-routed view.
     if let Some(report) = family_report(&state.get_ctx(), &auth, job_id).await {
@@ -1744,7 +1726,7 @@ pub async fn get_job_report(
     Query(query): Query<ReportQuery>,
 ) -> ServerResult<Response> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let cursor = decode_report_cursor(query.cursor.as_deref())?;
     if cursor
         .as_ref()
@@ -1897,7 +1879,7 @@ async fn artifact_response(
     headers: HeaderMap,
     download: bool,
 ) -> ServerResult<Response> {
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let now_ms = aruna_core::time::unix_timestamp_millis();
     // A destination realm reads with an export grant, only here on the owner node.
     let grant = crate::routes::federation::export::grant_header(&headers)?;
@@ -2213,7 +2195,7 @@ pub async fn delete_job(
     Path(job_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let outcome = delete_owned_run(&state.get_ctx(), &auth, job_id)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
@@ -2317,7 +2299,7 @@ pub async fn cancel_job(
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
     let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
 
     let outcome = cancel_job_routed(
         &state.get_ctx(),

@@ -22,7 +22,7 @@ use aruna_operations::device::publish_run::{
 
 use crate::auth::require_owner;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::execution::jobs::{map_job_request, map_local_error};
+use crate::routes::execution::jobs::map_local_error;
 use crate::server::state::ServerState;
 
 /// The device tag itself is declared by the device plane's own document.
@@ -270,7 +270,7 @@ async fn publish_device_run(
     Json(request): Json<PublishRunRequest>,
 ) -> ServerResult<Json<PublishRunResponse>> {
     let auth = require_owner(&state, auth).await?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let node_id = NodeId::from_str(&request.node_id)
         .map_err(|_| ServerError::BadRequestReason("node_id is not a node id".to_string()))?;
     let published = publish_run(
@@ -329,7 +329,7 @@ async fn get_local_crate(
     Path(job_id): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
     let auth = require_owner(&state, auth).await?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let jsonld = local_run_crate(&state.get_ctx(), job_id, auth.user_id)
         .await
         .map_err(map_publish_error)?;
