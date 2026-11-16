@@ -1,4 +1,4 @@
-//! Ignored timing gate that samples the document propagation tail under sustained writes.
+//! Ignored load test that documents written at a steady pace under load converge on every node.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -19,7 +19,6 @@ use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::projector::project_logged_events;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
@@ -31,7 +30,6 @@ use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
-use tokio::time::{MissedTickBehavior, sleep};
 use ulid::Ulid;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -46,10 +44,6 @@ const PROJECTION_BATCH: usize = 32;
 const WRITERS: usize = 24;
 const DOCS_PER_WRITER: usize = 500;
 const WRITER_PERIOD: Duration = Duration::from_millis(40);
-const PROBE_PERIOD: Duration = Duration::from_millis(500);
-const PROBE_POLL: Duration = Duration::from_millis(50);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
-const P95_TARGET_MS: u128 = 5000;
 
 struct TestNode {
     _temp_dir: Option<TempDir>,
@@ -73,210 +67,45 @@ fn make_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
         .build()?)
 }
 
-// Reproduces the per-document propagation tail seen in the 3-node cluster.
+// The load of the propagation tail seen in the 3-node cluster. Its latency
+// percentiles are measured by the measure example.
 #[test]
-#[ignore] // timing gate: run in release, like the metadata_throughput gates
+#[ignore]
 fn sustained_load_converges() -> Result<(), BoxError> {
     init_logging();
     let runtime = make_runtime()?;
-    let outcome = runtime.block_on(async {
+    runtime.block_on(async {
         let realm_id = RealmId([125u8; 32]);
         let nodes = build_realm_nodes(&realm_id, 3).await?;
         let targets = node_targets(&nodes);
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
         let group_id = Ulid::generate();
 
-        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
-        let sampler = tokio::spawn(run_sampler(
-            realm_id,
-            group_id,
-            targets.clone(),
-            contexts.clone(),
-            done_rx,
-        ));
-
-        let started = Instant::now();
         let mut handles = Vec::with_capacity(WRITERS);
         for writer in 0..WRITERS {
             let targets = targets.clone();
             handles.push(tokio::spawn(async move {
-                run_paced_writer(realm_id, group_id, "tail", writer, DOCS_PER_WRITER, targets)
-                    .await
+                run_paced_writer(realm_id, group_id, "tail", writer, DOCS_PER_WRITER, targets).await
             }));
         }
         let mut created: Vec<(GroupId, Ulid, Instant)> = Vec::new();
         for handle in handles {
             created.extend(handle.await??);
         }
-        let ingest_seconds = started.elapsed().as_secs_f64();
-        let total = created.len();
-        let ingest_rate = total as f64 / ingest_seconds;
-        let _ = done_tx.send(true);
-        println!("ingest done: docs={total} ingest_seconds={ingest_seconds:.3} ingest_docs_per_sec={ingest_rate:.1}");
-
         let pairs: Vec<(GroupId, Ulid)> = created
             .iter()
             .map(|(group_id, document_id, _)| (*group_id, *document_id))
             .collect();
-        let convergence = async {
-            wait_for_visibility(&contexts, &pairs, Duration::from_millis(200)).await?;
-            wait_empty_queues(&contexts).await?;
-            Ok::<f64, BoxError>(started.elapsed().as_secs_f64())
+        let result = match wait_for_visibility(&contexts, &pairs, Duration::from_millis(200)).await
+        {
+            Ok(()) => wait_empty_queues(&contexts).await,
+            Err(error) => Err(error),
         };
-        let (sampler_result, convergence_result) = tokio::join!(sampler, convergence);
-        let (mut latencies, failures) = sampler_result??;
-        let convergence_seconds = convergence_result?;
-
         shutdown_nodes(nodes).await;
-        latencies.sort_unstable();
-        Ok::<_, BoxError>((
-            latencies,
-            failures,
-            total,
-            ingest_seconds,
-            ingest_rate,
-            convergence_seconds,
-        ))
+        Ok::<(), BoxError>(result?)
     })?;
     runtime.shutdown_timeout(Duration::from_secs(10));
-
-    let (latencies, failures, total, ingest_seconds, ingest_rate, convergence_seconds) = outcome;
-    let p50 = percentile(&latencies, 50.0);
-    let p90 = percentile(&latencies, 90.0);
-    let p95 = percentile(&latencies, 95.0);
-    let max = latencies.last().copied().unwrap_or(0);
-    println!(
-        "probes={} probe_failures={failures} probe_p50_ms={p50} probe_p90_ms={p90} probe_p95_ms={p95} probe_max_ms={max}",
-        latencies.len() + failures
-    );
-    println!(
-        "docs={total} ingest_seconds={ingest_seconds:.3} ingest_docs_per_sec={ingest_rate:.1} convergence_seconds={convergence_seconds:.3}"
-    );
-
-    assert_eq!(
-        failures, 0,
-        "{failures} probes did not become visible on all nodes within {PROBE_TIMEOUT:?}"
-    );
-    if p95 > P95_TARGET_MS {
-        println!("TAIL TARGET VIOLATED locally: p95={p95}ms (target <= {P95_TARGET_MS}ms)");
-    }
-    assert!(
-        p95 <= P95_TARGET_MS,
-        "TAIL TARGET VIOLATED locally: p95={p95}ms (target <= {P95_TARGET_MS}ms)"
-    );
     Ok(())
-}
-
-fn percentile(sorted: &[u128], pct: f64) -> u128 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let rank = ((sorted.len() as f64) * pct / 100.0).ceil() as usize;
-    sorted[rank.clamp(1, sorted.len()) - 1]
-}
-
-async fn run_sampler(
-    realm_id: RealmId,
-    group_id: GroupId,
-    targets: Vec<(NodeId, Arc<DriverContext>)>,
-    contexts: Vec<Arc<DriverContext>>,
-    mut ingest_done: tokio::sync::watch::Receiver<bool>,
-) -> Result<(Vec<u128>, usize), BoxError> {
-    let mut ticker = tokio::time::interval(PROBE_PERIOD);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut index = 0usize;
-    let mut waiters = Vec::new();
-    let config = drive(GetConfigOperation::new(realm_id), targets[0].1.as_ref())
-        .await
-        .map_err(|error| format!("realm config load failed: {error:?}"))?;
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {}
-            _ = ingest_done.changed() => break,
-        }
-        if *ingest_done.borrow() {
-            break;
-        }
-        let slot = index % targets.len();
-        let (node_id, context) = targets[slot].clone();
-        let document_path = format!("probe/tail-{index}");
-        let actor = Actor {
-            node_id,
-            user_id: UserId::local(Ulid::generate(), realm_id),
-            realm_id,
-        };
-        let document_id = mint_local_document(&config, &actor, group_id, &document_path)
-            .map_err(|error| format!("mint failed index={index}: {error:?}"))?
-            .as_ulid();
-        let t0 = Instant::now();
-        let result = drive(
-            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-                actor,
-                group_id,
-                document_id,
-                document_path,
-                public: true,
-                payload: scaffold_payload("probe", 0, index),
-            }),
-            context.as_ref(),
-        )
-        .await
-        .map_err(|error| format!("probe create failed index={index}: {error:?}"))?;
-        project_logged_events(
-            context.as_ref(),
-            vec![(result.record.document_id, result.record.last_event_id)],
-        )
-        .await
-        .map_err(|error| format!("probe projection failed index={index}: {error:?}"))?;
-
-        let probe_id = result.record.document_id;
-        let contexts = contexts.clone();
-        waiters.push(tokio::spawn(async move {
-            wait_all_visible(&contexts, group_id, probe_id, t0).await
-        }));
-        index += 1;
-    }
-
-    let mut latencies = Vec::with_capacity(waiters.len());
-    let mut failures = 0usize;
-    for waiter in waiters {
-        match waiter.await? {
-            Some(elapsed) => latencies.push(elapsed.as_millis()),
-            None => failures += 1,
-        }
-    }
-    Ok((latencies, failures))
-}
-
-async fn wait_all_visible(
-    contexts: &[Arc<DriverContext>],
-    group_id: GroupId,
-    document_id: Ulid,
-    t0: Instant,
-) -> Option<Duration> {
-    let mut pending: Vec<Arc<DriverContext>> = contexts.to_vec();
-    loop {
-        let mut still_missing = Vec::with_capacity(pending.len());
-        for context in pending {
-            if drive(
-                GetDocumentOperation::new(group_id, document_id),
-                context.as_ref(),
-            )
-            .await
-            .is_err()
-            {
-                still_missing.push(context);
-            }
-        }
-        pending = still_missing;
-        if pending.is_empty() {
-            return Some(t0.elapsed());
-        }
-        if t0.elapsed() > PROBE_TIMEOUT {
-            return None;
-        }
-        sleep(PROBE_POLL).await;
-    }
 }
 
 fn node_targets(nodes: &[TestNode]) -> Vec<(NodeId, Arc<DriverContext>)> {
