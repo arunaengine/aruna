@@ -775,6 +775,7 @@ fn status_response(status: StatusCode) -> Response {
 
 /// Escapes the five XML entities and drops characters XML 1.0 cannot represent,
 /// so a conforming harvester can always parse the response.
+/// Not `quick_xml::escape::escape`: that one writes `\r` as `&#13;`, this keeps it raw.
 fn escape_xml(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
