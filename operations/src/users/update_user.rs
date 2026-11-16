@@ -1061,6 +1061,7 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::operation::Operation;
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key, sync_revision_key};
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -1871,16 +1872,16 @@ mod pure_tests {
     fn terminal_rejects_event() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
-        let mut operation = UpdateUserOperation::new(input(realm_id, user_id, user_id));
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::generate(),
-        }));
-
-        assert!(effects.is_empty());
-        assert!(matches!(
-            operation.finalize(),
-            Err(UpdateUserError::UnexpectedEvent { .. })
-        ));
+        let make = || UpdateUserOperation::new(input(realm_id, user_id, user_id));
+        for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    UpdateUserError::UnexpectedEvent { .. } | UpdateUserError::StorageError(_)
+                ),
+                "{error:?}"
+            );
+        }
     }
 }

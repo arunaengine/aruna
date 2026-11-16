@@ -1728,6 +1728,7 @@ mod tests {
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
         UPLOAD_KEYSPACE,
     };
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
@@ -3586,29 +3587,35 @@ mod tests {
     // A state that expects no event must reject one instead of ignoring it.
     #[test]
     fn terminal_rejects_event() {
-        let stray = || {
-            Event::Storage(StorageEvent::TransactionCommitted {
+        let load = || LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
+        for (_, effects, error) in rejects_events(load, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(error, LoadCountersError::UnexpectedEvent { .. }),
+                "{error:?}"
+            );
+        }
+
+        let rebuild = || {
+            let mut rebuild = RebuildStatsOperation::new();
+            rebuild.start();
+            rebuild.step(Event::Storage(StorageEvent::TransactionCommitted {
                 txn_id: TxnId::generate(),
-            })
+            }));
+            rebuild
         };
-
-        let mut load = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
-        load.step(stray());
-        assert!(matches!(
-            load.finalize(),
-            Err(LoadCountersError::UnexpectedEvent { .. })
-        ));
-
-        let mut rebuild = RebuildStatsOperation::new();
-        rebuild.start();
-        rebuild.step(stray());
-        rebuild.step(stray());
-        assert!(matches!(
-            rebuild.finalize(),
-            Err(RebuildStatsError::InvalidStateEvent {
-                state: RebuildStatsState::Error,
-                ..
-            })
-        ));
+        for (_, effects, error) in rejects_events(rebuild, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    RebuildStatsError::InvalidStateEvent {
+                        state: RebuildStatsState::Error,
+                        ..
+                    } | RebuildStatsError::StorageError(_)
+                ),
+                "{error:?}"
+            );
+        }
     }
 }

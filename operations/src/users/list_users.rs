@@ -251,6 +251,7 @@ mod pure_tests {
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
@@ -419,17 +420,16 @@ mod pure_tests {
     #[test]
     fn terminal_rejects_event() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let mut operation = ListUsersOperation::new(input(realm_id, 10, None));
-
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-
-        assert!(effects.is_empty());
-        assert!(matches!(
-            operation.finalize(),
-            Err(ListUsersError::UnexpectedEvent { .. })
-        ));
+        let make = || ListUsersOperation::new(input(realm_id, 10, None));
+        for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    ListUsersError::UnexpectedEvent { .. } | ListUsersError::StorageError(_)
+                ),
+                "{error:?}"
+            );
+        }
     }
 }

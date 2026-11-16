@@ -524,6 +524,7 @@ fn logical_record(spec: &LogicalJobSpec) -> JobRecord {
 mod pure_tests {
     use super::*;
     use crate::tests::records::{Family, REALM};
+    use aruna_core::operation_check::{rejects_events, sample_events};
 
     // A state that expects no event must reject one instead of ignoring it.
     #[test]
@@ -535,29 +536,28 @@ mod pure_tests {
         let sign = |record| {
             JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")
         };
-        let mut operation = AdmitSubmissionOperation::new(AdmitSubmissionConfig {
-            realm_id: REALM,
-            local_node_id: family.holder.public(),
-            submission_id: family.submission_id,
-            request_digest: family.request_digest,
-            candidate: Box::new(AdmissionCandidate {
-                job_id,
-                spec: sign(JobFamilyRecord::Spec(Box::new(spec))),
-                claim: sign(JobFamilyRecord::Claim(claim)),
-            }),
-            now_ms: 3_000,
-            quota_refusal: None,
-            quota_revision: None,
-        });
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: TxnId::generate(),
-        }));
-
-        assert!(effects.is_empty());
-        assert!(matches!(
-            operation.finalize(),
-            Err(LifecycleError::UnexpectedEvent { .. })
-        ));
+        let make = || {
+            AdmitSubmissionOperation::new(AdmitSubmissionConfig {
+                realm_id: REALM,
+                local_node_id: family.holder.public(),
+                submission_id: family.submission_id,
+                request_digest: family.request_digest,
+                candidate: Box::new(AdmissionCandidate {
+                    job_id,
+                    spec: sign(JobFamilyRecord::Spec(Box::new(spec.clone()))),
+                    claim: sign(JobFamilyRecord::Claim(claim.clone())),
+                }),
+                now_ms: 3_000,
+                quota_refusal: None,
+                quota_revision: None,
+            })
+        };
+        for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(error, LifecycleError::UnexpectedEvent { .. }),
+                "{error:?}"
+            );
+        }
     }
 }

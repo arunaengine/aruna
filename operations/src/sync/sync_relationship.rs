@@ -734,6 +734,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::sync::mirror_repair::stage_mirror_reconcile;
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
@@ -951,45 +952,86 @@ mod tests {
             })
         };
         let record = relationship(1, "source-a", "target-a");
+        let store = || {
+            let mut store = StoreRelationshipOperation::new(
+                record.clone(),
+                SyncRelationshipDirection::Outgoing,
+            );
+            store.start();
+            store.step(Event::Storage(StorageEvent::WriteResult {
+                key: Vec::<u8>::new().into(),
+            }));
+            store
+        };
+        for (_, effects, error) in rejects_events(store, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    SyncRelationshipError::UnexpectedEvent { .. }
+                        | SyncRelationshipError::Storage(_)
+                ),
+                "{error:?}"
+            );
+        }
 
-        let mut store =
-            StoreRelationshipOperation::new(record.clone(), SyncRelationshipDirection::Outgoing);
-        store.start();
-        store.step(Event::Storage(StorageEvent::WriteResult {
-            key: Vec::<u8>::new().into(),
-        }));
-        store.step(stray());
-        assert!(matches!(
-            store.finalize(),
-            Err(SyncRelationshipError::UnexpectedEvent { .. })
-        ));
+        let list = || {
+            let mut list =
+                ListRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, None);
+            list.start();
+            list.step(page());
+            list
+        };
+        for (_, effects, error) in rejects_events(list, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    SyncRelationshipError::UnexpectedEvent { .. }
+                        | SyncRelationshipError::Storage(_)
+                ),
+                "{error:?}"
+            );
+        }
 
-        let mut list = ListRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, None);
-        list.start();
-        list.step(page());
-        list.step(stray());
-        assert!(matches!(
-            list.finalize(),
-            Err(SyncRelationshipError::UnexpectedEvent { .. })
-        ));
+        let get = || {
+            let mut get =
+                GetRelationshipOperation::new(record.id, SyncRelationshipDirection::Outgoing);
+            get.start();
+            get.step(page());
+            get
+        };
+        for (_, effects, error) in rejects_events(get, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    SyncRelationshipError::UnexpectedEvent { .. }
+                        | SyncRelationshipError::Storage(_)
+                ),
+                "{error:?}"
+            );
+        }
 
-        let mut get = GetRelationshipOperation::new(record.id, SyncRelationshipDirection::Outgoing);
-        get.start();
-        get.step(page());
-        get.step(stray());
-        assert!(matches!(
-            get.finalize(),
-            Err(SyncRelationshipError::UnexpectedEvent { .. })
-        ));
-
-        let mut delete =
-            DeleteRelationshipOperation::new(record, SyncRelationshipDirection::Outgoing);
-        delete.start();
-        delete.step(stray());
-        delete.step(stray());
-        assert!(matches!(
-            delete.finalize(),
-            Err(SyncRelationshipError::UnexpectedEvent { .. })
-        ));
+        let delete = || {
+            let mut delete = DeleteRelationshipOperation::new(
+                record.clone(),
+                SyncRelationshipDirection::Outgoing,
+            );
+            delete.start();
+            delete.step(stray());
+            delete
+        };
+        for (_, effects, error) in rejects_events(delete, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            assert!(
+                matches!(
+                    error,
+                    SyncRelationshipError::UnexpectedEvent { .. }
+                        | SyncRelationshipError::Storage(_)
+                ),
+                "{error:?}"
+            );
+        }
     }
 }

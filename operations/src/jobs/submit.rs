@@ -890,6 +890,7 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::jobs::store::read_job_record;
     use aruna_core::keyspaces::{JOB_INDEX_KEYSPACE, JOB_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::execution::job::{
         ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
         ImportRoCrateSpec, ImportRoCrateTarget, JobState, RoCrateLimits, encode_dedup_value,
@@ -1601,20 +1602,20 @@ mod tests {
     // A state that expects no event must reject one instead of ignoring it.
     #[test]
     fn terminal_rejects_event() {
-        let mut operation = operation(spec(None));
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: TxnId::generate(),
-        }));
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TxnId::generate(),
-        }));
-
-        assert!(effects.is_empty());
-        let Err(SubmitJobError::UnexpectedEvent(got)) = operation.finalize() else {
-            panic!("a terminal state must reject a stray event");
+        let make = || {
+            let mut operation = operation(spec(None));
+            operation.start();
+            operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: TxnId::generate(),
+            }));
+            operation
         };
-        assert!(got.contains("TransactionAborted"), "{got}");
+        for (label, effects, error) in rejects_events(make, sample_events, |_| false) {
+            assert!(effects.is_empty());
+            let SubmitJobError::UnexpectedEvent(got) = error else {
+                panic!("a terminal state must reject a stray event");
+            };
+            assert_eq!(got, label);
+        }
     }
 }
