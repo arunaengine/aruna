@@ -469,8 +469,7 @@ node serves the call and every other node relays it to one.
         (status = 403, description = "No WRITE on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]

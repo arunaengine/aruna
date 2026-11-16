@@ -87,8 +87,7 @@ management node serves the call and every other node relays it to one.
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
@@ -137,8 +136,7 @@ management node serves the call and every other node relays it to one.
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "No provider with this id, or this node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "The provider is the last one, or another update of the realm configuration won the race", body = ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]

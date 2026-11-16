@@ -265,9 +265,8 @@ for.
                     "document_id": "01JDOCUMENT0123456789ABCDE"
                 }]
             })),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
@@ -310,9 +309,8 @@ for.
                 "retryable": true
             })),
         (status = 400, description = "The draft id is not a ULID", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such draft, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
@@ -350,10 +348,9 @@ for.
     responses(
         (status = 204, description = "The draft is gone from the device queue"),
         (status = 400, description = "The draft id is not a ULID", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such draft, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "A forward for this draft is in flight", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
@@ -409,9 +406,8 @@ for.
                 "structural_violations": []
             })),
         (status = 400, description = "The payload is not a JSON-LD object", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]

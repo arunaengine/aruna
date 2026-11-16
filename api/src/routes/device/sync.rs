@@ -181,9 +181,8 @@ for.
                     "lastError": "the bucket \"lab-data\" does not exist on node k5r2gmr7qeqfhqxhbpcpqoa2xhpqcrmr2vpxjqx3nvxfvbxvvrga"
                 }]
             })),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
@@ -217,9 +216,8 @@ for.
     responses(
         (status = 202, description = "The exchange is scheduled and runs on the device's timers", body = DeviceSyncRun,
             example = json!({"started": true})),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]

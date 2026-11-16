@@ -433,9 +433,8 @@ for.
                 "last_reconcile_ms": 1775748191000_i64,
                 "created_at_ms": 1775748000000_i64
             }]})),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
@@ -496,9 +495,8 @@ for.
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
@@ -858,9 +856,8 @@ for.
                 "updated_at_ms": 1775748191000_i64
             }], "next_cursor": "AAAAAQ"})),
         (status = 400, description = "Malformed folder id or cursor", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
@@ -1142,9 +1139,8 @@ for.
                 "outcome": "applied"
             }], "next_cursor": "AAAAAQ"})),
         (status = 400, description = "Malformed folder id or cursor", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
