@@ -461,6 +461,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 scripts/dev/check_style.py
 
+      - name: Run the layer guard self-tests
+        if: ${{ !cancelled() }}
+        run: python3 scripts/dev/check_layers_tests.py
+
+      # Structural counts may not rise above scripts/dev/layers_baseline.json.
+      - name: Run the layer guard
+        if: ${{ !cancelled() }}
+        run: python3 scripts/dev/check_layers.py
+
       # The official action builds a container from Docker Hub, whose rate
       # limited pulls time out on hosted runners; install the binary instead.
       - name: Install cargo-deny
