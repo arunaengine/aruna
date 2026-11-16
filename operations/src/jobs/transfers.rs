@@ -39,6 +39,7 @@ use crate::plugins::outgoing::{outgoing, release_into};
 use crate::plugins::release::ReleaseKeys;
 use crate::plugins::work::{Send, WorkRow, begin_send, record_sent, update_work};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 
 /// What a download writes: its target, the version minted once, expected digests and a bound.
@@ -66,6 +67,18 @@ pub async fn download_work(
         Ok(found) => found,
         Err(error) => return refused(error),
     };
+    // An earlier attempt that committed the version and lost its answer is done; nothing is sent.
+    match committed(ctx, (&bucket, &key), download.version_id).await {
+        Ok(Some(bytes)) => {
+            ctx.progress.set_current(bytes);
+            return JobRunOutcome::Succeeded(JobResultPayload::PluginWork {
+                bytes,
+                version_id: Some(download.version_id),
+            });
+        }
+        Ok(None) => {}
+        Err(error) => return retryable(error.to_string()),
+    }
     let request = prepared(ctx, (install, config, row), keys).await;
     let (outgoing, exposure, _) = match request {
         Ok(prepared) => prepared,
@@ -187,6 +200,24 @@ pub async fn download_work(
         Err(error) if broken.load(Ordering::Relaxed) => retryable(error.to_string()),
         Err(error @ PutObjectError::StorageError(_)) => retryable(error.to_string()),
         Err(error) => permanent(error.to_string()),
+    }
+}
+
+/// The size of version `version_id` of the target, if it was committed.
+async fn committed(
+    ctx: &JobContext,
+    (bucket, key): (&str, &str),
+    version_id: Ulid,
+) -> Result<Option<u64>, HeadObjectError> {
+    let head = HeadObjectInput {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id: Some(version_id),
+    };
+    match drive(HeadObjectOperation::new(head), &ctx.driver).await {
+        Ok(head) => Ok(Some(head.location.map_or(0, |location| location.blob_size))),
+        Err(HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 

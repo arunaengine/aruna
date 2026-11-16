@@ -178,7 +178,8 @@ async fn stored(ctx: &DriverContext, fixture: &Fixture, install: &PluginInstall)
 
 #[tokio::test]
 async fn downloads_once() {
-    // The answer becomes the minted version; a rerun after a lost answer replays that version.
+    // The answer becomes the minted version; a rerun after a lost answer replays that version
+    // without a second request.
     let fixture = Fixture::new().await;
     let install = downloader(&fixture).await;
     let (_root, blob) = ready(&fixture, &install).await;
@@ -193,7 +194,7 @@ async fn downloads_once() {
         };
         assert_eq!((bytes, version_id), (BODY.len() as u64, row.version_id));
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
     assert_eq!(stored(&blob, &fixture, &install).await, BODY);
 }
 
