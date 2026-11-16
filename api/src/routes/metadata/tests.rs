@@ -243,7 +243,7 @@ async fn public_routes_work() {
 
     let _ = replace_metadata_rocrate(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(ReplaceRoCrateRequest {
@@ -667,7 +667,7 @@ async fn rocrate_routes_work() {
 
     let _ = add_contextual_entity(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(json!({
@@ -681,7 +681,7 @@ async fn rocrate_routes_work() {
 
     let _ = add_data_entity(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(json!({
@@ -724,7 +724,7 @@ async fn data_entity_removal() {
     drain_metadata_background(test.state.as_ref()).await;
     let (_, Json(added)) = add_data_entity(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(json!({"@id": "./data/run-42.raw", "@type": "File", "name": "run-42.raw"})),
@@ -741,7 +741,7 @@ async fn data_entity_removal() {
         let (state, auth) = (test.state.clone(), test.auth.clone());
         remove_data_entity(
             State(state),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(None),
             Path(document_id.clone()),
             Query(query),
@@ -790,7 +790,7 @@ async fn stale_removal_conflicts() {
     drain_metadata_background(test.state.as_ref()).await;
     let (_, Json(added)) = add_data_entity(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(json!({"@id": "./data/gone.raw", "@type": "File", "name": "gone.raw"})),
@@ -807,7 +807,7 @@ async fn stale_removal_conflicts() {
         let (state, auth) = (test.state.clone(), test.auth.clone());
         remove_data_entity(
             State(state),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(None),
             Path(document_id.clone()),
             Query(query),
@@ -1616,7 +1616,7 @@ async fn replacement_summary_withheld() {
     );
     let _ = replace_metadata_rocrate(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id),
         Json(ReplaceRoCrateRequest {
@@ -2130,7 +2130,7 @@ async fn user_writes_forward() {
 
     let _ = add_data_entity(
         State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         bearer(),
         Path(document_id.clone()),
         Json(json!({
@@ -2825,7 +2825,7 @@ async fn page_size_clamped() {
     );
     let _ = replace_metadata_rocrate(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(ReplaceRoCrateRequest {

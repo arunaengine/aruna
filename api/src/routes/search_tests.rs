@@ -318,7 +318,7 @@ async fn attach_file(fx: &Fixture, document_id: &str, name: &str) {
     });
     let _ = replace_metadata_rocrate(
         State(fx.state.clone()),
-        Extension(Some(fx.auth.clone())),
+        RealmAuth(fx.auth.clone()),
         Extension(None),
         Path(document_id.to_string()),
         Json(ReplaceRoCrateRequest {

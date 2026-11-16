@@ -4,15 +4,15 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::jobs::repository::Action;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{RepositoryExportRequest, SubmitExportRequest, SubmitExportResponse};
 use crate::server::state::ServerState;
@@ -95,11 +95,10 @@ Invalid queries return 400, with code not_supported for a repository kind withou
 )]
 pub async fn search_records(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
     Query(query): Query<RepositorySearch>,
 ) -> ServerResult<Json<serde_json::Value>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     let query = aruna_core::repository::RepositoryQuery {
         group_id: ulid::Ulid::from_string(&group_id).map_err(|_| ServerError::BadRequest)?,
         connector_id: ulid::Ulid::from_string(&connector_id)
@@ -268,7 +267,7 @@ A kind without imports, a doi or url on a kind without search, or keep_updated o
 )]
 pub async fn import_record(
     state: State<Arc<ServerState>>,
-    auth: Extension<Option<AuthContext>>,
+    auth: UnrestrictedAuth,
     Json(request): Json<RepositoryImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
     use aruna_operations::jobs::repository::{RecordReference, TransferError, resolve};
@@ -285,7 +284,7 @@ pub async fn import_record(
     let record_id = match reference {
         RecordReference::Id(id) => id,
         reference => {
-            let caller = crate::auth::require_unrestricted_auth(&state, auth.0.clone())?;
+            let caller = auth.0.clone();
             let group_id =
                 ulid::Ulid::from_string(&request.group_id).map_err(|_| ServerError::BadRequest)?;
             let connector_id = ulid::Ulid::from_string(&request.connector_id)
@@ -392,7 +391,7 @@ Incomplete files, conflicting revisions or rejected metadata fail the job. An am
 )]
 pub async fn export_record(
     state: State<Arc<ServerState>>,
-    auth: Extension<Option<AuthContext>>,
+    auth: UnrestrictedAuth,
     path: Path<String>,
     Json(request): Json<SubmitRepositoryExport>,
 ) -> ServerResult<(StatusCode, Json<SubmitExportResponse>)> {

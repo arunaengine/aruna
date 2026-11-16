@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::federation::export::{
     INTENT_HEADER, decode_header, grant_header, transfer_refused,
@@ -31,9 +31,9 @@ use aruna_operations::federation::transfer::{
 use aruna_operations::jobs::import::{
     CreateRoCrateConfig, CreateRoCrateOperation, load_rocrate_upload, write_rocrate_upload,
 };
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use chrono::Utc;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
@@ -360,10 +360,9 @@ async fn pull_artifact(
 )]
 pub async fn create_intent(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<ImportIntentRequest>,
 ) -> ServerResult<Json<Signed<ImportIntent>>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if !hex::decode(&request.nonce).is_ok_and(|bytes| bytes.len() == SECRET_LEN) {
         return Err(ServerError::BadRequestReason(
             "nonce must be a hex SHA-256 digest".into(),
@@ -446,10 +445,9 @@ binds the call to the portal that requested the intent.
 )]
 pub async fn create_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<FederatedImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (intent, grant) = (request.intent, request.grant);
     if auth.user_id != intent.payload.principal {
         return Err(ServerError::Forbidden);
@@ -493,7 +491,7 @@ pub async fn create_import(
         },
         idempotency_key: Some(key),
     };
-    submit_import(State(state), Extension(Some(auth)), Json(submit)).await
+    submit_import(State(state), UnrestrictedAuth(auth), Json(submit)).await
 }
 
 #[cfg(test)]

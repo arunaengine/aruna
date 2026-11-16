@@ -2,9 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{
-    ValidatedBearer, ensure_permission_with, require_realm_auth, require_unrestricted_auth,
-};
+use crate::auth::{RealmAuth, UnrestrictedAuth};
+use crate::auth::{ValidatedBearer, ensure_permission_with};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
     JsonLdObject, MetadataDocumentSummary, MetadataRoCrateResponse, MetadataRoCrateView,
@@ -332,11 +331,10 @@ registry view. A path-restricted delegated token is refused even when it would p
 )]
 pub async fn submit_rocrate_export(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(document_id): Path<String>,
     Json(request): Json<SubmitExportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitExportResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let record = load_document_record(&state, document_id).await?;
     ensure_permission_with(
@@ -556,12 +554,11 @@ as none."#,
 )]
 pub async fn replace_metadata_rocrate(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Json(request): Json<ReplaceRoCrateRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let message = commit_message(request.message)?;
     ensure_readable_files(&state, &auth, &crate_entities(&request.rocrate)).await?;
@@ -673,12 +670,11 @@ caller's own token.
 )]
 pub async fn add_data_entity(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Json(entity): Json<Value>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     ensure_readable_files(&state, &auth, &crate_entities(&entity)).await?;
     let ctx = state.get_ctx();
@@ -777,12 +773,11 @@ caller's own token.
 )]
 pub async fn remove_data_entity(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Query(query): Query<RemovalQuery>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let expected_revision = (query.expected_revision.parse::<ulid::Ulid>())
         .map_err(|_| ServerError::BadRequestMessage("expected_revision is not a ULID".into()))?;
@@ -883,12 +878,11 @@ caller's own token.
 )]
 pub async fn add_contextual_entity(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Json(entity): Json<Value>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     ensure_readable_files(&state, &auth, &crate_entities(&entity)).await?;
     let ctx = state.get_ctx();

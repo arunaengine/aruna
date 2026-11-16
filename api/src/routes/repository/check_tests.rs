@@ -3,13 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::extract;
 use crate::routes::repository::links::tests::{Linked, setup, setup_crate};
 use aruna_core::metadata::{INVENIO_PROFILE_IRI, ZENODO_PROFILE_IRI};
+use axum::http::StatusCode;
 
 async fn check(linked: &Linked, request: CheckRequest) -> ServerResult<CheckResponse> {
     Box::pin(check_repository(
         State(linked.test.state.clone()),
-        Extension(Some(linked.test.auth.clone())),
+        UnrestrictedAuth(linked.test.auth.clone()),
         Path(linked.document_id.clone()),
         Json(request),
     ))
@@ -28,12 +31,14 @@ fn request(linked: &Linked, metadata: Option<serde_json::Value>) -> CheckRequest
 #[tokio::test]
 async fn kinds_list_publishers() {
     let linked = setup().await;
-    let state = || State(linked.test.state.clone());
-    assert!(matches!(
-        list_kinds(state(), Extension(None)).await,
-        Err(ServerError::Unauthorized)
-    ));
-    let Json(kinds) = list_kinds(state(), Extension(Some(linked.test.auth.clone())))
+    // `list_kinds` takes `UnrestrictedAuth`, so the refusal is the extractor's.
+    assert_eq!(
+        extract::<UnrestrictedAuth>(&linked.test.state, None)
+            .await
+            .err(),
+        Some(StatusCode::UNAUTHORIZED)
+    );
+    let Json(kinds) = list_kinds(UnrestrictedAuth(linked.test.auth.clone()))
         .await
         .unwrap();
     let kinds = serde_json::to_value(kinds).unwrap();

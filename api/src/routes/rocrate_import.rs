@@ -44,6 +44,7 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::UnrestrictedAuth;
 use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::execution::jobs::{job_urls, map_submit_error};
@@ -360,10 +361,9 @@ taken: READ on the source, WRITE on the target bucket, and WRITE on the metadata
 )]
 pub async fn submit_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<SubmitImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let mut source = parse_import_source(request.source)?;
     Box::pin(repository_source(&state, &auth, &source)).await?;
     if let ImportRoCrateSource::Repository {
