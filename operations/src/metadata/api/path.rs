@@ -2,6 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::path_types::{
+    MetadataLookupRequest, MetadataLookupResult, PathHolderSelection, PathShardView,
+};
 use super::{
     AuthContext, AuthFailure, AuthToken, DISTRIBUTED_QUERY_DEADLINE, DriverContext, GroupId,
     GroupPermissionRules, HashSet, MetaResourceId, MetadataApiError, MetadataPathCandidate,
@@ -644,25 +647,6 @@ pub(super) fn sanitize_path_winner(
     })
 }
 
-#[derive(Debug, Clone)]
-pub struct MetadataLookupRequest {
-    pub group_id: GroupId,
-    pub document_path: String,
-    pub auth: Option<AuthContext>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MetadataLookupResult {
-    pub winner: MetadataPathWinner,
-    pub conflicts: Vec<Ulid>,
-}
-
-#[derive(Debug)]
-pub(super) struct PathHolderSelection {
-    pub(super) node_id: NodeId,
-    pub(super) shards: Vec<u32>,
-}
-
 pub async fn lookup_metadata_path(
     context: &DriverContext,
     realm_id: RealmId,
@@ -836,9 +820,4 @@ pub(crate) async fn resolve_local_path(
     )
     .await?;
     reduce_path_candidates(candidates)
-}
-
-pub(super) struct PathShardView {
-    pub(super) shard: u32,
-    pub(super) candidates: Vec<MetadataPathCandidate>,
 }

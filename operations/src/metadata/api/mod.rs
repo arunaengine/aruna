@@ -123,6 +123,7 @@ mod links_types;
 mod list;
 mod list_types;
 mod path;
+mod path_types;
 mod preflight;
 mod read;
 mod read_types;
@@ -148,10 +149,12 @@ pub use self::list::list_visible_documents;
 pub use self::list_types::{
     ListVisibleRequest, ListVisibleResult, ListedMetadataDocument, MetadataListOrder,
 };
+pub use self::path::lookup_metadata_path;
 pub(crate) use self::path::resolve_local_path;
-pub use self::path::{MetadataLookupRequest, MetadataLookupResult, lookup_metadata_path};
+use self::path::{merge_path_views, reduce_path_candidates, select_path_holders};
 #[cfg(test)]
-use self::path::{PathShardView, merge_path_views, reduce_path_candidates, select_path_holders};
+use self::path_types::PathShardView;
+pub use self::path_types::{MetadataLookupRequest, MetadataLookupResult};
 pub use self::preflight::{
     MetadataExcludedForm, MetadataIndexState, MetadataNodeFreshness, MetadataPreflightLocation,
     MetadataResolvedTarget, MetadataStorageOperation, MetadataVisibleReference, ReferenceCoverage,
