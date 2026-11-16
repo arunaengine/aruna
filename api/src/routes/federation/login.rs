@@ -27,7 +27,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::{Arc, LazyLock};
 use tracing::info;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -44,12 +44,8 @@ fn login_limiter() -> DefaultKeyedRateLimiter<IpAddr> {
     RateLimiter::keyed(Quota::per_minute(rate))
 }
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct LoginApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(LoginApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_login_handoff))
         .routes(routes!(create_federated_session))
 }

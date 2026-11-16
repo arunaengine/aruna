@@ -29,15 +29,12 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-pub struct AdminTokensDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(AdminTokensDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_group_tokens))
         .routes(routes!(revoke_group_token))
         .routes(routes!(revoke_member_tokens))

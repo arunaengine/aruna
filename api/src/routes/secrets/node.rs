@@ -17,7 +17,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use ulid::Ulid;
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -30,12 +29,8 @@ use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "system/secrets", description = "Named node, realm, group and user secrets")))]
-pub struct NodeSecretsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(NodeSecretsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_node_secrets, create_node_secret))
         .routes(routes!(
             get_node_secret,

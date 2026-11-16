@@ -31,15 +31,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "access/policies", description = "Deny-only CEL request policies")),
-    components(schemas(
-        PolicyTraceDoc,
-        PolicyKindDoc,
-        PolicyResultDoc,
-        ScopedTraceEntry
-    ))
-)]
+#[openapi(components(schemas(PolicyTraceDoc, PolicyKindDoc, PolicyResultDoc, ScopedTraceEntry)))]
 pub struct PoliciesApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {

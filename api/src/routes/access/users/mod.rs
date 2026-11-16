@@ -63,21 +63,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::error;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags(
-        (name = "access/users", description = "User operations"),
-        (name = "access/devices", description = "User device administration")
-    )
-)]
-pub struct UsersApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(UsersApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(register_user))
         .routes(routes!(get_token))
         .routes(routes!(get_user_info, patch_user_info))

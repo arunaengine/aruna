@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -54,12 +54,8 @@ const ELN_MEDIA_TYPE: &str = "application/vnd.eln+zip";
 const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct RoCrateImportDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(RoCrateImportDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(upload_rocrate))
         .routes(routes!(submit_import))
 }

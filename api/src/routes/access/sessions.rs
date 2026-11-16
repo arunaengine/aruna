@@ -26,16 +26,12 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "access/sessions", description = "User bearer sessions")))]
-pub struct SessionsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SessionsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_session, list_sessions))
         .routes(routes!(delete_session))
 }

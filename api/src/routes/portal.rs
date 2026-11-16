@@ -14,7 +14,7 @@ use aruna_operations::realm::set_portal::{SetPortalConfig, SetPortalError, SetPo
 use axum::extract::State;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -22,13 +22,8 @@ use crate::auth::{ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "system/realm", description = "Realm configuration, placement and quota")))]
-pub struct PortalApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(PortalApiDoc::openapi())
-        .routes(routes!(get_portal_features, set_portal_features))
+    OpenApiRouter::new().routes(routes!(get_portal_features, set_portal_features))
 }
 
 /// Realm default on/off state per portal feature name.

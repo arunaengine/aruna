@@ -38,18 +38,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::SystemTime;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 const SERVICE_LABEL: &str = "service account";
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "access/service-accounts", description = "Service accounts of a group")))]
-pub struct ServiceApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ServiceApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_account, list_accounts))
         .routes(routes!(create_token))
         .routes(routes!(create_credential))

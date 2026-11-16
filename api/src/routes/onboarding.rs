@@ -52,7 +52,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;
 use url::Url;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -60,14 +60,8 @@ const SECRET_TTL_SECS: u64 = 3600;
 /// Policy operation name device enrollment is evaluated under.
 const ENROLL_DEVICE_OPERATION: &str = "onboarding.enroll_device";
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "access/onboarding", description = "Node onboarding and bootstrap operations"))
-)]
-pub struct OnboardingApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(OnboardingApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(bootstrap_onboarding))
         .routes(routes!(create_onboarding_secret, list_onboarding_secrets))
         .routes(routes!(revoke_onboarding_secret))

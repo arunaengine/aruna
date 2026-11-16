@@ -65,23 +65,18 @@ const MAX_OBJECT_IDS: usize = 100;
 const BULK_PROBE_CONCURRENCY: usize = 8;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "drs", description = "GA4GH DRS content access")),
-    components(
-        schemas(
-            DrsServiceResponse,
-            DrsAuthorizationsResponse,
-            DrsObjectResponse,
-            DrsChecksum,
-            DrsAccessMethod,
-            DrsAccessUrl,
-            DrsBulkBody,
-            DrsBulk,
-            DrsBulkItem,
-            DrsErrorPayload
-        )
-    )
-)]
+#[openapi(components(schemas(
+    DrsServiceResponse,
+    DrsAuthorizationsResponse,
+    DrsObjectResponse,
+    DrsChecksum,
+    DrsAccessMethod,
+    DrsAccessUrl,
+    DrsBulkBody,
+    DrsBulk,
+    DrsBulkItem,
+    DrsErrorPayload
+)))]
 pub struct DrsApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {

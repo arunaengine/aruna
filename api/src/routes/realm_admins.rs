@@ -12,7 +12,6 @@ use aruna_operations::driver::drive;
 use aruna_operations::realm::set_admin::{SetAdminConfig, SetAdminError, SetAdminOperation};
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -20,12 +19,8 @@ use crate::auth::{ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "system/realm", description = "Realm configuration, placement and quota")))]
-pub struct AdminsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(AdminsApiDoc::openapi()).routes(routes!(grant_admin, remove_admin))
+    OpenApiRouter::new().routes(routes!(grant_admin, remove_admin))
 }
 
 #[utoipa::path(

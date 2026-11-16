@@ -55,21 +55,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags(
-        (name = "system/info", description = "Node information and usage"),
-        (name = "system/realm", description = "Realm configuration, placement and quota")
-    )
-)]
-pub struct InfoApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(InfoApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_info))
         .routes(routes!(get_realm_info))
         .routes(routes!(get_realm_placement, mutate_realm_placement))

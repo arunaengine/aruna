@@ -19,7 +19,6 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tracing::warn;
 use ulid::Ulid;
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -60,11 +59,8 @@ static HOOK_CLIENT: LazyLock<Option<reqwest::Client>> = LazyLock::new(|| {
         .ok()
 });
 
-#[derive(OpenApi)]
-pub struct HooksApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(HooksApiDoc::openapi()).routes(routes!(receive))
+    OpenApiRouter::new().routes(routes!(receive))
 }
 
 #[utoipa::path(

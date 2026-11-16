@@ -45,18 +45,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use ulid::Ulid;
 use url::{Host, Url};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 pub(super) const PROXY_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "system/assistant", description = "Assistant provider operations")))]
-pub struct AssistantApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    let router = OpenApiRouter::with_openapi(AssistantApiDoc::openapi())
+    let router = OpenApiRouter::new()
         .routes(routes!(list_providers, create_provider))
         .routes(routes!(patch_provider, delete_provider))
         .routes(routes!(get_models))

@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -44,17 +44,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{forwarded_auth_token, map_api_error};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags(
-        (name = "pid", description = "w3id persistent identifier landing and lifecycle"),
-        (name = "metadata/pids", description = "Persistent identifiers for metadata documents")
-    )
-)]
-pub struct PidApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(PidApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(resolve_pid, withdraw_pid))
         .routes(routes!(resolve_profile_pid))
         .routes(routes!(list_persistent_ids))

@@ -40,19 +40,15 @@ use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 const SECRET_LEN: usize = 32;
 const PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct ImportApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ImportApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_intent))
         .routes(routes!(create_import))
 }

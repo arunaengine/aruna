@@ -18,7 +18,7 @@ use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -28,13 +28,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::hex32;
 use crate::server::state::ServerState;
 
-/// The audit route joins the `jobs` tag the jobs module already declares.
-#[derive(OpenApi)]
-#[openapi()]
-pub struct JobAuditDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(JobAuditDoc::openapi()).routes(routes!(get_job_audit))
+    OpenApiRouter::new().routes(routes!(get_job_audit))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]

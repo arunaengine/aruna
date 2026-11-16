@@ -37,7 +37,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -55,12 +55,8 @@ const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// Objects one staging call brings into the workspace bucket.
 const MAX_STAGED_ITEMS: usize = 64;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "compute/sessions", description = "Interactive notebook sessions")))]
-pub struct JobSessionDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(JobSessionDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_session))
         .routes(routes!(stream_session))
         .routes(routes!(submit_cell))

@@ -27,20 +27,14 @@ use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 use std::{str::FromStr, sync::Arc};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 mod sessions;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "access/credentials", description = "User credential management"))
-)]
-pub struct CredentialsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(CredentialsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_s3_credentials, create_s3_credentials))
         .routes(routes!(revoke_s3_credentials))
         .merge(sessions::router())

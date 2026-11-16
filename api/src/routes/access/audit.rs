@@ -17,7 +17,7 @@ use axum::extract::{Query, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -27,12 +27,8 @@ use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 50;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "access/audit", description = "Retained administrative audit rows")))]
-pub struct AdminAuditDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(AdminAuditDoc::openapi()).routes(routes!(list_admin_audit))
+    OpenApiRouter::new().routes(routes!(list_admin_audit))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, IntoParams)]

@@ -18,7 +18,7 @@ use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -29,12 +29,8 @@ use crate::server::state::ServerState;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "plugins", description = "WASM plugins published to the realm")))]
-pub struct PluginsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(PluginsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(publish, list_plugins))
         .layer(DefaultBodyLimit::max(MAX_ARTIFACT))
 }

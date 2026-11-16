@@ -33,7 +33,7 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -44,11 +44,8 @@ use crate::server::state::ServerState;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
-#[derive(OpenApi)]
-pub struct InstallsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(InstallsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(install))
         .routes(routes!(list_installs))
         .routes(routes!(get_install, remove))

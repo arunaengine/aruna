@@ -10,7 +10,6 @@ use aruna_operations::secrets::SecretChange;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -22,11 +21,8 @@ use super::{
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-pub struct GroupSecretsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(GroupSecretsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_group_secrets, create_group_secret))
         .routes(routes!(
             get_group_secret,

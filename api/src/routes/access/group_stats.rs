@@ -30,18 +30,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::warn;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 /// Jobs that finished within this window count as recent.
 const RECENT_MS: u64 = 24 * 60 * 60 * 1000;
 
-#[derive(OpenApi)]
-pub struct GroupStatsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(GroupStatsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_group_statistics))
         .routes(routes!(list_group_statistics))
 }

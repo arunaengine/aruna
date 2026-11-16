@@ -14,7 +14,7 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -26,12 +26,8 @@ use crate::server::state::ServerState;
 /// How long a run read relayed to the node that ran it may take, body included.
 const RELAY_DEADLINE: Duration = Duration::from_secs(30);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct RunsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(RunsApiDoc::openapi()).routes(routes!(get_run))
+    OpenApiRouter::new().routes(routes!(get_run))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

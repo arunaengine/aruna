@@ -25,7 +25,7 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -34,15 +34,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::info::TelemetryState;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(tags((
-    name = "compute/admin",
-    description = "Realm-admin administration of compute links, quotas, pressure and drain"
-)))]
-pub struct ComputeApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ComputeApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_compute_config, put_compute_config))
         .routes(routes!(get_compute_snapshots))
         .routes(routes!(set_compute_drain))

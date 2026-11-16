@@ -44,7 +44,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -59,14 +59,8 @@ const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;
 const DEFAULT_REPORT_LIMIT: usize = 200;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "compute/jobs", description = "Durable background jobs"))
-)]
-pub struct JobsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(JobsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_jobs, submit_job))
         .routes(routes!(get_job, delete_job))
         .routes(routes!(cancel_job))

@@ -56,19 +56,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(tags((
-    name = "data/placement",
-    description = "Placement policies, bucket defaults and their application: realm admins publish realm-wide policies, group admins the ones their own group owns"
-)))]
-pub struct PlacementApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(PlacementApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_placement_policy, list_placement_policies))
         .routes(routes!(get_placement_policy))
         .routes(routes!(get_placement_diagnostics))

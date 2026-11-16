@@ -12,7 +12,7 @@ use aruna_core::structs::identity::identifier::{
 use axum::extract::State;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -20,12 +20,8 @@ use crate::auth::require_realm_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct IdentifiersApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(IdentifiersApiDoc::openapi()).routes(routes!(test_rules))
+    OpenApiRouter::new().routes(routes!(test_rules))
 }
 
 /// What a rule reads: the object key or the recorded source URL.

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -25,13 +25,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::execution::jobs::map_local_error;
 use crate::server::state::ServerState;
 
-/// The device tag itself is declared by the device plane's own document.
-#[derive(OpenApi)]
-#[openapi()]
-pub struct DeviceComputeDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DeviceComputeDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_device_compute))
         .routes(routes!(publish_device_run))
         .routes(routes!(get_local_crate))

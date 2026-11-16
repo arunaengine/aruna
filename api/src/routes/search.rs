@@ -27,7 +27,7 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -39,16 +39,10 @@ const SEARCH_TYPE_BUCKETS: &str = "buckets";
 const SEARCH_TYPE_GROUPS: &str = "groups";
 const SEARCH_TYPE_USERS: &str = "users";
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "search", description = "Unified realm search"))
-)]
-pub struct SearchApiDoc;
-
 // Object search uses authenticated live heads with explicit partial or strict federation.
 // Pagination is a watermarked live keyset; signed snapshots and directory tiers remain deferred.
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SearchApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(unified_search))
         .routes(routes!(bucket_search))
         .routes(routes!(object_search))

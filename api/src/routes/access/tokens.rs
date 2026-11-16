@@ -21,18 +21,12 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "access/tokens", description = "Bearer token revocation"))
-)]
-pub struct TokensApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(TokensApiDoc::openapi()).routes(routes!(revoke_token))
+    OpenApiRouter::new().routes(routes!(revoke_token))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]

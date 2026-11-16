@@ -13,7 +13,7 @@ use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -23,11 +23,8 @@ use super::plugin_installs::{
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-pub struct ChangesApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ChangesApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(put_grants))
         .routes(routes!(put_version))
         .routes(routes!(pause))

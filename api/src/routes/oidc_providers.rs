@@ -15,7 +15,7 @@ use aruna_operations::realm::set_provider::{
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -24,13 +24,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::info::RealmProviderResponse;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "system/realm", description = "Realm configuration, placement and quota")))]
-pub struct ProvidersApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ProvidersApiDoc::openapi())
-        .routes(routes!(set_provider, remove_provider))
+    OpenApiRouter::new().routes(routes!(set_provider, remove_provider))
 }
 
 /// One OIDC provider whose ID tokens this realm accepts.

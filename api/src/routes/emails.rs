@@ -15,7 +15,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -23,16 +23,8 @@ use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct EmailsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(EmailsApiDoc::openapi()).routes(routes!(
-        get_email,
-        set_email,
-        delete_email
-    ))
+    OpenApiRouter::new().routes(routes!(get_email, set_email, delete_email))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -66,13 +66,7 @@ const STREAM_KEEP_ALIVE: Duration = Duration::from_secs(20);
 const NOTIFICATION_STREAM_RECHECK: Duration = Duration::from_secs(60);
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "system/notifications", description = "User notification inbox")),
-    components(schemas(
-        NotificationStreamResponse,
-        UnreadCountResponse
-    ))
-)]
+#[openapi(components(schemas(NotificationStreamResponse, UnreadCountResponse)))]
 pub struct NotificationsApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {

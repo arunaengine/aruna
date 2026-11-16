@@ -60,18 +60,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{Instrument, Span, field, info_span, trace, warn};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "access/groups", description = "Group management operations"))
-)]
-pub struct GroupsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(GroupsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_group, list_groups))
         .routes(routes!(get_group, update_group, delete_group))
         .routes(routes!(set_group_location))

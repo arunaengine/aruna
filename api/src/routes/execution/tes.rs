@@ -73,27 +73,24 @@ const DEFAULT_PAGE_SIZE: usize = 256;
 const MAX_PAGE_SIZE: usize = 512;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "tes", description = "GA4GH TES v1.1 task execution facade")),
-    components(schemas(
-        TesServiceInfo,
-        TesServiceType,
-        TesServiceOrganization,
-        TesTask,
-        TesExecutor,
-        TesInput,
-        TesOutput,
-        TesResources,
-        TesFileType,
-        TesState,
-        TesExecutorLog,
-        TesFileLog,
-        TesTaskLog,
-        TesTaskResponse,
-        TesTasksResponse,
-        TesErrorPayload
-    ))
-)]
+#[openapi(components(schemas(
+    TesServiceInfo,
+    TesServiceType,
+    TesServiceOrganization,
+    TesTask,
+    TesExecutor,
+    TesInput,
+    TesOutput,
+    TesResources,
+    TesFileType,
+    TesState,
+    TesExecutorLog,
+    TesFileLog,
+    TesTaskLog,
+    TesTaskResponse,
+    TesTasksResponse,
+    TesErrorPayload
+)))]
 pub struct TesApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
