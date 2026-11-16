@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::UserId;
@@ -31,9 +30,7 @@ use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, StructuredId};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
@@ -58,18 +55,15 @@ use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };
 use aruna_operations::sync::document_outbox::read_outbox_records;
-use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::sync::shard_placement::sort_node_ids;
-use aruna_operations::tasks::incoming::{OutboxDrainer, start_task_queues};
-use aruna_storage::FjallStorage;
-use aruna_tasks::TaskHandle;
-use tempfile::TempDir;
+use aruna_operations::tasks::incoming::OutboxDrainer;
 use tokio::time::sleep;
 use ulid::Ulid;
 
 use crate::convergence;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
+use crate::topology::{TestNode, spawn_replica, spawn_replica_with, wait_node_convergence};
 use convergence::wait_for_convergence;
 
 /// Retries of a write that lost a commit race to background work; 20 ms apart.
@@ -103,15 +97,6 @@ fn doc_id(seed: u64) -> Ulid {
     MetaResourceId::try_from((1u128 << 60) | u128::from(seed))
         .unwrap()
         .as_ulid()
-}
-
-struct TestNode {
-    _temp_dir: TempDir,
-    net: NetHandle,
-    context: Arc<DriverContext>,
-    /// Keeps the inbound handler's scheduled tasks tied to a live owner for
-    /// the node's whole lifetime.
-    _shutdown: aruna_core::shutdown::Shutdown,
 }
 
 #[tokio::test]
@@ -974,7 +959,7 @@ async fn long_history() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn batch_projection_materializes() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([43u8; 32]);
-    let nodes = vec![spawn_node(realm_id).await?];
+    let nodes = vec![spawn_replica(realm_id, true, true).await?];
     let config = install_realm_config(&nodes, &realm_id).await?;
     let node = &nodes[0];
     let group_id = Ulid::generate();
@@ -1209,7 +1194,7 @@ async fn build_realm_nodes(
 ) -> Result<(Vec<TestNode>, RealmConfigDocument), Box<dyn std::error::Error>> {
     let mut nodes = Vec::with_capacity(count);
     for _ in 0..count {
-        nodes.push(spawn_node(*realm_id).await?);
+        nodes.push(spawn_replica(*realm_id, true, true).await?);
     }
     let config = finish_realm_setup(&nodes, realm_id).await?;
     Ok((nodes, config))
@@ -1231,7 +1216,9 @@ async fn build_pinned_realm(
     let mut nodes = Vec::with_capacity(secret_seeds.len());
     for (index, seed) in secret_seeds.iter().enumerate() {
         let secret = iroh::SecretKey::from_bytes(&[*seed; 32]);
-        nodes.push(spawn_node_configured(*realm_id, Some(secret), start_tasks[index]).await?);
+        nodes.push(
+            spawn_replica_with(*realm_id, Some(secret), true, true, start_tasks[index]).await?,
+        );
     }
     // A node with no auto loop cannot refresh its own realm presence, which expires after
     // REALM_PRESENCE_TTL.
@@ -1282,70 +1269,6 @@ async fn finish_realm_setup(
 
     wait_node_convergence(nodes, realm_id).await?;
     install_realm_config(nodes, realm_id).await
-}
-
-async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
-    spawn_node_configured(realm_id, None, true).await
-}
-
-async fn spawn_node_configured(
-    realm_id: RealmId,
-    secret_key: Option<iroh::SecretKey>,
-    start_tasks: bool,
-) -> Result<TestNode, Box<dyn std::error::Error>> {
-    let temp_dir = tempfile::tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
-    let net = NetHandle::new(
-        NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-            realm_id,
-            secret_key,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
-        },
-        storage.clone(),
-    )
-    .await?;
-    let task_handle = TaskHandle::new();
-    let metadata_handle = MetadataHandle::new(
-        temp_dir.path().join("metadata"),
-        net.node_id(),
-        storage.clone(),
-        Some(net.clone()),
-        Some(net.document_sync_node()),
-        Some(net.document_sync_database()),
-    )?;
-
-    let context = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: Some(net.clone()),
-        blob_handle: None,
-        metadata_handle: Some(metadata_handle),
-        task_handle: Some(task_handle.clone()),
-        compute_handle: None,
-    });
-
-    let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
-    let shutdown = aruna_core::shutdown::Shutdown::new();
-    initialize_net_holder(
-        context.clone(),
-        aruna_core::structs::execution::job::RoCrateLimits::default(),
-        jobs_runtime.clone(),
-        &shutdown,
-    );
-    // A node without the auto task loop leaves its outbox drain (and every other
-    // timer) for the test to drive by hand.
-    if start_tasks {
-        start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
-    }
-
-    Ok(TestNode {
-        _temp_dir: temp_dir,
-        net,
-        context,
-        _shutdown: shutdown,
-    })
 }
 
 async fn install_realm_config(
@@ -1599,24 +1522,6 @@ fn same_holder_set(left: &[aruna_core::NodeId], right: &[aruna_core::NodeId]) ->
     left.len() == right.len()
         && left.iter().copied().collect::<HashSet<_>>()
             == right.iter().copied().collect::<HashSet<_>>()
-}
-
-async fn wait_node_convergence(
-    nodes: &[TestNode],
-    realm_id: &RealmId,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let expected: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
-    wait_for_convergence("realm nodes did not converge", || async {
-        let mut pending = 0;
-        for node in nodes {
-            match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
-                Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => pending += 1,
-            }
-        }
-        Ok(pending)
-    })
-    .await
 }
 
 async fn wait_metadata_convergence(
