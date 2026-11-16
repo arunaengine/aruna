@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
 
 use aruna_core::effects::StorageEffect;
@@ -21,6 +23,9 @@ use crate::compaction::{DELETE_THRESHOLD, compactable, sweep_due};
 use super::rebuild::shadow_row;
 
 use super::{CleanupEntry, CleanupKind, FjallStorage, MAX_TRANSACTION_CLEANUP, Txn};
+
+/// A transaction's pending counter changes, keyed by key space and key in sorted order.
+pub(super) type PendingChanges = BTreeMap<(String, ByteView), CounterChange>;
 
 /// A transaction's pending change of one counter row.
 #[derive(Clone, Copy, Debug)]
@@ -106,15 +111,14 @@ impl FjallStorage {
         let mut entries = Vec::with_capacity(changes.len());
         for (key, change) in changes {
             entries.push((key_space.clone(), key.clone()));
-            match pending
-                .iter_mut()
-                .find(|(space, existing, _)| *space == key_space && *existing == key)
-            {
-                Some((_, _, existing)) => match existing.merge(change) {
-                    Ok(merged) => *existing = merged,
+            match pending.entry((key_space.clone(), key)) {
+                Entry::Occupied(mut existing) => match existing.get().merge(change) {
+                    Ok(merged) => *existing.get_mut() = merged,
                     Err(error) => return StorageEvent::Error { error },
                 },
-                None => pending.push((key_space.clone(), key, change)),
+                Entry::Vacant(slot) => {
+                    slot.insert(change);
+                }
             }
         }
         StorageEvent::BatchWriteResult { entries }
@@ -133,7 +137,7 @@ impl FjallStorage {
         self.shadow_changes(&mut pending)?;
         let snapshot = self.store.db.read_tx();
         let failed = |error: &dyn std::fmt::Display| StorageError::WriteError(error.to_string());
-        for (key_space, key, change) in pending {
+        for ((key_space, key), change) in pending {
             let keyspace = self.store.resolve_keyspace(&key_space)?;
             let stored = snapshot
                 .get(&keyspace, &key)

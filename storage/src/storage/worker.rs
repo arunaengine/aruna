@@ -30,7 +30,7 @@ use super::metrics::{StorageMetrics, record_storage_call};
 use super::persistence::FjallPersistPolicy;
 use super::records::run_read;
 use super::telemetry::{storage_effect_kind, storage_event_kind};
-use super::transactions::CounterChange;
+use super::transactions::PendingChanges;
 use crate::compaction::Compactor;
 
 /// An open transaction; a read pool thread holds a clone while it reads in it.
@@ -176,7 +176,7 @@ pub struct FjallStorage {
     /// Journal count at the last journal sweep.
     pub(super) swept: usize,
     pub(super) txn_deletes: HashMap<Ulid, HashMap<String, u64>>,
-    pub(super) txn_usage: HashMap<Ulid, Vec<(String, ByteView, CounterChange)>>,
+    pub(super) txn_usage: HashMap<Ulid, PendingChanges>,
     /// Open write transactions that wrote or deleted realm config rows.
     pub(super) config_txns: HashSet<Ulid>,
     /// Keyspaces whose committed usage deltas also go to their rebuild rows.

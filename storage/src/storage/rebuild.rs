@@ -17,13 +17,11 @@ use fjall::Readable;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::transactions::{CounterChange, warn_clamped};
+use super::transactions::{CounterChange, PendingChanges, warn_clamped};
 use super::{FjallStorage, Store, iterate_page};
 
 /// Rows read per page while a rebuild clears or replaces counter rows.
 const REBUILD_PAGE: usize = 1024;
-
-type PendingChanges = Vec<(String, ByteView, CounterChange)>;
 
 /// The usage keyspace whose rebuild was begun before the last stop and saved its progress.
 pub(super) fn running_rebuild(store: &Store) -> HashSet<String> {
@@ -72,29 +70,24 @@ impl FjallStorage {
         if self.usage_shadow.is_empty() {
             return Ok(());
         }
-        let copies: PendingChanges = pending
+        let copies: Vec<_> = pending
             .iter()
-            .filter(|(key_space, key, change)| {
+            .filter(|((key_space, key), change)| {
                 self.usage_shadow.contains(key_space)
                     && !is_rebuild_row(key)
                     && !matches!(change, CounterChange::Range(_))
             })
-            .map(|(key_space, key, change)| {
-                (
-                    key_space.clone(),
-                    ByteView::from(usage_shadow_key(key)),
-                    *change,
-                )
+            .map(|((key_space, key), change)| {
+                let shadow = ByteView::from(usage_shadow_key(key));
+                ((key_space.clone(), shadow), *change)
             })
             .collect();
-        for (key_space, key, change) in copies {
-            match pending
-                .iter_mut()
-                .find(|(space, existing, _)| *space == key_space && *existing == key)
-            {
-                Some((_, _, existing)) => *existing = existing.merge(change)?,
-                None => pending.push((key_space, key, change)),
-            }
+        for (row, change) in copies {
+            let merged = match pending.get(&row) {
+                Some(existing) => existing.merge(change)?,
+                None => change,
+            };
+            pending.insert(row, merged);
         }
         Ok(())
     }
