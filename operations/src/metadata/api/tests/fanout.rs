@@ -4,7 +4,7 @@
 
 use super::list::{auth_for, user_role, write_policy_docs};
 use super::*;
-use crate::metadata::api::search::RangeLayout;
+use crate::metadata::api::search_types::RangeLayout;
 
 // Fan-out follows the live holders of the stored bucket; the event-time
 // holder stamp on the record is ignored, and no config means local only.

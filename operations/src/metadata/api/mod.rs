@@ -126,6 +126,7 @@ mod preflight;
 mod read;
 mod read_types;
 mod search;
+mod search_types;
 
 pub use self::distributed::MetadataQueryForm;
 pub use self::export::{
@@ -160,13 +161,13 @@ pub use self::read_types::{
     ApiQueryMode, DocumentQueryRequest, MetadataQueryExecution, MetadataQueryRequest,
     MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
 };
-pub use self::search::{
+pub use self::search::{search_metadata, search_objects};
+pub use self::search_types::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
-    ObjectExecution, ObjectPartitionCoverage, ObjectQueryMode, SearchQueryRequest, search_metadata,
-    search_objects,
+    ObjectExecution, ObjectPartitionCoverage, ObjectQueryMode, SearchQueryRequest,
 };
 #[cfg(test)]
-use self::search::{ObjectCursor, ObjectPartitionState, PendingBucket};
+use self::search_types::{ObjectCursor, ObjectPartitionState, PendingBucket};
 
 const REFERENCES_LIMIT: usize = 25;
 

@@ -5,9 +5,10 @@
 use super::*;
 
 use super::super::search::{
-    ObjectSearchPartitions, ObjectSearchPlan, RangeLayout, assemble_object_execution,
-    plan_object_search,
+    ObjectSearchPartitions, ObjectSearchPlan, assemble_object_execution, plan_object_search,
 };
+
+use super::super::search_types::RangeLayout;
 
 #[tokio::test]
 async fn bucket_fanout_partial() {
