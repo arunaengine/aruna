@@ -151,11 +151,11 @@ pub use self::list_types::{
 };
 pub use self::path::lookup_metadata_path;
 pub(crate) use self::path::resolve_local_path;
-use self::path::{merge_path_views, reduce_path_candidates};
 #[cfg(test)]
 use self::path_types::PathShardView;
 use self::path_types::select_path_holders;
 pub use self::path_types::{MetadataLookupRequest, MetadataLookupResult};
+use self::path_types::{merge_path_views, reduce_path_candidates};
 pub use self::preflight::{
     MetadataExcludedForm, MetadataIndexState, MetadataNodeFreshness, MetadataPreflightLocation,
     MetadataResolvedTarget, MetadataStorageOperation, MetadataVisibleReference, ReferenceCoverage,

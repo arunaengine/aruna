@@ -3,18 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::path_types::select_path_holders;
-use super::path_types::{
-    MetadataLookupRequest, MetadataLookupResult, PathHolderSelection, PathShardView,
-};
+use super::path_types::{MetadataLookupRequest, MetadataLookupResult, PathShardView};
+use super::path_types::{merge_path_views, reduce_path_candidates};
 use super::{
     AuthContext, AuthFailure, AuthToken, DISTRIBUTED_QUERY_DEADLINE, DriverContext, GroupId,
     GroupPermissionRules, HashSet, MetaResourceId, MetadataApiError, MetadataPathCandidate,
-    MetadataPathResolution, MetadataPathWinner, MetadataReadError, MetadataRegistryRecord,
-    MetadataTransportMessage, NodeId, PathClaimRecord, PlacementRef, QUERY_FANOUT_LIMIT,
-    QUERY_MAX_NODES, REGISTRY_CANDIDATE_LIMIT, ROLE_NODE, ReadDecision, RealmConfigDocument,
-    RealmId, Ulid, holds_placement, load_realm_config, meta_bucket_subject, metadata_read_request,
-    neg_log2_q48, peer_rank, reduce_holder_reads, registry_placement, registry_placement_for,
-    registry_strategy, resolve_holders_limit, resolve_shard_holders, select_top_peers,
+    MetadataPathResolution, MetadataReadError, MetadataRegistryRecord, MetadataTransportMessage,
+    NodeId, PathClaimRecord, PlacementRef, QUERY_FANOUT_LIMIT, QUERY_MAX_NODES,
+    REGISTRY_CANDIDATE_LIMIT, ROLE_NODE, ReadDecision, RealmConfigDocument, RealmId,
+    holds_placement, load_realm_config, meta_bucket_subject, metadata_read_request, neg_log2_q48,
+    reduce_holder_reads, registry_placement, registry_placement_for, registry_strategy,
     selector_hash, stream,
 };
 
@@ -227,56 +225,6 @@ pub(super) fn validate_path_resolution(
     Ok(())
 }
 
-pub(super) fn merge_path_views(
-    expected: &[usize],
-    views: Vec<PathShardView>,
-) -> Result<Vec<MetadataPathCandidate>, MetadataApiError> {
-    let mut consensus = vec![None; expected.len()];
-    let mut seen = vec![0usize; expected.len()];
-    for mut view in views {
-        let shard = view.shard as usize;
-        if shard >= expected.len() || seen[shard] >= expected[shard] {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
-        normalize_path_view(&mut view.candidates)?;
-        seen[shard] += 1;
-        match consensus[shard].as_ref() {
-            Some(current) if current != &view.candidates => {
-                return Err(MetadataApiError::ServiceUnavailable);
-            }
-            Some(_) => {}
-            None => consensus[shard] = Some(view.candidates),
-        }
-    }
-
-    let mut candidates = Vec::new();
-    for (shard, expected) in expected.iter().copied().enumerate() {
-        if expected == 0 || seen[shard] != expected {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
-        candidates.extend(consensus[shard].take().unwrap_or_default());
-    }
-    Ok(candidates)
-}
-
-pub(super) fn normalize_path_view(
-    candidates: &mut [MetadataPathCandidate],
-) -> Result<(), MetadataApiError> {
-    candidates.sort_by_key(|candidate| {
-        (
-            candidate.claim.document_id,
-            candidate.claim.establishing_event_id,
-        )
-    });
-    if candidates
-        .windows(2)
-        .any(|pair| pair[0].claim.document_id == pair[1].claim.document_id)
-    {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    Ok(())
-}
-
 pub(super) async fn load_path_holder(
     context: &DriverContext,
     group_id: GroupId,
@@ -409,64 +357,6 @@ pub(super) fn validate_path_candidate(
         return Err(MetadataApiError::ServiceUnavailable);
     }
     Ok(placement)
-}
-
-pub(super) fn reduce_path_candidates(
-    candidates: Vec<MetadataPathCandidate>,
-) -> Result<MetadataLookupResult, MetadataApiError> {
-    let claims = candidates
-        .iter()
-        .map(|candidate| candidate.claim.clone())
-        .collect::<Vec<_>>();
-    let resolution =
-        aruna_core::structs::resolve_path_claim(&claims).ok_or(MetadataApiError::NotFound)?;
-    let winner = candidates
-        .iter()
-        .filter(|candidate| candidate.claim == resolution.winner)
-        .find_map(|candidate| candidate.record.clone())
-        .ok_or(MetadataApiError::NotFound)?;
-    let winner = sanitize_path_winner(winner)?;
-    let conflicts = resolution
-        .conflicts
-        .iter()
-        .filter_map(|claim| {
-            candidates
-                .iter()
-                .filter(|candidate| candidate.claim == *claim)
-                .find_map(|candidate| candidate.record.as_ref())
-                .map(|record| record.document_id)
-        })
-        .collect::<Vec<_>>();
-    Ok(MetadataLookupResult { winner, conflicts })
-}
-
-pub(super) fn sanitize_path_winner(
-    record: MetadataRegistryRecord,
-) -> Result<MetadataPathWinner, MetadataApiError> {
-    MetaResourceId::from_bytes(record.document_id.to_bytes())
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    if record.graph_iri != MetadataRegistryRecord::graph_iri_for(record.document_id)
-        || record.permission_path
-            != MetadataRegistryRecord::permission_path_for(
-                &record.realm_id,
-                record.group_id,
-                &record.document_path,
-                record.document_id,
-            )
-    {
-        return Err(MetadataApiError::ServiceUnavailable);
-    }
-    Ok(MetadataPathWinner {
-        realm_id: record.realm_id,
-        group_id: record.group_id,
-        document_id: record.document_id,
-        document_path: record.document_path,
-        graph_iri: record.graph_iri,
-        public: record.public,
-        replicas: record.holder_node_ids.len(),
-        created_at_ms: record.created_at_ms,
-        updated_at_ms: record.updated_at_ms,
-    })
 }
 
 pub async fn lookup_metadata_path(

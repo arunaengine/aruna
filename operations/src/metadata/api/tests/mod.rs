@@ -6,9 +6,8 @@ use super::*;
 
 use super::export::raw_identity_matches;
 use super::fanout::ensure_query_form;
-use super::path::{
-    reduce_path_response, sanitize_path_winner, select_forward_peers, validate_path_resolution,
-};
+use super::path::{reduce_path_response, select_forward_peers, validate_path_resolution};
+use super::path_types::sanitize_path_winner;
 use super::read::ensure_permission;
 
 use std::collections::BTreeMap;

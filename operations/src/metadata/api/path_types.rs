@@ -3,12 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    AuthContext, GroupId, HashSet, MetadataApiError, MetadataPathCandidate, MetadataPathWinner,
-    MetadataRegistryRecord, NodeId, PlacementRef, QUERY_MAX_NODES, ROLE_NODE, RealmConfigDocument,
-    RealmId, Ulid, meta_bucket_subject, neg_log2_q48, peer_rank, resolve_holders_limit,
-    resolve_shard_holders, select_top_peers, selector_hash,
+    AuthContext, GroupId, HashSet, MetaResourceId, MetadataApiError, MetadataPathCandidate,
+    MetadataPathWinner, MetadataRegistryRecord, NodeId, PlacementRef, QUERY_MAX_NODES, ROLE_NODE,
+    RealmConfigDocument, RealmId, Ulid, meta_bucket_subject, neg_log2_q48, peer_rank,
+    resolve_holders_limit, resolve_shard_holders, select_top_peers, selector_hash,
 };
-use futures_util::StreamExt;
 
 #[derive(Debug, Clone)]
 pub struct MetadataLookupRequest {
@@ -211,4 +210,112 @@ pub(super) fn select_fanout_nodes(
             .then_with(|| left.as_bytes().cmp(right.as_bytes()))
     });
     ranked
+}
+
+pub(super) fn merge_path_views(
+    expected: &[usize],
+    views: Vec<PathShardView>,
+) -> Result<Vec<MetadataPathCandidate>, MetadataApiError> {
+    let mut consensus = vec![None; expected.len()];
+    let mut seen = vec![0usize; expected.len()];
+    for mut view in views {
+        let shard = view.shard as usize;
+        if shard >= expected.len() || seen[shard] >= expected[shard] {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        normalize_path_view(&mut view.candidates)?;
+        seen[shard] += 1;
+        match consensus[shard].as_ref() {
+            Some(current) if current != &view.candidates => {
+                return Err(MetadataApiError::ServiceUnavailable);
+            }
+            Some(_) => {}
+            None => consensus[shard] = Some(view.candidates),
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (shard, expected) in expected.iter().copied().enumerate() {
+        if expected == 0 || seen[shard] != expected {
+            return Err(MetadataApiError::ServiceUnavailable);
+        }
+        candidates.extend(consensus[shard].take().unwrap_or_default());
+    }
+    Ok(candidates)
+}
+
+pub(super) fn normalize_path_view(
+    candidates: &mut [MetadataPathCandidate],
+) -> Result<(), MetadataApiError> {
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.claim.document_id,
+            candidate.claim.establishing_event_id,
+        )
+    });
+    if candidates
+        .windows(2)
+        .any(|pair| pair[0].claim.document_id == pair[1].claim.document_id)
+    {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    Ok(())
+}
+
+pub(super) fn reduce_path_candidates(
+    candidates: Vec<MetadataPathCandidate>,
+) -> Result<MetadataLookupResult, MetadataApiError> {
+    let claims = candidates
+        .iter()
+        .map(|candidate| candidate.claim.clone())
+        .collect::<Vec<_>>();
+    let resolution =
+        aruna_core::structs::resolve_path_claim(&claims).ok_or(MetadataApiError::NotFound)?;
+    let winner = candidates
+        .iter()
+        .filter(|candidate| candidate.claim == resolution.winner)
+        .find_map(|candidate| candidate.record.clone())
+        .ok_or(MetadataApiError::NotFound)?;
+    let winner = sanitize_path_winner(winner)?;
+    let conflicts = resolution
+        .conflicts
+        .iter()
+        .filter_map(|claim| {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.claim == *claim)
+                .find_map(|candidate| candidate.record.as_ref())
+                .map(|record| record.document_id)
+        })
+        .collect::<Vec<_>>();
+    Ok(MetadataLookupResult { winner, conflicts })
+}
+
+pub(super) fn sanitize_path_winner(
+    record: MetadataRegistryRecord,
+) -> Result<MetadataPathWinner, MetadataApiError> {
+    MetaResourceId::from_bytes(record.document_id.to_bytes())
+        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+    if record.graph_iri != MetadataRegistryRecord::graph_iri_for(record.document_id)
+        || record.permission_path
+            != MetadataRegistryRecord::permission_path_for(
+                &record.realm_id,
+                record.group_id,
+                &record.document_path,
+                record.document_id,
+            )
+    {
+        return Err(MetadataApiError::ServiceUnavailable);
+    }
+    Ok(MetadataPathWinner {
+        realm_id: record.realm_id,
+        group_id: record.group_id,
+        document_id: record.document_id,
+        document_path: record.document_path,
+        graph_iri: record.graph_iri,
+        public: record.public,
+        replicas: record.holder_node_ids.len(),
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
+    })
 }
