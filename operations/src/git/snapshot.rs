@@ -41,20 +41,13 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::telemetry::time_stage;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
 use ulid::Ulid;
 
 /// How long other holders leave a new revision to the first holder before generating it.
 const FAILOVER_MS: u64 = 60_000;
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
-}
 
 fn first(context: &DriverContext, holders: &[NodeId]) -> bool {
     context.net_handle.as_ref().map(|net| net.node_id()) == holders.first().copied()
@@ -657,7 +650,7 @@ pub async fn refresh(
     store: &GitStore,
     document: &MetadataRegistryRecord,
 ) -> Result<Projection, GitError> {
-    let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
+    let overdue = unix_timestamp_millis().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
     if let Some(projection) = recent(context, store, document, overdue).await? {
         return Ok(projection);
     }
@@ -686,7 +679,7 @@ pub async fn view(
     store: &GitStore,
     document: &MetadataRegistryRecord,
 ) -> Result<(Projection, bool), GitError> {
-    let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
+    let overdue = unix_timestamp_millis().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
     if let Some(projection) = recent(context, store, document, overdue).await? {
         return Ok((projection, false));
     }
@@ -799,7 +792,7 @@ async fn update(
         tracing::warn!(document_id = %document.document_id, %error, "Pushed metadata waits");
     }
     let leading = first(context, &projection.holders);
-    let overdue = now_ms().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
+    let overdue = unix_timestamp_millis().saturating_sub(document.updated_at_ms) > FAILOVER_MS;
     // The graph's content decides, so a late older edit that changes it is captured too.
     let loading = erased(current(context, document, revision, materializing));
     if let Some(source) = time_stage("git_source", loading).await?

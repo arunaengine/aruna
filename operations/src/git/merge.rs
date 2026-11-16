@@ -7,8 +7,8 @@ use super::project::Projection;
 use super::push::{record_made, unlocked};
 use super::snapshot::{execute, linked};
 use super::versions::{
-    Version, WriteOptions, branch_ref, diff, expect, log, now_ms, open, parse_conflict,
-    peeled_tags, plain, protected, resolve, rocrate, version,
+    Version, WriteOptions, branch_ref, diff, expect, log, open, parse_conflict, peeled_tags, plain,
+    protected, resolve, rocrate, version,
 };
 use super::{GitError, MergeConflict};
 use crate::driver::DriverContext;
@@ -18,6 +18,7 @@ use aruna_core::git::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::time::unix_timestamp_millis;
 use bytes::Bytes;
 use ulid::Ulid;
 
@@ -73,7 +74,7 @@ pub async fn edit(
         snapshot: GitSnapshot {
             document_id: id,
             event_id: Ulid::nil(),
-            occurred_at_ms: now_ms(),
+            occurred_at_ms: unix_timestamp_millis(),
             jsonld,
             objects,
             message: None,

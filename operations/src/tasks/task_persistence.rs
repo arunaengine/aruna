@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use aruna_core::time::unix_timestamp_millis;
+use std::time::Duration;
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -110,7 +111,11 @@ pub async fn restore_task_timers(storage: &StorageHandle, task_handle: &TaskHand
                     continue;
                 }
             };
-            let after = Duration::from_millis(record.due_unix_millis.saturating_sub(now_millis()));
+            let after = Duration::from_millis(
+                record
+                    .due_unix_millis
+                    .saturating_sub(unix_timestamp_millis()),
+            );
             let event = task_handle
                 .send_effect(Effect::Task(TaskEffect::ResetTimer {
                     key: record.key,
@@ -231,17 +236,9 @@ pub(crate) fn task_storage_key(key: &TaskKey) -> Result<ByteView, String> {
 fn due_at_millis(after: Duration) -> Result<u64, String> {
     let after_millis =
         u64::try_from(after.as_millis()).map_err(|_| "timer duration is too large".to_string())?;
-    now_millis()
+    unix_timestamp_millis()
         .checked_add(after_millis)
         .ok_or_else(|| "timer deadline overflow".to_string())
-}
-
-fn now_millis() -> u64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

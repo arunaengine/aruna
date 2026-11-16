@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::time::unix_timestamp_secs;
 use aruna_core::{IdEnvironment, SystemEnvironment};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -140,10 +139,6 @@ fn clock_drift_ms(anchor: &ClockAnchor, sample: &ClockAnchor) -> Option<u64> {
     let elapsed_ms = sample.monotonic_ms.checked_sub(anchor.monotonic_ms)?;
     let expected_ms = anchor.wall_ms.saturating_add(elapsed_ms);
     Some(sample.wall_ms.abs_diff(expected_ms))
-}
-
-pub fn now_unix_secs() -> u64 {
-    unix_timestamp_secs()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

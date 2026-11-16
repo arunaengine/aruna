@@ -44,7 +44,6 @@ use super::rpc::{
     encode_traced_request, request_kind, response_kind,
 };
 use super::state::DhtStateMachine;
-use super::storage::now_unix_secs;
 use super::storage::{
     CLEANUP_PAGE_SIZE, DeadlineEntry, DeadlineIndex, DhtClock, DhtClockError, MergeError,
     StoredEntry, active_deadline, deadline_key, decode_entries, encode_entries, floor_deadline,
@@ -55,6 +54,7 @@ use crate::telemetry::{
     current_trace_context, duration_ms, extract_trace_context, record_duration_ms, warn_iroh_phase,
     warn_iroh_request,
 };
+use aruna_core::time::unix_timestamp_secs;
 
 pub type CallerOutcome = std::result::Result<DhtOutputValue, DhtIoError>;
 pub type InboundDhtStream = (SendStream, RecvStream, NodeId);
@@ -1999,7 +1999,7 @@ async fn run_storage_txn(
             }
         },
         None => match mutation {
-            StorageMutation::Merge { .. } => now_unix_secs(),
+            StorageMutation::Merge { .. } => unix_timestamp_secs(),
             StorageMutation::Prune { now_secs, .. } => *now_secs,
         },
     };
@@ -2986,7 +2986,7 @@ mod tests {
         let (storage, receivers) = StorageHandle::new();
         let receiver = receivers.foreground;
         let key = DhtKeyId::from_data(b"unchanged-replay");
-        let entry = make_entry(1, key, now_unix_secs().saturating_add(200));
+        let entry = make_entry(1, key, unix_timestamp_secs().saturating_add(200));
         let encoded = encode_entries(std::slice::from_ref(&entry)).expect("encode entry");
         let txn_id = TxnId::generate();
         let worker = std::thread::spawn(move || {
@@ -3053,7 +3053,7 @@ mod tests {
         let state = DhtStateMachine::new(
             endpoint.id(),
             endpoint.secret_key().clone(),
-            now_unix_secs(),
+            unix_timestamp_secs(),
         );
         let (_cmd_tx, cmd_rx) = mpsc::bounded_blocking_async(CMD_CHANNEL_CAPACITY);
         let (_inbound_tx, inbound_rx) = mpsc::bounded_blocking_async(1);
@@ -3463,7 +3463,11 @@ mod tests {
         write_count(&storage, count).await;
         let key = DhtKeyId::from_data(b"past-former-key-limit");
         let mutation = StorageMutation::Merge {
-            entries: vec![make_entry(1, key, now_unix_secs().saturating_add(200))],
+            entries: vec![make_entry(
+                1,
+                key,
+                unix_timestamp_secs().saturating_add(200),
+            )],
         };
 
         mutate_storage_entries(&storage, 12, StorageStage::InboundPutMerge, key, &mutation)
@@ -3500,7 +3504,11 @@ mod tests {
 
         let key = DhtKeyId::from_data(b"full-keyspace");
         let mutation = StorageMutation::Merge {
-            entries: vec![make_entry(1, key, now_unix_secs().saturating_add(200))],
+            entries: vec![make_entry(
+                1,
+                key,
+                unix_timestamp_secs().saturating_add(200),
+            )],
         };
         assert!(matches!(
             mutate_storage_entries(&storage, 12, StorageStage::InboundPutMerge, key, &mutation,)
@@ -3524,7 +3532,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_retained_floor() {
         let (_directory, storage) = open_storage();
-        let now_secs = now_unix_secs();
+        let now_secs = unix_timestamp_secs();
         let victim = DhtKeyId::from_data(b"floor-victim");
         let target = DhtKeyId::from_data(b"floor-replacement");
         let retained = StorageMutation::Merge {
@@ -3572,7 +3580,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_expired_row() {
         let (_directory, storage) = open_storage();
-        let now_secs = now_unix_secs();
+        let now_secs = unix_timestamp_secs();
         let victim = DhtKeyId::from_data(b"expired-active");
         let target = DhtKeyId::from_data(b"expired-replacement");
         let entry = make_entry(1, victim, now_secs);
@@ -3611,7 +3619,7 @@ mod tests {
     async fn capacity_unsafe_rows() {
         // Capacity reclaim skips corrupt, invalid, and live rows before choosing a safe victim.
         let (_directory, storage) = open_storage();
-        let now_secs = now_unix_secs();
+        let now_secs = unix_timestamp_secs();
         let corrupt = DhtKeyId::from_data(b"corrupt-victim");
         let invalid_key = DhtKeyId::from_data(b"invalid-victim");
         let victim = DhtKeyId::from_data(b"live-victim");
@@ -3687,7 +3695,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_floor_admission() {
         let (_directory, storage) = open_storage();
-        let now_secs = now_unix_secs();
+        let now_secs = unix_timestamp_secs();
         let victim = DhtKeyId::from_data(b"retained-floor");
         let target = DhtKeyId::from_data(b"new-floor");
         let _ = store_due_floor(&storage, victim, 1, now_secs.saturating_sub(2)).await;
@@ -3715,7 +3723,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_concurrent_reclaims() {
         let (_directory, storage) = open_storage();
-        let now_secs = now_unix_secs();
+        let now_secs = unix_timestamp_secs();
         let first_victim = DhtKeyId::from_data(b"first-floor-victim");
         let second_victim = DhtKeyId::from_data(b"second-floor-victim");
         let first_target = DhtKeyId::from_data(b"first-admission");
@@ -3769,7 +3777,7 @@ mod tests {
     async fn merge_indexes_row() {
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"indexed-row");
-        let expires_at = now_unix_secs().saturating_add(200);
+        let expires_at = unix_timestamp_secs().saturating_add(200);
         let mutation = StorageMutation::Merge {
             entries: vec![make_entry(1, key, expires_at)],
         };
@@ -3797,7 +3805,7 @@ mod tests {
     async fn cleanup_moves_floor() {
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"floor-transition");
-        let expires_at = now_unix_secs().saturating_add(20);
+        let expires_at = unix_timestamp_secs().saturating_add(20);
         let mutation = StorageMutation::Merge {
             entries: vec![make_entry(1, key, expires_at)],
         };
@@ -3830,7 +3838,7 @@ mod tests {
     async fn cleanup_deletes_floor() {
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"floor-removal");
-        let expires_at = now_unix_secs().saturating_add(20);
+        let expires_at = unix_timestamp_secs().saturating_add(20);
         let mutation = StorageMutation::Merge {
             entries: vec![make_entry(1, key, expires_at)],
         };
@@ -4037,7 +4045,7 @@ mod tests {
     async fn batch_merge_persists() {
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"batch-remote-merge");
-        let expires_at = now_unix_secs().saturating_add(200);
+        let expires_at = unix_timestamp_secs().saturating_add(200);
         let mutation = StorageMutation::Merge {
             entries: vec![
                 make_entry(1, key, expires_at),
@@ -4067,7 +4075,7 @@ mod tests {
         // the one that lost a concurrent revision race, rather than failing wholesale.
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"read-repair-mixed-batch");
-        let expires_at = now_unix_secs().saturating_add(200);
+        let expires_at = unix_timestamp_secs().saturating_add(200);
 
         let winner = StorageMutation::Merge {
             entries: vec![make_entry_rev(1, key, expires_at, 2)],
@@ -4104,7 +4112,7 @@ mod tests {
     async fn concurrent_merges_preserve() {
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"concurrent-merges");
-        let expires_at = now_unix_secs().saturating_add(200);
+        let expires_at = unix_timestamp_secs().saturating_add(200);
         let first = StorageMutation::Merge {
             entries: vec![make_entry(1, key, expires_at)],
         };
@@ -4127,7 +4135,7 @@ mod tests {
     async fn cleanup_preserves_fresh() {
         let (_directory, storage) = open_storage();
         let key = DhtKeyId::from_data(b"cleanup-race");
-        let now_secs = now_unix_secs();
+        let now_secs = unix_timestamp_secs();
         let old = StorageMutation::Merge {
             entries: vec![make_entry(1, key, now_secs.saturating_add(50))],
         };
@@ -4179,7 +4187,11 @@ mod tests {
         ));
 
         let mutation = StorageMutation::Merge {
-            entries: vec![make_entry(1, key, now_unix_secs().saturating_add(200))],
+            entries: vec![make_entry(
+                1,
+                key,
+                unix_timestamp_secs().saturating_add(200),
+            )],
         };
         assert!(
             mutate_storage_entries(&storage, 5, StorageStage::InboundPutMerge, key, &mutation,)

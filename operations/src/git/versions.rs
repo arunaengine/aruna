@@ -269,14 +269,6 @@ pub(super) fn expect(current: Option<&String>, expected: Option<&str>) -> Result
     }
 }
 
-pub(super) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
 /// The value of `key` in the message's final trailer block, the lines after its last blank line.
 fn trailer(message: &str, key: &str) -> Option<String> {
     let block = message

@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::time::unix_timestamp_millis;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -37,13 +37,6 @@ fn allocation_cursor_key(realm_id: &RealmId) -> Key {
     let mut bytes = b"handle_allocation_cursor:".to_vec();
     bytes.extend_from_slice(realm_id.as_bytes());
     Key::from(bytes)
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// A handle drawn from a granted range, with the provenance a binding must carry.
@@ -221,7 +214,7 @@ pub async fn allocate_handle(
     .await?;
     let ranges = config.handle_range_directory().granted_to(&node_id);
     crate::driver::drive(
-        AllocateHandleOperation::new(realm_id, node_id, ranges, now_ms()),
+        AllocateHandleOperation::new(realm_id, node_id, ranges, unix_timestamp_millis()),
         context,
     )
     .await
