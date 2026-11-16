@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
+use std::pin::pin;
 use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
@@ -13,12 +14,13 @@ use aruna_core::plugins::MAX_ARTIFACT;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::TxnId;
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
+use futures_util::TryStreamExt;
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
 use super::ArtifactBytes;
 use super::artifacts::ArtifactError;
 use crate::driver::DriverContext;
-use crate::storage_read::scan_all;
+use crate::storage_read::scan_pages;
 
 /// Bytes of one artifact chunk; node messages stay far below their 16 MiB limit.
 pub const CHUNK: usize = 8 << 20;
@@ -513,17 +515,21 @@ async fn scan_rows<T>(
     decode: fn(&[u8]) -> Option<T>,
 ) -> Result<Vec<(String, T)>, ArtifactError> {
     let prefix_key = Some(prefix.to_vec().into());
-    let rows = scan_all(&ctx.storage_handle, PLUGIN_ARTIFACT_KEYSPACE, prefix_key)
-        .await
-        .map_err(ArtifactError::Storage)?;
-    Ok((rows.into_iter())
-        .filter_map(|(key, value)| {
+    let mut pages = pin!(scan_pages(
+        &ctx.storage_handle,
+        PLUGIN_ARTIFACT_KEYSPACE,
+        prefix_key
+    ));
+    let mut decoded = Vec::new();
+    while let Some(page) = pages.try_next().await.map_err(ArtifactError::Storage)? {
+        decoded.extend(page.into_iter().filter_map(|(key, value)| {
             let digest = std::str::from_utf8(key.get(prefix.len()..)?)
                 .ok()?
                 .to_string();
             Some((digest, decode(&value)?))
-        })
-        .collect())
+        }));
+    }
+    Ok(decoded)
 }
 
 async fn read_row(ctx: &DriverContext, key: Vec<u8>) -> Result<Option<Vec<u8>>, ArtifactError> {

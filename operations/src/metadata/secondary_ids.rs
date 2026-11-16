@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::pin::pin;
+
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -15,6 +17,7 @@ use aruna_core::structs::secondary_id::{
 };
 use aruna_core::types::{Effects, TxnId};
 use byteview::ByteView;
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use ulid::Ulid;
@@ -26,7 +29,7 @@ use crate::metadata::persistent_id::{
     MappingRoute, PersistentIdError, mapping_revision, parse_mapping_read, read_mapping,
     read_mapping_effect, transition_entries,
 };
-use crate::storage_read::scan_all;
+use crate::storage_read::scan_pages;
 
 const COMMIT_ATTEMPTS: usize = 4;
 
@@ -266,17 +269,19 @@ pub async fn lookup_local(
     value: &str,
     endpoint: Option<&str>,
 ) -> Result<Vec<IdentifierMatch>, MetadataApiError> {
-    let rows = scan_all(
+    let prefix = ByteView::from(secondary_id_prefix(kind, value, endpoint));
+    let mut pages = pin!(scan_pages(
         &ctx.storage_handle,
         SECONDARY_ID_KEYSPACE,
-        Some(ByteView::from(secondary_id_prefix(kind, value, endpoint))),
-    )
-    .await
-    .map_err(MetadataApiError::Internal)?;
-    let mut documents = rows
-        .iter()
-        .filter_map(|(key, _)| index_document(key.as_ref()))
-        .collect::<Vec<_>>();
+        Some(prefix)
+    ));
+    let mut documents = Vec::new();
+    while let Some(page) = pages.try_next().await.map_err(MetadataApiError::Internal)? {
+        documents.extend(
+            page.iter()
+                .filter_map(|(key, _)| index_document(key.as_ref())),
+        );
+    }
     documents.sort();
     documents.dedup();
     let mut matches = Vec::new();

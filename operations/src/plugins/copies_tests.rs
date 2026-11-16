@@ -127,8 +127,9 @@ async fn local(ctx: &DriverContext, digest: &str) -> Option<Vec<u8>> {
 }
 
 async fn rows(ctx: &DriverContext) -> usize {
-    let rows = scan_all(&ctx.storage_handle, PLUGIN_ARTIFACT_KEYSPACE, None).await;
-    rows.unwrap().len()
+    let pages = scan_pages(&ctx.storage_handle, PLUGIN_ARTIFACT_KEYSPACE, None);
+    let pages: Vec<_> = pages.try_collect().await.unwrap();
+    pages.iter().map(Vec::len).sum()
 }
 
 fn after_grace(time: u64) -> u64 {

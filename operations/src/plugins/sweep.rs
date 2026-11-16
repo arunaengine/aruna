@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
+use std::pin::pin;
 use std::sync::{LazyLock, Mutex};
 
 use aruna_core::keyspaces::{AUTH_KEYSPACE, USER_KEYSPACE};
@@ -13,11 +14,12 @@ use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConf
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::{NodeId, UserId};
+use futures_util::TryStreamExt;
 use tracing::{info, warn};
 
 use super::account::read_row;
 use crate::driver::{DriverContext, drive};
-use crate::storage_read::scan_all;
+use crate::storage_read::scan_pages;
 use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE};
 
 /// How long an account stays unnamed before it is deactivated, so a record still on its way
@@ -35,11 +37,16 @@ pub async fn sweep_orphans(
     config: &RealmConfigDocument,
     now_ms: u64,
 ) -> Result<usize, String> {
-    let rows = scan_all(&ctx.storage_handle, USER_KEYSPACE, None).await?;
-    let accounts = (rows.iter())
-        .filter_map(|(_, value)| User::from_bytes(value).ok())
-        .filter_map(|user| Some((user.install()?, user)))
-        .filter(|(_, user)| !user.is_deactivated());
+    let mut pages = pin!(scan_pages(&ctx.storage_handle, USER_KEYSPACE, None));
+    let mut accounts = Vec::new();
+    while let Some(page) = pages.try_next().await? {
+        let users = (page.iter()).filter_map(|(_, value)| User::from_bytes(value).ok());
+        accounts.extend(
+            users
+                .filter_map(|user| Some((user.install()?, user)))
+                .filter(|(_, user)| !user.is_deactivated()),
+        );
+    }
     let mut due = Vec::new();
     {
         let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

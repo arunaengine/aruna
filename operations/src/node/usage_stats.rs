@@ -29,8 +29,10 @@ use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
+use futures_util::TryStreamExt;
 use smallvec::smallvec;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::pin::pin;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
@@ -38,7 +40,7 @@ use tracing::warn;
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::distribution::usage::replica_shares;
 use crate::driver::{DriverContext, drive};
-use crate::storage_read::scan_all;
+use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 pub use crate::node::usage_rebuild::{
@@ -996,24 +998,31 @@ async fn sum_snapshots(
     local_node_id: NodeId,
     active_node_ids: Option<&HashSet<NodeId>>,
 ) -> Result<(UsageCounters, UsageCounters), String> {
-    let entries = scan_all(storage, NODE_STATS_KEYSPACE, Some(Key::from(prefix))).await?;
+    let mut pages = pin!(scan_pages(
+        storage,
+        NODE_STATS_KEYSPACE,
+        Some(Key::from(prefix))
+    ));
     let (mut total, mut replicas) = (UsageCounters::default(), UsageCounters::default());
-    for (key, value) in entries {
-        let key_node_id = usage_node_id(key.as_ref());
-        let local = key_node_id == Some(local_node_id);
-        if !local && !counted(active_node_ids, key_node_id) {
-            continue;
-        }
-        let snapshot = NodeUsageSnapshot::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
-        // Reject snapshots whose embedded node differs from the storage key.
-        if key_node_id != Some(snapshot.node_id) {
-            continue;
-        }
-        replicas
-            .add(&snapshot.replicas)
-            .map_err(|e| e.to_string())?;
-        if !local {
-            total.add(&snapshot.counters).map_err(|e| e.to_string())?;
+    while let Some(page) = pages.try_next().await? {
+        for (key, value) in page {
+            let key_node_id = usage_node_id(key.as_ref());
+            let local = key_node_id == Some(local_node_id);
+            if !local && !counted(active_node_ids, key_node_id) {
+                continue;
+            }
+            let snapshot =
+                NodeUsageSnapshot::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
+            // Reject snapshots whose embedded node differs from the storage key.
+            if key_node_id != Some(snapshot.node_id) {
+                continue;
+            }
+            replicas
+                .add(&snapshot.replicas)
+                .map_err(|e| e.to_string())?;
+            if !local {
+                total.add(&snapshot.counters).map_err(|e| e.to_string())?;
+            }
         }
     }
     Ok((total, replicas))
@@ -1042,12 +1051,12 @@ async fn publish_retaining_markers(
 ) -> Result<(PublishedUsage, Vec<(Key, Value)>), String> {
     let storage = &ctx.storage_handle;
 
-    let observed_markers = scan_all(
-        storage,
-        NODE_STATS_KEYSPACE,
-        Some(Key::from(DIRTY_PREFIX.to_vec())),
-    )
-    .await?;
+    let dirty_prefix = Some(Key::from(DIRTY_PREFIX.to_vec()));
+    let mut pages = pin!(scan_pages(storage, NODE_STATS_KEYSPACE, dirty_prefix));
+    let mut observed_markers = Vec::new();
+    while let Some(page) = pages.try_next().await? {
+        observed_markers.extend(page);
+    }
 
     let mut groups: BTreeSet<GroupId> = BTreeSet::new();
     let mut global = false;
@@ -1064,31 +1073,27 @@ async fn publish_retaining_markers(
 
     if full {
         global = true;
-        for (key, _) in scan_all(
-            storage,
-            USAGE_STATS_KEYSPACE,
-            Some(Key::from(b"group/".to_vec())),
-        )
-        .await?
-        {
-            if let Some(rest) = key.as_ref().strip_prefix(b"group/")
-                && let Ok(bytes) = <[u8; 16]>::try_from(rest)
-            {
-                groups.insert(GroupId::from_bytes(bytes));
+        let group_prefix = Some(Key::from(b"group/".to_vec()));
+        let mut pages = pin!(scan_pages(storage, USAGE_STATS_KEYSPACE, group_prefix));
+        while let Some(page) = pages.try_next().await? {
+            for (key, _) in page {
+                if let Some(rest) = key.as_ref().strip_prefix(b"group/")
+                    && let Ok(bytes) = <[u8; 16]>::try_from(rest)
+                {
+                    groups.insert(GroupId::from_bytes(bytes));
+                }
             }
         }
         // Republish snapshots missing a live counter as zero so peers stop summing stale data.
-        for (key, _) in scan_all(
-            storage,
-            NODE_STATS_KEYSPACE,
-            Some(Key::from(USAGE_GROUP_PREFIX.to_vec())),
-        )
-        .await?
-        {
-            if usage_node_id(key.as_ref()) == Some(node_id)
-                && let Some(group_id) = usage_group_id(key.as_ref())
-            {
-                groups.insert(group_id);
+        let usage_prefix = Some(Key::from(USAGE_GROUP_PREFIX.to_vec()));
+        let mut pages = pin!(scan_pages(storage, NODE_STATS_KEYSPACE, usage_prefix));
+        while let Some(page) = pages.try_next().await? {
+            for (key, _) in page {
+                if usage_node_id(key.as_ref()) == Some(node_id)
+                    && let Some(group_id) = usage_group_id(key.as_ref())
+                {
+                    groups.insert(group_id);
+                }
             }
         }
     }
@@ -1437,14 +1442,17 @@ async fn clear_usage_cache(ctx: &DriverContext) -> Result<(), String> {
         NODE_STATS_KEYSPACE.to_string(),
         Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
     )];
-    for (key, _) in scan_all(
+    let summary_prefix = Some(Key::from(SUMMARY_GROUP_PREFIX.to_vec()));
+    let mut pages = pin!(scan_pages(
         &ctx.storage_handle,
         NODE_STATS_KEYSPACE,
-        Some(Key::from(SUMMARY_GROUP_PREFIX.to_vec())),
-    )
-    .await?
-    {
-        deletes.push((NODE_STATS_KEYSPACE.to_string(), key));
+        summary_prefix
+    ));
+    while let Some(page) = pages.try_next().await? {
+        deletes.extend(
+            page.into_iter()
+                .map(|(key, _)| (NODE_STATS_KEYSPACE.to_string(), key)),
+        );
     }
     match ctx
         .storage_handle
@@ -1581,10 +1589,13 @@ impl RealmUsage {
 /// recomputes their replica shares, and schedules it.
 async fn dirty_bound_groups(ctx: &DriverContext) -> Result<(), String> {
     let mut groups = BTreeSet::new();
-    for (_, value) in scan_all(&ctx.storage_handle, S3_BUCKET_KEYSPACE, None).await? {
-        let info = BucketInfo::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
-        if info.distribution.is_some() {
-            groups.insert(info.group_id);
+    let mut pages = pin!(scan_pages(&ctx.storage_handle, S3_BUCKET_KEYSPACE, None));
+    while let Some(page) = pages.try_next().await? {
+        for (_, value) in page {
+            let info = BucketInfo::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
+            if info.distribution.is_some() {
+                groups.insert(info.group_id);
+            }
         }
     }
     if groups.is_empty() {

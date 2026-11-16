@@ -1,4 +1,4 @@
-//! Parses storage read and iterate events and scans a whole keyspace page by page.
+//! Parses storage read and iterate events and reads a keyspace range page by page.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,6 +7,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
+use futures_util::{Stream, stream};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -69,37 +70,33 @@ pub(crate) fn parse_storage_scan(event: Event) -> Result<StorageScan, StorageRea
     }
 }
 
-pub(crate) async fn scan_all(
-    storage: &StorageHandle,
-    key_space: &str,
+/// Reads a keyspace range page by page, so a caller handles each page before the next read.
+pub(crate) fn scan_pages<'a>(
+    storage: &'a StorageHandle,
+    key_space: &'a str,
     prefix: Option<Key>,
-) -> Result<Vec<(Key, Value)>, String> {
-    let mut collected = Vec::new();
-    let mut start = None;
-    loop {
-        match storage
-            .send_storage_effect(StorageEffect::Iter {
+) -> impl Stream<Item = Result<Vec<(Key, Value)>, String>> + 'a {
+    stream::try_unfold(Some(None), move |start: Option<Option<Key>>| {
+        let prefix = prefix.clone();
+        async move {
+            let Some(start) = start else {
+                return Ok(None);
+            };
+            let iter = StorageEffect::Iter {
                 key_space: key_space.to_string(),
-                prefix: prefix.clone(),
+                prefix,
                 start: start.map(IterStart::After),
                 limit: 1_000,
                 txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => {
-                collected.extend(values);
-                match next_start_after {
-                    Some(next) => start = Some(next),
-                    None => break,
-                }
+            };
+            match storage.send_storage_effect(iter).await {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => Ok(Some((values, next_start_after.map(Some)))),
+                Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+                other => Err(format!("unexpected iter event: {other:?}")),
             }
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected iter event: {other:?}")),
         }
-    }
-    Ok(collected)
+    })
 }

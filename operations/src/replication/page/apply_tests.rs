@@ -251,11 +251,12 @@ async fn applies_page_once() {
 
 /// The object keys of the uploads this node journaled, in journal order.
 async fn journaled(handle: &StorageHandle) -> Vec<String> {
-    let rows =
-        crate::storage_read::scan_all(handle, EVENT_JOURNAL_KEYSPACE, Some(b"j".to_vec().into()))
-            .await
-            .unwrap();
-    let mut keys: Vec<String> = (rows.iter())
+    let pages =
+        crate::storage_read::scan_pages(handle, EVENT_JOURNAL_KEYSPACE, Some(b"j".to_vec().into()));
+    let pages: Vec<Vec<_>> = futures_util::TryStreamExt::try_collect(pages)
+        .await
+        .unwrap();
+    let mut keys: Vec<String> = (pages.iter().flatten())
         .map(|(_, value)| SourceEvent::from_bytes(value).unwrap())
         .map(|event| {
             event

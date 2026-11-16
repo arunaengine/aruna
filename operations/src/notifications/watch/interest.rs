@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::pin::pin;
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -24,6 +25,7 @@ use aruna_core::types::{Key, KeySpace, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
+use futures_util::TryStreamExt;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -35,7 +37,7 @@ use crate::notifications::watch::subscriptions::{
     WatchSubscriptionError, list_realm_subscriptions,
 };
 use crate::realm::get_config::GetConfigOperation;
-use crate::storage_read::scan_all;
+use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 /// Debounce window for the coalesced watch-interest publisher: `ShortenTimer`
@@ -509,54 +511,54 @@ pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHa
 pub async fn rebuild_interest_table(storage: &StorageHandle) -> WatchInterestTable {
     let mut table = WatchInterestTable::default();
     let mut eligible_by_realm: HashMap<RealmId, Option<HashSet<NodeId>>> = HashMap::new();
-    let entries = match scan_all(
-        storage,
-        WATCH_INTEREST_KEYSPACE,
-        Some(Key::from(interest_node_prefix())),
-    )
-    .await
-    {
-        Ok(entries) => entries,
-        Err(error) => {
-            warn!(error = %error, "Failed to scan watch interest digests");
-            return table;
-        }
-    };
-    for (key, value) in entries {
-        let Some(realm_id) = interest_realm_id(key.as_ref()) else {
-            continue;
-        };
-        let key_node_id = interest_node_id(key.as_ref());
-        let digest = match WatchInterestDigest::from_bytes(value.as_ref()) {
-            Ok(digest) => digest,
+    let prefix = Some(Key::from(interest_node_prefix()));
+    let mut pages = pin!(scan_pages(storage, WATCH_INTEREST_KEYSPACE, prefix));
+    loop {
+        let page = match pages.try_next().await {
+            Ok(Some(page)) => page,
+            Ok(None) => break,
             Err(error) => {
-                warn!(error = %error, "Failed to decode watch interest digest");
-                continue;
+                warn!(error = %error, "Failed to scan watch interest digests");
+                return WatchInterestTable::default();
             }
         };
-        // Never trust a digest whose embedded node id disagrees with its key.
-        if key_node_id != Some(digest.node_id) {
-            continue;
-        }
-        if let std::collections::hash_map::Entry::Vacant(entry) = eligible_by_realm.entry(realm_id)
-        {
-            let eligible = match sync_eligible_nodes(storage, realm_id).await {
-                Ok(eligible) => Some(eligible),
+        for (key, value) in page {
+            let Some(realm_id) = interest_realm_id(key.as_ref()) else {
+                continue;
+            };
+            let key_node_id = interest_node_id(key.as_ref());
+            let digest = match WatchInterestDigest::from_bytes(value.as_ref()) {
+                Ok(digest) => digest,
                 Err(error) => {
-                    warn!(%realm_id, %error, "Ignoring watch interest without a current realm config");
-                    None
+                    warn!(error = %error, "Failed to decode watch interest digest");
+                    continue;
                 }
             };
-            entry.insert(eligible);
+            // Never trust a digest whose embedded node id disagrees with its key.
+            if key_node_id != Some(digest.node_id) {
+                continue;
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                eligible_by_realm.entry(realm_id)
+            {
+                let eligible = match sync_eligible_nodes(storage, realm_id).await {
+                    Ok(eligible) => Some(eligible),
+                    Err(error) => {
+                        warn!(%realm_id, %error, "Ignoring watch interest without a current realm config");
+                        None
+                    }
+                };
+                entry.insert(eligible);
+            }
+            if !eligible_by_realm
+                .get(&realm_id)
+                .and_then(Option::as_ref)
+                .is_some_and(|eligible| eligible.contains(&digest.node_id))
+            {
+                continue;
+            }
+            table.insert(realm_id, digest.node_id, digest.entries);
         }
-        if !eligible_by_realm
-            .get(&realm_id)
-            .and_then(Option::as_ref)
-            .is_some_and(|eligible| eligible.contains(&digest.node_id))
-        {
-            continue;
-        }
-        table.insert(realm_id, digest.node_id, digest.entries);
     }
     table
 }
@@ -619,29 +621,27 @@ async fn build_node_map(
     realm_id: RealmId,
 ) -> Result<HashMap<NodeId, Vec<WatchInterestEntry>>, String> {
     let eligible = sync_eligible_nodes(storage, realm_id).await?;
-    let entries = scan_all(
-        storage,
-        WATCH_INTEREST_KEYSPACE,
-        Some(Key::from(interest_realm_prefix(realm_id))),
-    )
-    .await?;
+    let prefix = Some(Key::from(interest_realm_prefix(realm_id)));
+    let mut pages = pin!(scan_pages(storage, WATCH_INTEREST_KEYSPACE, prefix));
     let mut nodes: HashMap<NodeId, Vec<WatchInterestEntry>> = HashMap::new();
-    for (key, value) in entries {
-        let key_node_id = interest_node_id(key.as_ref());
-        let digest = match WatchInterestDigest::from_bytes(value.as_ref()) {
-            Ok(digest) => digest,
-            Err(error) => {
-                warn!(%realm_id, %error, "Skipping malformed watch interest digest");
+    while let Some(page) = pages.try_next().await? {
+        for (key, value) in page {
+            let key_node_id = interest_node_id(key.as_ref());
+            let digest = match WatchInterestDigest::from_bytes(value.as_ref()) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    warn!(%realm_id, %error, "Skipping malformed watch interest digest");
+                    continue;
+                }
+            };
+            if key_node_id != Some(digest.node_id)
+                || !eligible.contains(&digest.node_id)
+                || digest.entries.is_empty()
+            {
                 continue;
             }
-        };
-        if key_node_id != Some(digest.node_id)
-            || !eligible.contains(&digest.node_id)
-            || digest.entries.is_empty()
-        {
-            continue;
+            nodes.insert(digest.node_id, digest.entries);
         }
-        nodes.insert(digest.node_id, digest.entries);
     }
     Ok(nodes)
 }
