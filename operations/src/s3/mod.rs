@@ -4,6 +4,7 @@
 
 pub mod access;
 pub mod bucket;
+pub mod fence_store;
 pub mod holder_seal;
 pub mod key_status;
 pub mod listing;

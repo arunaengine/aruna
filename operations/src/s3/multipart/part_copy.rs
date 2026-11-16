@@ -4,12 +4,12 @@
 
 use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
 use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write_gate};
+use crate::s3::fence_store::ensure_write_allowed;
 use crate::s3::multipart::part_upload::{UploadPartError, UploadPartInput, UploadPartOperation};
 use crate::s3::object::copy::{CopySourceConditions, evaluate_source_conditions};
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, TokenRead, read_source,
 };
-use crate::s3::purge_fence::ensure_write_allowed;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;

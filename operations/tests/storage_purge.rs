@@ -49,6 +49,7 @@ use aruna_operations::jobs::store::{
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::fence_store::acquire_purge_fence;
 use aruna_operations::s3::multipart::complete::{
     CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
 };
@@ -71,7 +72,7 @@ use aruna_operations::s3::object::delete::{
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
-use aruna_operations::s3::purge_fence::{PurgeFenceError, acquire_purge_fence, fence_key};
+use aruna_operations::s3::purge_fence::{PurgeFenceError, fence_key};
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;

@@ -10,6 +10,7 @@ use crate::driver::{
     routing_snapshot,
 };
 use crate::s3::bucket::get::GetBucketOperation;
+use crate::s3::fence_store::ensure_write_allowed;
 use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectResult, TokenRead, read_source, reference_archive,
@@ -18,7 +19,6 @@ use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::s3::purge_fence::ensure_write_allowed;
 use crate::staging::reference::{
     MaterializeReferenceError, ReferenceWrite, write_reference_version,
 };

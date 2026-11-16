@@ -54,8 +54,8 @@ use aruna_operations::jobs::store::{
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
+use aruna_operations::s3::fence_store::acquire_purge_fence;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_operations::s3::purge_fence::acquire_purge_fence;
 use aruna_storage::storage;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

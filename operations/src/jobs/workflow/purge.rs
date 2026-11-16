@@ -30,13 +30,14 @@ use crate::driver::drive;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::{BucketScope, MembershipQuery};
+use crate::s3::fence_store::acquire_purge_fence;
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
 use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, version_pins};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
-use crate::s3::purge_fence::{PurgeFenceError, acquire_purge_fence};
+use crate::s3::purge_fence::PurgeFenceError;
 
 const PURGE_BATCH_SIZE: usize = 1_000;
 /// How often a paused purge looks whether it was resumed.
