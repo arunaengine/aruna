@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::staging::root_record::{hydrated, named_root, parse_root, read_root};
 use std::time::SystemTime;
 
 use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
@@ -396,7 +397,7 @@ async fn read_version(
     let version =
         BlobVersion::from_bytes(&value).map_err(|error| OriginError::Storage(error.to_string()))?;
     // The source's public address comes from the root this node keeps once.
-    let version = crate::staging::root_record::hydrate_version(context, version)
+    let version = hydrate_version(context, version)
         .await
         .map_err(OriginError::Storage)?;
     Ok((version_id, version))
@@ -464,6 +465,21 @@ async fn read(
         }
         other => Err(OriginError::Storage(format!("{other:?}"))),
     }
+}
+
+/// Puts the root's settings back into a version read with a compact binding.
+pub async fn hydrate_version(
+    context: &DriverContext,
+    version: BlobVersion,
+) -> Result<BlobVersion, String> {
+    let Some(digest) = named_root(&version) else {
+        return Ok(version);
+    };
+    let read = read_root(digest, None);
+    let event = context.storage_handle.send_storage_effect(read).await;
+    let root = parse_root(event).map_err(|error| error.to_string())?;
+    let root = root.ok_or_else(|| "the source root record is missing".to_string())?;
+    hydrated(version, &root)
 }
 
 #[cfg(test)]

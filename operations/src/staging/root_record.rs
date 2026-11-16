@@ -12,7 +12,6 @@ use aruna_core::structs::storage::distribution::source_root::{RootEntry, SourceR
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
 
-use crate::driver::DriverContext;
 use crate::storage_read::{StorageReadError, parse_storage_read};
 
 /// The record row of a root; a blind write, as every version of the root writes the same row.
@@ -62,19 +61,4 @@ pub fn hydrated(mut version: BlobVersion, root: &SourceRoot) -> Result<BlobVersi
     let full = RootEntry::hydrate(source, root).map_err(|error| error.to_string())?;
     *source = full.ok_or_else(|| "the source root record names another root".to_string())?;
     Ok(version)
-}
-
-/// Puts the root's settings back into a version read with a compact binding.
-pub async fn hydrate_version(
-    context: &DriverContext,
-    version: BlobVersion,
-) -> Result<BlobVersion, String> {
-    let Some(digest) = named_root(&version) else {
-        return Ok(version);
-    };
-    let read = read_root(digest, None);
-    let event = context.storage_handle.send_storage_effect(read).await;
-    let root = parse_root(event).map_err(|error| error.to_string())?;
-    let root = root.ok_or_else(|| "the source root record is missing".to_string())?;
-    hydrated(version, &root)
 }
