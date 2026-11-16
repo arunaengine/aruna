@@ -1,0 +1,13 @@
+# Example plugin: copies every new upload below one bucket path into an archive bucket path.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "archive-uploads"
+version = "0.1.0"
+title = "Copy new uploads into the archive"
+on = ["data_uploaded"]
+access = "write"
+
+[settings]
+incoming = "Bucket path to watch, such as lab-incoming/"
+archive = "Archive bucket path, such as lab-archive/"

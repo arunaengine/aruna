@@ -172,6 +172,20 @@ export class Fake {
     return `job-${this.calls.length}`;
   }
 
+  jobDownload(request) {
+    this.calls.push(["download", request]);
+    const id = `job-${this.calls.length}`;
+    this.job(id, { kind: "download", path: request.target, state: "queued" });
+    return id;
+  }
+
+  jobUpload(request) {
+    this.calls.push(["upload", request]);
+    const id = `job-${this.calls.length}`;
+    this.job(id, { kind: "upload", path: request.source, state: "queued" });
+    return id;
+  }
+
   jobGet(id) {
     if (!this.jobs.has(id)) throw new NotFound(`the install has no job ${id}`);
     return this.jobs.get(id).status;

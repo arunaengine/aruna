@@ -1,0 +1,23 @@
+# Example plugin: fetches the FASTQ files of an ENA run into a bucket path and links them to a
+# dataset.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "fetch-reads"
+version = "0.1.0"
+title = "Fetch sequencing reads from ENA"
+on = ["manual", "job_finished"]
+access = "write"
+
+[settings]
+bucket = "Bucket path for the reads"
+
+[services.ena]
+url = "https://www.ebi.ac.uk/ena/portal/api"
+
+[services.ena_files]
+url = "https://ftp.sra.ebi.ac.uk/vol1"
+
+[manual]
+dataset = { type = "dataset" }
+run = "ENA run accession, such as SRR000001"

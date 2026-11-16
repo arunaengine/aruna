@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 
 use crate::Level;
-use crate::bindings::aruna::plugin::jobs::Status;
+use crate::bindings::aruna::plugin::jobs::{DownloadRequest, Status, UploadRequest};
 use crate::bindings::aruna::plugin::metadata_create::Created;
 use crate::bindings::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
@@ -41,6 +41,8 @@ pub(crate) trait Host {
     fn state_put(&self, key: &str, value: &[u8], expected: Option<u64>) -> Answer<u64>;
     fn state_remove(&self, key: &str, expected: u64) -> Answer<()>;
     fn job_copy(&self, source: &str, version: Option<&str>, target: &str) -> Answer<String>;
+    fn job_download(&self, request: &DownloadRequest) -> Answer<String>;
+    fn job_upload(&self, request: &UploadRequest) -> Answer<String>;
     fn job_get(&self, id: &str) -> Answer<Status>;
     fn job_outputs(&self, id: &str, cursor: Option<&str>) -> Answer<ObjectPage>;
     fn job_cancel(&self, id: &str) -> Answer<()>;
@@ -119,6 +121,14 @@ impl Host for Imports {
 
     fn job_copy(&self, source: &str, version: Option<&str>, target: &str) -> Answer<String> {
         jobs::copy(source, version, target)
+    }
+
+    fn job_download(&self, request: &DownloadRequest) -> Answer<String> {
+        jobs::download(request)
+    }
+
+    fn job_upload(&self, request: &UploadRequest) -> Answer<String> {
+        jobs::upload(request)
     }
 
     fn job_get(&self, id: &str) -> Answer<Status> {

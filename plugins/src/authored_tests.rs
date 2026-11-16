@@ -67,7 +67,11 @@ fn short_forms() {
     assert_eq!(form["reference"].kind, SettingKind::String);
     let required = &manifest.permissions.required;
     // Write includes copies: read on the source and write on the target.
-    let write = [Permission::MetadataWrite, Permission::ObjectsCopy];
+    let write = [
+        Permission::MetadataWrite,
+        Permission::ObjectsCopy,
+        Permission::TransfersDownload,
+    ];
     for permission in write.into_iter().chain([Permission::SecretsValue]) {
         assert!(required.contains(&permission), "{permission}");
     }
@@ -80,8 +84,10 @@ fn read_by_default() {
     assert_eq!(manifest.check(), Ok(()));
     let required = &manifest.permissions.required;
     assert!(required.contains(&Permission::MetadataRead));
+    assert!(required.contains(&Permission::TransfersUpload));
     assert!(!required.contains(&Permission::MetadataWrite));
     assert!(!required.contains(&Permission::ObjectsCopy));
+    assert!(!required.contains(&Permission::TransfersDownload));
     assert_eq!(manifest.title, None);
 }
 

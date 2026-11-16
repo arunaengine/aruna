@@ -5,14 +5,17 @@
 
 use aruna_core::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_plugins::broker::{ErrorKind, HostError, JobStatus, ObjectInfo, ObjectPage};
+use aruna_plugins::broker::{ErrorKind, Field, HostError, JobStatus, ObjectInfo, ObjectPage};
+use base64::Engine;
+use serde_json::Value;
 use ulid::Ulid;
 
 use super::broker::short_path;
 use super::check::unavailable;
 use super::marks::is_marked;
 use super::work::{
-    Summary, WorkKind, WorkRow, WorkState, read_work, reconcile, summary_of, work_state,
+    SendBoundary, Summary, WorkKind, WorkRow, WorkState, read_work, reconcile, summary_of,
+    work_state,
 };
 use crate::driver::DriverContext;
 use crate::jobs::store::{JobMutationError, read_job_record, set_cancel_requested};
@@ -74,6 +77,18 @@ pub async fn job_status(
         fill(&mut status, summary);
     } else if let Some(record) = &record {
         status.message = (record.last_error.as_ref()).map(|error| error.message.clone());
+    }
+    // An upload's answer is kept as soon as it came, before the work settles.
+    if let (
+        None,
+        Some(SendBoundary::Sent {
+            status: code,
+            reply,
+            ..
+        }),
+    ) = (status.reply_status, &row.boundary)
+    {
+        answer(&mut status, *code, reply.as_deref());
     }
     Ok(status)
 }
@@ -145,10 +160,30 @@ fn fill(status: &mut JobStatus, summary: Summary) {
     status.message = summary.message;
     status.bytes = summary.bytes;
     status.version = summary.version_id.map(|version| version.to_string());
-    status.reply_status = summary.status;
-    status.reply_body = summary.reply.map(String::into_bytes);
+    if let Some(code) = summary.status {
+        answer(status, code, summary.reply.as_deref());
+    }
     status.exit_code = summary.exit_code;
     status.report = summary.report;
+}
+
+/// The status, headers and body of a kept answer, stored as the broker keeps whole answers; a
+/// reply that was too large to keep has no headers or body.
+fn answer(status: &mut JobStatus, code: u16, reply: Option<&str>) {
+    status.reply_status = Some(code);
+    let Some(value) = reply.and_then(|reply| serde_json::from_str::<Value>(reply).ok()) else {
+        return;
+    };
+    let headers = value.get("headers").cloned().unwrap_or(Value::Null);
+    let headers: Vec<(String, String)> = serde_json::from_value(headers).unwrap_or_default();
+    status.reply_headers = (headers.into_iter())
+        .map(|(name, value)| Field { name, value })
+        .collect();
+    let body = value
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    status.reply_body = base64::engine::general_purpose::STANDARD.decode(body).ok();
 }
 
 fn kind_name(kind: WorkKind) -> &'static str {

@@ -99,6 +99,10 @@ pub struct ConnectionLine {
     pub methods: Vec<String>,
     pub required: bool,
     pub granted: bool,
+    /// Whether whole answers of this service may be stored in buckets: the plugin downloads, and
+    /// the node adds a secret to its requests.
+    #[serde(default)]
+    pub stored: bool,
 }
 
 /// What an admin approves: the version, the permissions and connections, and the triggers.
@@ -178,7 +182,7 @@ pub struct InstallListQuery {
     pub limit: Option<usize>,
 }
 
-const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "webhook": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "methods": ["POST"], "required": true, "granted": true}], "triggers": ["dataset_created", "manual"], "secrets": [{"slot": "catalog_key", "kind": "bearer", "secret": "group:catalog-key", "value": false}], "warnings": []}}"#;
+const VIEW_EXAMPLE: &str = r#"{"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "account": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "receiver": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "status": "active", "blocked_reason": null, "paused": false, "settings": {"catalog_url": "https://catalog.example.org"}, "granted_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P3@realm", "revision": 2, "active_since_ms": 1762700000000, "failed": null, "webhook": null, "summary": {"id": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1", "plugin": "dataset-announcer", "title": "Announce new datasets", "version": "0.1.0", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "group": "01JBX7Y3S5M3Q8Y1V9K2T4R6P2", "permissions": [{"permission": "read", "required": true, "granted": ["/realm/g/01JBX7Y3S5M3Q8Y1V9K2T4R6P2/**"]}], "connections": [{"name": "catalog", "url": "{catalog_url}/api/records/", "methods": ["POST"], "required": true, "granted": true, "stored": false}], "triggers": ["dataset_created", "manual"], "secrets": [{"slot": "catalog_key", "kind": "bearer", "secret": "group:catalog-key", "value": false}], "warnings": []}}"#;
 
 pub(crate) fn view_example() -> Value {
     serde_json::from_str(VIEW_EXAMPLE).unwrap_or(Value::Null)
@@ -563,6 +567,8 @@ fn summary(
         let path = scope.secret(slot);
         values.is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &path)))
     };
+    let downloads =
+        (manifest.requested()).contains(&aruna_plugins::permission::Permission::TransfersDownload);
     let connections = (manifest.connections.iter())
         .map(|(name, connection)| ConnectionLine {
             name: name.clone(),
@@ -572,6 +578,7 @@ fn summary(
                 .collect(),
             required: !connection.optional,
             granted: sends.is_some_and(|paths| paths.contains(&scope.connection(name))),
+            stored: downloads && connection.auth.is_some(),
         })
         .collect();
     InstallSummary {
@@ -839,5 +846,29 @@ mod tests {
         let none = (&BTreeMap::new(), &BTreeMap::new());
         let lines = summary(&manifest, "sha256:ab", &scope, none).connections;
         assert_eq!(lines[0].methods, ["GET", "POST"]);
+    }
+
+    #[test]
+    fn summary_stored_answers() {
+        // Only a download through a connection with a secret stores answers the rule screens.
+        let scope = InstallScope {
+            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
+            group_id: Ulid::from_parts(1, 1),
+            install_id: Ulid::from_parts(2, 2),
+        };
+        let stored = |required: Value| {
+            let manifest = serde_json::json!({"name": "p", "version": "0.1.0",
+                "permissions": {"required": required},
+                "connections": {
+                    "files": {"url": "https://f.example.org/", "auth": "token"},
+                    "public": {"url": "https://p.example.org/"}}});
+            let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+            let none = (&BTreeMap::new(), &BTreeMap::new());
+            let lines = summary(&manifest, "sha256:ab", &scope, none).connections;
+            lines.iter().map(|line| line.stored).collect::<Vec<_>>()
+        };
+        let download = serde_json::json!(["transfers.download"]);
+        assert_eq!(stored(download), [true, false]);
+        assert_eq!(stored(serde_json::json!([])), [false, false]);
     }
 }

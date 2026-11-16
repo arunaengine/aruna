@@ -1,5 +1,5 @@
-//! Builds the dataset announcer and template probes in each language with its toolchain and runs
-//! them. Opt in with ARUNA_PLUGIN_LANGUAGES=1: the toolchains download packages on first use.
+//! Builds probes and the starter projects in each language and runs them; the examples run in
+//! `examples.rs`. Opt in with ARUNA_PLUGIN_LANGUAGES=1: toolchains download packages on first use.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,7 +7,6 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,12 +16,16 @@ use aruna_plugins::broker::{
     Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
     ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
 };
-use aruna_plugins::limits::{Limits, RuntimeConfig};
+use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
 use aruna_plugins::permission::Permission;
 use aruna_plugins::{
-    CancellationToken, Compiled, FailureKind, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
+    CancellationToken, Compiled, FailureKind, Invocation, InvokeError, Runtime, Trigger,
 };
+
+use common::{available, limits};
+
+mod common;
 
 /// Generous deadline for one case, build with downloads, compile and runs together.
 const HANG_CAP: Duration = Duration::from_secs(1800);
@@ -45,10 +48,6 @@ impl Catalog {
     fn new(reply: &'static str) -> Arc<Self> {
         let calls = Mutex::default();
         Arc::new(Self { calls, reply })
-    }
-
-    fn calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().clone()
     }
 
     fn note(&self, call: String) {
@@ -153,50 +152,6 @@ impl Broker for Catalog {
     async fn abandoned(&self, _: &CallContext, _: &Intent) {}
 }
 
-/// Whether the opt-in is exactly `1` and `program` runs; prints why a language is skipped.
-fn available(language: &str, program: &str) -> bool {
-    if std::env::var("ARUNA_PLUGIN_LANGUAGES").as_deref() != Ok("1") {
-        eprintln!("skipping {language}: set ARUNA_PLUGIN_LANGUAGES=1 to build the examples");
-        return false;
-    }
-    let runs = Command::new(program)
-        .arg("--version")
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if !runs {
-        eprintln!("skipping {language}: `{program}` is not installed");
-    }
-    runs && (language != "rust" || wasm_target())
-}
-
-/// Whether the toolchain has the `wasm32-unknown-unknown` standard library.
-fn wasm_target() -> bool {
-    let libdir = Command::new("rustc")
-        .args([
-            "--print",
-            "target-libdir",
-            "--target",
-            "wasm32-unknown-unknown",
-        ])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()));
-    let installed = libdir.is_some_and(|dir| dir.is_dir());
-    if !installed {
-        eprintln!("skipping rust: the wasm32-unknown-unknown target is not installed");
-    }
-    installed
-}
-
-fn limits() -> Limits {
-    Limits {
-        memory: 512 << 20,
-        fuel: 1 << 40,
-        ..Limits::default()
-    }
-}
-
 /// A built and compiled plugin and the deadline its case must end by.
 struct Plugin {
     runtime: Runtime,
@@ -277,7 +232,7 @@ async fn stop_tree(child: &mut tokio::process::Child) {
     #[cfg(windows)]
     if let Some(pid) = child.id() {
         let tree = ["/F", "/T", "/PID", &pid.to_string()];
-        let _ = Command::new("taskkill").args(tree).status();
+        let _ = std::process::Command::new("taskkill").args(tree).status();
     }
     let _ = child.kill().await;
 }
@@ -313,65 +268,6 @@ async fn run(
     timeout_at(plugin.deadline, invoke)
         .await
         .expect("the run ended before the deadline")
-}
-
-fn example(language: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("examples")
-        .join(language)
-}
-
-fn created() -> Trigger {
-    Trigger::Event(WatchEvent {
-        kind: "dataset_created".into(),
-        path: "meta/group-1/D1".into(),
-        resource: "D1".into(),
-        revision: "r1".into(),
-    })
-}
-
-/// Runs the example on a new dataset: it reads it, posts it, and records the catalog id.
-async fn announce(language: &str) {
-    let plugin = build(example(language)).await;
-    let catalog = Catalog::new(RECORD);
-    let ended = run(&plugin, created(), catalog.clone()).await;
-    assert!(ended.is_ok(), "{language}: {ended:?}");
-    let calls = catalog.calls();
-    let sent: serde_json::Value =
-        serde_json::from_str(calls[1].splitn(4, ' ').nth(3).unwrap()).unwrap();
-    assert_eq!(calls[0], "get D1", "{language}");
-    assert!(
-        calls[1].starts_with("send catalog Method::Post "),
-        "{language}: {calls:?}"
-    );
-    assert_eq!(
-        sent,
-        serde_json::json!({"id": "D1", "title": "Run 7"}),
-        "{language}"
-    );
-    let (_, patch) = calls[2]
-        .split_once("D1 r1 ")
-        .expect("a patch at the read revision");
-    let patch: serde_json::Value = serde_json::from_str(patch).unwrap();
-    assert_eq!(
-        patch,
-        serde_json::json!({"identifier": {"catalog": "c-1"}}),
-        "{language}"
-    );
-    assert_eq!(calls.len(), 3, "{language}: {calls:?}");
-
-    // A catalog answer without `/id` fails the run before any metadata is written.
-    let catalog = Catalog::new(r#"{"other":1}"#);
-    let ended = run(&plugin, created(), catalog.clone()).await;
-    let Err(InvokeError::Guest(failure)) = ended else {
-        panic!("{language}: a missing id must fail the run: {ended:?}");
-    };
-    assert_eq!(failure.kind, FailureKind::Permanent, "{language}");
-    let calls = catalog.calls();
-    assert!(
-        !calls.iter().any(|call| call.starts_with("patch")),
-        "{language}: {calls:?}"
-    );
 }
 
 /// A project whose plugin code is `code`, triggered by hand and by a timer.
@@ -484,27 +380,6 @@ def run(form):
 def tick(tick):
     return {"tick": int(tick.timestamp() * 1000)}
 "#;
-
-#[tokio::test]
-async fn announces_rust() {
-    if available("rust", "cargo") {
-        announce("rust").await;
-    }
-}
-
-#[tokio::test]
-async fn announces_javascript() {
-    if available("javascript", "npx") {
-        announce("javascript").await;
-    }
-}
-
-#[tokio::test]
-async fn announces_python() {
-    if available("python", "uv") {
-        announce("python").await;
-    }
-}
 
 #[tokio::test]
 async fn probes_javascript() {

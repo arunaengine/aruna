@@ -230,6 +230,7 @@ interface secrets {
 interface jobs {
   use types.{field, host-error};
   use objects-read.{object-page};
+  use services.{method};
 
   /// What a job did, read from its row after its record is gone too. `kind` is copy, download,
   /// upload or task; `path` is the bucket path it wrote or read; `state` is queued, running,
@@ -252,6 +253,39 @@ interface jobs {
   /// Copies an object, pinned to `version` when given, to `target`; needs read on the source and
   /// write on the target.
   copy: func(source: string, version: option<string>, target: string) -> result<string, host-error>;
+
+  /// A download through a service: the service's whole answer becomes a new version of `target`.
+  record download-request {
+    service: string,
+    path: string,
+    query: list<field>,
+    headers: list<field>,
+    target: string,
+    /// Bytes the answer may have at most.
+    size-limit: option<u64>,
+    /// Expected digests by algorithm (`md5`, `sha1`, `sha256`, `crc32`, `crc32c`), hex encoded.
+    checksums: list<field>,
+  }
+
+  /// Starts a download and answers its job id; it needs write on the target.
+  download: func(request: download-request) -> result<string, host-error>;
+
+  /// An upload through a service: one object version as the whole body, or as the file part
+  /// `file-field` of a form beside the text `fields`.
+  record upload-request {
+    service: string,
+    method: method,
+    path: string,
+    query: list<field>,
+    headers: list<field>,
+    source: string,
+    version: option<string>,
+    file-field: option<string>,
+    fields: list<field>,
+  }
+
+  /// Starts an upload with PUT or POST and answers its job id; it needs read on the source.
+  upload: func(request: upload-request) -> result<string, host-error>;
   /// Any job of the install.
   get: func(id: string) -> result<status, host-error>;
   /// One page of the objects a task wrote.

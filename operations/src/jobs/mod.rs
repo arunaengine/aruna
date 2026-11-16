@@ -35,6 +35,7 @@ pub mod source_read;
 pub mod staging;
 pub mod store;
 pub mod submit;
+mod transfers;
 pub mod workflow;
 
 pub use protocol::JobRouteError;

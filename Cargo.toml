@@ -19,7 +19,7 @@ members = [
     "cli",
     "plugins",
     "plugins/examples/elabftw",
-    "plugins/examples/rust",
+    "plugins/examples/announcer/rust",
     "plugins/fixture",
     "plugins/sdk",
     "registry",
@@ -30,7 +30,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.206"
+version = "3.0.0-alpha.207"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -201,6 +201,7 @@ rand_core = { version = "0.10.1", default-features = false }
 regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
+    "multipart",
     "rustls",
     "stream",
 ] }

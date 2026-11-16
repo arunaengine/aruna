@@ -1,0 +1,12 @@
+# Example plugin: sets a license on every dataset that has none, run by hand.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "fill-license"
+version = "0.1.0"
+title = "Fill a missing license on every dataset"
+on = ["manual"]
+access = "write"
+
+[settings]
+license = { type = "choice", choices = ["CC-BY-4.0", "CC0-1.0"] }

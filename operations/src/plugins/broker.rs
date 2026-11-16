@@ -13,8 +13,9 @@ use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scr
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun};
-use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields, header_name};
-use aruna_core::structs::checksum::HASH_BLAKE3;
+use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
+use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_BLAKE3};
+use aruna_core::structs::execution::job::UploadForm;
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission as Access,
 };
@@ -24,10 +25,9 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, ObjectInfo,
-    ObjectPage, Response, SendRequest, StatePut, StateRemove,
+    HostError, Intent, JobCopy, JobDownload, JobStatus, JobUpload, Listing, MetadataCreate,
+    MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
-use aruna_plugins::connection::relative_path;
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
 use base64::Engine;
@@ -44,14 +44,18 @@ use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
-use super::jobs::{cancel_job, job_outputs, job_status};
+use super::jobs::{cancel_job, job_outputs, job_row, job_status};
 use super::marks::{is_marked, unmarked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
+use super::outgoing::{node_keys, outgoing, request_context};
 use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
 use super::state::{PutError, check_key, put_state, read_state, remove_state};
 use super::store::{StoreError, Txn, transact};
-use super::submit::{CopyRequest, start_copy};
+use super::submit::{
+    CopyRequest, DownloadRequest, UploadRequest, start_copy, start_download, start_upload,
+};
+use super::work::RequestContext;
 use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
@@ -99,12 +103,7 @@ impl RunBroker {
         lines.log.clear();
         Self {
             outbound: Arc::new(Egress(ctx.blob_handle.clone())),
-            keys: (ctx.metadata_handle.as_ref())
-                .map(|handle| ReleaseKeys {
-                    seal: handle.realm_seal_key(),
-                    vault: handle.realm_vault_key(),
-                })
-                .unwrap_or_default(),
+            keys: node_keys(&ctx),
             held: tokio::sync::Mutex::default(),
             shown: Mutex::default(),
             ctx,
@@ -1110,9 +1109,106 @@ impl Broker for RunBroker {
         }
     }
 
+    async fn jobs_download(
+        &self,
+        _cx: &CallContext,
+        download: JobDownload,
+    ) -> Result<String, HostError> {
+        let target = self.expand(&download.target)?;
+        let checksums = expected(&download.checksums)?;
+        let request = SendRequest {
+            connection: download.service,
+            method: aruna_plugins::broker::Method::Get,
+            path: download.path,
+            query: download.query,
+            headers: download.headers,
+            body: Vec::new(),
+            intent: None,
+        };
+        // The whole answer lands in a bucket, so the rule must let the plugin see it whole.
+        let ready = self.ready(request).await?;
+        if ready.exposure != ResponseExposure::Full {
+            let narrower = "this connection does not expose its whole answer";
+            return Err(HostError::new(ErrorKind::Denied, narrower));
+        }
+        let request = DownloadRequest {
+            context: ready.context,
+            target,
+            checksums,
+            max_bytes: download.size_limit,
+            secret: ready.secret,
+            ordinal: download.intent.ordinal,
+        };
+        let started = start_download(&self.ctx, &self.scope, request);
+        match self.native(&download.intent, started).await {
+            Err(error) if error.kind == ErrorKind::Conflict => {
+                self.changed.store(true, Ordering::Relaxed);
+                Err(error)
+            }
+            answered => answered,
+        }
+    }
+
+    async fn jobs_upload(&self, _cx: &CallContext, upload: JobUpload) -> Result<String, HostError> {
+        use aruna_plugins::broker::Method;
+        if !matches!(upload.method, Method::Put | Method::Post) {
+            let message = "an upload is sent with PUT or POST";
+            return Err(HostError::new(ErrorKind::Invalid, message));
+        }
+        let source = self.expand(&upload.source)?;
+        let version = (upload.version.as_deref()).map(version_id).transpose()?;
+        let request = SendRequest {
+            connection: upload.service,
+            method: upload.method,
+            path: upload.path,
+            query: upload.query,
+            headers: upload.headers,
+            body: Vec::new(),
+            intent: None,
+        };
+        // The same checks as a request the run sends itself, with its secret released.
+        let ready = self.ready(request).await?;
+        let file_name = source.rsplit('/').next().unwrap_or_default().to_string();
+        let form = upload.file_field.map(|file_field| UploadForm {
+            file_field,
+            file_name,
+            fields: (upload.fields.into_iter())
+                .map(|field| (field.name, field.value))
+                .collect(),
+        });
+        let request = UploadRequest {
+            context: ready.context,
+            source,
+            version,
+            form,
+            ordinal: upload.intent.ordinal,
+        };
+        let started = start_upload(&self.ctx, &self.scope, request);
+        match self.native(&upload.intent, started).await {
+            Err(error) if error.kind == ErrorKind::Conflict => {
+                self.changed.store(true, Ordering::Relaxed);
+                Err(error)
+            }
+            answered => answered,
+        }
+    }
+
     async fn jobs_get(&self, _cx: &CallContext, id: &str) -> Result<JobStatus, HostError> {
         let install = self.admitted(None).await?;
-        job_status(&self.ctx, (&install, self.scope.local), id).await
+        let mut status = job_status(&self.ctx, (&install, self.scope.local), id).await?;
+        if status.reply_status.is_some() {
+            let row = job_row(&self.ctx, &install, id).await?;
+            let shown = match &row.context {
+                Some(context) => self.reply_shown(&install, context).await,
+                None => false,
+            };
+            // A refused check answers the state without the reply.
+            if !shown {
+                (status.reply_status, status.reply_body) = (None, None);
+                status.reply_headers.clear();
+            }
+        }
+        Ok(status)
     }
 
     async fn jobs_outputs(
@@ -1583,6 +1679,9 @@ struct Ready {
     fields: SecretFields,
     body: Vec<u8>,
     intent: Option<Intent>,
+    /// The request as a work row keeps it, and whether the connection injects a secret.
+    context: RequestContext,
+    secret: bool,
 }
 
 impl RunBroker {
@@ -1625,46 +1724,25 @@ impl RunBroker {
         let current = self.admitted(None).await?;
         let path = install_scope(&current).connection(&request.connection);
         let (install, _) = self.checked(Permission::ConnectionsSend, &path).await?;
-        let invalid = |why: &str| HostError::new(ErrorKind::Invalid, why);
         let config = read_config(&self.ctx, self.scope.realm_id).await;
         let config = config.map_err(|error| unavailable(error.to_string()))?;
         let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
         let manifest = plugin.and_then(|plugin| read_manifest(&plugin));
         let manifest = manifest.map_err(|error| unavailable(error.to_string()))?;
-        let connection = manifest.connections.get(&request.connection);
-        let connection =
-            connection.ok_or_else(|| invalid("the manifest has no such connection"))?;
-        let method = declared_method(request.method);
-        if !connection.methods.contains(&method) {
-            return Err(invalid("the connection does not allow this method"));
-        }
-        if !relative_path(&request.path) {
-            return Err(invalid("the path must stay below the connection's address"));
-        }
         // The guest built its request from the settings saved at admission; the address follows
         // them, while the grant and release checks use the current install.
-        let saved = &self.scope.run.settings;
-        let settings: Value = serde_json::from_str(saved).unwrap_or(Value::Null);
-        let mut url = connection.base(&settings).map_err(invalid)?;
-        let joined = format!("{}/{}", url.path().trim_end_matches('/'), request.path);
-        url.set_path(&joined);
-        if !request.query.is_empty() {
-            let pairs = request
-                .query
+        let pairs = |fields: &[Field]| -> Vec<(String, String)> {
+            let pairs = fields
                 .iter()
-                .map(|field| (&field.name, &field.value));
-            url.query_pairs_mut().extend_pairs(pairs);
-        }
-        let headers = (request.headers.iter())
-            .filter(|field| header_name(&field.name) && !credential(&field.name))
-            .map(|field| (field.name.to_ascii_lowercase(), field.value.clone()))
-            .collect();
-        let mut outgoing = OutgoingRequest {
-            method: method.as_str().to_string(),
-            url,
-            headers,
+                .map(|field| (field.name.clone(), field.value.clone()));
+            pairs.collect()
         };
-        let (exposure, fields) = match &connection.auth {
+        let (query, headers) = (pairs(&request.query), pairs(&request.headers));
+        let called = (request.connection.as_str(), declared_method(request.method));
+        let parts = (request.path.as_str(), &query[..], &headers[..]);
+        let context = request_context(&manifest, called, &self.scope.run.settings, parts)?;
+        let (mut outgoing, slot) = outgoing(&manifest, &context)?;
+        let (exposure, fields) = match &slot {
             None => (ResponseExposure::Full, None),
             Some(slot) => {
                 let (released, fields) =
@@ -1675,10 +1753,42 @@ impl RunBroker {
         Ok(Ready {
             outgoing,
             exposure,
+            secret: fields.is_some(),
             fields: fields.unwrap_or_else(|| SecretFields::new(Default::default())),
             body: request.body,
             intent: request.intent,
+            context,
         })
+    }
+
+    /// Whether a kept reply of `context` may be shown now: the connection is still granted and
+    /// declared, and its secret's rule still releases for the request and shows it whole.
+    async fn reply_shown(&self, install: &PluginInstall, context: &RequestContext) -> bool {
+        let path = install_scope(install).connection(&context.connection);
+        if self
+            .checked(Permission::ConnectionsSend, &path)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(config) = read_config(&self.ctx, self.scope.realm_id).await else {
+            return false;
+        };
+        let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
+        let Ok(manifest) = plugin.and_then(|plugin| read_manifest(&plugin)) else {
+            return false;
+        };
+        let Ok((mut request, slot)) = outgoing(&manifest, context) else {
+            return false;
+        };
+        match slot {
+            None => true,
+            Some(slot) => {
+                let released = self.inject(install, &slot, &config, &mut request).await;
+                released.is_ok_and(|(released, _)| released.exposure == ResponseExposure::Full)
+            }
+        }
     }
 
     /// Releases the slot's secret for this request and adds it as its kind says.
@@ -1750,6 +1860,32 @@ fn install_scope(install: &PluginInstall) -> InstallScope {
 }
 
 /// The manifest's name of a method the guest called.
+/// The expected digests of a download: a known algorithm and a hex digest of its length.
+fn expected(fields: &[Field]) -> Result<Vec<(ChecksumAlgorithm, Vec<u8>)>, HostError> {
+    use ChecksumAlgorithm::{Crc32, Crc32c, Md5, Sha1, Sha256};
+    let mut found = Vec::with_capacity(fields.len());
+    for field in fields {
+        let invalid = || {
+            let message = format!("`{}` is not a checksum this node checks", field.name);
+            HostError::new(ErrorKind::Invalid, message)
+        };
+        let algorithm = match field.name.to_ascii_lowercase().as_str() {
+            "md5" => Md5,
+            "sha1" => Sha1,
+            "sha256" => Sha256,
+            "crc32" => Crc32,
+            "crc32c" => Crc32c,
+            _ => return Err(invalid()),
+        };
+        let digest = hex::decode(field.value.trim()).map_err(|_| invalid())?;
+        if digest.len() != algorithm.digest_len() {
+            return Err(invalid());
+        }
+        found.push((algorithm, digest));
+    }
+    Ok(found)
+}
+
 fn declared_method(method: aruna_plugins::broker::Method) -> aruna_plugins::connection::Method {
     use aruna_plugins::broker::Method as Called;
     use aruna_plugins::connection::Method;
@@ -1761,11 +1897,6 @@ fn declared_method(method: aruna_plugins::broker::Method) -> aruna_plugins::conn
         Called::Patch => Method::Patch,
         Called::Delete => Method::Delete,
     }
-}
-
-/// Headers a guest may never set; the host owns credentials.
-fn credential(name: &str) -> bool {
-    ["authorization", "cookie", "proxy-authorization"].contains(&name.to_ascii_lowercase().as_str())
 }
 
 /// The whole answer as the code may see it, with echoes of the secret removed.
@@ -1786,7 +1917,7 @@ fn whole(fields: &SecretFields, answer: &Answer) -> Response {
     }
 }
 
-fn whole_text(reply: &Response) -> String {
+pub(crate) fn whole_text(reply: &Response) -> String {
     let headers: Vec<(&str, &str)> = (reply.headers.iter())
         .map(|field| (field.name.as_str(), field.value.as_str()))
         .collect();

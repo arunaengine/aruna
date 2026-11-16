@@ -145,7 +145,9 @@ async fn narrowed_grant_refuses() {
     let install = copier(&fixture).await;
     let ctx = job_context(&fixture.ctx, &fixture);
     let spec = recorded(&fixture, &install, ("in/a", "out/a")).await;
-    let PluginWorkAction::Copy { source, .. } = &spec.action;
+    let PluginWorkAction::Copy { source, .. } = &spec.action else {
+        unreachable!("a recorded work is a copy")
+    };
     let only_source = vec![source.clone()];
     edit_config(&fixture, |config| {
         let grants = &mut config.installs[0].grants;
@@ -185,7 +187,9 @@ pub(crate) async fn ready_copy(
 
 /// Whether `outcome` copied the 5 bytes as the work's minted version.
 fn copied(outcome: &JobRunOutcome, spec: &PluginWorkSpec) -> bool {
-    let PluginWorkAction::Copy { version_id, .. } = &spec.action;
+    let PluginWorkAction::Copy { version_id, .. } = &spec.action else {
+        return false;
+    };
     matches!(
         outcome,
         JobRunOutcome::Succeeded(JobResultPayload::PluginWork { bytes: 5, version_id: got })

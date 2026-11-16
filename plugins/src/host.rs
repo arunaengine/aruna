@@ -81,6 +81,8 @@ pub(crate) enum Needs<'a> {
     Free,
     Permission(Permission),
     Connection(&'a str),
+    /// A transfer: the permission and the connection it goes through.
+    Transfer(Permission, &'a str),
 }
 
 /// Store data of one run: grants, broker, ordinal counter and consumed budget.
@@ -190,6 +192,9 @@ impl Session {
             Needs::Free => true,
             Needs::Permission(permission) => self.permissions.contains(&permission),
             Needs::Connection(name) => self.connections.contains(name),
+            Needs::Transfer(permission, name) => {
+                self.permissions.contains(&permission) && self.connections.contains(name)
+            }
         };
         // The reply's charge is held back first, so a call never ends the run on its way back.
         if granted && !self.meter.reserve() {
@@ -200,6 +205,10 @@ impl Session {
             let what = match needs {
                 Needs::Permission(permission) => format!("permission `{permission}`"),
                 Needs::Connection(name) => format!("connection `{name}`"),
+                Needs::Transfer(permission, name) if self.permissions.contains(&permission) => {
+                    format!("connection `{name}`")
+                }
+                Needs::Transfer(permission, _) => format!("permission `{permission}`"),
                 Needs::Free => String::new(),
             };
             let message = format!("{what} is not granted to this install");

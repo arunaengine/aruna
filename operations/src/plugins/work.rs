@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
+use super::marks::{Mark, mark_in};
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
 use crate::jobs::service::find_dedup_job;
@@ -69,10 +70,35 @@ pub enum WorkState {
 }
 
 /// How far a sending attempt came; an attempt that finds `Sending` never sends again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendBoundary {
-    Sending { attempt: u32 },
-    Sent { status: u16 },
+    Sending {
+        attempt: u32,
+    },
+    /// The answer: its status and its reply as exposed when stored, absent when too large, and
+    /// the bytes and version sent.
+    Sent {
+        status: u16,
+        reply: Option<String>,
+        bytes: u64,
+        version: Ulid,
+    },
+}
+
+/// What an attempt that sends may do, from the boundary earlier attempts left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Send {
+    /// The attempt wrote `Sending` and sends now.
+    Now,
+    /// An earlier attempt may have sent; nothing is sent again and the outcome stays unknown.
+    Undecided,
+    /// An earlier attempt has the answer; it decides without a second request.
+    Answered {
+        status: u16,
+        reply: Option<String>,
+        bytes: u64,
+        version: Ulid,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +225,17 @@ pub async fn reserve(
     (install, identity): (&PluginInstall, &Identity),
     proposed: WorkRow,
 ) -> Result<(WorkRow, Reserve), WorkError> {
+    reserve_marked(ctx, (install, identity), proposed, None).await
+}
+
+/// [`reserve`], marking the version the work writes at `bucket/key` in the same transaction when
+/// it writes the row, so the version is marked before any byte of it exists.
+pub async fn reserve_marked(
+    ctx: &DriverContext,
+    (install, identity): (&PluginInstall, &Identity),
+    proposed: WorkRow,
+    marked: Option<(&str, &str)>,
+) -> Result<(WorkRow, Reserve), WorkError> {
     let key = row_key(install.install_id, identity)?;
     transact(ctx, async |txn: &Txn<'_>| {
         let stored = match txn.read(PLUGIN_WORK_KEYSPACE, &key).await? {
@@ -226,6 +263,16 @@ pub async fn reserve(
                     vec![(key.clone(), encode(&proposed)?)],
                 )
                 .await?;
+                if let (Some((bucket, object)), Some(version_id)) = (marked, proposed.version_id) {
+                    let mark = Mark {
+                        install_id: install.install_id,
+                        work_id: proposed.work_id,
+                        job: None,
+                        kind: proposed.kind,
+                        at_ms: proposed.created_ms,
+                    };
+                    mark_in(txn, (bucket, object, version_id), &mark).await?;
+                }
                 Ok((proposed, Reserve::Fresh))
             }
         }
@@ -288,6 +335,77 @@ pub async fn dispatched(
             row.state = WorkState::Dispatched;
             row.job = Some(job);
         }
+    })
+    .await
+}
+
+/// Moves the send boundary of work `work_id` before an attempt sends, in one transaction, unless
+/// the boundary earlier attempts left decides already.
+pub async fn begin_send(
+    ctx: &DriverContext,
+    (install_id, work_id): (Ulid, Ulid),
+    again: bool,
+) -> Result<Option<Send>, StoreError> {
+    transact(ctx, async |txn: &Txn<'_>| {
+        let Some((key, mut row)) = read_in(txn, install_id, work_id).await? else {
+            return Ok(None);
+        };
+        if let Some(decided) = decided(row.boundary.as_ref(), again) {
+            return Ok(Some(decided));
+        }
+        let attempt = match &row.boundary {
+            Some(SendBoundary::Sending { attempt }) => attempt + 1,
+            _ => 1,
+        };
+        row.boundary = Some(SendBoundary::Sending { attempt });
+        txn.write(PLUGIN_WORK_KEYSPACE, vec![(key, encode(&row)?)])
+            .await?;
+        Ok(Some(Send::Now))
+    })
+    .await
+}
+
+/// What a boundary decides without a new request: a kept answer, unless it asks a request that may
+/// go twice (`again`) to try later, and a begun request that may not go twice. `None` sends.
+pub fn decided(boundary: Option<&SendBoundary>, again: bool) -> Option<Send> {
+    match boundary {
+        Some(SendBoundary::Sent { status, .. }) if again && retried(*status) => None,
+        Some(SendBoundary::Sent {
+            status,
+            reply,
+            bytes,
+            version,
+        }) => Some(Send::Answered {
+            status: *status,
+            reply: reply.clone(),
+            bytes: *bytes,
+            version: *version,
+        }),
+        Some(SendBoundary::Sending { .. }) if !again => Some(Send::Undecided),
+        _ => None,
+    }
+}
+
+/// Whether an answer asks to try again later: a timeout, a throttle or a server error.
+pub fn retried(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500..=599)
+}
+
+/// Keeps the answer of a sent request: its status and its reply as exposed now, with the bytes
+/// and version it sent.
+pub async fn record_sent(
+    ctx: &DriverContext,
+    ids: (Ulid, Ulid),
+    (status, reply): (u16, Option<String>),
+    (bytes, version): (u64, Ulid),
+) -> Result<Option<WorkRow>, StoreError> {
+    update_work(ctx, ids, |row| {
+        row.boundary = Some(SendBoundary::Sent {
+            status,
+            reply,
+            bytes,
+            version,
+        });
     })
     .await
 }
@@ -359,12 +477,20 @@ pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, Stor
         };
         let changed = update_work(ctx, (install_id, row.work_id), |row| {
             if row.state == WorkState::Dispatched {
-                // The paths stay answerable after the job record is pruned.
+                // The paths and an upload's answer stay answerable after the job record is pruned.
                 let (source, target) = (row.source.clone(), row.target.clone());
+                let (status, reply) = match &row.boundary {
+                    Some(SendBoundary::Sent { status, reply, .. }) => {
+                        (Some(*status), reply.clone())
+                    }
+                    _ => (None, None),
+                };
                 row.state = WorkState::Settled;
                 row.summary = Some(Summary {
                     source,
                     target,
+                    status,
+                    reply,
                     ..summary
                 });
                 row.settled_ms = Some(now_ms);

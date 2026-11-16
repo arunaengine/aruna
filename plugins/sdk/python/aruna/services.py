@@ -71,6 +71,27 @@ class Service:
     def delete(self, path="", **options):
         return self.request("delete", path, **options)
 
+    def download(self, path="", *, to, query=None, headers=None, size_limit=None, checksums=None):
+        """Starts a download of the service's answer into a new version at the bucket path `to` and
+        answers its `Job`; it needs write on `to`. `checksums` are expected hex digests by
+        algorithm, such as `{"md5": "..."}`."""
+        from .jobs import Job
+
+        checksums = _pairs(checksums)
+        id = host().job_download(self.name, path, _pairs(query), _pairs(headers), to, size_limit, checksums)
+        return Job(id, "download", to)
+
+    def upload(self, source, path="", *, method="PUT", version=None, file_field=None, fields=None,
+               query=None, headers=None):
+        """Starts an upload of the object at `source`, pinned to `version`, with PUT or POST and
+        answers its `Job`; with `file_field` the object is the file part of a form beside
+        `fields`. It needs read on `source`; the service's answer is `job.reply`."""
+        from .jobs import Job
+
+        request = (method, path, _pairs(query), _pairs(headers))
+        id = host().job_upload(self.name, request, (source, version), (file_field, _pairs(fields)))
+        return Job(id, "upload", source)
+
 
 def _pairs(values):
     """A dict or list of pairs as a list of name and value pairs."""

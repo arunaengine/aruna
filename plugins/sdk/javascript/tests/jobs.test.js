@@ -41,3 +41,20 @@ test("delivers finished jobs", async () => {
   const event = { kind: "job_finished", path: "", resource: "j1", revision: "failed" };
   assert.deepEqual(JSON.parse(await fake.invoke("event", event)), ["j1", false, "the source is gone"]);
 });
+
+test("starts transfers", () => {
+  const fake = new Fake();
+  const ena = aruna.service("ena");
+  const download = ena.download("files/r.fq", { to: "raw/r.fq", sizeLimit: 9, checksums: { md5: "00" } });
+  assert.deepEqual([download.id, download.kind, download.path], ["job-1", "download", "raw/r.fq"]);
+  const [, asked] = fake.calls.at(-1);
+  assert.deepEqual([asked.service, asked.path, asked.target, asked.sizeLimit], ["ena", "files/r.fq", "raw/r.fq", 9]);
+  assert.deepEqual(asked.checksums, [["md5", "00"]]);
+  const zenodo = aruna.service("zenodo");
+  const fields = { title: "Run 7" };
+  const upload = zenodo.upload("raw/r.fq", { path: "deposit", method: "POST", fileField: "file", fields });
+  assert.deepEqual([upload.kind, upload.path], ["upload", "raw/r.fq"]);
+  const [, sent] = fake.calls.at(-1);
+  assert.deepEqual([sent.method, sent.path, sent.source, sent.fileField], ["post", "deposit", "raw/r.fq", "file"]);
+  assert.deepEqual(sent.fields, [["title", "Run 7"]]);
+});

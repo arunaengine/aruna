@@ -27,7 +27,10 @@ use crate::plugins::broker::local_object;
 use crate::plugins::check::{check_identity, copy_grants};
 use crate::plugins::install::read_config;
 use crate::plugins::marks::unmarked;
-use crate::plugins::work::read_work;
+use crate::plugins::outgoing::node_keys;
+use crate::plugins::work::{WorkRow, read_work};
+
+use super::transfers::{Download, Upload, download_work, upload_work};
 use crate::s3::object::copy::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_at,
 };
@@ -35,26 +38,56 @@ use crate::s3::object::get::GetObjectError;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 
 /// How often the bytes moved so far reach the job's progress.
-const PROGRESS_TICK: Duration = Duration::from_secs(1);
+pub(super) const PROGRESS_TICK: Duration = Duration::from_secs(1);
 /// How long a paused install's work waits before its next attempt.
 const PAUSED_RETRY: Duration = Duration::from_secs(60);
 
 /// Runs `spec` once. A refused check is final; state that cannot be read now is deferred.
 pub async fn run_plugin_work(ctx: &JobContext, spec: &PluginWorkSpec) -> JobRunOutcome {
-    let (install, config) = match admit_work(ctx, spec).await {
+    let (install, config, row) = match admit_work(ctx, spec).await {
         Ok(admitted) => admitted,
         Err(outcome) => return outcome,
     };
     match &spec.action {
         PluginWorkAction::Copy { .. } => copy_work(ctx, spec, (&install, &config)).await,
+        PluginWorkAction::Download {
+            target,
+            version_id,
+            checksums,
+            max_bytes,
+        } => {
+            let download = Download {
+                target,
+                version_id: *version_id,
+                checksums,
+                max_bytes: *max_bytes,
+            };
+            let keys = node_keys(&ctx.driver);
+            let admitted = (&install, &config, &row);
+            download_work(ctx, spec, admitted, (download, &keys)).await
+        }
+        PluginWorkAction::Upload {
+            source,
+            version,
+            form,
+        } => {
+            let upload = Upload {
+                source,
+                version: *version,
+                form: form.as_ref(),
+            };
+            let keys = node_keys(&ctx.driver);
+            let admitted = (&install, &config, &row);
+            upload_work(ctx, spec, admitted, (upload, &keys)).await
+        }
     }
 }
 
-/// The install, account and binding checks of one attempt, before any grant check.
+/// The install, account and binding checks of one attempt, before any grant check, and the row.
 async fn admit_work(
     ctx: &JobContext,
     spec: &PluginWorkSpec,
-) -> Result<(PluginInstall, RealmConfigDocument), JobRunOutcome> {
+) -> Result<(PluginInstall, RealmConfigDocument, WorkRow), JobRunOutcome> {
     let deferred = |message: String| JobRunOutcome::Deferred(JobError::retryable(message));
     let config = read_config(&ctx.driver, spec.realm_id).await;
     let config = config.map_err(|error| deferred(error.to_string()))?;
@@ -74,7 +107,7 @@ async fn admit_work(
     }
     // A pause, or an update waiting for approval, holds the work until the install is active.
     match install.state {
-        InstallState::Active if !install.paused => Ok((install.clone(), config)),
+        InstallState::Active if !install.paused => Ok((install.clone(), config, row)),
         InstallState::Active | InstallState::Paused | InstallState::Blocked => {
             let message = format!("the install is {}", install.state.as_str());
             let message = JobError::retryable(message);
@@ -96,7 +129,10 @@ async fn copy_work(
         source_version,
         target,
         version_id,
-    } = &spec.action;
+    } = &spec.action
+    else {
+        return permanent("the work is not a copy");
+    };
     let patterns = match copy_grants(&ctx.driver, install, (source, target)).await {
         Ok(found) => found,
         Err(error) => return refused(error),
@@ -175,7 +211,7 @@ fn source_locked(error: &CopyObjectError) -> bool {
 
 /// Parks the work on the key of the source version it reads, so it runs again once that key is
 /// unlocked; a key unlocked meanwhile is tried again at once.
-async fn key_wait(
+pub(super) async fn key_wait(
     ctx: &JobContext,
     install: &PluginInstall,
     (bucket, key, version_id): (String, String, Option<ulid::Ulid>),
@@ -200,7 +236,7 @@ async fn key_wait(
 }
 
 /// The install's account restricted to `patterns` with WRITE, which also reads.
-fn account(install: &PluginInstall, patterns: &BTreeSet<String>) -> AuthContext {
+pub(super) fn account(install: &PluginInstall, patterns: &BTreeSet<String>) -> AuthContext {
     let restrictions = (patterns.iter())
         .map(|pattern| PathRestriction {
             pattern: pattern.clone(),
@@ -216,14 +252,14 @@ fn account(install: &PluginInstall, patterns: &BTreeSet<String>) -> AuthContext 
 }
 
 /// A refused check ends the work; a check that could not run is tried again later.
-fn refused(error: HostError) -> JobRunOutcome {
+pub(super) fn refused(error: HostError) -> JobRunOutcome {
     match error.kind {
         ErrorKind::Unavailable => JobRunOutcome::Deferred(JobError::retryable(error.message)),
         _ => permanent(error.message),
     }
 }
 
-fn permanent(message: impl Into<String>) -> JobRunOutcome {
+pub(super) fn permanent(message: impl Into<String>) -> JobRunOutcome {
     JobRunOutcome::Failed(JobError::permanent(message.into()))
 }
 

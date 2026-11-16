@@ -1,0 +1,14 @@
+# Example plugin: adds keywords to a dataset, run by hand.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "set-keywords"
+version = "0.1.0"
+title = "Add keywords to a dataset"
+on = ["manual"]
+access = "write"
+
+[manual]
+dataset = { type = "dataset" }
+keywords = "Keywords, separated by commas"
+replace = { title = "Replace the existing keywords", type = "boolean", default = false }

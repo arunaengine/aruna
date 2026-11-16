@@ -116,6 +116,35 @@ fn probe(form: Form) -> Result<Value> {
             jobs::cancel(&text("id"))?;
             json!(true)
         }
+        "download" => {
+            let request = jobs::DownloadRequest {
+                service: text("connection"),
+                path: text("path"),
+                query: Vec::new(),
+                headers: Vec::new(),
+                target: text("target"),
+                size_limit: input.get("limit").and_then(Value::as_u64),
+                checksums: Vec::new(),
+            };
+            json!(jobs::download(&request)?)
+        }
+        "upload" => {
+            let request = jobs::UploadRequest {
+                service: text("connection"),
+                method: Method::Post,
+                path: text("path"),
+                query: Vec::new(),
+                headers: Vec::new(),
+                source: text("source"),
+                version: None,
+                file_field: input
+                    .get("field")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                fields: Vec::new(),
+            };
+            json!(jobs::upload(&request)?)
+        }
         "copy_mapped" => {
             // A copy, then the mapping its `job_finished` run reads, as a plugin keeps it.
             let id = jobs::copy(&text("source"), None, &text("target"))?;

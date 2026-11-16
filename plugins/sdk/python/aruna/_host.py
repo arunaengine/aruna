@@ -112,6 +112,22 @@ class Imports:
     def job_copy(self, source, version, target):
         return self.call(self.imports.jobs.copy, source, version, target)
 
+    def job_download(self, service, path, query, headers, target, size_limit, checksums):
+        jobs, field = self.imports.jobs, self.imports.types.Field
+        fields = lambda pairs: [field(*pair) for pair in pairs]  # noqa: E731
+        request = jobs.DownloadRequest(service, path, fields(query), fields(headers), target, size_limit,
+                                       fields(checksums))
+        return self.call(jobs.download, request)
+
+    def job_upload(self, service, request, source, form):
+        jobs, field = self.imports.jobs, self.imports.types.Field
+        fields = lambda pairs: [field(*pair) for pair in pairs]  # noqa: E731
+        (method, path, query, headers), (source, version), (file_field, form_fields) = request, source, form
+        method = getattr(self.imports.services.Method, method.upper())
+        request = jobs.UploadRequest(service, method, path, fields(query), fields(headers), source, version,
+                                     file_field, fields(form_fields))
+        return self.call(jobs.upload, request)
+
     def job_get(self, id):
         status = self.call(self.imports.jobs.get, id)
         reply = None

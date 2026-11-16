@@ -1,0 +1,19 @@
+# Example plugin: uploads one file of a dataset to a new Zenodo draft and records the draft id.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "zenodo-deposit"
+version = "0.1.0"
+title = "Deposit a file on Zenodo"
+on = ["manual", "job_finished"]
+access = "write"
+
+# The node adds the token to every request; its rule must show the whole answer, so the plugin
+# reads the draft's links and the upload's checksum.
+[services.zenodo]
+url = "https://zenodo.org/api"
+secret = "Zenodo access token"
+
+[manual]
+dataset = { type = "dataset" }
+file = { type = "object" }

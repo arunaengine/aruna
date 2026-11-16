@@ -1,0 +1,18 @@
+# Example plugin: adds an author to a dataset from their public ORCID record.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "orcid-names"
+version = "0.1.0"
+title = "Add an author from ORCID"
+on = ["manual"]
+access = "write"
+
+# A public service: no secret, and only reads.
+[services.orcid]
+url = "https://pub.orcid.org/v3.0"
+methods = ["GET"]
+
+[manual]
+dataset = { type = "dataset" }
+orcid = "ORCID iD, such as 0000-0002-1825-0097"

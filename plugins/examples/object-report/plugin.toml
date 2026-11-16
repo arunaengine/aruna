@@ -1,0 +1,11 @@
+# Example plugin: reports how many objects a bucket path holds, their size and the largest one.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "object-report"
+version = "0.1.0"
+title = "Report the objects below a bucket path"
+on = ["manual"]
+
+[manual]
+prefix = "Bucket path, such as raw-data/run-7/"

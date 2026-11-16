@@ -10,7 +10,7 @@ use std::rc::Rc;
 use serde_json::{Map, Value};
 
 use crate::Level;
-use crate::bindings::aruna::plugin::jobs::Status;
+use crate::bindings::aruna::plugin::jobs::{DownloadRequest, Status, UploadRequest};
 use crate::bindings::aruna::plugin::metadata_create::Created;
 use crate::bindings::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
@@ -349,6 +349,39 @@ impl Host for Fake {
 
     fn job_copy(&self, source: &str, version: Option<&str>, target: &str) -> Answer<String> {
         self.note(format!("copy {source} {} {target}", version.unwrap_or("-")));
+        Ok(format!("job-{}", self.0.borrow().jobs.len() + 1))
+    }
+
+    fn job_download(&self, request: &DownloadRequest) -> Answer<String> {
+        let limit = request.size_limit.map(|bytes| bytes.to_string());
+        let sums: Vec<_> = (request.checksums.iter())
+            .map(|sum| format!("{}={}", sum.name, sum.value))
+            .collect();
+        self.note(format!(
+            "download {} {} {} {} {}",
+            request.service,
+            request.path,
+            request.target,
+            limit.as_deref().unwrap_or("-"),
+            sums.join(",")
+        ));
+        Ok(format!("job-{}", self.0.borrow().jobs.len() + 1))
+    }
+
+    fn job_upload(&self, request: &UploadRequest) -> Answer<String> {
+        let fields: Vec<_> = (request.fields.iter())
+            .map(|field| format!("{}={}", field.name, field.value))
+            .collect();
+        self.note(format!(
+            "upload {} {:?} {} {} {} {} {}",
+            request.service,
+            request.method,
+            request.path,
+            request.source,
+            request.version.as_deref().unwrap_or("-"),
+            request.file_field.as_deref().unwrap_or("-"),
+            fields.join(",")
+        ));
         Ok(format!("job-{}", self.0.borrow().jobs.len() + 1))
     }
 

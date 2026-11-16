@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::{PluginWorkAction, PluginWorkSpec};
+use aruna_core::structs::execution::job::PluginWorkSpec;
 
 use super::*;
 use crate::jobs::plugin_work::tests::ready_copy;
@@ -37,7 +37,6 @@ async fn mark(ctx: &DriverContext, version: Version<'_>, (install_id, work_id): 
 }
 
 fn work_of(spec: &PluginWorkSpec) -> (Ulid, Ulid) {
-    let PluginWorkAction::Copy { .. } = &spec.action;
     (spec.install_id, spec.work_id)
 }
 

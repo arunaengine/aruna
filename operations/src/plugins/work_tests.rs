@@ -410,3 +410,80 @@ async fn removal_keeps_finished() {
     assert_eq!(settle_work(ctx, 6).await, Ok(1));
     assert_eq!(retire_work(ctx, &config, 7).await, Ok(1));
 }
+
+#[tokio::test]
+async fn boundary_sends_once() {
+    // A request that may not go twice is sent by the first attempt only; one that finds the
+    // boundary left open stays undecided, one that finds the answer decides by it. A request
+    // that may go twice sends again until it has an answer.
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let row = proposed(&install, 1);
+    reserve(&fixture.ctx, (&install, &call(1)), row.clone())
+        .await
+        .unwrap();
+    let ids = (install.install_id, row.work_id);
+    assert_eq!(
+        begin_send(&fixture.ctx, ids, false).await,
+        Ok(Some(Send::Now))
+    );
+    assert_eq!(
+        begin_send(&fixture.ctx, ids, false).await,
+        Ok(Some(Send::Undecided))
+    );
+    assert_eq!(
+        begin_send(&fixture.ctx, ids, true).await,
+        Ok(Some(Send::Now))
+    );
+    let stored = read_work(&fixture.ctx, ids.0, ids.1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.boundary, Some(SendBoundary::Sending { attempt: 2 }));
+    let reply = Some(r#"{"status":201}"#.to_string());
+    record_sent(&fixture.ctx, ids, (201, reply.clone()), (8, Ulid::nil()))
+        .await
+        .unwrap();
+    let answered = Send::Answered {
+        status: 201,
+        reply: reply.clone(),
+        bytes: 8,
+        version: Ulid::nil(),
+    };
+    assert_eq!(
+        begin_send(&fixture.ctx, ids, false).await,
+        Ok(Some(answered))
+    );
+    let gone = (install.install_id, Ulid::generate());
+    assert_eq!(begin_send(&fixture.ctx, gone, false).await, Ok(None));
+}
+
+#[tokio::test]
+async fn settles_answer() {
+    // A settled upload keeps its answer, so its status outlives the job record.
+    use crate::jobs::store::insert_job;
+    let fixture = Fixture::new().await;
+    let install = installed(&fixture).await;
+    let row = proposed(&install, 1);
+    reserve(&fixture.ctx, (&install, &call(1)), row.clone())
+        .await
+        .unwrap();
+    let ids = (install.install_id, row.work_id);
+    dispatched(&fixture.ctx, ids, job(1)).await.unwrap();
+    let reply = Some(r#"{"status":201}"#.to_string());
+    record_sent(&fixture.ctx, ids, (201, reply.clone()), (8, Ulid::nil()))
+        .await
+        .unwrap();
+    let mut job_record = record(spec_of(&install, &row), job(1), JobState::Succeeded);
+    job_record.finished_at_ms = Some(1);
+    insert_job(&fixture.ctx.storage_handle, &job_record)
+        .await
+        .unwrap();
+    assert_eq!(settle_work(&fixture.ctx, 5).await, Ok(1));
+    let settled = read_work(&fixture.ctx, ids.0, ids.1)
+        .await
+        .unwrap()
+        .unwrap();
+    let summary = settled.summary.unwrap();
+    assert_eq!((summary.status, summary.reply), (Some(201), reply));
+}

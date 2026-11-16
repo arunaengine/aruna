@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, JobCopy, JobStatus, Listing, MetadataCreate, MetadataPatch, Method,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
+    HostError, Intent, JobCopy, JobDownload, JobStatus, JobUpload, Listing, MetadataCreate,
+    MetadataPatch, Method, ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
 };
 use crate::host::wit::aruna::plugin::{
     jobs, log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services,
@@ -357,6 +357,102 @@ impl jobs::Host for Session {
             effect,
             Needs::Permission(Permission::ObjectsCopy),
             |broker, cx| async move { broker.jobs_copy(&cx, copy).await },
+            String::len,
+        )
+        .await
+    }
+
+    async fn download(
+        &mut self,
+        request: jobs::DownloadRequest,
+    ) -> wasmtime::Result<Result<String, HostError>> {
+        let size = request.service.len()
+            + request.path.len()
+            + fields_len(&request.query)
+            + fields_len(&request.headers)
+            + request.target.len()
+            + fields_len(&request.checksums);
+        let limit = request.size_limit.map(u64::to_le_bytes).unwrap_or_default();
+        let parts: [&[u8]; 8] = [
+            b"download",
+            request.service.as_bytes(),
+            request.path.as_bytes(),
+            &field_bytes(&request.query),
+            &field_bytes(&request.headers),
+            request.target.as_bytes(),
+            &limit,
+            &field_bytes(&request.checksums),
+        ];
+        let intent = Intent::new(self.next_ordinal(), &parts);
+        let effect = Effect::Write(intent.clone());
+        let service = request.service.clone();
+        let download = JobDownload {
+            service: request.service,
+            path: request.path,
+            query: request.query,
+            headers: request.headers,
+            target: request.target,
+            size_limit: request.size_limit,
+            checksums: request.checksums,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Transfer(Permission::TransfersDownload, &service),
+            |broker, cx| async move { broker.jobs_download(&cx, download).await },
+            String::len,
+        )
+        .await
+    }
+
+    async fn upload(
+        &mut self,
+        request: jobs::UploadRequest,
+    ) -> wasmtime::Result<Result<String, HostError>> {
+        let version = request.version.as_deref().unwrap_or_default();
+        let file_field = request.file_field.as_deref().unwrap_or_default();
+        let size = request.service.len()
+            + request.path.len()
+            + fields_len(&request.query)
+            + fields_len(&request.headers)
+            + request.source.len()
+            + version.len()
+            + file_field.len()
+            + fields_len(&request.fields);
+        let method = format!("{:?}", request.method);
+        let parts: [&[u8]; 10] = [
+            b"upload",
+            request.service.as_bytes(),
+            method.as_bytes(),
+            request.path.as_bytes(),
+            &field_bytes(&request.query),
+            &field_bytes(&request.headers),
+            request.source.as_bytes(),
+            version.as_bytes(),
+            file_field.as_bytes(),
+            &field_bytes(&request.fields),
+        ];
+        let intent = Intent::new(self.next_ordinal(), &parts);
+        let effect = Effect::Write(intent.clone());
+        let service = request.service.clone();
+        let upload = JobUpload {
+            service: request.service,
+            method: request.method,
+            path: request.path,
+            query: request.query,
+            headers: request.headers,
+            source: request.source,
+            version: request.version,
+            file_field: request.file_field,
+            fields: request.fields,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Transfer(Permission::TransfersUpload, &service),
+            |broker, cx| async move { broker.jobs_upload(&cx, upload).await },
             String::len,
         )
         .await
