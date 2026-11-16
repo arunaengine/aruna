@@ -42,6 +42,8 @@ pub enum ListDocumentsError {
     StorageError(#[from] aruna_core::errors::StorageError),
     #[error(transparent)]
     ConversionError(#[from] aruna_core::errors::ConversionError),
+    #[error("operation did not finish")]
+    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -147,7 +149,7 @@ impl Operation for ListDocumentsOperation {
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
             ListDocumentsState::Finish | ListDocumentsState::Error | ListDocumentsState::Init => {
-                smallvec![]
+                self.unexpected_event("no event in a terminal state", format!("{event:?}"))
             }
         }
     }
@@ -160,7 +162,7 @@ impl Operation for ListDocumentsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Ok(Vec::new()))
+        self.output.unwrap_or(Err(ListDocumentsError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
@@ -382,5 +384,35 @@ mod tests {
             establishing_event_id: Ulid::nil(),
             last_event_id: Ulid::nil(),
         }
+    }
+
+    // An unfinished list reports no empty success, and a finished one rejects a late event.
+    #[test]
+    fn rejects_early_finalize() {
+        let group_id = Ulid::from_parts(1, 1);
+        let mut operation = ListDocumentsOperation::new(group_id);
+        operation.start();
+        assert!(!operation.is_complete());
+        assert!(matches!(
+            operation.finalize(),
+            Err(ListDocumentsError::NotFinished)
+        ));
+
+        let empty = || {
+            Event::Storage(StorageEvent::IterResult {
+                values: Vec::new(),
+                next_start_after: None,
+            })
+        };
+        let mut operation = ListDocumentsOperation::new(group_id);
+        operation.start();
+        operation.step(empty());
+        operation.step(empty());
+        assert!(operation.is_complete());
+        assert!(operation.step(empty()).is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(ListDocumentsError::UnexpectedEvent { .. })
+        ));
     }
 }
