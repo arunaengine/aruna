@@ -9,14 +9,13 @@ use aruna_core::document::DocumentEffect;
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
 use aruna_core::realm_vault::RealmSealKey;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
 };
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::WebhookSubscription;
-use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
@@ -45,6 +44,7 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::convergence;
+use crate::topology::store_realm_config;
 use convergence::wait_for_convergence;
 
 const LIST_LIMIT: u32 = LIST_MAX_LIMIT as u32;
@@ -593,27 +593,7 @@ async fn install_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = config.realm_id;
     for node in nodes {
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: UserId::nil(realm_id),
-            realm_id,
-        };
-        let bytes = config.to_bytes(&actor)?;
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: (*realm_id.as_bytes()).into(),
-                value: bytes.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-        }
-        node.net.refresh_document_peers(config).await?;
+        store_realm_config(&node.net, &node.context, realm_id, config).await?;
     }
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).

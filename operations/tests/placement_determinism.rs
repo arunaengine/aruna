@@ -10,7 +10,6 @@ use aruna_core::document::{DocumentSyncPublish, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -43,6 +42,7 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::convergence;
+use crate::topology::store_realm_config;
 use convergence::wait_for_convergence;
 
 struct TestNode {
@@ -558,27 +558,7 @@ async fn install_realm_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = base_config(nodes, realm_id);
     for node in nodes {
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: aruna_core::UserId::nil(realm_id),
-            realm_id,
-        };
-        let bytes = config.to_bytes(&actor)?;
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: (*realm_id.as_bytes()).into(),
-                value: bytes.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-        }
-        node.net.refresh_document_peers(&config).await?;
+        store_realm_config(&node.net, &node.context, realm_id, &config).await?;
     }
     seed_config_topic(nodes, realm_id, &config).await?;
     // Config apply hook: restore shared topics and converge shard membership

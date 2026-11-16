@@ -5,10 +5,6 @@
 use std::sync::Arc;
 
 use aruna_core::document::{DocumentTarget, ShardManifest, ShardManifestEntry};
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -40,6 +36,7 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::convergence;
+use crate::topology::store_realm_config;
 use convergence::wait_for_convergence;
 
 /// A fixed structured id (handle 1, bucket 0) for the strategy-resolution sample,
@@ -376,27 +373,7 @@ async fn install_realm_config(
         config.seed_job_control(node.net.node_id(), band as u32);
     }
     for node in nodes {
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: UserId::nil(*realm_id),
-            realm_id: *realm_id,
-        };
-        let bytes = config.to_bytes(&actor)?;
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: (*realm_id.as_bytes()).into(),
-                value: bytes.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-        }
-        node.net.refresh_document_peers(&config).await?;
+        store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
     }
     for node in nodes {
         aruna_operations::placement::process_placements::process_shard_placements(

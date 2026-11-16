@@ -16,7 +16,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    EVENT_LOG_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    EVENT_LOG_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataBatchSource, MetadataDeleteRecord, MetadataEffect, MetadataEvent,
@@ -68,6 +68,7 @@ use tokio::time::sleep;
 use ulid::Ulid;
 
 use crate::convergence;
+use crate::topology::store_realm_config;
 use convergence::wait_for_convergence;
 
 /// Retries of a write that lost a commit race to background work; 20 ms apart.
@@ -1369,27 +1370,7 @@ async fn install_realm_config(
     }
 
     for node in nodes {
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: UserId::nil(*realm_id),
-            realm_id: *realm_id,
-        };
-        let bytes = config.to_bytes(&actor)?;
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: (*realm_id.as_bytes()).into(),
-                value: bytes.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-        }
-        node.net.refresh_document_peers(&config).await?;
+        store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
     }
     // Run startup reconciliation until no missing genesis schedules another pass.
     for _ in 0..3 {

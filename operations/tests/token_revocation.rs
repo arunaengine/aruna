@@ -9,11 +9,10 @@ use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::{bearer_token_hash, user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::document::{DocumentSyncPublish, DocumentTarget};
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -40,6 +39,7 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::convergence;
+use crate::topology::store_realm_config;
 use convergence::wait_for_convergence;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -340,27 +340,7 @@ fn base_config(nodes: &[TestNode], realm_id: RealmId) -> RealmConfigDocument {
 async fn install_realm_config(nodes: &[TestNode], realm_id: RealmId) -> TestResult<()> {
     let config = base_config(nodes, realm_id);
     for node in nodes {
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: UserId::nil(realm_id),
-            realm_id,
-        };
-        let bytes = config.to_bytes(&actor)?;
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: (*realm_id.as_bytes()).into(),
-                value: bytes.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-        }
-        node.net.refresh_document_peers(&config).await?;
+        store_realm_config(&node.net, &node.context, realm_id, &config).await?;
     }
     seed_sync_topic(nodes, realm_id, &config).await?;
     for node in nodes {

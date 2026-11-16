@@ -1432,6 +1432,41 @@ pub async fn read_group_record(node: &TestNode, group_id: Ulid) -> TestResult<Op
     }
 }
 
+/// Stores `config` as the realm config row of one node, encoded as that node with
+/// the nil user, and points its document sync at the configured peers.
+pub async fn store_realm_config(
+    net: &NetHandle,
+    context: &DriverContext,
+    realm_id: RealmId,
+    config: &RealmConfigDocument,
+) -> Result<(), String> {
+    let actor = Actor {
+        node_id: net.node_id(),
+        user_id: UserId::nil(realm_id),
+        realm_id,
+    };
+    let bytes = config
+        .to_bytes(&actor)
+        .map_err(|error| format!("realm config encoding failed: {error}"))?;
+    match context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: (*realm_id.as_bytes()).into(),
+            value: bytes.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => return Err(format!("unexpected realm config write event: {other:?}")),
+    }
+    net.refresh_document_peers(config)
+        .await
+        .map_err(|error| format!("document peer refresh failed: {error}"))?;
+    Ok(())
+}
+
 pub async fn read_realm_config(
     node: &TestNode,
     realm_id: RealmId,

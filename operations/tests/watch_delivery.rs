@@ -9,8 +9,8 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    SYNC_OUTBOX_KEYSPACE, WATCH_INTEREST_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    WATCH_INTEREST_KEYSPACE,
 };
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -51,6 +51,7 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::convergence;
+use crate::topology::store_realm_config;
 use convergence::wait_for_convergence;
 
 const LIST_LIMIT: usize = LIST_MAX_LIMIT;
@@ -897,27 +898,7 @@ async fn install_config_document(
     config: &RealmConfigDocument,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for node in nodes {
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: UserId::nil(realm_id),
-            realm_id,
-        };
-        let bytes = config.to_bytes(&actor)?;
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: (*realm_id.as_bytes()).into(),
-                value: bytes.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-        }
-        node.net.refresh_document_peers(config).await?;
+        store_realm_config(&node.net, &node.context, realm_id, config).await?;
     }
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
