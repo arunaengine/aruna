@@ -25,7 +25,7 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -39,12 +39,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{forwarded_auth_token, local_write_record, run_create_metadata};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct DatasetApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DatasetApiDoc::openapi()).routes(routes!(describe_bucket))
+    OpenApiRouter::new().routes(routes!(describe_bucket))
 }
 
 /// What the new dataset says about the bucket.

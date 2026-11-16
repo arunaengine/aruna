@@ -20,7 +20,7 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -31,12 +31,8 @@ use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::relay::{RestForward, relay_get};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct BucketUsageDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BucketUsageDoc::openapi()).routes(routes!(get_bucket_usage))
+    OpenApiRouter::new().routes(routes!(get_bucket_usage))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

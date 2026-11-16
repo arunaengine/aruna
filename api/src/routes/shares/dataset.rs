@@ -30,7 +30,7 @@ use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -46,12 +46,8 @@ use crate::server::state::ServerState;
 /// How long resolving one global version or content hash of a dataset may take.
 const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct DatasetDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DatasetDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(read_dataset))
         .routes(routes!(list_part))
         .routes(routes!(dataset_ticket))

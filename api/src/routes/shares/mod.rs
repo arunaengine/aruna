@@ -30,7 +30,7 @@ use axum::{Extension, Json};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -48,12 +48,8 @@ const MAX_PASSWORD: usize = 1024;
 /// Log entries per page when the caller names no limit.
 const LOG_PAGE: usize = 100;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "shares", description = "Share links for people without an account")))]
-pub struct SharesDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SharesDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_share, list_shares))
         .routes(routes!(get_share, revoke_share))
         .routes(routes!(share_log))

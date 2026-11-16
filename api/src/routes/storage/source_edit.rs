@@ -21,7 +21,7 @@ use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -32,12 +32,8 @@ use crate::server::state::ServerState;
 /// Version rows one call reads; `next` continues after them.
 const PAGE: usize = 1000;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct SourceEditDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SourceEditDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(add_sources))
         .routes(routes!(remove_sources))
 }

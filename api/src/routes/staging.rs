@@ -65,21 +65,12 @@ use std::path::{Component, Path as FsPath};
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((
-        name = "data/staging",
-        description = "Staging source objects into buckets, inline or as background jobs"
-    ))
-)]
-pub struct StagingApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StagingApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(stage_blob))
         .routes(routes!(stage_batch))
         .routes(routes!(list_staging_jobs, submit_staging))

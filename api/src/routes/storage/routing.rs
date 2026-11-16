@@ -26,16 +26,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct StorageRoutingDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageRoutingDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_bucket_routing, put_bucket_routing))
         .routes(routes!(get_group_routing, put_group_routing))
         .routes(routes!(list_group_buckets))

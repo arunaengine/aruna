@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::time::timeout;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -55,14 +55,8 @@ const CONNECTOR_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_ENTRY_LIMIT: usize = 200;
 const MAX_ENTRY_LIMIT: usize = 1000;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "data/connectors", description = "External source connector registration"))
-)]
-pub struct ConnectorsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ConnectorsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(check_source_connector))
         .routes(routes!(create_source_connector, list_source_connectors))
         .routes(routes!(

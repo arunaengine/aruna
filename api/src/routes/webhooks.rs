@@ -11,7 +11,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -20,16 +20,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::emails::{setting_error, settings_node};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct WebhooksApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(WebhooksApiDoc::openapi()).routes(routes!(
-        get_webhook,
-        set_webhook,
-        delete_webhook
-    ))
+    OpenApiRouter::new().routes(routes!(get_webhook, set_webhook, delete_webhook))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

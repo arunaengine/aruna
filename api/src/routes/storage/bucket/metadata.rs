@@ -21,7 +21,7 @@ use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -34,13 +34,8 @@ use crate::metadata::forwarded_auth_token;
 use crate::routes::identifiers::IdentifierParserBody;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct BucketMetadataDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BucketMetadataDoc::openapi())
-        .routes(routes!(get_bucket_metadata, put_bucket_metadata))
+    OpenApiRouter::new().routes(routes!(get_bucket_metadata, put_bucket_metadata))
 }
 
 /// One identifier of a bucket, such as its DOI.

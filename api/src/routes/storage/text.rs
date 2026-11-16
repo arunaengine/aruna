@@ -11,7 +11,6 @@ use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -25,12 +24,8 @@ use crate::server::state::ServerState;
 /// The largest text body one write stores, as for the MCP text tool.
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct TextDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(TextDoc::openapi()).routes(routes!(write_text_object))
+    OpenApiRouter::new().routes(routes!(write_text_object))
 }
 
 #[utoipa::path(

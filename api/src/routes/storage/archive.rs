@@ -28,7 +28,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio_util::task::AbortOnDropHandle;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -49,12 +49,8 @@ const PIPE_BYTES: usize = 128 * 1024;
 const LINK_SECS: u64 = 60;
 const DOWNLOAD_PATH: &str = "/api/v1/data/archives/download";
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct ArchiveDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ArchiveDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(download_selection))
         .routes(routes!(create_link))
         .routes(routes!(download_link))

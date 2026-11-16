@@ -26,7 +26,7 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -37,12 +37,8 @@ use crate::routes::storage::bucket::usage::range_sizes;
 use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct DistributedDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DistributedDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_distributed))
         .routes(routes!(get_distributed))
         .routes(routes!(retry_admission))

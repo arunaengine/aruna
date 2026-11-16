@@ -53,20 +53,14 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::warn;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 pub mod quarantine;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "data/sync", description = "S3 bucket synchronization"))
-)]
-pub struct SyncApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SyncApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_sync, list_sync))
         .routes(routes!(get_sync, update_sync, delete_sync))
         .routes(routes!(run_sync))

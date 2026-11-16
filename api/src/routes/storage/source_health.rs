@@ -11,7 +11,7 @@ use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -20,12 +20,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct SourceHealthDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SourceHealthDoc::openapi()).routes(routes!(get_source_health))
+    OpenApiRouter::new().routes(routes!(get_source_health))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]

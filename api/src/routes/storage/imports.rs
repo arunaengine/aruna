@@ -30,16 +30,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct BackendImportsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BackendImportsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_import, list_group_imports))
         .routes(routes!(get_import, update_import, delete_import))
         .routes(routes!(run_import))

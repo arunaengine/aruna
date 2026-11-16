@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -32,12 +32,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::bucket::usage::range_sizes;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct SetChangesDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SetChangesDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(join_distributed))
         .routes(routes!(leave_distributed))
         .routes(routes!(copy_distributed))

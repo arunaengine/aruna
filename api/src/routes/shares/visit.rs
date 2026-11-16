@@ -39,7 +39,7 @@ use axum::response::{IntoResponse, Response};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -69,13 +69,9 @@ const MAX_JSON_BYTES: usize = 64 * 1024;
 /// The longest one upload may take; a stalled body also ends after the import idle timeout.
 const UPLOAD_SECS: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct VisitDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     // Uploads stream their body unbuffered; every other visitor body is small JSON.
-    let small = OpenApiRouter::with_openapi(VisitDoc::openapi())
+    let small = OpenApiRouter::new()
         .routes(routes!(open_share))
         .routes(routes!(list_files))
         .routes(routes!(create_ticket))

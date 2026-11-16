@@ -19,7 +19,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -36,12 +36,8 @@ use crate::server::state::ServerState;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct ObjectsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ObjectsDoc::openapi()).routes(routes!(list_objects))
+    OpenApiRouter::new().routes(routes!(list_objects))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, IntoParams)]

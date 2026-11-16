@@ -43,7 +43,7 @@ use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi};
+use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -67,12 +67,8 @@ const PIPE_BYTES: usize = 64 * 1024;
 /// A regular file readable by everyone, so an unpacked crate opens without a chmod.
 const FILE_MODE: u16 = 0o100_644;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct ProvenanceApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ProvenanceApiDoc::openapi()).routes(routes!(export_provenance))
+    OpenApiRouter::new().routes(routes!(export_provenance))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]

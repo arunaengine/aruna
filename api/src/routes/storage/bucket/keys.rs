@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -53,12 +53,8 @@ const KEY_BYTES: usize = 32;
 const AUDIT_PAGE: usize = 50;
 const AUDIT_MAX: usize = 500;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct BucketKeysDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BucketKeysDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(unlock_bucket))
         .routes(routes!(extend_unlock))
         .routes(routes!(lock_bucket))

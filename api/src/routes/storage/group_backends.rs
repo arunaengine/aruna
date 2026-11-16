@@ -29,21 +29,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((
-        name = "data/storage",
-        description = "Tenant-registered write backends on a group's own object storage"
-    ))
-)]
-pub struct GroupBackendsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(GroupBackendsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_group_backend, list_group_backends))
         .routes(routes!(
             get_group_backend,

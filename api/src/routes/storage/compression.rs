@@ -21,7 +21,7 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -31,13 +31,8 @@ const DEFAULT_LEVEL: u8 = 3;
 /// Saves at most this often for one request; the migration task updates the record a save reads.
 const PUT_ATTEMPTS: usize = 5;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct StorageCompressionDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageCompressionDoc::openapi())
-        .routes(routes!(get_bucket_compression, put_bucket_compression))
+    OpenApiRouter::new().routes(routes!(get_bucket_compression, put_bucket_compression))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]

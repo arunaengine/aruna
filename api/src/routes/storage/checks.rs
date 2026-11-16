@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -28,12 +28,8 @@ const PAGE_MAX: usize = 1000;
 /// Recorded rows one request reads at most, hidden ones included.
 const SCAN_MAX: usize = 10_000;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct StorageCheckDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageCheckDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_bucket_check, start_bucket_check))
         .routes(routes!(clean_bucket_check))
 }

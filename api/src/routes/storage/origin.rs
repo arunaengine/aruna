@@ -32,7 +32,7 @@ use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -58,12 +58,8 @@ use aruna_operations::s3::bucket::release::{
 /// How long an origin read directed at another node may take, body included.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct OriginApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(OriginApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_origin))
         .routes(routes!(get_version_origin))
         .routes(routes!(get_sources))

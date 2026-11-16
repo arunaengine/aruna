@@ -20,17 +20,12 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct StorageMoveDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageMoveDoc::openapi())
-        .routes(routes!(get_bucket_move, start_bucket_move))
+    OpenApiRouter::new().routes(routes!(get_bucket_move, start_bucket_move))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, IntoParams)]

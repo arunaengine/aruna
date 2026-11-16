@@ -38,18 +38,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::warn;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "data/blobs", description = "Blob management and replication"))
-)]
-pub struct BlobsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BlobsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(replicate_blob))
         .routes(routes!(blob_locations))
 }

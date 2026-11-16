@@ -52,16 +52,12 @@ use base64::prelude::BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct StorageEncryptionDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageEncryptionDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_bucket_encryption, put_bucket_encryption))
         .routes(routes!(list_bucket_tokens))
 }
