@@ -2,11 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::transport::{MetadataWriteError, RetryDisposition, retry_disposition};
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
+use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
 use crate::placement::holds_placement;
 use crate::placement::resolve_shard_holders;
 use aruna_core::NodeId;
@@ -14,6 +16,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use std::sync::Arc;
+use tracing::{error, warn};
 use ulid::Ulid;
 
 /// Where a metadata write must be applied: topic membership equals the bucket's
@@ -136,4 +139,109 @@ pub(crate) fn holder_intersection(current: &[NodeId], frozen: &[NodeId]) -> Vec<
         .filter(|holder| frozen.contains(holder))
         .collect::<Vec<_>>();
     distinct_holders(&holders)
+}
+
+pub(crate) async fn forward_to_holders(
+    context: &Arc<DriverContext>,
+    holders: &[NodeId],
+    message: MetadataTransportMessage,
+    local_miss: Option<NodeId>,
+    local_capacity: bool,
+) -> Result<MetadataTransportMessage, MetadataWriteError> {
+    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+        return Err(MetadataWriteError::Undeliverable(
+            "no metadata handle to forward with".to_string(),
+        ));
+    };
+    let holders = distinct_holders(holders);
+    let local_node_id = local_miss.or_else(|| context.net_handle.as_ref().map(|net| net.node_id()));
+    let tracks_not_found = matches!(
+        &message,
+        MetadataTransportMessage::ForwardUpdateDocument { .. }
+            | MetadataTransportMessage::ForwardDeleteDocument { .. }
+            | MetadataTransportMessage::ForwardPersistentId { .. }
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut not_found = usize::from(local_miss.is_some_and(|local| holders.contains(&local)));
+    let mut capacity =
+        usize::from(local_capacity && local_miss.is_some_and(|local| holders.contains(&local)));
+    for holder in holders
+        .iter()
+        .filter(|holder| Some(**holder) != local_node_id)
+    {
+        match metadata_handle
+            .request_forwarded_write(*holder, message.clone())
+            .await
+        {
+            Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: WriteAuthError::Unauthorized,
+            }) => return Err(MetadataWriteError::Unauthorized),
+            Ok(MetadataTransportMessage::ForwardedWriteDenied {
+                error: WriteAuthError::Forbidden,
+            }) => return Err(MetadataWriteError::Forbidden),
+            Ok(MetadataTransportMessage::WriteNotFound) if tracks_not_found => {
+                not_found += 1;
+            }
+            Ok(MetadataTransportMessage::WriteNotFound) => {
+                failures.push(format!(
+                    "{holder}: holder returned not found for a forwarded create"
+                ));
+            }
+            Ok(MetadataTransportMessage::ForwardedWriteUnavailable) => {
+                failures.push(format!("{holder}: holder placement view is unavailable"));
+            }
+            Ok(MetadataTransportMessage::MetadataHistoryCapacity)
+                if matches!(
+                    &message,
+                    MetadataTransportMessage::ForwardUpdateDocument { .. }
+                ) =>
+            {
+                capacity += 1;
+            }
+            Ok(MetadataTransportMessage::MetadataHistoryCapacity) => {
+                failures.push(format!(
+                    "{holder}: holder returned metadata history capacity for a non-update"
+                ));
+            }
+            Ok(MetadataTransportMessage::Reject(error)) => {
+                warn!(holder = %holder, error = %error, "Holder rejected a forwarded metadata write");
+                return Err(MetadataWriteError::Undeliverable(format!(
+                    "holder `{holder}` rejected the forwarded metadata write; refusing to replay it: {error}"
+                )));
+            }
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                warn!(holder = %holder, error = %error, "Failed to forward a metadata write to holder");
+                if retry_disposition(error.delivery()) == RetryDisposition::Stop {
+                    return Err(MetadataWriteError::Undeliverable(format!(
+                        "forward to holder `{holder}` may have applied the metadata write before failing; refusing to replay it: {error}"
+                    )));
+                }
+                failures.push(format!("{holder}: {error}"));
+            }
+        }
+    }
+
+    if !holders.is_empty() && capacity == holders.len() {
+        return Err(MetadataWriteError::Undeliverable(
+            "metadata history capacity reached on every holder".to_string(),
+        ));
+    }
+
+    if tracks_not_found && !holders.is_empty() && not_found == holders.len() {
+        return Err(MetadataWriteError::NotFound);
+    }
+
+    let detail = if failures.is_empty() {
+        "the document's bucket has no reachable holder".to_string()
+    } else {
+        failures.join("; ")
+    };
+    error!(
+        holders = holders.len(),
+        detail = %detail,
+        "Metadata write reached a non-holder and no holder accepted the forward"
+    );
+    Err(MetadataWriteError::Undeliverable(detail))
 }

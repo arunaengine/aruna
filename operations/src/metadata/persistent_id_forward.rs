@@ -40,7 +40,7 @@ use crate::forward::authorize::authorize_write;
 use crate::forward::authorize::forward_auth_error;
 use crate::forward::replay::document_deleted_here;
 use crate::forward::replay::existing_record;
-use crate::forward::transport::forward_to_holders;
+use crate::forward::routing::forward_to_holders;
 use crate::forward::transport::read_error;
 use crate::forward::transport::reject;
 use crate::forward::transport::write_error;
