@@ -16,7 +16,7 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::device::backlog::RetryView;
+use crate::device::retry::RetryView;
 
 /// Folders one device may bind. A device serves one person's machine, so this
 /// is a human-sized list rather than an inventory.

@@ -25,10 +25,10 @@ use aruna_storage::storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
 
-use crate::device::backlog::{
-    ForwardOutcome, QueueDrain, arm_timer, drain_queue, exhausted, retry_due_ms,
-};
+use crate::device::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue};
+
 use crate::device::drain::DrainOutcome;
+use crate::device::retry::{exhausted, retry_due_ms};
 use crate::driver::DriverContext;
 use crate::placement::process_placements::load_realm_config;
 

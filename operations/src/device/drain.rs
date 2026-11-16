@@ -30,13 +30,15 @@ use crate::metadata::forward::{apply_batch_routed, route_metadata_create};
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::placement::process_placements::load_realm_config;
 
-use super::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue, exhausted, retry_due_ms};
+use super::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue};
+
 use super::edit::{refused_edit, reject_edit};
 use super::publish_queue::{
     MAX_PUBLISH_ATTEMPTS, PublishEntry, PublishKind, PublishState, entry_with_state, publish_entry,
     publish_key, read_publish_entry, scan_publish_queue,
 };
 use super::replica::{read_replica, store_replica};
+use super::retry::{exhausted, retry_due_ms};
 use super::selection::track_created;
 
 /// Delay before a deferred pass looks for the realm again.

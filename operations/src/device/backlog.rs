@@ -1,5 +1,4 @@
-//! Shared retry math, page draining and timer arming for the two device queues.
-//! The stored state enums stay distinct; only their control flow lives here.
+//! Shared page draining and timer arming for the two device queues.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,96 +6,13 @@ use std::future::Future;
 use std::time::Duration;
 
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use aruna_tasks::TaskHandle;
 use futures_util::StreamExt;
 use tracing::warn;
 
-use crate::tasks::queue_backoff::retry_delay_ms;
-
 use super::drain::DrainOutcome;
-use super::publish_queue::{PublishEntry, PublishState};
-use super::sync::repository::{SyncUpload, UploadState};
-
-/// The retry view both device queue states expose.
-pub(crate) trait RetryView {
-    /// When the entry may be forwarded again; `None` while it is terminal.
-    fn due_at_ms(&self) -> Option<u64>;
-    /// Forwards already spent; zero while the entry is terminal.
-    fn attempts(&self) -> u32;
-
-    /// Whether the drain may pick the entry up now.
-    fn is_due(&self, now_ms: u64) -> bool {
-        self.due_at_ms()
-            .is_some_and(|due_at_ms| due_at_ms <= now_ms)
-    }
-}
-
-impl RetryView for PublishState {
-    fn due_at_ms(&self) -> Option<u64> {
-        match self {
-            Self::Pending { due_at_ms, .. } | Self::Publishing { due_at_ms, .. } => {
-                Some(*due_at_ms)
-            }
-            Self::Published { .. } | Self::Failed { .. } => None,
-        }
-    }
-
-    fn attempts(&self) -> u32 {
-        match self {
-            Self::Pending { attempts, .. } | Self::Publishing { attempts, .. } => *attempts,
-            Self::Published { .. } | Self::Failed { .. } => 0,
-        }
-    }
-}
-
-impl RetryView for UploadState {
-    fn due_at_ms(&self) -> Option<u64> {
-        match self {
-            Self::Pending { due_at_ms, .. } => Some(*due_at_ms),
-            Self::Transferring { .. } => Some(0),
-            Self::Failed { .. } => None,
-        }
-    }
-
-    fn attempts(&self) -> u32 {
-        match self {
-            Self::Pending { attempts, .. } | Self::Transferring { attempts, .. } => *attempts,
-            Self::Failed { .. } => 0,
-        }
-    }
-}
-
-impl RetryView for PublishEntry {
-    fn due_at_ms(&self) -> Option<u64> {
-        self.state.due_at_ms()
-    }
-
-    fn attempts(&self) -> u32 {
-        self.state.attempts()
-    }
-}
-
-impl RetryView for SyncUpload {
-    fn due_at_ms(&self) -> Option<u64> {
-        self.state.due_at_ms()
-    }
-
-    fn attempts(&self) -> u32 {
-        self.state.attempts()
-    }
-}
-
-/// Due time for the next attempt after `attempts` failures.
-pub(crate) fn retry_due_ms(attempts: u32) -> u64 {
-    unix_timestamp_millis().saturating_add(retry_delay_ms(attempts))
-}
-
-/// Whether `attempts` spent exhausts `max_attempts` and parks the row.
-pub(crate) fn exhausted(attempts: u32, max_attempts: u32) -> bool {
-    attempts >= max_attempts
-}
+use super::retry::RetryView;
 
 /// What forwarding one due queue entry asks of the drain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,8 +85,10 @@ mod tests {
     use aruna_core::types::Key;
     use tokio::sync::Barrier;
 
-    use super::{ForwardOutcome, QueueDrain, RetryView, drain_queue};
+    use super::{ForwardOutcome, QueueDrain, drain_queue};
+
     use crate::device::drain::DrainOutcome;
+    use crate::device::retry::RetryView;
 
     #[derive(Clone, Debug)]
     struct Entry {

@@ -14,7 +14,7 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::backlog::RetryView;
+use super::retry::RetryView;
 use crate::auth::bearer_token::token_grant;
 
 /// Entries one device may hold. A device authors for one person, so the queue
