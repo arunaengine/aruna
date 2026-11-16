@@ -49,6 +49,7 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
+use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::projector::{project_logged_events, replay_event_log};
 use aruna_operations::metadata::{AuthToken, MetadataHandle};
 use aruna_operations::notifications::placement::resolve_inbox_holder;
@@ -1971,6 +1972,48 @@ pub async fn spawn_replicas(
     }
     mesh(nodes.iter().map(|node| &node.net)).await;
     Ok(nodes)
+}
+
+pub async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
+    drive(
+        GetDocumentOperation::new(group_id, document_id),
+        node.context.as_ref(),
+    )
+    .await
+    .is_ok()
+}
+
+pub fn document_config(
+    realm: &Topology,
+    node: &TestNode,
+    group_id: Ulid,
+    document_id: Ulid,
+    document_path: &str,
+    payload: CreateDocumentPayload,
+) -> CreateDocumentConfig {
+    CreateDocumentConfig {
+        actor: realm.actor(node),
+        group_id,
+        document_id,
+        document_path: document_path.to_string(),
+        public: true,
+        payload,
+    }
+}
+
+/// Creates a document on `node`, replays its event log, and returns the document's placement.
+pub async fn create_document(
+    realm: &Topology,
+    node: &TestNode,
+    group_id: Ulid,
+    document_id: Ulid,
+    document_path: &str,
+    payload: CreateDocumentPayload,
+) -> TestResult<PlacementRef> {
+    let config = document_config(realm, node, group_id, document_id, document_path, payload);
+    let created = drive(CreateDocumentOperation::new(config), node.context.as_ref()).await?;
+    replay_event_log(node.context.as_ref()).await?;
+    Ok(created.record.placement)
 }
 
 /// The default realm config with each of `nets` as a management node.

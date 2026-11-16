@@ -12,15 +12,13 @@ use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::placement::transition::TransitionLimits;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::mint_local_document;
-use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::placement::transition::{preview_transition, transition_health};
 use aruna_operations::placement::{holds_placement, resolve_shard_holders};
 use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
-use ulid::Ulid;
 
-use topology::{LOCATIONS, NODE_WEIGHT, TestNode, TestResult, Topology, wait_until};
+use crate::topology::document_present;
+use topology::{LOCATIONS, NODE_WEIGHT, TestResult, Topology, wait_until};
 
 const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;
@@ -185,13 +183,4 @@ async fn register_phantom(realm: &mut Topology) -> TestResult<NodeId> {
     });
     realm.apply_config(config).await?;
     Ok(phantom)
-}
-
-async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
-    drive(
-        GetDocumentOperation::new(group_id, document_id),
-        node.context.as_ref(),
-    )
-    .await
-    .is_ok()
 }

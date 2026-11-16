@@ -8,13 +8,11 @@ use std::collections::BTreeMap;
 
 use aruna_core::StructuredId;
 use aruna_core::structs::placement::record::NodePlacementEntry;
-use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::mint_local_document;
-use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::placement::resolve_shard_holders;
-use ulid::Ulid;
 
-use topology::{TestNode, TestResult, Topology, wait_until};
+use crate::topology::document_present;
+use topology::{TestResult, Topology, wait_until};
 
 const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;
@@ -116,13 +114,4 @@ async fn config_preserves_holders() -> TestResult<()> {
 
     realm.shutdown().await;
     Ok(())
-}
-
-async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
-    drive(
-        GetDocumentOperation::new(group_id, document_id),
-        node.context.as_ref(),
-    )
-    .await
-    .is_ok()
 }

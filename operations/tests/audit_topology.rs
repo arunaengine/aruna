@@ -5,19 +5,16 @@
 use crate::topology;
 
 use aruna_core::StructuredId;
-use aruna_core::structs::placement::record::PlacementRef;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::audit::{
     AUDIT_DEADLINE_SECS, AUDIT_PAGE_LIMIT, AuditAggregate, ListAuditOperation, ListAuditRequest,
     LocalPageOperation, list_audit,
 };
-use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
-};
-use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::metadata::create_document::{CreateDocumentPayload, mint_local_document};
 use std::cell::RefCell;
 use ulid::Ulid;
 
+use crate::topology::create_document;
 use topology::{TestNode, TestResult, Topology, wait_for_convergence, wait_until};
 
 const MANAGEMENT_NODES: usize = 5;
@@ -40,7 +37,15 @@ async fn nonholder_audit_trail() -> TestResult<()> {
         let origin = realm.leading_node(group_id, &path);
         let document_id =
             mint_local_document(&realm.config, &realm.actor(origin), group_id, &path)?.as_ulid();
-        let placement = create_document(&realm, origin, group_id, document_id, &path).await?;
+        let placement = create_document(
+            &realm,
+            origin,
+            group_id,
+            document_id,
+            &path,
+            audit_payload(),
+        )
+        .await?;
         for holder in realm.assert_holder(origin.node_id(), &placement) {
             let node = realm.find(holder);
             wait_until("audit row reaches holder", node.node_id(), || {
@@ -248,50 +253,6 @@ fn unique_documents(
     ids.len()
 }
 
-fn document_config(
-    realm: &Topology,
-    node: &TestNode,
-    group_id: Ulid,
-    document_id: Ulid,
-    document_path: &str,
-) -> CreateDocumentConfig {
-    CreateDocumentConfig {
-        actor: realm.actor(node),
-        group_id,
-        document_id,
-        document_path: document_path.to_string(),
-        public: true,
-        payload: CreateDocumentPayload::Scaffold {
-            name: "Audit Dataset".to_string(),
-            description: "Written to exercise the distributed audit trail".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-        },
-    }
-}
-
-async fn create_document(
-    realm: &Topology,
-    node: &TestNode,
-    group_id: Ulid,
-    document_id: Ulid,
-    document_path: &str,
-) -> TestResult<PlacementRef> {
-    let created = drive(
-        CreateDocumentOperation::new(document_config(
-            realm,
-            node,
-            group_id,
-            document_id,
-            document_path,
-        )),
-        node.context.as_ref(),
-    )
-    .await?;
-    replay_event_log(node.context.as_ref()).await?;
-    Ok(created.record.placement)
-}
-
 async fn audit_has_document(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
     drive(
         LocalPageOperation::new(
@@ -305,4 +266,14 @@ async fn audit_has_document(node: &TestNode, group_id: Ulid, document_id: Ulid) 
     )
     .await
     .is_ok_and(|page| !page.records.is_empty())
+}
+
+/// The scaffold payload of every document this file creates.
+fn audit_payload() -> CreateDocumentPayload {
+    CreateDocumentPayload::Scaffold {
+        name: "Audit Dataset".to_string(),
+        description: "Written to exercise the distributed audit trail".to_string(),
+        date_published: "2026-01-01".to_string(),
+        license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+    }
 }

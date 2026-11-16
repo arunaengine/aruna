@@ -36,8 +36,8 @@ use aruna_operations::metadata::api::{
     MetadataApiError, RoCrateExportView, query_metadata_document,
 };
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
-    mint_local_document, resolve_metadata_id,
+    CreateDocumentOperation, CreateDocumentPayload, mint_forward_document, mint_local_document,
+    resolve_metadata_id,
 };
 use aruna_operations::metadata::forward::{
     PinnedCreate, create_with_id, export_rocrate_routed, route_metadata_create,
@@ -46,12 +46,12 @@ use aruna_operations::metadata::forward::{
 use aruna_operations::metadata::get_document::{
     GetDocumentError, GetDocumentOperation, load_document_record,
 };
-use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use std::cell::RefCell;
 use ulid::Ulid;
 
+use crate::topology::{create_document, document_config, document_present};
 use topology::{TestNode, TestResult, Topology, wait_for_convergence, wait_until};
 
 const MANAGEMENT_NODES: usize = 5;
@@ -696,7 +696,15 @@ async fn create_stamps_origin() -> TestResult<()> {
         .expect("a Management node holds buckets");
     let holders = realm.assert_holder(origin.node_id(), &expected);
 
-    let created = create_document(&realm, origin, group_id, document_id, path).await?;
+    let created = create_document(
+        &realm,
+        origin,
+        group_id,
+        document_id,
+        path,
+        topology_payload(),
+    )
+    .await?;
     assert_eq!(
         created, expected,
         "create stamped a bucket it does not hold"
@@ -740,7 +748,15 @@ async fn read_misses_nonholder() -> TestResult<()> {
     let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
-    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
+    let placement = create_document(
+        &realm,
+        origin,
+        group_id,
+        document_id,
+        path,
+        topology_payload(),
+    )
+    .await?;
     let holders = realm.assert_holder(origin.node_id(), &placement);
 
     for holder in &holders {
@@ -795,7 +811,15 @@ async fn bystander_writes_forward() -> TestResult<()> {
     let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
-    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
+    let placement = create_document(
+        &realm,
+        origin,
+        group_id,
+        document_id,
+        path,
+        topology_payload(),
+    )
+    .await?;
     let holders = realm.assert_holder(origin.node_id(), &placement);
     for holder in &holders {
         let node = realm.find(*holder);
@@ -929,7 +953,15 @@ async fn document_sparql_routes() -> TestResult<()> {
     let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
-    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
+    let placement = create_document(
+        &realm,
+        origin,
+        group_id,
+        document_id,
+        path,
+        topology_payload(),
+    )
+    .await?;
     let holders = realm.assert_holder(origin.node_id(), &placement);
     for holder in &holders {
         let node = realm.find(*holder);
@@ -983,7 +1015,15 @@ async fn document_export_routes() -> TestResult<()> {
     let origin = realm.leading_node(group_id, path);
     let document_id =
         mint_local_document(&realm.config, &realm.actor(origin), group_id, path)?.as_ulid();
-    let placement = create_document(&realm, origin, group_id, document_id, path).await?;
+    let placement = create_document(
+        &realm,
+        origin,
+        group_id,
+        document_id,
+        path,
+        topology_payload(),
+    )
+    .await?;
     let holders = realm.assert_holder(origin.node_id(), &placement);
     for holder in &holders {
         let node = realm.find(*holder);
@@ -1048,7 +1088,14 @@ async fn user_create_forwards() -> TestResult<()> {
     );
 
     let created = route_metadata_create(
-        CreateDocumentOperation::new(document_config(&realm, user, group_id, document_id, path)),
+        CreateDocumentOperation::new(document_config(
+            &realm,
+            user,
+            group_id,
+            document_id,
+            path,
+            topology_payload(),
+        )),
         user.context.clone(),
         Some(realm.bearer_token()),
     )
@@ -1190,60 +1237,6 @@ async fn delete_routed(node: &TestNode, realm: &Topology, document_id: Ulid) -> 
     .await
 }
 
-fn document_config(
-    realm: &Topology,
-    node: &TestNode,
-    group_id: Ulid,
-    document_id: Ulid,
-    document_path: &str,
-) -> CreateDocumentConfig {
-    CreateDocumentConfig {
-        actor: realm.actor(node),
-        group_id,
-        document_id,
-        document_path: document_path.to_string(),
-        public: true,
-        payload: CreateDocumentPayload::Scaffold {
-            name: "Topology Dataset".to_string(),
-            description: "Written on a realm above the replication factor".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-        },
-    }
-}
-
-/// Creates locally on a bucket-holding node and returns the bucket it stamped.
-async fn create_document(
-    realm: &Topology,
-    node: &TestNode,
-    group_id: Ulid,
-    document_id: Ulid,
-    document_path: &str,
-) -> TestResult<aruna_core::structs::placement::record::PlacementRef> {
-    let created = drive(
-        CreateDocumentOperation::new(document_config(
-            realm,
-            node,
-            group_id,
-            document_id,
-            document_path,
-        )),
-        node.context.as_ref(),
-    )
-    .await?;
-    replay_event_log(node.context.as_ref()).await?;
-    Ok(created.record.placement)
-}
-
-async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
-    drive(
-        GetDocumentOperation::new(group_id, document_id),
-        node.context.as_ref(),
-    )
-    .await
-    .is_ok()
-}
-
 async fn registry_row_present(node: &TestNode, document_id: Ulid) -> bool {
     load_document_record(node.context.as_ref(), document_id)
         .await
@@ -1297,4 +1290,14 @@ async fn pinned_create_repeats() -> TestResult<()> {
     assert_eq!(again.last_event_id, first.last_event_id);
     realm.shutdown().await;
     Ok(())
+}
+
+/// The scaffold payload of every document this file creates.
+fn topology_payload() -> CreateDocumentPayload {
+    CreateDocumentPayload::Scaffold {
+        name: "Topology Dataset".to_string(),
+        description: "Written on a realm above the replication factor".to_string(),
+        date_published: "2026-01-01".to_string(),
+        license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+    }
 }

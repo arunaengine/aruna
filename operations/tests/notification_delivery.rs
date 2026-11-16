@@ -43,10 +43,10 @@ use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-use crate::convergence;
+use crate::convergence::wait_for_convergence;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
-use convergence::wait_for_convergence;
+use crate::topology::{realm_config_for, user_with_holder};
 
 const LIST_LIMIT: u32 = LIST_MAX_LIMIT as u32;
 
@@ -65,7 +65,7 @@ struct TestNode {
 async fn notification_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([12u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
-    let config = realm_config_for(&nodes, realm_id);
+    let config = realm_config_for(nodes.iter().map(|node| &node.net), realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
     let record = added_group_record(recipient, realm_id, unix_timestamp_millis());
@@ -107,7 +107,7 @@ async fn delivery_retries_outage() -> Result<(), Box<dyn std::error::Error>> {
     mesh(nodes.iter().map(|node| &node.net)).await;
     install_realm_config(&nodes, realm_id).await?;
 
-    let config = realm_config_for(&nodes, realm_id);
+    let config = realm_config_for(nodes.iter().map(|node| &node.net), realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
     let record = added_group_record(recipient, realm_id, unix_timestamp_millis());
@@ -156,7 +156,7 @@ async fn delivery_retries_outage() -> Result<(), Box<dyn std::error::Error>> {
 async fn duplicate_delivery_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([33u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
-    let config = realm_config_for(&nodes, realm_id);
+    let config = realm_config_for(nodes.iter().map(|node| &node.net), realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
     let record = added_group_record(recipient, realm_id, unix_timestamp_millis());
@@ -207,7 +207,7 @@ async fn duplicate_delivery_idempotent() -> Result<(), Box<dyn std::error::Error
 async fn unread_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([44u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
-    let config = realm_config_for(&nodes, realm_id);
+    let config = realm_config_for(nodes.iter().map(|node| &node.net), realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
 
@@ -268,7 +268,7 @@ async fn placement_converges() -> Result<(), Box<dyn std::error::Error>> {
 async fn dispatch_proxies_nonholder() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([66u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
-    let config = realm_config_for(&nodes, realm_id);
+    let config = realm_config_for(nodes.iter().map(|node| &node.net), realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
     // Neither the emitter nor the holder: every op it serves must proxy one hop
@@ -377,30 +377,6 @@ fn added_group_record(
         },
         created_at_ms,
     )
-}
-
-fn realm_config_for(nodes: &[TestNode], realm_id: RealmId) -> RealmConfigDocument {
-    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-    config.seed_default_placement();
-    for node in nodes {
-        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
-    }
-    config
-}
-
-fn user_with_holder(
-    realm_config: &RealmConfigDocument,
-    holder: NodeId,
-    realm_id: RealmId,
-) -> UserId {
-    for _ in 0..10_000 {
-        let candidate = UserId::local(Ulid::generate(), realm_id);
-        if matches!(resolve_inbox_holder(&candidate, realm_config), Ok(Some(node)) if node == holder)
-        {
-            return candidate;
-        }
-    }
-    panic!("no user hashed to holder {holder} within the sampling bound");
 }
 
 async fn emit_on(
@@ -570,7 +546,11 @@ async fn install_realm_config(
     nodes: &[TestNode],
     realm_id: RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    install_config(nodes, &realm_config_for(nodes, realm_id)).await
+    install_config(
+        nodes,
+        &realm_config_for(nodes.iter().map(|node| &node.net), realm_id),
+    )
+    .await
 }
 
 async fn install_config(
