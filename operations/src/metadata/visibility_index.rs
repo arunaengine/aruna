@@ -24,7 +24,8 @@ use ulid::Ulid;
 
 use crate::auth::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
 use crate::driver::DriverContext;
-use crate::metadata::repository::{StorageReadError, delete_index_keys};
+use crate::metadata::repository::StorageReadError;
+use crate::metadata::timestamp_index::delete_index_keys;
 use crate::metadata::timestamp_index::enumerate_updated;
 use crate::storage_read::parse_storage_scan;
 

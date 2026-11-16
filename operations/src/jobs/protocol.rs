@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::jobs::route::JobRouteError;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +20,6 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
@@ -41,20 +41,6 @@ pub(crate) use aruna_core::jobs::{
 
 const JOB_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum JobRouteError {
-    #[error("job request is unauthorized")]
-    Unauthorized,
-    #[error("job request is forbidden")]
-    Forbidden,
-    #[error("job not found")]
-    NotFound,
-    #[error("job owner unavailable: {0}")]
-    Unavailable(String),
-    #[error("job operation failed: {0}")]
-    Internal(String),
-}
 
 impl From<&OwnedArtifact> for WireArtifact {
     fn from(owned: &OwnedArtifact) -> Self {

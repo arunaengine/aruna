@@ -20,6 +20,7 @@ pub mod snapshot;
 pub mod state;
 pub mod versions;
 
+use self::changes::PropertyConflict;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
@@ -74,15 +75,6 @@ pub struct MergeConflict {
     /// Files both sides changed that no metadata merge resolves.
     pub files: Vec<String>,
     pub properties: Vec<PropertyConflict>,
-}
-
-/// A metadata property both sides changed from their common version to different values.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PropertyConflict {
-    pub entity: String,
-    pub property: String,
-    pub source: Vec<serde_json::Value>,
-    pub target: Vec<serde_json::Value>,
 }
 
 pub async fn document(

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::document_repository::read_effect;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, JobControlEffect, NetEffect};
 use aruna_core::events::{Event, JobControlEvent, NetEvent, StorageEvent};
@@ -12,9 +13,7 @@ use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::{JobOwnerError, RealmConfigDocument, RealmId};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
-
-use super::protocol::JobRouteError;
-use crate::document_repository::read_effect;
+use thiserror::Error;
 
 /// Where a routed job-control request must be served.
 #[derive(Debug, PartialEq)]
@@ -180,6 +179,20 @@ impl Operation for JobRouteOperation {
             JobRouteError::NotFound | JobRouteError::Unauthorized | JobRouteError::Forbidden
         )
     }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum JobRouteError {
+    #[error("job request is unauthorized")]
+    Unauthorized,
+    #[error("job request is forbidden")]
+    Forbidden,
+    #[error("job not found")]
+    NotFound,
+    #[error("job owner unavailable: {0}")]
+    Unavailable(String),
+    #[error("job operation failed: {0}")]
+    Internal(String),
 }
 
 #[cfg(test)]

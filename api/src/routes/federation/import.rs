@@ -22,8 +22,9 @@ use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::transfer::{ExportGrant, ImportDestination, ImportIntent, TransferError};
 use aruna_operations::driver::drive;
 use aruna_operations::federation::import::{
-    self, ImportError, ImportRecord, authorize_import, reusable_upload, write_import,
+    self, ImportError, authorize_import, reusable_upload, write_import,
 };
+use aruna_operations::federation::records::ImportRecord;
 use aruna_operations::federation::transfer::{
     AdmitTransferConfig, AdmitTransferOperation, IssueIntentConfig, IssueIntentOperation,
     TransferAdmitError,

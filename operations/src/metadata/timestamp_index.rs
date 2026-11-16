@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::events::{Event, StorageEvent};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::metadata::get_document::load_document_record;
-use crate::metadata::repository::{StorageReadError, delete_index_keys};
+use crate::metadata::repository::StorageReadError;
 use crate::storage_read::parse_storage_scan;
 
 /// Storage rows scanned per index batch while assembling one enumeration page.
@@ -205,6 +206,37 @@ fn iter_effect(start: IterStart) -> Effect {
         limit: INDEX_SCAN_BATCH,
         txn_id: None,
     })
+}
+
+/// Untransacted batch delete of index keys in one keyspace, returning how many
+/// were dropped.
+pub async fn delete_index_keys(
+    context: &DriverContext,
+    keyspace: &str,
+    keys: Vec<Key>,
+) -> Result<usize, StorageReadError> {
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let count = keys.len();
+    let deletes = keys
+        .into_iter()
+        .map(|key| (keyspace.to_string(), key))
+        .collect();
+    let event = context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None,
+        }))
+        .await;
+    match event {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(count),
+        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
+        _ => Err(StorageReadError::Storage(
+            aruna_core::errors::StorageError::WriteError("unexpected event".to_string()),
+        )),
+    }
 }
 
 #[cfg(test)]

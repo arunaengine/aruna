@@ -37,7 +37,8 @@ use std::sync::Arc;
 use tracing::warn;
 
 use super::REPORT_MAX_ROWS;
-use super::protocol::{JobRequest, JobResponse, JobRouteError, WireRange, send_job_request};
+use super::protocol::{JobRequest, JobResponse, WireRange, send_job_request};
+use super::route::JobRouteError;
 use super::runtime::JobsRuntime;
 use super::staging::read_staging_checkpoint;
 use super::store::{

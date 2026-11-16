@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::federation::records::ImportRecord;
 use std::collections::BTreeMap;
 
 use aruna_core::federation::Signed;
@@ -18,7 +19,7 @@ use aruna_core::transfer::{
     ExportGrant, ImportDestination, ImportIntent, TransferError, check_grant, check_intent,
 };
 use aruna_core::{NodeId, UserId};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -33,15 +34,6 @@ use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 pub const IMPORT_OPERATION: &str = "federation.import";
-
-/// Binds an upload of another realm's artifact to the intent and grant it arrived with.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImportRecord {
-    pub intent: Signed<ImportIntent>,
-    pub grant: Signed<ExportGrant>,
-    /// The source confirmed the grant since the import job last started; a start consumes it.
-    pub confirmed: bool,
-}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ImportError {

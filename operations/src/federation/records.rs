@@ -6,18 +6,20 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::federation::Signed;
 use aruna_core::keyspaces::{
     DEDUP_INDEX_KEYSPACE, FEDERATION_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{RoCrateUploadRecord, job_record_key, parse_dedup_value};
+use aruna_core::transfer::{ExportGrant, ImportIntent};
 use aruna_core::types::{Effects, Key, TxnId, Value};
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use super::export::GrantRecord;
-use super::import::ImportRecord;
 use crate::jobs::import::{upload_key, upload_stale};
 use crate::jobs::store::decode_job_record;
 
@@ -391,6 +393,15 @@ impl Operation for RecordOperation {
             .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
             .unwrap_or_default()
     }
+}
+
+/// Binds an upload of another realm's artifact to the intent and grant it arrived with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRecord {
+    pub intent: Signed<ImportIntent>,
+    pub grant: Signed<ExportGrant>,
+    /// The source confirmed the grant since the import job last started; a start consumes it.
+    pub confirmed: bool,
 }
 
 #[cfg(test)]
