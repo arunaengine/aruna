@@ -2,59 +2,38 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::StructuredId;
-use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::GroupId;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
-};
+use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::node::startup::{RESTORE_TOPIC_COUNT, restore_shard_subscriptions};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::realm::get_nodes::GetNodesOperation;
-use aruna_operations::sync::incoming::initialize_net_holder;
-use aruna_operations::tasks::incoming::start_task_queues;
-use aruna_storage::FjallStorage;
-use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
 use tokio::time::sleep;
 use ulid::Ulid;
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
 use crate::convergence;
-use crate::topology::flush_projection_batches;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
+use crate::topology::{
+    BoxError, TestNode, install_load_config, make_runtime, respawn_with_retry, run_writer,
+    shutdown_nodes, spawn_load_node, spawn_node_with, stop_node, wait_node_convergence,
+};
 use convergence::{
     HANG_CAP, NO_PROGRESS_TIMEOUT, wait_for_convergence, wait_for_visibility, wait_storage_released,
 };
 
-const PROJECTION_BATCH: usize = 32;
 const SEED_DOCUMENTS: usize = 256;
-
-struct TestNode {
-    _temp_dir: Option<TempDir>,
-    net: NetHandle,
-    task_handle: TaskHandle,
-    context: Arc<DriverContext>,
-    shutdown: aruna_core::shutdown::Shutdown,
-}
 
 struct IncidentFixture {
     nodes: Vec<TestNode>,
@@ -110,7 +89,7 @@ async fn prepare_restart_state(
     let nodes = spawn_restart_nodes(realm_id, node2_dir, secret, aux).await?;
     announce_restart_nodes(&nodes, realm_id, aux).await?;
     wait_node_convergence(&nodes, &realm_id).await?;
-    install_realm_config(&nodes, &realm_id).await?;
+    install_load_config(&nodes, &realm_id).await?;
     let (group_id, created) = seed_restart_documents(realm_id, &nodes).await?;
     Ok((nodes, group_id, created))
 }
@@ -148,10 +127,19 @@ async fn finish_restart(
     group_id: GroupId,
 ) -> Result<(), BoxError> {
     // A fresh write after the restart converges to all nodes.
-    let fresh = run_writer(realm_id, group_id, 1, "fresh", {
-        vec![(nodes[0].net.node_id(), nodes[0].context.clone())]
-    })
+    let targets = vec![(nodes[0].net.node_id(), nodes[0].context.clone())];
+    let fresh = run_writer(
+        realm_id,
+        group_id,
+        "fresh",
+        0,
+        1,
+        targets,
+        None,
+        restart_payload,
+    )
     .await?;
+    let fresh: Vec<(GroupId, Ulid)> = fresh.into_iter().map(|(g, d, _)| (g, d)).collect();
     wait_auto_outbox(&nodes[0]).await?;
     let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|node| node.context.clone()).collect();
     wait_for_visibility(&contexts, &fresh, Duration::from_millis(200)).await?;
@@ -168,13 +156,13 @@ async fn spawn_restart_nodes(
     aux: &AuxRuntime,
 ) -> Result<Vec<TestNode>, BoxError> {
     let mut nodes = Vec::with_capacity(3);
-    nodes.push(spawn_node(realm_id).await?);
-    nodes.push(spawn_node(realm_id).await?);
+    nodes.push(spawn_load_node(realm_id, true).await?);
+    nodes.push(spawn_load_node(realm_id, true).await?);
     let dir2 = node2_dir.path().to_path_buf();
     let secret2 = secret.clone();
     let node2 = aux
         .handle()
-        .spawn(async move { spawn_node_with(realm_id, Some(secret2), dir2).await })
+        .spawn(async move { spawn_node_with(realm_id, Some(secret2), dir2, true).await })
         .await??;
     nodes.push(node2);
     mesh(nodes.iter().map(|node| &node.net)).await;
@@ -214,7 +202,18 @@ async fn seed_restart_documents(
 ) -> Result<(GroupId, Vec<(GroupId, Ulid)>), BoxError> {
     let group_id = Ulid::generate();
     let targets = vec![(nodes[0].net.node_id(), nodes[0].context.clone())];
-    let created = run_writer(realm_id, group_id, SEED_DOCUMENTS, "seed", targets).await?;
+    let created = run_writer(
+        realm_id,
+        group_id,
+        "seed",
+        0,
+        SEED_DOCUMENTS,
+        targets,
+        None,
+        restart_payload,
+    )
+    .await?;
+    let created: Vec<(GroupId, Ulid)> = created.into_iter().map(|(g, d, _)| (g, d)).collect();
     // Do not stop node 2 while the seed publication handler is still in flight.
     wait_auto_outbox(&nodes[0]).await?;
     let sample_stride = created.len().div_ceil(40);
@@ -240,17 +239,14 @@ async fn restart_node(
     aux: AuxRuntime,
 ) -> Result<TestNode, BoxError> {
     let node2 = nodes.pop().ok_or("node 2 present")?;
-    let _ = node2.shutdown.drain(NO_PROGRESS_TIMEOUT).await;
-    node2.net.clear_inbound_handler();
-    let _ = node2.task_handle.shutdown(NO_PROGRESS_TIMEOUT).await;
-    node2.net.shutdown().await;
+    stop_node(&node2).await;
     let storage = node2.context.storage_handle.clone();
     drop(node2);
     aux.shutdown().await?;
     wait_storage_released(storage).await?;
     println!("node 2 shut down");
 
-    let node2 = respawn_with_retry(realm_id, secret, node2_dir.path()).await?;
+    let node2 = respawn_with_retry(realm_id, secret, node2_dir.path(), true).await?;
     for other in nodes {
         node2.net.add_peer_addr(other.net.endpoint_addr()).await;
         other.net.add_peer_addr(node2.net.endpoint_addr()).await;
@@ -265,12 +261,6 @@ async fn restart_node(
     )
     .await?;
     Ok(node2)
-}
-
-fn make_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
-    Ok(tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?)
 }
 
 // Owns the auxiliary node-2 runtime and always tears it down off the async
@@ -316,66 +306,6 @@ impl Drop for AuxRuntime {
     }
 }
 
-async fn run_writer(
-    realm_id: RealmId,
-    group_id: GroupId,
-    count: usize,
-    label: &str,
-    targets: Vec<(aruna_core::NodeId, Arc<DriverContext>)>,
-) -> Result<Vec<(GroupId, Ulid)>, BoxError> {
-    let mut batches: Vec<Vec<(Ulid, Ulid)>> = targets.iter().map(|_| Vec::new()).collect();
-    let mut pending = 0usize;
-    let mut created = Vec::with_capacity(count);
-
-    // Mint from the replicated realm config; the id is no longer in the path,
-    // since the path now feeds the bucket the id embeds.
-    let config = drive(GetConfigOperation::new(realm_id), targets[0].1.as_ref())
-        .await
-        .map_err(|error| format!("realm config load failed: {error:?}"))?;
-
-    for index in 0..count {
-        let slot = index % targets.len();
-        let (node_id, context) = &targets[slot];
-        let document_path = format!("datasets/restart-{label}-{index}");
-        let actor = Actor {
-            node_id: *node_id,
-            user_id: UserId::local(Ulid::generate(), realm_id),
-            realm_id,
-        };
-        let document_id = mint_local_document(&config, &actor, group_id, &document_path)
-            .map_err(|error| format!("mint failed index={index}: {error:?}"))?
-            .as_ulid();
-        let result = drive(
-            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-                actor,
-                group_id,
-                document_id,
-                document_path,
-                public: true,
-                payload: CreateDocumentPayload::Scaffold {
-                    name: format!("Restart Dataset {index}"),
-                    description: "Restart traffic document".to_string(),
-                    date_published: "2026-07-07".to_string(),
-                    license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-                },
-            }),
-            context.as_ref(),
-        )
-        .await
-        .map_err(|error| format!("create failed index={index}: {error:?}"))?;
-
-        batches[slot].push((result.record.document_id, result.record.last_event_id));
-        created.push((group_id, result.record.document_id));
-        pending += 1;
-        if pending >= PROJECTION_BATCH {
-            flush_projection_batches(&targets, &mut batches).await?;
-            pending = 0;
-        }
-    }
-    flush_projection_batches(&targets, &mut batches).await?;
-    Ok(created)
-}
-
 /// Waits for every sampled document to become readable on the node. Replicas
 /// cover all nodes here, so each arrival is progress that resets the window.
 async fn wait_sample_visible(
@@ -400,116 +330,6 @@ async fn wait_sample_visible(
     .await
 }
 
-async fn spawn_node(realm_id: RealmId) -> Result<TestNode, BoxError> {
-    let temp_dir = tempfile::tempdir()?;
-    let mut node = spawn_node_with(realm_id, None, temp_dir.path().to_path_buf()).await?;
-    node._temp_dir = Some(temp_dir);
-    Ok(node)
-}
-
-async fn spawn_node_with(
-    realm_id: RealmId,
-    secret_key: Option<iroh::SecretKey>,
-    dir: PathBuf,
-) -> Result<TestNode, BoxError> {
-    let fjall_dir = dir.join("fjall");
-    std::fs::create_dir_all(&fjall_dir)?;
-    let storage = FjallStorage::open(fjall_dir.to_str().ok_or("invalid storage path")?)?;
-    let net = NetHandle::new(
-        NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-            secret_key,
-            realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            sync_storage_path: Some(dir.join("document-sync")),
-            ..NetConfig::default()
-        },
-        storage.clone(),
-    )
-    .await?;
-    let task_handle = TaskHandle::new();
-    let metadata_handle = MetadataHandle::new(
-        dir.join("metadata"),
-        net.node_id(),
-        storage.clone(),
-        Some(net.clone()),
-        Some(net.document_sync_node()),
-        Some(net.document_sync_database()),
-    )?;
-
-    let context = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: Some(net.clone()),
-        blob_handle: None,
-        metadata_handle: Some(metadata_handle),
-        task_handle: Some(task_handle.clone()),
-        compute_handle: None,
-    });
-
-    let shutdown = aruna_core::shutdown::Shutdown::new();
-    initialize_net_holder(
-        context.clone(),
-        aruna_core::structs::execution::job::RoCrateLimits::default(),
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
-        &shutdown,
-    );
-    start_task_queues(
-        context.clone(),
-        task_handle.clone(),
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
-        &shutdown,
-    )
-    .await;
-
-    Ok(TestNode {
-        _temp_dir: None,
-        net,
-        task_handle,
-        context,
-        shutdown,
-    })
-}
-
-async fn respawn_with_retry(
-    realm_id: RealmId,
-    secret_key: iroh::SecretKey,
-    dir: &Path,
-) -> Result<TestNode, BoxError> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        match spawn_node_with(realm_id, Some(secret_key.clone()), dir.to_path_buf()).await {
-            Ok(node) => return Ok(node),
-            Err(error) => {
-                if Instant::now() >= deadline {
-                    return Err(format!("respawn failed after retries: {error}").into());
-                }
-                sleep(Duration::from_millis(250)).await;
-            }
-        }
-    }
-}
-
-async fn install_realm_config(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), BoxError> {
-    let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
-    config.seed_default_placement();
-    for (band, node) in nodes.iter().enumerate() {
-        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
-        config.seed_job_control(node.net.node_id(), band as u32);
-    }
-
-    write_config(nodes, realm_id, &config).await?;
-    for node in nodes {
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &node.context,
-            *realm_id,
-            node.net.node_id(),
-        )
-        .await;
-    }
-    Ok(())
-}
-
 async fn write_config(
     nodes: &[TestNode],
     realm_id: &RealmId,
@@ -519,30 +339,6 @@ async fn write_config(
         store_realm_config(&node.net, &node.context, *realm_id, config).await?;
     }
     Ok(())
-}
-
-async fn wait_node_convergence(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), BoxError> {
-    let expected: std::collections::HashSet<_> =
-        nodes.iter().map(|node| node.net.node_id()).collect();
-    wait_for_convergence("realm nodes did not converge", || async {
-        let mut pending = 0;
-        for node in nodes {
-            match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
-                Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => pending += 1,
-            }
-        }
-        Ok(pending)
-    })
-    .await
-}
-
-async fn shutdown_nodes(nodes: Vec<TestNode>) {
-    for node in nodes {
-        let _ = node.shutdown.drain(NO_PROGRESS_TIMEOUT).await;
-        let _ = node.task_handle.shutdown(NO_PROGRESS_TIMEOUT).await;
-        node.net.shutdown().await;
-    }
 }
 
 /// Held shard topics the incident node restored.
@@ -673,7 +469,13 @@ async fn prepare_outage(realm_id: RealmId, record_count: usize) -> Result<Outage
     let local = nodes[0].net.node_id();
     let holders: Vec<_> = nodes.iter().map(|node| node.net.node_id()).collect();
     let (live, dir_one, dir_two) = stop_peers(nodes).await?;
-    let _ = live.task_handle.shutdown(NO_PROGRESS_TIMEOUT).await;
+    let _ = live
+        .context
+        .task_handle
+        .as_ref()
+        .ok_or("the node has a task handle")?
+        .shutdown(NO_PROGRESS_TIMEOUT)
+        .await;
     let seeded = seed_outbox(
         &live,
         realm_id,
@@ -818,9 +620,14 @@ async fn spawn_incident_nodes(
     let mut nodes = Vec::with_capacity(3);
     for secret in secrets {
         let dir = tempfile::tempdir()?;
-        let mut node =
-            spawn_node_with(realm_id, Some(secret.clone()), dir.path().to_path_buf()).await?;
-        node._temp_dir = Some(dir);
+        let mut node = spawn_node_with(
+            realm_id,
+            Some(secret.clone()),
+            dir.path().to_path_buf(),
+            true,
+        )
+        .await?;
+        node.temp_dir = Some(dir);
         nodes.push(node);
     }
     mesh(nodes[1..].iter().map(|node| &node.net)).await;
@@ -945,21 +752,15 @@ async fn stop_peers(mut nodes: Vec<TestNode>) -> Result<(TestNode, TempDir, Temp
     let mut offline_one = nodes.remove(0);
     let mut offline_two = nodes.remove(0);
     let dir_one = offline_one
-        ._temp_dir
+        .temp_dir
         .take()
         .ok_or("offline peer directory missing")?;
     let dir_two = offline_two
-        ._temp_dir
+        .temp_dir
         .take()
         .ok_or("offline peer directory missing")?;
-    let _ = offline_one.shutdown.drain(NO_PROGRESS_TIMEOUT).await;
-    offline_one.net.clear_inbound_handler();
-    let _ = offline_one.task_handle.shutdown(NO_PROGRESS_TIMEOUT).await;
-    offline_one.net.shutdown().await;
-    let _ = offline_two.shutdown.drain(NO_PROGRESS_TIMEOUT).await;
-    offline_two.net.clear_inbound_handler();
-    let _ = offline_two.task_handle.shutdown(NO_PROGRESS_TIMEOUT).await;
-    offline_two.net.shutdown().await;
+    stop_node(&offline_one).await;
+    stop_node(&offline_two).await;
     let storage_one = offline_one.context.storage_handle.clone();
     let storage_two = offline_two.context.storage_handle.clone();
     drop(offline_one);
@@ -1195,11 +996,11 @@ async fn restore_peers(
     config: &RealmConfigDocument,
 ) -> Result<Vec<TestNode>, BoxError> {
     let path_one = dir_one.path().to_path_buf();
-    let mut peer_one = respawn_with_retry(realm_id, secrets[1].clone(), &path_one).await?;
-    peer_one._temp_dir = Some(dir_one);
+    let mut peer_one = respawn_with_retry(realm_id, secrets[1].clone(), &path_one, true).await?;
+    peer_one.temp_dir = Some(dir_one);
     let path_two = dir_two.path().to_path_buf();
-    let mut peer_two = respawn_with_retry(realm_id, secrets[2].clone(), &path_two).await?;
-    peer_two._temp_dir = Some(dir_two);
+    let mut peer_two = respawn_with_retry(realm_id, secrets[2].clone(), &path_two, true).await?;
+    peer_two.temp_dir = Some(dir_two);
     let nodes = vec![live, peer_one, peer_two];
     mesh(nodes.iter().map(|node| &node.net)).await;
     write_config(&nodes, &realm_id, config).await?;
@@ -1376,5 +1177,15 @@ async fn outbox_keys(node: &TestNode) -> Result<Vec<Vec<u8>>, BoxError> {
             return Ok(keys);
         }
         start = batch.next_start_after;
+    }
+}
+
+/// The restart scenario writes scaffold documents only.
+fn restart_payload(_label: &str, _writer: usize, index: usize, _id: Ulid) -> CreateDocumentPayload {
+    CreateDocumentPayload::Scaffold {
+        name: format!("Restart Dataset {index}"),
+        description: "Restart traffic document".to_string(),
+        date_published: "2026-07-07".to_string(),
+        license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
     }
 }
