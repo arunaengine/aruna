@@ -19,7 +19,9 @@ use ulid::Ulid;
 
 use crate::convergence::wait_for_convergence;
 use crate::topology::store_realm_config;
-use crate::topology::{TestNode, announce_nodes, spawn_replica, spawn_replicas};
+use crate::topology::{
+    TestNode, announce_nodes, install_default_config, spawn_replica, spawn_replicas,
+};
 
 #[tokio::test]
 async fn rejects_nonrealm_peer() -> Result<(), Box<dyn std::error::Error>> {
@@ -313,32 +315,8 @@ async fn build_realm_nodes(
 ) -> Result<(Vec<TestNode>, RealmConfigDocument), Box<dyn std::error::Error>> {
     let nodes = spawn_replicas(*realm_id, count, true, true).await?;
     announce_nodes(&nodes, realm_id).await?;
-    let config = install_realm_config(&nodes, realm_id).await?;
+    let config = install_default_config(&nodes, realm_id).await?;
     Ok((nodes, config))
-}
-
-async fn install_realm_config(
-    nodes: &[TestNode],
-    realm_id: &RealmId,
-) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
-    let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
-    config.seed_default_placement();
-    for (band, node) in nodes.iter().enumerate() {
-        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
-        config.seed_job_control(node.net.node_id(), band as u32);
-    }
-    for node in nodes {
-        store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
-    }
-    for node in nodes {
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &node.context,
-            *realm_id,
-            node.net.node_id(),
-        )
-        .await;
-    }
-    Ok(config)
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

@@ -15,7 +15,7 @@ use ulid::Ulid;
 
 use crate::convergence::{wait_empty_queues, wait_for_visibility, wait_storage_released};
 use crate::topology::{
-    BoxError, build_realm_nodes, init_logging, install_load_config, make_runtime, mesh,
+    BoxError, build_realm_nodes, init_logging, install_default_config, make_runtime, mesh,
     mixed_payload, node_targets, respawn_with_retry, run_writer, run_writers, shutdown_nodes,
     spawn_load_node, spawn_node_with, wait_node_convergence,
 };
@@ -198,7 +198,7 @@ async fn churn_convergence_body() -> Result<(), BoxError> {
         }
     }
     wait_node_convergence(&nodes, &realm_id).await?;
-    install_load_config(&nodes, &realm_id).await?;
+    install_default_config(&nodes, &realm_id).await?;
 
     let group_id = Ulid::generate();
     let targets0 = vec![(nodes[0].net.node_id(), nodes[0].context.clone())];

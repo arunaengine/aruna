@@ -1544,7 +1544,7 @@ pub async fn build_realm_nodes(
     }
     mesh(nodes.iter().map(|node| &node.net)).await;
     announce_nodes(&nodes, realm_id).await?;
-    install_load_config(&nodes, realm_id).await?;
+    install_default_config(&nodes, realm_id).await?;
     Ok(nodes)
 }
 
@@ -1646,9 +1646,55 @@ pub async fn respawn_with_retry(
     }
 }
 
-/// Installs the default realm config with every node as a management node, then runs
-/// the shard placement step a realm-config apply runs, which creates topic genesis.
-pub async fn install_load_config(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), BoxError> {
+/// Installs the default realm config with every node as a management node, then repeats
+/// the restore and placement passes of a realm-config apply until none reschedules.
+pub async fn install_replica_config(
+    nodes: &[TestNode],
+    realm_id: &RealmId,
+) -> Result<RealmConfigDocument, String> {
+    let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
+    config.seed_default_placement();
+    for node in nodes {
+        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
+    }
+
+    for node in nodes {
+        store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
+    }
+
+    for _ in 0..5 {
+        for node in nodes {
+            aruna_operations::node::startup::restore_shard_subscriptions(
+                &node.context,
+                node.net.node_id(),
+                *realm_id,
+            )
+            .await;
+        }
+        let mut retry = false;
+        for node in nodes {
+            retry |= aruna_operations::placement::process_placements::process_shard_placements(
+                &node.context,
+                *realm_id,
+                node.net.node_id(),
+            )
+            .await
+            .retry_scheduled;
+        }
+        if !retry {
+            break;
+        }
+    }
+
+    Ok(config)
+}
+
+/// Installs the default realm config with every node as a management node in its own job
+/// control band, then runs the shard placement step a realm-config apply runs.
+pub async fn install_default_config(
+    nodes: &[TestNode],
+    realm_id: &RealmId,
+) -> Result<RealmConfigDocument, String> {
     let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
     config.seed_default_placement();
     for (band, node) in nodes.iter().enumerate() {
@@ -1666,7 +1712,7 @@ pub async fn install_load_config(nodes: &[TestNode], realm_id: &RealmId) -> Resu
         )
         .await;
     }
-    Ok(())
+    Ok(config)
 }
 
 /// Announces every node's presence, then waits until each node sees all of them.

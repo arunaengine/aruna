@@ -6,7 +6,7 @@ use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::{PlacementRef, shard_for_subject};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
@@ -17,8 +17,7 @@ use aruna_operations::placement::{
 use ulid::Ulid;
 
 use crate::convergence::wait_for_convergence;
-use crate::topology::store_realm_config;
-use crate::topology::{TestNode, spawn_replicas};
+use crate::topology::{TestNode, install_replica_config, spawn_replicas};
 
 #[tokio::test]
 async fn creation_replicates_globally() -> Result<(), Box<dyn std::error::Error>> {
@@ -129,50 +128,8 @@ async fn build_realm_nodes(
 ) -> Result<(Vec<TestNode>, RealmConfigDocument), Box<dyn std::error::Error>> {
     let nodes = spawn_replicas(*realm_id, count, false, true).await?;
 
-    let config = install_realm_config(&nodes, realm_id).await?;
+    let config = install_replica_config(&nodes, realm_id).await?;
     Ok((nodes, config))
-}
-
-async fn install_realm_config(
-    nodes: &[TestNode],
-    realm_id: &RealmId,
-) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
-    let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
-    config.seed_default_placement();
-    for node in nodes {
-        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
-    }
-
-    for node in nodes {
-        store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
-    }
-    // Config apply hook: the shard's rank-0 holder eagerly creates each shard topic genesis and
-    // every other holder pulls it (mirrors the production realm-config apply path).
-    for _ in 0..5 {
-        for node in nodes {
-            aruna_operations::node::startup::restore_shard_subscriptions(
-                &node.context,
-                node.net.node_id(),
-                *realm_id,
-            )
-            .await;
-        }
-        let mut retry = false;
-        for node in nodes {
-            retry |= aruna_operations::placement::process_placements::process_shard_placements(
-                &node.context,
-                *realm_id,
-                node.net.node_id(),
-            )
-            .await
-            .retry_scheduled;
-        }
-        if !retry {
-            break;
-        }
-    }
-
-    Ok(config)
 }
 
 async fn wait_group_convergence(

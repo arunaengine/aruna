@@ -26,7 +26,7 @@ use crate::convergence;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use crate::topology::{
-    BoxError, TestNode, install_load_config, make_runtime, respawn_with_retry, run_writer,
+    BoxError, TestNode, install_default_config, make_runtime, respawn_with_retry, run_writer,
     shutdown_nodes, spawn_load_node, spawn_node_with, stop_node, wait_node_convergence,
 };
 use convergence::{
@@ -89,7 +89,7 @@ async fn prepare_restart_state(
     let nodes = spawn_restart_nodes(realm_id, node2_dir, secret, aux).await?;
     announce_restart_nodes(&nodes, realm_id, aux).await?;
     wait_node_convergence(&nodes, &realm_id).await?;
-    install_load_config(&nodes, &realm_id).await?;
+    install_default_config(&nodes, &realm_id).await?;
     let (group_id, created) = seed_restart_documents(realm_id, &nodes).await?;
     Ok((nodes, group_id, created))
 }

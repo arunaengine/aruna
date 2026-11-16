@@ -4,11 +4,10 @@
 
 use std::time::{Duration, SystemTime};
 
-use crate::topology::store_realm_config;
-use crate::topology::{TestNode, spawn_replicas};
+use crate::topology::{TestNode, install_replica_config, spawn_replicas};
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::PathRestriction;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::access::create::{CreateUserConfig, CreateUserOperation};
 use aruna_operations::s3::access::get::GetAccessOperation;
@@ -94,49 +93,8 @@ async fn build_realm_nodes(
     count: usize,
 ) -> Result<Vec<TestNode>, Box<dyn std::error::Error>> {
     let nodes = spawn_replicas(*realm_id, count, false, false).await?;
-    install_realm_config(&nodes, realm_id).await?;
+    install_replica_config(&nodes, realm_id).await?;
     Ok(nodes)
-}
-
-async fn install_realm_config(
-    nodes: &[TestNode],
-    realm_id: &RealmId,
-) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
-    let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
-    config.seed_default_placement();
-    for node in nodes {
-        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
-    }
-
-    for node in nodes {
-        store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
-    }
-
-    for _ in 0..5 {
-        for node in nodes {
-            aruna_operations::node::startup::restore_shard_subscriptions(
-                &node.context,
-                node.net.node_id(),
-                *realm_id,
-            )
-            .await;
-        }
-        let mut retry = false;
-        for node in nodes {
-            retry |= aruna_operations::placement::process_placements::process_shard_placements(
-                &node.context,
-                *realm_id,
-                node.net.node_id(),
-            )
-            .await
-            .retry_scheduled;
-        }
-        if !retry {
-            break;
-        }
-    }
-
-    Ok(config)
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

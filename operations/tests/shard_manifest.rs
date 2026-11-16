@@ -6,7 +6,7 @@ use aruna_core::StructuredId;
 use aruna_core::UserId;
 use aruna_core::document::{DocumentTarget, ShardManifest};
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
@@ -17,8 +17,7 @@ use aruna_operations::shard::assemble_shard_manifest;
 use ulid::Ulid;
 
 use crate::convergence::wait_for_convergence;
-use crate::topology::store_realm_config;
-use crate::topology::{TestNode, announce_nodes, spawn_replicas};
+use crate::topology::{TestNode, announce_nodes, install_default_config, spawn_replicas};
 
 // A metadata document created on node A must leave a manifest row on the origin AND on the
 // receiver that syncs it.
@@ -121,32 +120,8 @@ async fn build_realm_nodes(
 ) -> Result<(Vec<TestNode>, RealmConfigDocument), Box<dyn std::error::Error>> {
     let nodes = spawn_replicas(*realm_id, count, true, false).await?;
     announce_nodes(&nodes, realm_id).await?;
-    let config = install_realm_config(&nodes, realm_id).await?;
+    let config = install_default_config(&nodes, realm_id).await?;
     Ok((nodes, config))
-}
-
-async fn install_realm_config(
-    nodes: &[TestNode],
-    realm_id: &RealmId,
-) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
-    let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
-    config.seed_default_placement();
-    for (band, node) in nodes.iter().enumerate() {
-        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
-        config.seed_job_control(node.net.node_id(), band as u32);
-    }
-    for node in nodes {
-        store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
-    }
-    for node in nodes {
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &node.context,
-            *realm_id,
-            node.net.node_id(),
-        )
-        .await;
-    }
-    Ok(config)
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {
