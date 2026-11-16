@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod cleanup;
+pub mod cleanup_rows;
 pub mod hidden;
 pub mod holders;
 pub mod managed_copy;

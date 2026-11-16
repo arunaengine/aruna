@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::request_authorization::BucketAccess;
-use crate::blob::cleanup::schedule_cleanup_effect;
+use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::blob::migration::move_routing;
 use crate::driver::DriverContext;
 use crate::jobs::store::iter_prefix_page;

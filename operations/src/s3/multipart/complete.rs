@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::cleanup::schedule_cleanup_effect;
+use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, owner_write_effect, write_head_effect,

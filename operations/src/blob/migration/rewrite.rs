@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::cleanup::schedule_cleanup_effect;
+use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::blob::records::{blob_location_read, owner_delete_effect, read_version_effect};
 use crate::node::usage_stats::{QuotaGate, StoredDelta, UsageCounterUpdate, UsageUpdateError};

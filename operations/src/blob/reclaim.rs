@@ -33,7 +33,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::blob::cleanup::schedule_cleanup_effect;
+use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::blob::pending_reclaim::ReclaimPendingOperation;
 use crate::blob::records::{blob_location_read, iter_index_effect, owners_scan_effect};
 use crate::driver::{DriverContext, drive, node_routing};

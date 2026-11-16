@@ -5,8 +5,7 @@
 use std::time::Duration;
 
 use crate::replication::dht_registration::dht_registration_effect;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::errors::StorageError;
+use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
@@ -23,7 +22,6 @@ use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::multipart::{
     COMPLETION_DEADLINE_MS, MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
 };
-use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 use tracing::{error, warn};
 use ulid::Ulid;
@@ -37,7 +35,6 @@ use crate::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
 const CLEANUP_PAGE_SIZE: usize = 128;
-const MAX_CLEANUP_RETRIES: u8 = 3;
 /// An `Open` upload nobody added to or aborted is abandoned; S3 lifecycle rules
 /// use the same order of magnitude.
 const OPEN_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -46,55 +43,6 @@ const OPEN_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const COMPLETING_TTL_MS: u64 = COMPLETION_DEADLINE_MS + BLOB_CLEANUP_AFTER.as_millis() as u64;
 /// Aborts are transactional, so one run reclaims a bounded slice of the backlog.
 const UPLOAD_SWEEP_BATCH: usize = 32;
-
-/// A cleanup row an operation has emitted but storage has not yet accepted.
-/// The row is the only durable record that the written object exists, so the
-/// work is held until the write succeeds.
-#[derive(Debug, Default, PartialEq)]
-pub struct PendingCleanup {
-    work: Option<BlobCleanupWork>,
-    key: Option<Key>,
-    channel_closed: bool,
-    attempts: u8,
-}
-
-impl PendingCleanup {
-    /// The write effect for one row. `None` means the row will never encode,
-    /// leaving the caller with the failure it already carries.
-    pub fn queue(&mut self, work: BlobCleanupWork) -> Option<Effect> {
-        let key = cleanup_row_key(&work);
-        let effect = cleanup_row_write(&work, &key)?;
-        self.work = Some(work);
-        self.key = Some(key);
-        self.channel_closed = false;
-        self.attempts = 0;
-        Some(effect)
-    }
-
-    pub fn accepted(&mut self) {
-        self.work = None;
-        self.key = None;
-    }
-
-    /// Re-emit one write per temporary rejection; the caller remains queued.
-    /// The retries are bounded: an endless loop would pin the blob reservation
-    /// and never let the request finish.
-    pub fn retry(&mut self, error: &StorageError) -> Option<Effect> {
-        if self.channel_closed {
-            return None;
-        }
-        if matches!(error, StorageError::ChannelClosed) {
-            self.channel_closed = true;
-            return None;
-        }
-        self.attempts = self.attempts.saturating_add(1);
-        if self.attempts > MAX_CLEANUP_RETRIES {
-            error!(error = %error, "Giving up on a rejected blob cleanup row");
-            return None;
-        }
-        cleanup_row_write(self.work.as_ref()?, self.key.as_ref()?)
-    }
-}
 
 /// How long a recorded copy upload may go without a copied part before the cleanup takes it
 /// for a leftover; each part renews it.
@@ -146,46 +94,6 @@ async fn purge_ended(context: &DriverContext, job_id: Ulid) -> Option<bool> {
             None
         }
     }
-}
-
-fn cleanup_row_key(work: &BlobCleanupWork) -> Key {
-    match work {
-        BlobCleanupWork::ReconcileWrite { location, .. } => {
-            location.ulid.to_bytes().to_vec().into()
-        }
-        BlobCleanupWork::DeleteBlob { .. }
-        | BlobCleanupWork::RegisterDht { .. }
-        | BlobCleanupWork::ReconcileReservation { .. }
-        | BlobCleanupWork::ReleaseRenamed { .. }
-        | BlobCleanupWork::DropTrail { .. }
-        | BlobCleanupWork::DropClaims { .. }
-        | BlobCleanupWork::ReleasePlanned { .. }
-        | BlobCleanupWork::SettleUpload { .. }
-        | BlobCleanupWork::SettleMove { .. }
-        | BlobCleanupWork::DropRows { .. } => Ulid::generate().to_bytes().to_vec().into(),
-    }
-}
-
-fn cleanup_row_write(work: &BlobCleanupWork, key: &Key) -> Option<Effect> {
-    match work.to_bytes() {
-        Ok(bytes) => Some(Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: key.clone(),
-            value: bytes.into(),
-            txn_id: None,
-        })),
-        Err(error) => {
-            warn!(error = %error, "Blob cleanup row could not be encoded");
-            None
-        }
-    }
-}
-
-pub fn schedule_cleanup_effect() -> Effect {
-    Effect::Task(TaskEffect::ShortenTimer {
-        key: TaskKey::DrainCleanupQueue,
-        after: Duration::ZERO,
-    })
 }
 
 #[derive(Debug, Default)]
@@ -850,7 +758,8 @@ async fn archive_owned(context: &DriverContext, location: &BackendLocation) -> O
 
 #[cfg(test)]
 mod tests {
-    use super::{CLEANUP_PAGE_SIZE, MAX_CLEANUP_RETRIES, PendingCleanup, process_cleanup_batch};
+    use super::{CLEANUP_PAGE_SIZE, process_cleanup_batch};
+    use crate::blob::cleanup_rows::{MAX_CLEANUP_RETRIES, PendingCleanup};
     use crate::driver::DriverContext;
     use crate::jobs::store::iter_prefix_page;
     use aruna_core::UserId;
