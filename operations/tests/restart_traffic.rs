@@ -21,7 +21,6 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::metadata::projector::project_logged_events;
 use aruna_operations::node::startup::{RESTORE_TOPIC_COUNT, restore_shard_subscriptions};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
@@ -39,6 +38,7 @@ use ulid::Ulid;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 use crate::convergence;
+use crate::topology::flush_projection_batches;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use convergence::{
@@ -374,22 +374,6 @@ async fn run_writer(
     }
     flush_projection_batches(&targets, &mut batches).await?;
     Ok(created)
-}
-
-async fn flush_projection_batches(
-    targets: &[(aruna_core::NodeId, Arc<DriverContext>)],
-    batches: &mut [Vec<(Ulid, Ulid)>],
-) -> Result<(), BoxError> {
-    for (slot, batch) in batches.iter_mut().enumerate() {
-        if batch.is_empty() {
-            continue;
-        }
-        let drained: Vec<(Ulid, Ulid)> = std::mem::take(batch);
-        project_logged_events(targets[slot].1.as_ref(), drained)
-            .await
-            .map_err(|error| format!("projection failed: {error:?}"))?;
-    }
-    Ok(())
 }
 
 /// Waits for every sampled document to become readable on the node. Replicas

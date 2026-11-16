@@ -1778,7 +1778,8 @@ pub async fn run_writer(
     Ok(created)
 }
 
-async fn flush_projection_batches(
+/// Projects the logged events of each target node's batch and empties the batches.
+pub async fn flush_projection_batches(
     targets: &[(NodeId, Arc<DriverContext>)],
     batches: &mut [Vec<(Ulid, Ulid)>],
 ) -> Result<(), BoxError> {
