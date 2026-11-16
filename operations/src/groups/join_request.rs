@@ -548,7 +548,7 @@ impl Operation for GroupJoinOperation {
             ) => {
                 if self.notifications {
                     self.state = State::Notify;
-                    smallvec![crate::notifications::outbox::schedule_drain_effect()]
+                    smallvec![crate::notifications::outbox_record::schedule_drain_effect()]
                 } else {
                     self.state = State::Done;
                     smallvec![]

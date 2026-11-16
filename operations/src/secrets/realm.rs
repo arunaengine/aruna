@@ -27,7 +27,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::{Applied, ChangeError, Managers, SecretChange, apply_change, widening_notices};
-use crate::notifications::outbox::schedule_drain_effect as notice_drain_effect;
+use crate::notifications::outbox_record::schedule_drain_effect as notice_drain_effect;
 use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{

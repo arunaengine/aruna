@@ -11,6 +11,7 @@ pub mod incoming;
 pub mod list;
 pub mod mark_read;
 pub mod outbox;
+pub mod outbox_record;
 pub mod placement;
 pub mod protocol;
 pub mod prune;

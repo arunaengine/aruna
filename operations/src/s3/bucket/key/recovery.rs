@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::{DriverContext, drive};
-use crate::notifications::outbox::{new_outbox_record, schedule_drain_effect};
+use crate::notifications::outbox_record::{new_outbox_record, schedule_drain_effect};
 use crate::s3::bucket::holders::lookup_keys;
 use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
 use crate::s3::key_status::KeyStatusOperation;

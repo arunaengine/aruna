@@ -36,7 +36,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::{ChangeError, Managers, SecretChange, widening_notices};
-use crate::notifications::outbox::schedule_drain_effect as notice_drain_effect;
+use crate::notifications::outbox_record::schedule_drain_effect as notice_drain_effect;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };

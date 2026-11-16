@@ -15,7 +15,7 @@ use smallvec::smallvec;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::notifications::outbox::schedule_drain_effect;
+use crate::notifications::outbox_record::schedule_drain_effect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EmitNotificationsInput {

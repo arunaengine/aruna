@@ -41,7 +41,7 @@ use aruna_core::{NodeId, UserId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::notifications::outbox::schedule_drain_effect;
+use crate::notifications::outbox_record::schedule_drain_effect;
 use crate::sync::mirror_repair::mirror_delete_entry;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

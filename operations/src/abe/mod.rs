@@ -553,7 +553,7 @@ impl Operation for KeyOperation {
                 self.txn = None;
                 if self.notify {
                     self.state = State::Drain;
-                    return smallvec![crate::notifications::outbox::schedule_drain_effect()];
+                    return smallvec![crate::notifications::outbox_record::schedule_drain_effect()];
                 }
                 self.walk()
             }

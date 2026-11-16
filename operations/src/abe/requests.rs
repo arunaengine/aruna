@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::notifications::outbox::new_outbox_record;
+use crate::notifications::outbox_record::new_outbox_record;
 use aruna_core::request_policy::CompiledPolicySet;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{

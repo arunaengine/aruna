@@ -26,7 +26,7 @@ use tempfile::tempdir;
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
-use crate::notifications::outbox::new_outbox_record;
+use crate::notifications::outbox_record::new_outbox_record;
 
 #[path = "tests_harness.rs"]
 mod harness;

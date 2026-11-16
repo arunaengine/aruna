@@ -22,7 +22,7 @@ use ulid::Ulid;
 
 use super::{ChangeError, Managers, SecretChange, apply_change, widening_notices};
 use crate::node_vault::{delete_secret, write_secret};
-use crate::notifications::outbox::schedule_drain_effect;
+use crate::notifications::outbox_record::schedule_drain_effect;
 
 /// One node secret change, with the time and write id it uses.
 #[derive(Clone, Debug, PartialEq, Eq)]

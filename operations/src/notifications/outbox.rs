@@ -8,32 +8,17 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
-use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
+use aruna_core::structs::execution::notification::NotificationOutboxRecord;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::TxnId;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
-use ulid::Ulid;
 
 pub const OUTBOX_BATCH_SIZE: usize = 512;
 pub const DELIVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub const OUTBOX_RETENTION_MS: u64 = 48 * 60 * 60 * 1000;
-
-pub fn new_outbox_record(record: NotificationRecord) -> NotificationOutboxRecord {
-    NotificationOutboxRecord {
-        outbox_id: Ulid::generate(),
-        record,
-    }
-}
-
-pub fn schedule_drain_effect() -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainNotificationOutbox,
-        after: Duration::ZERO,
-    })
-}
 
 pub struct NotificationOutboxBatch {
     pub records: Vec<(Vec<u8>, NotificationOutboxRecord)>,
@@ -201,6 +186,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Arc;
     use tokio::sync::{Semaphore, mpsc};
+    use ulid::Ulid;
 
     struct RecordingHandler {
         seen: mpsc::Sender<TaskKey>,
