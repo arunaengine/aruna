@@ -40,7 +40,9 @@ use ulid::Ulid;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 use crate::convergence;
-use convergence::{HANG_CAP, NO_PROGRESS_TIMEOUT, wait_for_convergence, wait_storage_released};
+use convergence::{
+    HANG_CAP, NO_PROGRESS_TIMEOUT, wait_for_convergence, wait_for_visibility, wait_storage_released,
+};
 
 const PROJECTION_BATCH: usize = 32;
 const SEED_DOCUMENTS: usize = 256;
@@ -387,50 +389,6 @@ async fn flush_projection_batches(
             .map_err(|error| format!("projection failed: {error:?}"))?;
     }
     Ok(())
-}
-
-// Keeps per-node pruning, but fails on a lost-progress window rather than a fixed
-// budget so a slow-but-converging run is not flunked.
-async fn wait_for_visibility(
-    contexts: &[Arc<DriverContext>],
-    pairs: &[(GroupId, Ulid)],
-    poll_interval: Duration,
-) -> Result<(), BoxError> {
-    let mut remaining: Vec<Vec<(GroupId, Ulid)>> =
-        contexts.iter().map(|_| pairs.to_vec()).collect();
-    let mut best = usize::MAX;
-    let mut deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
-
-    loop {
-        for (context, missing) in contexts.iter().zip(remaining.iter_mut()) {
-            let mut still_missing = Vec::new();
-            for &(group_id, document_id) in missing.iter() {
-                if drive(
-                    GetDocumentOperation::new(group_id, document_id),
-                    context.as_ref(),
-                )
-                .await
-                .is_err()
-                {
-                    still_missing.push((group_id, document_id));
-                }
-            }
-            *missing = still_missing;
-        }
-        let pending: usize = remaining.iter().map(Vec::len).sum();
-        if pending == 0 {
-            return Ok(());
-        }
-        if pending < best {
-            best = pending;
-            deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
-        }
-        if Instant::now() >= deadline {
-            let counts: Vec<usize> = remaining.iter().map(Vec::len).collect();
-            return Err(format!("visibility stalled; missing per node: {counts:?}").into());
-        }
-        sleep(poll_interval).await;
-    }
 }
 
 /// Waits for every sampled document to become readable on the node. Replicas

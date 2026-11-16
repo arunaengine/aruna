@@ -23,8 +23,6 @@ use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::metadata::materialization_queue::materialization_jobs_exist;
 use aruna_operations::metadata::projector::project_logged_events;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
@@ -42,7 +40,9 @@ use ulid::Ulid;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 use crate::convergence;
-use convergence::{NO_PROGRESS_TIMEOUT, wait_for_convergence, wait_storage_released};
+use convergence::{
+    wait_empty_queues, wait_for_convergence, wait_for_visibility, wait_storage_released,
+};
 
 const PROJECTION_BATCH: usize = 32;
 const TOTAL_CREATES: usize = 2000;
@@ -147,10 +147,9 @@ fn convergence_gate() -> Result<(), BoxError> {
             .collect();
 
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
-        let result =
-            wait_for_visibility(&contexts, &last, Duration::from_millis(200), Instant::now()).await;
+        let result = wait_for_visibility(&contexts, &last, Duration::from_millis(200)).await;
         shutdown_nodes(nodes).await;
-        result
+        Ok::<(), BoxError>(result?)
     })?;
     runtime.shutdown_timeout(Duration::from_secs(10));
     Ok(())
@@ -170,7 +169,6 @@ fn production_convergence_gate() -> Result<(), BoxError> {
 
         let writers = 32usize;
         let per_writer = 128usize;
-        let started = Instant::now();
         let mut handles = Vec::with_capacity(writers);
         for writer in 0..writers {
             let targets = targets.clone();
@@ -192,29 +190,13 @@ fn production_convergence_gate() -> Result<(), BoxError> {
             .map(|(group_id, document_id, _)| (*group_id, *document_id))
             .collect();
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
-        wait_for_visibility(&contexts, &pairs, Duration::from_millis(200), started).await?;
+        wait_for_visibility(&contexts, &pairs, Duration::from_millis(200)).await?;
         wait_empty_queues(&contexts).await?;
         shutdown_nodes(nodes).await;
         Ok::<(), BoxError>(())
     })?;
     runtime.shutdown_timeout(Duration::from_secs(10));
     Ok(())
-}
-
-async fn wait_empty_queues(contexts: &[Arc<DriverContext>]) -> Result<(), BoxError> {
-    wait_for_convergence("materialization queues never drained", || async {
-        let mut busy = 0usize;
-        for context in contexts {
-            if materialization_jobs_exist(&context.storage_handle)
-                .await
-                .map_err(|error| format!("materialization probe failed: {error:?}"))?
-            {
-                busy += 1;
-            }
-        }
-        Ok(busy)
-    })
-    .await
 }
 
 #[test]
@@ -277,13 +259,7 @@ async fn churn_convergence_body() -> Result<(), BoxError> {
     let initial_pair = vec![(initial[0].0, initial[0].1)];
     {
         let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|n| n.context.clone()).collect();
-        wait_for_visibility(
-            &contexts,
-            &initial_pair,
-            Duration::from_millis(200),
-            Instant::now(),
-        )
-        .await?;
+        wait_for_visibility(&contexts, &initial_pair, Duration::from_millis(200)).await?;
     }
     println!("initial doc converged to all 3 nodes");
 
@@ -321,12 +297,11 @@ async fn churn_convergence_body() -> Result<(), BoxError> {
         std::slice::from_ref(&node2.context),
         &pairs,
         Duration::from_millis(500),
-        Instant::now(),
     )
     .await;
     nodes.push(node2);
     shutdown_nodes(nodes).await;
-    result.map(|_| ())
+    Ok(result?)
 }
 
 fn node_targets(nodes: &[TestNode]) -> Vec<(NodeId, Arc<DriverContext>)> {
@@ -443,51 +418,6 @@ async fn flush_projection_batches(
             .map_err(|error| format!("projection failed: {error:?}"))?;
     }
     Ok(())
-}
-
-// Keeps the per-node pruning and elapsed-time return, but fails on a lost-progress
-// window rather than a fixed budget so a slow-but-converging run is not flunked.
-async fn wait_for_visibility(
-    contexts: &[Arc<DriverContext>],
-    pairs: &[(GroupId, Ulid)],
-    poll_interval: Duration,
-    t0: Instant,
-) -> Result<f64, BoxError> {
-    let mut remaining: Vec<Vec<(GroupId, Ulid)>> =
-        contexts.iter().map(|_| pairs.to_vec()).collect();
-    let mut best = usize::MAX;
-    let mut deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
-
-    loop {
-        for (context, missing) in contexts.iter().zip(remaining.iter_mut()) {
-            let mut still_missing = Vec::new();
-            for &(group_id, document_id) in missing.iter() {
-                if drive(
-                    GetDocumentOperation::new(group_id, document_id),
-                    context.as_ref(),
-                )
-                .await
-                .is_err()
-                {
-                    still_missing.push((group_id, document_id));
-                }
-            }
-            *missing = still_missing;
-        }
-        let pending: usize = remaining.iter().map(Vec::len).sum();
-        if pending == 0 {
-            return Ok(t0.elapsed().as_secs_f64());
-        }
-        if pending < best {
-            best = pending;
-            deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
-        }
-        if Instant::now() >= deadline {
-            let counts: Vec<usize> = remaining.iter().map(Vec::len).collect();
-            return Err(format!("visibility stalled; missing per node: {counts:?}").into());
-        }
-        sleep(poll_interval).await;
-    }
 }
 
 async fn build_realm_nodes(realm_id: &RealmId, count: usize) -> Result<Vec<TestNode>, BoxError> {
