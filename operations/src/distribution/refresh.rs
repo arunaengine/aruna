@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::imports::read_value;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -269,22 +270,6 @@ async fn write_round(
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         other => Err(format!("refresh round not written: {other:?}")),
-    }
-}
-
-async fn read_value(
-    context: &DriverContext,
-    key_space: &str,
-    key: Key,
-) -> Result<Option<Value>, String> {
-    let read = StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        other => Err(format!("unexpected read answer {other:?}")),
     }
 }
 

@@ -439,7 +439,7 @@ async fn delete(context: &DriverContext, key: Key) -> Result<(), String> {
     }
 }
 
-async fn read_value(
+pub(super) async fn read_value(
     context: &DriverContext,
     key_space: &str,
     key: Key,
