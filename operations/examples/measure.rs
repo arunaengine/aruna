@@ -86,27 +86,73 @@ struct Node {
     context: Arc<DriverContext>,
 }
 
+/// Workloads in run order; each runs in its own child process, so the nodes, stores and
+/// background tasks of one workload cannot slow down or starve the next one.
+const WORKLOADS: [&str; 9] = [
+    "create-1",
+    "create-8",
+    "create-32",
+    "create-64",
+    "spread",
+    "converge",
+    "tail",
+    "outbox",
+    "single",
+];
+
 fn main() -> Result<(), BoxError> {
     init_logging();
+    match std::env::args().nth(1) {
+        Some(workload) => run_child(&workload),
+        None => run_each(),
+    }
+}
+
+fn run_each() -> Result<(), BoxError> {
+    let program = std::env::current_exe()?;
+    for workload in WORKLOADS {
+        let status = std::process::Command::new(&program)
+            .arg(workload)
+            .status()?;
+        if !status.success() {
+            return Err(format!("workload {workload} failed: {status}").into());
+        }
+    }
+    Ok(())
+}
+
+fn run_child(workload: &str) -> Result<(), BoxError> {
     let runtime = make_runtime()?;
-    let result = runtime.block_on(run_all());
+    let result = runtime.block_on(run_workload(workload));
     runtime.shutdown_timeout(Duration::from_secs(10));
     result
 }
 
-async fn run_all() -> Result<(), BoxError> {
-    for (level, writers) in WRITER_LEVELS.into_iter().enumerate() {
-        measure_creates(91 + level as u8, writers).await?;
+async fn run_workload(workload: &str) -> Result<(), BoxError> {
+    if let Some(writers) = workload.strip_prefix("create-") {
+        let writers: usize = writers.parse()?;
+        let level = WRITER_LEVELS
+            .iter()
+            .position(|&level| level == writers)
+            .ok_or("unknown writer level")?;
+        return measure_creates(91 + level as u8, writers).await;
     }
-    measure_spread().await?;
-    measure_drain().await?;
-    measure_tail().await?;
-    measure_outbox().await?;
-    let single = spawn_single().await?;
-    measure_reads(&single.context).await?;
-    measure_objects(&single).await?;
-    single.net.shutdown().await;
-    Ok(())
+    match workload {
+        "spread" => measure_spread().await,
+        "converge" => measure_drain().await,
+        "tail" => measure_tail().await,
+        "outbox" => measure_outbox().await,
+        "single" => {
+            let single = spawn_single().await?;
+            let result = match measure_reads(&single.context).await {
+                Ok(()) => measure_objects(&single).await,
+                Err(error) => Err(error),
+            };
+            single.net.shutdown().await;
+            result
+        }
+        other => Err(format!("unknown workload {other}").into()),
+    }
 }
 
 fn report(workload: &str, detail: &str, count: usize, seconds: f64) {
