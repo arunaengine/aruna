@@ -289,3 +289,20 @@ async fn multipart_form() {
     let file = r#"name="file"; filename="reads.fq""#;
     assert!(body.contains(file) && body.contains("ACGTACGT"), "{body}");
 }
+
+#[tokio::test]
+async fn denied_connection() {
+    // A policy that denies the connection after submission stops the upload before any request.
+    let fixture = Fixture::new().await;
+    let install = uploader(&fixture).await;
+    let (_root, blob) = ready(&fixture, &install).await;
+    let (base, seen) = server(201).await;
+    let (_, spec) = recorded(&fixture, &install, (&base, "PUT")).await;
+    fixture
+        .deny(&["operation == 'plugin.connections.send'"])
+        .await;
+    let ctx = job_context(&blob, &fixture);
+    let outcome = run_plugin_work(&ctx, &spec).await;
+    assert_eq!(name(&outcome), ("failed", Some(JobErrorKind::Permanent)));
+    assert_eq!(seen.hits.load(Ordering::SeqCst), 0);
+}

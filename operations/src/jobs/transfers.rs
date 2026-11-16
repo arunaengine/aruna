@@ -366,7 +366,7 @@ async fn upload_grants(
     install: &PluginInstall,
     (row, source): (&WorkRow, &str),
 ) -> Result<BTreeSet<String>, HostError> {
-    connection_granted(install, row)?;
+    connection_granted(ctx, install, row).await?;
     let upload = Permission::TransfersUpload;
     let patterns = matching(install, upload, source)?;
     authorize_access(
@@ -380,8 +380,13 @@ async fn upload_grants(
     Ok(patterns)
 }
 
-/// Whether the row's connection is still granted to the install.
-fn connection_granted(install: &PluginInstall, row: &WorkRow) -> Result<(), HostError> {
+/// Whether the install may still send through the row's connection: its grant and its
+/// authorization, as at submission.
+async fn connection_granted(
+    ctx: &JobContext,
+    install: &PluginInstall,
+    row: &WorkRow,
+) -> Result<(), HostError> {
     let context = row.context.as_ref();
     let context = context.ok_or_else(|| HostError::new(ErrorKind::Invalid, "no request"))?;
     let scope = InstallScope {
@@ -389,12 +394,10 @@ fn connection_granted(install: &PluginInstall, row: &WorkRow) -> Result<(), Host
         group_id: install.group_id,
         install_id: install.install_id,
     };
-    matching(
-        install,
-        Permission::ConnectionsSend,
-        &scope.connection(&context.connection),
-    )?;
-    Ok(())
+    let send = Permission::ConnectionsSend;
+    let connection = scope.connection(&context.connection);
+    let patterns = matching(install, send, &connection)?;
+    authorize_call(&ctx.driver, install, send, &connection, &patterns).await
 }
 
 fn locked(error: &GetObjectError) -> bool {
@@ -410,7 +413,7 @@ async fn download_grants(
     install: &PluginInstall,
     (row, target): (&WorkRow, &str),
 ) -> Result<BTreeSet<String>, HostError> {
-    connection_granted(install, row)?;
+    connection_granted(ctx, install, row).await?;
     let download = Permission::TransfersDownload;
     let patterns = matching(install, download, target)?;
     authorize_call(&ctx.driver, install, download, target, &patterns).await?;
