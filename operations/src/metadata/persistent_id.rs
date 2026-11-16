@@ -1041,9 +1041,14 @@ mod tests {
         );
         abort_transaction(&ctx, txn_id).await;
 
-        crate::placement::fence::close(&ctx.storage_handle, &realm(), &route.placement, 1)
-            .await
-            .expect("the departing holder closes the fence");
+        crate::placement::process_transitions::close(
+            &ctx.storage_handle,
+            &realm(),
+            &route.placement,
+            1,
+        )
+        .await
+        .expect("the departing holder closes the fence");
         let txn_id = start_transaction(&ctx).await.unwrap();
         assert!(!fence_admits(&ctx, &Some(route), txn_id).await.unwrap());
         abort_transaction(&ctx, txn_id).await;

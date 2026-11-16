@@ -1535,7 +1535,7 @@ mod tests {
         let config = activated_config(event.record.realm_id, &[node(1), node(2), node(3)]);
         let event = stamped(event, &config);
         store_realm_config(&storage, &config).await;
-        crate::placement::fence::close(
+        crate::placement::process_transitions::close(
             &storage,
             &event.record.realm_id,
             &event.record.placement,

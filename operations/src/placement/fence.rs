@@ -3,19 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::StorageEffect;
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::WRITE_FENCE_KEYSPACE;
 use aruna_core::storage_entries::placement_fence_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, Value};
-use aruna_storage::StorageHandle;
-use byteview::ByteView;
-use tracing::warn;
-
-const CLOSE_ATTEMPTS: usize = 4;
 
 /// Generation a write of `placement` is admitted at: the bucket's activation
 /// epoch. `None` while the bucket has no usable activation, which is bootstrap
@@ -40,7 +32,7 @@ pub fn fence_read(realm_id: &RealmId, placement: &PlacementRef) -> (String, Key)
 /// The generation the stored fence value closes, or `None` when the bytes do
 /// not parse. Only `close` may act on the difference: every other reader must
 /// treat an unparseable value as closed rather than reopen the bucket.
-fn stored_generation(value: Option<&Value>) -> Option<u64> {
+pub(crate) fn stored_generation(value: Option<&Value>) -> Option<u64> {
     match value {
         None => Some(0),
         Some(bytes) => <[u8; 8]>::try_from(bytes.as_ref())
@@ -124,105 +116,13 @@ impl WriteFence {
     }
 }
 
-/// Durably closes `placement` through `generation`, so no later transaction is
-/// admitted and every uncommitted one conflicts. Monotone and idempotent; an
-/// unparseable stored value is overwritten rather than bricking the bucket.
-pub async fn close(
-    storage: &StorageHandle,
-    realm_id: &RealmId,
-    placement: &PlacementRef,
-    generation: u64,
-) -> Result<(), String> {
-    let (key_space, key) = fence_read(realm_id, placement);
-    for _ in 0..CLOSE_ATTEMPTS {
-        let txn_id = match storage
-            .send_storage_effect(StorageEffect::StartTransaction { read: false })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected fence transaction result: {other:?}")),
-        };
-        let current = match storage
-            .send_storage_effect(StorageEffect::Read {
-                key_space: key_space.clone(),
-                key: key.clone(),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                stored_generation(value.as_ref())
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error.to_string());
-            }
-            other => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(format!("unexpected fence read result: {other:?}"));
-            }
-        };
-        if current.is_some_and(|current| current >= generation) {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Ok(());
-        }
-        if current.is_none() {
-            // Unparseable bytes admit nothing, so leaving them would brick the
-            // bucket for good while this close reported success.
-            warn!(?placement, "Rewriting an unparseable placement write fence");
-        }
-        match storage
-            .send_storage_effect(StorageEffect::Write {
-                key_space: key_space.clone(),
-                key: key.clone(),
-                value: ByteView::from(generation.to_be_bytes().to_vec()),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error.to_string());
-            }
-            other => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(format!("unexpected fence write result: {other:?}"));
-            }
-        }
-        match storage
-            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
-                return Ok(());
-            }
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }) => continue,
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected fence commit result: {other:?}")),
-        }
-    }
-    Err(StorageError::TransactionConflict.to_string())
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::placement::process_transitions::close;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::Event;
     use aruna_core::events::StorageEvent;
+    use byteview::ByteView;
     use tempfile::tempdir;
     use ulid::Ulid;
 
