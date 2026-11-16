@@ -2,8 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{BTreeMap, Deserialize, NodeId, Serialize, Ulid};
+use std::collections::BTreeMap;
+
+use aruna_core::NodeId;
 use aruna_core::structs::storage::data::link::{DataLink, LinkScope};
+use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 /// Documents one page returns at most.
 pub const LINKS_MAX_LIMIT: usize = 100;

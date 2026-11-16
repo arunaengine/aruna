@@ -124,7 +124,6 @@ mod fanout;
 mod fanout_types;
 mod join;
 mod links;
-mod links_types;
 mod list;
 mod list_types;
 mod path;
@@ -143,13 +142,13 @@ pub use self::export_types::{
 use self::fanout_types::MetadataFanoutScope;
 pub use self::fanout_types::MetadataFanoutStats;
 pub(crate) use self::fanout_types::RealmNodeDiscovery;
+pub use self::links::types::{
+    LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery,
+    PART_OF_LIMIT, PartOf, PartTarget, SetPreview, SetPreviewPage, merge_pages, merge_previews,
+};
 pub use self::links::{
     file_queries, links_distributed, links_local, part_of, resolve_part, set_preview_distributed,
     set_preview_local,
-};
-pub use self::links_types::{
-    LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery,
-    PART_OF_LIMIT, PartOf, PartTarget, SetPreview, SetPreviewPage, merge_pages, merge_previews,
 };
 pub use self::list::list_visible_documents;
 pub use self::list_types::{

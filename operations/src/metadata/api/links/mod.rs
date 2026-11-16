@@ -6,7 +6,9 @@
 // Every metadata node answers from its own postings within one budget; results merge by
 // document id and say whether they are complete.
 
-use super::links_types::{
+pub(super) mod types;
+
+use self::types::{
     LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery,
     PART_OF_LIMIT, PartOf, PartTarget, SetPreview, SetPreviewPage, merge_pages, merge_previews,
 };
@@ -601,5 +603,4 @@ async fn read_row(
 }
 
 #[cfg(test)]
-#[path = "links_tests.rs"]
 mod tests;
