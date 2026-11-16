@@ -1,7 +1,9 @@
-//! Relays a REST write on a distributed bucket member to the key range's coordinator, and a read
-//! to a holder, with the caller's bearer token (D12). An unreachable coordinator fails the write.
+//! Looks up buckets, callers and relay targets shared by the REST routes and the MCP tools.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
+
+// A REST write on a distributed bucket member is relayed to the key range's coordinator, a read to
+// a holder, with the caller's bearer token (D12). An unreachable coordinator fails the write.
 
 // The target checks the token and the caller's permissions again on its own path.
 
@@ -585,5 +587,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "reads_tests.rs"]
+#[path = "lookup_tests.rs"]
 mod reads;

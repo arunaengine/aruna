@@ -7,8 +7,8 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, explained, internal_error, request_auth,
     server_error, tool_extras,
 };
+use crate::lookup::{relay_json, rest_target};
 use crate::routes::storage::objects::object_page;
-use crate::routes::storage::relay::{relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};

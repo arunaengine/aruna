@@ -8,6 +8,7 @@ use crate::auth::{
     require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::{RestForward, relay_json, rest_target};
 use crate::routes::execution::jobs::{
     decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
 };
@@ -15,7 +16,6 @@ use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::connectors::{
     ApiConnectorKind, CreateConnectorRequest, SourceConnectorResponse,
 };
-use crate::routes::storage::relay::{RestForward, relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
@@ -902,7 +902,7 @@ pub async fn submit_staging(
         ensure_prefix_permission(&state, &auth, group_id, mirror_id, prefix).await?;
     }
 
-    crate::routes::storage::relay::relayed_set(&bucket_info, &headers)?;
+    crate::lookup::relayed_set(&bucket_info, &headers)?;
     let source = local_connector(&state, group_id, connector_id).await?;
     // A distributed bucket imports by range: every coordinator runs a job for its own keys.
     let fan_out =

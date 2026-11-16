@@ -26,9 +26,9 @@ use utoipa_axum::routes;
 
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::{RestForward, relay_get};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::deletion::bucket_info;
-use crate::routes::storage::relay::{RestForward, relay_get};
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -513,7 +513,7 @@ pub async fn get_bucket_usage(
             "held is only accepted from another member".into(),
         ));
     }
-    crate::routes::storage::relay::relayed_set(&info, &headers)?;
+    crate::lookup::relayed_set(&info, &headers)?;
     let ranges = held_ranges(&state.get_ctx(), &bucket).await;
     match ranges.map_err(|error| ServerError::InternalError(error.into()))? {
         Some((_, _, ranges)) if held => {

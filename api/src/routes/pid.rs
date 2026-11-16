@@ -173,7 +173,7 @@ async fn document_landing(
 /// already carry the `/api/v1` nest.
 fn rocrate_url(api: &str, document_id: Ulid) -> String {
     let path = format!("/metadata/{document_id}/rocrate?here=true");
-    crate::routes::storage::relay::relay_url(api, &path)
+    crate::lookup::relay_url(api, &path)
 }
 
 #[utoipa::path(
