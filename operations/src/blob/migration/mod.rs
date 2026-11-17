@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod batch;
+pub mod broken;
 pub mod check;
 pub mod misplaced;
 pub mod queue;
@@ -1792,7 +1793,7 @@ pub async fn process_migrations(
         soon(after);
     }
     // Storage checks share this task too.
-    if !resumed && let Some(after) = check::process_checks(context).await? {
+    if !resumed && let Some(after) = broken::process_checks(context).await? {
         soon(after);
     }
     // So do the re-mapping and duplicate cleanup jobs of buckets.
