@@ -545,8 +545,8 @@ mod tests {
     // A full page continues the sweep after its last row; a dirty sweep stays dirty.
     #[test]
     fn full_page_continues() {
-        let checked: Vec<_> = (0..ROOT_PAGE as u8)
-            .map(|seed| (checked_key(SET, &[seed; 32]), Vec::new()))
+        let checked: Vec<_> = (0..ROOT_PAGE)
+            .map(|seed| (checked_key(SET, &[seed as u8; 32]), Vec::new()))
             .collect();
         let last = checked.last().map(|(key, _)| key.clone()).unwrap();
         let sweep = Sweep {
