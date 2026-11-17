@@ -7,6 +7,7 @@ mod blob;
 mod metadata;
 mod net;
 pub mod routing;
+mod session;
 mod storage;
 mod task;
 
@@ -135,6 +136,9 @@ pub(crate) async fn dispatch_effect_until(
             );
             Event::Stream()
         }
+        Effect::Session(effect) => {
+            Event::Session(Box::new(session::dispatch_session(*effect, context).await))
+        }
     };
 
     trace!(
@@ -167,6 +171,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Session(_) => "session",
     }
 }
 
@@ -182,5 +187,6 @@ fn event_kind(event: &Event) -> &'static str {
         Event::Task(_) => "task",
         Event::Search() => "search",
         Event::Stream() => "stream",
+        Event::Session(_) => "session",
     }
 }

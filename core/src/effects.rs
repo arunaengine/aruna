@@ -52,6 +52,7 @@ pub enum Effect {
     Task(TaskEffect),
     Search(),
     Stream(),
+    Session(Box<crate::compute::session::SessionEffect>),
 }
 
 #[derive(Debug, PartialEq)]

@@ -6,7 +6,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aruna_compute::ExecutorBackend;
-use aruna_compute::session::{EndReason, Session, SessionConfig};
+use aruna_compute::session::{Session, SessionConfig};
+use aruna_core::compute::session::EndReason;
 use aruna_core::compute::FenceContext;
 use aruna_core::structs::execution::job::{
     ExecutionSpec, JobId, JobRecord, JobResultPayload, SessionReportDetail, SessionReportRow,

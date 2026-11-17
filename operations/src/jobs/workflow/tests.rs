@@ -17,7 +17,8 @@ use crate::jobs::workflow::workspace::mint_workspace_credential;
 use crate::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_compute::ExecutorRegistry;
-use aruna_compute::session::{EndReason, Session, SessionConfig};
+use aruna_compute::session::{Session, SessionConfig};
+use aruna_core::compute::session::EndReason;
 use aruna_core::UserId;
 use aruna_core::compute::{
     AdoptableEvidence, AttemptPhase, AttemptStatus, CancelEvidence, LogLimits, LogTails, NOBODY,

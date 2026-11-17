@@ -120,6 +120,7 @@ pub(crate) fn describe_event(event: &Event) -> String {
         Event::Task(_) => "Event::Task".to_string(),
         Event::Search() => "Event::Search".to_string(),
         Event::Stream() => "Event::Stream".to_string(),
+        Event::Session(_) => "Event::Session".to_string(),
     }
 }
 

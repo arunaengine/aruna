@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::stream::BackendStream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::time::Duration;
@@ -167,6 +168,73 @@ pub enum SessionError {
     Helper(String),
 }
 
+/// One object staged into the workspace bucket after the session started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StagedInput {
+    pub dest_key: String,
+    pub bytes: u64,
+    pub blake3: String,
+    pub source_node_id: String,
+    pub version_id: String,
+}
+
+/// One object a background copy job is still bringing into the workspace
+/// bucket. The report resolves it against the job once the session ends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PendingInput {
+    pub dest_key: String,
+    pub job_id: String,
+    pub source_node_id: String,
+}
+
+/// One object the session's own credential read or wrote, as the S3 plane
+/// attributed it to this job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TouchedObject {
+    pub bucket: String,
+    pub key: String,
+    /// `read` or `write`.
+    pub operation: String,
+}
+
+/// One cell as the client sees it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CellSnapshot {
+    pub cell_id: String,
+    pub state: CellPhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
+}
+
+/// The whole session as the client sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub job_id: String,
+    pub state: SessionPhase,
+    pub runtime: String,
+    pub workspace_bucket: String,
+    pub executor_node_id: String,
+    pub started_at_ms: u64,
+    pub idle_after_ms: u64,
+    pub idle_deadline_ms: u64,
+    pub credential_expires_ms: u64,
+    pub last_event_id: u64,
+    pub cells: Vec<CellSnapshot>,
+    pub ended: Option<EndReason>,
+}
+
+/// One stream frame. `data` is already serialized so the ring can measure it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionEvent {
+    pub id: u64,
+    pub kind: EventKind,
+    pub data: String,
+}
+
 /// One request the node sends to the helper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -229,6 +297,68 @@ pub enum HelperEvent {
         #[serde(flatten)]
         body: Map<String, Value>,
     },
+}
+
+/// One request to the live session of a job on this node; the job id is the physical one.
+#[derive(Debug, PartialEq)]
+pub struct SessionEffect {
+    pub job_id: String,
+    pub request: SessionRequest,
+}
+
+/// What a request asks of the live session.
+#[derive(Debug, PartialEq)]
+pub enum SessionRequest {
+    Snapshot,
+    /// Frames after `after` and the live tail; `None` replays everything the ring still holds.
+    Subscribe {
+        after: Option<u64>,
+    },
+    SubmitCell {
+        cell_id: String,
+        code: String,
+    },
+    Interrupt,
+    End(EndReason),
+    RecordInput(StagedInput),
+    RecordPending(PendingInput),
+    RecordTouched(TouchedObject),
+    /// Moves the idle deadline.
+    Touch,
+    CellOutputs {
+        cell_id: String,
+        after: u64,
+    },
+    ListScratch {
+        path: String,
+    },
+    ReadScratch {
+        path: String,
+        limit: u64,
+    },
+}
+
+/// The live session's answer to one request.
+#[derive(Debug, PartialEq)]
+pub enum SessionAnswer {
+    /// No session of that job runs on this node.
+    Missing,
+    Done,
+    Snapshot(Box<SessionSnapshot>),
+    /// Replayed frames, then the live frames until the session closes.
+    Stream {
+        backlog: Vec<SessionEvent>,
+        live: BackendStream<SessionEvent>,
+    },
+    /// The ring no longer reaches the requested resume point.
+    Gap,
+    Position(usize),
+    Outputs {
+        last_event_id: u64,
+        outputs: Vec<Value>,
+    },
+    Body(Map<String, Value>),
+    Refused(SessionError),
 }
 
 #[cfg(test)]

@@ -52,6 +52,7 @@ pub enum Event {
     Task(TaskEvent),
     Search(),
     Stream(),
+    Session(Box<crate::compute::session::SessionAnswer>),
 }
 
 #[derive(Debug, PartialEq)]
