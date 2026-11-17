@@ -3,24 +3,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::AuthorizationError;
+use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows::{PrefixPages, done, values};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::storage::blob::{ManagedCopyQuarantine, VersionKey};
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::types::Key;
 use thiserror::Error;
 use tracing::info;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_core::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
+use aruna_core::managed_copy::{COPY_PAGE_LIMIT, ManagedCopyError, version_scope};
 
-use super::subject::{SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation};
+use super::subject::{
+    SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation, SubjectScanResult,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolveQuarantineConfig {
@@ -55,50 +57,44 @@ pub enum QuarantineError {
     Unauthorized,
     #[error("unexpected event in state {0}")]
     InvalidEvent(&'static str),
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 #[derive(Debug, PartialEq)]
 enum ResolveState {
-    Init,
     Authorize,
     ReadSubject,
+    /// Pages through the local registrations of the released version.
     Release,
+    /// Deletes one page of them.
+    Delete,
     Rescan,
-    Finish,
-    Error,
 }
+
+type ResolveTurn = Result<Next<QuarantineResolution>, QuarantineError>;
 
 #[derive(Debug, PartialEq)]
 pub struct ResolveQuarantineOperation {
     config: ResolveQuarantineConfig,
     state: ResolveState,
     subject: Option<NodeSubjectRecord>,
-    removal: Option<ManagedCopyRemoval>,
-    scan: Option<SubjectScanOperation>,
+    removal: Option<PrefixPages>,
     released: bool,
-    output: Option<Result<QuarantineResolution, QuarantineError>>,
 }
 
 impl ResolveQuarantineOperation {
     pub fn new(config: ResolveQuarantineConfig) -> Self {
         Self {
             config,
-            state: ResolveState::Init,
+            state: ResolveState::Authorize,
             subject: None,
             removal: None,
-            scan: None,
             released: false,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: QuarantineError) -> Effects {
-        self.state = ResolveState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn settle(&mut self, resolution: QuarantineResolution) -> Effects {
+    fn settle(resolution: QuarantineResolution) -> Next<QuarantineResolution> {
         info!(
             released = resolution.released,
             restored = resolution.restored,
@@ -106,164 +102,125 @@ impl ResolveQuarantineOperation {
             cleared = resolution.cleared,
             "Quarantine resolution finished"
         );
-        self.state = ResolveState::Finish;
-        self.output = Some(Ok(resolution));
-        smallvec![]
+        Next::Done(resolution)
     }
 
-    fn read_subject(&mut self) -> Effects {
+    fn read_subject(&mut self) -> Next<QuarantineResolution> {
         self.state = ResolveState::ReadSubject;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
-            key: Key::from(NODE_SUBJECT_KEY.to_vec()),
-            txn_id: None,
-        })]
+        let row = (
+            NODE_SUBJECT_KEYSPACE.to_string(),
+            Key::from(NODE_SUBJECT_KEY.to_vec()),
+        );
+        Next::Call(IoCall::Read(vec![row]))
     }
 
     /// Drops every local registration of the released version, so the copy stops
     /// being inventory this node has to decide about. The bytes stay on the
     /// backend: releasing makes them unserveable, it never deletes them.
-    fn release(&mut self, version: &VersionKey) -> Effects {
-        let mut removal = match ManagedCopyRemoval::for_version(version) {
-            Ok(removal) => removal,
-            Err(error) => return self.fail(error.into()),
-        };
-        let effects = removal.start(None);
-        self.removal = Some(removal);
+    fn release(&mut self, version: &VersionKey) -> ResolveTurn {
+        let pages = PrefixPages::new(
+            MANAGED_COPY_KEYSPACE,
+            version_scope(version)?,
+            COPY_PAGE_LIMIT,
+        );
+        let call = pages.call();
+        self.removal = Some(pages);
         self.released = true;
         self.state = ResolveState::Release;
-        effects
+        Ok(Next::Call(call))
     }
 
-    fn rescan(&mut self) -> Effects {
-        let Some(subject) = self.subject.as_ref() else {
-            return self.fail(QuarantineError::InvalidEvent("ReadSubject"));
-        };
-        let mut scan = SubjectScanOperation::new(SubjectScanConfig {
+    fn removal(&mut self) -> Result<&mut PrefixPages, QuarantineError> {
+        self.removal
+            .as_mut()
+            .ok_or(QuarantineError::InvalidEvent("Release"))
+    }
+
+    fn rescan(&mut self) -> ResolveTurn {
+        let subject = self
+            .subject
+            .as_ref()
+            .ok_or(QuarantineError::InvalidEvent("ReadSubject"))?;
+        let scan = SubjectScanOperation::new(SubjectScanConfig {
             realm_id: self.config.realm_id,
             observed: subject.subject.clone(),
             mode: SubjectScanMode::Revalidate(ManagedCopyQuarantine::PolicyViolation),
             now_ms: self.config.now_ms,
         });
-        let effects = scan.start();
-        let complete = scan.is_complete();
-        self.scan = Some(scan);
         self.state = ResolveState::Rescan;
-        match complete {
-            true => self.finish_scan(),
-            false => effects,
-        }
-    }
-
-    fn finish_scan(&mut self) -> Effects {
-        let Some(scan) = self.scan.take() else {
-            return self.fail(QuarantineError::InvalidEvent("Rescan"));
-        };
-        match scan.finalize() {
-            Ok(result) => self.settle(QuarantineResolution {
-                released: self.released,
-                scanned: result.scanned,
-                restored: result.restored,
-                quarantined: result.quarantined,
-                cleared: result.quarantined == 0,
-            }),
-            Err(error) => self.fail(error.into()),
-        }
+        Ok(Next::Call(IoCall::child(scan)))
     }
 }
 
-impl EffectOperation for ResolveQuarantineOperation {
+impl Operation for ResolveQuarantineOperation {
     type Output = QuarantineResolution;
     type Error = QuarantineError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> ResolveTurn {
         self.state = ResolveState::Authorize;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
                 auth_context: self.config.auth_context.clone(),
                 path: policy_admin_path(self.config.realm_id),
                 required_permission: Permission::WRITE,
-            }),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+            },
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> ResolveTurn {
         match self.state {
-            ResolveState::Authorize => match event {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                    allowed: Ok(true),
-                }) => self.read_subject(),
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { .. }) => {
-                    self.fail(QuarantineError::Unauthorized)
-                }
-                _ => self.fail(QuarantineError::InvalidEvent("Authorize")),
+            ResolveState::Authorize => match result.child::<bool, AuthorizationError>()? {
+                Ok(true) => Ok(self.read_subject()),
+                _ => Err(QuarantineError::Unauthorized),
             },
             ResolveState::ReadSubject => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(QuarantineError::InvalidEvent("ReadSubject"));
-                };
                 // A node that never advertised a subject holds nothing governed,
                 // so there is no quarantine to resolve and nothing is blocked.
-                let Some(value) = value else {
-                    return self.settle(QuarantineResolution {
+                let [Some(value)] = values::<1>(result)? else {
+                    return Ok(Self::settle(QuarantineResolution {
                         cleared: true,
                         ..QuarantineResolution::default()
-                    });
+                    }));
                 };
-                match NodeSubjectRecord::from_bytes(value.as_ref()) {
-                    Ok(record) => {
-                        self.subject = Some(record);
-                        match self.config.release.clone() {
-                            Some(version) => self.release(&version),
-                            None => self.rescan(),
-                        }
-                    }
-                    Err(error) => self.fail(error.into()),
+                self.subject = Some(NodeSubjectRecord::from_bytes(value.as_ref())?);
+                match self.config.release.clone() {
+                    Some(version) => self.release(&version),
+                    None => self.rescan(),
                 }
             }
             ResolveState::Release => {
-                let Some(removal) = self.removal.as_mut() else {
-                    return self.fail(QuarantineError::InvalidEvent("Release"));
-                };
-                match removal.step(event, None) {
-                    Ok(Some(effects)) => effects,
-                    Ok(None) => {
-                        self.removal = None;
-                        self.rescan()
-                    }
-                    Err(error) => self.fail(error.into()),
+                let rows = self.removal()?.take(result)?;
+                if rows.is_empty() {
+                    return self.rescan();
                 }
+                self.state = ResolveState::Delete;
+                let deletes = rows
+                    .into_iter()
+                    .map(|(key, _)| (MANAGED_COPY_KEYSPACE.to_string(), key))
+                    .collect();
+                Ok(Next::Call(IoCall::Delete(deletes)))
+            }
+            ResolveState::Delete => {
+                done(result)?;
+                // A full page resumes strictly after the last deleted key, so removal progresses.
+                let removal = self.removal()?;
+                if removal.done() {
+                    return self.rescan();
+                }
+                let call = removal.call();
+                self.state = ResolveState::Release;
+                Ok(Next::Call(call))
             }
             ResolveState::Rescan => {
-                let Some(scan) = self.scan.as_mut() else {
-                    return self.fail(QuarantineError::InvalidEvent("Rescan"));
-                };
-                let effects = scan.step(event);
-                match scan.is_complete() {
-                    true => self.finish_scan(),
-                    false => effects,
-                }
+                let result = result.child::<SubjectScanResult, SubjectScanError>()??;
+                Ok(Self::settle(QuarantineResolution {
+                    released: self.released,
+                    scanned: result.scanned,
+                    restored: result.restored,
+                    quarantined: result.quarantined,
+                    cleared: result.quarantined == 0,
+                }))
             }
-            ResolveState::Init | ResolveState::Finish | ResolveState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ResolveState::Finish | ResolveState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(QuarantineError::InvalidEvent("Finish")))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.scan.as_mut() {
-            Some(scan) => scan.abort(),
-            None => smallvec![],
         }
     }
 }
@@ -272,6 +229,7 @@ impl EffectOperation for ResolveQuarantineOperation {
 mod pure_tests {
     use super::*;
     use aruna_core::UserId;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::id::NodeId;
     use aruna_core::structs::placement::policy::PlacementSubject;
     use aruna_core::structs::storage::blob::VersionKey;
@@ -320,24 +278,33 @@ mod pure_tests {
         })
     }
 
-    fn allowed(allowed: bool) -> Event {
-        Event::SubOperation(SubOperationEvent::AuthorizationResult {
-            allowed: Ok(allowed),
-        })
+    fn allowed(allowed: bool) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Ok::<_, AuthorizationError>(allowed)))
     }
 
-    fn stored(record: &NodeSubjectRecord) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(record.to_bytes().expect("record encodes").into()),
-        })
+    fn stored(record: &NodeSubjectRecord) -> IoResult {
+        IoResult::Values(vec![Some(
+            record.to_bytes().expect("record encodes").into(),
+        )])
     }
 
-    fn empty_page() -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        })
+    fn page(keys: &[&[u8]]) -> IoResult {
+        IoResult::Page {
+            rows: keys
+                .iter()
+                .map(|key| (Key::from(key.to_vec()), Key::from(Vec::new())))
+                .collect(),
+            next: None,
+        }
+    }
+
+    /// The answer of a finished revalidation walk.
+    fn scanned(quarantined: usize) -> IoResult {
+        let result = SubjectScanResult {
+            quarantined,
+            ..SubjectScanResult::default()
+        };
+        IoResult::Child(ChildOutcome::new(Ok::<_, SubjectScanError>(result)))
     }
 
     #[test]
@@ -345,12 +312,12 @@ mod pure_tests {
         // Resolving a quarantine is a realm-admin decision, checked in the
         // operation and not only at the transport.
         let mut operation = operation(None);
-        operation.start();
+        operation.first().unwrap();
 
-        operation.step(allowed(false));
-
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Err(QuarantineError::Unauthorized));
+        assert_eq!(
+            operation.next(allowed(false)).err(),
+            Some(QuarantineError::Unauthorized)
+        );
     }
 
     #[test]
@@ -358,18 +325,14 @@ mod pure_tests {
         // The revalidation walk ends the block exactly when no quarantined copy
         // is left, which is what reopens governed admission.
         let mut operation = operation(None);
-        operation.start();
-        operation.step(allowed(true));
-        operation.step(stored(&blocked()));
-        // The embedded scan reads the record itself, then walks the inventory.
-        operation.step(stored(&blocked()));
-        operation.step(empty_page());
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        }));
+        operation.first().unwrap();
+        operation.next(allowed(true)).unwrap();
+        let scan = operation.next(stored(&blocked()));
+        assert!(matches!(scan, Ok(Next::Call(IoCall::Child(_)))));
 
-        assert!(operation.is_complete());
-        let resolution = operation.finalize().expect("resolution completes");
+        let Ok(Next::Done(resolution)) = operation.next(scanned(0)) else {
+            panic!("expected the resolution");
+        };
         assert!(resolution.cleared);
         assert!(!resolution.released);
         assert_eq!(resolution.quarantined, 0);
@@ -380,23 +343,22 @@ mod pure_tests {
         // Releasing removes the local rows of one exact version before the walk,
         // so the copy becomes locally unavailable rather than serveable.
         let mut operation = operation(Some(version()));
-        operation.start();
-        operation.step(allowed(true));
-        let effects = operation.step(stored(&blocked()));
-
+        operation.first().unwrap();
+        operation.next(allowed(true)).unwrap();
+        let scan = operation.next(stored(&blocked()));
         assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::Iter { key_space, .. }))
-                if key_space == aruna_core::keyspaces::MANAGED_COPY_KEYSPACE
+            scan,
+            Ok(Next::Call(IoCall::Page { space, .. }))
+                if space == aruna_core::keyspaces::MANAGED_COPY_KEYSPACE
         ));
-        operation.step(empty_page());
-        operation.step(stored(&blocked()));
-        operation.step(empty_page());
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        }));
+        let deletes = operation.next(page(&[b"one", b"two"]));
+        assert!(matches!(deletes, Ok(Next::Call(IoCall::Delete(rows))) if rows.len() == 2));
+        let walk = operation.next(IoResult::Done);
+        assert!(matches!(walk, Ok(Next::Call(IoCall::Child(_)))));
 
-        let resolution = operation.finalize().expect("resolution completes");
+        let Ok(Next::Done(resolution)) = operation.next(scanned(0)) else {
+            panic!("expected the resolution");
+        };
         assert!(resolution.released);
         assert!(resolution.cleared);
     }
@@ -406,14 +368,12 @@ mod pure_tests {
         // A node that never advertised a subject holds nothing governed, so
         // there is nothing to resolve and nothing stays blocked.
         let mut operation = operation(None);
-        operation.start();
-        operation.step(allowed(true));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        }));
+        operation.first().unwrap();
+        operation.next(allowed(true)).unwrap();
 
-        let resolution = operation.finalize().expect("resolution completes");
+        let Ok(Next::Done(resolution)) = operation.next(IoResult::Values(vec![None])) else {
+            panic!("expected the resolution");
+        };
         assert!(resolution.cleared);
         assert_eq!(resolution.scanned, 0);
     }
