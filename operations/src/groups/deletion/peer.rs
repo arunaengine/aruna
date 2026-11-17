@@ -142,7 +142,8 @@ pub(super) async fn apply_control(
             if caller.realm_id != *net.realm_id() {
                 return Err(GroupDeletionError::Unauthorized);
             }
-            super::check::check_node(context, &config, &caller, group_id, net.node_id()).await?;
+            super::coordinator::check_node(context, &config, &caller, group_id, net.node_id())
+                .await?;
             Ok(None)
         }
         GroupDeleteAction::Start { .. } => Err(GroupDeletionError::Invalid(

@@ -18,7 +18,8 @@ use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::types::TxnId;
 use ulid::Ulid;
 
-use super::check::{CheckOperation, check_node, scan};
+use super::check::CheckOperation;
+use super::coordinator::{check_node, scan};
 use super::tests::{Fixture, node, read, write};
 use crate::driver::drive;
 use crate::s3::bucket::create::CreateBucketOperation;
