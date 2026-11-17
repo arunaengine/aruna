@@ -920,7 +920,8 @@ impl OperationsTaskHandler {
                 self.publish_registration().await;
             }),
             TaskKey::PruneConnectorReferences => Box::pin(async move {
-                match crate::connectors::reference_prune::prune_references(&self.context).await {
+                let prune = crate::connectors::reference_prune::PruneReferencesOperation::new();
+                match drive(prune, &self.context).await {
                     Ok(true) => {
                         self.reschedule_timer(TaskKey::PruneConnectorReferences, Duration::ZERO)
                             .await;
