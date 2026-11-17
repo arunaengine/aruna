@@ -436,6 +436,10 @@ fn answer(wait: Wait, event: Event) -> Result<IoResult, IoError> {
         (Wait::Written, Event::Storage(StorageEvent::BatchWriteResult { .. }))
         | (Wait::Deleted, Event::Storage(StorageEvent::BatchDeleteResult { .. }))
         | (Wait::Synced, Event::Storage(StorageEvent::SyncAllFinished)) => Ok(IoResult::Done),
+        // A refused storage effect fails like a storage call, a lost conflict as a conflict.
+        (Wait::Family(Family::Storage), event @ Event::Storage(StorageEvent::Error { .. })) => {
+            Err(failure("a storage event", event))
+        }
         (Wait::Family(family), event) if event_family(&event) == Some(family) => {
             Ok(IoResult::Event(event))
         }

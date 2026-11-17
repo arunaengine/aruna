@@ -154,6 +154,24 @@ fn sends_after_commit() {
 }
 
 #[test]
+fn storage_refusal_fails() {
+    // A storage effect answered with a storage error fails the operation like a storage call.
+    let read = StorageEffect::Read {
+        key_space: "rows".to_string(),
+        key: key("a"),
+        txn_id: None,
+    };
+    let mut operation = run(script(vec![IoCall::Effect(storage(read))]), false);
+    operation.start();
+    let error = StorageError::ReadError("disk".to_string());
+    let refused = Event::Storage(StorageEvent::Error {
+        error: error.clone(),
+    });
+    assert!(operation.step(refused).is_empty());
+    assert_eq!(operation.finalize(), Err(IoError::Storage(error)));
+}
+
+#[test]
 fn transaction_commits_outcome() {
     let write = vec![("rows".to_string(), key("a"), key("1"))];
     let mut operation = run(script(vec![read_a(), IoCall::Write(write.clone())]), true);
