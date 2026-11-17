@@ -482,7 +482,7 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
             }
         }
         BlobCleanupWork::SettleMove { version, intents } => {
-            match crate::blob::migration::settle_move(context, &version, &intents).await {
+            match crate::blob::migration::drain::settle_move(context, &version, &intents).await {
                 Ok(true) => RowOutcome::Done,
                 Ok(false) => RowOutcome::Kept,
                 Err(error) => {

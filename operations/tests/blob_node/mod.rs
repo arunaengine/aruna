@@ -28,7 +28,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
 use aruna_core::structs::storage::routing::{RoutingSnapshot, StorageRoutingRule};
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::blob::migration::process_migrations;
+use aruna_operations::blob::migration::drain::process_migrations;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};

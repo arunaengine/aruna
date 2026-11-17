@@ -14,7 +14,7 @@ use aruna_core::structs::storage::broken::{BrokenVersion, StorageCheck};
 use aruna_core::types::Key;
 
 use super::check::{CheckOutcome, CheckVersionOperation};
-use super::{BUCKET_PAGE, MIGRATION_CONTINUE, MIGRATION_PAGE};
+use super::drain::{BUCKET_PAGE, MIGRATION_CONTINUE, MIGRATION_PAGE};
 use crate::driver::DriverContext;
 
 /// Advances the unfinished checks at the head of the queue by one page each. Returns when

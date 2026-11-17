@@ -135,7 +135,7 @@ pub async fn storage_files(
         });
     }
     // A second copy an import registered for a purged version goes with that version.
-    let routing = crate::blob::migration::move_routing(context, bucket).await?;
+    let routing = crate::blob::migration::drain::move_routing(context, bucket).await?;
     let mut keys: std::collections::BTreeMap<&str, Vec<Ulid>> = Default::default();
     for (key, id) in versions {
         keys.entry(key.as_str()).or_default().push(*id);
@@ -301,7 +301,7 @@ pub async fn scope_totals(
     let (mut key_marker, mut version_marker) = (None, None);
     let mut last_key = None::<String>;
     let mut scanned = 0u64;
-    let routing = crate::blob::migration::move_routing(context, scope.bucket()).await?;
+    let routing = crate::blob::migration::drain::move_routing(context, scope.bucket()).await?;
     let routing = routing.as_ref();
     // The versions of the key passed over last, whose second copies count once it ends.
     let mut ids = Vec::new();

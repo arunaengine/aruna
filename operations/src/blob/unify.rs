@@ -5,7 +5,7 @@
 
 use crate::auth::request_authorization::BucketAccess;
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
-use crate::blob::migration::move_routing;
+use crate::blob::migration::drain::move_routing;
 use crate::driver::DriverContext;
 use crate::s3::bucket::job_pages::JobStep;
 use crate::storage_read::iter_prefix_page;

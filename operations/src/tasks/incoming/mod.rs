@@ -834,7 +834,8 @@ impl OperationsTaskHandler {
                 let start = (self.migration_cursor.lock())
                     .expect("migration cursor mutex poisoned")
                     .clone();
-                let run = crate::blob::migration::process_migrations(&self.context, start).await;
+                let run =
+                    crate::blob::migration::drain::process_migrations(&self.context, start).await;
                 let after = match run {
                     Ok(run) => {
                         *(self.migration_cursor.lock()).expect("migration cursor mutex poisoned") =

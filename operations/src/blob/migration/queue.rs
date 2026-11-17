@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::migration::MIGRATION_CONTINUE;
+use crate::blob::migration::drain::MIGRATION_CONTINUE;
 use crate::blob::migration::rewrite::{RewriteOutcome, RewriteVersionOperation};
 use crate::driver::{DriverContext, drive};
 use crate::realm::get_config::{GetConfigError, GetConfigOperation};
