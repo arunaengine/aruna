@@ -6,14 +6,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
+use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::plugin_installs::{
-    BoundScope, InstallState, PluginInstall, Prerequisite, SecretBinding,
+    BoundScope, InstallGuard, InstallState, PluginInstall, Prerequisite, SecretBinding,
 };
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::time::unix_timestamp_millis;
+use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use aruna_plugins::artifact::ArtifactDigest;
@@ -27,7 +29,7 @@ use ulid::Ulid;
 
 use super::account::{
     Identity, account_name, check_ready, ensure_account, ensure_role, guard_of, read_auth,
-    read_user, teardown,
+    read_row, read_user, teardown,
 };
 use super::bound::{BindError, BindPlace, bind_slots, vault_kind};
 use super::grants::covers;
@@ -39,12 +41,14 @@ use super::receiver::pick_receiver;
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
 use super::rules::{ensure_rules, retire_rules};
 use super::settings::{SettingError, check_settings};
+use super::sweep::{ORPHAN_GRACE_MS, plugin_accounts};
 use crate::auth::enforcement::enforce_policies;
 use crate::auth::request_authorization::permission_rules;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::is_management;
+use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE};
 use crate::users::service_account::check::{ServiceCheckConfig, ServiceCheckOperation};
 
 #[derive(Debug, Error)]
@@ -374,7 +378,7 @@ pub(crate) async fn reconcile_installs(ctx: &DriverContext) -> Result<usize, Ins
         return Ok(0);
     }
     let repaired = repair_settled(ctx, node_id, realm_id, &config.installs).await;
-    let swept = super::sweep::sweep_orphans(ctx, node_id, &config, unix_timestamp_millis()).await;
+    let swept = sweep_orphans(ctx, node_id, &config, unix_timestamp_millis()).await;
     Ok(repaired
         + swept.unwrap_or_else(|error| {
             warn!(%error, "Could not sweep unnamed plugin accounts");
@@ -779,6 +783,94 @@ fn bare_summary(install: &PluginInstall) -> Summary {
         secrets: Vec::new(),
         warnings: Vec::new(),
     }
+}
+
+/// When this node first saw each unnamed account; a restart starts the grace again.
+static SEEN: LazyLock<std::sync::Mutex<HashMap<UserId, u64>>> = LazyLock::new(Default::default);
+
+/// Deactivates the active plugin accounts the canonical records have not named for the grace
+/// period, as a realm administrator. Returns how many it deactivated.
+pub(crate) async fn sweep_orphans(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    config: &RealmConfigDocument,
+    now_ms: u64,
+) -> Result<usize, String> {
+    let accounts = drive(plugin_accounts(), ctx)
+        .await
+        .map_err(|error| error.0)?;
+    let mut due = Vec::new();
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (install_id, user) in accounts {
+            let named = (config.installs.iter())
+                .any(|install| install.install_id == install_id && install.account == user.user_id);
+            if named {
+                seen.remove(&user.user_id);
+                continue;
+            }
+            let first = *seen.entry(user.user_id).or_insert(now_ms);
+            if now_ms.saturating_sub(first) >= ORPHAN_GRACE_MS {
+                due.push((install_id, user.user_id));
+            }
+        }
+    }
+    if due.is_empty() {
+        return Ok(0);
+    }
+    let Some(admin) = realm_admin(ctx, config).await? else {
+        warn!("No realm administrator to deactivate unnamed plugin accounts with");
+        return Ok(0);
+    };
+    let realm_id = config.realm_id;
+    let mut swept = 0;
+    for (install_id, account) in due {
+        let status = AccountStatusOperation::new(AccountStatusConfig {
+            actor: Actor {
+                node_id,
+                user_id: admin,
+                realm_id,
+            },
+            auth_context: AuthContext {
+                user_id: admin,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            target: account,
+            active: false,
+            now: unix_timestamp_secs(),
+        })
+        .guarded(InstallGuard::Unnamed {
+            install_id,
+            account,
+        })
+        .by_install();
+        match drive(status, ctx).await {
+            Ok(()) => {
+                info!(%account, %install_id, "Deactivated a plugin account its install no longer names");
+                swept += 1;
+            }
+            Err(error) => warn!(%account, %error, "Could not deactivate an unnamed plugin account"),
+        }
+    }
+    Ok(swept)
+}
+
+/// The realm administrator with the smallest id, so every node acts as the same one.
+async fn realm_admin(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+) -> Result<Option<UserId>, String> {
+    let key = config.realm_id.as_bytes().to_vec();
+    let realm = read_row(ctx, AUTH_KEYSPACE, key).await?;
+    let realm = (realm.map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes)))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let admins = (realm.iter().flat_map(|realm| realm.roles.values()))
+        .filter(|role| role.name == REALM_ADMIN_ROLE)
+        .flat_map(|role| role.assigned_users.iter().copied());
+    Ok(admins.min())
 }
 
 #[cfg(test)]
