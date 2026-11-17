@@ -15,7 +15,7 @@ use prometheus_client::metrics::info::Info;
 use prometheus_client::registry::{Metric, Registry, Unit};
 
 /// Exponential request-duration buckets in seconds, spanning ~1 ms to 60 s.
-pub const DURATION_BUCKETS_SECONDS: [f64; 15] = [
+const DURATION_BUCKETS_SECONDS: [f64; 15] = [
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 

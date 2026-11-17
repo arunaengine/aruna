@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::NodeId;
 
 /// Downloads one node serves at once.
-pub const DOWNLOAD_SLOTS: u32 = 256;
+const DOWNLOAD_SLOTS: u32 = 256;
 /// How long a failed holder is skipped.
-pub const AVOID_MS: u64 = 30_000;
+const AVOID_MS: u64 = 30_000;
 /// At most this many holders are skipped at once; the one avoided longest goes first.
 const MAX_AVOIDED: usize = 256;
 
@@ -102,7 +102,7 @@ pub struct AvoidList {
 }
 
 impl AvoidList {
-    /// Skips `node_id` for [`AVOID_MS`] from `now_ms`.
+    /// Skips `node_id` for `AVOID_MS` from `now_ms`.
     pub fn avoid(&self, node_id: NodeId, now_ms: u64) {
         let Ok(mut until) = self.until.lock() else {
             return;
