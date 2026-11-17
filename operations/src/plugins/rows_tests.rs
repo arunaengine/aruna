@@ -256,3 +256,76 @@ fn empty_write_skipped() {
     assert!(operation.start().is_empty());
     assert_eq!(operation.finalize(), Ok(()));
 }
+
+#[test]
+fn writes_then_deletes() {
+    let rows = vec![row(SPACE, b"a".to_vec(), b"1".to_vec())];
+    let mut plan = Writes {
+        rows: Some(rows.clone()),
+        deletes: Some(vec![(SPACE, b"b".to_vec())]),
+    };
+    assert_eq!(plan.first().unwrap(), Turn::Ask(Ask::Write(rows)));
+    let deleted = Ask::Delete(vec![(SPACE, b"b".to_vec())]);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Ask(deleted));
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(()));
+    assert!(plan.next(Answer::Values(Vec::new())).is_err());
+}
+
+#[test]
+fn scans_every_page() {
+    let mut plan = ScanRows(Scan::new(SPACE, b"p".to_vec()));
+    let Turn::Ask(Ask::Page { after, limit, .. }) = plan.first().unwrap() else {
+        panic!("a scan reads a page");
+    };
+    assert_eq!((after, limit), (None, 1_000));
+    let first = vec![(b"p1".to_vec(), b"1".to_vec())];
+    let Turn::Ask(Ask::Page { after, .. }) = plan
+        .next(Answer::Page(first, Some(b"p1".to_vec())))
+        .unwrap()
+    else {
+        panic!("a scan continues after the last key");
+    };
+    assert_eq!(after, Some(b"p1".to_vec()));
+    let second = vec![(b"p2".to_vec(), b"2".to_vec())];
+    let Turn::Finish(rows) = plan.next(Answer::Page(second, None)).unwrap() else {
+        panic!("the last page ends the scan");
+    };
+    assert_eq!(rows.len(), 2);
+    assert!(plan.next(Answer::Done).is_err());
+}
+
+#[test]
+fn single_requests() {
+    let mut read = ReadRows(Some(Ask::Read(vec![(SPACE, b"a".to_vec())])));
+    assert!(matches!(read.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    assert!(read.first().is_err());
+    let values = vec![Some(b"1".to_vec())];
+    let answer = read.next(Answer::Values(values.clone())).unwrap();
+    assert_eq!(answer, Turn::Finish(values));
+    let mut page = PageRows(Some(Ask::Page {
+        space: SPACE,
+        prefix: Vec::new(),
+        after: None,
+        limit: 1,
+    }));
+    page.first().unwrap();
+    let answer = page.next(Answer::Page(Vec::new(), None)).unwrap();
+    assert_eq!(answer, Turn::Finish((Vec::new(), None)));
+    let mut change = Change(Some(Ask::Sync));
+    assert_eq!(change.first().unwrap(), Turn::Ask(Ask::Sync));
+    assert_eq!(change.next(Answer::Done).unwrap(), Turn::Finish(()));
+    assert!(change.first().is_err());
+    assert!(values::<2>(Answer::Values(vec![None])).is_err());
+}
+
+#[test]
+fn sync_answers_done() {
+    let mut operation = sync_all();
+    let sync = storage(StorageEffect::SyncAll);
+    check_trace(
+        &mut operation,
+        &[sync],
+        vec![(Event::Storage(StorageEvent::SyncAllFinished), vec![])],
+    );
+    assert_eq!(operation.finalize(), Ok(()));
+}
