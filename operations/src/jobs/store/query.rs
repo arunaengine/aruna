@@ -46,7 +46,7 @@ pub async fn list_user_jobs(
             let record = if value.is_empty() {
                 read_job_record(storage, job_id, None).await?
             } else {
-                decode_job_record(value.as_ref()).ok()
+                JobRecord::from_bytes(value.as_ref()).ok()
             };
             if let Some(record) = record
                 && !record.payload.is_internal()

@@ -11,7 +11,7 @@ pub async fn read_job_record(
     txn_id: Option<TxnId>,
 ) -> Result<Option<JobRecord>, String> {
     match read_raw(storage, JOB_KEYSPACE, job_record_key(job_id), txn_id).await? {
-        Some(value) => match decode_job_record(&value) {
+        Some(value) => match JobRecord::from_bytes(&value) {
             Ok(record) => Ok(Some(record)),
             Err(error) => {
                 warn!(job_id = %job_id, error = %error, "Malformed job record retained");

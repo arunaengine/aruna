@@ -41,6 +41,7 @@ mod key_wait;
 mod launch;
 mod local;
 mod pages;
+mod rows;
 
 pub use family::*;
 pub use identity::*;
@@ -49,6 +50,7 @@ pub use key_wait::*;
 pub use launch::*;
 pub use local::*;
 pub use pages::*;
+pub use rows::*;
 
 #[cfg(test)]
 mod tests;
