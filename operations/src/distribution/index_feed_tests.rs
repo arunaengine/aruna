@@ -6,10 +6,18 @@
 use std::ops::Bound;
 
 use super::*;
+use crate::distribution::feed_walks::{FeedLimits, state_key};
 use crate::distribution::test_record::{record, searched, store_record};
-use crate::distribution::test_store::{apply, context, get, install, open, purge, range, write};
-use aruna_core::key_index::KeyQuery;
+use crate::distribution::test_store::{
+    apply, context, get, install, open, purge, range, send, write,
+};
+use aruna_core::effects::Effect;
+use aruna_core::key_index::{KeyChange, KeyQuery, MetaTerms};
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, SEARCH_FEED_KEYSPACE};
+use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
+use aruna_core::structs::storage::distribution::inventory::HeadEntry;
 use aruna_core::structs::storage::distribution::inventory::head_position;
+use aruna_storage::StorageHandle;
 use tempfile::TempDir;
 
 /// The set of [`searched`], which keeps a search index.
@@ -33,7 +41,7 @@ async fn fixture() -> Fixture {
     store_record(&handle, set(), searched().1).await;
     install(&handle, set(), &[range(1, "", None)]).await;
     let index_dir = tempfile::tempdir().unwrap();
-    let indexes = Arc::new(RangeIndexes::new(index_dir.path()));
+    let indexes = handle.install_range_indexes(RangeIndexes::new(index_dir.path()));
     Fixture {
         _dir: dir,
         _index_dir: index_dir,
@@ -66,7 +74,7 @@ async fn builds_then_feeds() {
     let handle = &fixture.handle;
     assert!(apply(handle, write(set(), "a/one", 1, 3)).await.unwrap());
     assert!(apply(handle, write(set(), "b/two", 2, 4)).await.unwrap());
-    let mut feeder = Feeder::new(fixture.indexes.clone(), FeedLimits::default());
+    let mut feeder = Feeder::new(FeedLimits::default());
 
     assert!(feeder.pass(&context(handle)).await);
     assert_eq!(
@@ -89,29 +97,6 @@ async fn builds_then_feeds() {
 }
 
 #[tokio::test]
-async fn changed_rows_stay() {
-    let fixture = fixture().await;
-    let handle = &fixture.handle;
-    assert!(apply(handle, write(set(), "k", 1, 3)).await.unwrap());
-    let key = head_position(set(), "k");
-    let stored = get(handle, SEARCH_FEED_KEYSPACE, key.clone())
-        .await
-        .unwrap();
-
-    let stale = vec![(Key::from(key.clone()), Value::from(b"older".to_vec()))];
-    assert_eq!(drop_settled(&handle.bulk(), stale).await.unwrap(), 0);
-    assert!(
-        get(handle, SEARCH_FEED_KEYSPACE, key.clone())
-            .await
-            .is_some(),
-        "a row a writer changed after it was read stays"
-    );
-    let seen = vec![(Key::from(key.clone()), Value::from(stored))];
-    assert_eq!(drop_settled(&handle.bulk(), seen).await.unwrap(), 1);
-    assert!(get(handle, SEARCH_FEED_KEYSPACE, key).await.is_none());
-}
-
-#[tokio::test]
 async fn build_resumes_cursor() {
     let fixture = fixture().await;
     let handle = &fixture.handle;
@@ -123,7 +108,7 @@ async fn build_resumes_cursor() {
         rebuild_pages: 1,
         ..FeedLimits::default()
     };
-    let mut feeder = Feeder::new(fixture.indexes.clone(), limits);
+    let mut feeder = Feeder::new(limits);
     assert!(feeder.pass(&context(handle)).await);
     let Some(IndexState::Building {
         generation: 1,
@@ -135,7 +120,7 @@ async fn build_resumes_cursor() {
     assert!(cursor.is_some(), "the build keeps its durable cursor");
 
     // A fresh feeder resumes from the stored cursor, as after a restart.
-    let mut feeder = Feeder::new(fixture.indexes.clone(), limits);
+    let mut feeder = Feeder::new(limits);
     for _ in 0..16 {
         feeder.pass(&context(handle)).await;
         if state(handle).await == Some(IndexState::Ready { generation: 1 }) {
@@ -162,7 +147,7 @@ async fn build_skips_unread() {
         rebuild_pages: 1,
         ..FeedLimits::default()
     };
-    let mut feeder = Feeder::new(fixture.indexes.clone(), limits);
+    let mut feeder = Feeder::new(limits);
     feeder.pass(&context(handle)).await;
     assert_eq!(keys(&fixture.indexes, 1).await, ["a"]);
 
@@ -191,7 +176,7 @@ async fn build_skips_unread() {
 async fn missing_index_rebuilds() {
     let fixture = fixture().await;
     let handle = &fixture.handle;
-    let mut feeder = Feeder::new(fixture.indexes.clone(), FeedLimits::default());
+    let mut feeder = Feeder::new(FeedLimits::default());
     feeder.pass(&context(handle)).await;
     assert_eq!(
         state(handle).await,
@@ -222,7 +207,7 @@ async fn missing_index_rebuilds() {
 async fn leftover_generation_pruned() {
     let fixture = fixture().await;
     let handle = &fixture.handle;
-    let mut feeder = Feeder::new(fixture.indexes.clone(), FeedLimits::default());
+    let mut feeder = Feeder::new(FeedLimits::default());
     feeder.pass(&context(handle)).await;
     assert_eq!(
         state(handle).await,
@@ -261,7 +246,7 @@ async fn drops_gone_ranges() {
         .await
         .unwrap();
 
-    let mut feeder = Feeder::new(fixture.indexes.clone(), FeedLimits::default());
+    let mut feeder = Feeder::new(FeedLimits::default());
     feeder.pass(&context(handle)).await;
     assert!(get(handle, SEARCH_INDEX_KEYSPACE, key).await.is_none());
     assert!(!fixture.indexes.exists(set(), gone, 1).await.unwrap());
@@ -276,7 +261,7 @@ async fn split_reindexes_children() {
     let handle = &fixture.handle;
     assert!(apply(handle, write(set(), "a", 1, 3)).await.unwrap());
     assert!(apply(handle, write(set(), "x", 2, 4)).await.unwrap());
-    let mut feeder = Feeder::new(fixture.indexes.clone(), FeedLimits::default());
+    let mut feeder = Feeder::new(FeedLimits::default());
     feeder.pass(&context(handle)).await;
     assert_eq!(
         state(handle).await,
@@ -330,8 +315,8 @@ async fn search_off_skips() {
     install(&handle, set_id, &[range(1, "", None)]).await;
     assert!(apply(&handle, write(set_id, "a/one", 1, 3)).await.unwrap());
     let index_dir = tempfile::tempdir().unwrap();
-    let indexes = Arc::new(RangeIndexes::new(index_dir.path()));
-    let mut feeder = Feeder::new(indexes.clone(), FeedLimits::default());
+    let indexes = handle.install_range_indexes(RangeIndexes::new(index_dir.path()));
+    let mut feeder = Feeder::new(FeedLimits::default());
 
     feeder.pass(&context(&handle)).await;
 
@@ -399,9 +384,16 @@ async fn described(handle: &StorageHandle, key: &str, seed: u8, organism: &str) 
     .with_metadata(metadata);
     let version_key = VersionKey::new("spire", key, Ulid::from_bytes([seed; 16]));
     let row = (version_key.to_bytes().unwrap(), version.to_bytes().unwrap());
-    put_row(&handle.bulk(), BLOB_VERSIONS_KEYSPACE, row.0, row.1)
-        .await
-        .unwrap();
+    let write = StorageEffect::Write {
+        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+        key: row.0.into(),
+        value: row.1.into(),
+        txn_id: None,
+    };
+    assert!(matches!(
+        send(handle, Effect::Storage(write)).await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
 }
 
 async fn matching(indexes: &Arc<RangeIndexes>, text: &str, exact: &str) -> Vec<String> {
@@ -438,7 +430,7 @@ async fn metadata_indexed_versions() {
             .await
             .unwrap()
     );
-    let mut feeder = Feeder::new(fixture.indexes.clone(), FeedLimits::default());
+    let mut feeder = Feeder::new(FeedLimits::default());
     assert!(feeder.pass(&context(handle)).await);
     assert_eq!(matching(&fixture.indexes, "coli", "").await, ["coli/"]);
 

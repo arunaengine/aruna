@@ -32,7 +32,7 @@ use aruna_core::structs::storage::distribution::on_use::{
 use aruna_core::types::{GroupId, Key, Value};
 use ulid::Ulid;
 
-use super::feed_store::split_key;
+use super::feed_walks::split_key;
 use super::imports::drop_resume;
 use super::inventory::{Walk, route};
 use super::pull::drop_copy;
