@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -11,13 +13,16 @@ use crate::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot, S
 use crate::compute::{ExecutorAvailability, MAX_ADVERTISED_EXECUTORS};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::MAX_KIND_LEN;
-use crate::structs::storage::node_info::{AdvertisementEpoch, NodeUtilization};
+use crate::structs::storage::node_info::{AdvertisementEpoch, NodeInfoDocument, NodeUtilization};
 
 /// Largest encoded heartbeat a peer accepts.
 pub const MAX_HEARTBEAT_BYTES: usize = 32 * 1024;
 /// Interval between two heartbeats. Peers treat a heartbeat older than three intervals as stale
 /// telemetry.
 pub const INFO_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Oldest heartbeat that still counts as current telemetry: three missed intervals.
+pub const MAX_HEARTBEAT_AGE: std::time::Duration =
+    std::time::Duration::from_secs(3 * INFO_PUBLISH_INTERVAL.as_secs());
 /// Deadline for reading or sending one heartbeat.
 pub const HEARTBEAT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -172,6 +177,44 @@ pub enum HeartbeatEvent {
     PushFailed(String),
     Stored(bool),
     Holders(Box<HolderFacts>),
+}
+
+/// Takes the load, download slots and executor availability of each document from the node's
+/// fresh heartbeat when that names the document's advertisement, and clears them otherwise:
+/// unknown ranks worst.
+pub fn live_telemetry(
+    fresh: &BTreeMap<NodeId, HeldHeartbeat>,
+    documents: &mut BTreeMap<NodeId, NodeInfoDocument>,
+    now_ms: u64,
+) {
+    for (node_id, document) in documents.iter_mut() {
+        let held = fresh.get(node_id).filter(|held| {
+            let epoch = &held.heartbeat.epoch;
+            (epoch.membership_generation, epoch.publisher_generation)
+                == (
+                    document.epoch.membership_generation,
+                    document.epoch.publisher_generation,
+                )
+        });
+        let observed_at_ms = held.map_or(0, |held| now_ms.saturating_sub(held.age_ms));
+        document.utilization.load_permille =
+            held.and_then(|held| held.heartbeat.utilization.load_permille);
+        document.utilization.download_slots =
+            held.and_then(|held| held.heartbeat.utilization.download_slots);
+        for executor in &mut document.executors {
+            executor.availability = held
+                .and_then(|held| {
+                    held.heartbeat
+                        .availability
+                        .iter()
+                        .find(|(kind, _)| *kind == executor.kind)
+                })
+                .map(|(_, availability)| ExecutorAvailability {
+                    observed_at_ms,
+                    ..*availability
+                });
+        }
+    }
 }
 
 fn revision(epoch: &AdvertisementEpoch) -> (u64, u64) {

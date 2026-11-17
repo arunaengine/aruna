@@ -35,8 +35,8 @@ use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::holders::GetHoldersOperation;
 use crate::driver::{DriverContext, drive};
-use crate::node::heartbeat::{fresh_heartbeats, live_telemetry};
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
+use aruna_core::heartbeat::live_telemetry;
 use aruna_core::node_state::ReadInfoOperation;
 
 /// Tag that pins the container network mode, shared with the executor path.
@@ -74,7 +74,7 @@ pub async fn build_plan(
         .map(|net| net.node_id())
         .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
     let (mut documents, unread) = advertisements(context, config).await;
-    let fresh = fresh_heartbeats(context.net_handle.as_ref());
+    let fresh = context.fresh_heartbeats();
     live_telemetry(&fresh, &mut documents, now_ms);
     let inputs = resolve_inputs(context, config, spec, local).await?;
     let mut output_policies = inputs

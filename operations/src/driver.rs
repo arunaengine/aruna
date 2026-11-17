@@ -4,10 +4,12 @@
 
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
+use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
 use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
+use aruna_core::heartbeat::{HeldHeartbeat, MAX_HEARTBEAT_AGE};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
@@ -89,6 +91,22 @@ impl DriverContext {
                 net_handle.subscribe_dashboard_changes(),
             )
         })
+    }
+
+    /// Heartbeats held for each node, fresh or stale; none without a net transport.
+    pub fn held_heartbeats(&self) -> BTreeMap<NodeId, HeldHeartbeat> {
+        let held = self.net_handle.as_ref().map(NetHandle::held_heartbeats);
+        (held.unwrap_or_default().into_iter())
+            .map(|held| (held.node_id, held))
+            .collect()
+    }
+
+    /// Fresh heartbeats held for each node; none without a net transport.
+    pub fn fresh_heartbeats(&self) -> BTreeMap<NodeId, HeldHeartbeat> {
+        let max_age_ms = MAX_HEARTBEAT_AGE.as_millis() as u64;
+        let mut held = self.held_heartbeats();
+        held.retain(|_, held| held.age_ms <= max_age_ms);
+        held
     }
 
     /// Tells dashboard subscribers that something they show changed.

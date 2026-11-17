@@ -1,23 +1,19 @@
-//! Pushes and keeps heartbeats with live telemetry between sync peers, and reads held ones.
+//! Pushes and keeps heartbeats with live telemetry between sync peers.
 //! One stream carries one length-prefixed heartbeat and no response; nothing is written to disk.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::compute::ExecutorAvailability;
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
 use aruna_core::heartbeat::{
-    HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, INFO_PUBLISH_INTERVAL, NodeHeartbeat,
+    HeartbeatEffect, HeartbeatEvent, INFO_PUBLISH_INTERVAL, NodeHeartbeat,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::types::{Effects, Value};
-use aruna_net::NetHandle;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -26,64 +22,6 @@ use tracing::{debug, warn};
 const PARALLEL_SENDS: usize = 16;
 /// Longest one send pass over all peers may take, well inside the heartbeat interval.
 const SEND_PASS_TIMEOUT: Duration = Duration::from_secs(INFO_PUBLISH_INTERVAL.as_secs() / 2);
-/// Oldest heartbeat that still counts as current telemetry: three missed intervals.
-pub const MAX_HEARTBEAT_AGE: Duration = Duration::from_secs(3 * INFO_PUBLISH_INTERVAL.as_secs());
-
-/// Heartbeats held for each node, fresh or stale; none without a network.
-pub fn held_heartbeats(net_handle: Option<&NetHandle>) -> BTreeMap<NodeId, HeldHeartbeat> {
-    net_handle
-        .map(NetHandle::held_heartbeats)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|held| (held.node_id, held))
-        .collect()
-}
-
-/// Fresh heartbeats held for each node; none without a network.
-pub fn fresh_heartbeats(net_handle: Option<&NetHandle>) -> BTreeMap<NodeId, HeldHeartbeat> {
-    let max_age_ms = MAX_HEARTBEAT_AGE.as_millis() as u64;
-    let mut held = held_heartbeats(net_handle);
-    held.retain(|_, held| held.age_ms <= max_age_ms);
-    held
-}
-
-/// Takes the load, download slots and executor availability of each document from the node's
-/// fresh heartbeat when that names the document's advertisement, and clears them otherwise:
-/// unknown ranks worst.
-pub fn live_telemetry(
-    fresh: &BTreeMap<NodeId, HeldHeartbeat>,
-    documents: &mut BTreeMap<NodeId, NodeInfoDocument>,
-    now_ms: u64,
-) {
-    for (node_id, document) in documents.iter_mut() {
-        let held = fresh.get(node_id).filter(|held| {
-            let epoch = &held.heartbeat.epoch;
-            (epoch.membership_generation, epoch.publisher_generation)
-                == (
-                    document.epoch.membership_generation,
-                    document.epoch.publisher_generation,
-                )
-        });
-        let observed_at_ms = held.map_or(0, |held| now_ms.saturating_sub(held.age_ms));
-        document.utilization.load_permille =
-            held.and_then(|held| held.heartbeat.utilization.load_permille);
-        document.utilization.download_slots =
-            held.and_then(|held| held.heartbeat.utilization.download_slots);
-        for executor in &mut document.executors {
-            executor.availability = held
-                .and_then(|held| {
-                    held.heartbeat
-                        .availability
-                        .iter()
-                        .find(|(kind, _)| *kind == executor.kind)
-                })
-                .map(|(_, availability)| ExecutorAvailability {
-                    observed_at_ms,
-                    ..*availability
-                });
-        }
-    }
-}
 
 /// Why a heartbeat run stopped; a failed send or an invalid heartbeat is only logged.
 #[derive(Debug, Error, PartialEq)]
@@ -306,10 +244,14 @@ impl Operation for ReceiveHeartbeatOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::compute::ExecutorCapability;
+    use std::collections::BTreeMap;
+
     use aruna_core::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot};
+    use aruna_core::compute::{ExecutorAvailability, ExecutorCapability};
+    use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::PlacementSubject;
+    use aruna_core::structs::storage::node_info::NodeInfoDocument;
     use aruna_core::structs::storage::node_info::{AdvertisementEpoch, NodeUrls, NodeUtilization};
 
     use aruna_core::operation_check::{

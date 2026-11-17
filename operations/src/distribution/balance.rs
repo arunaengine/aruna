@@ -22,7 +22,6 @@ use ulid::Ulid;
 use super::create::submit;
 use super::sign_statement;
 use crate::driver::DriverContext;
-use crate::node::heartbeat::fresh_heartbeats;
 
 /// How long a node waits after proposing a transfer before it proposes the next one.
 pub const COOL_DOWN: Duration = Duration::from_secs(30 * 60);
@@ -102,7 +101,8 @@ pub async fn balance_set(
     if cooling {
         return;
     }
-    let mut fill: BTreeMap<NodeId, u64> = fresh_heartbeats(context.net_handle.as_ref())
+    let mut fill: BTreeMap<NodeId, u64> = context
+        .fresh_heartbeats()
         .into_iter()
         .filter_map(|(node_id, held)| {
             let utilization = held.heartbeat.utilization;

@@ -525,7 +525,7 @@ pub async fn group_demand(
         .sync_eligible_nodes()
         .map_err(|error| error.to_string())?;
     let local = demand_snapshot(ctx, AdvertisementEpoch::default()).await?;
-    let fresh = crate::node::heartbeat::fresh_heartbeats(ctx.net_handle.as_ref());
+    let fresh = ctx.fresh_heartbeats();
     Ok(merge_view(local, &members, node_id, &fresh, group_id))
 }
 
