@@ -6,7 +6,6 @@ use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::WATCH_INTEREST_KEYSPACE;
-use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::execution::notification::InboxWriteOutcome;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventRetry, watch_retry_prefix,
@@ -17,28 +16,7 @@ use tracing::warn;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::notifications::protocol::{RETRY_BATCH_CAP, RETRY_BYTES_CAP, valid_retry};
 use crate::notifications::watch::digest::InterestOperation;
-use crate::notifications::watch::expansion::{ExpandError, ExpandOutcome, WatchExpandOperation};
-
-/// Runs one expansion, once more after a conflict, and records its delivery suppressions.
-async fn expand_once(
-    context: &DriverContext,
-    build: impl FnMut() -> WatchExpandOperation,
-    seed: &[u8],
-) -> Result<ExpandOutcome, ExpandError> {
-    let expanded = drive_retry(build, context, seed).await;
-    match &expanded {
-        Ok(outcome) => {
-            for reason in &outcome.suppressed {
-                record_delivery_suppression(context, *reason);
-            }
-        }
-        Err(ExpandError::Unavailable(_)) => {
-            record_delivery_suppression(context, WatchMetricReason::AuthorizationUnavailable);
-        }
-        Err(_) => {}
-    }
-    expanded
-}
+use crate::notifications::watch::expansion::WatchExpandOperation;
 
 /// Expands one bounded subscription page into idempotent inbox records.
 /// Later pages are durably retried; placement and authorization are rechecked.
@@ -54,7 +32,7 @@ pub(crate) async fn expand_watch_events(
         let events = events.to_vec();
         WatchExpandOperation::new(realm_id, realm_config.clone(), local_node_id, events, None)
     };
-    let expanded = expand_once(context, build, realm_id.as_bytes()).await;
+    let expanded = drive_retry(build, context, realm_id.as_bytes()).await;
     expanded
         .map(|outcome| (outcome.inbox, outcome.dropped))
         .map_err(|error| error.to_string())
@@ -117,7 +95,7 @@ pub(crate) async fn drain_watch_events(
                 resume,
             )
         };
-        if let Err(error) = expand_once(context, build, &key).await {
+        if let Err(error) = drive_retry(build, context, &key).await {
             warn!(%realm_id, %error, "Watch retry row deferred");
             failed = true;
         }
@@ -135,19 +113,6 @@ async fn defer_retry(context: &DriverContext, realm_id: RealmId, error: String) 
         return format!("{error}; failed to retain retry marker: {marker}");
     }
     error
-}
-
-fn record_delivery_suppression(context: &DriverContext, reason: WatchMetricReason) {
-    if let Some(net_handle) = context.net_handle.as_ref() {
-        net_handle
-            .notification_watch_metrics()
-            .record_delivery_suppression(reason);
-    }
-    warn!(
-        parent: None,
-        reason = reason.as_str(),
-        "Notification watch delivery suppressed"
-    );
 }
 
 #[cfg(test)]

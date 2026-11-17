@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE};
 use aruna_core::metrics::WatchMetricReason;
@@ -60,13 +61,11 @@ impl From<IoError> for ExpandError {
     }
 }
 
-/// What one expansion stored, whether it skipped stale or unauthorized watches, and the
-/// delivery suppressions the shell records as metrics.
+/// What one expansion stored, and whether it skipped stale or unauthorized watches.
 #[derive(Debug, Default, PartialEq)]
 pub struct ExpandOutcome {
     pub inbox: InboxWriteOutcome,
     pub dropped: bool,
-    pub suppressed: Vec<WatchMetricReason>,
 }
 
 /// One watch that routes one event into records, waiting for its authorization.
@@ -121,6 +120,8 @@ pub struct WatchExpandOperation {
     current: Option<Candidate>,
     records: Vec<NotificationRecord>,
     queue_changed: bool,
+    /// The suppressed deliveries, recorded as metrics once the run ends either way.
+    suppressed: Vec<WatchMetricReason>,
     outcome: ExpandOutcome,
 }
 
@@ -153,6 +154,7 @@ impl WatchExpandOperation {
             current: None,
             records: Vec::new(),
             queue_changed: false,
+            suppressed: Vec::new(),
             outcome: ExpandOutcome::default(),
         }
     }
@@ -294,12 +296,12 @@ impl WatchExpandOperation {
                 Ok(Next::Call(IoCall::child(check)))
             }
             Ok(WatchAuthorization::Denied(reason)) => {
-                self.outcome.suppressed.push(reason.metric_reason());
+                self.suppressed.push(reason.metric_reason());
                 self.outcome.dropped = true;
                 self.next_candidate()
             }
-            Ok(WatchAuthorization::Unavailable(error)) => Err(ExpandError::Unavailable(error)),
-            Err(error) => Err(ExpandError::Unavailable(error.to_string())),
+            Ok(WatchAuthorization::Unavailable(error)) => Err(self.unavailable(error)),
+            Err(error) => Err(self.unavailable(error.to_string())),
         }
     }
 
@@ -308,12 +310,10 @@ impl WatchExpandOperation {
         match check {
             Ok(WatchAuthorization::Authorized) => self.records.extend(candidate.routed),
             Ok(WatchAuthorization::Denied(reason)) => {
-                self.outcome.suppressed.push(reason.metric_reason());
+                self.suppressed.push(reason.metric_reason());
             }
-            Ok(WatchAuthorization::Unavailable(error)) => {
-                return Err(ExpandError::Unavailable(error));
-            }
-            Err(error) => return Err(ExpandError::Unavailable(error.to_string())),
+            Ok(WatchAuthorization::Unavailable(error)) => return Err(self.unavailable(error)),
+            Err(error) => return Err(self.unavailable(error.to_string())),
         }
         self.next_candidate()
     }
@@ -426,17 +426,32 @@ impl WatchExpandOperation {
         Ok(Next::Call(IoCall::Write(vec![self.marker.clone()])))
     }
 
-    /// Ends the run; a queued next page asks for a publish once the transaction committed.
+    /// A check that could not run now ends the run, recorded as one more suppression.
+    fn unavailable(&mut self, error: String) -> ExpandError {
+        self.suppressed
+            .push(WatchMetricReason::AuthorizationUnavailable);
+        ExpandError::Unavailable(error)
+    }
+
+    /// The metric records of the suppressed deliveries.
+    fn suppression_calls(&mut self) -> Vec<IoCall> {
+        let suppressed = std::mem::take(&mut self.suppressed).into_iter();
+        let record = |reason| IoCall::from(Effect::Net(NetEffect::RecordSuppression(reason)));
+        suppressed.map(record).collect()
+    }
+
+    /// Ends the run; after the commit it records the suppressions, and a queued next page asks
+    /// for a publish.
     fn finish(&mut self) -> Turn {
         let output = std::mem::take(&mut self.outcome);
+        let mut calls = self.suppression_calls();
         if self.queue_changed && self.next.is_some() {
-            let publish = IoCall::child(InterestOperation::publish());
-            return Ok(Next::Then {
-                output,
-                calls: vec![publish],
-            });
+            calls.push(IoCall::child(InterestOperation::publish()));
         }
-        Ok(Next::Done(output))
+        if calls.is_empty() {
+            return Ok(Next::Done(output));
+        }
+        Ok(Next::Then { output, calls })
     }
 }
 
@@ -510,6 +525,11 @@ impl Operation for WatchExpandOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    /// A failed run still records the suppressions it found.
+    fn abort(&mut self) -> Vec<IoCall> {
+        self.suppression_calls()
     }
 
     /// One more run after a conflict, as the delivery did before.
