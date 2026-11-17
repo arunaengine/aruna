@@ -95,9 +95,7 @@ use crate::notifications::outbox::{
     read_outbox_batch, restore_idle_timer, restore_outbox_timer,
 };
 use crate::notifications::placement::resolve_inbox_holder;
-use crate::notifications::prune::{
-    NOTIFICATION_POLL_AFTER, NOTIFICATION_RETRY_AFTER, process_prune_batch,
-};
+use crate::notifications::prune::RestorePruneOperation;
 use crate::notifications::watch::interest::{
     WATCH_PUBLISH_DEBOUNCE, rebuild_interest_table, refresh_target_interest,
 };
@@ -118,6 +116,7 @@ use crate::sync::shard_placement::{
     DEFER_RETRY_AFTER, PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
 };
 use crate::tasks::queue_backoff::retry_delay_ms;
+use crate::triggers::{TimerInput, timer_operation};
 use crate::tasks::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_task_timers,
 };
@@ -731,6 +730,28 @@ impl OperationsTaskHandler {
 
     /// The timer map. Each arm is boxed here, outside an async body, so only
     /// the selected timer's future stays on the stack while its work runs.
+    /// Runs the operation the trigger table names for `key` and arms the timer when it asks.
+    async fn run_trigger(&self, key: TaskKey) {
+        let input = TimerInput {
+            now_ms: unix_timestamp_millis(),
+            local_node: self.context.net_handle.as_ref().map(|net| net.node_id()),
+        };
+        let Some(operation) = timer_operation(&key, &input) else {
+            error!(task_id = ?key, "The trigger table names no operation for this timer");
+            return;
+        };
+        let after = match drive(operation, self.context.as_ref()).await {
+            Ok(after) => after,
+            Err(failure) => {
+                warn!(task_id = ?key, error = %failure, "Timer run failed");
+                Some(failure.retry_after)
+            }
+        };
+        if let Some(after) = after {
+            self.reschedule_timer(key, after).await;
+        }
+    }
+
     fn timer_work(&self, key: TaskKey) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         match key {
             TaskKey::RealmPresence { realm_id, node_id } => Box::pin(async move {
@@ -806,9 +827,7 @@ impl OperationsTaskHandler {
             TaskKey::DrainNotificationOutbox => Box::pin(async move {
                 self.drain_notification_outbox().await;
             }),
-            TaskKey::PruneNotifications => Box::pin(async move {
-                self.prune_notifications().await;
-            }),
+            TaskKey::PruneNotifications => Box::pin(self.run_trigger(key)),
             TaskKey::PublishWatchInterest => Box::pin(async move {
                 self.publish_watch_interest().await;
             }),

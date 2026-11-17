@@ -59,8 +59,7 @@ async fn durable_rearm_loop(
         restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
         crate::metadata::prune_queue::restore_prune_timer(&context.storage_handle, &task_handle)
             .await;
-        crate::notifications::prune::restore_prune_timer(&context.storage_handle, &task_handle)
-            .await;
+        restore_notification_prune(&context, &task_handle).await;
         restore_drain_timer(&context.storage_handle, &task_handle).await;
         restore_prune_timer(&context.storage_handle, &task_handle).await;
         restore_mirror_timer(&context.storage_handle, &task_handle).await;
@@ -69,6 +68,18 @@ async fn durable_rearm_loop(
             &task_handle,
         )
         .await;
+    }
+}
+
+/// Arms the notification prune timer on the task handle the queues run on.
+async fn restore_notification_prune(context: &DriverContext, task_handle: &TaskHandle) {
+    let context = DriverContext {
+        task_handle: Some(task_handle.clone()),
+        ..context.clone()
+    };
+    let restore = RestorePruneOperation::new(unix_timestamp_millis());
+    if let Err(error) = drive(restore, &context).await {
+        warn!(%error, "Failed to restore notification prune timer");
     }
 }
 
@@ -263,8 +274,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::notifications::prune::restore_prune_timer(&context.storage_handle, &task_handle)
-            .await;
+        restore_notification_prune(&context, &task_handle).await;
         if stopped() {
             return;
         }
@@ -655,24 +665,6 @@ impl OperationsTaskHandler {
             self.reschedule_timer(TaskKey::DrainFamilyOutbox, OUTBOX_RETRY_AFTER)
                 .await;
         }
-    }
-}
-
-impl OperationsTaskHandler {
-    pub(super) async fn prune_notifications(&self) {
-        let after = match process_prune_batch(&self.context).await {
-            Ok(outcome) if outcome.has_more => Duration::ZERO,
-            Ok(outcome) => outcome
-                .next_due_after
-                .unwrap_or(NOTIFICATION_POLL_AFTER)
-                .min(NOTIFICATION_POLL_AFTER),
-            Err(error) => {
-                warn!(task_id = ?TaskKey::PruneNotifications, error = %error, "Failed to prune notifications");
-                NOTIFICATION_RETRY_AFTER
-            }
-        };
-        self.reschedule_timer(TaskKey::PruneNotifications, after)
-            .await;
     }
 }
 
@@ -1145,6 +1137,7 @@ mod stop_tests {
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
+            outbound_handle: None,
         });
         let queues = install_task_queues(
             context,
