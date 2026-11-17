@@ -20,11 +20,10 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::{
-    PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, evaluate_placement,
+    PlacementDecision, PlacementPolicyRef, PlacementSubject, evaluate_placement,
 };
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::time::unix_timestamp_millis;
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -35,6 +34,7 @@ use super::cancel::cancel_local_run;
 use super::fetch::FetchFamilyOperation;
 use super::ids::{self, workspace_of};
 use super::plan::{REALM_STAGING, network_access};
+use super::policies::ResolvePoliciesOperation;
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -47,7 +47,6 @@ use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::service::mint_local_job;
 use crate::placement::policy::GateOperation;
-use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::realm::load_config::load_realm_config;
 use aruna_core::node_state::DrainStateOperation;
 use aruna_core::node_state::ReadInfoOperation;
@@ -762,28 +761,9 @@ async fn placement_verdict(
     }
     let mut refs = output_policies.clone();
     refs.extend(inputs.iter().flatten().copied());
-    refs.sort_unstable();
-    refs.dedup();
-    let mut policies: BTreeMap<Ulid, PolicyResolution> = BTreeMap::new();
-    for policy_ref in &refs {
-        let resolution = drive(
-            ResolvePolicyOperation::new(ResolvePolicyConfig {
-                realm_id: spec.realm_id,
-                policy_ref: *policy_ref,
-                local_node_id: subject.node_id,
-                now_ms: unix_timestamp_millis(),
-            }),
-            context,
-        )
-        .await;
-        policies.insert(
-            policy_ref.policy_id,
-            match resolution {
-                Ok(resolved) => PolicyResolution::Known(resolved.policy),
-                Err(_) => PolicyResolution::Unresolved,
-            },
-        );
-    }
+    let now_ms = unix_timestamp_millis();
+    let operation = ResolvePoliciesOperation::new(spec.realm_id, subject.node_id, now_ms, refs);
+    let policies = drive(operation, context).await.unwrap_or_default();
     for policy_set in
         std::iter::once(output_policies.as_slice()).chain(inputs.iter().map(Vec::as_slice))
     {

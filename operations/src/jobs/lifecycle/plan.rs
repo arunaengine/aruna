@@ -31,11 +31,11 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::ids;
+use super::policies::ResolvePoliciesOperation;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::holders::GetHoldersOperation;
 use crate::driver::{DriverContext, drive};
-use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use aruna_core::heartbeat::live_telemetry;
 use aruna_core::node_state::ReadInfoOperation;
 
@@ -456,35 +456,16 @@ async fn resolve_policies(
     now_ms: u64,
     local: NodeId,
 ) -> BTreeMap<Ulid, PolicyResolution> {
-    let mut refs: Vec<PlacementPolicyRef> = inputs
+    let refs: Vec<PlacementPolicyRef> = inputs
         .iter()
         .flat_map(|input| input.policies.clone())
         .chain(output_policies.iter().cloned())
         .collect();
-    refs.sort_unstable();
-    refs.dedup();
-    let mut resolved = BTreeMap::new();
-    for policy_ref in refs {
-        let outcome = drive(
-            ResolvePolicyOperation::new(ResolvePolicyConfig {
-                realm_id: spec.realm_id,
-                policy_ref,
-                local_node_id: local,
-                now_ms,
-            }),
-            context,
-        )
-        .await;
-        let resolution = match outcome {
-            Ok(resolved) => PolicyResolution::Known(resolved.policy),
-            Err(error) => {
-                debug!(error = %error, "Placement policy stayed unresolved for planning");
-                PolicyResolution::Unresolved
-            }
-        };
-        resolved.insert(policy_ref.policy_id, resolution);
-    }
-    resolved
+    let operation = ResolvePoliciesOperation::new(spec.realm_id, local, now_ms, refs);
+    drive(operation, context).await.unwrap_or_else(|error| {
+        debug!(error = %error, "Placement policies stayed unresolved for planning");
+        BTreeMap::new()
+    })
 }
 
 /// Network mode pinned by the request tag, defaulting to no egress.
