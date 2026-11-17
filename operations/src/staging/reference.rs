@@ -2,6 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::VecDeque;
+use std::time::SystemTime;
+
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::connectors::repository::{
     StorageReadError, connector_reference_write, parse_secret_read, read_secret_effect,
@@ -12,7 +15,6 @@ use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
@@ -20,17 +22,18 @@ use crate::plugins::journal::journaled;
 use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::{build_source_binding, build_source_descriptor};
-use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
-use crate::tasks::task_persistence::persist_task_effect;
+use crate::staging::head_source::{
+    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
+};
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
 };
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
@@ -43,14 +46,13 @@ use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPoli
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::storage::distribution::DistributionBinding;
-use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::hint::{SetHint, with_hint};
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, GroupId, TxnId};
-use std::time::SystemTime;
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -171,6 +173,7 @@ pub async fn stage_reference_blob(
 
 /// One reference version to record: freshly resolved through a connector, or
 /// cloned from a version that already carries the binding.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReferenceWrite {
     pub preassigned_version_id: Option<Ulid>,
     pub group_id: GroupId,
@@ -698,6 +701,538 @@ async fn guard_expected_bucket(
             .unwrap_or_default(),
         binding,
     ))
+}
+
+/// Where a reference write is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteState {
+    Init,
+    Begin,
+    Fence,
+    Bucket,
+    Authority,
+    Connector,
+    Secret,
+    Mirror,
+    Planned,
+    Pointer,
+    Current,
+    Rows,
+    Usage,
+    Commit,
+    Schedule,
+    Abort,
+    Finish,
+    Error,
+}
+
+/// Writes one reference version in one transaction. Outputs the version id and whether
+/// anything changed: the same binding with the same observation at the head is kept.
+#[derive(Debug, PartialEq)]
+pub struct WriteReferenceOperation {
+    write: ReferenceWrite,
+    now: SystemTime,
+    fresh: Ulid,
+    state: WriteState,
+    txn_id: Option<TxnId>,
+    policies: Vec<PlacementPolicyRef>,
+    binding: Option<DistributionBinding>,
+    epoch: OriginalEpoch,
+    version_id: Ulid,
+    mirror: usize,
+    pointer: Option<CurrentVersionPointer>,
+    rows: VecDeque<Effect>,
+    usage: Option<UsageCounterUpdate>,
+    result: Option<(Ulid, bool)>,
+    output: Option<Result<(Ulid, bool), MaterializeReferenceError>>,
+}
+
+impl WriteReferenceOperation {
+    /// `now` stamps the version and `fresh` names it unless the bucket's set hints another id.
+    pub fn new(write: ReferenceWrite, now: SystemTime, fresh: Ulid) -> Self {
+        Self {
+            write,
+            now,
+            fresh,
+            state: WriteState::Init,
+            txn_id: None,
+            policies: Vec::new(),
+            binding: None,
+            epoch: OriginalEpoch::default(),
+            version_id: fresh,
+            mirror: 0,
+            pointer: None,
+            rows: VecDeque::new(),
+            usage: None,
+            result: None,
+            output: None,
+        }
+    }
+
+    fn txn(&self) -> Result<TxnId, MaterializeReferenceError> {
+        self.txn_id.ok_or(StorageError::TransactionNotFound.into())
+    }
+
+    fn read(
+        &mut self,
+        state: WriteState,
+        key_space: &str,
+        key: Key,
+    ) -> Result<Effects, MaterializeReferenceError> {
+        let txn_id = self.txn()?;
+        self.state = state;
+        Ok(smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: Some(txn_id),
+        })])
+    }
+
+    /// Ends with `error`, aborting the open transaction first.
+    fn fail(&mut self, error: MaterializeReferenceError) -> Effects {
+        self.output = Some(Err(error));
+        match self.txn_id.take() {
+            Some(txn_id) => {
+                self.state = WriteState::Abort;
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            None => {
+                self.state = WriteState::Error;
+                smallvec![]
+            }
+        }
+    }
+
+    /// Commits and ends with `result`; a changed head schedules the usage snapshot afterwards.
+    fn commit(&mut self, result: (Ulid, bool)) -> Result<Effects, MaterializeReferenceError> {
+        let txn_id = self
+            .txn_id
+            .take()
+            .ok_or(StorageError::TransactionNotFound)?;
+        self.result = Some(result);
+        self.state = WriteState::Commit;
+        Ok(smallvec![Effect::Storage(
+            StorageEffect::CommitTransaction { txn_id }
+        )])
+    }
+
+    /// The bucket as read in the transaction must be the one the caller saw.
+    fn bucket_read(&mut self, value: Option<Value>) -> Result<Effects, MaterializeReferenceError> {
+        let current = (value.as_ref())
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()?;
+        let write = &self.write;
+        let unchanged = match write.expected_bucket.as_ref() {
+            Some(expected) => {
+                expected.group_id == write.group_id
+                    && current.as_ref().map(BucketInfo::identity) == Some(expected.identity())
+            }
+            None => (current.as_ref()).is_some_and(|bucket| bucket.group_id == write.group_id),
+        };
+        if !unchanged {
+            return Err(StorageError::TransactionConflict.into());
+        }
+        self.binding = (current.as_ref()).and_then(|bucket| bucket.distribution.clone());
+        self.policies = current
+            .map(|bucket| bucket.placement_policies)
+            .unwrap_or_default();
+        match self.binding.as_ref() {
+            // Only the coordinator of the key's range writes, at its epoch; the read in the
+            // write transaction conflicts with a fence set meanwhile.
+            Some(binding) => {
+                let read = authority_read(binding.set_id, Some(self.txn()?));
+                self.state = WriteState::Authority;
+                Ok(smallvec![read])
+            }
+            None => self.named(),
+        }
+    }
+
+    /// Names the version and starts the connector checks.
+    fn named(&mut self) -> Result<Effects, MaterializeReferenceError> {
+        let hint = self.binding.as_ref().map(DistributionBinding::hint);
+        if let (Some(hint), Some(planned)) = (hint, self.write.preassigned_version_id)
+            && SetHint::of_version(planned) != hint
+        {
+            return Err(StorageError::WriteError(
+                "planned reference version lacks the set hint".into(),
+            )
+            .into());
+        }
+        self.version_id = match (self.write.preassigned_version_id, hint) {
+            (Some(planned), _) => planned,
+            (None, Some(hint)) => with_hint(self.fresh, hint),
+            (None, None) => self.fresh,
+        };
+        let inherited = self.write.inherited_policies.iter().copied();
+        self.policies.extend(inherited);
+        match self.write.connector_guard.as_ref() {
+            Some((connector, _)) => {
+                let key = source_connector_key(connector.group_id, connector.connector_id);
+                self.read(WriteState::Connector, SOURCE_INDEX_KEYSPACE, key)
+            }
+            None => self.next_mirror(),
+        }
+    }
+
+    /// Re-reads the next mirror connector, or goes on to the head once all are checked.
+    fn next_mirror(&mut self) -> Result<Effects, MaterializeReferenceError> {
+        let Some(connector) = self.write.mirror_guards.get(self.mirror) else {
+            return self.versions();
+        };
+        let key = source_connector_key(connector.group_id, connector.connector_id);
+        self.mirror += 1;
+        self.read(WriteState::Mirror, SOURCE_INDEX_KEYSPACE, key)
+    }
+
+    /// A planned version is read first; otherwise the current head.
+    fn versions(&mut self) -> Result<Effects, MaterializeReferenceError> {
+        let (bucket, key) = (&self.write.bucket, &self.write.key);
+        match self.write.preassigned_version_id {
+            Some(_) => {
+                let row = VersionKey::new(bucket, key, self.version_id).to_bytes()?;
+                self.read(WriteState::Planned, BLOB_VERSIONS_KEYSPACE, row.into())
+            }
+            None => self.pointer(),
+        }
+    }
+
+    fn pointer(&mut self) -> Result<Effects, MaterializeReferenceError> {
+        let head = BlobHeadKey::new(&self.write.bucket, &self.write.key).to_bytes()?;
+        self.read(WriteState::Pointer, BLOB_HEAD_KEYSPACE, head.into())
+    }
+
+    /// Whether `version` already references the same source with the same observation.
+    fn same_reference(&self, version: &BlobVersion) -> bool {
+        matches!(
+            &version.state,
+            BlobVersionState::Reference { source, cached_metadata, .. }
+                if RootEntry::same_source(source, &self.write.version_source)
+                    && source_metadata_matches(cached_metadata, &self.write.metadata)
+        )
+    }
+
+    /// The rows of a new head version, in write order, and its usage update.
+    fn plan_rows(
+        &mut self,
+        existing: Option<BlobVersion>,
+    ) -> Result<Effects, MaterializeReferenceError> {
+        let txn_id = self.txn()?;
+        let write = &self.write;
+        // An offered directory observation is charged only while it is the head.
+        let released =
+            (existing.as_ref()).and_then(|version| version.offered_size(&write.bucket, &write.key));
+        let was_live = existing.is_some_and(|version| !version.is_deleted());
+        let version_id = self.version_id;
+        let next_pointer = CurrentVersionPointer::next_for(self.pointer.as_ref(), version_id)?;
+        let next_pointer = stamp_head(next_pointer, self.binding.as_ref(), self.epoch);
+        let generation = next_pointer.generation;
+        let alias = HeadAliasContext::new(
+            write.realm_id,
+            write.group_id,
+            write.node_id,
+            &write.bucket,
+            &write.key,
+        );
+        let mut rows: VecDeque<Effect> =
+            build_transition_effects(&alias, Some(next_pointer), None, Some(txn_id))?
+                .into_iter()
+                .collect();
+        let version_key = VersionKey::new(&write.bucket, &write.key, version_id);
+        let version = BlobVersion::reference(
+            write.version_source.clone(),
+            write.metadata.clone(),
+            self.now,
+            write.user_id,
+            self.now,
+        )
+        .with_origin(Some(VersionOrigin::Source {
+            job_id: write.job_id,
+        }))
+        .with_policies(std::mem::take(&mut self.policies))?;
+        let version = stamp_version(version, self.binding.as_ref(), generation, self.epoch);
+        let now_ms = self
+            .now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        let uploaded = SourceEvent::data_uploaded(
+            (write.realm_id, write.group_id, write.node_id),
+            (&write.bucket, &write.key),
+            version_id,
+            now_ms,
+        );
+        let effect = write_version_effect(&version_key, &version, Some(txn_id))?;
+        rows.push_back(journaled(effect, &uploaded)?);
+        for (key_space, key, value) in connector_reference_write(&version, &version_key)? {
+            rows.push_back(Effect::Storage(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: Some(txn_id),
+            }));
+        }
+        // The obligation commits with the version, so its fan-out survives a crash.
+        let auth = AuthContext {
+            user_id: write.user_id,
+            realm_id: write.realm_id,
+            path_restrictions: write.restrictions.clone(),
+            session: None,
+        };
+        rows.push_back(build_live_obligation(
+            write.node_id,
+            auth,
+            write.bucket.clone(),
+            write.key.clone(),
+            version_id,
+            false,
+            Some(txn_id),
+        )?);
+        let referenced_bytes = write.metadata.content_length;
+        let added = AddedVersion {
+            version_id,
+            epoch: version.original_epoch,
+            generation,
+            entry: entry_of(&version, referenced_bytes),
+        };
+        let inventory = version_written(self.binding.as_ref(), &write.key, added, true);
+        let usage = UsageCounterUpdate::for_group(
+            write.group_id,
+            UsageDelta {
+                objects: if was_live { 0 } else { 1 },
+                referenced_bytes: i128::from(referenced_bytes) - i128::from(released.unwrap_or(0)),
+                ..Default::default()
+            },
+        )
+        .in_bucket(&write.bucket, RowChange::AddedVersion)
+        .with_inventory(inventory);
+        self.usage = (!usage.is_noop()).then_some(usage);
+        self.rows = rows;
+        self.next_row()
+    }
+
+    /// Writes the next planned row, then runs the usage update, then commits.
+    fn next_row(&mut self) -> Result<Effects, MaterializeReferenceError> {
+        if let Some(row) = self.rows.pop_front() {
+            self.state = WriteState::Rows;
+            return Ok(smallvec![row]);
+        }
+        let txn_id = self.txn()?;
+        match self.usage.as_mut() {
+            Some(usage) => {
+                self.state = WriteState::Usage;
+                Ok(usage.start(txn_id))
+            }
+            None => self.commit((self.version_id, true)),
+        }
+    }
+
+    fn step_inner(&mut self, event: Event) -> Result<Effects, MaterializeReferenceError> {
+        let (bucket, key) = (self.write.bucket.clone(), self.write.key.clone());
+        match (self.state, event) {
+            (WriteState::Begin, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
+                self.txn_id = Some(txn_id);
+                self.state = WriteState::Fence;
+                Ok(smallvec![write_fence_read(&bucket, Some(txn_id))])
+            }
+            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (WriteState::Fence, event) => {
+                check_write_fence(event, &bucket, &key)?;
+                self.read(
+                    WriteState::Bucket,
+                    S3_BUCKET_KEYSPACE,
+                    bucket.as_bytes().into(),
+                )
+            }
+            (WriteState::Bucket, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.bucket_read(value)
+            }
+            (WriteState::Authority, event) => {
+                let binding = self.binding.as_ref().ok_or(StorageError::InvalidEffect)?;
+                self.epoch = record_epoch(binding, &key, event)?;
+                self.named()
+            }
+            (WriteState::Connector, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                let (connector, _) =
+                    (self.write.connector_guard.as_ref()).ok_or(StorageError::InvalidEffect)?;
+                guard_record(connector, value)?;
+                let connector_id = connector.connector_id;
+                self.state = WriteState::Secret;
+                Ok(smallvec![read_secret_effect(
+                    connector_id,
+                    Some(self.txn()?)
+                )])
+            }
+            (WriteState::Secret, event) => {
+                let (connector, fingerprint) =
+                    (self.write.connector_guard.as_ref()).ok_or(StorageError::InvalidEffect)?;
+                let current = match parse_secret_read(event, connector.connector_id) {
+                    Ok(secret) => secret,
+                    Err(StorageReadError::Storage(error)) => return Err(error.into()),
+                    Err(StorageReadError::Conversion(error)) => return Err(error.into()),
+                };
+                if current.as_ref().map(secret_fingerprint) != *fingerprint {
+                    return Err(StorageError::TransactionConflict.into());
+                }
+                self.next_mirror()
+            }
+            (WriteState::Mirror, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                let checked = self.mirror.checked_sub(1);
+                let connector = (checked.and_then(|index| self.write.mirror_guards.get(index)))
+                    .ok_or(StorageError::InvalidEffect)?;
+                guard_record(connector, value)?;
+                self.next_mirror()
+            }
+            (WriteState::Planned, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                let existing = (value.as_ref())
+                    .map(|value| BlobVersion::from_bytes(value.as_ref()))
+                    .transpose()?;
+                match existing {
+                    Some(existing) if self.same_reference(&existing) => {
+                        self.commit((self.version_id, false))
+                    }
+                    Some(_) => Err(StorageError::WriteError(
+                        "planned reference version changed".into(),
+                    )
+                    .into()),
+                    None => self.pointer(),
+                }
+            }
+            (WriteState::Pointer, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.pointer = (value.as_ref())
+                    .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
+                    .transpose()?;
+                match self.pointer.as_ref() {
+                    Some(pointer) => {
+                        let row = VersionKey::new(&bucket, &key, pointer.version_id).to_bytes()?;
+                        self.read(WriteState::Current, BLOB_VERSIONS_KEYSPACE, row.into())
+                    }
+                    None => self.plan_rows(None),
+                }
+            }
+            (WriteState::Current, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                let existing = (value.as_ref())
+                    .map(|value| BlobVersion::from_bytes(value.as_ref()))
+                    .transpose()?;
+                let kept = (self.write.preassigned_version_id.is_none())
+                    .then(|| {
+                        existing
+                            .as_ref()
+                            .filter(|version| self.same_reference(version))
+                    })
+                    .flatten()
+                    .and(self.pointer.as_ref().map(|pointer| pointer.version_id));
+                match kept {
+                    Some(version_id) => self.commit((version_id, false)),
+                    None => self.plan_rows(existing),
+                }
+            }
+            (
+                WriteState::Rows,
+                Event::Storage(
+                    StorageEvent::WriteResult { .. }
+                    | StorageEvent::BatchWriteResult { .. }
+                    | StorageEvent::DeleteResult { .. },
+                ),
+            ) => self.next_row(),
+            (WriteState::Usage, event) => {
+                let txn_id = self.txn()?;
+                let usage = self.usage.as_mut().ok_or(StorageError::InvalidEffect)?;
+                match usage.step(event, txn_id)? {
+                    Some(effects) => Ok(effects),
+                    None => {
+                        self.usage = None;
+                        self.commit((self.version_id, true))
+                    }
+                }
+            }
+            (WriteState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
+                let result = self.result.ok_or(StorageError::InvalidEffect)?;
+                if !result.1 {
+                    self.state = WriteState::Finish;
+                    self.output = Some(Ok(result));
+                    return Ok(smallvec![]);
+                }
+                self.state = WriteState::Schedule;
+                Ok(smallvec![schedule_snapshot_publish()])
+            }
+            // A missed snapshot timer only delays the usage snapshot; the commit stands.
+            (WriteState::Schedule, Event::Task(_)) => {
+                self.state = WriteState::Finish;
+                self.output = self.result.map(Ok);
+                Ok(smallvec![])
+            }
+            (state, event) => Err(StorageError::ReadError(format!(
+                "unexpected event {} in state {state:?}",
+                event.label()
+            ))
+            .into()),
+        }
+    }
+}
+
+/// The connector record must be unchanged since it was resolved.
+fn guard_record(
+    resolved: &SourceConnector,
+    value: Option<Value>,
+) -> Result<(), MaterializeReferenceError> {
+    let current = (value.as_ref())
+        .map(|value| SourceConnector::from_bytes(value.as_ref()))
+        .transpose()?;
+    match current.as_ref() == Some(resolved) {
+        true => Ok(()),
+        false => Err(StorageError::TransactionConflict.into()),
+    }
+}
+
+impl Operation for WriteReferenceOperation {
+    type Output = (Ulid, bool);
+    type Error = MaterializeReferenceError;
+
+    fn start(&mut self) -> Effects {
+        self.state = WriteState::Begin;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if self.state == WriteState::Abort {
+            self.state = WriteState::Error;
+            return smallvec![];
+        }
+        if self.state == WriteState::Commit
+            && let Event::Storage(StorageEvent::Error { error }) = &event
+        {
+            // A failed commit leaves no transaction to abort.
+            let error = error.clone();
+            self.state = WriteState::Error;
+            self.output = Some(Err(error.into()));
+            return smallvec![];
+        }
+        match self.step_inner(event) {
+            Ok(effects) => effects,
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, WriteState::Finish | WriteState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        match self.state {
+            WriteState::Finish | WriteState::Error => self.output.unwrap_or(Err(
+                StorageError::WriteError("the reference write did not finish".into()).into(),
+            )),
+            _ => Err(StorageError::WriteError("the reference write did not finish".into()).into()),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        abort_effects(&mut self.txn_id)
+    }
 }
 
 #[cfg(test)]
