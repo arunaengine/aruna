@@ -13,7 +13,7 @@ use aruna_core::structs::execution::notification::{
 use aruna_core::structs::execution::notification_watch::WatchSubscription;
 use thiserror::Error;
 
-use crate::notifications::unexpected;
+use crate::notifications::unexpected_event;
 
 /// Why a holder gave no answer; the text is the transport's.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -46,17 +46,17 @@ impl Operation for HolderRequestOperation {
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         let request = self.request.take().ok_or(IoError::Unfinished)?;
-        Ok(Next::Call(IoCall::Effect(Effect::Net(
+        Ok(Next::Call(IoCall::from(Effect::Net(
             NetEffect::Notification(request),
         ))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
-        match result {
-            IoResult::Event(Event::Net(NetEvent::Notification(answer))) => answer
+        match result.event()? {
+            Event::Net(NetEvent::Notification(answer)) => answer
                 .map(|answer| Next::Done(*answer))
                 .map_err(RemoteError),
-            other => Err(unexpected("NetEvent::Notification", &other).into()),
+            other => Err(unexpected_event("NetEvent::Notification", &other).into()),
         }
     }
 }
@@ -155,7 +155,7 @@ mod call_tests {
         };
         assert_eq!(
             request.first(),
-            Ok(Next::Call(IoCall::Effect(Effect::Net(
+            Ok(Next::Call(IoCall::from(Effect::Net(
                 NetEffect::Notification(Box::new(sent))
             ))))
         );
@@ -164,7 +164,10 @@ mod call_tests {
             capped: false,
         };
         let event = Event::Net(NetEvent::Notification(Ok(Box::new(answer.clone()))));
-        assert_eq!(request.next(IoResult::Event(event)), Ok(Next::Done(answer)));
+        assert_eq!(
+            request.next(IoResult::Event(Box::new(event))),
+            Ok(Next::Done(answer))
+        );
         assert!(request.first().is_err(), "the request is sent once");
     }
 
@@ -192,7 +195,7 @@ mod call_tests {
         request.first().unwrap();
         let failed = Event::Net(NetEvent::Notification(Err("closed".to_string())));
         assert_eq!(
-            request.next(IoResult::Event(failed)),
+            request.next(IoResult::Event(Box::new(failed))),
             Err(RemoteError("closed".to_string()))
         );
         assert!(request.next(IoResult::Done).is_err());

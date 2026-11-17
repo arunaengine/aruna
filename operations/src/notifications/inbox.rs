@@ -19,7 +19,7 @@ use aruna_core::structs::execution::notification::{
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use thiserror::Error;
 
-use crate::notifications::unexpected;
+use crate::notifications::{unexpected, unexpected_event};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum InboxError {
@@ -152,7 +152,7 @@ impl UpsertInboxOperation {
             IoCall::Delete(deletes) => StorageEffect::BatchDelete { deletes, txn_id },
             other => return Ok(Next::Call(other)),
         };
-        Ok(Next::Call(IoCall::Effect(Effect::Storage(effect))))
+        Ok(Next::Call(IoCall::from(Effect::Storage(effect))))
     }
 
     fn read_cutoffs(&mut self) -> Turn {
@@ -402,8 +402,12 @@ impl UpsertInboxOperation {
 
 /// The plain result of a storage effect run in the caller's transaction.
 fn plain(result: IoResult) -> Result<IoResult, InboxError> {
-    let IoResult::Event(Event::Storage(event)) = result else {
+    let IoResult::Event(event) = result else {
         return Ok(result);
+    };
+    let event = match *event {
+        Event::Storage(event) => event,
+        other => return Err(unexpected_event("a storage result", &other).into()),
     };
     match event {
         StorageEvent::BatchReadResult { values } => Ok(IoResult::Values(
@@ -420,9 +424,7 @@ fn plain(result: IoResult) -> Result<IoResult, InboxError> {
             Ok(IoResult::Done)
         }
         StorageEvent::Error { error } => Err(IoError::Storage(error).into()),
-        other => {
-            Err(unexpected("a storage result", &IoResult::Event(Event::Storage(other))).into())
-        }
+        other => Err(unexpected_event("a storage result", &Event::Storage(other)).into()),
     }
 }
 
@@ -878,20 +880,21 @@ mod call_tests {
     fn within_caller_transaction() {
         let mut upsert = UpsertInboxOperation::within(vec![notice()], TXN);
         assert!(!upsert.transaction());
+        let Ok(Next::Call(IoCall::Effect(effect))) = upsert.first() else {
+            panic!("a storage effect");
+        };
         assert!(matches!(
-            upsert.first(),
-            Ok(Next::Call(IoCall::Effect(Effect::Storage(
-                StorageEffect::BatchRead {
-                    txn_id: Some(TXN),
-                    ..
-                }
-            ))))
+            *effect,
+            Effect::Storage(StorageEffect::BatchRead {
+                txn_id: Some(TXN),
+                ..
+            })
         ));
         let conflict = Event::Storage(StorageEvent::Error {
             error: StorageError::TransactionConflict,
         });
         assert_eq!(
-            upsert.next(IoResult::Event(conflict)),
+            upsert.next(IoResult::Event(Box::new(conflict))),
             Err(InboxError::Conflict)
         );
     }

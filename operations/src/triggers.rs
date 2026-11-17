@@ -85,6 +85,9 @@ fn timer_turn<O: TimerRun>(
         Ok(Next::Call(call)) => Ok(Next::Call(call)),
         Ok(Next::Wait) => Ok(Next::Wait),
         Ok(Next::Done(output)) => O::rearm(Ok(output)).map(Next::Done),
+        Ok(Next::Then { output, calls }) => {
+            O::rearm(Ok(output)).map(|output| Next::Then { output, calls })
+        }
         Err(error) => O::rearm(Err(error)).map(Next::Done),
     }
 }
@@ -243,6 +246,9 @@ fn peer_turn<O: PeerRun>(
         Ok(Next::Call(call)) => Ok(Next::Call(call)),
         Ok(Next::Wait) => Ok(Next::Wait),
         Ok(Next::Done(output)) => O::answer(Ok(output)).map(Next::Done),
+        Ok(Next::Then { output, calls }) => {
+            O::answer(Ok(output)).map(|output| Next::Then { output, calls })
+        }
         Err(error) => O::answer(Err(error)).map(Next::Done),
     }
 }
