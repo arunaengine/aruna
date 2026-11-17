@@ -23,21 +23,11 @@ use tokio::time::{Instant, timeout_at};
 use tracing::{debug, warn};
 
 use crate::driver::{DriverContext, drive, drive_retry_until};
-use crate::notifications::checks::{message_realm, validate_watch_events, verify_recipient_holder};
-use crate::notifications::dispatch::{list_on_holder, mark_on_holder, unread_on_holder};
-use crate::notifications::mark_read::MARK_MAX_IDS;
+use crate::notifications::checks::{message_realm, validate_watch_events};
 use crate::triggers::{PeerInput, peer_operation};
 
-use crate::notifications::watch::authorization::{
-    authorize_forwarded_watch, list_authorized_subscriptions,
-};
 use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::expand::expand_watch_events;
-use crate::notifications::watch::paths::WatchAuthorization;
-use crate::notifications::watch::records::{
-    WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE,
-};
-use crate::notifications::watch::subscriptions::create_holder_watch;
 
 const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -122,120 +112,6 @@ async fn build_response(
     let local_node_id = net_handle.node_id();
 
     match message {
-        NotificationTransportMessage::List {
-            recipient,
-            cursor,
-            limit,
-        } => {
-            if let Err(reason) = verify_recipient_holder(&recipient, &realm_config, local_node_id) {
-                return NotificationTransportMessage::Reject(reason);
-            }
-            match list_on_holder(context, recipient, cursor, limit as usize).await {
-                Ok((records, next_cursor)) => NotificationTransportMessage::ListResult {
-                    records,
-                    next_cursor,
-                },
-                Err(error) => NotificationTransportMessage::Reject(error),
-            }
-        }
-        NotificationTransportMessage::UnreadCount { recipient } => {
-            if let Err(reason) = verify_recipient_holder(&recipient, &realm_config, local_node_id) {
-                return NotificationTransportMessage::Reject(reason);
-            }
-            match unread_on_holder(context, recipient).await {
-                Ok((count, capped)) => {
-                    NotificationTransportMessage::UnreadCountResult { count, capped }
-                }
-                Err(error) => NotificationTransportMessage::Reject(error),
-            }
-        }
-        NotificationTransportMessage::MarkRead {
-            recipient,
-            ids,
-            up_to_ms,
-        } => {
-            if ids.len() > MARK_MAX_IDS {
-                return NotificationTransportMessage::Reject(format!(
-                    "mark read id count {} exceeds cap {MARK_MAX_IDS}",
-                    ids.len()
-                ));
-            }
-            if let Err(reason) = verify_recipient_holder(&recipient, &realm_config, local_node_id) {
-                return NotificationTransportMessage::Reject(reason);
-            }
-            match mark_on_holder(context, recipient, ids, up_to_ms).await {
-                Ok(marked) => {
-                    if marked > 0 {
-                        net_handle.notify_inbox_activity(recipient);
-                    }
-                    NotificationTransportMessage::MarkReadResult { marked }
-                }
-                Err(error) => NotificationTransportMessage::Reject(error),
-            }
-        }
-        NotificationTransportMessage::CreateWatch {
-            owner,
-            path_prefix,
-            event_mask,
-            authorization,
-        } => {
-            if let Err(reason) = verify_recipient_holder(&owner, &realm_config, local_node_id) {
-                return NotificationTransportMessage::Reject(reason);
-            }
-
-            match authorize_forwarded_watch(
-                context,
-                realm_id,
-                owner,
-                &path_prefix,
-                event_mask,
-                &authorization,
-            )
-            .await
-            {
-                Ok(WatchAuthorization::Authorized) => {}
-                Ok(WatchAuthorization::Denied(reason)) => {
-                    return NotificationTransportMessage::Reject(format!(
-                        "{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}",
-                        reason.metric_reason().as_str()
-                    ));
-                }
-                Ok(WatchAuthorization::Unavailable(_)) => {
-                    return NotificationTransportMessage::Reject(
-                        WATCH_SUBSCRIPTION_UNAVAILABLE.to_string(),
-                    );
-                }
-                Err(error) => return NotificationTransportMessage::Reject(error),
-            }
-
-            match create_holder_watch(
-                context,
-                local_node_id,
-                owner,
-                path_prefix,
-                event_mask,
-                authorization,
-                unix_timestamp_millis(),
-            )
-            .await
-            {
-                Ok(subscription) => {
-                    let _ = drive(InterestOperation::publish(), context).await;
-                    NotificationTransportMessage::WatchCreated { subscription }
-                }
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
-            }
-        }
-        NotificationTransportMessage::ListWatches { owner } => {
-            if let Err(reason) = verify_recipient_holder(&owner, &realm_config, local_node_id) {
-                return NotificationTransportMessage::Reject(reason);
-            }
-
-            match list_authorized_subscriptions(context, owner).await {
-                Ok(subscriptions) => NotificationTransportMessage::WatchList { subscriptions },
-                Err(error) => NotificationTransportMessage::Reject(error),
-            }
-        }
         NotificationTransportMessage::DeliverWatchEvents { events } => {
             if let Err(reason) = validate_watch_events(&events, realm_id, unix_timestamp_millis()) {
                 return NotificationTransportMessage::Reject(reason);
@@ -257,8 +133,13 @@ async fn build_response(
                 Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
-        // The trigger table answers a delivery and a watch deletion.
-        NotificationTransportMessage::DeliverBatch { .. }
+        // The trigger table answers every other request before this shell.
+        NotificationTransportMessage::List { .. }
+        | NotificationTransportMessage::UnreadCount { .. }
+        | NotificationTransportMessage::MarkRead { .. }
+        | NotificationTransportMessage::CreateWatch { .. }
+        | NotificationTransportMessage::ListWatches { .. }
+        | NotificationTransportMessage::DeliverBatch { .. }
         | NotificationTransportMessage::DeleteWatch { .. }
         | NotificationTransportMessage::DeliverAck { .. }
         | NotificationTransportMessage::ListResult { .. }
