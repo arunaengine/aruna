@@ -19,7 +19,7 @@ const HIT_TYPE_MAX: usize = 8;
 
 /// Human-readable title for a search hit. Always returns a non-empty string,
 /// falling back through the schema name, the document path or subject IRI.
-pub(crate) fn hit_title(
+pub fn hit_title(
     properties: &[(String, Term)],
     document_path: &str,
     subject_iri: &str,
@@ -47,7 +47,7 @@ pub(crate) fn hit_title(
 
 /// The matched subject's `rdf:type` IRIs, in describe order and capped at
 /// [`HIT_TYPE_MAX`]. Empty when the subject carries no named type.
-pub(crate) fn hit_types(properties: &[(String, Term)]) -> Vec<String> {
+pub fn hit_types(properties: &[(String, Term)]) -> Vec<String> {
     properties
         .iter()
         .filter(|(property, _)| property == RDF_TYPE)
@@ -61,7 +61,7 @@ pub(crate) fn hit_types(properties: &[(String, Term)]) -> Vec<String> {
 
 /// Query-relevant snippet windowed around the first matching token, or a prefix
 /// of the indexed literals when no token matches. `None` when there is no text.
-pub(crate) fn hit_snippet(properties: &[(String, Term)], query: &str) -> Option<String> {
+pub fn hit_snippet(properties: &[(String, Term)], query: &str) -> Option<String> {
     let mut text = String::new();
     for predicate in [
         SCHEMA_NAME,
