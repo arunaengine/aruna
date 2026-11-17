@@ -31,7 +31,7 @@ use super::offer::{OfferLaunchOperation, OfferOutcome};
 use super::plan::build_plan;
 use super::witness_arm::{
     ArmFamilyOperation, ChangeDeadlineOperation, DEADLINE_KEY_BYTES, DeadlineChange,
-    WitnessDeadline, deadline_index_key, deadline_key,
+    WitnessDeadline, WitnessExplain, deadline_index_key, deadline_key,
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
@@ -51,18 +51,6 @@ pub const WITNESS_RETRY_AFTER: Duration = Duration::from_secs(1);
 const OFFER_DEADLINE: Duration = Duration::from_secs(30);
 /// Declined targets one explain row retains.
 const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
-
-/// The bounded plan this witness stored before it launched, with the targets
-/// that already refused this request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WitnessExplain {
-    pub sequence: u32,
-    pub plan: ExecutionPlan,
-    pub declined: Vec<ExecutionTargetId>,
-    /// The previous launch was never confirmed, so this one may overlap it.
-    pub overlapping: bool,
-    pub stored_at_ms: u64,
-}
 
 /// Arms this node's fallback for one family; see [`ArmFamilyOperation`].
 pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u64) {
@@ -770,13 +758,6 @@ async fn change_deadline(
 ) -> bool {
     let operation = ChangeDeadlineOperation::new(*family, change);
     drive(operation, context).await.unwrap_or(false)
-}
-
-pub(super) async fn has_deadline(context: &DriverContext, family: JobFamilyId) -> bool {
-    match read_deadline_index(context, &family).await {
-        Ok(deadline) => deadline.is_some(),
-        Err(_) => true,
-    }
 }
 
 fn lost_target_expired(created_at_ms: u64, now_ms: u64, window_ms: u64) -> bool {

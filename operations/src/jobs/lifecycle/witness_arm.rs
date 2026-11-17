@@ -5,11 +5,13 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::Effect;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DEADLINE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
+use aruna_core::scheduling::ExecutionPlan;
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind,
@@ -35,6 +37,18 @@ pub(super) const DEADLINE_KEY_BYTES: usize = 8 + 64;
 pub struct WitnessDeadline {
     pub due_at_ms: u64,
     pub rank: u32,
+}
+
+/// The bounded plan this witness stored before it launched, with the targets
+/// that already refused this request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessExplain {
+    pub sequence: u32,
+    pub plan: ExecutionPlan,
+    pub declined: Vec<ExecutionTargetId>,
+    /// The previous launch was never confirmed, so this one may overlap it.
+    pub overlapping: bool,
+    pub stored_at_ms: u64,
 }
 
 /// Kicks the witness queue without persisting a timer of its own.
@@ -469,5 +483,4 @@ mod tests {
         };
         assert!(deadline_key(&family, 1) < deadline_key(&family, 2));
     }
-
 }
