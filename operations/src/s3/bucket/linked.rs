@@ -360,7 +360,7 @@ pub async fn read_bucket_job(
     };
     let values = match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => return Err(format!("could not read the bucket job: {other:?}")),
+        other => return Err(format!("could not read the bucket job: {}", other.label())),
     };
     let mut values = values.into_iter().map(|(_, value)| value);
     let mut next = || values.next().flatten();
@@ -619,7 +619,12 @@ async fn store_once(
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("could not start a job transaction: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not start a job transaction: {}",
+                other.label()
+            ));
+        }
     };
     let read = StorageEffect::Read {
         key_space: LINKED_JOB_KEYSPACE.to_string(),
@@ -632,7 +637,7 @@ async fn store_once(
             storage
                 .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                 .await;
-            return Err(format!("could not read the job: {other:?}"));
+            return Err(format!("could not read the job: {}", other.label()));
         }
     };
     let stored = stored.as_deref().map(LinkedJob::from_bytes).transpose();
@@ -682,7 +687,7 @@ async fn store_once(
         Event::Storage(StorageEvent::Error {
             error: StorageError::TransactionConflict,
         }) => Ok(false),
-        other => Err(format!("could not store the job: {other:?}")),
+        other => Err(format!("could not store the job: {}", other.label())),
     }
 }
 

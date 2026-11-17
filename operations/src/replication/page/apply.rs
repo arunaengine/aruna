@@ -204,7 +204,7 @@ impl PageApplyOperation {
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
             (state, event) => Err(PageError::UnexpectedEvent {
                 state: state_name(state),
-                received: format!("{event:?}"),
+                received: event.label().to_string(),
             }),
         }
     }

@@ -338,7 +338,7 @@ pub async fn bucket_runs(
                 values,
                 next_start_after,
             }) => (values, next_start_after),
-            other => return Err(OriginError::Storage(format!("{other:?}"))),
+            other => return Err(OriginError::Storage(other.label().to_string())),
         };
         scanned += heads.len();
         for (head, pointer) in heads {
@@ -463,7 +463,7 @@ async fn read(
         Event::Storage(StorageEvent::Error { error }) => {
             Err(OriginError::Storage(error.to_string()))
         }
-        other => Err(OriginError::Storage(format!("{other:?}"))),
+        other => Err(OriginError::Storage(other.label().to_string())),
     }
 }
 

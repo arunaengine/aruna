@@ -314,7 +314,7 @@ impl MintSuccessorOperation {
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
             (state, event) => Err(MintError::UnexpectedEvent {
                 state,
-                received: format!("{event:?}"),
+                received: event.label().to_string(),
             }),
         }
     }

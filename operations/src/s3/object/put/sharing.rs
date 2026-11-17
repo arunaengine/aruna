@@ -77,7 +77,7 @@ impl ReaderScan {
             next_start_after,
         }) = event
         else {
-            return Err(format!("unexpected answer {event:?}"));
+            return Err(format!("unexpected answer {}", event.label()));
         };
         for (_, value) in values {
             let rule = BackendImport::from_bytes(&value).map_err(|error| error.to_string())?;

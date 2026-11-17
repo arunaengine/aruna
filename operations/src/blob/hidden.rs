@@ -124,7 +124,10 @@ async fn load_cursor(storage: &StorageHandle, deadline: Instant) -> Result<Sweep
         }) => postcard::from_bytes(value.as_ref()).map_err(|error| error.to_string()),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(SweepCursor::default()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected hidden sweep cursor event: {other:?}")),
+        other => Err(format!(
+            "unexpected hidden sweep cursor event: {}",
+            other.label()
+        )),
     }
 }
 
@@ -148,7 +151,10 @@ async fn save_cursor(
     match event {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected hidden sweep cursor event: {other:?}")),
+        other => Err(format!(
+            "unexpected hidden sweep cursor event: {}",
+            other.label()
+        )),
     }
 }
 
@@ -552,7 +558,10 @@ async fn read_value(
         }) => Ok(Some(value)),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected sweep metadata event: {other:?}")),
+        other => Err(format!(
+            "unexpected sweep metadata event: {}",
+            other.label()
+        )),
     }
 }
 
@@ -603,7 +612,10 @@ async fn list_hidden(
             next_cursor,
         }) => Ok((entries, next_cursor)),
         Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
-        other => Err(format!("unexpected hidden blob list event: {other:?}")),
+        other => Err(format!(
+            "unexpected hidden blob list event: {}",
+            other.label()
+        )),
     }
 }
 
@@ -624,7 +636,10 @@ async fn delete_key(
     match event {
         Event::Blob(BlobEvent::HiddenDeleted) => Ok(()),
         Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
-        other => Err(format!("unexpected hidden blob delete event: {other:?}")),
+        other => Err(format!(
+            "unexpected hidden blob delete event: {}",
+            other.label()
+        )),
     }
 }
 
@@ -677,7 +692,10 @@ async fn delete_unclaimed(
         }
         other => {
             abort_txn(storage, txn_id).await?;
-            return Err(format!("unexpected upload cleanup read event: {other:?}"));
+            return Err(format!(
+                "unexpected upload cleanup read event: {}",
+                other.label()
+            ));
         }
     };
     let record: RoCrateUploadRecord = match postcard::from_bytes(value.as_ref()) {
@@ -726,7 +744,10 @@ async fn delete_unclaimed(
         abort_txn(storage, txn_id).await?;
         return match event {
             Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-            other => Err(format!("unexpected upload cleanup delete event: {other:?}")),
+            other => Err(format!(
+                "unexpected upload cleanup delete event: {}",
+                other.label()
+            )),
         };
     }
     match commit_txn(storage, txn_id, deadline).await {
@@ -758,7 +779,8 @@ async fn delete_cleanup(
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!(
-            "unexpected upload cleanup row delete event: {other:?}"
+            "unexpected upload cleanup row delete event: {}",
+            other.label()
         )),
     }
 }
@@ -774,7 +796,8 @@ async fn start_txn(storage: &StorageHandle, deadline: Instant) -> Result<TxnId, 
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!(
-            "unexpected upload cleanup transaction event: {other:?}"
+            "unexpected upload cleanup transaction event: {}",
+            other.label()
         )),
     }
 }
@@ -807,7 +830,10 @@ async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<(), String>
     match event {
         Event::Storage(StorageEvent::TransactionAborted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected upload cleanup abort event: {other:?}")),
+        other => Err(format!(
+            "unexpected upload cleanup abort event: {}",
+            other.label()
+        )),
     }
 }
 

@@ -84,7 +84,7 @@ pub(super) async fn live_obligations_exist(
     {
         Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -241,7 +241,7 @@ pub(super) async fn retire_obligations(
         }
         return Ok(());
     }
-    let unexpected = |other: Event| BlobQueueError::UnexpectedEvent(format!("{other:?}"));
+    let unexpected = |other: Event| BlobQueueError::UnexpectedEvent(other.label().to_string());
     // One drain at a time creates or parks member jobs, so this read needs no transaction.
     let existing = read_existing_jobs(storage, &jobs).await?;
     // Only a drain sets continuations; any other rewrite owes just the jobs queued here.
@@ -369,7 +369,7 @@ async fn read_existing_jobs(
         // A range holding more rows than `jobs` is read key by key.
         Event::Storage(StorageEvent::IterResult { .. }) => {}
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => return Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
     let reads = (keys.into_iter())
         .map(|key| (REPLICATION_JOB_KEYSPACE.to_string(), key))
@@ -385,7 +385,7 @@ async fn read_existing_jobs(
             Ok(values.into_iter().map(|(_, value)| value).collect())
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -423,7 +423,7 @@ async fn read_live_obligations(
             Ok((obligations, next_start_after.map(|key| key.to_vec())))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -439,7 +439,7 @@ pub(super) async fn write_live_obligation(
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
         }
     };
     let (current, valid) = match storage
@@ -463,7 +463,7 @@ pub(super) async fn write_live_obligation(
         }
         other => {
             abort_cursor(storage, txn_id).await;
-            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
         }
     };
     let should_write = !valid
@@ -495,7 +495,7 @@ pub(super) async fn write_live_obligation(
         }
         other => {
             abort_cursor(storage, txn_id).await;
-            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
         }
     }
     match storage
@@ -504,7 +504,7 @@ pub(super) async fn write_live_obligation(
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -540,7 +540,7 @@ pub(super) async fn read_relationships_limit(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+                return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
             }
         };
         for (key, value) in values {
@@ -718,7 +718,7 @@ async fn persist_live_jobs(
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
         }
     };
     if values.len() != jobs.len() {
@@ -757,7 +757,7 @@ async fn persist_live_jobs(
             progressed: true,
         }),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -792,7 +792,7 @@ async fn read_inbound_source(
             Ok(Some(relationship.source))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -808,7 +808,7 @@ pub(super) async fn delete_live_obligation(
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
         }
     };
     let current = match storage
@@ -826,7 +826,7 @@ pub(super) async fn delete_live_obligation(
         }
         other => {
             abort_cursor(storage, txn_id).await;
-            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
         }
     };
     let should_delete = match current {
@@ -855,7 +855,7 @@ pub(super) async fn delete_live_obligation(
         }
         other => {
             abort_cursor(storage, txn_id).await;
-            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
         }
     }
     match storage
@@ -864,7 +864,7 @@ pub(super) async fn delete_live_obligation(
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -881,7 +881,7 @@ async fn read_obligation_cursor(
             .filter(|value| !value.is_empty())
             .map(|value| value.to_vec())),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -910,6 +910,6 @@ async fn write_obligation_cursor(
     match storage.send_storage_effect(write).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }

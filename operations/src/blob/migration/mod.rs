@@ -1625,7 +1625,12 @@ pub async fn rename_request(
     };
     let value = match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => return Err(format!("could not read the rename request: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not read the rename request: {}",
+                other.label()
+            ));
+        }
     };
     let request = value
         .map(|value| RenameRequest::from_bytes(&value))
@@ -1813,7 +1818,10 @@ async fn encrypting(context: &crate::driver::DriverContext, bucket: &Key) -> Res
                 .map(|settings| settings.is_encrypted())
                 .map_err(|error| error.to_string())
         }
-        other => Err(format!("could not read encryption settings: {other:?}")),
+        other => Err(format!(
+            "could not read encryption settings: {}",
+            other.label()
+        )),
     }
 }
 
@@ -1834,7 +1842,10 @@ async fn read_progress(
             .map(|value| CompressionMigration::from_bytes(value.as_ref()))
             .transpose()
             .map_err(|error| error.to_string()),
-        other => Err(format!("could not read migration progress: {other:?}")),
+        other => Err(format!(
+            "could not read migration progress: {}",
+            other.label()
+        )),
     }
 }
 
@@ -2079,7 +2090,7 @@ async fn read_ahead(
             .map(|value| MigrationAhead::from_bytes(&value))
             .transpose()
             .map_err(|error| error.to_string()),
-        other => Err(format!("could not read the rows ahead: {other:?}")),
+        other => Err(format!("could not read the rows ahead: {}", other.label())),
     }
 }
 
@@ -2110,7 +2121,7 @@ async fn stage_ahead(
         Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
             Ok(())
         }
-        other => Err(format!("could not store the rows ahead: {other:?}")),
+        other => Err(format!("could not store the rows ahead: {}", other.label())),
     }
 }
 
@@ -2166,7 +2177,7 @@ async fn read_handover(
             .map(|value| postcard::from_bytes(&value))
             .transpose()
             .map_err(|error| error.to_string()),
-        other => Err(format!("could not read the hand-over: {other:?}")),
+        other => Err(format!("could not read the hand-over: {}", other.label())),
     }
 }
 
@@ -2195,7 +2206,7 @@ async fn store_handover(
         Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
             Ok(())
         }
-        other => Err(format!("could not store the hand-over: {other:?}")),
+        other => Err(format!("could not store the hand-over: {}", other.label())),
     }
 }
 
@@ -2262,7 +2273,7 @@ async fn hand_over_moves(
             };
             match context.storage_handle.send_storage_effect(write).await {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-                other => return Err(format!("could not hand over the moves: {other:?}")),
+                other => return Err(format!("could not hand over the moves: {}", other.label())),
             }
         }
         match next {
@@ -2297,7 +2308,12 @@ pub async fn settle_move(
     };
     let present = match storage.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
-        other => return Err(format!("could not read the moved version: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not read the moved version: {}",
+                other.label()
+            ));
+        }
     };
     let routing = match present {
         true => move_routing(context, &version.bucket).await?,
@@ -2366,7 +2382,7 @@ async fn read_path(
     };
     let value = match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => return Err(format!("could not read a version: {other:?}")),
+        other => return Err(format!("could not read a version: {}", other.label())),
     };
     let Some(value) = value else {
         return Ok(None);
@@ -2383,7 +2399,7 @@ async fn read_path(
             .map(|value| BackendLocation::from_bytes(&value).map(|found| found.backend_path))
             .transpose()
             .map_err(|error| error.to_string()),
-        other => Err(format!("could not read a location: {other:?}")),
+        other => Err(format!("could not read a location: {}", other.label())),
     }
 }
 
@@ -2453,7 +2469,10 @@ async fn abandon(
     };
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(true),
-        other => Err(format!("could not queue the abandoned copy: {other:?}")),
+        other => Err(format!(
+            "could not queue the abandoned copy: {}",
+            other.label()
+        )),
     }
 }
 
@@ -2504,7 +2523,10 @@ async fn drop_intents(
     };
     match context.storage_handle.send_storage_effect(delete).await {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(true),
-        other => Err(format!("could not drop the move's intents: {other:?}")),
+        other => Err(format!(
+            "could not drop the move's intents: {}",
+            other.label()
+        )),
     }
 }
 
@@ -2561,7 +2583,12 @@ async fn store_progress(
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("could not start a progress transaction: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not start a progress transaction: {}",
+                other.label()
+            ));
+        }
     };
     let staged = stage_progress(storage, txn_id, bucket, record, ahead).await;
     if !matches!(staged, Ok(true)) {
@@ -2575,7 +2602,10 @@ async fn store_progress(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        other => Err(format!("migration progress was not stored: {other:?}")),
+        other => Err(format!(
+            "migration progress was not stored: {}",
+            other.label()
+        )),
     }
 }
 
@@ -2603,7 +2633,12 @@ async fn stage_progress(
             CompressionMigration::from_bytes(value.as_ref()).map_err(|error| error.to_string())?
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(false),
-        other => return Err(format!("could not read migration progress: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not read migration progress: {}",
+                other.label()
+            ));
+        }
     };
     // An aborted move keeps the end its abort wrote.
     let ended = stored.finished_at_ms.is_some();
@@ -2621,7 +2656,12 @@ async fn stage_progress(
         .await
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => return Err(format!("could not write migration progress: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not write migration progress: {}",
+                other.label()
+            ));
+        }
     }
     if let Some(ahead) = ahead {
         stage_ahead(storage, txn_id, bucket, ahead).await?;
@@ -2636,7 +2676,12 @@ async fn stage_progress(
         };
         let request = match storage.send_storage_effect(read).await {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-            other => return Err(format!("could not read the rename request: {other:?}")),
+            other => {
+                return Err(format!(
+                    "could not read the rename request: {}",
+                    other.label()
+                ));
+            }
         };
         let request = request.as_deref().map(RenameRequest::from_bytes);
         let aborted = request
@@ -2653,7 +2698,12 @@ async fn stage_progress(
             };
             match storage.send_storage_effect(delete).await {
                 Event::Storage(StorageEvent::DeleteResult { .. }) => {}
-                other => return Err(format!("could not leave the migration queue: {other:?}")),
+                other => {
+                    return Err(format!(
+                        "could not leave the migration queue: {}",
+                        other.label()
+                    ));
+                }
             }
         }
     }

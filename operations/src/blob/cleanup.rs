@@ -77,7 +77,7 @@ async fn drop_rows(
     };
     match context.storage_handle.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(false),
-        other => Err(format!("could not drop rows: {other:?}")),
+        other => Err(format!("could not drop rows: {}", other.label())),
     }
 }
 
@@ -206,7 +206,10 @@ async fn read_cursor(context: &DriverContext) -> Result<Option<Key>, String> {
     };
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        other => Err(format!("could not read the cleanup cursor: {other:?}")),
+        other => Err(format!(
+            "could not read the cleanup cursor: {}",
+            other.label()
+        )),
     }
 }
 
@@ -229,7 +232,10 @@ async fn store_cursor(context: &DriverContext, cursor: Option<Key>) -> Result<()
         Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
             Ok(())
         }
-        other => Err(format!("could not store the cleanup cursor: {other:?}")),
+        other => Err(format!(
+            "could not store the cleanup cursor: {}",
+            other.label()
+        )),
     }
 }
 
@@ -361,7 +367,10 @@ async fn delete_cleanup_rows(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected cleanup delete event: {other:?}")),
+        other => Err(format!(
+            "unexpected cleanup delete event: {}",
+            other.label()
+        )),
     }
 }
 

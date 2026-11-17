@@ -780,7 +780,7 @@ pub(super) async fn read_job_relationships(
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
         }
     };
     if values.len() != keys.len() {
@@ -825,7 +825,7 @@ pub(super) async fn read_replication_cursor(
             value: Some(value), ..
         }) => Ok(postcard::from_bytes(value.as_ref()).unwrap_or_default()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -877,7 +877,7 @@ pub(super) async fn advance_replication_cursor(
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
         }
     };
     let (current, valid) = match storage
@@ -903,7 +903,7 @@ pub(super) async fn advance_replication_cursor(
         }
         other => {
             abort_cursor(storage, txn_id).await;
-            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
         }
     };
     let merged = cursor_merge(candidate, current.clone());
@@ -914,7 +914,7 @@ pub(super) async fn advance_replication_cursor(
         {
             Event::Storage(StorageEvent::TransactionAborted { .. }) => Ok(()),
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+            other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
         }
     } else {
         let value = postcard::to_allocvec(&merged).map_err(ConversionError::from)?;
@@ -934,7 +934,7 @@ pub(super) async fn advance_replication_cursor(
             }
             other => {
                 abort_cursor(storage, txn_id).await;
-                return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+                return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
             }
         }
         match storage
@@ -943,7 +943,7 @@ pub(super) async fn advance_replication_cursor(
         {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+            other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
         }
     }
 }
@@ -975,7 +975,7 @@ pub(super) async fn scan_due_jobs(
         }) => (values, next_start_after),
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+            return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
         }
     };
     let mut last_key;
@@ -1085,7 +1085,7 @@ async fn read_blob_job(
         }) => Ok(Some(BlobJobRecord::from_bytes(&value)?)),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -1105,7 +1105,7 @@ pub(super) async fn write_blob_job(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -1120,7 +1120,7 @@ async fn delete_blob_job(storage: &StorageHandle, key: Vec<u8>) -> Result<(), Bl
     {
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -1158,7 +1158,7 @@ pub(super) async fn reschedule_blob_job(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(due_at_ms),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -1186,7 +1186,7 @@ pub(super) async fn read_relationships(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
+                return Err(BlobQueueError::UnexpectedEvent(other.label().to_string()));
             }
         };
         for (key, value) in values {

@@ -121,7 +121,7 @@ impl Operation for QueuedNodesOperation {
                     self.state = QueuedState::Error;
                     self.output = Some(Err(LocationSummaryError::Unexpected {
                         state: "queued_scan",
-                        event: format!("{event:?}"),
+                        event: event.label().to_string(),
                     }));
                     return smallvec![];
                 };

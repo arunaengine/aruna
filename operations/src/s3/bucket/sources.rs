@@ -157,7 +157,7 @@ impl Operation for BucketSourcesOperation {
                     next_start_after,
                 }),
             ) => self.imports_read(values, next_start_after.is_none()),
-            (_, event) => Err(SourcesError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => Err(SourcesError::UnexpectedEvent(event.label().to_string())),
         };
         result.unwrap_or_else(|error| {
             self.state = SourcesState::Error;

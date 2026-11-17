@@ -229,7 +229,7 @@ impl Operation for QueueBlobOperation {
             QueueBlobState::ClearConsent => match event {
                 Event::Storage(StorageEvent::DeleteResult { .. }) => self.read_existing(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
             },
             QueueBlobState::ReadExisting => match event {
                 Event::Storage(StorageEvent::ReadResult {
@@ -242,14 +242,14 @@ impl Operation for QueueBlobOperation {
                 },
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.write_job(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
             },
             QueueBlobState::WriteJob => match event {
                 Event::Storage(
                     StorageEvent::WriteResult { .. } | StorageEvent::BatchWriteResult { .. },
                 ) => self.schedule_drain(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
             },
             QueueBlobState::ScheduleDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(true),
@@ -459,7 +459,7 @@ impl Operation for LiveVersionOperation {
                     self.read_obligation()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
             },
             LiveVersionState::ReadObligation => match event {
                 Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
@@ -474,16 +474,18 @@ impl Operation for LiveVersionOperation {
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.abort_obligation(Some(error.into()))
                 }
-                other => self
-                    .abort_obligation(Some(BlobQueueError::UnexpectedEvent(format!("{other:?}")))),
+                other => self.abort_obligation(Some(BlobQueueError::UnexpectedEvent(
+                    other.label().to_string(),
+                ))),
             },
             LiveVersionState::WriteObligation => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => self.commit_obligation(),
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.abort_obligation(Some(error.into()))
                 }
-                other => self
-                    .abort_obligation(Some(BlobQueueError::UnexpectedEvent(format!("{other:?}")))),
+                other => self.abort_obligation(Some(BlobQueueError::UnexpectedEvent(
+                    other.label().to_string(),
+                ))),
             },
             LiveVersionState::CommitObligation => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.schedule_drain(),
@@ -491,7 +493,7 @@ impl Operation for LiveVersionOperation {
                     error: StorageError::TransactionConflict,
                 }) => self.schedule_drain(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
             },
             LiveVersionState::AbortObligation => match event {
                 Event::Storage(StorageEvent::TransactionAborted { .. }) => {
@@ -501,7 +503,7 @@ impl Operation for LiveVersionOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(BlobQueueError::UnexpectedEvent(other.label().to_string())),
             },
             LiveVersionState::ScheduleDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish(0, true),
@@ -702,7 +704,9 @@ impl Operation for JobStatsOperation {
                 smallvec![]
             }
             (_, event) => {
-                self.output = Some(Err(BlobQueueError::UnexpectedEvent(format!("{event:?}"))));
+                self.output = Some(Err(BlobQueueError::UnexpectedEvent(
+                    event.label().to_string(),
+                )));
                 smallvec![]
             }
         }

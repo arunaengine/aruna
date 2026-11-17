@@ -108,7 +108,7 @@ impl Operation for ConsentStoreOperation {
                 ),
             ) => Ok(()),
             (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(PlaintextError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => Err(PlaintextError::UnexpectedEvent(event.label().to_string())),
         });
         smallvec![]
     }
@@ -273,7 +273,9 @@ impl Operation for HolderCheckOperation {
             (HolderState::ReadGrant, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
                 self.grant_read(value)
             }
-            (_, event) => self.done(Err(PlaintextError::UnexpectedEvent(format!("{event:?}")))),
+            (_, event) => self.done(Err(PlaintextError::UnexpectedEvent(
+                event.label().to_string(),
+            ))),
         }
     }
 
@@ -317,7 +319,7 @@ impl Operation for ConsentReadOperation {
                 decode_requester(value.as_deref())
             }
             (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(PlaintextError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => Err(PlaintextError::UnexpectedEvent(event.label().to_string())),
         });
         smallvec![]
     }
@@ -445,7 +447,9 @@ impl Operation for EncryptionCheckOperation {
                     next_start_after,
                 }),
             ) => self.keys_read(values, next_start_after),
-            (_, event) => self.done(Err(PlaintextError::UnexpectedEvent(format!("{event:?}")))),
+            (_, event) => self.done(Err(PlaintextError::UnexpectedEvent(
+                event.label().to_string(),
+            ))),
         }
     }
 

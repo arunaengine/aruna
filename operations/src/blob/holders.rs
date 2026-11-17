@@ -226,7 +226,7 @@ impl RefreshHoldersOperation {
         self.fail(RefreshHoldersError::UnexpectedEvent {
             state,
             expected,
-            got: format!("{event:?}"),
+            got: event.label().to_string(),
         })
     }
 }
@@ -395,7 +395,7 @@ impl GetHoldersOperation {
         self.fail(GetHoldersError::UnexpectedEvent {
             state,
             expected,
-            got: format!("{event:?}"),
+            got: event.label().to_string(),
         })
     }
 

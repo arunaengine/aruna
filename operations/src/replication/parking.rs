@@ -102,7 +102,7 @@ impl WaitCheck {
                 next_start_after,
             }) if self.settings.is_some() => self.versions_read(values, next_start_after),
             Event::Storage(StorageEvent::BatchReadResult { values }) => self.locations_read(values),
-            other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+            other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
         }
     }
 
@@ -449,7 +449,7 @@ impl Operation for ParkJobOperation {
                     Err(error) => self.fail(BlobQueueError::Wake(error)),
                 }
             }
-            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(event.label().to_string())),
         }
     }
 
@@ -628,7 +628,7 @@ impl Operation for WakeJobOperation {
                 self.state = WakeState::Finish;
                 smallvec![]
             }
-            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(event.label().to_string())),
         }
     }
 
@@ -768,7 +768,7 @@ impl Operation for WakeParkedOperation {
                 self.finish()
             }
             (ParkedState::Schedule, Event::Task(_)) => self.finish(),
-            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(event.label().to_string())),
         }
     }
 
@@ -892,7 +892,7 @@ impl Operation for AwaitingJobsOperation {
             (AwaitingState::ReadJobs, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 self.jobs_read(values)
             }
-            (_, event) => Err(BlobQueueError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => Err(BlobQueueError::UnexpectedEvent(event.label().to_string())),
         };
         result.unwrap_or_else(|error| {
             self.state = AwaitingState::Error;
@@ -1960,7 +1960,7 @@ mod tests {
                 .transpose()
                 .map_err(Into::into),
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+            other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
         }
     }
 

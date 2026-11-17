@@ -212,7 +212,7 @@ impl ReleaseMembersOperation {
         };
         self.fail(ReleaseError::UnexpectedEvent {
             state,
-            got: format!("{got:?}"),
+            got: got.label().to_string(),
         })
     }
 

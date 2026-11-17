@@ -157,23 +157,17 @@ fn existing_fence_decides() {
 }
 
 #[test]
-fn conflicts_retry_bounded() {
-    let mut operation = acquire_after(Vec::new());
-    for attempt in 1..=FENCE_MUTATE_ATTEMPTS {
-        operation.step(started());
-        operation.step(read(None));
-        operation.step(written());
-        let effects = operation.step(failed(StorageError::TransactionConflict));
-        if attempt < FENCE_MUTATE_ATTEMPTS {
-            assert_eq!(effects.as_slice(), [begin()], "attempt {attempt}");
-        } else {
-            assert!(effects.is_empty());
-        }
-    }
-    assert_eq!(
-        operation.finalize(),
-        Err(PurgeFenceError::Storage(StorageError::TransactionConflict))
+fn conflict_left_to_runner() {
+    // A commit conflict ends the attempt; the runner retries it with a fresh operation.
+    let mut operation = acquire_after(vec![started(), read(None), written()]);
+    assert!(
+        operation
+            .step(failed(StorageError::TransactionConflict))
+            .is_empty()
     );
+    let error = operation.finalize().unwrap_err();
+    assert!(AcquireFenceOperation::is_conflict(&error));
+    assert!(!AcquireFenceOperation::is_conflict(&PurgeFenceError::Busy));
 }
 
 #[test]

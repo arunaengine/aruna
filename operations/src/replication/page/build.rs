@@ -294,7 +294,7 @@ impl Operation for PageBuildOperation {
             }
             (BuildState::Finish | BuildState::Error, _) => return smallvec![],
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(BuildError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => Err(BuildError::UnexpectedEvent(event.label().to_string())),
         };
         result.unwrap_or_else(|error| {
             self.state = BuildState::Error;

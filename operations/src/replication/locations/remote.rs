@@ -59,7 +59,7 @@ impl RemoteLocationOperation {
     fn unexpected(&mut self, event: Event) -> Effects {
         self.fail(LocationSummaryError::Unexpected {
             state: "remote",
-            event: format!("{event:?}"),
+            event: event.label().to_string(),
         })
     }
 }

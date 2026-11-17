@@ -73,7 +73,7 @@ impl Operation for PausePurgeOperation {
                 ),
             ) => Ok(()),
             (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(PauseError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => Err(PauseError::UnexpectedEvent(event.label().to_string())),
         });
         smallvec![]
     }
@@ -123,7 +123,7 @@ impl Operation for PausedOperation {
         self.output = Some(match (&self.output, event) {
             (None, Event::Storage(StorageEvent::ReadResult { value, .. })) => Ok(value.is_some()),
             (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(PauseError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => Err(PauseError::UnexpectedEvent(event.label().to_string())),
         });
         smallvec![]
     }

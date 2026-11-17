@@ -170,7 +170,7 @@ impl Operation for ReleaseViewOperation {
                 let output = self.on_crate(read);
                 self.finish(output)
             }
-            (_, event) => self.finish(Err(ViewError::UnexpectedEvent(format!("{event:?}")))),
+            (_, event) => self.finish(Err(ViewError::UnexpectedEvent(event.label().to_string()))),
         }
     }
 

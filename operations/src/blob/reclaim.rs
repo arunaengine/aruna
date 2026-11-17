@@ -299,7 +299,10 @@ async fn delete_candidates(context: &DriverContext, keys: Vec<Key>) -> Result<()
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected candidate delete event: {other:?}")),
+        other => Err(format!(
+            "unexpected candidate delete event: {}",
+            other.label()
+        )),
     }
 }
 

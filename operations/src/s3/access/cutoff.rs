@@ -100,7 +100,7 @@ impl CutoffSweepOperation {
         let error = CutoffSweepError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label().to_string(),
         };
         self.finish(Err(error))
     }

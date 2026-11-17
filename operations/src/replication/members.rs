@@ -159,7 +159,7 @@ impl Operation for ReadRecordOperation {
         self.output = Some(match (&self.output, event) {
             (None, Event::Storage(StorageEvent::ReadResult { value, .. })) => decode_record(value),
             (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(RecordError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => Err(RecordError::UnexpectedEvent(event.label().to_string())),
         });
         smallvec![]
     }
@@ -263,7 +263,7 @@ impl Operation for BoundRecordOperation {
                     .map(|view| view.map(|view| (*binding, view.head.snapshot)));
                 self.done(record)
             }
-            (_, event) => self.done(Err(RecordError::UnexpectedEvent(format!("{event:?}")))),
+            (_, event) => self.done(Err(RecordError::UnexpectedEvent(event.label().to_string()))),
         }
     }
 
@@ -361,7 +361,7 @@ fn queue_page(answered: bool, event: Event) -> Result<(Vec<(Key, Value)>, bool),
             next_start_after,
         }) if !answered => Ok((values, next_start_after.is_some())),
         Event::Storage(StorageEvent::Error { error }) if !answered => Err(error.into()),
-        event => Err(RecordError::UnexpectedEvent(format!("{event:?}"))),
+        event => Err(RecordError::UnexpectedEvent(event.label().to_string())),
     }
 }
 

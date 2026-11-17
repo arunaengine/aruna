@@ -418,7 +418,7 @@ async fn referenced(
                 values,
                 next_start_after,
             }) => (values, next_start_after),
-            other => return Err(format!("could not read hash aliases: {other:?}")),
+            other => return Err(format!("could not read hash aliases: {}", other.label())),
         };
         for (key, _) in aliases {
             let alias = HashIndex::from_bytes(key.as_ref()).map_err(|error| error.to_string())?;
@@ -449,7 +449,7 @@ async fn referenced(
     match send(context, owners).await {
         Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty() => {}
         Event::Storage(StorageEvent::IterResult { .. }) => return Ok(true),
-        other => return Err(format!("could not read archive owners: {other:?}")),
+        other => return Err(format!("could not read archive owners: {}", other.label())),
     }
     other_rows(context, location, import_id).await
 }
@@ -511,7 +511,7 @@ async fn pinned(
                 values,
                 next_start_after,
             }) => (values, next_start_after),
-            other => return Err(format!("could not read locations: {other:?}")),
+            other => return Err(format!("could not read locations: {}", other.label())),
         };
         for (key, value) in rows {
             let row = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
@@ -643,7 +643,7 @@ async fn send(context: &DriverContext, effect: StorageEffect) -> Event {
 fn storage(effect: Effect) -> Result<StorageEffect, String> {
     match effect {
         Effect::Storage(effect) => Ok(effect),
-        other => Err(format!("not a storage effect: {other:?}")),
+        other => Err(format!("not a storage effect: {}", other.label())),
     }
 }
 

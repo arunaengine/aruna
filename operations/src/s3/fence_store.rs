@@ -14,8 +14,6 @@ use smallvec::smallvec;
 
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, fence_key, write_fence_read};
 
-const FENCE_MUTATE_ATTEMPTS: usize = 8;
-
 /// Cheap rejection before a writer moves payload bytes. Mutating operations still read the
 /// fence again in their commit transaction to close the race with a fence acquired later.
 #[derive(Debug, PartialEq)]
@@ -46,7 +44,7 @@ impl Operation for FenceCheckOperation {
     fn step(&mut self, event: Event) -> Effects {
         let checked = match self.output {
             None => check_write_fence(event, &self.bucket, &self.key),
-            Some(_) => Err(PurgeFenceError::Unexpected(format!("{event:?}"))),
+            Some(_) => Err(PurgeFenceError::Unexpected(event.label().to_string())),
         };
         self.output = Some(checked);
         smallvec![]
@@ -78,12 +76,11 @@ enum AcquireState {
 }
 
 /// Takes the write fence of `scope` for `job_id`, or confirms that the job already holds it.
-/// A commit conflict starts over, at most eight times in all.
+/// A commit conflict is retried by the runner (`drive_retry`).
 #[derive(Debug, PartialEq)]
 pub struct AcquireFenceOperation {
     job_id: JobId,
     scope: StoragePurgeScope,
-    attempt: usize,
     txn_id: Option<TxnId>,
     state: AcquireState,
     error: Option<PurgeFenceError>,
@@ -94,7 +91,6 @@ impl AcquireFenceOperation {
         Self {
             job_id,
             scope,
-            attempt: 0,
             txn_id: None,
             state: AcquireState::Init,
             error: None,
@@ -161,10 +157,6 @@ impl AcquireFenceOperation {
     fn commit_failed(&mut self, error: StorageError) -> Effects {
         // The failed commit closed the transaction.
         self.txn_id = None;
-        self.attempt += 1;
-        if error == StorageError::TransactionConflict && self.attempt < FENCE_MUTATE_ATTEMPTS {
-            return self.begin();
-        }
         self.fail(error.into())
     }
 }
@@ -209,7 +201,7 @@ impl Operation for AcquireFenceOperation {
                 self.state = AcquireState::Finish;
                 smallvec![]
             }
-            (_, event) => self.fail(PurgeFenceError::Unexpected(format!("{event:?}"))),
+            (_, event) => self.fail(PurgeFenceError::Unexpected(event.label().to_string())),
         }
     }
 
@@ -227,6 +219,10 @@ impl Operation for AcquireFenceOperation {
 
     fn abort(&mut self) -> Effects {
         abort_effects(&mut self.txn_id)
+    }
+
+    fn is_conflict(error: &PurgeFenceError) -> bool {
+        *error == PurgeFenceError::Storage(StorageError::TransactionConflict)
     }
 }
 

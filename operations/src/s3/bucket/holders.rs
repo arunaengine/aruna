@@ -101,7 +101,7 @@ impl Operation for LookupKeysOperation {
                 self.ask_next()
             }
             (_, event) => {
-                self.error = Some(LookupError::UnexpectedEvent(format!("{event:?}")));
+                self.error = Some(LookupError::UnexpectedEvent(event.label().to_string()));
                 smallvec![]
             }
         }

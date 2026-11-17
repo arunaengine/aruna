@@ -83,7 +83,7 @@ pub(crate) async fn resume_transitions(
             };
             match storage.send_storage_effect(write).await {
                 Event::Storage(StorageEvent::WriteResult { .. }) => resumed = true,
-                other => return Err(format!("could not resume transition: {other:?}")),
+                other => return Err(format!("could not resume transition: {}", other.label())),
             }
         }
         let event = storage
@@ -94,7 +94,7 @@ pub(crate) async fn resume_transitions(
             Event::Storage(StorageEvent::TransactionCommitted { .. })
         ) {
             transaction.unknown();
-            return Err(format!("transition wake was not stored: {event:?}"));
+            return Err(format!("transition wake was not stored: {}", event.label()));
         }
         transaction.finish();
         match cursor {
@@ -202,7 +202,10 @@ async fn read_record(
             .map(|value| EncryptionTransition::from_bytes(value.as_ref()))
             .transpose()
             .map_err(|error| error.to_string()),
-        other => Err(format!("could not read transition progress: {other:?}")),
+        other => Err(format!(
+            "could not read transition progress: {}",
+            other.label()
+        )),
     }
 }
 
@@ -379,7 +382,12 @@ async fn finish(
             {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {}
                 Event::Task(TaskEvent::Error { message, .. }) => return Err(message),
-                other => return Err(format!("could not schedule the copy drain: {other:?}")),
+                other => {
+                    return Err(format!(
+                        "could not schedule the copy drain: {}",
+                        other.label()
+                    ));
+                }
             }
         }
     }
@@ -489,7 +497,12 @@ async fn forget_removed(
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("could not start a cleanup transaction: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not start a cleanup transaction: {}",
+                other.label()
+            ));
+        }
     };
     let staged = stage_forget(storage, txn_id, prefix_len, keys).await;
     let Ok(left) = staged else {
@@ -503,7 +516,10 @@ async fn forget_removed(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(left),
-        other => Err(format!("removed copies were not forgotten: {other:?}")),
+        other => Err(format!(
+            "removed copies were not forgotten: {}",
+            other.label()
+        )),
     }
 }
 
@@ -532,7 +548,12 @@ async fn stage_forget(
         };
         match storage.send_storage_effect(delete).await {
             Event::Storage(StorageEvent::DeleteResult { .. }) => {}
-            other => return Err(format!("could not forget a removed copy: {other:?}")),
+            other => {
+                return Err(format!(
+                    "could not forget a removed copy: {}",
+                    other.label()
+                ));
+            }
         }
     }
     Ok(left)
@@ -581,7 +602,7 @@ async fn exists(
     };
     match storage.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
-        other => Err(format!("could not read {key_space}: {other:?}")),
+        other => Err(format!("could not read {key_space}: {}", other.label())),
     }
 }
 
@@ -596,7 +617,12 @@ async fn store(
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("could not start a progress transaction: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not start a progress transaction: {}",
+                other.label()
+            ));
+        }
     };
     let staged = stage(storage, txn_id, bucket, record).await;
     if !matches!(staged, Ok(true)) {
@@ -610,7 +636,10 @@ async fn store(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
-        other => Err(format!("transition progress was not stored: {other:?}")),
+        other => Err(format!(
+            "transition progress was not stored: {}",
+            other.label()
+        )),
     }
 }
 
@@ -631,7 +660,12 @@ async fn stage(
             value: Some(value), ..
         }) => EncryptionTransition::from_bytes(value.as_ref()).map_err(|e| e.to_string())?,
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(false),
-        other => return Err(format!("could not read transition progress: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not read transition progress: {}",
+                other.label()
+            ));
+        }
     };
     if stored.started_at_ms != record.started_at_ms || stored.kind != record.kind {
         return Ok(false);
@@ -677,7 +711,12 @@ async fn stage(
             Event::Storage(
                 StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
             ) => {}
-            other => return Err(format!("could not store transition progress: {other:?}")),
+            other => {
+                return Err(format!(
+                    "could not store transition progress: {}",
+                    other.label()
+                ));
+            }
         }
     }
     Ok(true)
@@ -844,7 +883,8 @@ async fn reclaim_uploads(
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
                 other => {
                     return Err(format!(
-                        "could not remove stale upload envelopes: {other:?}"
+                        "could not remove stale upload envelopes: {}",
+                        other.label()
                     ));
                 }
             }
@@ -879,7 +919,7 @@ async fn retire_source(
             value: Some(value), ..
         }) => BucketKeyRecord::from_bytes(value.as_ref()).map_err(|e| e.to_string())?,
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(Vec::new()),
-        other => return Err(format!("could not read the source key: {other:?}")),
+        other => return Err(format!("could not read the source key: {}", other.label())),
     };
     let vault = key.vault_entry.take().or(record.source_vault);
     key.state = KeyState::Retired;

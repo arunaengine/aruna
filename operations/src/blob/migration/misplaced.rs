@@ -164,7 +164,7 @@ async fn read(
     };
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.map(|v| v.to_vec())),
-        other => Err(format!("could not read {key_space}: {other:?}")),
+        other => Err(format!("could not read {key_space}: {}", other.label())),
     }
 }
 
@@ -183,7 +183,7 @@ async fn read_location(
                 .map_err(|error| error.to_string()),
             None => Ok(None),
         },
-        other => Err(format!("could not read a location: {other:?}")),
+        other => Err(format!("could not read a location: {}", other.label())),
     }
 }
 
@@ -422,7 +422,10 @@ async fn batch(
         Event::Storage(StorageEvent::BatchReadResult { values }) => {
             Ok(values.into_iter().map(|(_, value)| value).collect())
         }
-        other => Err(format!("could not read the plan's records: {other:?}")),
+        other => Err(format!(
+            "could not read the plan's records: {}",
+            other.label()
+        )),
     }
 }
 

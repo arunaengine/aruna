@@ -292,7 +292,7 @@ pub async fn read_check(
             .map(|value| StorageCheck::from_bytes(value.as_ref()))
             .transpose()
             .map_err(|error| error.to_string()),
-        other => Err(format!("could not read check progress: {other:?}")),
+        other => Err(format!("could not read check progress: {}", other.label())),
     }
 }
 
@@ -349,7 +349,12 @@ async fn store_check(
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("could not start a progress transaction: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not start a progress transaction: {}",
+                other.label()
+            ));
+        }
     };
     let key: Key = bucket.as_bytes().to_vec().into();
     let read = StorageEffect::Read {
@@ -362,7 +367,7 @@ async fn store_check(
             .map(|value| StorageCheck::from_bytes(value.as_ref()))
             .transpose()
             .map_err(|error| error.to_string()),
-        other => Err(format!("could not read check progress: {other:?}")),
+        other => Err(format!("could not read check progress: {}", other.label())),
     };
     let same = matches!(&current, Ok(Some(stored)) if stored.started_at_ms == record.started_at_ms);
     let mut writes = Vec::new();
@@ -381,7 +386,7 @@ async fn store_check(
     let written = match (current, storage.send_storage_effect(batch).await) {
         (Err(error), _) => Err(error),
         (_, Event::Storage(StorageEvent::BatchWriteResult { .. })) => Ok(()),
-        (_, other) => Err(format!("could not write check progress: {other:?}")),
+        (_, other) => Err(format!("could not write check progress: {}", other.label())),
     };
     let finished = written.is_ok() && same && record.finished_at_ms.is_some();
     let left = match finished {
@@ -393,7 +398,10 @@ async fn store_check(
             };
             match storage.send_storage_effect(delete).await {
                 Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-                other => Err(format!("could not leave the check queue: {other:?}")),
+                other => Err(format!(
+                    "could not leave the check queue: {}",
+                    other.label()
+                )),
             }
         }
         false => written,
@@ -409,7 +417,7 @@ async fn store_check(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        other => Err(format!("check progress was not stored: {other:?}")),
+        other => Err(format!("check progress was not stored: {}", other.label())),
     }
 }
 
@@ -562,7 +570,12 @@ async fn clean_one(
     };
     match context.storage_handle.send_storage_effect(delete).await {
         Event::Storage(StorageEvent::DeleteResult { .. }) => cleaned.deleted += u64::from(deleted),
-        other => return Err(format!("could not clear a broken version: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not clear a broken version: {}",
+                other.label()
+            ));
+        }
     }
     Ok(true)
 }
@@ -582,7 +595,7 @@ pub async fn is_current(context: &DriverContext, key: &VersionKey) -> Result<boo
                 .map_err(|error| error.to_string()),
             None => Ok(false),
         },
-        other => Err(format!("could not read a head: {other:?}")),
+        other => Err(format!("could not read a head: {}", other.label())),
     }
 }
 

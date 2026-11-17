@@ -191,7 +191,7 @@ impl LocationSummaryOperation {
         let state = self.state_name();
         self.fail(LocationSummaryError::Unexpected {
             state,
-            event: format!("{event:?}"),
+            event: event.label().to_string(),
         })
     }
 

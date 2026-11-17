@@ -126,7 +126,7 @@ impl Operation for DropTrailOperation {
                 &TrailState::DeletePage { last },
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }),
             ) => self.after_page(last),
-            (_, event) => self.fail(TrailError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => self.fail(TrailError::UnexpectedEvent(event.label().to_string())),
         }
     }
 

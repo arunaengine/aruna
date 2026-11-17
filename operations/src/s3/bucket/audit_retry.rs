@@ -179,7 +179,7 @@ impl Operation for StoreAuditOperation {
                 self.state = StoreState::Finish;
                 smallvec![]
             }
-            (_, event) => self.fail(AuditError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => self.fail(AuditError::UnexpectedEvent(event.label().to_string())),
         }
     }
 
@@ -314,7 +314,7 @@ impl Operation for ResumeAuditOperation {
                 }
                 self.store_next()
             }
-            (_, event) => self.fail(AuditError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => self.fail(AuditError::UnexpectedEvent(event.label().to_string())),
         }
     }
 

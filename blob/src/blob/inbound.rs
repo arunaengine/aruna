@@ -52,7 +52,7 @@ impl BlobHandle {
             Err(_) => Err(InboundError::TimedOut),
             Ok(Event::Blob(BlobEvent::MessageReceived { payload, .. })) => Ok(payload),
             Ok(Event::Blob(BlobEvent::Error(error))) => Err(InboundError::Blob(Box::new(error))),
-            Ok(other) => Err(InboundError::Unexpected(format!("{other:?}"))),
+            Ok(other) => Err(InboundError::Unexpected(other.label().to_string())),
         }
     }
 

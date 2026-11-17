@@ -262,7 +262,7 @@ async fn delete_jobs(context: &DriverContext, keys: Vec<Vec<u8>>) -> Result<(), 
     match context.storage_handle.send_storage_effect(delete).await {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -305,7 +305,7 @@ async fn reschedule(
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(due),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 

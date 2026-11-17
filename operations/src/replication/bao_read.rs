@@ -162,7 +162,7 @@ impl BaoReadOperation {
     fn unexpected(&mut self, event: Event) -> Effects {
         self.fail(BaoReadError::Unexpected {
             state: self.state_name(),
-            event: format!("{event:?}"),
+            event: event.label().to_string(),
         })
     }
 
@@ -1003,7 +1003,7 @@ impl IncomingBaoOperation {
     fn unexpected(&mut self, event: Event) -> Effects {
         self.fail(BaoReadError::Unexpected {
             state: self.state_name(),
-            event: format!("{event:?}"),
+            event: event.label().to_string(),
         })
     }
 

@@ -381,7 +381,7 @@ pub(crate) async fn release_rows(
                 values,
                 next_start_after,
             }) => (values, next_start_after),
-            other => return Err(PublishError::Unavailable(format!("{other:?}"))),
+            other => return Err(PublishError::Unavailable(other.label().to_string())),
         };
         for (key, value) in values {
             let Some(bytes) = key.get(prefix.len()..) else {
@@ -520,7 +520,7 @@ async fn file_guards(
     };
     let values = match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => return Err(PublishError::Unavailable(format!("{other:?}"))),
+        other => return Err(PublishError::Unavailable(other.label().to_string())),
     };
     if values.iter().any(|(_, value)| value.is_none()) {
         return Err(PublishError::Conflict(CHANGED.to_string()));

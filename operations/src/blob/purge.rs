@@ -77,7 +77,7 @@ async fn batch(
         Event::Storage(StorageEvent::BatchReadResult { values }) => {
             Ok(values.into_iter().map(|(_, value)| value).collect())
         }
-        other => Err(format!("could not read purged versions: {other:?}")),
+        other => Err(format!("could not read purged versions: {}", other.label())),
     }
 }
 
@@ -244,7 +244,7 @@ async fn read_elsewhere(
                 values,
                 next_start_after,
             }) => (values, next_start_after),
-            other => return Err(format!("could not read hash aliases: {other:?}")),
+            other => return Err(format!("could not read hash aliases: {}", other.label())),
         };
         for (key, _) in aliases {
             *budget = budget.saturating_sub(1);
@@ -449,7 +449,10 @@ pub async fn plan_files(
     };
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        other => Err(format!("could not plan the file releases: {other:?}")),
+        other => Err(format!(
+            "could not plan the file releases: {}",
+            other.label()
+        )),
     }
 }
 

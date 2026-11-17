@@ -417,7 +417,7 @@ async fn scan(
             .map(|(key, value)| (key.to_vec(), value))
             .collect()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected scan answer {other:?}")),
+        other => Err(format!("unexpected scan answer {}", other.label())),
     }
 }
 
@@ -432,7 +432,7 @@ async fn delete(context: &DriverContext, deletes: Vec<(String, Key)>) -> Result<
     match context.storage_handle.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected delete answer {other:?}")),
+        other => Err(format!("unexpected delete answer {}", other.label())),
     }
 }
 
@@ -452,7 +452,7 @@ pub(crate) async fn read_cursor(
             .transpose()
             .map_err(|error| error.to_string()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected cursor answer {other:?}")),
+        other => Err(format!("unexpected cursor answer {}", other.label())),
     }
 }
 
@@ -823,7 +823,7 @@ impl SetWalk {
                 };
                 return match context.storage_handle.send_storage_effect(write).await {
                     Event::Storage(StorageEvent::WriteResult { .. }) => Ok(Some(child)),
-                    other => Err(format!("a child cursor was not stored: {other:?}")),
+                    other => Err(format!("a child cursor was not stored: {}", other.label())),
                 };
             }
             ancestor = snapshot

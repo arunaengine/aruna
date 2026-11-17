@@ -257,7 +257,7 @@ impl Operation for RetireJobOperation {
                 smallvec![]
             }
             (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error.into()),
-            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(event.label().to_string())),
         }
     }
 

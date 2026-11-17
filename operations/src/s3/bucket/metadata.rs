@@ -375,7 +375,7 @@ pub async fn bucket_metadata(
         })
         .await;
     let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-        return Err(format!("bucket metadata read failed: {event:?}"));
+        return Err(format!("bucket metadata read failed: {}", event.label()));
     };
     let mut values = values.into_iter().map(|(_, value)| value);
     let (row, creation) = (values.next().flatten(), values.next().flatten());

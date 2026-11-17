@@ -308,7 +308,9 @@ impl Operation for QueueRefreshOperation {
             (_, Event::Storage(StorageEvent::Error { error })) => return self.fail(error.into()),
             (_, Event::Storage(event)) => event,
             (_, other) => {
-                return self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}")));
+                return self.fail(ReferenceRefreshError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
         match (&self.state, event) {
@@ -322,7 +324,9 @@ impl Operation for QueueRefreshOperation {
             (QueueRefreshState::Commit, StorageEvent::TransactionCommitted { .. }) => {
                 self.schedule_drain()
             }
-            (_, other) => self.fail(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+            (_, other) => self.fail(ReferenceRefreshError::UnexpectedEvent(
+                other.label().to_string(),
+            )),
         }
     }
 
@@ -372,7 +376,12 @@ pub async fn refresh_with_context(
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected start transaction event: {other:?}")),
+        other => {
+            return Err(format!(
+                "unexpected start transaction event: {}",
+                other.label()
+            ));
+        }
     };
 
     let mut minted = false;
@@ -494,7 +503,7 @@ pub async fn refresh_with_context(
         }
         other => {
             abort_reference_refresh(context, txn_id).await;
-            return Err(format!("unexpected version read event: {other:?}"));
+            return Err(format!("unexpected version read event: {}", other.label()));
         }
     };
 
@@ -516,7 +525,7 @@ pub async fn refresh_with_context(
             }
             other => {
                 abort_reference_refresh(context, txn_id).await;
-                return Err(format!("unexpected version write event: {other:?}"));
+                return Err(format!("unexpected version write event: {}", other.label()));
             }
         }
     }
@@ -543,7 +552,7 @@ pub async fn refresh_with_context(
         }
         other => {
             abort_reference_refresh(context, txn_id).await;
-            Err(format!("unexpected commit event: {other:?}"))
+            Err(format!("unexpected commit event: {}", other.label()))
         }
     }
 }
@@ -701,7 +710,9 @@ async fn first_due(
             values,
             next_start_after,
         } => Ok((values, next_start_after.is_some())),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -761,7 +772,9 @@ async fn send(
     match storage.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         Event::Storage(event) => Ok(event),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -779,7 +792,9 @@ async fn read_job(
         StorageEvent::ReadResult { value, .. } => {
             Ok(value.map(|value| postcard::from_bytes(&value)))
         }
-        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -790,7 +805,9 @@ async fn delete_rows(
 ) -> Result<(), ReferenceRefreshError> {
     match send(storage, StorageEffect::BatchDelete { deletes, txn_id }).await? {
         StorageEvent::BatchDeleteResult { .. } => Ok(()),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -803,7 +820,11 @@ async fn settle_job(
 ) -> Result<(), ReferenceRefreshError> {
     let txn_id = match send(storage, StorageEffect::StartTransaction { read: false }).await? {
         StorageEvent::TransactionStarted { txn_id } => txn_id,
-        other => return Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+        other => {
+            return Err(ReferenceRefreshError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
+        }
     };
     let result = async {
         if !matches!(read_job(storage, key, Some(txn_id)).await?, Some(Ok(stored)) if stored == *job)
@@ -823,7 +844,7 @@ async fn settle_job(
         let writes = job_entries(next)?;
         match send(storage, StorageEffect::BatchWrite { writes, txn_id: Some(txn_id) }).await? {
             StorageEvent::BatchWriteResult { .. } => Ok(()),
-            other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+            other => Err(ReferenceRefreshError::UnexpectedEvent(other.label().to_string())),
         }
     }
     .await;
@@ -836,7 +857,9 @@ async fn settle_job(
     };
     match send(storage, effect).await? {
         StorageEvent::TransactionCommitted { .. } => Ok(()),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(ReferenceRefreshError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
