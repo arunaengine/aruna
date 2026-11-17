@@ -14,6 +14,7 @@ use aruna_core::task::TaskKey;
 use aruna_core::types::Effects;
 use thiserror::Error;
 
+use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, DrainOutboxOperation};
 use crate::notifications::prune::{
     NOTIFICATION_RETRY_AFTER, PRUNE_PAGE_SIZE, PruneNotificationsOperation,
 };
@@ -44,12 +45,16 @@ pub trait TimerRun: Operation + Sized {
 /// and arms that timer.
 #[derive(Debug, PartialEq)]
 pub enum TimerOperation {
+    DrainNotificationOutbox(DrainOutboxOperation),
     PruneNotifications(PruneNotificationsOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
 pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperation> {
     match key {
+        TaskKey::DrainNotificationOutbox => Some(TimerOperation::DrainNotificationOutbox(
+            DrainOutboxOperation::new(input.local_node, input.now_ms),
+        )),
         TaskKey::PruneNotifications => Some(TimerOperation::PruneNotifications(
             PruneNotificationsOperation::new(input.now_ms, PRUNE_PAGE_SIZE),
         )),
@@ -63,24 +68,30 @@ impl Operation for TimerOperation {
 
     fn start(&mut self) -> Effects {
         match self {
+            TimerOperation::DrainNotificationOutbox(operation) => operation.start(),
             TimerOperation::PruneNotifications(operation) => operation.start(),
         }
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self {
+            TimerOperation::DrainNotificationOutbox(operation) => operation.step(event),
             TimerOperation::PruneNotifications(operation) => operation.step(event),
         }
     }
 
     fn is_complete(&self) -> bool {
         match self {
+            TimerOperation::DrainNotificationOutbox(operation) => operation.is_complete(),
             TimerOperation::PruneNotifications(operation) => operation.is_complete(),
         }
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self {
+            TimerOperation::DrainNotificationOutbox(operation) => {
+                DrainOutboxOperation::rearm(operation.finalize())
+            }
             TimerOperation::PruneNotifications(operation) => {
                 PruneNotificationsOperation::rearm(operation.finalize())
             }
@@ -89,8 +100,18 @@ impl Operation for TimerOperation {
 
     fn abort(&mut self) -> Effects {
         match self {
+            TimerOperation::DrainNotificationOutbox(operation) => operation.abort(),
             TimerOperation::PruneNotifications(operation) => operation.abort(),
         }
+    }
+}
+
+impl TimerRun for DrainOutboxOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
+        result.map_err(|error| TimerFailure {
+            retry_after: DELIVERY_RETRY_AFTER,
+            reason: error.to_string(),
+        })
     }
 }
 

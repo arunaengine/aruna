@@ -90,10 +90,7 @@ use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::usage_stats::{refresh_usage_targets, restore_usage_timer};
 use crate::notifications::client::deliver_remote;
 use crate::notifications::inbox::upsert_with_report;
-use crate::notifications::outbox::{
-    DELIVERY_RETRY_AFTER, OUTBOX_BATCH_SIZE, OUTBOX_RETENTION_MS, delete_outbox_records,
-    read_outbox_batch, restore_idle_timer, restore_outbox_timer,
-};
+use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::prune::RestorePruneOperation;
 use crate::notifications::watch::interest::{
@@ -824,9 +821,7 @@ impl OperationsTaskHandler {
             TaskKey::DrainRefreshQueue => Box::pin(async move {
                 self.drain_refresh_queue().await;
             }),
-            TaskKey::DrainNotificationOutbox => Box::pin(async move {
-                self.drain_notification_outbox().await;
-            }),
+            TaskKey::DrainNotificationOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::PruneNotifications => Box::pin(self.run_trigger(key)),
             TaskKey::PublishWatchInterest => Box::pin(async move {
                 self.publish_watch_interest().await;
