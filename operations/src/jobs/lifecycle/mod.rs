@@ -43,6 +43,8 @@ pub enum LifecycleError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error("a row did not encode or decode: {0}")]
+    Codec(String),
     #[error(transparent)]
     Record(#[from] JobRecordError),
     #[error(transparent)]
@@ -84,6 +86,7 @@ impl From<IoError> for LifecycleError {
                 got,
             },
             IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
+            IoError::Codec(error) => Self::Codec(error),
         }
     }
 }

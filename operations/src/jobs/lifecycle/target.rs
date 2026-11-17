@@ -346,6 +346,7 @@ pub(crate) fn classify(error: &LifecycleError) -> CommitVerdict {
         LifecycleError::NotHolder | LifecycleError::RealmConfigMissing => CommitVerdict::Drained,
         LifecycleError::GroupWrite(_)
         | LifecycleError::Conversion(_)
+        | LifecycleError::Codec(_)
         | LifecycleError::Record(_)
         | LifecycleError::Family(_)
         | LifecycleError::Store(_)
