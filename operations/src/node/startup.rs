@@ -28,7 +28,7 @@ use crate::metadata::projector::{project_create_events, project_logged_events};
 use crate::metadata::prune_queue::process_graph_tombstones;
 use crate::node::usage_stats::refresh_usage_targets;
 use crate::notifications::watch::interest::refresh_target_interest;
-use crate::placement::{draining_former_holders, resolve_shard_holders};
+use aruna_core::placement::{draining_former_holders, resolve_shard_holders};
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on
 /// these; see [`DocumentTarget::sync_topic_id`]).
@@ -1107,7 +1107,7 @@ fn plan_shard_groups(
             let holders = resolve_shard_holders(config, &placement);
             // During transitions, target and retained departing holders stay members.
             // Publishers remain the authority set.
-            let membership = crate::placement::bucket_membership(config, &placement, now_ms);
+            let membership = aruna_core::placement::bucket_membership(config, &placement, now_ms);
             if !membership.members.contains(&node_id) {
                 continue;
             }
@@ -2001,7 +2001,7 @@ mod tests {
                 shard: shard as u32,
             };
             config.placement_overrides.push(PlacementOverride {
-                subject: crate::placement::shard_subject_bytes(&placement),
+                subject: aruna_core::placement::shard_subject_bytes(&placement),
                 pinned: vec![local, *peer],
                 excluded: Vec::new(),
                 strategy_id: None,

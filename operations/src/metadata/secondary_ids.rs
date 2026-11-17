@@ -124,7 +124,7 @@ impl AddIdentifiersOperation {
         {
             Some(route) => {
                 let (key_space, key) =
-                    crate::placement::fence::fence_read(&route.realm_id, &route.placement);
+                    aruna_core::placement::fence::fence_read(&route.realm_id, &route.placement);
                 self.state = State::Fence;
                 smallvec![Effect::Storage(StorageEffect::Read {
                     key_space,
@@ -142,7 +142,7 @@ impl AddIdentifiersOperation {
             .route
             .as_ref()
             .map_or(0, |route| route.generation);
-        if !crate::placement::fence::admits(value.as_ref(), generation) {
+        if !aruna_core::placement::fence::admits(value.as_ref(), generation) {
             self.merged = None;
             return self.fail(PersistentIdError::PlacementFenced);
         }

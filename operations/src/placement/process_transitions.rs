@@ -22,8 +22,8 @@ use byteview::ByteView;
 use tracing::{debug, warn};
 
 use crate::driver::{DriverContext, drive};
-use crate::placement::fence::{fence_read, stored_generation};
-use crate::placement::transition::{
+use aruna_core::placement::fence::{fence_read, stored_generation};
+use aruna_core::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
 use crate::realm::mutate_placement::{
@@ -837,7 +837,7 @@ pub async fn close(
 
 #[cfg(test)]
 mod tests {
-    use crate::placement::fence;
+    use aruna_core::placement::fence;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
@@ -1367,7 +1367,7 @@ mod tests {
 
         assert!(!document.placement_transitions[0].released(u64::MAX));
         assert!(
-            crate::placement::retained_departing_holder(&document, &_placement, node(1)),
+            aruna_core::placement::retained_departing_holder(&document, &_placement, node(1)),
             "a removed holder is still a retained publisher until it reports"
         );
     }

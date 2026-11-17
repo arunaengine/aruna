@@ -37,7 +37,7 @@ use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsage, Rea
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
 };
-use aruna_operations::placement::transition::transition_health;
+use aruna_core::placement::transition::transition_health;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::get_nodes::{
     GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,

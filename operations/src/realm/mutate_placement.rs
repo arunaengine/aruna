@@ -44,7 +44,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -488,7 +488,7 @@ impl RealmPlacementMutation {
                 }
                 // The plan restates derived holder sets, so admission re-derives
                 // them: a plan naming sets this node disagrees with never enters.
-                if !crate::placement::transition::plan_is_derivable(document, plan) {
+                if !aruna_core::placement::transition::plan_is_derivable(document, plan) {
                     return Err(MutatePlacementError::InvalidInput(
                         "transition plan does not match the resolved holder sets".to_string(),
                     ));
@@ -919,14 +919,14 @@ impl MutatePlacementOperation {
         }
 
         if let Some((node_id, placement)) =
-            crate::placement::first_draining_change(&pre_document, &document)
+            aruna_core::placement::first_draining_change(&pre_document, &document)
         {
             return Err(MutatePlacementError::InvalidInput(format!(
                 "placement change alters drain-time holder set for node {node_id}, strategy {} shard {}",
                 placement.strategy_id, placement.shard
             )));
         }
-        if let Some(placement) = crate::placement::first_empty_shard(&document) {
+        if let Some(placement) = aruna_core::placement::first_empty_shard(&document) {
             return Err(MutatePlacementError::EmptyShardHolders {
                 strategy_id: placement.strategy_id,
                 shard: placement.shard,

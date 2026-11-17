@@ -19,7 +19,7 @@ use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
 use crate::placement::process_placements::load_realm_config;
-use crate::placement::selector::select_top_peers;
+use aruna_core::placement::selector::select_top_peers;
 use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::Actor;

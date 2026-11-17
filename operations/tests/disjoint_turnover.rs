@@ -10,7 +10,7 @@ use aruna_core::document::shard_topic_id;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::transition::TransitionLimits;
 use aruna_operations::metadata::create_document::mint_local_document;
-use aruna_operations::placement::transition::preview_transition;
+use aruna_core::placement::transition::preview_transition;
 use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
 
 use crate::topology::document_present;

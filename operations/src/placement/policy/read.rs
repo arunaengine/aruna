@@ -25,7 +25,7 @@ use smallvec::smallvec;
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::placement::{PlacementResolveError, read_holder_sets};
+use aruna_core::placement::{PlacementResolveError, read_holder_sets};
 
 /// Wall-clock budget one policy fetch may spend across its holders.
 pub const POLICY_FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -289,7 +289,7 @@ impl ReadPolicyOperation {
             let Some(realm) = self.realm.as_ref() else {
                 return Err(ReadPolicyError::RealmConfigMissing);
             };
-            let placement = crate::placement::plan_target_placement(
+            let placement = aruna_core::placement::plan_target_placement(
                 &realm.config,
                 &self.target(),
                 Default::default(),
@@ -604,7 +604,7 @@ mod pure_tests {
         let placement = config
             .policy_placement(policy.policy().policy_id)
             .expect("policy bucket resolves");
-        let expected = crate::placement::read_holder_sets(&config, &placement).expect("holders");
+        let expected = aruna_core::placement::read_holder_sets(&config, &placement).expect("holders");
         assert_eq!(fetch.holders.as_slice(), expected.as_slice());
 
         operation.step(answered(expected[0], &policy));

@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::driver::DriverContext;
 use crate::node::startup::apply_restored_reconcile;
-use crate::placement::resolve_shard_holders;
+use aruna_core::placement::resolve_shard_holders;
 use crate::shard::client::fetch_shard_manifest;
 use crate::shard::{assemble_shard_manifest, manifest_entry_digest};
 use crate::sync::shard_placement::{placement_key, placement_prefix};

@@ -18,7 +18,7 @@ use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
 use crate::placement::process_placements::load_realm_config;
-use crate::placement::selector::select_top_peers;
+use aruna_core::placement::selector::select_top_peers;
 use aruna_core::NodeId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::auth::valid_revocation_expiry;

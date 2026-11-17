@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -57,7 +57,7 @@ pub struct ResolveOidcOperation {
     input: ResolveOidcInput,
     realm_config: Option<RealmConfigDocument>,
     /// Bucket the user's rows publish onto, read inside the write transaction.
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     state: ResolveOidcState,
     output: Option<Result<User, ResolveOidcError>>,
 }

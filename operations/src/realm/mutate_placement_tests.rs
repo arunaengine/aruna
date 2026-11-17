@@ -22,7 +22,7 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::placement::transition::{TransitionRequest, plan_transition};
+use aruna_core::placement::transition::{TransitionRequest, plan_transition};
 use crate::realm::get_config::GetConfigOperation;
 use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits,

@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use super::check::{ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation};
-use crate::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -91,7 +91,7 @@ enum CreateServiceState {
 #[derive(Debug, PartialEq)]
 pub struct CreateServiceOperation {
     config: CreateServiceConfig,
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     state: CreateServiceState,
     output: Option<Result<User, CreateServiceError>>,
     guard: Option<aruna_core::plugin_installs::InstallGuard>,

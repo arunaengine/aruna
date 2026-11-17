@@ -13,7 +13,7 @@ use crate::metadata::protocol::PersistentIdOutcome;
 use crate::metadata::protocol::PersistentIdRequest;
 use crate::metadata::protocol::PersistentIdResolution;
 use crate::placement::process_placements::load_realm_config;
-use crate::placement::resolve_shard_holders;
+use aruna_core::placement::resolve_shard_holders;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;

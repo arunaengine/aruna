@@ -27,7 +27,7 @@ use crate::jobs::records::keys::record_key;
 use crate::jobs::records::rows::{OutboxEntry, from_bytes, to_bytes};
 use crate::jobs::store::iter_prefix_page;
 use crate::metadata::api::load_realm_config;
-use crate::placement::resolve_shard_holders;
+use aruna_core::placement::resolve_shard_holders;
 
 /// Records one drain pass delivers before it re-arms.
 pub const OUTBOX_DRAIN_BATCH: usize = 32;

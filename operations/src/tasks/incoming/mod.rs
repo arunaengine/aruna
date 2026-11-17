@@ -510,7 +510,7 @@ impl OperationsTaskHandler {
             }
             None => return false,
         };
-        let holders = crate::placement::resolve_shard_holders(config, &record.placement);
+        let holders = aruna_core::placement::resolve_shard_holders(config, &record.placement);
         if holders.is_empty() {
             return false;
         }

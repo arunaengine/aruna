@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{admin_outbox_prefix, revocation_index_entry};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,

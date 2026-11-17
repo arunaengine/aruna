@@ -25,7 +25,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 use crate::realm::ensure_config::overlay_reducer_state;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{

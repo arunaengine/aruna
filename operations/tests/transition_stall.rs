@@ -13,8 +13,8 @@ use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::placement::transition::TransitionLimits;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::metadata::create_document::mint_local_document;
-use aruna_operations::placement::transition::{preview_transition, transition_health};
-use aruna_operations::placement::{holds_placement, resolve_shard_holders};
+use aruna_core::placement::transition::{preview_transition, transition_health};
+use aruna_core::placement::{holds_placement, resolve_shard_holders};
 use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
 
 use crate::topology::document_present;

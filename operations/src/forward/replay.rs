@@ -9,7 +9,7 @@ use crate::metadata::create_document::accepted_create_matches;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::placement::holds_placement;
+use aruna_core::placement::holds_placement;
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;

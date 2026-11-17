@@ -5,9 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
-use aruna_core::structs::identity::realm::RealmNodeKind;
-use aruna_core::structs::placement::record::{
+use crate::NodeId;
+use crate::structs::identity::realm::RealmNodeKind;
+use crate::structs::placement::record::{
     AffinityEffect, AffinityRule, LabelMatch, PlacementStrategy,
 };
 use ulid::Ulid;

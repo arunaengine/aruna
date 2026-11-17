@@ -54,11 +54,8 @@ use aruna_operations::metadata::projector::{project_logged_events, replay_event_
 use aruna_operations::metadata::{AuthToken, MetadataHandle};
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::placement::expand_placement::expand_realm_placement;
-use aruna_operations::placement::transition::{TransitionRequest, plan_transition};
-use aruna_operations::placement::{
-    PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
-    resolve_shard_holders, strategy_for_target,
-};
+use aruna_core::placement::transition::{TransitionRequest, plan_transition};
+use aruna_core::placement::{PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject, resolve_shard_holders, strategy_for_target};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -1235,7 +1232,7 @@ async fn seed_config_topic(
         .ok_or("topology has no nodes")?;
     let target = DocumentTarget::RealmConfig { realm_id };
     let placement =
-        aruna_operations::placement::target_placement_ref(config, &target, Default::default());
+        aruna_core::placement::target_placement_ref(config, &target, Default::default());
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: seeder.node_id(),

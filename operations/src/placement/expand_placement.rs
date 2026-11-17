@@ -10,7 +10,7 @@ use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
+use aruna_core::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
@@ -159,7 +159,7 @@ fn next_map(config: &RealmConfigDocument) -> (u64, CandidatePlacementMap) {
     (epoch, config.freeze_map(epoch))
 }
 
-fn invalid(error: crate::placement::transition::TransitionPlanError) -> MutatePlacementError {
+fn invalid(error: aruna_core::placement::transition::TransitionPlanError) -> MutatePlacementError {
     MutatePlacementError::InvalidInput(error.to_string())
 }
 

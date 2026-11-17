@@ -16,7 +16,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use ulid::Ulid;
 
 use super::keys::{budget_key, id_key};
-use crate::placement::transition::activation_holders;
+use aruna_core::placement::transition::activation_holders;
 
 /// The authenticated local view records of one family are judged against.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -32,7 +32,7 @@ use super::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive_until};
-use crate::placement::selector::select_top_peers;
+use aruna_core::placement::selector::select_top_peers;
 
 pub const AUDIT_PAGE_LIMIT: usize = MAX_AUDIT_RECORDS;
 pub const AUDIT_PAGE_SIZE: usize = 50;

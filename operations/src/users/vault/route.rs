@@ -31,7 +31,7 @@ use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
 use crate::metadata::transport_message_kind;
 use crate::placement::process_placements::load_realm_config;
-use crate::placement::{holds_placement, target_placement_ref};
+use aruna_core::placement::{holds_placement, target_placement_ref};
 
 /// Saves one holder attempt makes when its transaction loses to a concurrent save.
 const CONFLICT_ATTEMPTS: usize = 3;

@@ -319,7 +319,7 @@ pub(crate) fn map_api_error(error: MetadataApiError) -> ServerError {
         }
         MetadataApiError::SearchIncomplete(reason) => ServerError::ServiceUnavailableReason(reason),
         MetadataApiError::PlacementUnavailable(
-            aruna_operations::placement::PlacementResolveError::ActivationConflicted(_),
+            aruna_core::placement::PlacementResolveError::ActivationConflicted(_),
         ) => ServerError::ServiceUnavailableReason("placement_activation_conflict".to_string()),
         MetadataApiError::PlacementUnavailable(_) => {
             ServerError::ServiceUnavailableReason("placement_activation_unavailable".to_string())

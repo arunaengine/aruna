@@ -356,5 +356,5 @@ pub(super) fn record_matches_filters(
 
 fn path_matches_prefix(document_path: &str, path_prefix: &str) -> bool {
     let normalized_path = MetadataRegistryRecord::normalize_document_path(document_path);
-    crate::placement::resolver::path_prefix_match(&normalized_path, path_prefix).is_some()
+    aruna_core::placement::resolver::path_prefix_match(&normalized_path, path_prefix).is_some()
 }

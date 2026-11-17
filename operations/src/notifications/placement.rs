@@ -10,7 +10,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::{DEFAULT_SHARD_COUNT, PlacementStrategy};
 use ulid::Ulid;
 
-use crate::placement::{build_view, resolve_holders};
+use aruna_core::placement::{build_view, resolve_holders};
 
 pub const INBOX_TOPIC_DOMAIN: &[u8] = b"aruna-notification-inbox-v1";
 

@@ -54,7 +54,7 @@ use crate::metadata::repository::{
     StorageReadError, create_materialization_entries, create_outbox_entries, parse_lifecycle_read,
     parse_status_read, read_document_registry, read_lifecycle_effect, read_status_effect,
 };
-use crate::placement::{registry_placement, resolve_shard_holders};
+use aruna_core::placement::{registry_placement, resolve_shard_holders};
 use crate::sync::outbox_record::schedule_drain_effect;
 use crate::sync::shard_placement::sort_node_ids;
 use crate::tasks::task_persistence::persist_task_effect;
@@ -416,7 +416,7 @@ pub async fn project_create_events(
     let mut projected_records = Vec::new();
     // Graphs that only receive a late merge job; their lifecycle still fences the write.
     let mut late_graphs = BTreeSet::new();
-    let mut fence = crate::placement::fence::WriteFence::default();
+    let mut fence = aruna_core::placement::fence::WriteFence::default();
     let mut journaled = BTreeSet::new();
 
     for event in events {
@@ -559,7 +559,7 @@ pub async fn project_create_events(
                 config,
                 [
                     event.record.placement,
-                    crate::placement::registry_placement(config, &event.record),
+                    aruna_core::placement::registry_placement(config, &event.record),
                 ],
             );
         }
@@ -842,7 +842,7 @@ async fn transactional_projection_write(
     context: &DriverContext,
     writes: Vec<(String, ByteView, ByteView)>,
     graph_iris: BTreeSet<String>,
-    fence: &crate::placement::fence::WriteFence,
+    fence: &aruna_core::placement::fence::WriteFence,
 ) -> Result<(), MetadataProjectionError> {
     // Read lifecycle keys in the same transaction as registry writes so a
     // delete commit conflicts instead of allowing storage resurrection.
@@ -1411,17 +1411,17 @@ mod tests {
         let target = DocumentTarget::MetadataDocumentLifecycle {
             document_id: event.record.document_id,
         };
-        let context = crate::placement::PlacementResolutionContext {
+        let context = aruna_core::placement::PlacementResolutionContext {
             group_id: Some(event.record.group_id),
             metadata_path: Some(event.record.document_path.as_str()),
         };
-        let (strategy, _) = crate::placement::strategy_for_target(config, &target, context)
+        let (strategy, _) = aruna_core::placement::strategy_for_target(config, &target, context)
             .expect("strategy resolves");
-        event.record.placement = crate::placement::choose_origin_bucket(
+        event.record.placement = aruna_core::placement::choose_origin_bucket(
             config,
             strategy,
             event.node_id,
-            &crate::placement::subject_bytes(&target),
+            &aruna_core::placement::subject_bytes(&target),
         )
         .expect("origin holds a bucket");
         event
@@ -2265,7 +2265,7 @@ mod tests {
         config.ensure_node(node(4), RealmNodeKind::Server);
         // A user node holds no bucket, so its create fell back to the hashed
         // one (stage 1); it still never becomes a holder of it.
-        event.record.placement = crate::placement::target_placement_ref(
+        event.record.placement = aruna_core::placement::target_placement_ref(
             &config,
             &DocumentTarget::MetadataDocumentLifecycle {
                 document_id: event.record.document_id,

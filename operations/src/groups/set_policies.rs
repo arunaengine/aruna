@@ -26,7 +26,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -53,7 +53,7 @@ pub struct SetGroupOperation {
     txn_id: Option<TxnId>,
     /// Bucket the authorization row publishes onto, read inside the write
     /// transaction.
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     state: SetGroupState,
     conflicts: u8,
     output: Option<Result<GroupAuthorizationDocument, SetGroupError>>,

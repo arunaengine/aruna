@@ -87,7 +87,7 @@ pub(crate) mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
     use ulid::Ulid;
 
-    use crate::placement::resolve_shard_holders;
+    use aruna_core::placement::resolve_shard_holders;
 
     /// Realm authorization granting `user` the realm-configuration write every
     /// policy publication is verified against.

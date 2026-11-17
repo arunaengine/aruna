@@ -25,7 +25,7 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::raw_revision::MetadataRawView;
 use crate::metadata::raw_revision::load_raw_view;
 use crate::placement::process_placements::load_realm_config;
-use crate::placement::read_holder_sets;
+use aruna_core::placement::read_holder_sets;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::PeerTrust;
 use crate::realm::peer_trust::ensure_peer_trust;

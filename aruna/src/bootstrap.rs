@@ -19,7 +19,7 @@ use aruna_operations::notifications::watch::interest::{
     ensure_interest_digest, mark_interest_dirty,
 };
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-use aruna_operations::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,

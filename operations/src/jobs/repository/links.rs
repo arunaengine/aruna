@@ -30,7 +30,7 @@ use ulid::Ulid;
 use super::link_queue::ACTIVE_RETRY_MS;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::persistent_id::{MappingRoute, mapping_route};
-use crate::placement::fence;
+use aruna_core::placement::fence;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 
 const LINK_PAGE: usize = 256;

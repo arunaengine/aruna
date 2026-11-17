@@ -348,14 +348,14 @@ async fn onboarding_sync_topics(
                 continue;
             }
             let placement =
-                crate::placement::target_placement_ref(&config, document, Default::default());
+                aruna_core::placement::target_placement_ref(&config, document, Default::default());
             if placement == PlacementRef::NIL {
                 let DocumentTarget::User { user_id } = document else {
                     unreachable!("shard onboarding documents are restricted to users");
                 };
                 return Err(BootstrapFinalizeError::UserPlacementUnavailable(*user_id));
             }
-            if crate::placement::holds_placement(&config, &placement, joiner_node_id) {
+            if aruna_core::placement::holds_placement(&config, &placement, joiner_node_id) {
                 topics
                     .shard
                     .push(document.sync_topic_id(realm_id, &placement));
@@ -956,8 +956,8 @@ mod tests {
                 user_id: UserId::local(Ulid::from_bytes(bytes), fixture.realm_id),
             };
             let placement =
-                crate::placement::target_placement_ref(&config, &target, Default::default());
-            if crate::placement::holds_placement(&config, &placement, fixture.joiner_node_id) {
+                aruna_core::placement::target_placement_ref(&config, &target, Default::default());
+            if aruna_core::placement::holds_placement(&config, &placement, fixture.joiner_node_id) {
                 held.get_or_insert(target);
             } else {
                 nonholder.get_or_insert(target);
@@ -969,7 +969,7 @@ mod tests {
         let held = held.expect("joiner holds a capped user shard");
         let nonholder = nonholder.expect("joiner does not hold every capped user shard");
         let held_placement =
-            crate::placement::target_placement_ref(&config, &held, Default::default());
+            aruna_core::placement::target_placement_ref(&config, &held, Default::default());
         let ticket = OnboardingTicket::issue(
             &fixture.realm_signing_key,
             &fixture.realm_id,

@@ -11,8 +11,8 @@ use aruna_operations::metadata::create_document::mint_local_document;
 use aruna_operations::metadata::forward::route_metadata_update;
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
-use aruna_operations::placement::holds_placement;
-use aruna_operations::placement::transition::preview_transition;
+use aruna_core::placement::holds_placement;
+use aruna_core::placement::transition::preview_transition;
 use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
 
 use crate::topology::document_present;

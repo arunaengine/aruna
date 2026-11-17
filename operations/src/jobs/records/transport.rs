@@ -32,7 +32,7 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
 use crate::node::dashboard::notify_dashboard_change;
-use crate::placement::holds_placement;
+use aruna_core::placement::holds_placement;
 
 /// Publishes one record to the family holders, or reads a bounded page back.
 pub async fn dispatch_record(context: &DriverContext, effect: JobRecordEffect) -> JobRecordEvent {

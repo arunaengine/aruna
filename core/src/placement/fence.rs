@@ -3,11 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::keyspaces::WRITE_FENCE_KEYSPACE;
-use aruna_core::storage_entries::placement_fence_key;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::types::{Key, Value};
+use crate::keyspaces::WRITE_FENCE_KEYSPACE;
+use crate::storage_entries::placement_fence_key;
+use crate::structs::identity::realm::{RealmConfigDocument, RealmId};
+use crate::structs::placement::record::PlacementRef;
+use crate::types::{Key, Value};
 
 /// Generation a write of `placement` is admitted at: the bucket's activation
 /// epoch. `None` while the bucket has no usable activation, which is bootstrap
@@ -32,7 +32,7 @@ pub fn fence_read(realm_id: &RealmId, placement: &PlacementRef) -> (String, Key)
 /// The generation the stored fence value closes, or `None` when the bytes do
 /// not parse. Only `close` may act on the difference: every other reader must
 /// treat an unparseable value as closed rather than reopen the bucket.
-pub(crate) fn stored_generation(value: Option<&Value>) -> Option<u64> {
+pub fn stored_generation(value: Option<&Value>) -> Option<u64> {
     match value {
         None => Some(0),
         Some(bytes) => <[u8; 8]>::try_from(bytes.as_ref())
@@ -119,9 +119,9 @@ impl WriteFence {
 #[cfg(test)]
 mod tests {
     use crate::placement::process_transitions::close;
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::Event;
-    use aruna_core::events::StorageEvent;
+    use crate::effects::StorageEffect;
+    use crate::events::Event;
+    use crate::events::StorageEvent;
     use byteview::ByteView;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -157,7 +157,7 @@ mod tests {
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         config
             .strategies
-            .push(aruna_core::structs::placement::record::PlacementStrategy {
+            .push(crate::structs::placement::record::PlacementStrategy {
                 strategy_id: placement().strategy_id,
                 name: "default".to_string(),
                 replica_count: Some(1),
@@ -218,7 +218,7 @@ mod tests {
 
         let write = storage
             .send_storage_effect(StorageEffect::Write {
-                key_space: aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE.to_string(),
+                key_space: crate::keyspaces::SYNC_OUTBOX_KEYSPACE.to_string(),
                 key: ByteView::from(b"paused-row".to_vec()),
                 value: ByteView::from(vec![1u8]),
                 txn_id: Some(txn_id),
@@ -235,7 +235,7 @@ mod tests {
             matches!(
                 commit,
                 Event::Storage(StorageEvent::Error {
-                    error: aruna_core::errors::StorageError::TransactionConflict
+                    error: crate::errors::StorageError::TransactionConflict
                 })
             ),
             "the paused predecessor write must conflict, got {commit:?}"

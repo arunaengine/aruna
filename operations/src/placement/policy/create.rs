@@ -27,7 +27,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
+use aruna_core::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 
 #[derive(Debug, Clone, PartialEq)]

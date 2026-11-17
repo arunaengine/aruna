@@ -420,11 +420,11 @@ impl UpdateDocumentOperation {
         };
         [
             record.placement,
-            crate::placement::registry_placement(config, record),
+            aruna_core::placement::registry_placement(config, record),
         ]
         .into_iter()
         .filter_map(|placement| {
-            let generation = crate::placement::fence::write_generation(config, &placement)?;
+            let generation = aruna_core::placement::fence::write_generation(config, &placement)?;
             Some((placement, generation))
         })
         .collect()
@@ -933,7 +933,7 @@ impl UpdateDocumentOperation {
         // The fence joins this transaction's read set, so a
         // departing holder's close conflicts an uncommitted write.
         reads.extend(self.fenced.iter().map(|(placement, _)| {
-            crate::placement::fence::fence_read(&record.realm_id, placement)
+            aruna_core::placement::fence::fence_read(&record.realm_id, placement)
         }));
         reads.extend(self.window.map(|checkpoint| {
             (
@@ -983,7 +983,7 @@ impl UpdateDocumentOperation {
                         .iter()
                         .zip(fences)
                         .all(|((_, generation), (_, value))| {
-                            crate::placement::fence::admits(value.as_ref(), *generation)
+                            aruna_core::placement::fence::admits(value.as_ref(), *generation)
                         });
                 if !admitted {
                     return self.fail(UpdateDocumentError::PlacementFenced);

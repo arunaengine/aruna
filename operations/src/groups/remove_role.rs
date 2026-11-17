@@ -29,7 +29,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -49,7 +49,7 @@ pub struct RemoveGroupOperation {
     input: RemoveGroupConfig,
     /// Bucket the authorization rows publish onto, read inside the write
     /// transaction.
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     state: RemoveGroupState,
     conflicts: u8,
     output: Option<Result<(Group, GroupAuthorizationDocument), RemoveGroupError>>,

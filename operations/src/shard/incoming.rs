@@ -19,7 +19,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
-use crate::placement::{bucket_membership, resolve_shard_holders};
+use aruna_core::placement::{bucket_membership, resolve_shard_holders};
 use crate::shard::assemble_shard_manifest;
 use crate::shard::client::{SHARD_IO_TIMEOUT, close_stream};
 use crate::shard::protocol::{

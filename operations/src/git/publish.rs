@@ -5,7 +5,7 @@
 use super::{GitError, records};
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
-use crate::placement::resolve_shard_holders;
+use aruna_core::placement::resolve_shard_holders;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -68,7 +68,7 @@ pub async fn publish_pack(
         .map(|net| net.node_id())
         .ok_or(GitError::Unavailable)?;
     let peers = holders_in(&config, node_id, document)?;
-    let mut fence = crate::placement::fence::WriteFence::default();
+    let mut fence = aruna_core::placement::fence::WriteFence::default();
     fence.add(document.realm_id, &config, [pack.placement]);
     let writes = pack_writes(&pack, document.realm_id, peers, &fence)?;
     records::commit(context, writes, &fence).await?;
@@ -102,7 +102,7 @@ pub fn pack_writes(
     pack: &GitPackRecord,
     realm_id: RealmId,
     peers: Vec<NodeId>,
-    fence: &crate::placement::fence::WriteFence,
+    fence: &aruna_core::placement::fence::WriteFence,
 ) -> Result<Vec<Row>, GitError> {
     let target = pack.target();
     let change = pack.change();
@@ -192,7 +192,7 @@ pub async fn publish_with(
     if !record.validate() {
         return Err(GitError::Invalid);
     }
-    let mut fence = crate::placement::fence::WriteFence::default();
+    let mut fence = aruna_core::placement::fence::WriteFence::default();
     fence.add(record.realm_id, &config, [record.placement]);
     let target = DocumentTarget::GitRecord {
         document_id: record.document_id,

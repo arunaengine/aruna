@@ -42,10 +42,7 @@ use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
     update_metadata_document,
 };
-use aruna_operations::placement::{
-    PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
-    strategy_for_target, subject_bytes,
-};
+use aruna_core::placement::{PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders, strategy_for_target, subject_bytes};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -1072,7 +1069,7 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
     let event_id = Ulid::generate();
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
     let lifecycle_target = DocumentTarget::MetadataDocumentLifecycle { document_id };
-    let placement = aruna_operations::placement::target_placement_ref(
+    let placement = aruna_core::placement::target_placement_ref(
         &realm_config,
         &lifecycle_target,
         Default::default(),

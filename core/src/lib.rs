@@ -42,6 +42,7 @@ pub mod password;
 pub mod permission_path;
 pub mod plugin_installs;
 pub mod plugin_runs;
+pub mod placement;
 pub mod plugins;
 pub mod realm_vault;
 pub mod recovery_code;

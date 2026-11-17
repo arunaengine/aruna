@@ -27,7 +27,7 @@ use tracing::warn;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 use crate::realm::assign_role::should_seed_role;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{

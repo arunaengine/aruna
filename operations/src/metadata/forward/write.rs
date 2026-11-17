@@ -36,7 +36,7 @@ use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_document::update_metadata_document;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::process_placements::load_realm_config;
-use crate::placement::resolve_shard_holders;
+use aruna_core::placement::resolve_shard_holders;
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;

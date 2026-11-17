@@ -31,8 +31,8 @@ use smallvec::smallvec;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::groups::backends::{backend_key, index_prefix};
-use crate::placement::fence::WriteFence;
-use crate::placement::target_placement_ref;
+use aruna_core::placement::fence::WriteFence;
+use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };

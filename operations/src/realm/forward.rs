@@ -9,7 +9,7 @@ use crate::forward::transport::reject;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
-use crate::placement::holds_placement;
+use aruna_core::placement::holds_placement;
 use crate::placement::process_placements::load_realm_config;
 use crate::sync::outbox_record::new_outbox_record;
 use crate::sync::outbox_record::schedule_drain_effect;
@@ -193,7 +193,7 @@ pub(crate) async fn apply_admin_relay(
 mod tests {
     use super::RelayAdmission;
     use super::admit_relayed_admin;
-    use crate::placement::resolve_shard_holders;
+    use aruna_core::placement::resolve_shard_holders;
     use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentEvent;

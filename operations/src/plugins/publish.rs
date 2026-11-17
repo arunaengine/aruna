@@ -32,7 +32,7 @@ use super::copies::{chunk_count, chunk_of, store_local};
 use super::copies_needed;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{

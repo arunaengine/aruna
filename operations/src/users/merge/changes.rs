@@ -26,7 +26,7 @@ use smallvec::smallvec;
 use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 
-use crate::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 use crate::realm::ensure_config::overlay_reducer_state;
 use crate::users::update_user::local_sync_change;
 

@@ -41,9 +41,7 @@ use aruna_operations::metadata::projector::{
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
 };
-use aruna_operations::placement::{
-    PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
-};
+use aruna_core::placement::{PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes};
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;

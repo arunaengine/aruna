@@ -24,9 +24,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::placement::{
-    PlacementResolveError, holds_placement, plan_target_placement, read_holder_sets,
-};
+use aruna_core::placement::{PlacementResolveError, holds_placement, plan_target_placement, read_holder_sets};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadVaultConfig {
