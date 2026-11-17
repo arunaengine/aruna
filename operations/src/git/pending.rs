@@ -189,7 +189,7 @@ async fn drain(context: &DriverContext) {
         let Ok(Some(document)) = load_document_record(context, id).await else {
             continue;
         };
-        let _guard = super::project::lock(id).await;
+        let _guard = store.lock(id).await;
         // The same refresh as Git traffic: rebuilds a missing cache, then applies the merges.
         if let Err(error) = Box::pin(super::snapshot::refresh(context, store, &document)).await {
             warn!(document_id = %id, %error, "Pushed metadata waits");

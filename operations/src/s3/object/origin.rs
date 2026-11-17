@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::staging::root_record::{hydrated, named_root, parse_root, read_root};
+use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
 use std::time::SystemTime;
 
 use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};

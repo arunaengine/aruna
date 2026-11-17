@@ -9,6 +9,7 @@ use crate::effects::{
     encoded_len,
 };
 use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
+use crate::key_index::IndexEvent;
 use crate::metadata::MetadataEvent;
 use crate::node_vault::VaultEntry;
 use crate::outbound::OutboundEvent;
@@ -53,6 +54,7 @@ pub enum Event {
     Task(TaskEvent),
     Search(),
     Stream(),
+    Index(IndexEvent),
     Group(GroupEvent),
     Session(Box<crate::compute::session::SessionAnswer>),
     Outbound(OutboundEvent),
@@ -961,6 +963,18 @@ impl Event {
             ),
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
+            Event::Index(event) => variant_label!(
+                event,
+                IndexEvent {
+                    Applied,
+                    Searched,
+                    Exists,
+                    Outdated,
+                    Counted,
+                    Pruned,
+                    Error,
+                }
+            ),
             Event::Session(_) => "Event::Session",
             Event::Outbound(event) => variant_label!(event, OutboundEvent { Posted, MailSent }),
         }

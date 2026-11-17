@@ -61,6 +61,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+    use crate::tests::staging::sample_metadata;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -82,17 +83,6 @@ mod pure_tests {
     }
 
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-
-    fn sample_metadata() -> SourceMetadata {
-        SourceMetadata {
-            content_length: 42,
-            content_type: Some("application/octet-stream".to_string()),
-            etag: Some("etag-1".to_string()),
-            last_modified: Some(SystemTime::UNIX_EPOCH),
-            source_version: None,
-            digests: Default::default(),
-        }
-    }
 
     #[test]
     fn descriptor_copies_config() {

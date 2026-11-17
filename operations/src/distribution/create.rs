@@ -374,7 +374,7 @@ pub(crate) async fn send_admin(
 
 /// Sends one request to the set's publisher; an unreachable publisher means configuration
 /// changes are unavailable, never a queued request.
-pub(crate) async fn publish_remote(
+async fn publish_remote(
     context: &Arc<DriverContext>,
     publisher: NodeId,
     message: MetadataTransportMessage,
@@ -400,7 +400,7 @@ pub(crate) async fn publish_remote(
 }
 
 /// Asks a member's node to create and admit its local bucket under the caller's bearer token.
-pub(crate) async fn request_admission(
+async fn request_admission(
     context: &Arc<DriverContext>,
     (node_id, member_id, sizes): (NodeId, Ulid, &[RangeSize]),
     auth_token: AuthToken,

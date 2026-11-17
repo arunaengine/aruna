@@ -31,7 +31,8 @@ use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use aruna_operations::staging::bucket_guard::BucketGuardOperation;
+use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use rmcp::Json;
@@ -998,9 +999,13 @@ pub(crate) async fn write_text(
             ),
         )));
     }
-    guard_bucket_write(server.state.get_ctx().as_ref(), &input.bucket)
-        .await
-        .map_err(map_offered_error)?;
+    drive(
+        BucketGuardOperation::new(input.bucket.as_str()),
+        server.state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(OfferedDirectoryError::from)
+    .map_err(map_offered_error)?;
     let bucket_info = server.bucket_info(&input.bucket).await?;
     authorize_tool(
         &server.state,

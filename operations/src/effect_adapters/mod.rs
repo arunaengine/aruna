@@ -14,6 +14,7 @@ mod task;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
 use aruna_core::outbound::{OutboundEffect, OutboundError, OutboundEvent};
+use aruna_core::key_index::{IndexError, IndexEvent};
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
@@ -80,18 +81,12 @@ pub(crate) async fn dispatch_effect_until(
         Effect::Net(NetEffect::VaultSign(records)) => Event::Net(NetEvent::VaultSign(
             crate::users::vault_route::sign_records(context, *records),
         )),
-        Effect::Net(NetEffect::SnapshotSign(claim)) => Event::Net(NetEvent::SnapshotSign(
-            crate::distribution::sign_snapshot(context, *claim),
-        )),
         // Release crate reads and holder requests need the runner's handles.
         Effect::Net(NetEffect::Release(effect)) => Event::Net(NetEvent::Release(
             Box::pin(crate::s3::bucket::release::publish::dispatch_release(
                 context, *effect,
             ))
             .await,
-        )),
-        Effect::Net(NetEffect::StatementSign(claim)) => Event::Net(NetEvent::StatementSign(
-            crate::distribution::sign_statement(context, *claim),
         )),
         // Job-record replication and launch offers resolve their holders in the
         // operation and run only the holder round-trips here.
@@ -155,6 +150,10 @@ pub(crate) async fn dispatch_effect_until(
             }
         }
         Effect::Task(task_effect) => task::dispatch_task(task_effect, context).await,
+        Effect::Index(index_effect) => Event::Index(match context.storage_handle.range_indexes() {
+            Some(indexes) => indexes.execute(*index_effect).await,
+            None => IndexEvent::Error(IndexError::Unavailable),
+        }),
         Effect::Search() => {
             warn!(
                 depth,
@@ -212,6 +211,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Index(_) => "index",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
         Effect::Outbound(_) => "outbound",

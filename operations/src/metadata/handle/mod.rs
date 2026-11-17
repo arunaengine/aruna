@@ -21,6 +21,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
+use aruna_storage::key_index::RangeIndexes;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use async_trait::async_trait;
 use craqle::{
@@ -51,7 +52,6 @@ use crate::auth::bearer_token::{
     ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_linked_owner,
     realm_token_revoked, realm_user_cutoff,
 };
-use crate::distribution::key_index::RangeIndexes;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::sync::mirror_repair::RECONCILE_GRACE;
@@ -298,7 +298,6 @@ impl From<MetadataSearchStorage> for SearchStorage {
 }
 
 struct MetadataInner {
-    git: std::sync::OnceLock<aruna_blob::git::GitStore>,
     node: Arc<CraqleNode>,
     storage_handle: StorageHandle,
     auth_validation: AuthValidationState,
@@ -319,7 +318,6 @@ struct MetadataInner {
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
     peer_contacts: PeerContacts,
     sync_pulls: crate::metadata::device_pull::PullRegistry,
-    range_indexes: Arc<RangeIndexes>,
     #[cfg(feature = "test-hooks")]
     drop_ack: AtomicBool,
     #[cfg(feature = "test-hooks")]
@@ -574,9 +572,10 @@ impl MetadataHandle {
                 .unwrap_or(4)
                 .max(4)
         });
+        // Range indexes sit beside the metadata store, so only a node with metadata keeps them.
+        storage_handle.install_range_indexes(RangeIndexes::new(path.join(RANGE_INDEX_DIR)));
         Ok(Self {
             inner: Arc::new(MetadataInner {
-                git: std::sync::OnceLock::new(),
                 node: Arc::new(node),
                 auth_validation: AuthValidationState::new(
                     storage_handle.clone(),
@@ -602,7 +601,6 @@ impl MetadataHandle {
                 profile_shacl,
                 peer_contacts: PeerContacts::default(),
                 sync_pulls: Default::default(),
-                range_indexes: Arc::new(RangeIndexes::new(path.join(RANGE_INDEX_DIR))),
                 #[cfg(feature = "test-hooks")]
                 drop_ack: AtomicBool::new(false),
                 #[cfg(feature = "test-hooks")]
@@ -610,11 +608,6 @@ impl MetadataHandle {
             }),
             storage_priority: StoragePriority::Foreground,
         })
-    }
-
-    /// The search indexes of the distributed bucket ranges this node holds.
-    pub fn range_indexes(&self) -> Arc<RangeIndexes> {
-        self.inner.range_indexes.clone()
     }
 
     /// Test hook: the next sync mirror create reports a timeout after the target stored it.
@@ -665,15 +658,6 @@ impl MetadataHandle {
             inner: self.inner.clone(),
             storage_priority: StoragePriority::Bulk,
         }
-    }
-
-    /// Installs the Git store once; a later install keeps the first store.
-    pub fn install_git(&self, store: aruna_blob::git::GitStore) {
-        self.inner.git.get_or_init(|| store);
-    }
-
-    pub(crate) fn git(&self) -> Option<&aruna_blob::git::GitStore> {
-        self.inner.git.get()
     }
 
     fn lifecycle_storage(&self) -> StorageHandle {

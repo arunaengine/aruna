@@ -98,7 +98,7 @@ async fn stored(context: &DriverContext, pack: &GitPackRecord) -> Result<bool, G
 }
 
 /// The pack row, its sync revision, shard manifest row and outbox publish.
-pub fn pack_writes(
+fn pack_writes(
     pack: &GitPackRecord,
     realm_id: RealmId,
     peers: Vec<NodeId>,

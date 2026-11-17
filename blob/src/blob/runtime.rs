@@ -6,15 +6,18 @@ use super::group::{BackendClaim, GroupHold};
 use super::{BackendRegistry, BlobHandle, BlobHandler, CONNECTION_SLOTS, PEER_CONNECTIONS};
 use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
+use crate::native;
 use crate::opendal::init_operator;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, Effect, LocalFileEffect, StagingSourceEffect};
 use aruna_core::egress::EgressPolicy;
-use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::errors::{BlobError, StagingSourceError};
+use aruna_core::events::{BlobEvent, Event, StagingSourceEvent};
 use aruna_core::handle::Handle;
+use aruna_core::native_reference::is_native;
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::storage::blob::BackendConfig;
 use aruna_core::structs::storage::encryption::{generate_key, seal_copies};
 use aruna_core::structs::storage::multipart::MultipartPartKey;
@@ -254,6 +257,15 @@ impl BlobHandle {
         BlobHandle { handler }
     }
 
+    /// Installs the Git store on first call; later calls get the installed one.
+    pub fn install_git(&self, store: Arc<crate::git::GitStore>) -> Arc<crate::git::GitStore> {
+        self.handler.git.get_or_init(|| store).clone()
+    }
+
+    pub fn git(&self) -> Option<&crate::git::GitStore> {
+        self.handler.git.get().map(Arc::as_ref)
+    }
+
     /// Closes the blob write path before storage is closed. Mutations that
     /// arrive afterwards are rejected and counted.
     pub fn close_writes(&self) {
@@ -450,6 +462,24 @@ impl BlobHandle {
 
     pub async fn send_staging_effect(&self, effect: StagingSourceEffect) -> Event {
         let staging_source_event = match effect {
+            // A native source is another node's object, read through the reference protocol.
+            StagingSourceEffect::Head { access } if is_native(&access) => {
+                native::head(&self.handler.net, access)
+                    .await
+                    .unwrap_or_else(source_error)
+            }
+            StagingSourceEffect::Read { access, range, .. } if is_native(&access) => {
+                native::read(&self.handler.net, access, range)
+                    .await
+                    .unwrap_or_else(source_error)
+            }
+            StagingSourceEffect::Check { access } | StagingSourceEffect::List { access, .. }
+                if is_native(&access) =>
+            {
+                source_error(StagingSourceError::UnsupportedKind(
+                    SourceConnectorKind::ArunaNative.to_string(),
+                ))
+            }
             StagingSourceEffect::Check { access } => {
                 self.handler.check_staging_source(access).await
             }
@@ -635,6 +665,7 @@ impl BlobHandler {
             spool_dir: spool_dir.map(Arc::new),
             spool_files: Arc::new(Semaphore::new(super::local_spool::SPOOL_FILES)),
             spool_budget: Arc::new(Semaphore::new(SPOOL_BUDGET_MIB)),
+            git: Arc::default(),
         };
         blob_handler.ensure_multipart_bucket().await?;
         if let Err(error) = blob_handler.backfill_free_index().await {
@@ -1330,4 +1361,8 @@ impl BlobHandler {
             .control_io_timeout
             .min(Duration::from_secs(5))
     }
+}
+
+fn source_error(error: StagingSourceError) -> StagingSourceEvent {
+    StagingSourceEvent::Error { error }
 }

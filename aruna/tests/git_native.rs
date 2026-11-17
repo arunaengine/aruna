@@ -27,11 +27,11 @@ async fn git_server(
     capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
     root: std::path::PathBuf,
 ) -> TestResult<(String, tokio_util::sync::CancellationToken, ServerTask)> {
-    let metadata = context.metadata_handle.as_ref().ok_or("metadata handle")?;
-    metadata.install_git(aruna_blob::git::GitStore::new(
+    let blob = context.blob_handle.as_ref().ok_or("blob handle")?;
+    blob.install_git(Arc::new(aruna_blob::git::GitStore::new(
         root,
         env!("CARGO_BIN_EXE_aruna").into(),
-    ));
+    )));
     let state = Arc::new(
         ServerState::new(
             context,

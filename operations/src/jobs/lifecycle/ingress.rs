@@ -22,7 +22,9 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::bucket_metadata::{CapturedDatabase, ReleaseRef};
 use aruna_core::structs::storage::dataset_description::DatasetDescription;
 use aruna_core::structs::storage::origin::SourcePin;
-use aruna_core::structs::storage::read_grant::{GrantScope, ReadGrant};
+use aruna_core::structs::storage::read_grant::{
+    GrantScope, HEAD_OPERATION, READ_OPERATION, ReadGrant,
+};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::time::unix_timestamp_millis;
 use serde::{Deserialize, Serialize};

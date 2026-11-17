@@ -15,10 +15,10 @@ use aruna_api::server::{Server, ServerConfig};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_operations::device::replica::{DEFAULT_CACHE_BYTES, set_cache_budget};
-use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_tasks::shutdown::Shutdown;
+use aruna_tasks::wipe::DeviceWipe;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -287,11 +287,11 @@ async fn bind_all(
         }
         false => None,
     };
-    if let Some(metadata) = &driver_ctx.metadata_handle {
-        metadata.install_git(aruna_blob::git::GitStore::new(
+    if let Some(blob) = &driver_ctx.blob_handle {
+        blob.install_git(Arc::new(aruna_blob::git::GitStore::new(
             std::path::Path::new(&config.storage_path).join("git"),
             std::env::current_exe()?,
-        ));
+        )));
     }
     let mut state = ServerState::new(
         driver_ctx.clone(),

@@ -24,8 +24,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::permission_rules::PermissionRules;
+use crate::connectors::descriptor::build_source_descriptor;
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
-use crate::staging::descriptor::build_source_descriptor;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SourceChange {

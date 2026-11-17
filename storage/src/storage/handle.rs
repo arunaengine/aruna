@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::key_index::RangeIndexes;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -93,6 +94,8 @@ pub struct StorageHandle {
     pub(super) secret_key: Arc<OnceLock<CredentialEncryptionKey>>,
     pub(super) vault_key: Arc<OnceLock<NodeVaultKey>>,
     pub(super) database: Arc<OnceLock<OpenDatabase>>,
+    /// The key indexes of distributed bucket ranges, on a node that keeps them.
+    pub(super) range_indexes: Arc<OnceLock<Arc<RangeIndexes>>>,
 }
 
 /// The opened node database behind a `Send + Sync` object, so the auto trait proofs of handle
@@ -161,9 +164,20 @@ impl StorageHandle {
                 secret_key: Arc::new(OnceLock::new()),
                 vault_key: Arc::new(OnceLock::new()),
                 database: Arc::new(OnceLock::new()),
+                range_indexes: Arc::new(OnceLock::new()),
             },
             StorageReceivers { foreground, bulk },
         )
+    }
+
+    /// Installs the range key indexes on first call; later calls get the installed ones.
+    pub fn install_range_indexes(&self, indexes: RangeIndexes) -> Arc<RangeIndexes> {
+        self.range_indexes.get_or_init(|| Arc::new(indexes)).clone()
+    }
+
+    /// The range key indexes; `None` on a node that keeps none.
+    pub fn range_indexes(&self) -> Option<Arc<RangeIndexes>> {
+        self.range_indexes.get().cloned()
     }
 
     /// The opened node database, for consistent read snapshots such as live backups. `None`

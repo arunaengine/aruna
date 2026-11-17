@@ -24,8 +24,9 @@ use crate::jobs::source_read::{SourceReadError, authorize_read};
 use crate::jobs::workflow::input_view::ViewStream;
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use crate::staging::native_source::{body_stream, delegated_read};
-use crate::staging::reference::{ReferenceWrite, write_reference_version};
+use crate::staging::native_source::delegated_read;
+use crate::staging::reference::{ReferenceWrite, WriteReferenceOperation};
+use aruna_blob::native::body_stream;
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -240,7 +241,8 @@ pub async fn create_link(
         restrictions: caller.auth.path_restrictions.clone(),
         mirror_guards: Vec::new(),
     };
-    let (version, _) = Box::pin(write_reference_version(context, write))
+    let write = WriteReferenceOperation::new(write, std::time::SystemTime::now(), Ulid::generate());
+    let (version, _) = Box::pin(drive(write, context))
         .await
         .map_err(|error| LinkError::Unavailable(error.to_string()))?;
     Ok(version)

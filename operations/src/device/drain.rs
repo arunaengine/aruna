@@ -14,13 +14,13 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structured_id::StructuredId;
 use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, TxnId};
+use aruna_core::types::Key;
 use aruna_storage::storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
@@ -34,10 +34,10 @@ use super::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue};
 
 use super::edit::{refused_edit, reject_edit};
 use super::publish_queue::{
-    MAX_PUBLISH_ATTEMPTS, PublishEntry, PublishKind, PublishState, entry_with_state, publish_entry,
-    publish_key, read_publish_entry, scan_publish_queue,
+    ClaimStateOperation, MAX_PUBLISH_ATTEMPTS, PublishEntry, PublishKind, PublishState,
+    entry_with_state, publish_entry, publish_key, scan_publish_queue,
 };
-use super::replica::{read_replica, store_replica};
+use super::replica_store::{read_replica, store_replica};
 use super::retry::{exhausted, retry_due_ms};
 use super::selection::track_created;
 
@@ -150,72 +150,14 @@ async fn read_page(
     }
 }
 
-/// Stores `next` only while the entry still carries the state the scan read.
-/// A delete committed in between therefore wins instead of the entry coming
-/// back as `Publishing`.
-pub(super) async fn claim_state(
+/// Claims a queued draft for `next`; see [`ClaimStateOperation`].
+async fn claim_state(
     context: &Arc<DriverContext>,
     entry: &PublishEntry,
     next: PublishState,
 ) -> bool {
-    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    else {
-        warn!(draft_id = %entry.draft_id, "Failed to open a transaction for a queued draft");
-        return false;
-    };
-    if !write_claim(context, entry, next, txn_id).await {
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return false;
-    }
-    matches!(
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-            .await,
-        Event::Storage(StorageEvent::TransactionCommitted { .. })
-    )
-}
-
-async fn write_claim(
-    context: &Arc<DriverContext>,
-    entry: &PublishEntry,
-    next: PublishState,
-    txn_id: TxnId,
-) -> bool {
-    let Effect::Storage(read) = read_publish_entry(entry.draft_id, Some(txn_id)) else {
-        return false;
-    };
-    let current = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => PublishEntry::from_bytes(&bytes).ok(),
-        _ => None,
-    };
-    if !current.is_some_and(|current| current.state == entry.state) {
-        return false;
-    }
-    let Ok((key_space, key, value)) = publish_entry(&entry_with_state(entry, next)) else {
-        warn!(draft_id = %entry.draft_id, "Failed to encode a queued draft");
-        return false;
-    };
-    matches!(
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: Some(txn_id),
-            })
-            .await,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    )
+    let claim = ClaimStateOperation::new(entry.clone(), next);
+    drive(claim, context).await.unwrap_or(false)
 }
 
 async fn store_entry(context: &Arc<DriverContext>, entry: &PublishEntry) {

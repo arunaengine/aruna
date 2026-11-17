@@ -483,10 +483,10 @@ impl Operation for ReplaceSourceOperation {
 mod tests {
     use super::*;
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
+    use crate::connectors::descriptor::build_source_binding;
     use crate::connectors::repository::{connector_reference_key, connector_reference_write};
     use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
     use crate::driver::{DriverContext, drive};
-    use crate::staging::descriptor::build_source_binding;
     use aruna_core::keyspaces::{
         BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
     };

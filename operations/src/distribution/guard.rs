@@ -99,7 +99,8 @@ pub fn authority_rows(event: Event) -> Result<(Option<Value>, Option<Value>), Gu
             Err(GuardError::Unreadable(error.to_string()))
         }
         other => Err(GuardError::Unreadable(format!(
-            "unexpected answer {other:?}"
+            "unexpected answer {}",
+            other.label()
         ))),
     }
 }
@@ -324,16 +325,6 @@ pub fn record_epoch(
     event: Event,
 ) -> Result<OriginalEpoch, GuardError> {
     record_authority(binding, key, event).map(|authority| authority.epoch)
-}
-
-/// Checks `authority` from the answer to [`authority_read`] inside a publication transaction.
-pub fn authority_answer(
-    authority: &WriteAuthority,
-    key: &str,
-    event: Event,
-) -> Result<(), GuardError> {
-    let (record, fence) = authority_rows(event)?;
-    check_authority(authority, key, record.as_deref(), fence.as_deref())
 }
 
 #[cfg(test)]

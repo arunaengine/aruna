@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::changes::summary;
-use super::project::{Projection, author, forget, lock, project, recent, remember};
+use super::project::{Projection, author, forget, project, recent, remember};
 use super::versions::{copied, plain};
 use super::{GitError, document, objects, publish, records};
 use crate::auth::request_authorization::authorize;
@@ -708,11 +708,11 @@ pub async fn read_view(
     document: &MetadataRegistryRecord,
 ) -> Result<(Projection, bool), GitError> {
     let id = document.document_id;
-    let guard = match super::project::try_lock(id) {
+    let guard = match store.try_lock(id) {
         Some(guard) => guard,
         None => match super::project::last(id) {
             Some(projection) => return Ok((projection, true)),
-            None => lock(id).await,
+            None => store.lock(id).await,
         },
     };
     let viewed = view(context, store, document).await;
@@ -735,7 +735,7 @@ fn background(context: &DriverContext, document: &MetadataRegistryRecord) {
     tokio::spawn(async move {
         if let Ok(store) = super::store(&context) {
             let refreshing = timed(id, async {
-                let _guard = lock(id).await;
+                let _guard = store.lock(id).await;
                 refresh(&context, store, &document).await
             });
             if let Err(error) = Box::pin(refreshing).await {
@@ -838,7 +838,7 @@ pub async fn capture(
         return Ok(());
     };
     timed(record.document_id, async {
-        let _guard = lock(record.document_id).await;
+        let _guard = store.lock(record.document_id).await;
         forget(record.document_id);
         match update(context, store, record, revision, true).await {
             Ok(_) | Err(GitError::NotHolder) => Ok(()),
@@ -880,7 +880,7 @@ pub async fn status(
     let store = super::store(context)?;
     let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
     // Status never waits for a first snapshot either; it reports an empty pending state.
-    let (projection, pending) = match super::project::try_lock(id) {
+    let (projection, pending) = match store.try_lock(id) {
         Some(guard) => {
             let viewed = view(context, store, &document).await?;
             drop(guard);

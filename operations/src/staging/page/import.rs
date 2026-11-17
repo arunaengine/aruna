@@ -365,7 +365,7 @@ impl PageImportOperation {
             (state, event) => Err(PageImportError::UnexpectedEvent {
                 state,
                 expected: expected_event(state),
-                received: format!("{event:?}"),
+                received: event.label().to_string(),
             }),
         }
     }

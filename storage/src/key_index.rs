@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aruna_core::key_index::{IndexEffect, IndexError, IndexEvent, KeyChange, KeyPage, KeyQuery};
 use aruna_core::keyspaces::prefix_upper_bound;
 use aruna_core::structs::execution::table::PREFIX_CHARS;
 use tantivy::directory::MmapDirectory;
@@ -61,53 +62,6 @@ pub enum KeyIndexError {
     Missing(PathBuf),
     #[error("range index task failed: {0}")]
     Task(String),
-}
-
-/// One live key of a range: its current version and size.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IndexedKey {
-    pub key: String,
-    pub size: u64,
-    pub version_id: Ulid,
-    /// The search terms of a searchable version.
-    pub terms: Option<MetaTerms>,
-}
-
-/// Free text tokens and exact `column=value` terms of one version's metadata.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MetaTerms {
-    pub text: BTreeSet<String>,
-    pub exact: BTreeSet<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum KeyChange {
-    Put(IndexedKey),
-    Remove(String),
-}
-
-/// Keys between `start` and `end` in key order; `names` or `meta` keep keys with every token or
-/// term. Text tokens of three or more characters match by start; an overfull metadata one is left
-/// out, so callers check loaded versions. Terms cap matches at `limit`, else keys per segment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KeyQuery {
-    pub start: Bound<String>,
-    pub end: Bound<String>,
-    pub names: Option<String>,
-    pub meta: Option<MetaTerms>,
-    pub limit: usize,
-}
-
-/// The live matching keys of the examined part of a window, in key order.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct KeyPage {
-    pub keys: Vec<String>,
-    /// Keys looked at: the matches of a query with terms, every walked key of one without.
-    pub examined: usize,
-    /// The last examined key when the window continues after it; `None` once it is read.
-    pub last: Option<String>,
-    /// When the index last committed, read after the search; `None` without a recorded time.
-    pub committed_at: Option<SystemTime>,
 }
 
 #[derive(Clone, Copy)]
@@ -186,16 +140,18 @@ impl RangeIndexes {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_scan(root: impl Into<PathBuf>, scan_limit: u64) -> Self {
+    /// Indexes with a smaller match scan limit, so tests reach the key walk.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn with_scan(root: impl Into<PathBuf>, scan_limit: u64) -> Self {
         Self {
             scan_limit,
             ..Self::new(root)
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_range_bytes(self, range_bytes: usize) -> Self {
+    /// Indexes with another range query budget, so tests reach the prefix check.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn with_range_bytes(self, range_bytes: usize) -> Self {
         Self {
             range_bytes,
             ..self
@@ -211,6 +167,52 @@ impl RangeIndexes {
     pub fn directory(&self, set_id: Ulid, range_id: Ulid, generation: u64) -> PathBuf {
         self.range_dir(set_id, range_id)
             .join(generation.to_string())
+    }
+
+    /// Carries out one index effect and answers with its event.
+    pub async fn execute(self: &Arc<Self>, effect: IndexEffect) -> IndexEvent {
+        let answer = match effect {
+            IndexEffect::Apply {
+                set_id,
+                range_id,
+                generation,
+                changes,
+            } => (self.apply(set_id, range_id, generation, changes).await)
+                .map(|()| IndexEvent::Applied),
+            IndexEffect::Search {
+                set_id,
+                range_id,
+                generation,
+                query,
+            } => (self.search(set_id, range_id, generation, query).await)
+                .map(|page| IndexEvent::Searched(Box::new(page))),
+            IndexEffect::Exists {
+                set_id,
+                range_id,
+                generation,
+            } => (self.exists(set_id, range_id, generation).await).map(IndexEvent::Exists),
+            IndexEffect::Outdated {
+                set_id,
+                range_id,
+                generation,
+            } => (self.outdated(set_id, range_id, generation).await).map(IndexEvent::Outdated),
+            IndexEffect::Count {
+                set_id,
+                range_id,
+                generation,
+            } => (self.count(set_id, range_id, generation).await).map(IndexEvent::Counted),
+            IndexEffect::Prune {
+                set_id,
+                range_id,
+                keep,
+            } => (self.prune(set_id, range_id, keep).await).map(|()| IndexEvent::Pruned),
+        };
+        answer.unwrap_or_else(|error| {
+            IndexEvent::Error(match error {
+                KeyIndexError::Missing(_) => IndexError::Missing,
+                error => IndexError::Failed(error.to_string()),
+            })
+        })
     }
 
     /// Applies `changes` in order to a generation, creating it when missing, and commits.
@@ -767,6 +769,7 @@ fn walk_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::key_index::{IndexedKey, MetaTerms};
 
     fn set() -> Ulid {
         Ulid::from_bytes([1; 16])
@@ -793,6 +796,63 @@ mod tests {
             meta: None,
             limit,
         }
+    }
+
+    // Each effect answers with its own event; a missing generation is a typed refusal.
+    #[tokio::test]
+    async fn executes_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = Arc::new(RangeIndexes::new(dir.path()));
+        let (set_id, range_id) = (set(), range());
+        let all = query(Bound::Unbounded, Bound::Unbounded, None, 10);
+        let search = IndexEffect::Search {
+            set_id,
+            range_id,
+            generation: 1,
+            query: all,
+        };
+        assert_eq!(
+            indexes.execute(search.clone()).await,
+            IndexEvent::Error(IndexError::Missing)
+        );
+        let changes = vec![put("a"), put("b")];
+        let apply = IndexEffect::Apply {
+            set_id,
+            range_id,
+            generation: 1,
+            changes,
+        };
+        assert_eq!(indexes.execute(apply).await, IndexEvent::Applied);
+        let IndexEvent::Searched(page) = indexes.execute(search).await else {
+            panic!("a search answers with a page");
+        };
+        assert_eq!(page.keys, ["a", "b"]);
+        let generation = 1;
+        let exists = IndexEffect::Exists {
+            set_id,
+            range_id,
+            generation,
+        };
+        assert_eq!(indexes.execute(exists).await, IndexEvent::Exists(true));
+        let outdated = IndexEffect::Outdated {
+            set_id,
+            range_id,
+            generation,
+        };
+        assert_eq!(indexes.execute(outdated).await, IndexEvent::Outdated(false));
+        let count = IndexEffect::Count {
+            set_id,
+            range_id,
+            generation,
+        };
+        assert_eq!(indexes.execute(count.clone()).await, IndexEvent::Counted(2));
+        let prune = IndexEffect::Prune {
+            set_id,
+            range_id,
+            keep: None,
+        };
+        assert_eq!(indexes.execute(prune).await, IndexEvent::Pruned);
+        assert_eq!(indexes.execute(count).await, IndexEvent::Counted(0));
     }
 
     #[tokio::test]

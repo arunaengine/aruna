@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, StatementSignEvent, StorageEvent};
 use aruna_core::keyspaces::{
@@ -72,7 +72,10 @@ pub enum AdmitError {
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: got {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
+    UnexpectedEvent {
+        state: &'static str,
+        got: &'static str,
+    },
     #[error("usage counters are being rebuilt; new ranges are admitted once they are complete")]
     UsageIncomplete,
     #[error(
@@ -380,7 +383,7 @@ impl AdmitOperation {
         }
         self.fail(AdmitError::UnexpectedEvent {
             state,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 }
@@ -466,10 +469,7 @@ impl Operation for AdmitOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        abort_effects(&mut self.txn_id)
     }
 }
 

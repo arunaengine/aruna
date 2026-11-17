@@ -859,13 +859,15 @@ fn record_line(row: usize, meta: &str) -> String {
 // second job with empty rows on the same bucket: every key once, counters and search right.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_pages_resume() {
-    use crate::distribution::index_feed::{FeedLimits, Feeder};
-    use crate::distribution::key_index::{KeyQuery, RangeIndexes};
+    use crate::distribution::feed_walks::FeedLimits;
+    use crate::distribution::index_feed::Feeder;
     use crate::staging::page::rows::MAX_PAGE_ENTRIES;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::key_index::KeyQuery;
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
+    use aruna_storage::key_index::RangeIndexes;
     use std::ops::Bound;
 
     let (endpoint, site, server) = serve(Site::ncbi).await;
@@ -977,8 +979,9 @@ async fn record_pages_resume() {
     }
 
     // The feed finds no index at first; the first index generation is built from the heads.
-    let indexes = Arc::new(RangeIndexes::new(fixture._dir.path().join("range-indexes")));
-    let mut feeder = Feeder::new(indexes.clone(), FeedLimits::default());
+    let indexes = RangeIndexes::new(fixture._dir.path().join("range-indexes"));
+    let indexes = fixture.driver.storage_handle.install_range_indexes(indexes);
+    let mut feeder = Feeder::new(FeedLimits::default());
     while feeder.pass(&fixture.driver).await {}
     for row in [0, MAX_PAGE_ENTRIES, rows - 1, rows + 299] {
         let query = KeyQuery {
@@ -1091,9 +1094,12 @@ async fn import_records(
     let stopping = stop.clone();
     let mut woken = pages.subscribe();
     let feed = tokio::spawn(async move {
-        use crate::distribution::index_feed::{FeedLimits, Feeder};
-        use crate::distribution::key_index::RangeIndexes;
-        let mut feeder = Feeder::new(Arc::new(RangeIndexes::new(indexes)), FeedLimits::default());
+        use crate::distribution::feed_walks::FeedLimits;
+        use crate::distribution::index_feed::Feeder;
+        use aruna_storage::key_index::RangeIndexes;
+        feed.storage_handle
+            .install_range_indexes(RangeIndexes::new(indexes));
+        let mut feeder = Feeder::new(FeedLimits::default());
         while background && !stopping.is_cancelled() {
             if !feeder.pass(&feed).await {
                 tokio::select! {

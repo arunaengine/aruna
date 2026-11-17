@@ -23,7 +23,8 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::distribution::index_feed::{IndexProgress, range_progress};
+use crate::distribution::feed_walks::IndexProgress;
+use crate::distribution::index_feed::range_progress;
 use crate::driver::DriverContext;
 use crate::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use crate::placement::process_placements::load_realm_config;
@@ -378,8 +379,8 @@ pub async fn read_status(
 /// Adds this node's search index progress and, for the ranges it coordinates, what it still
 /// owes each member. Both are hints, so a failed read leaves them out.
 pub async fn add_progress(context: &Arc<DriverContext>, status: &mut DistributionStatus) {
-    if let Some(handle) = context.metadata_handle.as_ref() {
-        let progress = range_progress(context, &handle.range_indexes(), &status.bucket).await;
+    if let Some(indexes) = context.storage_handle.range_indexes() {
+        let progress = range_progress(context, &indexes, &status.bucket).await;
         let progress = progress.unwrap_or_default();
         for range in &mut status.ranges {
             range.search_index = progress.get(&range.range_id).copied();

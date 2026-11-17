@@ -8,12 +8,16 @@ use crate::s3::bucket::create::CreateBucketOperation;
 use aruna_blob::blob::{BackendRegistry, BlobHandler};
 use aruna_core::UserId;
 use aruna_core::egress::EgressPolicy;
+use aruna_core::structs::execution::source_access::{
+    ResolvedSourceAccess, ResolvedSourceConnector, SourceMetadata,
+};
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
 use std::collections::HashMap;
+use std::time::SystemTime;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -113,4 +117,41 @@ pub(crate) async fn create_test_bucket(
     .await
     .expect("bucket creation must succeed");
     info
+}
+
+pub(crate) fn sample_connector() -> SourceConnector {
+    SourceConnector::new(
+        Ulid::from_bytes([2u8; 16]),
+        Ulid::from_bytes([1u8; 16]),
+        "staging-http".to_string(),
+        SourceConnectorKind::Http,
+        HashMap::from([("endpoint".to_string(), "http://127.0.0.1:1".to_string())]),
+        SystemTime::UNIX_EPOCH,
+        SystemTime::UNIX_EPOCH,
+        Default::default(),
+    )
+}
+
+pub(crate) fn sample_resolved_connector() -> ResolvedSourceConnector {
+    ResolvedSourceConnector {
+        connector: sample_connector(),
+        secret_fingerprint: None,
+        access: ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Http,
+            config: HashMap::from([("endpoint".to_string(), "http://127.0.0.1:1".to_string())]),
+            path: "folder/file.txt".to_string(),
+            version: None,
+        },
+    }
+}
+
+pub(crate) fn sample_metadata() -> SourceMetadata {
+    SourceMetadata {
+        content_length: 42,
+        content_type: Some("application/octet-stream".to_string()),
+        etag: Some("etag-1".to_string()),
+        last_modified: Some(SystemTime::UNIX_EPOCH),
+        source_version: None,
+        digests: Default::default(),
+    }
 }

@@ -508,7 +508,7 @@ fn search_assembly_order() {
         query: plan.query.clone(),
         ..plan
     };
-    let progress = crate::distribution::index_feed::IndexProgress {
+    let progress = crate::distribution::feed_walks::IndexProgress {
         ready: false,
         indexed: 10,
         keys: 50,

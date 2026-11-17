@@ -18,7 +18,7 @@ pub struct ListDraftsOperation {
     output: Option<Result<Vec<PublishEntry>, ListDraftsError>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ListDraftsState {
     Init,
     Scan,
@@ -75,7 +75,7 @@ impl Operation for ListDraftsOperation {
             other => other,
         };
 
-        match self.state.clone() {
+        match self.state {
             ListDraftsState::Scan => {
                 let got = event.label();
                 let Event::Storage(StorageEvent::IterResult {

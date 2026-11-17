@@ -4,6 +4,8 @@
 
 use super::*;
 use crate::distribution::test_record::{record, store_record};
+use crate::driver::{DriverContext, drive};
+use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
 use aruna_core::structs::storage::distribution::snapshot::Deletion;
 
 #[test]
@@ -57,11 +59,19 @@ async fn counts_owner_group() {
     store_record(&context.storage_handle, snapshot.set_id(), bytes).await;
     let owner = snapshot.config.owner_group;
 
-    let all = set_counts(&context, None).await.unwrap();
+    let all = drive(SetCountsOperation::new(None), &context)
+        .await
+        .unwrap();
     assert_eq!((all.sets, all.members, all.complete), (1, 2, true));
-    assert_eq!(set_counts(&context, Some(owner)).await.unwrap().sets, 1);
     assert_eq!(
-        set_counts(&context, Some(ulid::Ulid::nil()))
+        drive(SetCountsOperation::new(Some(owner)), &context)
+            .await
+            .unwrap()
+            .sets,
+        1
+    );
+    assert_eq!(
+        drive(SetCountsOperation::new(Some(ulid::Ulid::nil())), &context)
             .await
             .unwrap()
             .sets,
@@ -100,8 +110,99 @@ async fn reads_deleting_record() {
     )
     .await;
 
-    let counts = set_counts(&context, Some(snapshot.config.owner_group))
-        .await
-        .unwrap();
+    let counts = drive(
+        SetCountsOperation::new(Some(snapshot.config.owner_group)),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!((counts.deleting, counts.distinct(5)), (1, None));
+}
+
+fn page(start: Option<Key>) -> Effect {
+    Effect::Storage(StorageEffect::Iter {
+        key_space: DISTRIBUTION_KEYSPACE.to_string(),
+        prefix: None,
+        start: start.map(IterStart::After),
+        limit: PAGE,
+        txn_id: None,
+    })
+}
+
+fn rows(values: Vec<(Key, aruna_core::types::Value)>, next: Option<Key>) -> Event {
+    Event::Storage(StorageEvent::IterResult {
+        values,
+        next_start_after: next,
+    })
+}
+
+// Pages are read until the records end; undecodable records and other groups' sets are left out.
+#[test]
+fn pages_until_end() {
+    let (snapshot, bytes) = record(true);
+    let owner = snapshot.config.owner_group;
+    let full: Vec<(Key, aruna_core::types::Value)> = (0..PAGE)
+        .map(|_| (Key::from(vec![1]), aruna_core::types::Value::from(vec![0])))
+        .collect();
+    let next = Key::from(vec![2]);
+    let mut operation = SetCountsOperation::new(Some(owner));
+    check_trace(
+        &mut operation,
+        &[page(None)],
+        vec![
+            (rows(full, Some(next.clone())), vec![page(Some(next))]),
+            (
+                rows(vec![(Key::from(vec![3]), bytes.into())], None),
+                Vec::new(),
+            ),
+        ],
+    );
+    let counts = operation.finalize().unwrap();
+    assert_eq!((counts.sets, counts.members, counts.complete), (1, 2, true));
+}
+
+// Records beyond the read limit leave the counts incomplete.
+#[test]
+fn limit_marks_incomplete() {
+    let mut operation = SetCountsOperation::new(None);
+    operation.start();
+    let mut effects = Effects::new();
+    for _ in 0..MAX_SETS / PAGE {
+        let full = (0..PAGE)
+            .map(|_| (Key::from(vec![1]), Key::from(vec![0])))
+            .collect();
+        effects = operation.step(rows(full, Some(Key::from(vec![2]))));
+    }
+    assert!(effects.is_empty());
+    assert!(!operation.finalize().unwrap().complete);
+}
+
+// A failed read and events outside the page read end the count with an error.
+#[test]
+fn rejects_unexpected() {
+    let mut operation = SetCountsOperation::new(None);
+    operation.start();
+    operation.step(Event::Storage(StorageEvent::Error {
+        error: StorageError::Timeout,
+    }));
+    assert_eq!(operation.finalize(), Err(StorageError::Timeout.into()));
+    let started = || {
+        let mut operation = SetCountsOperation::new(None);
+        operation.start();
+        operation
+    };
+    let refused = rejects_events(started, sample_events, |event| {
+        matches!(
+            event,
+            Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
+        )
+    });
+    assert_eq!(refused.len(), sample_events().len() - 2);
+    let fresh = || SetCountsOperation::new(None);
+    assert_eq!(
+        rejects_events(fresh, sample_events, |_| false).len(),
+        sample_events().len()
+    );
+    assert!(started().abort().is_empty());
+    rejects_finalize(started());
 }

@@ -194,7 +194,7 @@ pub(super) async fn management_urls(
 /// The caller's own groups, as the documents this node stores. A read that
 /// fails yields an empty list: one unreadable group must not cost the device
 /// the realm configuration it is judged by.
-pub(super) async fn device_group_documents(
+async fn device_group_documents(
     context: &Arc<DriverContext>,
     user_id: UserId,
 ) -> Vec<DeviceGroupDocuments> {
@@ -244,7 +244,7 @@ pub(super) async fn device_group_documents(
 
 /// Whether the owner holds a role in this group. A device caches its owner's
 /// groups only; a realm-scale group list is not theirs to hold.
-pub(super) fn holds_any_role(authorization: &GroupAuthorizationDocument, user_id: UserId) -> bool {
+fn holds_any_role(authorization: &GroupAuthorizationDocument, user_id: UserId) -> bool {
     authorization
         .roles
         .values()

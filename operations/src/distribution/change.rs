@@ -166,7 +166,7 @@ pub struct SplitPlan {
 
 /// The split of `range_id` at `split_key`, or at the middle of this node's key sample of the
 /// range by object count when no key is given.
-pub async fn plan_split(
+async fn plan_split(
     context: &DriverContext,
     snapshot: &DistributionSnapshot,
     range_id: Ulid,

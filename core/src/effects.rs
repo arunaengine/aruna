@@ -52,6 +52,7 @@ pub enum Effect {
     Task(TaskEffect),
     Search(),
     Stream(),
+    Index(Box<crate::key_index::IndexEffect>),
     /// Independent effects the runner runs at the same time; never persisted.
     Group(EffectGroup),
     Session(Box<crate::compute::session::SessionEffect>),

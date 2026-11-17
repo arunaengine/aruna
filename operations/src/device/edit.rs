@@ -25,7 +25,8 @@ use ulid::Ulid;
 
 use crate::device::enqueue_draft::{EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation};
 use crate::device::publish_queue::{PublishEntry, PublishKind, PublishState};
-use crate::device::replica::{ReplicaRecord, mark_edited, store_replica};
+use crate::device::replica::{ReplicaRecord, mark_edited};
+use crate::device::replica_store::store_replica;
 use crate::device::sync_status::read_publish_entries;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::update_document::UpdateDocumentMutation;
@@ -292,7 +293,7 @@ async fn request_persist(context: &Arc<DriverContext>) {
 /// Whether one queued entry's batch must be re-merged after a restart: only an
 /// edit still on its way to the realm, which nothing else restores. A published
 /// entry returns by refresh; a parked one is not this device's state.
-pub fn replays_edit(entry: &PublishEntry) -> bool {
+fn replays_edit(entry: &PublishEntry) -> bool {
     matches!(entry.kind, PublishKind::Edit { .. })
         && matches!(
             entry.state,
@@ -351,6 +352,7 @@ mod tests {
     use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
     use crate::driver::DriverContext;
     use crate::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
+    use crate::tests::device::record;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -359,7 +361,6 @@ mod tests {
         MetadataGraphPolicy, MetadataRequestDurability,
     };
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use craqle::VectorClock;
     use std::sync::Arc;
@@ -367,25 +368,6 @@ mod tests {
 
     fn node(seed: u8) -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    fn record() -> MetadataRegistryRecord {
-        let document_id = Ulid::from_bytes([2u8; 16]);
-        MetadataRegistryRecord {
-            realm_id: RealmId::from_bytes([3u8; 32]),
-            group_id: Ulid::from_bytes([1u8; 16]),
-            document_id,
-            document_path: "notes".to_string(),
-            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
-            public: false,
-            permission_path: "/notes".to_string(),
-            placement: PlacementRef::NIL,
-            holder_node_ids: Vec::new(),
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            establishing_event_id: Ulid::from_bytes([4u8; 16]),
-            last_event_id: Ulid::from_bytes([5u8; 16]),
-        }
     }
 
     fn edit(state: PublishState) -> PublishEntry {
@@ -533,7 +515,7 @@ mod tests {
         let mut read = replica(&record);
         read.selected = false;
         read.displayed_jsonld = r#"{"@graph":[]}"#.to_string();
-        assert!(crate::device::replica::store_replica(&context, &read).await);
+        assert!(crate::device::replica_store::store_replica(&context, &read).await);
         let update = |public: Option<bool>| {
             route_metadata_update(
                 &context,

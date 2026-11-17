@@ -6,7 +6,7 @@
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
@@ -68,20 +68,30 @@ enum RemoveNodeState {
         reducer_state_value: Option<Value>,
     },
     WriteDocumentState {
-        document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
-    DeleteAdminConflicts {
-        document: RealmConfigDocument,
-    },
-    CommitTransaction {
-        document: RealmConfigDocument,
-    },
-    ScheduleSyncDrain {
-        document: RealmConfigDocument,
-    },
+    DeleteAdminConflicts,
+    CommitTransaction,
+    ScheduleSyncDrain,
     Finish,
     Error,
+}
+
+impl RemoveNodeState {
+    fn name(&self) -> &'static str {
+        match self {
+            RemoveNodeState::Init => "init",
+            RemoveNodeState::StartTransaction => "start transaction",
+            RemoveNodeState::ReadCurrent => "read current",
+            RemoveNodeState::ReadCutoffs { .. } => "read cutoffs",
+            RemoveNodeState::WriteDocumentState { .. } => "write document state",
+            RemoveNodeState::DeleteAdminConflicts => "delete admin conflicts",
+            RemoveNodeState::CommitTransaction => "commit transaction",
+            RemoveNodeState::ScheduleSyncDrain => "schedule sync drain",
+            RemoveNodeState::Finish => "finish",
+            RemoveNodeState::Error => "error",
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -112,7 +122,7 @@ pub enum RemoveNodeError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -250,9 +260,8 @@ impl RemoveNodeOperation {
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(document.clone()));
+        self.output = Some(Ok(document));
         self.state = RemoveNodeState::WriteDocumentState {
-            document,
             stale_conflict_deletes,
         };
 
@@ -262,11 +271,11 @@ impl RemoveNodeOperation {
         })])
     }
 
-    fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
+    fn emit_commit_transaction(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.fail(RemoveNodeError::MissingTransaction);
         };
-        self.state = RemoveNodeState::CommitTransaction { document };
+        self.state = RemoveNodeState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -277,10 +286,14 @@ impl RemoveNodeOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
+    fn unexpected_event(
+        &mut self,
+        state: &str,
+        expected: &'static str,
+        got: &'static str,
+    ) -> Effects {
         self.fail(RemoveNodeError::UnexpectedEvent {
-            state,
+            state: state.to_string(),
             expected,
             got,
         })
@@ -299,13 +312,14 @@ impl Operation for RemoveNodeOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        let name = self.state.name();
+        match std::mem::replace(&mut self.state, RemoveNodeState::Error) {
             RemoveNodeState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event(name, "transaction start result", other.label()),
             },
             RemoveNodeState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -316,8 +330,9 @@ impl Operation for RemoveNodeOperation {
                     ] = values.as_slice()
                     else {
                         return self.unexpected_event(
+                            name,
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch of another length",
                         );
                     };
                     let membership = match MembershipFence::from_value(membership.as_deref()) {
@@ -340,7 +355,7 @@ impl Operation for RemoveNodeOperation {
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event(name, "storage batch read result", other.label()),
             },
             RemoveNodeState::ReadCutoffs {
                 document_value,
@@ -357,10 +372,9 @@ impl Operation for RemoveNodeOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("publisher index rows", format!("{other:?}")),
+                other => self.unexpected_event(name, "publisher index rows", other.label()),
             },
             RemoveNodeState::WriteDocumentState {
-                document,
                 stale_conflict_deletes,
             } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
@@ -368,37 +382,37 @@ impl Operation for RemoveNodeOperation {
                         return self.fail(RemoveNodeError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = RemoveNodeState::DeleteAdminConflicts { document };
+                        self.state = RemoveNodeState::DeleteAdminConflicts;
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
                         })];
                     }
-                    self.emit_commit_transaction(document)
+                    self.emit_commit_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+                other => self.unexpected_event(name, "storage batch write result", other.label()),
             },
-            RemoveNodeState::DeleteAdminConflicts { document } => match event {
+            RemoveNodeState::DeleteAdminConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(document)
+                    self.emit_commit_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+                other => self.unexpected_event(name, "storage batch delete result", other.label()),
             },
-            RemoveNodeState::CommitTransaction { document } => match event {
+            RemoveNodeState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = RemoveNodeState::ScheduleSyncDrain { document };
+                    self.state = RemoveNodeState::ScheduleSyncDrain;
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self.unexpected_event(name, "transaction commit result", other.label()),
             },
-            RemoveNodeState::ScheduleSyncDrain { .. } => match event {
+            RemoveNodeState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = RemoveNodeState::Finish;
                     smallvec![]
@@ -409,11 +423,13 @@ impl Operation for RemoveNodeOperation {
                     smallvec![]
                 }
                 other => self.unexpected_event(
+                    name,
                     "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
+                    other.label(),
                 ),
             },
-            RemoveNodeState::Finish | RemoveNodeState::Error | RemoveNodeState::Init => {
+            state @ (RemoveNodeState::Finish | RemoveNodeState::Error | RemoveNodeState::Init) => {
+                self.state = state;
                 smallvec![]
             }
         }
@@ -428,10 +444,7 @@ impl Operation for RemoveNodeOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        abort_effects(&mut self.txn_id)
     }
 }
 
@@ -444,20 +457,7 @@ mod tests {
     use aruna_core::document::DocumentTarget;
     use aruna_core::events::StorageEvent;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
-    use tempfile::tempdir;
     use ulid::Ulid;
-
-    fn context(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
-    }
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -509,8 +509,7 @@ mod tests {
     async fn evicts_owned_device() {
         // The device leaves the stored membership, so it stops being an
         // admitted peer once the configuration is refreshed.
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
         seed(
@@ -538,8 +537,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_foreign_device() {
         // A device owned by somebody else must look absent, not evictable.
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let actor = actor(realm_id);
         let other = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
@@ -563,8 +561,7 @@ mod tests {
     async fn admin_evicts_foreign() {
         // A realm admin reaches a device it does not own, and the owner path is
         // still refused for the same device.
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let actor = actor(realm_id);
         let other = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
@@ -593,8 +590,7 @@ mod tests {
     async fn admin_spares_infrastructure() {
         // The admin scope widens ownership, not membership: a server node is not
         // a device and stays in the configuration.
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let actor = actor(realm_id);
         let mut document = realm_with_device(realm_id, &actor, actor.user_id);
@@ -621,8 +617,7 @@ mod tests {
     async fn refuses_server_node() {
         // Peers reject a realm-config event whose origin is not management, so
         // the eviction must not be published from a server node either.
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let actor = actor(realm_id);
         let mut document = realm_with_device(realm_id, &actor, actor.user_id);
@@ -649,8 +644,7 @@ mod tests {
     async fn removal_refuses_publisher() {
         // A set's publisher is never removed with a possibly stale cutoff.
         use aruna_core::structs::storage::distribution::{DistributionRevision, publisher_key};
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
         seed(

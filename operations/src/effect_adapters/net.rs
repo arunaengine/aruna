@@ -4,11 +4,16 @@
 
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, JobControlEvent, NetError, NetEvent};
+use aruna_core::events::{
+    Event, JobControlEvent, NetError, NetEvent, SnapshotSignEvent, StatementSignEvent,
+};
 use aruna_core::handle::Handle;
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 
 use crate::driver::DriverContext;
+
+/// Why signing fails on a node without a net handle, which holds the node key.
+const UNAVAILABLE: &str = "net transport unavailable";
 
 pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> Event {
     if let NetEffect::DocumentSync(DocumentEffect::ReconcileTopics { topics }) = effect {
@@ -27,6 +32,12 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
                     },
                 ))
             }
+            NetEffect::SnapshotSign(_) => Event::Net(NetEvent::SnapshotSign(
+                SnapshotSignEvent::Unavailable(UNAVAILABLE.to_string()),
+            )),
+            NetEffect::StatementSign(_) => Event::Net(NetEvent::StatementSign(
+                StatementSignEvent::Unavailable(UNAVAILABLE.to_string()),
+            )),
             NetEffect::JobControl(_) => {
                 Event::Net(NetEvent::JobControl(JobControlEvent::Unavailable(
                     "job owner unavailable: network handle unavailable".to_string(),

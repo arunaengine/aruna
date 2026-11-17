@@ -2052,7 +2052,8 @@ pub(crate) async fn distinct_buckets(
     group: Option<ulid::Ulid>,
     buckets: u64,
 ) -> Option<u64> {
-    match aruna_operations::distribution::counts::set_counts(&state.get_ctx(), group).await {
+    let count = aruna_operations::distribution::counts::SetCountsOperation::new(group);
+    match aruna_operations::driver::drive(count, &state.get_ctx()).await {
         Ok(counts) => counts.distinct(buckets),
         Err(error) => {
             warn!(error = %error, "distributed bucket counts unavailable for usage response");

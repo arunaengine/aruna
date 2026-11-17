@@ -14,7 +14,7 @@ use aruna_core::structs::storage::broken::BrokenVersion;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::connectors::repository::connector_reference_write;
-use aruna_operations::staging::root_record::{compact_version, root_write};
+use aruna_operations::connectors::root_record::{compact_version, root_write};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
