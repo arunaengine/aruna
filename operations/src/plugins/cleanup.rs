@@ -121,8 +121,9 @@ impl SweepEvents {
                     .filter(|key| self.standing(install_at(key, 0)) == Standing::Removing)
                     .collect();
                 let queue = (keys.iter()).map(|key| (PLUGIN_QUEUE_KEYSPACE, key.clone()));
+                let queue = queue.collect();
                 let waiting = (keys.into_iter()).map(|key| (PLUGIN_WAITING_KEYSPACE, key));
-                vec![queue.collect(), waiting.collect()]
+                vec![queue, waiting.collect()]
             }
             Table::Gaps => {
                 let keys = (rows.into_iter()).filter(|(key, value)| {

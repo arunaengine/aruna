@@ -223,12 +223,12 @@ impl Plan for RemoveState {
             (RemovePhase::Reading, answer) => {
                 let [current, total] = values::<2>(answer)?;
                 let current = current.map(|bytes| decode::<StateRow>(&bytes)).transpose()?;
-                let Some(row) = current.filter(|row| row.version == self.remove.expected) else {
+                let Some(stored) = current.filter(|row| row.version == self.remove.expected) else {
                     let message = format!("the value is not at version {}", self.remove.expected);
                     return Err(PutError::Refused(message, ErrorKind::Conflict));
                 };
                 let total = total.map_or(Ok(0), |bytes| decode::<u64>(&bytes))?;
-                let freed = (self.remove.key.len() + row.value.len()) as u64;
+                let freed = (self.remove.key.len() + stored.value.len()) as u64;
                 let total = encode(&total.saturating_sub(freed))?;
                 let rows = vec![
                     row(PLUGIN_STATE_KEYSPACE, bytes_key(self.install_id), total),

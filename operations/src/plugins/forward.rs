@@ -387,7 +387,7 @@ async fn unreadable(ctx: &DriverContext, row: &ForwardRow) -> Result<bool, Store
     let (Ok(document), Ok(event_id)) = parsed else {
         return Ok(false);
     };
-    let facts = match event.kind {
+    let mut facts = match event.kind {
         SourceKind::DataUploaded
         | SourceKind::SyncCompleted
         | SourceKind::SyncFailed
@@ -399,7 +399,7 @@ async fn unreadable(ctx: &DriverContext, row: &ForwardRow) -> Result<bool, Store
             drive(dataset_facts(document, event_id, updated), ctx).await?
         }
     };
-    let applied = match (event.kind, facts.batch) {
+    let applied = match (event.kind, facts.batch.take()) {
         (SourceKind::DatasetCreated, _) => facts.materialized(|id| id >= event_id),
         (_, Some((graph_iri, batch))) => dot_applied(ctx, &graph_iri, &batch)
             .await
@@ -454,9 +454,9 @@ impl Plan for DatasetFacts {
     fn first(&mut self) -> Result<Turn<Facts>, StoreError> {
         let graph = graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(self.document));
         Ok(Turn::Ask(Ask::Read(vec![
-            (MATERIALIZATION_STATUS_KEYSPACE, materialization_status_key(self.document)),
-            (EVENT_LOG_KEYSPACE, event_log_key(self.document, self.event_id)),
-            (GRAPH_LIFECYCLE_KEYSPACE, graph),
+            (MATERIALIZATION_STATUS_KEYSPACE, materialization_status_key(self.document).to_vec()),
+            (EVENT_LOG_KEYSPACE, event_log_key(self.document, self.event_id).to_vec()),
+            (GRAPH_LIFECYCLE_KEYSPACE, graph.to_vec()),
         ])))
     }
 
