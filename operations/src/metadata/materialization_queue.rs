@@ -1137,30 +1137,6 @@ async fn transactional_batch_delete(
     }
 }
 
-pub async fn enqueue_job(
-    context: &DriverContext,
-    event: &MetadataEventRecord,
-) -> Result<(), MetadataMaterializationError> {
-    let now = unix_timestamp_millis();
-    let status = new_pending_status(event, now);
-    let job = new_materialization_job(event, now);
-    write_status_job(&context.storage_handle, &status, &job).await?;
-    if let Some(task_handle) = context.task_handle.as_ref() {
-        match task_handle.send_effect(schedule_materialization()).await {
-            Event::Task(aruna_core::task::TaskEvent::TimerScheduled { .. }) => {}
-            Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(message));
-            }
-            other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(
-                    other.label().to_string(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 async fn read_document_job(
     storage: &StorageHandle,
     document_id: Ulid,
@@ -2517,31 +2493,6 @@ fn is_terminal_error(error: &MetadataMaterializationError) -> bool {
         materialization_failure_kind(error),
         MaterializationFailureKind::Terminal
     )
-}
-
-async fn write_status_job(
-    storage: &StorageHandle,
-    status: &MaterializationStatusRecord,
-    job: &MetadataMaterializationRecord,
-) -> Result<(), MetadataMaterializationError> {
-    let writes = vec![
-        materialization_status_entry(status)?,
-        materialization_job_entry(job)?,
-        document_job_entry(job)?,
-    ];
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(
-            other.label().to_string(),
-        )),
-    }
 }
 
 async fn job_is_live(

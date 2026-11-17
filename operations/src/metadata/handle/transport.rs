@@ -931,26 +931,6 @@ impl MetadataHandle {
         }
     }
 
-    pub async fn request_bucket_owner(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        bucket: String,
-    ) -> Result<aruna_core::types::GroupId, MetadataReadError> {
-        match send_remote_request(
-            &self.inner,
-            &Span::current(),
-            node_id,
-            MetadataTransportMessage::BucketOwner { auth_token, bucket },
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::BucketOwnerResult { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
     pub async fn request_identifier_lookup(
         &self,
         node_id: NodeId,
