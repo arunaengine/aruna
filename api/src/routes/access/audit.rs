@@ -9,30 +9,27 @@ use aruna_core::secrets::{Delivery, SecretScope};
 use aruna_core::structs::identity::admin_audit::{
     AdminAuditAction, AdminAuditRecord, AuditIndex, SecretAudit,
 };
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::placement::policy::document::policy_authority_path;
 use aruna_operations::driver::drive;
 use aruna_operations::users::admin_audit::{AuditPageInput, AuditPageOperation};
+use axum::Json;
 use axum::extract::{Query, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, parse_group_id, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 50;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "access/audit", description = "Retained administrative audit rows")))]
-pub struct AdminAuditDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(AdminAuditDoc::openapi()).routes(routes!(list_admin_audit))
+    OpenApiRouter::new().routes(routes!(list_admin_audit))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, IntoParams)]
@@ -177,17 +174,15 @@ pub struct AdminAuditPage {
             "partial": true
         })),
         (status = 400, description = "Invalid group id or cursor, or `me` together with a group id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or no administration grant for the scope", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_admin_audit(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<AdminAuditQuery>,
 ) -> ServerResult<Json<AdminAuditPage>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = query.group_id.as_deref().map(parse_group_id).transpose()?;
     let own = query.me.unwrap_or(false);
     if own && group_id.is_some() {
@@ -219,7 +214,7 @@ pub async fn list_admin_audit(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(Json(AdminAuditPage {
         records: page.records.into_iter().map(row).collect(),
         next_cursor: page.next.map(|id| id.to_string()),

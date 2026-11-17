@@ -28,19 +28,21 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio_util::task::AbortOnDropHandle;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::download::{self, AdmissionError, DownloadPermit};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::rate_limit::LocalKey;
 use crate::routes::federation::import::shared_stream;
-use crate::routes::shares::{rfc3339, unix_now};
+use crate::routes::shares::rfc3339;
 use crate::routes::storage::objects::BearerRelay;
 use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
+use aruna_core::time::unix_timestamp_secs;
 
 /// Bytes buffered between the archive writer and the response body.
 const PIPE_BYTES: usize = 128 * 1024;
@@ -48,12 +50,8 @@ const PIPE_BYTES: usize = 128 * 1024;
 const LINK_SECS: u64 = 60;
 const DOWNLOAD_PATH: &str = "/api/v1/data/archives/download";
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct ArchiveDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ArchiveDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(download_selection))
         .routes(routes!(create_link))
         .routes(routes!(download_link))
@@ -233,18 +231,16 @@ READ on its prefix, as the object listing requires.
     responses(
         (status = 200, description = "The archive as an `application/zip` stream with an attachment `Content-Disposition` and `Cache-Control: no-store`"),
         (status = 400, description = "An empty selection, an entry with both or neither of key and prefix, an invalid bucket name or version id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 503, description = "The node has no free download capacity right now", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn download_selection(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<ArchiveRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let entries = selection(request)?;
     let permit = admitted(&state, auth.user_id)?;
     Ok(archive_response(state, (auth, bearer), entries, permit))
@@ -274,21 +270,19 @@ pub async fn download_selection(
     responses(
         (status = 200, description = "The download URL path", body = LinkResponse, example = json!({"path": "/api/v1/data/archives/download?ticket=<single-use-ticket>", "expires_at": "2026-11-07T10:01:00Z"})),
         (status = 400, description = "An empty selection, an entry with both or neither of key and prefix, an invalid bucket name or version id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn create_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<ArchiveRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let grant = token_grant(bearer.as_str()).map_err(|_| ServerError::Unauthorized)?;
     let entries = selection(request)?;
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let link = PendingLink {
         auth,
         grant,
@@ -333,7 +327,7 @@ pub async fn download_link(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<LinkQuery>,
 ) -> ServerResult<Response> {
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let links = state.archive_links();
     let creator = links
         .creator(&query.ticket, now)

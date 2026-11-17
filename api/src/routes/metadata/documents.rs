@@ -2,8 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::metadata::{
     CreateMetadataRequest, CreateMetadataResponse, ListMetadataQuery, ListMetadataResponse,
     MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, commit_message,
@@ -12,7 +14,7 @@ use crate::metadata::{
     serialize_jsonld_object, with_global_ids,
 };
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::git::GitError;
 use aruna_operations::metadata::api::{
@@ -132,7 +134,6 @@ text of at most 4096 bytes after trimming; an empty message counts as none."#,
             )
         ),
         (status = 400, description = "Malformed body, unknown fields, a group id that is not a ULID, an empty document path, a message over 4096 bytes or with control characters other than line breaks and tabs, a non-object RO-Crate, an invalid storage location bucket or prefix, a Profile root (prof:Profile) at a path outside profiles/, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is denied on the group's metadata path, the new document's path or the chosen storage location", body = ErrorResponse),
         (status = 404, description = "The chosen storage location names a bucket this node does not have", body = ErrorResponse),
         (status = 409, description = "Concurrent create conflict; the create was not accepted and may be retried. Or the group's default storage location is unusable on this node, which the message explains; choose a storage location or change the group default", body = ErrorResponse),
@@ -142,11 +143,10 @@ text of at most 4096 bytes after trimming; an empty message counts as none."#,
 )]
 pub async fn create_metadata_document(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateMetadataRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateMetadataResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let message = commit_message(match &request {
         CreateMetadataRequest::Scaffold(request) => request.message.clone(),
         CreateMetadataRequest::RoCrate(request) => request.message.clone(),
@@ -551,22 +551,17 @@ caller's own token.
 )]
 pub async fn delete_metadata_document(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     run_delete_metadata_document(
         &ctx,
-        Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor(&state, &auth),
         record.as_ref(),
         document_id,
         forwarded_auth_token(bearer_token)?,

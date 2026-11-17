@@ -15,13 +15,14 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::OwnerAuth;
 use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
     ProfilePreviewRequest, ProfilePreviewResponse, ensure_metadata_scope, forwarded_auth_token,
 };
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_operations::device::delete_draft::{DeleteDraftError, DeleteDraftOperation};
 use aruna_operations::device::enqueue_draft::{
     EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation,
@@ -32,8 +33,6 @@ use aruna_operations::device::publish_queue::{PublishEntry, PublishState, token_
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::profile::validation::preview_submission;
 use aruna_operations::metadata::public_preview::restricted_files;
-
-use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -147,7 +146,7 @@ fn rocrate_jsonld(rocrate: &Value) -> ServerResult<String> {
             "rocrate must be a JSON-LD object".to_string(),
         ));
     }
-    serde_json::to_string(rocrate).map_err(|error| ServerError::InternalError(error.to_string()))
+    serde_json::to_string(rocrate).map_err(|error| ServerError::InternalError(error.into()))
 }
 
 #[utoipa::path(
@@ -196,7 +195,6 @@ for.
                 "attempts": 0
             })),
         (status = 400, description = "Malformed group id, blank path or a non-object payload", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for, or READ is denied on the named group's metadata", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 409, description = "The device already holds the maximum number of queued drafts", body = ErrorResponse),
@@ -206,11 +204,10 @@ for.
 )]
 async fn queue_draft(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<QueueDraftRequest>,
 ) -> ServerResult<(StatusCode, Json<DeviceDraft>)> {
-    let auth = require_owner(&state, auth).await?;
     let issued_at = token_issued_at(forwarded_auth_token(bearer)?.as_ref());
     let group_id = parse_group_id(&request.group_id)?;
     let jsonld = rocrate_jsonld(&request.rocrate)?;
@@ -234,7 +231,7 @@ async fn queue_draft(
         EnqueueDraftError::MissingPath | EnqueueDraftError::MissingPayload => {
             ServerError::BadRequestReason(error.to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     Ok((StatusCode::CREATED, Json(queued.into())))
 }
@@ -266,21 +263,18 @@ for.
                     "document_id": "01JDOCUMENT0123456789ABCDE"
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn list_drafts(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
 ) -> ServerResult<Json<DeviceDraftList>> {
-    require_owner(&state, auth).await?;
     let entries = drive(ListDraftsOperation::new(), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(Json(DeviceDraftList {
         drafts: entries.into_iter().map(DeviceDraft::from).collect(),
     }))
@@ -312,25 +306,22 @@ for.
                 "retryable": true
             })),
         (status = 400, description = "The draft id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such draft, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn get_draft(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(draft_id): Path<String>,
 ) -> ServerResult<Json<DeviceDraft>> {
-    require_owner(&state, auth).await?;
     let draft_id = parse_draft_id(&draft_id)?;
     let entry = drive(InspectDraftOperation::new(draft_id), &state.get_ctx())
         .await
         .map_err(|error| match error {
             InspectDraftError::NotFound => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     Ok(Json(entry.into()))
 }
@@ -353,27 +344,24 @@ for.
     responses(
         (status = 204, description = "The draft is gone from the device queue"),
         (status = 400, description = "The draft id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such draft, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "A forward for this draft is in flight", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn delete_draft(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(draft_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    require_owner(&state, auth).await?;
     let draft_id = parse_draft_id(&draft_id)?;
     drive(DeleteDraftOperation::new(draft_id), &state.get_ctx())
         .await
         .map_err(|error| match error {
             DeleteDraftError::NotFound => ServerError::NotFound,
             DeleteDraftError::PublishInFlight => ServerError::Conflict(error.to_string()),
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -413,19 +401,16 @@ for.
                 "structural_violations": []
             })),
         (status = 400, description = "The payload is not a JSON-LD object", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn preview_draft(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Json(request): Json<ProfilePreviewRequest>,
 ) -> ServerResult<(StatusCode, Json<ProfilePreviewResponse>)> {
-    let auth = require_owner(&state, auth).await?;
     let group_id = request
         .group_id
         .as_deref()
@@ -439,7 +424,7 @@ async fn preview_draft(
     let jsonld = rocrate_jsonld(&request.rocrate)?;
     let preview = preview_submission(&state.get_ctx(), group_id, &jsonld)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let mut response = ProfilePreviewResponse::from(preview);
     if request.public {
         response.set_restricted(
@@ -451,7 +436,7 @@ async fn preview_draft(
                 &request.rocrate,
             )
             .await
-            .map_err(|error| ServerError::InternalError(error.to_string()))?,
+            .map_err(|error| ServerError::InternalError(error.into()))?,
         );
     }
     Ok((StatusCode::OK, Json(response)))

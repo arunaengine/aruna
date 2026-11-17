@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use aruna_api::auth::RealmAuth;
 use aruna_api::error::ServerError;
 use aruna_api::routes::bucket_usage::{UsageQuery, get_bucket_usage};
 use aruna_api::routes::storage::routing::{
@@ -349,7 +350,7 @@ async fn reader_reads_routing() {
 
     let Json(routing) = get_bucket_routing(
         State(fixture.state.clone()),
-        Extension(Some(fixture.reader.clone())),
+        RealmAuth(fixture.reader.clone()),
         Path("data".to_string()),
     )
     .await
@@ -365,7 +366,7 @@ async fn reader_denied_write() {
 
     let denied = put_bucket_routing(
         State(fixture.state.clone()),
-        Extension(Some(fixture.reader.clone())),
+        RealmAuth(fixture.reader.clone()),
         Path("data".to_string()),
         Json(BucketRoutingRequest { rules: Vec::new() }),
     )

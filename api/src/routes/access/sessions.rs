@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
+use crate::auth::ValidatedBearer;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::credentials::{
     CreatePathRestriction, build_credential_restrictions, serialize_restrictions,
@@ -26,16 +27,12 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "access/sessions", description = "User bearer sessions")))]
-pub struct SessionsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SessionsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_session, list_sessions))
         .routes(routes!(delete_session))
 }
@@ -104,7 +101,7 @@ pub(crate) fn map_create_error(error: CreateSessionError) -> ServerError {
         CreateSessionError::Token(CreateTokenError::RestrictionsTooLarge) => {
             ServerError::BadRequestReason("path restrictions exceed the allowed size".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -136,7 +133,7 @@ pub(crate) async fn session_restrictions(
 fn map_revoke_error(error: RevokeSessionError) -> ServerError {
     match error {
         RevokeSessionError::NotFound => ServerError::NotFound,
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -198,7 +195,6 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
                 "expires_at": "2026-04-09T12:00:00Z"
             })),
         (status = 400, description = "Unknown session kind, a lifetime outside the allowed range, a malformed restriction, or restrictions without a read or write scope", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A requested scope exceeds the caller's access, the user is deactivated, the caller holds a federated session, or the token belongs to another realm", body = ErrorResponse),
         (status = 409, description = "The caller already holds 256 active sessions", body = ErrorResponse)
     ),
@@ -206,11 +202,10 @@ fn session_summary(session: UserSession, current_sid: Option<&str>) -> SessionSu
 )]
 pub async fn create_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateSessionRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateSessionResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let kind = parse_session_kind(&request.kind)?;
     // A federated session can neither renew itself nor create children of any kind.
@@ -283,20 +278,18 @@ pub async fn create_session(
                     "current": true
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_sessions(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<ListSessionsResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let current_sid = auth.session.as_ref().map(|session| session.sid.as_str());
     let sessions = drive(ListSessionOperation::new(auth.user_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .into_iter()
         .map(|session| session_summary(session, current_sid))
         .collect();
@@ -320,7 +313,6 @@ pub async fn list_sessions(
     params(("session_id" = String, Path, description = "Session ULID")),
     responses(
         (status = 204, description = "Session revoked, or already revoked by an earlier call"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "The session belongs to another user", body = ErrorResponse)
     ),
@@ -328,10 +320,9 @@ pub async fn list_sessions(
 )]
 pub async fn delete_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(session_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if Ulid::from_string(&session_id).is_err() {
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -413,7 +404,7 @@ mod tests {
         let (_dir, state, auth) = setup_state().await;
         let error = create_session(
             State(state),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "unknown".to_string(),
@@ -438,7 +429,7 @@ mod tests {
         });
         let error = create_session(
             State(state.clone()),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "portal".to_string(),
@@ -491,7 +482,7 @@ mod tests {
     ) -> ServerResult<CreateSessionResponse> {
         create_session(
             State(state.clone()),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "api".to_string(),
@@ -639,7 +630,7 @@ mod tests {
         });
         let (_, Json(created)) = create_session(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "assistant".to_string(),
@@ -652,7 +643,7 @@ mod tests {
         .unwrap();
         delete_session(
             State(state.clone()),
-            Extension(Some(auth)),
+            UnrestrictedAuth(auth),
             Path(created.session_id),
         )
         .await
@@ -669,7 +660,7 @@ mod tests {
         let (_dir, state, auth) = setup_state().await;
         let (_, Json(created)) = create_session(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Extension(Some(ValidatedBearer::new_for_test("parent"))),
             Json(CreateSessionRequest {
                 kind: "api".to_string(),
@@ -686,7 +677,7 @@ mod tests {
         };
         let error = delete_session(
             State(state),
-            Extension(Some(stranger)),
+            UnrestrictedAuth(stranger),
             Path(created.session_id),
         )
         .await

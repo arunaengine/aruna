@@ -4,10 +4,10 @@
 
 use super::*;
 use crate::download::{self, AdmissionError};
+use crate::lookup::relay_stream;
 use crate::object_key::ObjectKey;
 use crate::rate_limit::LocalKey;
 use crate::routes::execution::jobs::range_request;
-use crate::routes::storage::relay::relay_stream;
 use aruna_operations::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, read_object,
 };

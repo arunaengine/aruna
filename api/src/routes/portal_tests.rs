@@ -3,13 +3,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
+use crate::auth::extract;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use axum::http::StatusCode;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -70,21 +75,26 @@ async fn member_reads_defaults() {
     // Every portal needs the defaults, so a member without admin rights reads them.
     let (_dir, state, admin) = setup_state().await;
     let member = UserId::local(Ulid::generate(), state.get_realm_id());
-    let Json(stored) =
-        set_portal_features(State(state.clone()), Extension(auth(&state, admin)), body())
-            .await
-            .unwrap();
+    let Json(stored) = set_portal_features(
+        State(state.clone()),
+        RealmAuth(auth(&state, admin).expect("a signed-in caller")),
+        body(),
+    )
+    .await
+    .unwrap();
     assert_eq!(stored, body().0);
 
-    let Json(read) = get_portal_features(State(state.clone()), Extension(auth(&state, member)))
-        .await
-        .unwrap();
+    let Json(read) = get_portal_features(
+        State(state.clone()),
+        RealmAuth(auth(&state, member).expect("a signed-in caller")),
+    )
+    .await
+    .unwrap();
     assert_eq!(read, body().0);
 
-    let error = get_portal_features(State(state), Extension(None))
-        .await
-        .unwrap_err();
-    assert!(matches!(error, ServerError::Unauthorized));
+    // `get_portal_features` takes `RealmAuth`, so the refusal is the extractor's.
+    let error = extract::<RealmAuth>(&state, None).await;
+    assert_eq!(error.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -93,16 +103,19 @@ async fn member_cannot_replace() {
     let member = UserId::local(Ulid::generate(), state.get_realm_id());
     let error = set_portal_features(
         State(state.clone()),
-        Extension(auth(&state, member)),
+        RealmAuth(auth(&state, member).expect("a signed-in caller")),
         body(),
     )
     .await
     .unwrap_err();
     assert!(matches!(error, ServerError::Forbidden));
 
-    let Json(read) = get_portal_features(State(state.clone()), Extension(auth(&state, member)))
-        .await
-        .unwrap();
+    let Json(read) = get_portal_features(
+        State(state.clone()),
+        RealmAuth(auth(&state, member).expect("a signed-in caller")),
+    )
+    .await
+    .unwrap();
     assert!(read.features.is_empty());
 }
 
@@ -114,7 +127,7 @@ async fn rejects_invalid_name() {
     });
     let error = set_portal_features(
         State(state.clone()),
-        Extension(auth(&state, admin)),
+        RealmAuth(auth(&state, admin).expect("a signed-in caller")),
         invalid,
     )
     .await

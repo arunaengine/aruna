@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::jobs::{
     JobRequestError, MAX_OUTPUT_PREFIXES, mount_permission_path, native_input, native_outputs,
     output_buckets, validate_output_prefixes, workspace_request,
@@ -19,6 +20,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::execution::job::{
     CollisionPolicy, ComputeResources, ExecutionSpec, OutputDestination, WorkspaceMode,
 };
+use aruna_core::structs::execution::job::{JobRecord, JobState};
 use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
@@ -30,6 +32,7 @@ use aruna_operations::jobs::command::{
     ExecutionInput, ExecutionOutput, InputMode, WorkspaceMode as CommandWorkspaceMode,
     WorkspaceSpec,
 };
+use aruna_operations::jobs::lifecycle::FamilyReport;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
@@ -517,7 +520,7 @@ async fn list_newest_first() {
 
     let (_, Json(page1)) = list_jobs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Query(ListJobsQuery {
             limit: Some(2),
             ..Default::default()
@@ -532,7 +535,7 @@ async fn list_newest_first() {
 
     let (_, Json(page2)) = list_jobs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Query(ListJobsQuery {
             limit: Some(2),
             cursor: Some(cursor),
@@ -555,7 +558,7 @@ async fn report_pages_frozen() {
 
     let first = get_job_report(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
         Query(ReportQuery {
@@ -572,7 +575,7 @@ async fn report_pages_frozen() {
 
     let second = get_job_report(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
         Query(ReportQuery {
@@ -594,7 +597,7 @@ async fn report_pages_frozen() {
     let conflict = URL_SAFE_NO_PAD.encode(postcard::to_allocvec(&conflict).unwrap());
     let response = get_job_report(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
         Query(ReportQuery {
@@ -608,7 +611,7 @@ async fn report_pages_frozen() {
 
     let foreign = get_job_report(
         State(state),
-        Extension(auth_for(user(3))),
+        UnrestrictedAuth(auth_for(user(3)).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
         Query(ReportQuery::default()),
@@ -628,7 +631,7 @@ async fn report_pending_typed() {
 
     let response = get_job_report(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
         Query(ReportQuery::default()),
@@ -826,7 +829,7 @@ async fn names_owner_url() {
 
     let (_, Json(response)) = get_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
     )
@@ -906,7 +909,7 @@ async fn foreign_not_found() {
 
     let result = get_job(
         State(state.clone()),
-        Extension(auth_for(user(3))),
+        UnrestrictedAuth(auth_for(user(3)).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
     )
@@ -954,7 +957,7 @@ async fn delete_job_rules() {
     let call = |who: UserId, id: JobId| {
         delete_job(
             State(state.clone()),
-            Extension(auth_for(who)),
+            UnrestrictedAuth(auth_for(who).expect("a signed-in caller")),
             Path(id.to_string()),
         )
     };
@@ -973,7 +976,7 @@ async fn delete_job_rules() {
     ));
     let result = get_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(finished.to_string()),
     )
@@ -999,14 +1002,14 @@ async fn exhausted_job_removable() {
     let delete = |id: JobId| {
         delete_job(
             State(state.clone()),
-            Extension(auth_for(owner)),
+            UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
             Path(id.to_string()),
         )
     };
 
     let (_, Json(cancelled)) = cancel_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(stuck.to_string()),
     )
@@ -1043,7 +1046,7 @@ async fn cancel_is_idempotent() {
 
     let (status, _) = cancel_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
     )
@@ -1054,7 +1057,7 @@ async fn cancel_is_idempotent() {
     // Repeated cancel of a still-live job stays 202.
     let (status, Json(body)) = cancel_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
     )
@@ -1078,7 +1081,7 @@ async fn cancel_terminal_noop() {
 
     let (status, _) = cancel_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
     )
@@ -1125,31 +1128,10 @@ async fn restricted_token_rejected() {
     .await
     .unwrap();
 
-    let list = list_jobs(
-        State(state.clone()),
-        Extension(restricted_auth_for(owner)),
-        Query(ListJobsQuery::default()),
-    )
-    .await;
-    assert!(matches!(list, Err(ServerError::Forbidden)));
-
-    let get = get_job(
-        State(state.clone()),
-        Extension(restricted_auth_for(owner)),
-        Extension(None),
-        Path(job_id.to_string()),
-    )
-    .await;
-    assert!(matches!(get, Err(ServerError::Forbidden)));
-
-    let cancel = cancel_job(
-        State(state.clone()),
-        Extension(restricted_auth_for(owner)),
-        Extension(None),
-        Path(job_id.to_string()),
-    )
-    .await;
-    assert!(matches!(cancel, Err(ServerError::Forbidden)));
+    // The job routes take `UnrestrictedAuth`, so the refusal is the extractor's.
+    let refused =
+        crate::auth::extract::<UnrestrictedAuth>(&state, restricted_auth_for(owner)).await;
+    assert_eq!(refused.err(), Some(StatusCode::FORBIDDEN));
 }
 
 fn local_request() -> SubmitExecutionRequest {
@@ -1563,7 +1545,7 @@ async fn invalid_cursor_rejected() {
     let (_dir, state) = build_state().await;
     let result = list_jobs(
         State(state.clone()),
-        Extension(auth_for(user(2))),
+        UnrestrictedAuth(auth_for(user(2)).expect("a signed-in caller")),
         Query(ListJobsQuery {
             cursor: Some("not-base64!".to_string()),
             ..Default::default()

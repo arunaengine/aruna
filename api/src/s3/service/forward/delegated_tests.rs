@@ -3,24 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use aruna_core::structs::storage::distribution::delegation::{
     DELEGATION_HEADER, Delegation, Payload,
 };
+use aruna_core::time::unix_timestamp_secs;
 use http::{HeaderMap, Method};
 use s3s::dto::StreamingBlob;
 
 use super::forwarded_digest;
 use crate::s3::service::payload::frame_body;
 use crate::tests::members::{BUCKET, Members, members};
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
 
 /// What one delegated request names; `key` is the key the delegation binds.
 struct Delegated<'a> {
@@ -49,7 +41,7 @@ fn delegation(
         group_id: user.group_id,
         credential_id: user.access_key.clone(),
         restrictions: None,
-        credential_expiry: now() + 3600,
+        credential_expiry: unix_timestamp_secs() + 3600,
         operation: request.operation.to_string(),
         bucket: BUCKET.to_string(),
         key: request.key.to_string(),
@@ -57,7 +49,7 @@ fn delegation(
         request_digest: forwarded_digest(&request.method, BUCKET, request.key, None, headers),
         payload: request.payload.clone(),
         nonce: rand::random(),
-        issued_at: now(),
+        issued_at: unix_timestamp_secs(),
         valid_secs: 10,
     }
 }
@@ -208,7 +200,7 @@ async fn refuses_strangers() {
     let (status, _) = send(&members, 1, (Method::GET, "k/held"), &[value], None).await;
     assert_eq!(status, http::StatusCode::FORBIDDEN);
     let mut expired = delegation(&members, (0, 1), &request, &accept());
-    expired.issued_at = now() - 3600;
+    expired.issued_at = unix_timestamp_secs() - 3600;
     let value = expired.sign(&members.nodes[0].secret).encode().unwrap();
     let (status, _) = send(&members, 1, (Method::GET, "k/held"), &[value], None).await;
     assert_eq!(status, http::StatusCode::FORBIDDEN);

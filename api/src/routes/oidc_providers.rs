@@ -5,32 +5,29 @@
 use std::sync::Arc;
 
 use aruna_core::errors::StorageError;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::set_provider::{
     ProviderChange, SetProviderConfig, SetProviderError, SetProviderOperation,
 };
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::info::RealmProviderResponse;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "system/realm", description = "Realm configuration, placement and quota")))]
-pub struct ProvidersApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ProvidersApiDoc::openapi())
-        .routes(routes!(set_provider, remove_provider))
+    OpenApiRouter::new().routes(routes!(set_provider, remove_provider))
 }
 
 /// One OIDC provider whose ID tokens this realm accepts.
@@ -84,18 +81,16 @@ management node serves the call and every other node relays it to one.
                 "discovery_url": "https://login.aai.lifescience-ri.eu/oidc/.well-known/openid-configuration"
             }])),
         (status = 400, description = "Malformed body, id, issuer, audience or discovery URL", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn set_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
     Json(request): Json<ProviderRequest>,
 ) -> ServerResult<Json<Vec<RealmProviderResponse>>> {
@@ -135,18 +130,16 @@ management node serves the call and every other node relays it to one.
                 "discovery_url": "https://keycloak.example.test/realms/aruna/.well-known/openid-configuration"
             }])),
         (status = 400, description = "Malformed id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "No provider with this id, or this node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "The provider is the last one, or another update of the realm configuration won the race", body = ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn remove_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<Vec<RealmProviderResponse>>> {
     change_provider(&state, auth, ProviderChange::Remove(id)).await
@@ -154,10 +147,9 @@ pub async fn remove_provider(
 
 async fn change_provider(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     change: ProviderChange,
 ) -> ServerResult<Json<Vec<RealmProviderResponse>>> {
-    let auth = require_realm_auth(state, auth)?;
     // Request policies live at this boundary; the operation only checks roles.
     ensure_permission(
         state,
@@ -168,11 +160,7 @@ async fn change_provider(
     .await?;
     let stored = drive(
         SetProviderOperation::new(SetProviderConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
+            actor: actor(state, &auth),
             auth_context: auth,
             change,
         }),
@@ -209,12 +197,8 @@ fn map_provider_error(error: SetProviderError) -> ServerError {
         SetProviderError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
             "concurrent realm configuration update conflict; retry".to_string(),
         ),
-        SetProviderError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        SetProviderError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -224,6 +208,7 @@ mod tests {
     use crate::tests::routes::{test_context, test_state, test_storage};
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
@@ -298,7 +283,7 @@ mod tests {
     ) -> ServerResult<Vec<String>> {
         let Json(list) = set_provider(
             State(state.clone()),
-            Extension(auth(state, user)),
+            RealmAuth(auth(state, user).expect("a signed-in caller")),
             Path(id.to_string()),
             body(issuer),
         )
@@ -316,7 +301,7 @@ mod tests {
 
         let Json(list) = remove_provider(
             State(state.clone()),
-            Extension(auth(&state, admin)),
+            RealmAuth(auth(&state, admin).expect("a signed-in caller")),
             Path("lifescience".to_string()),
         )
         .await
@@ -326,7 +311,7 @@ mod tests {
 
         let last = remove_provider(
             State(state.clone()),
-            Extension(auth(&state, admin)),
+            RealmAuth(auth(&state, admin).expect("a signed-in caller")),
             Path("main".to_string()),
         )
         .await;
@@ -341,7 +326,7 @@ mod tests {
         assert!(matches!(error, Err(ServerError::Forbidden)));
         let error = remove_provider(
             State(state.clone()),
-            Extension(auth(&state, member)),
+            RealmAuth(auth(&state, member).expect("a signed-in caller")),
             Path("main".to_string()),
         )
         .await;

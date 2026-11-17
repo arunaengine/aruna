@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::imports::{admin_of_group, existing_rule, map_error};
+use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -28,16 +29,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct OrganizeDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(OrganizeDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(preview_move))
         .routes(routes!(start_move))
         .routes(routes!(preview_duplicates))
@@ -245,14 +242,14 @@ fn job_error(error: LinkedError) -> ServerError {
         LinkedError::Storage(aruna_core::errors::StorageError::TransactionConflict) => {
             ServerError::Conflict("the bucket job changed meanwhile; try again".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
 /// The rule, the caller and the caller's WRITE on its bucket; restricted tokens are refused.
 async fn caller(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     (group_id, import_id): (&str, &str),
 ) -> ServerResult<(BackendImport, AuthContext, BucketAccess)> {
     let (group_id, auth) = admin_of_group(state, auth, group_id).await?;
@@ -392,7 +389,6 @@ including request policies. Tokens with path restrictions are refused.
             ]
         })),
         (status = 400, description = "Invalid pattern, target, folder, limit or cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "Too many keys in a row are hidden from the caller", body = ErrorResponse)
@@ -401,7 +397,7 @@ including request policies. Tokens with path restrictions are refused.
 )]
 pub async fn preview_move(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     Json(request): Json<MovePreviewRequest>,
 ) -> ServerResult<Json<MovePreview>> {
@@ -461,7 +457,6 @@ the job ends as aborted.
             "total": 300000, "counted": true, "started_at_ms": 1790000000000_u64, "controls": true
         })),
         (status = 400, description = "Invalid pattern, target or folder", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "`job_running`: another job of the bucket runs", body = ErrorResponse)
@@ -470,7 +465,7 @@ the job ends as aborted.
 )]
 pub async fn start_move(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, import_id)): Path<(String, String)>,
     Json(request): Json<MoveRequest>,
@@ -480,7 +475,7 @@ pub async fn start_move(
     let scope = scope(&state, (&rule, &auth), &access);
     let total = remap::count_selected(&state.get_ctx(), &plan, &scope, None)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let task = LinkedTask::Remap(plan);
     start_job(&state, (&rule, auth, bearer), (task, total)).await
 }
@@ -520,7 +515,6 @@ pub async fn start_move(
             }]
         })),
         (status = 400, description = "Invalid limit or cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -528,7 +522,7 @@ pub async fn start_move(
 )]
 pub async fn preview_duplicates(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     Json(page): Json<PageRequest>,
 ) -> ServerResult<Json<DuplicatePreview>> {
@@ -547,7 +541,7 @@ pub async fn preview_duplicates(
         (filter, after, limit),
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let file = |location: aruna_core::structs::storage::blob::BackendLocation| StoredFile {
         path: location.backend_path,
         bytes: location.blob_size,
@@ -597,7 +591,6 @@ pub async fn preview_duplicates(
             "kind": "duplicates", "state": "running", "done": 0, "skipped": 0, "failed": 0,
             "total": 1200, "counted": true, "started_at_ms": 1790000000000_u64, "controls": true
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "`job_running`: another job of the bucket runs", body = ErrorResponse)
@@ -606,7 +599,7 @@ pub async fn preview_duplicates(
 )]
 pub async fn start_duplicates(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<OrganizeJob>)> {
@@ -618,7 +611,7 @@ pub async fn start_duplicates(
         (None, None, 1),
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let task = LinkedTask::Unify {
         prefix: String::new(),
     };
@@ -647,7 +640,6 @@ pub async fn start_duplicates(
             "kind": "move", "state": "running", "done": 120, "skipped": 3, "failed": 0,
             "total": 300000, "counted": true, "started_at_ms": 1790000000000_u64, "controls": true
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -655,14 +647,14 @@ pub async fn start_duplicates(
 )]
 pub async fn get_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<Option<OrganizeJob>>> {
     let (rule, ..) = caller(&state, auth, (&group_id, &import_id)).await?;
     let context = state.get_ctx();
     let job = read_bucket_job(&context, &rule.bucket)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     match job {
         Some(job) => Ok(Json(Some(shown(&context, &rule.bucket, job).await?))),
         None => Ok(Json(None)),
@@ -679,7 +671,7 @@ async fn shown(
     let total = match &job {
         BucketJob::Rename(record, _) => {
             let total = rename_total(context, bucket, record.started_at_ms).await;
-            total.map_err(ServerError::InternalError)?
+            total.map_err(|error| ServerError::InternalError(error.into()))?
         }
         _ => None,
     };
@@ -716,7 +708,6 @@ async fn shown(
             "total": 300000, "counted": true, "started_at_ms": 1790000000000_u64, "controls": true
         })),
         (status = 400, description = "Unknown action", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "`no_job`: no running or paused job, or the action does not fit its state", body = ErrorResponse)
@@ -725,7 +716,7 @@ async fn shown(
 )]
 pub async fn control_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id, action)): Path<(String, String, String)>,
 ) -> ServerResult<Json<OrganizeJob>> {
     let (rule, ..) = caller(&state, auth, (&group_id, &import_id)).await?;
@@ -762,7 +753,6 @@ A file is shown only when the caller may read every key the rule may give it: it
         (status = 200, description = "The link's last sync", body = LinkStatus, example = json!({
             "conflicts": [{"path": "raw/a.faa.gz", "reason": "another link records the file"}]
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -770,7 +760,7 @@ A file is shown only when the caller may read every key the rule may give it: it
 )]
 pub async fn link_status(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<LinkStatus>> {
     let (rule, _, access) = caller(&state, auth, (&group_id, &import_id)).await?;
@@ -838,10 +828,10 @@ async fn file_keys(
             value,
             ..
         }) => value,
-        other => return Err(ServerError::InternalError(format!("{other:?}"))),
+        other => return Err(ServerError::InternalError(format!("{other:?}").into())),
     };
     let row = row.as_deref().map(ImportedObject::from_bytes).transpose();
-    let row = row.map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let row = row.map_err(|error| ServerError::InternalError(error.into()))?;
     let mut keys: Vec<String> = row.and_then(|row| row.key).into_iter().collect();
     keys.extend(rule.aruna_key(path));
     // A pending write to the path names its key too.
@@ -856,13 +846,15 @@ async fn file_keys(
         INTENT_PAGE,
         None,
     );
-    let (intents, more) = intents.await.map_err(ServerError::InternalError)?;
+    let (intents, more) = intents
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     if more.is_some() {
         return Ok(Vec::new());
     }
     for (_, value) in intents {
         let intent = aruna_core::structs::storage::backend_import::WriteIntent::from_bytes(&value);
-        let intent = intent.map_err(|error| ServerError::InternalError(error.to_string()))?;
+        let intent = intent.map_err(|error| ServerError::InternalError(error.into()))?;
         keys.push(intent.key);
     }
     // A pending write to the path names its key too.
@@ -877,13 +869,15 @@ async fn file_keys(
         INTENT_PAGE,
         None,
     );
-    let (intents, more) = intents.await.map_err(ServerError::InternalError)?;
+    let (intents, more) = intents
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     if more.is_some() {
         return Ok(Vec::new());
     }
     for (_, value) in intents {
         let intent = aruna_core::structs::storage::backend_import::WriteIntent::from_bytes(&value);
-        let intent = intent.map_err(|error| ServerError::InternalError(error.to_string()))?;
+        let intent = intent.map_err(|error| ServerError::InternalError(error.into()))?;
         keys.push(intent.key);
     }
     match file_identity(rule, earlier, rules, path) {

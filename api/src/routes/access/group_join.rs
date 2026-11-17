@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
@@ -16,8 +17,8 @@ use aruna_operations::groups::join_request::{
 };
 use aruna_operations::groups::list_requests::{ListJoinError, ListJoinInput, ListJoinOperation};
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
+use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::{Extension, Json};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -131,7 +132,7 @@ fn map_error(error: GroupJoinError) -> ServerError {
             ServerError::Conflict("concurrent membership update; refresh and retry".into())
         }
         GroupJoinError::InvalidMessage | GroupJoinError::InvalidRoles => ServerError::BadRequest,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -156,7 +157,7 @@ async fn authorize_join(
     .await
     .map_err(|error| match error {
         PolicyEnforcementError::Denied { .. } => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })
 }
 
@@ -230,7 +231,7 @@ async fn list(
     .await
     .map_err(|error| match error {
         ListJoinError::Unauthorized => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     let names = drive(
         ResolveUsersOperation::new(ResolveUsersInput {
@@ -244,7 +245,7 @@ async fn list(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?
+    .map_err(|error| ServerError::InternalError(error.into()))?
     .users
     .into_iter()
     .map(|user| (user.user_id.to_string(), user.name))
@@ -285,11 +286,10 @@ async fn list(
         (status = 409, body = ErrorResponse, description = "Already a member, concurrent change, or device node")), security(("bearer_auth" = [])))]
 async fn submit_join(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<Ulid>,
     Json(input): Json<CreateJoinRequest>,
 ) -> ServerResult<(StatusCode, Json<JoinResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     authorize_join(&state, &auth, Some(group_id), Permission::WRITE).await?;
     Ok((
         StatusCode::CREATED,
@@ -323,11 +323,10 @@ Realm and group request policies may deny.
         (status = 400, body = ErrorResponse, description = "Invalid filter or cursor"), (status = 401, body = ErrorResponse, description = "Authentication required"), (status = 403, body = ErrorResponse, description = "Membership administration required")), security(("bearer_auth" = [])))]
 async fn list_joins(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<Ulid>,
     Query(query): Query<JoinQuery>,
 ) -> ServerResult<Json<JoinPage>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     ensure_permission(
         &state,
         &auth,
@@ -354,10 +353,9 @@ async fn list_joins(
         (status = 400, body = ErrorResponse, description = "Invalid cursor"), (status = 401, body = ErrorResponse, description = "Authentication required"), (status = 403, body = ErrorResponse, description = "Restricted token or policy denial")), security(("bearer_auth" = [])))]
 async fn own_joins(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<JoinQuery>,
 ) -> ServerResult<Json<JoinPage>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     authorize_join(&state, &auth, None, Permission::READ).await?;
     Ok(Json(list(&state, auth, None, query).await?))
 }
@@ -377,10 +375,9 @@ Realm and group request policies may deny.
     responses((status = 204, description = "Withdrawn"), (status = 401, body = ErrorResponse, description = "Authentication required"), (status = 403, body = ErrorResponse, description = "Not the requester or policy denial"), (status = 404, body = ErrorResponse, description = "Request not found"), (status = 409, body = ErrorResponse, description = "Already decided, concurrent change, or device node")), security(("bearer_auth" = [])))]
 async fn withdraw_join(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, request_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     authorize_join(&state, &auth, Some(group_id), Permission::WRITE).await?;
     mutate(&state, auth, group_id, JoinAction::Withdraw { request_id }).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -405,11 +402,10 @@ Realm and group request policies may deny.
         (status = 400, body = ErrorResponse, description = "Invalid roles or reason"), (status = 401, body = ErrorResponse, description = "Authentication required"), (status = 403, body = ErrorResponse, description = "Membership administration required"), (status = 404, body = ErrorResponse, description = "Request not found"), (status = 409, body = ErrorResponse, description = "Different terminal decision, concurrent change, or device node")), security(("bearer_auth" = [])))]
 async fn decide_join(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, request_id)): Path<(Ulid, Ulid)>,
     Json(input): Json<DecideJoinRequest>,
 ) -> ServerResult<Json<JoinDecisionResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     ensure_permission(
         &state,
         &auth,

@@ -14,6 +14,7 @@ pub mod error;
 pub mod forwarded;
 pub mod https;
 pub mod jobs;
+mod lookup;
 pub mod mcp;
 pub mod metadata;
 pub mod monitoring;

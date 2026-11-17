@@ -11,28 +11,20 @@ use aruna_operations::driver::drive;
 use aruna_operations::notifications::email::{self, EmailError, read_email, remove_email};
 use aruna_operations::notifications::settings::SettingError;
 use aruna_operations::realm::get_config::GetConfigOperation;
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct EmailsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(EmailsApiDoc::openapi()).routes(routes!(
-        get_email,
-        set_email,
-        delete_email
-    ))
+    OpenApiRouter::new().routes(routes!(get_email, set_email, delete_email))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -73,7 +65,6 @@ is read, and its address is never returned.
             "categories": ["share.upload"],
             "created_at_ms": 1762160400000u64
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 404, description = "The caller receives no notification emails", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
@@ -83,9 +74,8 @@ is read, and its address is never returned.
 )]
 pub async fn get_email(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<Json<EmailResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
     let preference = read_email(&state.get_ctx(), auth.user_id)
         .await
@@ -133,7 +123,6 @@ caller.
             "created_at_ms": 1762160400000u64
         })),
         (status = 400, description = "No category, an unknown one, or an address that is not the caller's verified address", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "The realm sends no email, or this node is a user device", body = ErrorResponse),
         (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
@@ -142,10 +131,9 @@ caller.
 )]
 pub async fn set_email(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<EmailRequest>,
 ) -> ServerResult<Json<EmailResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
     let ctx = state.get_ctx();
     let local = state.get_node_id();
@@ -181,7 +169,6 @@ pub async fn set_email(
 - 503 when the realm configuration cannot be read now."#,
     responses(
         (status = 204, description = "This node stored that email is off"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
         (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
@@ -190,9 +177,8 @@ pub async fn set_email(
 )]
 pub async fn delete_email(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
     remove_email(&state.get_ctx(), state.get_node_id(), auth.user_id)
         .await
@@ -228,7 +214,7 @@ fn map_error(error: EmailError) -> ServerError {
         EmailError::NotConfigured => ServerError::Conflict(error.to_string()),
         EmailError::Setting(error) => setting_error(error),
         EmailError::Storage(_) | EmailError::Conversion(_) => {
-            ServerError::InternalError(error.to_string())
+            ServerError::InternalError(error.into())
         }
     }
 }
@@ -239,7 +225,7 @@ pub(crate) fn setting_error(error: SettingError) -> ServerError {
         SettingError::Register(_) => ServerError::Conflict(error.to_string()),
         // The write is one local batch, so a failed one stored nothing.
         SettingError::Build(_) | SettingError::Storage(_) => {
-            ServerError::InternalError(error.to_string())
+            ServerError::InternalError(error.into())
         }
     }
 }

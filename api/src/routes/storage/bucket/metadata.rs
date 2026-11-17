@@ -21,26 +21,22 @@ use axum::extract::{Path, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::super::deletion::bucket_info;
 use super::super::distributed::map_create_error;
 use super::super::routing::ensure_group_admin;
-use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::metadata::forwarded_auth_token;
 use crate::routes::identifiers::IdentifierParserBody;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct BucketMetadataDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BucketMetadataDoc::openapi())
-        .routes(routes!(get_bucket_metadata, put_bucket_metadata))
+    OpenApiRouter::new().routes(routes!(get_bucket_metadata, put_bucket_metadata))
 }
 
 /// One identifier of a bucket, such as its DOI.
@@ -204,7 +200,7 @@ pub(crate) async fn write_metadata(
                     }
                     PutMetadataError::Forbidden => ServerError::Forbidden,
                     PutMetadataError::Changed => ServerError::Conflict(error.to_string()),
-                    error => ServerError::InternalError(error.to_string()),
+                    error => ServerError::InternalError(error.into()),
                 })?;
         }
     }
@@ -266,7 +262,6 @@ caller's own access to the dataset.
                 "identifiers": [{"name": "DOI", "value": "10.5281/zenodo.14916843", "url": "https://doi.org/10.5281/zenodo.14916843"}]
             }
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "The metadata could not be read now", body = ErrorResponse)
@@ -275,11 +270,10 @@ caller's own access to the dataset.
 )]
 pub async fn get_bucket_metadata(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketMetadataResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let path = bucket_permission_path(
         state.get_realm_id(),
@@ -335,7 +329,6 @@ the linked dataset. For a distributed bucket the set's publisher checks the forw
             "description": {"title": "Bakta database", "description": "Annotation database for Bakta", "version": "6.0", "license": null, "identifiers": []}
         })),
         (status = 400, description = "Missing `metadata`, an unknown field such as a former `title`, `database` without `dataset`, invalid identifier rules, or a dataset that does not exist, cannot be read by the caller or is not a Dataset", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the owning group's admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the group", body = ErrorResponse),
         (status = 409, description = "The set's publisher refused the change", body = ErrorResponse),
@@ -345,12 +338,11 @@ the linked dataset. For a distributed bucket the set's publisher checks the forw
 )]
 pub async fn put_bucket_metadata(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     request: Result<Json<PutMetadataRequest>, JsonRejection>,
 ) -> ServerResult<Json<BucketMetadataResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     let metadata = request.metadata.map(BucketMetadata::try_from).transpose()?;

@@ -10,22 +10,18 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::realm::set_admin::{SetAdminConfig, SetAdminError, SetAdminOperation};
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "system/realm", description = "Realm configuration, placement and quota")))]
-pub struct AdminsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(AdminsApiDoc::openapi()).routes(routes!(grant_admin, remove_admin))
+    OpenApiRouter::new().routes(routes!(grant_admin, remove_admin))
 }
 
 #[utoipa::path(
@@ -51,18 +47,16 @@ one.
                 "01JC8X9Q2M0000000000000000@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA"
             ])),
         (status = 400, description = "The id is not a user id of this realm", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm administrator", body = ErrorResponse),
         (status = 404, description = "This node holds no realm configuration or authorization document", body = ErrorResponse),
         (status = 409, description = "Another update of the realm authorization won the race; retry", body = ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn grant_admin(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(user_id): Path<String>,
 ) -> ServerResult<Json<Vec<String>>> {
     change_admin(&state, auth, &user_id, true).await
@@ -91,18 +85,16 @@ one.
         (status = 200, description = "All realm administrators after the change, sorted", body = Vec<String>,
             example = json!(["01JC8X8Z5W0000000000000000@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA"])),
         (status = 400, description = "The id is not a user id of this realm", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm administrator", body = ErrorResponse),
         (status = 404, description = "This node holds no realm configuration or authorization document", body = ErrorResponse),
         (status = 409, description = "The user is the last realm administrator, or another update of the realm authorization won the race", body = ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn remove_admin(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(user_id): Path<String>,
 ) -> ServerResult<Json<Vec<String>>> {
     change_admin(&state, auth, &user_id, false).await
@@ -110,11 +102,10 @@ pub async fn remove_admin(
 
 async fn change_admin(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     user_id: &str,
     admin: bool,
 ) -> ServerResult<Json<Vec<String>>> {
-    let auth = require_realm_auth(state, auth)?;
     let realm_id = state.get_realm_id();
     let user_id = UserId::from_string(user_id).map_err(|_| ServerError::BadRequest)?;
     crate::routes::plugin_installs::refuse_plugin_account(state, user_id).await?;
@@ -159,12 +150,8 @@ fn map_admin_error(error: SetAdminError) -> ServerError {
         SetAdminError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
             "concurrent realm authorization update conflict; retry".to_string(),
         ),
-        SetAdminError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        SetAdminError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -223,17 +210,17 @@ mod tests {
         target: UserId,
         admin: bool,
     ) -> ServerResult<Vec<String>> {
-        let auth = Some(AuthContext {
+        let auth = AuthContext {
             user_id: caller,
             realm_id: state.get_realm_id(),
             path_restrictions: None,
             session: None,
-        });
+        };
         let path = Path(target.to_string());
         let route = if admin {
-            grant_admin(State(state.clone()), Extension(auth), path).await
+            grant_admin(State(state.clone()), RealmAuth(auth), path).await
         } else {
-            remove_admin(State(state.clone()), Extension(auth), path).await
+            remove_admin(State(state.clone()), RealmAuth(auth), path).await
         };
         route.map(|Json(ids)| ids)
     }

@@ -226,7 +226,7 @@ pub(crate) async fn with_global_ids(state: &ServerState, value: &Value) -> Serve
         &mut value,
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(value)
 }
 
@@ -246,7 +246,7 @@ pub(crate) fn map_write_error(error: MetadataWriteError) -> ServerError {
         MetadataWriteError::NotFound => ServerError::NotFound,
         MetadataWriteError::Create(error) => map_create_error(error),
         MetadataWriteError::Update(error) => map_update_error(error),
-        MetadataWriteError::Delete(error) => ServerError::InternalError(error.to_string()),
+        MetadataWriteError::Delete(error) => ServerError::InternalError(error.into()),
         MetadataWriteError::Undeliverable(error) => ServerError::ServiceUnavailableReason(format!(
             "metadata write is undeliverable: {error}"
         )),
@@ -270,7 +270,7 @@ pub(crate) fn map_create_error(error: CreateDocumentError) -> ServerError {
             ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
         }
         CreateDocumentError::RawLimit => ServerError::ServiceUnavailable,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -285,7 +285,7 @@ pub(crate) fn map_update_error(error: UpdateDocumentError) -> ServerError {
         UpdateDocumentError::GraphPending { .. } => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 /// The caller's own bearer token, carried to the holder a write is forwarded to
@@ -304,7 +304,7 @@ pub(crate) fn map_metadata_error(error: MetadataError) -> ServerError {
             ServerError::MetadataProfileValidation(findings)
         }
         MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -327,7 +327,7 @@ pub(crate) fn map_api_error(error: MetadataApiError) -> ServerError {
         MetadataApiError::InvalidCursor(message) | MetadataApiError::InvalidQuery(message) => {
             ServerError::BadRequestMessage(message)
         }
-        MetadataApiError::Internal(message) => ServerError::InternalError(message),
+        MetadataApiError::Internal(message) => ServerError::InternalError(message.into()),
     }
 }
 
@@ -443,10 +443,10 @@ pub(crate) async fn local_write_record(
             Ok(Some(record)) => record,
             Ok(None) => return Ok(None),
             Err(ReadError::Storage(error)) => {
-                return Err(ServerError::InternalError(error.to_string()));
+                return Err(ServerError::InternalError(error.into()));
             }
             Err(ReadError::Conversion(error)) => {
-                return Err(ServerError::InternalError(error.to_string()));
+                return Err(ServerError::InternalError(error.into()));
             }
         };
     ensure_record_writable(state, auth, &record, extras).await?;
@@ -474,8 +474,8 @@ pub(crate) async fn load_document_record(
     match load_metadata_record_by_document_from_operations(ctx.as_ref(), document_id).await {
         Ok(Some(record)) => Ok(record),
         Ok(None) => Err(ServerError::NotFound),
-        Err(ReadError::Storage(error)) => Err(ServerError::InternalError(error.to_string())),
-        Err(ReadError::Conversion(error)) => Err(ServerError::InternalError(error.to_string())),
+        Err(ReadError::Storage(error)) => Err(ServerError::InternalError(error.into())),
+        Err(ReadError::Conversion(error)) => Err(ServerError::InternalError(error.into())),
     }
 }
 type ReadError = aruna_operations::metadata::repository::StorageReadError;
@@ -603,7 +603,7 @@ fn build_view_id(
 
 fn parse_jsonld(jsonld: String) -> ServerResult<Value> {
     serde_json::from_str(&jsonld)
-        .map_err(|_| ServerError::InternalError("invalid jsonld export".to_string()))
+        .map_err(|_| ServerError::InternalError("invalid jsonld export".to_string().into()))
 }
 
 fn rewrite_view_jsonld(mut value: Value, graph_iri: &str, view_id: &str) -> ServerResult<Value> {

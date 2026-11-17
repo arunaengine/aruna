@@ -419,7 +419,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(|error| job_error(map_job_request(error)))?;
+        .map_err(|error| job_error(error.into()))?;
         accepted_payload(&self.state, response).await
     }
 
@@ -442,7 +442,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(|error| job_error(map_job_request(error)))?;
+            .map_err(|error| job_error(error.into()))?;
         let position = session
             .submit_cell(&input.cell_id, &input.code)
             .map_err(bad_request)?;
@@ -475,7 +475,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(|error| job_error(map_job_request(error)))?;
+            .map_err(|error| job_error(error.into()))?;
         let (last_event_id, outputs) =
             session.cell_outputs(&input.cell_id, input.after.unwrap_or_default());
         Ok(Json(JsonPayload(json!({
@@ -504,7 +504,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(|error| job_error(map_job_request(error)))?;
+            .map_err(|error| job_error(error.into()))?;
         session.interrupt().map_err(bad_request)?;
         Ok(Json(JsonPayload(json!({ "interrupted": true }))))
     }
@@ -532,7 +532,7 @@ impl McpServer {
         .await?;
         let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
             .await
-            .map_err(|error| job_error(map_job_request(error)))?;
+            .map_err(|error| job_error(error.into()))?;
         session.end(aruna_compute::session::EndReason::Ended);
         Ok(Json(JsonPayload(json!({ "ended": true }))))
     }
@@ -600,7 +600,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(|error| submit_error(map_job_request(error)))?;
+        .map_err(|error| submit_error(error.into()))?;
         accepted_payload(&self.state, response).await
     }
 
@@ -623,7 +623,7 @@ impl McpServer {
             extras,
         )
         .await
-        .map_err(|error| submit_error(map_job_request(error)))?;
+        .map_err(|error| submit_error(error.into()))?;
         accepted_payload(&self.state, response).await
     }
 
@@ -649,33 +649,33 @@ impl McpServer {
         )
         .await?;
         let job_id = parse_job(&input.id)?;
-        let response =
-            if let Some(report) = family_report(&self.state.get_ctx(), &auth, job_id).await {
-                let report = report
-                    .map_err(crate::routes::jobs::map_job_route)
-                    .map_err(job_error)?;
-                let mut response = crate::routes::jobs::job_view_response(&report.job);
-                let family = crate::routes::jobs::family_response(&report);
-                crate::routes::jobs::bind_output_routes(&mut response.result, &family.outputs)
-                    .map_err(crate::routes::jobs::map_job_route)
-                    .map_err(server_error)?;
-                response.family = Some(family);
-                response
-            } else {
-                let routed = read_job_routed(
-                    &self.state.get_ctx(),
-                    &auth,
-                    job_id,
-                    crate::routes::jobs::forwarded_job_auth(request_bearer(&parts))
-                        .map_err(server_error)?,
-                )
-                .await
-                .map_err(crate::routes::jobs::map_job_route)
+        let response = if let Some(report) =
+            family_report(&self.state.get_ctx(), &auth, job_id).await
+        {
+            let report = report
+                .map_err(crate::jobs::map_job_route)
                 .map_err(job_error)?;
-                let mut response = crate::routes::jobs::job_view_response(&routed.job);
-                response.run_crate = routed.run_crate;
-                response
-            };
+            let mut response = crate::jobs::job_view_response(&report.job);
+            let family = crate::jobs::family_response(&report);
+            crate::jobs::bind_output_routes(&mut response.result, &family.outputs)
+                .map_err(crate::jobs::map_job_route)
+                .map_err(server_error)?;
+            response.family = Some(family);
+            response
+        } else {
+            let routed = read_job_routed(
+                &self.state.get_ctx(),
+                &auth,
+                job_id,
+                crate::jobs::forwarded_job_auth(request_bearer(&parts)).map_err(server_error)?,
+            )
+            .await
+            .map_err(crate::jobs::map_job_route)
+            .map_err(job_error)?;
+            let mut response = crate::jobs::job_view_response(&routed.job);
+            response.run_crate = routed.run_crate;
+            response
+        };
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -703,43 +703,43 @@ impl McpServer {
         )
         .await?;
         let job_id = parse_job(&input.id)?;
-        let (view, outputs) =
-            if let Some(report) = family_report(&self.state.get_ctx(), &auth, job_id).await {
-                let report = report
-                    .map_err(crate::routes::jobs::map_job_route)
-                    .map_err(job_error)?;
-                let outputs = report
-                    .outputs
-                    .iter()
-                    .map(|output| {
-                        (
-                            crate::routes::jobs::output_response(
-                                output,
-                                report.output_endpoints.get(&output.node_id),
-                            ),
-                            Some(output.node_id),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                (crate::routes::jobs::job_view_response(&report.job), outputs)
-            } else {
-                let routed = read_job_routed(
-                    &self.state.get_ctx(),
-                    &auth,
-                    job_id,
-                    crate::routes::jobs::forwarded_job_auth(request_bearer(&parts))
-                        .map_err(server_error)?,
-                )
-                .await
-                .map_err(crate::routes::jobs::map_job_route)
+        let (view, outputs) = if let Some(report) =
+            family_report(&self.state.get_ctx(), &auth, job_id).await
+        {
+            let report = report
+                .map_err(crate::jobs::map_job_route)
                 .map_err(job_error)?;
-                let view = crate::routes::jobs::job_view_response(&routed.job);
-                let outputs = result_outputs(view.result.as_ref())?
-                    .into_iter()
-                    .map(|output| (output, None))
-                    .collect::<Vec<_>>();
-                (view, outputs)
-            };
+            let outputs = report
+                .outputs
+                .iter()
+                .map(|output| {
+                    (
+                        crate::jobs::output_response(
+                            output,
+                            report.output_endpoints.get(&output.node_id),
+                        ),
+                        Some(output.node_id),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (crate::jobs::job_view_response(&report.job), outputs)
+        } else {
+            let routed = read_job_routed(
+                &self.state.get_ctx(),
+                &auth,
+                job_id,
+                crate::jobs::forwarded_job_auth(request_bearer(&parts)).map_err(server_error)?,
+            )
+            .await
+            .map_err(crate::jobs::map_job_route)
+            .map_err(job_error)?;
+            let view = crate::jobs::job_view_response(&routed.job);
+            let outputs = result_outputs(view.result.as_ref())?
+                .into_iter()
+                .map(|output| (output, None))
+                .collect::<Vec<_>>();
+            (view, outputs)
+        };
         let mut artifacts = Vec::with_capacity(outputs.len());
         for (output, node_id) in outputs {
             artifacts.push(artifact_output(self, &view.job_id, output, node_id).await);
@@ -801,12 +801,12 @@ impl McpServer {
         )
         .await
         .map_err(internal_error)?;
-        let response = crate::routes::jobs::JobListResponse {
+        let response = crate::jobs::JobListResponse {
             jobs: records
                 .iter()
-                .map(crate::routes::jobs::job_status_response)
+                .map(crate::jobs::job_status_response)
                 .collect(),
-            next_cursor: crate::routes::jobs::encode_cursor(next_cursor),
+            next_cursor: crate::jobs::encode_cursor(next_cursor),
         };
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
@@ -840,11 +840,10 @@ impl McpServer {
             &self.state.jobs_runtime(),
             auth.user_id,
             job_id,
-            crate::routes::jobs::forwarded_job_auth(request_bearer(&parts))
-                .map_err(server_error)?,
+            crate::jobs::forwarded_job_auth(request_bearer(&parts)).map_err(server_error)?,
         )
         .await
-        .map_err(crate::routes::jobs::map_job_route)
+        .map_err(crate::jobs::map_job_route)
         .map_err(job_error)?;
         let job = match outcome {
             RoutedCancelOutcome::NotFound => {
@@ -852,7 +851,7 @@ impl McpServer {
             }
             RoutedCancelOutcome::AlreadyTerminal(job) | RoutedCancelOutcome::Requested(job) => job,
         };
-        let response = crate::routes::jobs::job_view_response(&job);
+        let response = crate::jobs::job_view_response(&job);
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -862,7 +861,7 @@ impl McpServer {
 /// Outputs of a job with no replicated family live in its own result payload.
 fn result_outputs(
     result: Option<&serde_json::Value>,
-) -> Result<Vec<crate::routes::jobs::JobOutputResponse>, CallToolResult> {
+) -> Result<Vec<crate::jobs::JobOutputResponse>, CallToolResult> {
     let Some(outputs) = result.and_then(|result| result.get("outputs")) else {
         return Ok(Vec::new());
     };
@@ -875,7 +874,7 @@ fn result_outputs(
 async fn artifact_output(
     server: &McpServer,
     job_id: &str,
-    output: crate::routes::jobs::JobOutputResponse,
+    output: crate::jobs::JobOutputResponse,
     node_id: Option<aruna_core::NodeId>,
 ) -> JobArtifactOutput {
     let local = node_id.is_none_or(|node_id| node_id == server.state.get_node_id());
@@ -933,10 +932,10 @@ async fn accepted_payload(
     state: &crate::server::state::ServerState,
     accepted: AcceptedExecution,
 ) -> Result<Json<JsonPayload>, CallToolResult> {
-    let urls = crate::routes::jobs::job_urls(state, accepted.job_id)
+    let urls = crate::jobs::job_urls(state, accepted.job_id)
         .await
         .map_err(server_error)?;
-    let response = crate::routes::jobs::SubmitJobResponse {
+    let response = crate::jobs::SubmitJobResponse {
         job_id: accepted.job_id.to_string(),
         created: accepted.created,
         submission_id: accepted.submission_id,
@@ -972,7 +971,7 @@ fn parse_job(id: &str) -> Result<aruna_core::structs::execution::job::JobId, Cal
 fn parse_job_state(
     value: &str,
 ) -> Result<aruna_core::structs::execution::job::JobState, CallToolResult> {
-    crate::routes::jobs::parse_state(value).map_err(|_| {
+    crate::jobs::parse_state(value).map_err(|_| {
         bad_request(
             "state must be one of queued, claimed, preparing, ready, running, cancelling, \
              indeterminate, succeeded, failed, or cancelled",
@@ -1015,27 +1014,6 @@ fn submit_error(error: crate::error::ServerError) -> CallToolResult {
             "the caller needs write permission on the group and on the workspace bucket",
         ),
         error => server_error(error),
-    }
-}
-
-/// Maps the shared job outcome onto the REST status the tool explanations
-/// were written for.
-fn map_job_request(error: crate::jobs::JobRequestError) -> crate::error::ServerError {
-    use crate::error::ServerError;
-    use crate::jobs::JobRequestError;
-    match error {
-        JobRequestError::BadRequest => ServerError::BadRequest,
-        JobRequestError::BadRequestMessage(message) => ServerError::BadRequestMessage(message),
-        JobRequestError::Unauthorized => ServerError::Unauthorized,
-        JobRequestError::Forbidden => ServerError::Forbidden,
-        JobRequestError::NotFound => ServerError::NotFound,
-        JobRequestError::Conflict(message) => ServerError::Conflict(message),
-        JobRequestError::JobPlanConflict(message) => ServerError::JobPlanConflict(message),
-        JobRequestError::ComputeQuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
-        JobRequestError::ServiceUnavailableReason(message) => {
-            ServerError::ServiceUnavailableReason(message)
-        }
-        JobRequestError::InternalError(message) => ServerError::InternalError(message),
     }
 }
 

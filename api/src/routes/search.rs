@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{
@@ -27,7 +28,7 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -39,16 +40,10 @@ const SEARCH_TYPE_BUCKETS: &str = "buckets";
 const SEARCH_TYPE_GROUPS: &str = "groups";
 const SEARCH_TYPE_USERS: &str = "users";
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "search", description = "Unified realm search"))
-)]
-pub struct SearchApiDoc;
-
 // Object search uses authenticated live heads with explicit partial or strict federation.
 // Pagination is a watermarked live keyset; signed snapshots and directory tiers remain deferred.
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SearchApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(unified_search))
         .routes(routes!(bucket_search))
         .routes(routes!(object_search))
@@ -620,7 +615,6 @@ restrictions and request policies before it can be returned.
             })
         ),
         (status = 400, description = "Query shorter than 2 characters, or a cursor that does not match this query, bucket, match type and mode", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
         (status = 503, description = "Strict distributed coverage could not be completed, or the live-head scan was unavailable", body = ErrorResponse)
     ),
@@ -628,11 +622,10 @@ restrictions and request policies before it can be returned.
 )]
 pub async fn object_search(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<ObjectParams>,
 ) -> ServerResult<(StatusCode, Json<ObjectResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let query = params.q.trim();
     if query.chars().count() < MIN_QUERY_CHARS {
         return Err(ServerError::BadRequest);
@@ -866,18 +859,16 @@ so a caller never learns of a group it may not read, and the user directory sear
             })
         ),
         (status = 400, description = "Query shorter than 2 characters, unknown type, malformed group id, or a cursor that is unsupported, sent with more than one type, or does not match the original query", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn unified_search(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<SearchParams>,
 ) -> ServerResult<(StatusCode, Json<SearchResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer_token.map(|carrier| carrier.as_str().to_string());
     Ok((
         StatusCode::OK,
@@ -1121,7 +1112,7 @@ async fn run_groups(
             &state.get_ctx(),
         )
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.into()))?;
         let raw_next = output.next_start_after;
         let total = output.groups.len();
         for (index, group) in output.groups.into_iter().enumerate() {
@@ -1192,7 +1183,7 @@ async fn run_users(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.into()))?;
     Ok(Some(UsersSection {
         hits: output
             .users

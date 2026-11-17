@@ -2,14 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
+use crate::lookup::bucket_info;
+use crate::lookup::{copy_miss, query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{
-    BucketInfo, CopyOrigin, bucket_permission_path, object_permission_path,
+    CopyOrigin, bucket_permission_path, object_permission_path,
 };
 use aruna_operations::blob::holders::{GetHoldersError, GetHoldersOperation};
 use aruna_operations::distribution::resolve::key_holders;
@@ -26,7 +28,6 @@ use aruna_operations::replication::queue::QueueBlobOperation;
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
@@ -38,18 +39,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::warn;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "data/blobs", description = "Blob management and replication"))
-)]
-pub struct BlobsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BlobsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(replicate_blob))
         .routes(routes!(blob_locations))
 }
@@ -90,19 +85,6 @@ pub struct ReplicateBlobResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
     pub target_node_id: String,
-}
-
-async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(bucket_info) => Ok(bucket_info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
-    }
 }
 
 #[utoipa::path(
@@ -153,7 +135,6 @@ the whole bucket when it is not.
             })
         ),
         (status = 400, description = "Malformed destination node id or version id, or a version_id sent without a path", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token belongs to another realm, the caller lacks WRITE on the bucket or object, or `not_holder` when `plaintext` is set and the caller is no current key holder of the encrypted source bucket",
@@ -166,15 +147,10 @@ the whole bucket when it is not.
 )]
 pub async fn replicate_blob(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<ReplicateBlobRequest>,
 ) -> ServerResult<(StatusCode, Json<ReplicateBlobResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
-    if auth.realm_id != state.get_realm_id() {
-        return Err(ServerError::Forbidden);
-    }
-
-    let bucket_info = load_bucket(&state, &request.bucket).await?;
+    let bucket_info = bucket_info(&state, &request.bucket).await?;
 
     let permission_path = match request.path.as_deref() {
         Some(path) => object_permission_path(
@@ -239,7 +215,7 @@ pub async fn replicate_blob(
     let operation = QueueBlobOperation::new(input, None).with_plaintext(plaintext);
     let queue_result = drive(operation, &state.get_ctx())
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.into()))?;
     if !queue_result.scheduled {
         warn!(
             bucket = %response.bucket,
@@ -262,7 +238,7 @@ pub(crate) async fn plaintext_holder(
     let context = state.get_ctx();
     let encrypted = consent_required(&context, bucket)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     if !encrypted {
         return Ok(false);
     }
@@ -273,7 +249,7 @@ pub(crate) async fn plaintext_holder(
             "not_holder",
             format!("the caller holds no key of bucket {bucket}"),
         )),
-        Err(error) => Err(ServerError::InternalError(error)),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -555,7 +531,6 @@ fn copy_response(
             })
         ),
         (status = 400, description = "Malformed version id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the object", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node, or the object has no such version", body = ErrorResponse),
         (status = 503, description = "No holder of the key's range answered", body = ErrorResponse)
@@ -564,15 +539,11 @@ fn copy_response(
 )]
 pub async fn blob_locations(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Query(query): Query<BlobLocationsQuery>,
 ) -> ServerResult<Json<BlobLocationsResponse>> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
-    if auth.realm_id != state.get_realm_id() {
-        return Err(ServerError::Forbidden);
-    }
     let ctx = state.get_ctx();
     let local_node = state.get_node_id();
     let version_id = query
@@ -581,7 +552,7 @@ pub async fn blob_locations(
         .map(ulid::Ulid::from_string)
         .transpose()
         .map_err(|_| ServerError::BadRequest)?;
-    let info = load_bucket(&state, &query.bucket).await?;
+    let info = bucket_info(&state, &query.bucket).await?;
     crate::auth::ensure_permission(
         &state,
         &auth,
@@ -623,7 +594,7 @@ pub async fn blob_locations(
     .map_err(|error| match error {
         LocationSummaryError::Denied => ServerError::Forbidden,
         LocationSummaryError::BucketNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     let Some(resolved) = local.summary.version_id else {
         let Some(coordinator) = copy_miss(&state, &info, &query.path, &headers).await? else {

@@ -7,7 +7,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_operations::driver::drive;
 use aruna_operations::harvest::create_connector::{
@@ -20,14 +20,15 @@ use aruna_operations::harvest::read_connector::{
 use aruna_operations::harvest::update_connector::{
     UpdateConnectorError, UpdateConnectorInput, UpdateRepositoryOperation,
 };
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 
-use crate::auth::{parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::ensure_metadata_scope;
 use crate::server::state::ServerState;
@@ -139,7 +140,6 @@ pub struct RepositoryList {
             "created_at": "2026-09-23T10:00:00+00:00", "updated_at": "2026-09-23T10:00:00+00:00"
         })),
         (status = 400, description = "Invalid group id, name, endpoint or configuration", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's metadata path", body = ErrorResponse),
         (status = 409, description = "The group is being deleted", body = ErrorResponse)
     ),
@@ -147,11 +147,10 @@ pub struct RepositoryList {
 )]
 pub async fn create_repository(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<RepositoryRequest>,
 ) -> ServerResult<(StatusCode, Json<RepositoryResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_metadata_scope(&state, &auth, group_id, Permission::WRITE).await?;
     let result = drive(
@@ -200,17 +199,15 @@ pub async fn create_repository(
             }]
         })),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the group's metadata path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_repositories(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<Json<RepositoryList>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_metadata_scope(&state, &auth, group_id, Permission::READ).await?;
     let views = drive(ListRepositoryOperation::new(group_id), &state.get_ctx())
@@ -245,7 +242,6 @@ pub async fn list_repositories(
             "created_at": "2026-09-23T10:00:00+00:00", "updated_at": "2026-09-23T10:00:00+00:00"
         })),
         (status = 400, description = "An id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the group's metadata path", body = ErrorResponse),
         (status = 404, description = "No such connector in this group", body = ErrorResponse)
     ),
@@ -253,10 +249,9 @@ pub async fn list_repositories(
 )]
 pub async fn get_repository(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
 ) -> ServerResult<Json<RepositoryResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector(&connector_id)?;
     ensure_metadata_scope(&state, &auth, group_id, Permission::READ).await?;
@@ -299,7 +294,6 @@ pub async fn get_repository(
             "created_at": "2026-09-23T10:00:00+00:00", "updated_at": "2026-09-23T11:00:00+00:00"
         })),
         (status = 400, description = "Invalid id or configuration, or an endpoint change that keeps the token", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's metadata path", body = ErrorResponse),
         (status = 404, description = "No such connector in this group", body = ErrorResponse),
         (status = 409, description = "The group is being deleted", body = ErrorResponse)
@@ -308,11 +302,10 @@ pub async fn get_repository(
 )]
 pub async fn replace_repository(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
     Json(request): Json<RepositoryRequest>,
 ) -> ServerResult<Json<RepositoryResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector(&connector_id)?;
     ensure_metadata_scope(&state, &auth, group_id, Permission::WRITE).await?;
@@ -354,7 +347,6 @@ pub async fn replace_repository(
     responses(
         (status = 204, description = "Connector and token deleted"),
         (status = 400, description = "An id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's metadata path", body = ErrorResponse),
         (status = 404, description = "No such connector in this group", body = ErrorResponse),
         (status = 409, description = "Repository links still use the connector", body = ErrorResponse)
@@ -363,10 +355,9 @@ pub async fn replace_repository(
 )]
 pub async fn delete_repository(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector(&connector_id)?;
     ensure_metadata_scope(&state, &auth, group_id, Permission::WRITE).await?;
@@ -418,7 +409,7 @@ fn create_error(error: CreateConnectorError) -> ServerError {
         | CreateConnectorError::Conversion(_)
         | CreateConnectorError::Failed
         | CreateConnectorError::InvalidStateEvent { .. } => {
-            ServerError::InternalError(error.to_string())
+            ServerError::InternalError(error.into())
         }
         CreateConnectorError::EmptyName
         | CreateConnectorError::EmptyEndpoint
@@ -444,7 +435,7 @@ fn update_error(error: UpdateConnectorError) -> ServerError {
         }
         UpdateConnectorError::GroupWrite(_)
         | UpdateConnectorError::Storage(_)
-        | UpdateConnectorError::Unexpected => ServerError::InternalError(error.to_string()),
+        | UpdateConnectorError::Unexpected => ServerError::InternalError(error.into()),
     }
 }
 
@@ -452,7 +443,7 @@ fn read_error(error: ReadConnectorError) -> ServerError {
     match error {
         ReadConnectorError::NotFound => ServerError::NotFound,
         ReadConnectorError::Storage(_) | ReadConnectorError::Unexpected => {
-            ServerError::InternalError(error.to_string())
+            ServerError::InternalError(error.into())
         }
     }
 }

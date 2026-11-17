@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::metadata::{
     ExcludedFormResponse, MetadataReferencesParams, MetadataReferencesResponse, PreflightBody,
@@ -12,7 +13,6 @@ use crate::metadata::{
     map_references_response,
 };
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::metadata::api::{
     MetadataReferencesRequest, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,
     ReferenceTarget, references_metadata as run_references_metadata,
@@ -98,7 +98,6 @@ filtered by the caller's READ permission, so an unreadable referencing document 
             )
         ),
         (status = 400, description = "Missing iri, or an iri or predicate that is not a valid absolute IRI", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
         (status = 503, description = "The reference index could not answer within the page budget", body = ErrorResponse)
     ),
@@ -106,10 +105,9 @@ filtered by the caller's READ permission, so an unreadable referencing document 
 )]
 pub async fn metadata_references(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(params): Query<MetadataReferencesParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataReferencesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let ctx = state.get_ctx();
     let execution = run_references_metadata(
         ctx.as_ref(),
@@ -220,7 +218,6 @@ target names content identities directly and checks no storage permission.
                 }
             })),
         (status = 400, description = "Malformed or oversized target set, unsupported content identity, or invalid cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is missing on the bucket, prefix or a resolved key", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
         (status = 503, description = "With allow_partial=false a failed, stale or otherwise incomplete partition fails the request instead of silently downgrading it; retryable", body = ErrorResponse)
@@ -229,11 +226,10 @@ target names content identities directly and checks no storage permission.
 )]
 pub async fn metadata_reference_preflight(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<PreflightBody>,
 ) -> ServerResult<(StatusCode, Json<PreflightResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let target = match request.target {
         PreflightTargetBody::ContentW3ids {
             content_w3ids,

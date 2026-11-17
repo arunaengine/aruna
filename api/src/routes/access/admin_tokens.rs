@@ -2,15 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{
-    ensure_permission, parse_group_id, permission_granted, require_unrestricted_auth,
-};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ensure_permission, parse_group_id, permission_granted};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::access::groups::ensure_group_admin;
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::NEVER_EXPIRES_SECS;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::revoke_token::RevokeTokenError;
@@ -22,22 +22,19 @@ use aruna_operations::groups::tokens::revoke::{
 };
 use aruna_operations::groups::tokens::{GroupToken, GroupTokensError, TokenKind, TokenStatus};
 use aruna_operations::users::revoke_all::{RevokeAllConfig, RevokeAllError, RevokeAllOperation};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-pub struct AdminTokensDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(AdminTokensDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_group_tokens))
         .routes(routes!(revoke_group_token))
         .routes(routes!(revoke_member_tokens))
@@ -136,7 +133,7 @@ fn token_response(token: GroupToken) -> GroupTokenResponse {
 fn map_revocation(message: String) -> ServerError {
     match message == RevokeTokenError::CapacityReached.to_string() {
         true => ServerError::ServiceUnavailableReason("token_revocation_capacity_reached".into()),
-        false => ServerError::InternalError(message),
+        false => ServerError::InternalError(message.into()),
     }
 }
 
@@ -150,15 +147,7 @@ fn map_tokens_error(error: GroupTokensError) -> ServerError {
                 .to_string(),
         ),
         GroupTokensError::Revocation(message) => map_revocation(message),
-        error => ServerError::InternalError(error.to_string()),
-    }
-}
-
-fn actor_for(state: &ServerState, auth: &AuthContext) -> Actor {
-    Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: auth.realm_id,
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -171,7 +160,7 @@ async fn run_revocation(
     ensure_group_admin(state, &auth, group_id).await?;
     let revocation = drive(
         RevokeTokensOperation::new(RevokeTokensConfig {
-            actor: actor_for(state, &auth),
+            actor: actor(state, &auth),
             auth_context: auth.clone(),
             group_id,
             target,
@@ -236,18 +225,16 @@ async fn run_revocation(
                 "next_cursor": "AQExSkFLRVkwMTIzNDU2Nzg5QUJDREVGR0hK"
             })),
         (status = 400, description = "The group id is not a ULID, or the cursor is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller does not administer the group", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_group_tokens(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<String>,
     Query(query): Query<TokenPageQuery>,
 ) -> ServerResult<(StatusCode, Json<GroupTokensResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let cursor = parse_cursor(query.cursor.as_deref())?;
     let (default, largest) = TOKEN_PAGE;
@@ -302,7 +289,6 @@ pub async fn list_group_tokens(
         (status = 200, description = "The token is revoked", body = RevocationResponse,
             example = json!({ "revoked": 1, "all_tokens": false })),
         (status = 400, description = "Invalid group id or token kind", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller does not administer the group", body = ErrorResponse),
         (status = 404, description = "This node holds no such token of the group", body = ErrorResponse),
         (status = 409, description = "The token is a bearer session, which is not confined to the group", body = ErrorResponse),
@@ -312,10 +298,9 @@ pub async fn list_group_tokens(
 )]
 pub async fn revoke_group_token(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, kind, token_id)): Path<(String, String, String)>,
 ) -> ServerResult<(StatusCode, Json<RevocationResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let kind = parse_kind(&kind)?;
     let target = RevokeTarget::Token { kind, id: token_id };
@@ -350,7 +335,6 @@ pub async fn revoke_group_token(
         (status = 200, description = "The member's group tokens are revoked", body = RevocationResponse,
             example = json!({ "revoked": 2, "all_tokens": false })),
         (status = 400, description = "Invalid group or user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller does not administer the group", body = ErrorResponse),
         (status = 409, description = "The member is a service account of the group and the caller is no user administrator", body = ErrorResponse),
         (status = 503, description = "The revocation set is at capacity; retryable", body = ErrorResponse)
@@ -359,10 +343,9 @@ pub async fn revoke_group_token(
 )]
 pub async fn revoke_member_tokens(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, user_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<RevocationResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let member = UserId::from_string(&user_id).map_err(|_| ServerError::BadRequest)?;
     let path = format!("/{}/admin/u/{member}", auth.realm_id);
@@ -397,7 +380,6 @@ pub async fn revoke_member_tokens(
     responses(
         (status = 204, description = "Every token issued so far is revoked"),
         (status = 400, description = "The id is not a user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, the target is of another realm, or the caller lacks WRITE on the user's administration path", body = ErrorResponse),
         (status = 503, description = "The revocation set is at capacity; retryable", body = ErrorResponse)
     ),
@@ -405,16 +387,15 @@ pub async fn revoke_member_tokens(
 )]
 pub async fn revoke_user_tokens(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let target = UserId::from_string(&id).map_err(|_| ServerError::BadRequest)?;
     let path = format!("/{}/admin/u/{target}", auth.realm_id);
     ensure_permission(&state, &auth, path, Permission::WRITE).await?;
     drive(
         RevokeAllOperation::new(RevokeAllConfig {
-            actor: actor_for(&state, &auth),
+            actor: actor(&state, &auth),
             auth_context: auth,
             target,
             now: unix_timestamp_secs(),
@@ -425,7 +406,7 @@ pub async fn revoke_user_tokens(
     .map_err(|error| match error {
         RevokeAllError::Refused => ServerError::Forbidden,
         RevokeAllError::Cutoff(message) => map_revocation(message),
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     })?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -11,9 +11,9 @@ use aruna_operations::jobs::repository::links::LinkChange;
 use aruna_operations::jobs::repository::pull::{check_now, start_pull};
 use aruna_operations::jobs::repository::{Action, TransferError, remote_state, seal_link_token};
 use aruna_operations::jobs::service::cancel_owned_job;
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::repository::links::{
@@ -21,6 +21,7 @@ use super::repository::links::{
     ensure_capable, job_response, link_error, link_example, managed, metadata_json, parse_ulid,
     readable, seal_error, view,
 };
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -96,7 +97,7 @@ The shape matches the list entries. Tokens are never returned."#,
 )]
 pub async fn get_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<Json<RepositoryLinkResponse>> {
     let (_, document_id) = readable(&state, auth, &document_id).await?;
@@ -137,7 +138,7 @@ A metadata value that is not an object returns 400. auto_update on a push link, 
 )]
 pub async fn patch_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
     Json(request): Json<PatchLinkRequest>,
 ) -> ServerResult<Json<RepositoryLinkResponse>> {
@@ -200,7 +201,7 @@ Records and drafts in the repository stay. A running push is cancelled and stops
 )]
 pub async fn delete_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
@@ -243,7 +244,7 @@ A paused link, a dataset without a revision, a creator at the active job limit o
 )]
 pub async fn push_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
@@ -304,7 +305,7 @@ A link without an open draft, a running push, a creator at the active job limit 
 )]
 pub async fn publish_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
@@ -366,7 +367,7 @@ An empty token returns 400; a connector whose endpoint changed since the link wa
 )]
 pub async fn rotate_token(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
     Json(request): Json<RotateTokenRequest>,
 ) -> ServerResult<StatusCode> {
@@ -425,7 +426,7 @@ A running push returns 409. A rejected token returns 409 with reason token_rejec
 )]
 pub async fn accept_remote(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<Json<RepositoryLinkResponse>> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
@@ -484,7 +485,7 @@ A paused or push link, a dataset that already holds the latest version, a refuse
 )]
 pub async fn pull_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;

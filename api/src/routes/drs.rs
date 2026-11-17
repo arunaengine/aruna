@@ -17,6 +17,7 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::bearer_token::token_grant;
 use aruna_operations::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content, resolve_version};
@@ -64,23 +65,18 @@ const MAX_OBJECT_IDS: usize = 100;
 const BULK_PROBE_CONCURRENCY: usize = 8;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "drs", description = "GA4GH DRS content access")),
-    components(
-        schemas(
-            DrsServiceResponse,
-            DrsAuthorizationsResponse,
-            DrsObjectResponse,
-            DrsChecksum,
-            DrsAccessMethod,
-            DrsAccessUrl,
-            DrsBulkBody,
-            DrsBulk,
-            DrsBulkItem,
-            DrsErrorPayload
-        )
-    )
-)]
+#[openapi(components(schemas(
+    DrsServiceResponse,
+    DrsAuthorizationsResponse,
+    DrsObjectResponse,
+    DrsChecksum,
+    DrsAccessMethod,
+    DrsAccessUrl,
+    DrsBulkBody,
+    DrsBulk,
+    DrsBulkItem,
+    DrsErrorPayload
+)))]
 pub struct DrsApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -951,7 +947,7 @@ async fn redeem(
 ) -> Result<AuthContext, Response> {
     let refused = || drs_error(StatusCode::FORBIDDEN, "download ticket refused");
     let signed = SignedTicket::decode(encoded).map_err(|_| refused())?;
-    let now = now_millis() / 1000;
+    let now = unix_timestamp_millis() / 1000;
     match redeem_ticket(&state.get_ctx(), &signed, object_id, now).await {
         Ok(auth) => Ok(auth),
         Err(RedeemError::Unavailable) => Err(DrsError::unavailable().into_response()),
@@ -975,7 +971,7 @@ async fn chosen_holder(
         .copied()
         .filter(|node_id| *node_id != local || resolved.location.is_some())
         .collect();
-    choose_holder(&state.get_ctx(), &candidates, now_millis())
+    choose_holder(&state.get_ctx(), &candidates, unix_timestamp_millis())
         .await
         .map(|chosen| chosen.node_id)
         .filter(|node_id| *node_id != local)
@@ -1034,7 +1030,7 @@ async fn holder_redirect(
         return DrsError::unavailable().into_response();
     };
     if let Some(input) = ticket {
-        let signed = issue_ticket(&state.get_ctx(), input, now_millis() / 1000);
+        let signed = issue_ticket(&state.get_ctx(), input, unix_timestamp_millis() / 1000);
         let Some(encoded) = signed.and_then(|signed| signed.encode().ok()) else {
             return DrsError::unavailable().into_response();
         };
@@ -1310,7 +1306,7 @@ async fn resolve_global(
         if Instant::now() >= deadline {
             break;
         }
-        let Some(holder) = choose_holder(&context, &remote, now_millis()).await else {
+        let Some(holder) = choose_holder(&context, &remote, unix_timestamp_millis()).await else {
             break;
         };
         remote.retain(|node_id| *node_id != holder.node_id);
@@ -1320,7 +1316,9 @@ async fn resolve_global(
             }
             ResolveOutcome::Denied => outcome = ResolveOutcome::Denied,
             // A holder that could not answer is skipped by the next choices for a while.
-            ResolveOutcome::Unavailable => avoid_holder(&context, holder.node_id, now_millis()),
+            ResolveOutcome::Unavailable => {
+                avoid_holder(&context, holder.node_id, unix_timestamp_millis())
+            }
             ResolveOutcome::NotFound => {}
         }
     }
@@ -1333,12 +1331,6 @@ struct ObjectRef<'a> {
     key: &'a str,
     version_id: Ulid,
     canonical_w3id: &'a str,
-}
-
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 /// Resolve a versioned ARN owned by another node in this realm. Only the owner

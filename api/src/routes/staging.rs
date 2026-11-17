@@ -2,19 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::RealmAuth;
 use crate::auth::{
     ValidatedBearer, blob_permission_path, ensure_permission, parse_connector_id, parse_group_id,
     require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::execution::jobs::{
-    decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
-};
+use crate::jobs::{decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor};
+use crate::lookup::bucket_info;
+use crate::lookup::{RestForward, relay_json, rest_target};
+use crate::routes::execution::jobs::map_submit_error;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::connectors::{
     ApiConnectorKind, CreateConnectorRequest, SourceConnectorResponse,
 };
-use crate::routes::storage::relay::{RestForward, relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
@@ -28,7 +29,7 @@ use aruna_core::structs::execution::table::{
     TableImport, TableSource, source_path as table_source_path,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
+use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_operations::auth::permission_rules::permission_rules;
 use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};
@@ -39,7 +40,6 @@ use aruna_operations::jobs::staging::read_staging_checkpoint;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
@@ -65,21 +65,12 @@ use std::path::{Component, Path as FsPath};
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((
-        name = "data/staging",
-        description = "Staging source objects into buckets, inline or as background jobs"
-    ))
-)]
-pub struct StagingApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StagingApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(stage_blob))
         .routes(routes!(stage_batch))
         .routes(routes!(list_staging_jobs, submit_staging))
@@ -358,7 +349,6 @@ connector's source path, both checked against the concrete path rather than a pr
             })
         ),
         (status = 400, description = "The group or connector id does not parse, or the source path is empty, absolute or contains a `.` or `..` segment", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, no WRITE on the target key or READ on the source path, or the snapshot would exceed the group's quota ceiling", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node or belongs to another group, the connector does not exist, or the source object is absent", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
@@ -369,15 +359,14 @@ connector's source path, both checked against the concrete path rather than a pr
 )]
 pub async fn stage_blob(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<StageRequest>,
 ) -> ServerResult<(StatusCode, Json<StageResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     // A member that does not coordinate the key's range relays the write with the bearer.
     if let StageRequest::Snapshot(target) | StageRequest::Reference(target) = &request {
-        let bucket_info = load_bucket_info(&state, &target.bucket).await?;
+        let bucket_info = bucket_info(&state, &target.bucket).await?;
         let forward = rest_target(&state, &bucket_info, &target.key, &headers).await?;
         if let Some(forward) = forward {
             let path = "/data/staging";
@@ -467,7 +456,6 @@ route, and sending `prefixes` additionally requires READ on the group's data pat
             })
         ),
         (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a prefix is not a confined relative path, or the batch would exceed 1000 objects", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or prefixes were given and the caller has no READ on the group's data path", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse)
     ),
@@ -774,7 +762,6 @@ Nothing is authorized later while the job runs.
             })
         ),
         (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path, prefix or checksum manifest name is not confined, a target key is blank, neither items nor prefixes nor a table were given, or the table descriptor is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on a source path or the table, or no WRITE on a target key or the table's destination bucket", body = ErrorResponse),
         (status = 404, description = "The bucket is unknown to this node or belongs to another group, a source path does not exist, or the connector is not registered on this node (code `connector_not_found`)", body = ErrorResponse),
         (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
@@ -784,12 +771,11 @@ Nothing is authorized later while the job runs.
 )]
 pub async fn submit_staging(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<StageBatchRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitStagingResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let relayed = StageBatchRequest {
         node_id: None,
         ..request.clone()
@@ -818,7 +804,7 @@ pub async fn submit_staging(
             "staging node must be the local node".to_string(),
         ));
     }
-    let bucket_info = load_bucket_info(&state, &request.bucket).await?;
+    let bucket_info = bucket_info(&state, &request.bucket).await?;
     if bucket_info.group_id != group_id {
         return Err(ServerError::NotFound);
     }
@@ -915,7 +901,7 @@ pub async fn submit_staging(
         ensure_prefix_permission(&state, &auth, group_id, mirror_id, prefix).await?;
     }
 
-    crate::routes::storage::relay::relayed_set(&bucket_info, &headers)?;
+    crate::lookup::relayed_set(&bucket_info, &headers)?;
     let source = local_connector(&state, group_id, connector_id).await?;
     // A distributed bucket imports by range: every coordinator runs a job for its own keys.
     let fan_out =
@@ -1026,16 +1012,14 @@ exactly the same restrictions.
                 "next_cursor": "AAABkWPGovsBAgMEBQYHCAkKCwwNDg8Q"
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_staging_jobs(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<StagingJobQuery>,
 ) -> ServerResult<(StatusCode, Json<StagingListResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let cursor = decode_job_cursor(query.cursor.as_deref())?;
     let limit = query
         .limit
@@ -1047,12 +1031,12 @@ pub async fn list_staging_jobs(
             matches!(record.payload, JobPayload::Staging(_)) && staging_job_visible(record, &auth)
         })
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let mut jobs = Vec::with_capacity(records.len());
     for record in records {
         let checkpoint = read_staging_checkpoint(&state.get_ctx(), record.job_id)
             .await
-            .map_err(ServerError::InternalError)?;
+            .map_err(|error| ServerError::InternalError(error.into()))?;
         jobs.push(staging_job_response(&record, checkpoint.as_ref())?);
     }
     Ok((
@@ -1124,11 +1108,10 @@ pub async fn list_staging_jobs(
 )]
 pub async fn get_staging_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     AxumPath(job_id): AxumPath<String>,
 ) -> ServerResult<(StatusCode, Json<StagingJobResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let job_id = aruna_core::structs::execution::job::JobId::from_str(&job_id)
         .map_err(|_| ServerError::BadRequest)?;
     // The owner is the sole 404 authority; a non-owner routes or reports 503.
@@ -1136,10 +1119,10 @@ pub async fn get_staging_job(
         &state.get_ctx(),
         auth.user_id,
         job_id,
-        crate::routes::execution::jobs::forwarded_job_auth(bearer)?,
+        crate::jobs::forwarded_job_auth(bearer)?,
     )
     .await
-    .map_err(crate::routes::execution::jobs::map_job_route)?
+    .map_err(crate::jobs::map_job_route)?
     .filter(|(record, _)| staging_job_visible(record, &auth))
     .ok_or(ServerError::NotFound)?;
     Ok((
@@ -1203,7 +1186,6 @@ outside a path restriction, are left out of the page.
             })
         ),
         (status = 400, description = "The cursor could not be decoded", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),
@@ -1211,11 +1193,10 @@ outside a path restriction, are left out of the page.
 )]
 pub async fn list_references(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<ReferenceListQuery>,
 ) -> ServerResult<(StatusCode, Json<ReferenceListResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
-    let bucket_info = load_bucket_info(&state, &query.bucket).await?;
+    let bucket_info = bucket_info(&state, &query.bucket).await?;
     let bucket_path = bucket_permission_path(
         state.get_realm_id(),
         bucket_info.group_id,
@@ -1226,7 +1207,7 @@ pub async fn list_references(
     // Denies and path restrictions below the bucket hide single keys from the page.
     let rules = permission_rules(&state.get_ctx(), &auth, &bucket_path)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
 
     let continuation_token = decode_reference_cursor(query.cursor.as_deref())?;
     let limit = query
@@ -1256,7 +1237,7 @@ pub async fn list_references(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
 
     let entries = result
         .objects
@@ -1487,7 +1468,7 @@ fn encode_reference_cursor(token: ListContinuationToken) -> ServerResult<String>
     token
         .to_bytes()
         .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
-        .map_err(|error| ServerError::InternalError(error.to_string()))
+        .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 fn normalize_prefix(prefix: &str) -> ServerResult<String> {
@@ -1539,7 +1520,7 @@ async fn snapshot_blob(
 ) -> ServerResult<(StatusCode, Json<StageResponse>)> {
     let group_id = parse_group_id(&request.group_id)?;
     let connector_id = parse_connector_id(&request.connector_id)?;
-    let bucket_info = load_bucket_info(&state, &request.bucket).await?;
+    let bucket_info = bucket_info(&state, &request.bucket).await?;
     if bucket_info.group_id != group_id {
         return Err(ServerError::NotFound);
     }
@@ -1609,7 +1590,7 @@ async fn reference_blob(
 ) -> ServerResult<(StatusCode, Json<StageResponse>)> {
     let group_id = parse_group_id(&request.group_id)?;
     let connector_id = parse_connector_id(&request.connector_id)?;
-    let bucket_info = load_bucket_info(&state, &request.bucket).await?;
+    let bucket_info = bucket_info(&state, &request.bucket).await?;
     if bucket_info.group_id != group_id {
         return Err(ServerError::NotFound);
     }
@@ -1690,7 +1671,7 @@ async fn local_connector(
                  the same connector_id"
             ),
         )),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -1728,7 +1709,7 @@ async fn coordinator_jobs(
 ) -> ServerResult<(bool, Vec<CoordinatorJobResponse>)> {
     let view = bound_view(state.get_ctx().as_ref(), binding)
         .await
-        .map_err(crate::routes::storage::distributed::map_guard_error)?;
+        .map_err(crate::lookup::map_guard_error)?;
     let snapshot = view.snapshot();
     // Refused before any relay, as the local job would be while a range moves away from here.
     let moving = (snapshot.lifecycle.transfers.iter()).any(|open| open.from == binding.member_id);
@@ -1787,7 +1768,7 @@ async fn resolve_quota_ceiling(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.into()))?;
     Ok(config.quota.effective_group_ceiling(&group_id))
 }
 
@@ -1811,26 +1792,13 @@ async fn check_table(
             ensure_source_permission(state, auth, group_id, connector_id, &path).await?;
         }
         TableSource::Object { bucket, key } => {
-            let info = load_bucket_info(state, bucket).await?;
+            let info = bucket_info(state, bucket).await?;
             let path = blob_permission_path(state, info.group_id, bucket, key);
             ensure_permission(state, auth, path, Permission::READ).await?;
         }
     }
     let target = blob_permission_path(state, group_id, bucket, "");
     ensure_permission(state, auth, target, Permission::WRITE).await
-}
-
-async fn load_bucket_info(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(bucket_info) => Ok(bucket_info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
-    }
 }
 
 async fn ensure_source_permission(
@@ -1916,12 +1884,10 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
         MaterializeSnapshotError::Write(PutObjectError::QuotaExceeded { .. }) => {
             ServerError::Forbidden
         }
-        MaterializeSnapshotError::Write(error) => ServerError::InternalError(error.to_string()),
-        MaterializeSnapshotError::Storage(error) => ServerError::InternalError(error.to_string()),
-        MaterializeSnapshotError::Conversion(error) => {
-            ServerError::InternalError(error.to_string())
-        }
-        MaterializeSnapshotError::Routing(error) => ServerError::InternalError(error.to_string()),
+        MaterializeSnapshotError::Write(error) => ServerError::InternalError(error.into()),
+        MaterializeSnapshotError::Storage(error) => ServerError::InternalError(error.into()),
+        MaterializeSnapshotError::Conversion(error) => ServerError::InternalError(error.into()),
+        MaterializeSnapshotError::Routing(error) => ServerError::InternalError(error.into()),
         // A node revalidating its inventory admits nothing governed; the client
         // learns only that this node is busy, never which rule applies.
         MaterializeSnapshotError::Gate(_) => ServerError::ServiceUnavailable,
@@ -1931,18 +1897,14 @@ fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
 fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
     match error {
         MaterializeReferenceError::Head(error) => map_head_error(error),
-        MaterializeReferenceError::Storage(error) => ServerError::InternalError(error.to_string()),
-        MaterializeReferenceError::Conversion(error) => {
-            ServerError::InternalError(error.to_string())
-        }
-        MaterializeReferenceError::Usage(error) => ServerError::InternalError(error.to_string()),
+        MaterializeReferenceError::Storage(error) => ServerError::InternalError(error.into()),
+        MaterializeReferenceError::Conversion(error) => ServerError::InternalError(error.into()),
+        MaterializeReferenceError::Usage(error) => ServerError::InternalError(error.into()),
         // A policy error names the ids it conflicts on, which a client must
         // never learn: the refusal is reported without them.
         MaterializeReferenceError::Policy(_) => ServerError::Forbidden,
         MaterializeReferenceError::Purge(_) => ServerError::ServiceUnavailable,
-        MaterializeReferenceError::Distribution(error) => {
-            crate::routes::storage::distributed::map_guard_error(error)
-        }
+        MaterializeReferenceError::Distribution(error) => crate::lookup::map_guard_error(error),
     }
 }
 
@@ -1950,7 +1912,7 @@ fn map_head_error(error: HeadSourceError) -> ServerError {
     match error {
         HeadSourceError::Resolve(error) => map_resolution_error(error),
         HeadSourceError::Staging(error) => map_source_error(error),
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 
@@ -1958,7 +1920,7 @@ fn map_read_error(error: ReadSourceError) -> ServerError {
     match error {
         ReadSourceError::Resolve(error) => map_resolution_error(error),
         ReadSourceError::Staging(error) => map_source_error(error),
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 
@@ -1967,7 +1929,7 @@ fn map_resolution_error(error: SourceResolutionError) -> ServerError {
         SourceResolutionError::NotFound => ServerError::NotFound,
         SourceResolutionError::InvalidSourcePath
         | SourceResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 
@@ -1982,7 +1944,7 @@ fn map_list_error(error: ListStagingError) -> ServerError {
     match error {
         ListStagingError::Resolve(error) => map_resolution_error(error),
         ListStagingError::Staging(error) => map_source_error(error),
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 

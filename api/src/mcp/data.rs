@@ -7,16 +7,16 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, explained, internal_error, request_auth,
     server_error, tool_extras,
 };
+use crate::lookup::ObjectOutput;
+use crate::lookup::{relay_json, rest_target};
 use crate::routes::storage::objects::object_page;
-use crate::routes::storage::relay::{relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
+use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
-use aruna_core::structs::storage::data::identity::content_id;
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
 use aruna_operations::realm::get_config::GetConfigOperation;
@@ -26,7 +26,6 @@ use aruna_operations::s3::object::get::{
     GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
 };
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_operations::s3::object::list::ListedObject;
 use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
@@ -98,24 +97,6 @@ pub struct ListObjectsInput {
     /// on the node that holds the bucket, found by its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, utoipa::ToSchema)]
-pub struct ObjectOutput {
-    pub key: String,
-    /// The current version, so a selection can pin exactly what was listed.
-    pub version_id: String,
-    pub size: Option<u64>,
-    pub etag: Option<String>,
-    pub last_modified: Option<String>,
-    pub content_type: Option<String>,
-    pub referenced: bool,
-    /// Content address `https://w3id.org/aruna/data/<blake3>` to use as a File entity `@id`.
-    /// Absent for a reference whose bytes were never read.
-    pub content_id: Option<String>,
-    /// A link's binding, kept to check its target before the entry is shown; never sent.
-    #[serde(skip)]
-    pub link: Option<aruna_core::structs::execution::staging::VersionSourceBinding>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -795,70 +776,6 @@ impl McpServer {
     }
 }
 
-/// One listed object as the listing tools and the REST object listing show it.
-pub(crate) fn object_output(object: &ListedObject) -> ObjectOutput {
-    let size = entry_size(object);
-    let etag = object
-        .location
-        .as_ref()
-        .and_then(|location| location.hashes.get(HASH_MD5))
-        .map(hex::encode)
-        .or_else(|| {
-            object
-                .source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.etag.clone())
-        });
-    let content_type = object
-        .source_metadata
-        .as_ref()
-        .and_then(|metadata| metadata.content_type.clone());
-    let content_id = object
-        .location
-        .as_ref()
-        .and_then(|location| location.hashes.get(HASH_BLAKE3))
-        .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
-        .map(content_id);
-    let last_modified =
-        entry_time(object).map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
-    ObjectOutput {
-        key: object.head.key.clone(),
-        version_id: object.version_id.to_string(),
-        size,
-        etag,
-        last_modified,
-        content_type,
-        referenced: object.referenced,
-        content_id,
-        link: object.link.clone(),
-    }
-}
-
-fn entry_size(object: &ListedObject) -> Option<u64> {
-    object
-        .location
-        .as_ref()
-        .map(|location| location.blob_size)
-        .or_else(|| {
-            object
-                .source_metadata
-                .as_ref()
-                .map(|metadata| metadata.content_length)
-        })
-}
-
-fn entry_time(object: &ListedObject) -> Option<std::time::SystemTime> {
-    object
-        .version_created_at
-        .or(object.last_refresh)
-        .or_else(|| {
-            object
-                .source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.last_modified)
-        })
-}
-
 pub(crate) fn filename_of(key: &str) -> String {
     key.rsplit('/')
         .find(|segment| !segment.is_empty())
@@ -1183,7 +1100,8 @@ pub(crate) async fn store_stream(
     (metadata, create_only): (HashMap<String, String>, bool),
 ) -> Result<PutObjectResult, crate::error::ServerError> {
     use crate::error::ServerError;
-    let internal = |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string());
+    let internal =
+        |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string().into());
     let realm = drive(
         GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
@@ -1419,23 +1337,21 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
         error @ PutObjectError::UsageRebuilding => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        PutObjectError::Distribution(error) => {
-            crate::routes::storage::distributed::map_guard_error(error)
-        }
+        PutObjectError::Distribution(error) => crate::lookup::map_guard_error(error),
         PutObjectError::InvalidOperationState => {
-            ServerError::InternalError("invalid object write state".to_string())
+            ServerError::InternalError("invalid object write state".to_string().into())
         }
         PutObjectError::NoTransactionFound => {
-            ServerError::InternalError("object write transaction is missing".to_string())
+            ServerError::InternalError("object write transaction is missing".to_string().into())
         }
         PutObjectError::MissingOutput => {
-            ServerError::InternalError("object write output is missing".to_string())
+            ServerError::InternalError("object write output is missing".to_string().into())
         }
         PutObjectError::MissingHash(hash) => {
-            ServerError::InternalError(format!("object hash is missing: {hash}"))
+            ServerError::InternalError(format!("object hash is missing: {hash}").into())
         }
         PutObjectError::InvalidPreassignedVersion => {
-            ServerError::InternalError("invalid object version".to_string())
+            ServerError::InternalError("invalid object version".to_string().into())
         }
         PutObjectError::ObjectExists => ServerError::Refused(
             http::StatusCode::CONFLICT,
@@ -1443,7 +1359,7 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
             "another file took this name during the upload; upload again".to_string(),
         ),
         PutObjectError::PutObjectFailed => {
-            ServerError::InternalError("object write failed".to_string())
+            ServerError::InternalError("object write failed".to_string().into())
         }
         error @ (PutObjectError::StorageError(_)
         | PutObjectError::WriteFailed(_)
@@ -1461,7 +1377,7 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
         | PutObjectError::ImportRemoved
         | PutObjectError::VersionExists
         | PutObjectError::HistoryDeleted
-        | PutObjectError::FenceTaken) => ServerError::InternalError(error.to_string()),
+        | PutObjectError::FenceTaken) => ServerError::InternalError(error.into()),
     }
 }
 

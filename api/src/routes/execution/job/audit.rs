@@ -18,23 +18,20 @@ use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::super::jobs::{JobOutputResponse, map_job_request, map_job_route, output_response};
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::jobs::JobOutputResponse;
 use crate::jobs::hex32;
+use crate::jobs::map_job_route;
+use crate::jobs::output_response;
 use crate::server::state::ServerState;
 
-/// The audit route joins the `jobs` tag the jobs module already declares.
-#[derive(OpenApi)]
-#[openapi()]
-pub struct JobAuditDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(JobAuditDoc::openapi()).routes(routes!(get_job_audit))
+    OpenApiRouter::new().routes(routes!(get_job_audit))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -308,7 +305,6 @@ surface never confirms that somebody else's job exists.
             })
         ),
         (status = 400, description = "Unknown `scope`, a cursor that is not a record key of this log, or a `limit` outside 1..=64", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "Unknown, unparseable or foreign job id, or a responder that never held the family; page the node that accepted the submission", body = ErrorResponse),
         (status = 503, description = "The log could not be reduced here; retryable, the caller may page again", body = ErrorResponse)
@@ -322,7 +318,7 @@ pub async fn get_job_audit(
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<JobAuditResponse>)> {
     let auth: AuthContext = require_unrestricted_auth(&state, auth)?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let (range, scope) = parse_range(query.scope.as_deref())?;
     let paging = parse_paging(&query)?;
     let context = state.get_ctx();

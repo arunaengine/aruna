@@ -791,8 +791,8 @@ fn keeps_encoded_keys() {
 mod global {
     use super::super::*;
     use crate::auth::ValidatedBearer;
+    use crate::lookup::bucket_info;
     use crate::mcp::data::{WriteObjectInput, store_text};
-    use crate::routes::storage::deletion::bucket_info;
     use crate::tests::distributed::{
         BUCKET, Node, PEER, distribute, mirror, node_id, node_state, peer_heartbeat, publish_api,
         unsigned_token,
@@ -1133,7 +1133,7 @@ mod global {
             session: None,
             object_id: id.clone(),
         };
-        let now = now_millis() / 1000;
+        let now = unix_timestamp_millis() / 1000;
         let ticket = issue_ticket(&node.state.get_ctx(), input, now).unwrap();
         let ticket = ticket.encode().unwrap();
         let first = download(&node, None, &id, Some(ticket.clone())).await;

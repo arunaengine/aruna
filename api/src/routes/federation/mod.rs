@@ -7,13 +7,15 @@ pub mod import;
 pub mod link;
 pub mod login;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::git::expected;
 use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::time::unix_timestamp_secs;
@@ -22,24 +24,20 @@ use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_federation::{
     SetFederationConfig, SetFederationError, SetFederationOperation,
 };
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use url::Url;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "system/realm", description = "Realm configuration, placement and quota")))]
-pub struct FederationApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(FederationApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_realm_federation, set_realm_federation))
         .routes(routes!(get_realm_descriptor))
 }
@@ -122,7 +120,7 @@ impl RealmFederation {
             accepted_realms: AcceptedRealmsSetting::from(&settings.accepted_realms),
             descriptor: Some(
                 serde_json::to_value(&settings.descriptor)
-                    .map_err(|error| ServerError::InternalError(error.to_string()))?,
+                    .map_err(|error| ServerError::InternalError(error.into()))?,
             ),
         })
     }
@@ -149,7 +147,7 @@ async fn read_config(state: &ServerState) -> ServerResult<RealmConfigDocument> {
     .await
     .map_err(|error| match error {
         GetConfigError::DocumentNotFound => config_missing(),
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     })
 }
 
@@ -159,9 +157,9 @@ fn settings_response(
 ) -> ServerResult<(HeaderMap, Json<RealmFederation>)> {
     let digest = settings
         .digest()
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let etag = HeaderValue::from_str(&format!("\"{digest}\""))
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok((
         HeaderMap::from_iter([(header::ETAG, etag)]),
         Json(RealmFederation::from_settings(settings)?),
@@ -228,7 +226,6 @@ fn expected_settings(headers: &HeaderMap) -> ServerResult<Option<String>> {
                     "signature": "<hex ed25519 signature>"
                 }
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "The realm has no federation settings; code `federation_unset`", body = crate::error::ErrorResponse),
         (status = 503, description = "This node holds no configuration document for its realm; code `realm_config_missing`", body = crate::error::ErrorResponse)
@@ -237,9 +234,8 @@ fn expected_settings(headers: &HeaderMap) -> ServerResult<Option<String>> {
 )]
 pub async fn get_realm_federation(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
 ) -> ServerResult<(HeaderMap, Json<RealmFederation>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let config = read_config(&state).await?;
     ensure_permission(
         &state,
@@ -339,7 +335,6 @@ management node serves the call and signs the descriptor; every other node relay
                 }
             })),
         (status = 400, description = "A malformed or non-HTTPS URL, an empty or too long name, a too long description, a malformed contact, an unknown or repeated login provider, a malformed realm id or too many accepted realms", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = crate::error::ErrorResponse),
         (status = 412, description = "The settings changed since they were read, or are already set up; code `settings_changed`", body = crate::error::ErrorResponse),
@@ -351,11 +346,10 @@ management node serves the call and signs the descriptor; every other node relay
 )]
 pub async fn set_realm_federation(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     headers: HeaderMap,
     Json(request): Json<RealmFederation>,
 ) -> ServerResult<(HeaderMap, Json<RealmFederation>)> {
-    let auth = require_realm_auth(&state, auth)?;
     read_config(&state).await?;
     ensure_permission(
         &state,
@@ -379,11 +373,7 @@ pub async fn set_realm_federation(
         ),
     };
     let config = SetFederationConfig {
-        actor: Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor: actor(&state, &auth),
         auth_context: Some(auth),
         node_capabilities: state.node_capabilities().clone(),
         name: request.name,
@@ -404,10 +394,9 @@ pub async fn set_realm_federation(
     let stored = drive(SetFederationOperation::new(config), &state.get_ctx())
         .await
         .map_err(map_federation_error)?;
-    let settings = stored
-        .federation
-        .as_ref()
-        .ok_or_else(|| ServerError::InternalError("federation settings missing".to_string()))?;
+    let settings = stored.federation.as_ref().ok_or_else(|| {
+        ServerError::InternalError("federation settings missing".to_string().into())
+    })?;
     settings_response(settings)
 }
 
@@ -426,12 +415,8 @@ fn map_federation_error(error: SetFederationError) -> ServerError {
         SetFederationError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm federation update conflict; retry".to_string())
         }
-        SetFederationError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        SetFederationError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -482,7 +467,7 @@ pub(crate) async fn descriptor_response(state: &ServerState) -> Response {
     {
         Ok(config) => config,
         Err(GetConfigError::DocumentNotFound) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return ServerError::InternalError(error.to_string()).into_response(),
+        Err(error) => return ServerError::InternalError(error.into()).into_response(),
     };
     let Some(settings) = config.federation else {
         return StatusCode::NOT_FOUND.into_response();

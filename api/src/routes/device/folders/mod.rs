@@ -5,21 +5,21 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::Deserialize;
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::OwnerAuth;
 use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::id::NodeId;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
     ActionKind, ActionOutcome, ActionScope, FolderMode, FolderState, RemoteBinding,
 };
@@ -38,7 +38,6 @@ use super::dto::{
     ActionRecordPage, ActionScopeName, EntryAction, FolderEntryPage, FolderEntryView,
     SyncedFolderList, SyncedFolderView, action_view, entry_view, folder_view,
 };
-use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -209,7 +208,7 @@ pub(super) fn map_folder_error(error: FolderError) -> ServerError {
         | FolderError::DeleteObject(_)
         | FolderError::DeleteBucket(_)
         | FolderError::ListUploads(_)
-        | FolderError::AbortUpload(_) => ServerError::InternalError(error.to_string()),
+        | FolderError::AbortUpload(_) => ServerError::InternalError(error.into()),
     }
 }
 
@@ -229,7 +228,7 @@ fn map_offer_error(error: OfferedDirectoryError) -> ServerError {
             | StagingSourceError::AccessDenied
             | StagingSourceError::CheckError(_)),
         ) => ServerError::BadRequestReason(format!("the directory is unusable: {source}")),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -243,7 +242,7 @@ fn map_action_error(error: ActionError) -> ServerError {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
         ActionError::Folder(folder) => map_folder_error(folder),
-        ActionError::Storage(error) => ServerError::InternalError(error.to_string()),
+        ActionError::Storage(error) => ServerError::InternalError(error.into()),
     }
 }
 
@@ -340,7 +339,6 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "Malformed ids, an unusable directory, a non-realm target, or a missing remote bucket", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not this device's owner, or the remote bucket refuses the owner", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 409, description = "The root overlaps a bound folder, also one still binding, or the bucket belongs to another group", body = ErrorResponse),
@@ -351,10 +349,9 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
 )]
 async fn bind_synced_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Json(request): Json<BindFolderRequest>,
 ) -> ServerResult<(StatusCode, Json<SyncedFolderView>)> {
-    let auth = require_owner(&state, auth).await?;
     let group_id = parse_group_id(&request.group_id)?;
     let folder_id = Ulid::generate();
     let node_id = NodeId::from_str(&request.remote_node_id).map_err(|_| {
@@ -434,18 +431,15 @@ for.
                 "last_reconcile_ms": 1775748191000_i64,
                 "created_at_ms": 1775748000000_i64
             }]})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn list_synced_folders(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
 ) -> ServerResult<Json<SyncedFolderList>> {
-    require_owner(&state, auth).await?;
     let bound = list_folders(&state.get_ctx())
         .await
         .map_err(map_folder_error)?;
@@ -498,19 +492,16 @@ for.
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn get_synced_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let folder = read_bound(&state.get_ctx(), folder_id)
         .await
@@ -563,7 +554,6 @@ for.
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "A download-only folder cannot propagate deletions", body = ErrorResponse),
@@ -573,11 +563,10 @@ for.
 )]
 async fn update_synced_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
     Json(request): Json<UpdateFolderRequest>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let folder = set_propagate_deletes(&state.get_ctx(), folder_id, request.propagate_deletes)
         .await
@@ -608,7 +597,6 @@ for. Nothing outside this device is decided here, so the owner binding is the wh
         (status = 200, description = "The folder is marked `deleting` and is removed in the background", body = UnboundFolder,
             example = json!({"folder_id": "01JFOLDER0123456789ABCDEFG"})),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet, or a concurrent change to the folder caused a storage conflict; retryable", body = ErrorResponse)
@@ -617,10 +605,9 @@ for. Nothing outside this device is decided here, so the owner binding is the wh
 )]
 async fn unbind_synced_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<UnboundFolder>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     unbind_folder(&state.get_ctx(), folder_id)
         .await
@@ -671,7 +658,6 @@ for.
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The folder is still being bound", body = ErrorResponse),
@@ -681,10 +667,9 @@ for.
 )]
 async fn pause_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let folder = set_folder_state(&state.get_ctx(), folder_id, FolderState::Paused)
         .await
@@ -730,7 +715,6 @@ for."#,
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "The folder id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The folder is still being bound", body = ErrorResponse),
@@ -740,10 +724,9 @@ for."#,
 )]
 async fn resume_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let folder = set_folder_state(&state.get_ctx(), folder_id, FolderState::Active)
         .await
@@ -796,7 +779,6 @@ for.
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "Malformed folder id, or the local directory is missing or unusable", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not this device's owner", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The folder is paused", body = ErrorResponse),
@@ -806,10 +788,9 @@ for.
 )]
 async fn sync_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let context = state.get_ctx();
     let folder = read_bound(&context, folder_id)
@@ -866,20 +847,17 @@ for.
                 "updated_at_ms": 1775748191000_i64
             }], "next_cursor": "AAAAAQ"})),
         (status = 400, description = "Malformed folder id or cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn list_folder_entries(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
     Query(query): Query<EntryQuery>,
 ) -> ServerResult<Json<FolderEntryPage>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let cursor = decode_cursor(query.cursor)?;
     let (entries, next) = list_entries(&state.get_ctx(), folder_id, query.state.as_deref(), cursor)
@@ -955,7 +933,6 @@ for.
                 "updated_at_ms": 1775748191000_i64
             })),
         (status = 400, description = "Malformed ids or hashes", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder or entry, or this node is not a user node", body = ErrorResponse),
         (status = 412, description = "The bytes changed since the owner saw them, or `expected` is missing for a replacement; the file is preserved and the attempt is audited", body = ErrorResponse),
@@ -965,11 +942,10 @@ for.
 )]
 async fn act_on_entry(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Path((folder_id, path)): Path<(String, String)>,
     Json(request): Json<EntryActionRequest>,
 ) -> ServerResult<Json<FolderEntryView>> {
-    let auth = require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let expected = request
         .expected
@@ -1078,7 +1054,6 @@ for.
                 "created_at_ms": 1775748000000_i64
             })),
         (status = 400, description = "Malformed folder id or an unsupported action", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The confirmation does not name this folder", body = ErrorResponse),
@@ -1088,11 +1063,10 @@ for.
 )]
 async fn act_on_folder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Path(folder_id): Path<String>,
     Json(request): Json<FolderActionRequest>,
 ) -> ServerResult<Json<SyncedFolderView>> {
-    let auth = require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     if request.action != EntryAction::ReplaceLocal || request.scope != ActionScopeName::AllPending {
         return Err(ServerError::BadRequestReason(
@@ -1153,20 +1127,17 @@ for.
                 "outcome": "applied"
             }], "next_cursor": "AAAAAQ"})),
         (status = 400, description = "Malformed folder id or cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such folder, or this node is not a user node", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn list_folder_actions(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(folder_id): Path<String>,
     Query(query): Query<ActionQuery>,
 ) -> ServerResult<Json<ActionRecordPage>> {
-    require_owner(&state, auth).await?;
     let folder_id = parse_folder_id(&folder_id)?;
     let cursor = decode_cursor(query.cursor)?;
     let (actions, next) = list_actions(&state.get_ctx(), folder_id, cursor)

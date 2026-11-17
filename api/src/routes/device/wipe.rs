@@ -4,23 +4,21 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::wipe::{
     INCOMPLETE_EXIT_CODE, WIPED_EXIT_CODE, WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation,
 };
 use aruna_operations::driver::drive;
-
-use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(wipe_device))
@@ -85,19 +83,16 @@ for.
                 "exit_code": 79
             })),
         (status = 400, description = "The confirmation does not name this node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn wipe_device(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Json(request): Json<WipeDeviceRequest>,
 ) -> ServerResult<(StatusCode, Json<WipeDeviceResponse>)> {
-    require_owner(&state, auth).await?;
     let wipe = state.device_wipe().ok_or(ServerError::NotFound)?.clone();
     let node_id = drive(
         WipeDeviceOperation::new(WipeDeviceConfig {
@@ -109,7 +104,7 @@ async fn wipe_device(
     .await
     .map_err(|error| match error {
         WipeDeviceError::ConfirmationMismatch => ServerError::BadRequestReason(error.to_string()),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     wipe.arm();
     // A backend this process cannot erase is known before the wipe runs, so the

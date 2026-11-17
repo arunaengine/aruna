@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::federation::export::{
     INTENT_HEADER, decode_header, grant_header, transfer_refused,
@@ -32,28 +32,24 @@ use aruna_operations::federation::transfer::{
 use aruna_operations::jobs::import::{
     CreateRoCrateConfig, CreateRoCrateOperation, load_rocrate_upload, write_rocrate_upload,
 };
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use chrono::Utc;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 const SECRET_LEN: usize = 32;
 const PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct ImportApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ImportApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_intent))
         .routes(routes!(create_import))
 }
@@ -127,7 +123,7 @@ fn admission_refused(error: TransferAdmitError) -> ServerError {
         TransferAdmitError::Config(_) => ServerError::ServiceUnavailableReason(message),
         TransferAdmitError::Sign(_)
         | TransferAdmitError::NotFinished
-        | TransferAdmitError::UnexpectedEvent => ServerError::InternalError(message),
+        | TransferAdmitError::UnexpectedEvent => ServerError::InternalError(message.into()),
     }
 }
 
@@ -205,7 +201,7 @@ pub(crate) async fn pushed_upload(
     rebind(state, &push.intent, &push.grant, &push.key, upload_id).await?;
     let record = load_rocrate_upload(&context, upload_id)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let owner_node_url = owner_node_url(state).await?;
     match record {
         Some(record) => upload_response(&record, owner_node_url).map(Some),
@@ -260,7 +256,7 @@ pub(crate) async fn bind_upload(
     let bound = bound.map_err(import_refused)?;
     load_rocrate_upload(&context, bound)
         .await
-        .map_err(ServerError::InternalError)?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)
 }
 
@@ -358,7 +354,6 @@ async fn pull_artifact(
         (status = 200, description = "The signed import intent", body = serde_json::Value,
             example = json!({ "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "descriptor_digest": "<hex>", "principal": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "destination": { "group_id": "01JGR0VP0123456789ABCDEFGH", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "01J1NTENT0123456789ABCDEFG" }, "signer": "Realm", "signature": "<hex>" })),
         (status = 400, description = "A malformed nonce, id, bucket, prefix or path", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "WRITE or a policy denied the import (code `import_denied`), or federation is not set up (code `federation_disabled`)", body = ErrorResponse),
         (status = 404, description = "The destination bucket does not exist", body = ErrorResponse)
     ),
@@ -366,10 +361,9 @@ async fn pull_artifact(
 )]
 pub async fn create_intent(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<ImportIntentRequest>,
 ) -> ServerResult<Json<Signed<ImportIntent>>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if !hex::decode(&request.nonce).is_ok_and(|bytes| bytes.len() == SECRET_LEN) {
         return Err(ServerError::BadRequestReason(
             "nonce must be a hex SHA-256 digest".into(),
@@ -444,7 +438,6 @@ binds the call to the portal that requested the intent.
         (status = 202, description = "The import job is recorded", body = SubmitImportResponse,
             example = json!({ "job_id": "01JJ0B0123456789ABCDEFGH1J", "created": true, "owner_node_url": "https://b.example.org/api/v1", "status_url": "https://b.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGH1J", "report_url": "https://b.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGH1J/report" })),
         (status = 400, description = "A malformed secret", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the intent's principal, the intent or grant was refused (code `transfer_rejected`), WRITE or a policy denied the import (code `import_denied`), or the source refused the pull (code `source_refused`)", body = ErrorResponse),
         (status = 409, description = "The import key is bound to a different plan, or to another transfer, owner or artifact (code `import_conflict`)", body = ErrorResponse),
         (status = 502, description = "The source realm could not be reached, failed or was busy (code `pull_unreachable`) or sent another artifact (code `artifact_mismatch`)", body = ErrorResponse)
@@ -453,10 +446,9 @@ binds the call to the portal that requested the intent.
 )]
 pub async fn create_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<FederatedImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (intent, grant) = (request.intent, request.grant);
     if auth.user_id != intent.payload.principal {
         return Err(ServerError::Forbidden);
@@ -500,7 +492,7 @@ pub async fn create_import(
         },
         idempotency_key: Some(key),
     };
-    submit_import(State(state), Extension(Some(auth)), Json(submit)).await
+    submit_import(State(state), UnrestrictedAuth(auth), Json(submit)).await
 }
 
 #[cfg(test)]

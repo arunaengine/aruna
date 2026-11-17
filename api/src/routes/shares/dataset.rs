@@ -30,7 +30,7 @@ use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -40,18 +40,14 @@ use super::visit::{
     sign_ticket, unavailable, visit_scope, visited_link,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::deletion::bucket_info;
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 
 /// How long resolving one global version or content hash of a dataset may take.
 const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct DatasetDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DatasetDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(read_dataset))
         .routes(routes!(list_part))
         .routes(routes!(dataset_ticket))
@@ -196,8 +192,8 @@ async fn local_parts(
     let (record, jsonld) = export_here(state, dataset_reader(link, state), document_id)
         .await
         .map_err(|_| unavailable())?;
-    let rocrate: serde_json::Value = serde_json::from_str(&jsonld)
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let rocrate: serde_json::Value =
+        serde_json::from_str(&jsonld).map_err(|error| ServerError::InternalError(error.into()))?;
     let (realm, node) = (state.get_realm_id(), state.get_node_id());
     let named = named_sets(&rocrate, &record.graph_iri, realm);
     let sets = member_sets(state, named).await;

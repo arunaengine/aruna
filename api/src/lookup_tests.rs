@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::object_key::ObjectKey;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::placement::{ObjectPlacementQuery, get_object_placement};
@@ -47,7 +48,7 @@ async fn placement_asks_holder() {
     let read = |key: &str, headers: HeaderMap| {
         get_object_placement(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             bearer(),
             headers,
             Path(BUCKET.to_string()),
@@ -81,7 +82,7 @@ async fn reads_ask_holder() {
     let (node, peer, _) = sharded(&answer.to_string()).await;
     let Json(locations) = blob_locations(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         bearer(),
         HeaderMap::new(),
         Query(BlobLocationsQuery {
@@ -171,7 +172,7 @@ async fn local_miss_relays() {
     publish_api(&node.state, node_id(PEER), &peer.url).await;
     let Json(view) = get_object_placement(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         bearer(),
         HeaderMap::new(),
         Path(BUCKET.to_string()),

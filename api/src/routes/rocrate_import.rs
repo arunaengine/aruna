@@ -23,7 +23,6 @@ use aruna_operations::jobs::import::{
 };
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
 use aruna_operations::metadata::create_document::mint_job_document;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::staging::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation,
@@ -40,13 +39,16 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::UnrestrictedAuth;
 use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::execution::jobs::{job_urls, map_submit_error};
+use crate::jobs::job_urls;
+use crate::lookup::bucket_info;
+use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
 
 const ZIP_MEDIA_TYPE: &str = "application/zip";
@@ -54,12 +56,8 @@ const ELN_MEDIA_TYPE: &str = "application/vnd.eln+zip";
 const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct RoCrateImportDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(RoCrateImportDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(upload_rocrate))
         .routes(routes!(submit_import))
 }
@@ -192,7 +190,6 @@ a path-restricted delegated token are both refused.
             })
         ),
         (status = 400, description = "Content-Type is neither application/zip nor application/vnd.eln+zip", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm or is a path-restricted delegated token", body = ErrorResponse),
         (status = 409, description = "A pushed export conflicts with the upload bound to its import (code `import_conflict`)", body = ErrorResponse),
         (status = 413, description = "The archive exceeds the node's direct-upload cap; the partial spool is discarded", body = ErrorResponse),
@@ -243,7 +240,7 @@ pub async fn upload_rocrate(
     };
     let expires_at_ms = aruna_core::time::unix_timestamp_millis()
         .checked_add(state.rocrate_limits().upload_retention_ms)
-        .ok_or_else(|| ServerError::InternalError("upload expiry overflow".to_string()))?;
+        .ok_or_else(|| ServerError::InternalError("upload expiry overflow".to_string().into()))?;
     let owner_node_url = timeout_at(deadline, owner_node_url(&state))
         .await
         .map_err(|_| {
@@ -286,7 +283,7 @@ pub(crate) fn upload_response(
     let timestamp = i64::try_from(record.expires_at_ms)
         .ok()
         .and_then(DateTime::<Utc>::from_timestamp_millis)
-        .ok_or_else(|| ServerError::InternalError("upload expiry is invalid".to_string()))?;
+        .ok_or_else(|| ServerError::InternalError("upload expiry is invalid".to_string().into()))?;
     Ok(UploadRoCrateResponse {
         upload_id: record.upload_id.to_string(),
         blake3: hex::encode(record.blake3),
@@ -355,7 +352,6 @@ taken: READ on the source, WRITE on the target bucket, and WRITE on the metadata
             })
         ),
         (status = 400, description = "Malformed ids, an empty or oversized bucket, prefix or metadata path, an unsafe path segment, an expired or oversized source, or a repository source whose kind cannot import (code not_supported) or does not accept the record id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, is a path-restricted delegated token, names another user's upload, or lacks READ on the source or WRITE on the target bucket or metadata path", body = ErrorResponse),
         (status = 404, description = "The upload, source object or version, connector source, repository connector, or target bucket does not exist", body = ErrorResponse),
         (status = 409, description = "Idempotency key bound to a different plan, an upload already claimed by another job, a reached active-job cap, or a standing compute quota refusal, which reports the exact scope, dimension and numbers in `quota`", body = ErrorResponse),
@@ -366,10 +362,9 @@ taken: READ on the source, WRITE on the target bucket, and WRITE on the metadata
 )]
 pub async fn submit_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<SubmitImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let mut source = parse_import_source(request.source)?;
     Box::pin(repository_source(&state, &auth, &source)).await?;
     if let ImportRoCrateSource::Repository {
@@ -619,7 +614,7 @@ async fn fast_source_check(
         ImportRoCrateSource::Upload { upload_id } => {
             let record = load_rocrate_upload(&state.get_ctx(), *upload_id)
                 .await
-                .map_err(ServerError::InternalError)?
+                .map_err(|error| ServerError::InternalError(error.into()))?
                 .ok_or(ServerError::NotFound)?;
             if record.owner != auth.user_id {
                 return Err(ServerError::Forbidden);
@@ -628,7 +623,7 @@ async fn fast_source_check(
                 let dedup_key = idempotency_key.map(|key| user_dedup_key(auth.user_id, key));
                 let claimed = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
                     .await
-                    .map_err(ServerError::InternalError)?;
+                    .map_err(|error| ServerError::InternalError(error.into()))?;
                 let same_identity = matches!(
                     (
                         claimed.as_ref().and_then(|job| job.dedup_key.as_ref()),
@@ -660,7 +655,7 @@ async fn fast_source_check(
             key,
             version,
         } => {
-            let bucket_info = load_bucket(state, bucket).await?;
+            let bucket_info = bucket_info(state, bucket).await?;
             ensure_permission(
                 state,
                 auth,
@@ -742,7 +737,7 @@ async fn fast_target_check(
     auth: &AuthContext,
     target: &ImportRoCrateTarget,
 ) -> ServerResult<()> {
-    let bucket_info = load_bucket(state, &target.bucket).await?;
+    let bucket_info = bucket_info(state, &target.bucket).await?;
     ensure_permission(
         state,
         auth,
@@ -777,22 +772,6 @@ async fn fast_metadata_check(
     )
     .await?;
     Ok(())
-}
-
-async fn load_bucket(
-    state: &ServerState,
-    bucket: &str,
-) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(info) => Ok(info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
-    }
 }
 
 pub(crate) fn upload_body_stream(
@@ -838,7 +817,7 @@ pub(crate) fn map_upload_error(error: CreateRoCrateError) -> ServerError {
         CreateRoCrateError::Blob(BlobError::HandleMissing) => {
             ServerError::ServiceUnavailableReason("blob storage is unavailable".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -880,7 +859,7 @@ fn map_head_error(error: HeadObjectError) -> ServerError {
         HeadObjectError::NoSuchKey
         | HeadObjectError::NoSuchVersion
         | HeadObjectError::DeleteMarker => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -893,7 +872,7 @@ fn map_source_error(error: HeadSourceError) -> ServerError {
             | SourceResolutionError::UnsupportedConnectorKind(_),
         ) => ServerError::BadRequest,
         HeadSourceError::Staging(_) => ServerError::BadGateway,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -917,7 +896,11 @@ pub(crate) async fn owner_node_url(state: &ServerState) -> ServerResult<String> 
         .rest
         .map(|rest| rest.api_base_url)
         .ok_or_else(|| {
-            ServerError::InternalError("REST interface public URL is unavailable".to_string())
+            ServerError::InternalError(
+                "REST interface public URL is unavailable"
+                    .to_string()
+                    .into(),
+            )
         })
 }
 

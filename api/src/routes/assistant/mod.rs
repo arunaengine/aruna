@@ -45,18 +45,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use ulid::Ulid;
 use url::{Host, Url};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 pub(super) const PROXY_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "system/assistant", description = "Assistant provider operations")))]
-pub struct AssistantApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    let router = OpenApiRouter::with_openapi(AssistantApiDoc::openapi())
+    let router = OpenApiRouter::new()
         .routes(routes!(list_providers, create_provider))
         .routes(routes!(patch_provider, delete_provider))
         .routes(routes!(get_models))
@@ -355,7 +351,7 @@ fn map_store_error(error: ProviderStoreError) -> ServerError {
         ProviderStoreError::Stale => {
             ServerError::Conflict("provider changed concurrently".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -412,7 +408,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
                     "status": "ready"
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse)
     ),
@@ -482,7 +477,6 @@ refused. The provider is registered for the calling user alone.
                 "status": "ready"
             })),
         (status = 400, description = "Unknown kind, missing or invalid base URL, or a refused custom header", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse)
     ),
@@ -582,7 +576,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
                 "status": "ready"
             })),
         (status = 400, description = "Invalid base URL or a refused custom header", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse)
@@ -614,7 +607,9 @@ pub async fn patch_provider(
     }
     let mut secret = provider
         .open_secret(state.credential_encryption_key())
-        .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
+        .map_err(|_| {
+            ServerError::InternalError("provider secret unavailable".to_string().into())
+        })?;
     if let Some(api_key) = request.api_key {
         secret.api_key = Some(Secret::new(api_key));
     }
@@ -622,12 +617,14 @@ pub async fn patch_provider(
         Some(headers) => headers_from_input(headers)?,
         None => provider
             .open_headers(state.credential_encryption_key())
-            .map_err(|_| ServerError::InternalError("provider headers unavailable".to_string()))?,
+            .map_err(|_| {
+                ServerError::InternalError("provider headers unavailable".to_string().into())
+            })?,
     };
     provider
         .encrypt_secret(state.credential_encryption_key(), &secret)
         .and_then(|_| provider.encrypt_headers(state.credential_encryption_key(), &headers))
-        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string()))?;
+        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     let provider = save_provider(&state, auth.user_id, expected, provider).await?;
     Ok((StatusCode::OK, Json(provider_summary(&provider))))
 }
@@ -649,7 +646,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
     responses(
         (status = 204, description = "Provider deleted"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse)
     ),
@@ -702,7 +698,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
                         "reasoning_efforts": ["low", "medium", "high"]}
                 ]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
@@ -754,7 +749,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     responses(
         (status = 200, description = "The verdict of the check, whether or not the provider answered", body = ProviderTestResponse,
             example = json!({"ok": true, "message": "Provider is ready"})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse)
     ),

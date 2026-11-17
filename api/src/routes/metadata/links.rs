@@ -17,11 +17,12 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 
+use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
+use crate::lookup::{node_read, query_path};
 use crate::metadata::{bearer_token_string, map_api_error};
-use crate::routes::storage::deletion::bucket_info;
-use crate::routes::storage::relay::{node_read, query_path};
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 25;
@@ -176,7 +177,6 @@ permission; unreadable matches only set `hidden_references_exist`.
     responses(
         (status = 200, description = "Readable documents that link the identifier", body = DataLinksResponse, example = json!(example())),
         (status = 400, description = "`id` names no Aruna data", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
         (status = 503, description = "No metadata node could answer", body = ErrorResponse)
     ),
@@ -184,11 +184,10 @@ permission; unreadable matches only set `hidden_references_exist`.
 )]
 pub async fn data_links(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<DataLinksParams>,
 ) -> ServerResult<Json<DataLinksResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let link = DataLink::parse(params.id.trim()).ok_or_else(|| {
         ServerError::BadRequestReason("id names no Aruna data identifier".to_string())
     })?;
@@ -231,7 +230,6 @@ pub async fn data_links(
     responses(
         (status = 200, description = "Readable documents that link the file, folder or bucket", body = DataLinksResponse, example = json!(example())),
         (status = 400, description = "Neither or both of `key` and `prefix`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file or bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "No metadata node could answer", body = ErrorResponse)
@@ -240,12 +238,11 @@ pub async fn data_links(
 )]
 pub async fn bucket_links(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     Query(params): Query<BucketLinksParams>,
 ) -> ServerResult<Json<DataLinksResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     let queries = match (params.key, params.prefix) {
@@ -382,7 +379,6 @@ caller's READ permission; unreadable ones only set `hidden_references_exist`.
             "hidden_references_exist": false,
             "more_datasets": "/api/v1/data/buckets/lab-raw-data/links?key=raw%2F2026%2Freef-07%2Freads_R1.fastq.gz&parts_only=true"
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "No metadata node could answer", body = ErrorResponse)
@@ -391,12 +387,11 @@ caller's READ permission; unreadable ones only set `hidden_references_exist`.
 )]
 pub async fn file_part_of(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     Query(params): Query<PartOfParams>,
 ) -> ServerResult<Json<PartOfResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     let path = object_permission_path(realm_id, info.group_id, node_id, &bucket, &params.key);

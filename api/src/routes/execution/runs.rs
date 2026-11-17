@@ -14,24 +14,21 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::relay::{node_directed, node_read};
+use crate::lookup::{node_directed, node_read};
 use crate::server::state::ServerState;
 
 /// How long a run read relayed to the node that ran it may take, body included.
 const RELAY_DEADLINE: Duration = Duration::from_secs(30);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct RunsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(RunsApiDoc::openapi()).routes(routes!(get_run))
+    OpenApiRouter::new().routes(routes!(get_run))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -77,7 +74,6 @@ restrictions; anyone else needs READ on the run crate with their own token.
             "run_crate_iri": "https://w3id.org/aruna/01K8W1C0000000000000000000",
             "run_crate_status": { "status": "written", "resource": "01K8W1C0000000000000000000" }
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "Unknown run, or not visible to the caller", body = ErrorResponse),
         (status = 409, description = "The read was directed at another node", body = ErrorResponse),
         (status = 503, description = "The node that ran the job did not answer", body = ErrorResponse)
@@ -86,12 +82,11 @@ restrictions; anyone else needs READ on the run crate with their own token.
 )]
 pub async fn get_run(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> ServerResult<Json<RunResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let deadline = tokio::time::Instant::now() + RELAY_DEADLINE;
     run_answer(&state, &auth, bearer, &headers, (&run_id, deadline)).await
 }

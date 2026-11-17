@@ -4,28 +4,25 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_operations::s3::object::origin::{OriginError, SourceHealth, source_health};
+use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::deletion::bucket_info;
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct SourceHealthDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SourceHealthDoc::openapi()).routes(routes!(get_source_health))
+    OpenApiRouter::new().routes(routes!(get_source_health))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -122,7 +119,6 @@ impl From<SourceHealth> for SourceHealthBody {
                 "stats": {"first_byte_ms": null, "bytes_per_sec": null, "error_rate": 0.0, "in_flight": 0, "failing": false}
             }]
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
         (status = 404, description = "Bucket or version not found on this node", body = ErrorResponse)
     ),
@@ -130,11 +126,10 @@ impl From<SourceHealth> for SourceHealthBody {
 )]
 pub async fn get_source_health(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Query(params): Query<SourceHealthParams>,
 ) -> ServerResult<Json<SourceHealthResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let path = object_permission_path(
         state.get_realm_id(),
@@ -154,7 +149,7 @@ pub async fn get_source_health(
     .await
     .map_err(|error| match error {
         OriginError::BucketMissing | OriginError::VersionMissing => ServerError::NotFound,
-        OriginError::Storage(reason) => ServerError::InternalError(reason),
+        OriginError::Storage(reason) => ServerError::InternalError(reason.into()),
     })?;
     Ok(Json(SourceHealthResponse {
         sources: sources.into_iter().map(Into::into).collect(),

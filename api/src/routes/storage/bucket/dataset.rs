@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, validate_identifiers};
@@ -25,26 +25,24 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::super::deletion::bucket_info;
 use super::super::routing::ensure_group_admin;
 use super::metadata::{
     BucketIdentifierBody, BucketMetadataBody, DatasetDescriptionBody, write_metadata,
 };
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
+use crate::lookup::bucket_info;
 use crate::metadata::{forwarded_auth_token, local_write_record, run_create_metadata};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct DatasetApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DatasetApiDoc::openapi()).routes(routes!(describe_bucket))
+    OpenApiRouter::new().routes(routes!(describe_bucket))
 }
 
 /// What the new dataset says about the bucket.
@@ -112,7 +110,6 @@ group's metadata path.
             "description": {"title": "Bakta database", "description": "Annotation database for Bakta", "version": "6.0", "license": "https://spdx.org/licenses/CC-BY-4.0.html", "identifiers": [{"name": "DOI", "value": "10.5281/zenodo.14916843", "url": "https://doi.org/10.5281/zenodo.14916843"}]}
         })),
         (status = 400, description = "An unknown field, an empty title or description, or an identifier without an http or https link; or the dataset was refused", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the owning group's admin or metadata path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "The bucket already links a dataset, or its metadata changed meanwhile", body = ErrorResponse),
@@ -122,12 +119,11 @@ group's metadata path.
 )]
 pub async fn describe_bucket(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     request: Result<Json<DescribeBucketRequest>, JsonRejection>,
 ) -> ServerResult<(StatusCode, Json<DescribeBucketResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     let identifiers = checked_identifiers(&request)?;
@@ -254,11 +250,7 @@ async fn remove_dataset(
 ) -> ServerResult<()> {
     let extras = PolicyRequestExtras::rest();
     let record = local_write_record(state, auth, dataset, extras).await?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
+    let actor = actor(state, auth);
     let token = forwarded_auth_token(bearer)?;
     let ctx = state.get_ctx();
     route_metadata_delete(&ctx, actor, record.as_ref(), dataset, token)

@@ -3,11 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 
+use crate::jobs::job_urls;
 use crate::metadata::{SubmitExportResponse, load_document_record, parse_document_id};
-use crate::routes::execution::jobs::{job_urls, map_submit_error};
+use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
 use aruna_core::federation::{RealmDescriptor, Signed};
 use aruna_core::structs::execution::job::{
@@ -22,25 +23,21 @@ use aruna_operations::federation::export::{
 };
 use aruna_operations::federation::import::header_value;
 use aruna_operations::jobs::service::{read_artifact_routed, read_owned_job, submit_export_job};
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct ExportApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ExportApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_export))
         .routes(routes!(create_grant, delete_grant))
         .routes(routes!(push_export))
@@ -76,7 +73,7 @@ pub(crate) const INTENT_HEADER: &str = "x-aruna-import-intent";
 const PUSH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) fn encode_header<T: Serialize>(value: &T) -> ServerResult<String> {
-    header_value(value).map_err(|e| ServerError::InternalError(e.to_string()))
+    header_value(value).map_err(|e| ServerError::InternalError(e.into()))
 }
 
 pub(crate) fn decode_header<T: DeserializeOwned>(
@@ -121,7 +118,7 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
         }
         GrantError::Transfer(error) => transfer_refused(error),
         GrantError::Storage(_) => ServerError::ServiceUnavailableReason(message),
-        GrantError::Sign(_) => ServerError::InternalError(message),
+        GrantError::Sign(_) => ServerError::InternalError(message.into()),
     }
 }
 
@@ -167,7 +164,6 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
                 "artifact_url": "https://a.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGHJK/artifacts/rocrate"
             })),
         (status = 400, description = "A malformed document id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The intent or descriptor was refused (code `transfer_rejected`), READ or a policy denied the export (code `export_denied`), or every copy of a selected file needs a bucket key the caller lacks (code `key_holder_required`)", body = ErrorResponse),
         (status = 404, description = "No such document on this node", body = ErrorResponse),
         (status = 409, description = "The caller's active RO-Crate job limit is reached", body = ErrorResponse),
@@ -177,10 +173,9 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
 )]
 pub async fn create_export(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<FederatedExportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitExportResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let local = state.get_realm_id();
     check_remote(
         &request.intent,
@@ -247,7 +242,7 @@ pub(crate) async fn owned_export(
     let job_id = crate::jobs::parse_job_id(job_id).map_err(|_| ServerError::NotFound)?;
     let record = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
         .await
-        .map_err(ServerError::InternalError)?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)?;
     let JobPayload::ExportRoCrate(spec) = record.payload else {
         return Err(ServerError::NotFound);
@@ -284,7 +279,6 @@ that owns the job.
     responses(
         (status = 200, description = "The signed export grant", body = serde_json::Value,
             example = json!({ "payload": { "source": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], "audience": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "intent_digest": "<hex>", "export_job_id": "<ulid>", "document_id": "<ulid>", "source_revision": "<ulid>", "dataset_digest": "<hex>", "selection_digest": "<hex>", "artifact_url": "https://a.example.org/api/v1/compute/jobs/<job id>/artifacts/rocrate", "artifact_blake3": "<hex>", "artifact_size": 2048, "issued_at": 1791000000, "expires_at": 1791086400 }, "signer": "Realm", "signature": "<hex>" })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The export is no longer allowed (code `export_denied`) or its grant expired (code `transfer_rejected`)", body = ErrorResponse),
         (status = 404, description = "No such export into another realm of the caller on this node", body = ErrorResponse),
         (status = 409, description = "The export has not succeeded or left out a selected file (code `export_unfinished`)", body = ErrorResponse),
@@ -294,10 +288,9 @@ that owns the job.
 )]
 pub async fn create_grant(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Json<Signed<ExportGrant>>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (job_id, spec) = owned_export(&state, &auth, &job_id).await?;
     let Some(selection) = spec.selection.as_ref() else {
         return Err(ServerError::NotFound);
@@ -307,7 +300,7 @@ pub async fn create_grant(
     let artifact_url = urls
         .artifact_url
         .parse()
-        .map_err(|_| ServerError::InternalError("artifact URL is invalid".to_string()))?;
+        .map_err(|_| ServerError::InternalError("artifact URL is invalid".to_string().into()))?;
     let request = GrantRequest {
         auth: &auth,
         job_id,
@@ -340,7 +333,6 @@ that owns the job.
     params(("job_id" = String, Path, description = "Export job id")),
     responses(
         (status = 204, description = "The grant is revoked"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "No grant for an export of the caller on this node", body = ErrorResponse),
         (status = 409, description = "The export has not succeeded (code `export_unfinished`)", body = ErrorResponse)
     ),
@@ -348,10 +340,9 @@ that owns the job.
 )]
 pub async fn delete_grant(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (job_id, _) = owned_export(&state, &auth, &job_id).await?;
     match revoke_grant(&state.get_ctx(), job_id).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
@@ -391,7 +382,6 @@ that owns the job.
     responses(
         (status = 200, description = "The destination's upload answer, unverified", body = serde_json::Value,
             example = json!({ "upload_id": "01JABCDEF0123456789ABCDEFG", "blake3": "<hex>", "size": 2048, "expires_at": "2026-04-10T14:23:11.123+00:00", "owner_node_url": "https://b.example.org/api/v1" })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The intent was refused (code `transfer_rejected`) or the export is no longer allowed (code `export_denied`)", body = ErrorResponse),
         (status = 404, description = "No grant for an export of the caller on this node", body = ErrorResponse),
         (status = 410, description = "The grant was revoked (code `grant_revoked`)", body = ErrorResponse),
@@ -401,11 +391,10 @@ that owns the job.
 )]
 pub async fn push_export(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Json(request): Json<PushExportRequest>,
 ) -> ServerResult<Json<serde_json::Value>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (job_id, _) = owned_export(&state, &auth, &job_id).await?;
     let (local, now) = (state.get_realm_id(), unix_timestamp_secs());
     let context = state.get_ctx();
@@ -436,7 +425,7 @@ pub async fn push_export(
     }
     let url = url
         .join("metadata/rocrate/uploads")
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let blob = context
         .blob_handle
         .as_ref()
@@ -475,6 +464,7 @@ mod tests {
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::transfer::MAX_TRANSFER_SECS;
+    use axum::Extension;
     use axum::http::HeaderValue;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;

@@ -22,20 +22,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags(
-        (name = "metadata/documents", description = "Metadata document lifecycle"),
-        (name = "metadata/query", description = "Metadata search and SPARQL"),
-        (name = "metadata/references", description = "Metadata reference resolution"),
-        (name = "metadata/rocrate", description = "RO-Crate document operations"),
-        (name = "metadata/repository", description = "Repository search, import, publication and requirement checks"),
-        (name = "metadata/repositories", description = "Invenio and OAI-PMH repository connectors"),
-        (name = "metadata/git", description = "Native ARC repositories and Git LFS transfers"),
-        (name = "metadata/versions", description = "Dataset versions, branches, tags and merges as plain JSON"),
-        (name = "metadata/validation", description = "Metadata profile validation")
-    ),
-    components(schemas(crate::metadata::MetadataRoCrateView))
-)]
+#[openapi(components(schemas(crate::metadata::MetadataRoCrateView)))]
 pub struct MetadataApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {

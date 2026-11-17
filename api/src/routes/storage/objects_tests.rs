@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::lookup::RELAY_SET_HEADER;
 use crate::mcp::data::{WriteObjectInput, store_text};
-use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
     replicate,

@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerResult};
 use crate::metadata::{
     ProfileCapabilitiesResponse, ProfilePreviewRequest, ProfilePreviewResponse,
@@ -185,7 +186,6 @@ metadata path, because the group's own Profiles resolve for it.
                 "restricted_files_complete": true
             })),
         (status = 400, description = "The body is not a parseable RO-Crate JSON-LD document", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or READ is denied on the named group's metadata", body = ErrorResponse),
         (status = 503, description = "The Profile or the evaluator is temporarily unavailable; retryable", body = ErrorResponse)
     ),
@@ -193,10 +193,9 @@ metadata path, because the group's own Profiles resolve for it.
 )]
 pub async fn preview_profile_validation(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<ProfilePreviewRequest>,
 ) -> ServerResult<(StatusCode, Json<ProfilePreviewResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = request
         .group_id
         .as_deref()
@@ -327,7 +326,6 @@ pub async fn get_validation_status(
                 "stale_reason": null
             })),
         (status = 400, description = "Document id or Profile tag is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller lacks READ on the document", body = ErrorResponse),
         (status = 404, description = "The document does not exist or is not readable", body = ErrorResponse),
         (status = 503, description = "The Profile, evaluator, Dataset revision or a holder is temporarily unavailable; retryable", body = ErrorResponse)
@@ -336,11 +334,10 @@ pub async fn get_validation_status(
 )]
 pub async fn revalidate_profile(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ProfileValidationResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let status = run_profile_validation_status(
         &state.get_ctx(),

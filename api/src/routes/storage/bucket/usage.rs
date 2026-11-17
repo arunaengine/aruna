@@ -20,23 +20,19 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
+use crate::lookup::{RestForward, relay_get};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
-use crate::routes::storage::deletion::bucket_info;
-use crate::routes::storage::relay::{RestForward, relay_get};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct BucketUsageDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BucketUsageDoc::openapi()).routes(routes!(get_bucket_usage))
+    OpenApiRouter::new().routes(routes!(get_bucket_usage))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -276,7 +272,7 @@ async fn merged_usage(
         counted.extend(found.map(|found| &found.range));
     }
     let counters = sum_held(counted.iter().copied())
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let usage = RangeUsage {
         counters,
         ranges: wanted,
@@ -387,7 +383,7 @@ pub(crate) async fn range_sizes(
     bearer: Option<&ValidatedBearer>,
     set_id: Ulid,
 ) -> ServerResult<Vec<RangeSize>> {
-    let internal = |error: String| ServerError::InternalError(error);
+    let internal = |error: String| ServerError::InternalError(error.into());
     let view = read_view(&state.get_ctx(), set_id).await;
     let Some(view) = view.map_err(|error| internal(error.to_string()))? else {
         return Ok(Vec::new());
@@ -395,7 +391,7 @@ pub(crate) async fn range_sizes(
     let snapshot = &view.head.snapshot;
     let bucket = snapshot.config.bucket.as_str();
     let local = held_ranges(&state.get_ctx(), bucket).await;
-    let local = local.map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let local = local.map_err(|error| ServerError::InternalError(error.into()))?;
     let (member, held) = match local {
         Some((binding, _, held)) if binding.set_id == snapshot.set_id() => {
             (Some(binding.member_id), held)
@@ -408,8 +404,8 @@ pub(crate) async fn range_sizes(
     let counted = (ranges.into_iter())
         .filter(|(_, counted)| counted.range.complete && counted.range.coordinated);
     for (range_id, counted) in counted {
-        let counters = sum_held([&counted.range])
-            .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        let counters =
+            sum_held([&counted.range]).map_err(|error| ServerError::InternalError(error.into()))?;
         sizes.push(RangeSize {
             range_id,
             bytes: count(counters.logical_bytes),
@@ -517,9 +513,9 @@ pub async fn get_bucket_usage(
             "held is only accepted from another member".into(),
         ));
     }
-    crate::routes::storage::relay::relayed_set(&info, &headers)?;
+    crate::lookup::relayed_set(&info, &headers)?;
     let ranges = held_ranges(&state.get_ctx(), &bucket).await;
-    match ranges.map_err(|error| ServerError::InternalError(error.to_string()))? {
+    match ranges.map_err(|error| ServerError::InternalError(error.into()))? {
         Some((_, _, ranges)) if held => {
             let usage = RangeUsage {
                 counters: RangeCounters::default(),
@@ -545,7 +541,7 @@ pub async fn get_bucket_usage(
             let counters = bucket_counters(&state, &bucket).await?;
             let complete = usage_complete(&state.get_ctx())
                 .await
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                .map_err(|error| ServerError::InternalError(error.into()))?;
             Ok(Json(BucketUsageResponse::new(bucket, counters, complete)))
         }
     }
@@ -571,11 +567,11 @@ async fn bucket_counters(state: &ServerState, bucket: &str) -> ServerResult<Buck
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         other => {
             let error = format!("could not read the bucket counter: {other:?}");
-            return Err(ServerError::InternalError(error));
+            return Err(ServerError::InternalError(error.into()));
         }
     };
     let counters = value.as_deref().map(BucketCounters::from_bytes).transpose();
-    let counters = counters.map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let counters = counters.map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(counters.unwrap_or_default())
 }
 

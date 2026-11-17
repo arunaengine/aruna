@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::openapi::ApiDoc;
 use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
@@ -26,7 +27,7 @@ async fn connector_crud_redacts() {
 
     let (_, Json(created)) = create_source_connector(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
         Json(CreateConnectorRequest {
             name: "refdata".to_string(),
@@ -51,7 +52,7 @@ async fn connector_crud_redacts() {
 
     let (_, Json(listed)) = list_source_connectors(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
     )
     .await
@@ -62,7 +63,7 @@ async fn connector_crud_redacts() {
 
     let (_, Json(fetched)) = get_source_connector(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path((test.group_id.to_string(), created.connector_id.clone())),
     )
     .await
@@ -72,7 +73,7 @@ async fn connector_crud_redacts() {
 
     let (_, Json(replaced)) = replace_source_connector(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path((test.group_id.to_string(), created.connector_id.clone())),
         Json(ReplaceConnectorRequest {
             name: "refdata-updated".to_string(),
@@ -93,7 +94,7 @@ async fn connector_crud_redacts() {
 
     let delete_status = delete_source_connector(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path((test.group_id.to_string(), created.connector_id.clone())),
     )
     .await
@@ -103,7 +104,7 @@ async fn connector_crud_redacts() {
 
     let get_result = get_source_connector(
         State(test.state.clone()),
-        Extension(Some(test.auth)),
+        RealmAuth(test.auth),
         Path((test.group_id.to_string(), created.connector_id)),
     )
     .await;
@@ -116,7 +117,7 @@ async fn connectors_require_permission() {
 
     let result = create_source_connector(
         State(test.state),
-        Extension(Some(test.other_auth)),
+        RealmAuth(test.other_auth),
         Path(test.group_id.to_string()),
         Json(CreateConnectorRequest {
             name: "forbidden".to_string(),
@@ -140,7 +141,7 @@ async fn check_requires_permission() {
 
     let result = check_source_connector(
         State(test.state),
-        Extension(Some(test.other_auth)),
+        RealmAuth(test.other_auth),
         Path(test.group_id.to_string()),
         Json(SourceConnectorRequest {
             name: "source".to_string(),
@@ -163,7 +164,7 @@ async fn check_returns_failure() {
 
     let Json(result) = check_source_connector(
         State(test.state),
-        Extension(Some(test.auth)),
+        RealmAuth(test.auth),
         Path(test.group_id.to_string()),
         Json(SourceConnectorRequest {
             name: "source".to_string(),
@@ -214,7 +215,7 @@ async fn stored_check_resolves() {
     let test = setup_state().await;
     let (_, Json(connector)) = create_source_connector(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
         Json(CreateConnectorRequest {
             name: "stored-source".to_string(),
@@ -235,7 +236,7 @@ async fn stored_check_resolves() {
 
     let Json(result) = check_stored_connector(
         State(test.state),
-        Extension(Some(test.auth)),
+        RealmAuth(test.auth),
         Path((test.group_id.to_string(), connector.connector_id)),
     )
     .await
@@ -269,7 +270,7 @@ async fn entries_reject_traversal() {
 
     let result = list_connector_entries(
         State(test.state),
-        Extension(Some(test.auth)),
+        UnrestrictedAuth(test.auth),
         Path((test.group_id.to_string(), Ulid::generate().to_string())),
         Query(ConnectorEntriesQuery {
             path: "../secret".to_string(),
@@ -288,7 +289,7 @@ async fn entries_require_permission() {
 
     let result = list_connector_entries(
         State(test.state),
-        Extension(Some(test.other_auth)),
+        UnrestrictedAuth(test.other_auth),
         Path((test.group_id.to_string(), Ulid::generate().to_string())),
         Query(ConnectorEntriesQuery {
             path: String::new(),

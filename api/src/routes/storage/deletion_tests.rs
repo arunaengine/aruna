@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
@@ -100,7 +101,7 @@ mod coverage {
         };
         let (_, Json(answer)) = deletion_preflight(
             State(node.state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
             Json(request),
         )

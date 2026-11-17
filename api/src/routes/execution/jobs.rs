@@ -9,26 +9,25 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::structs::execution::job::{
-    CompositionError, ExportReportRow, ImportReportRow, JobId, JobRecord, JobState, KeyWait,
-    SYSTEM_ENTRY_PREFIX,
+    CompositionError, ExportReportRow, ImportReportRow, JobId, SYSTEM_ENTRY_PREFIX,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::device::compute::LocalExecutionError;
 use aruna_operations::federation::export::admit_grant;
+use aruna_operations::jobs::REPORT_MAX_ROWS;
 use aruna_operations::jobs::command::{
     CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::{FamilyReport, family_report};
+use aruna_operations::jobs::lifecycle::family_report;
 use aruna_operations::jobs::service::{
-    ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
+    ArtifactLookup, JobKind, JobReportLookup, OwnedArtifact, RoutedCancelOutcome,
     cancel_job_routed, delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed,
     read_report_routed, resolve_job_owner,
 };
 use aruna_operations::jobs::store::RunDelete;
-use aruna_operations::jobs::{JobRouteError, REPORT_MAX_ROWS};
 use aruna_operations::node::node_info::read_info_documents;
 use aruna_operations::s3::object::get::ObjectRangeRequest;
 use axum::body::Body;
@@ -44,14 +43,19 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::jobs::{JobRequestError, admit_execution, hex32};
+use crate::jobs::{
+    JobListResponse, JobStatusResponse, SubmitJobResponse, admit_execution, bind_output_routes,
+    decode_cursor, encode_cursor, family_response, forwarded_job_auth, job_status_response,
+    job_urls, job_view_response, map_job_route, parse_state,
+};
 use crate::rate_limit::LocalKey;
 use crate::server::state::{RestInterfaceRuntime, ServerState};
 
@@ -59,14 +63,8 @@ const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;
 const DEFAULT_REPORT_LIMIT: usize = 200;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "compute/jobs", description = "Durable background jobs"))
-)]
-pub struct JobsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(JobsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_jobs, submit_job))
         .routes(routes!(get_job, delete_job))
         .routes(routes!(cancel_job))
@@ -408,180 +406,6 @@ impl From<ExecutionTarget> for CommandExecutionTarget {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SubmitJobResponse {
-    /// The alias this responder bound the request to. Stable for the caller.
-    pub job_id: String,
-    pub created: bool,
-    /// The replicated identity of the request itself, hex encoded. Two aliases
-    /// of one request always share it. Absent for a local run, which is never
-    /// replicated and belongs to no submission family.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub submission_id: Option<String>,
-    /// The alias the responder currently reduces as canonical. It may change
-    /// once a partitioned lower claim is learned; `job_id` never does.
-    pub canonical_job_id: String,
-    /// Family state at acceptance or the current reduced state for an idempotent replay.
-    /// This is a snapshot; poll `status_url` for the live state.
-    pub state: String,
-    /// Preferred route, not an owner: any node that reduced the family answers.
-    pub origin_node_url: String,
-    pub status_url: String,
-}
-
-/// One object exactly one execution wrote, named by its own VersionId.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobOutputResponse {
-    pub bucket: String,
-    pub key: String,
-    /// The exact version this execution created; the object's latest version
-    /// may be a later, unrelated write.
-    pub version_id: String,
-    pub execution_id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub container_path: String,
-    pub size: u64,
-    /// Type the key's extension implies, so a caller can tell a chart from a
-    /// log without a second call. `stat_object` reports the stored type.
-    #[serde(default)]
-    pub content_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub digest: Option<String>,
-    /// Node-local S3 endpoint owning this version, which may differ from the execution node.
-    /// Null when the responder does not know the endpoint; other output remains available.
-    pub endpoint_url: Option<String>,
-}
-
-/// One input the plan moves to the target, so a caller can show where the data
-/// comes from and what the move was expected to cost.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[schema(as = JobPlacementInputResponse)]
-pub struct JobInputResponse {
-    pub destination_key: String,
-    pub bytes: u64,
-    /// Null when the target already holds the compliant copy, so nothing moves.
-    pub source_node_id: Option<String>,
-    pub transfer_ms: u64,
-}
-
-/// One target a planning round looked at, in report order: the selected target
-/// first, then the alternatives by rank, then the rejected ones.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[schema(as = JobPlacementCandidateResponse)]
-pub struct JobCandidateResponse {
-    pub node_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub executor_kind: Option<String>,
-    /// `selected`, `ranked` or `rejected`.
-    pub verdict: String,
-    /// Place among the alternatives, counted from one. Absent for the selected
-    /// target and for a rejected one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rank: Option<u32>,
-    /// Why the target was rejected, in plain words. Absent otherwise.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-/// Uses this responder's stored plan, or otherwise the newest witnessed launch record.
-/// Only a local planning round supplies `alternatives`, `rejected`, and `omitted` counts.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobPlacementResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub executor_kind: Option<String>,
-    /// The node the execution was planned to run on.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_node_id: Option<String>,
-    /// The node that planned the launch.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scheduler_node_id: Option<String>,
-    pub estimated_transfer_bytes: u64,
-    pub estimated_transfer_ms: u64,
-    pub alternatives: u32,
-    pub rejected: u32,
-    /// Rejections the bound dropped, so truncation never reads as agreement.
-    pub omitted: u32,
-    pub stored_at_ms: u64,
-    pub inputs: Vec<JobInputResponse>,
-    /// Every target of the planning round. Filled only on the node that planned
-    /// the request; empty when the placement comes from a launch record.
-    pub candidates: Vec<JobCandidateResponse>,
-}
-
-/// One physical execution of the family, canonical or not.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobExecutionResponse {
-    pub execution_id: String,
-    pub executor_node_id: String,
-    pub state: String,
-    /// When the work itself started: the first running update, else the moment
-    /// the target accepted the launch.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at_ms: Option<u64>,
-    /// When this responder last saw an update of the execution.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_at_ms: Option<u64>,
-    /// The execution the family's outcome is taken from.
-    pub canonical: bool,
-}
-
-/// The replicated family behind one external job, as this responder reduces it.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobFamilyResponse {
-    pub submission_id: String,
-    pub request_digest: String,
-    pub canonical_job_id: String,
-    pub aliases: Vec<String>,
-    pub alias_count: u32,
-    /// Other request families of the same submission: idempotency conflicts a
-    /// partition may have accepted elsewhere. Counted from a bounded scan, so a
-    /// very large family may understate it.
-    pub conflict_count: u32,
-    pub logical_state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub canonical_execution_id: Option<String>,
-    pub executions: u32,
-    /// Every known execution of the family, next to the count above.
-    pub execution_list: Vec<JobExecutionResponse>,
-    pub duplicate_successes: u32,
-    pub outputs: Vec<JobOutputResponse>,
-    pub revision: u64,
-    pub projection_digest: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub responder_node_id: Option<String>,
-    /// The family holds more records than one projection may reduce.
-    pub partial: bool,
-    /// Responder-local diagnostic, outside the projection digest: every known
-    /// execution is terminal without success and no retry is armed here. It is
-    /// not evidence of a permanent failure.
-    pub locally_exhausted: bool,
-    pub cancel_requested: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub placement: Option<JobPlacementResponse>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobUrls {
-    pub owner_node_url: String,
-    pub status_url: String,
-    pub report_url: String,
-    pub artifact_url: String,
-}
-
-pub async fn job_urls(state: &ServerState, job_id: JobId) -> ServerResult<JobUrls> {
-    let interface = state.interface_state().await;
-    let rest = interface.rest.ok_or_else(|| {
-        ServerError::InternalError("REST interface public URL is unavailable".to_string())
-    })?;
-    let api_base_url = rest.api_base_url.trim_end_matches('/');
-    Ok(JobUrls {
-        owner_node_url: rest.api_base_url.clone(),
-        status_url: format!("{api_base_url}/compute/jobs/{job_id}"),
-        report_url: format!("{api_base_url}/compute/jobs/{job_id}/report"),
-        artifact_url: format!("{api_base_url}/compute/jobs/{job_id}/artifacts/rocrate"),
-    })
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ListJobsQuery {
     pub limit: Option<usize>,
@@ -623,264 +447,6 @@ struct ReportCursor {
     last_key: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobProgressResponse {
-    pub current: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total: Option<u64>,
-    pub unit: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobErrorResponse {
-    pub message: String,
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobStatusResponse {
-    pub job_id: String,
-    pub kind: String,
-    pub state: String,
-    pub attempts: u32,
-    pub cancel_requested: bool,
-    pub created_at: String,
-    pub updated_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<String>,
-    pub progress: JobProgressResponse,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<JobErrorResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_bucket: Option<String>,
-    pub workspace_mode: String,
-    /// This node spent its attempts without a job-specific verdict: no further
-    /// automatic attempt runs here and the outcome is not a proven failure.
-    #[serde(default)]
-    pub locally_exhausted: bool,
-    /// Present for a notebook session: the catalog runtime it runs, for example
-    /// `python-notebook`. Absent for every other job.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_runtime: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_crate: Option<serde_json::Value>,
-    /// Present only for a distributed external job, whose truth is the
-    /// replicated family rather than this node's own row.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub family: Option<JobFamilyResponse>,
-    /// Present while `awaiting_key`: the locked bucket keys the job waits for, as
-    /// `{node_id, bucket, group_id?}` objects.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub awaiting_keys: Vec<serde_json::Value>,
-    /// Api url of the node that owns an owner-routed job, as its submission named it.
-    /// Absent for a distributed execution job and when this node does not know the url.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_node_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobListResponse {
-    pub jobs: Vec<JobStatusResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
-}
-
-pub(crate) fn rfc3339(ms: u64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms as i64)
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_default()
-}
-
-pub(crate) fn job_status_response(record: &JobRecord) -> JobStatusResponse {
-    job_view_response(&JobStatusView::from(record))
-}
-
-pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
-    JobStatusResponse {
-        job_id: job.job_id.to_string(),
-        kind: job.kind.name().to_string(),
-        state: job.state.name().to_string(),
-        attempts: job.attempts,
-        cancel_requested: job.cancel_requested,
-        created_at: rfc3339(job.created_at_ms),
-        updated_at: rfc3339(job.updated_at_ms),
-        finished_at: job.finished_at_ms.map(rfc3339),
-        progress: JobProgressResponse {
-            current: job.progress.current,
-            total: job.progress.total,
-            unit: job.progress.unit.clone(),
-        },
-        error: job.last_error.as_ref().map(|error| JobErrorResponse {
-            message: error.message.clone(),
-            kind: error.kind.name().to_string(),
-        }),
-        result: job.result.clone(),
-        workspace_bucket: job.workspace_bucket.clone(),
-        workspace_mode: job.workspace_mode.name().to_string(),
-        locally_exhausted: job.locally_exhausted,
-        session_runtime: job.session_runtime.clone(),
-        run_crate: None,
-        family: None,
-        awaiting_keys: job
-            .awaiting_keys
-            .iter()
-            .map(KeyWait::to_public_json)
-            .collect(),
-        owner_node_url: None,
-    }
-}
-
-pub(crate) fn output_response(
-    output: &aruna_core::structs::execution::job::OutputObject,
-    endpoint_url: Option<&String>,
-) -> JobOutputResponse {
-    JobOutputResponse {
-        bucket: output.bucket.clone(),
-        version_id: output.version_id.to_string(),
-        execution_id: output.execution_id.to_string(),
-        container_path: output.container_path.clone(),
-        size: output.size,
-        content_type: aruna_core::structs::storage::blob::key_content_type(&output.key).to_string(),
-        key: output.key.clone(),
-        digest: output.digest.clone(),
-        endpoint_url: endpoint_url.cloned(),
-    }
-}
-
-/// Projects the reduced family. Node ids of the executions and of the placement
-/// are disclosed, because a caller needs them to tell one run from another.
-pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
-    // A missing endpoint only leaves that output unaddressable; the succeeded
-    // family stays readable on any responder.
-    let outputs = report
-        .outputs
-        .iter()
-        .map(|output| output_response(output, report.output_endpoints.get(&output.node_id)))
-        .collect::<Vec<_>>();
-    JobFamilyResponse {
-        submission_id: hex32(&report.submission_id.0),
-        request_digest: hex32(&report.request_digest),
-        canonical_job_id: report.canonical_job_id.to_string(),
-        aliases: report.aliases.iter().map(JobId::to_string).collect(),
-        alias_count: report.aliases.len() as u32,
-        conflict_count: report.conflicts,
-        logical_state: report.state.name().to_string(),
-        canonical_execution_id: report
-            .canonical_execution_id
-            .map(|execution| execution.to_string()),
-        executions: report.executions,
-        execution_list: report
-            .execution_list
-            .iter()
-            .map(|execution| JobExecutionResponse {
-                execution_id: execution.execution_id.to_string(),
-                executor_node_id: execution.executor_node_id.to_string(),
-                state: execution.state.name().to_string(),
-                started_at_ms: execution.started_at_ms,
-                observed_at_ms: execution.observed_at_ms,
-                canonical: report.canonical_execution_id == Some(execution.execution_id),
-            })
-            .collect(),
-        duplicate_successes: report.duplicate_successes,
-        outputs,
-        revision: report.revision,
-        projection_digest: hex32(&report.digest),
-        responder_node_id: report.responder.map(|node| node.to_string()),
-        partial: report.partial,
-        locally_exhausted: report.locally_exhausted,
-        cancel_requested: report.cancel_requested,
-        placement: report.plan.as_ref().map(|plan| JobPlacementResponse {
-            executor_kind: plan
-                .target
-                .as_ref()
-                .map(|target| target.executor_kind.clone()),
-            target_node_id: plan
-                .target
-                .as_ref()
-                .map(|target| target.node_id.to_string()),
-            scheduler_node_id: plan.scheduler_node_id.map(|node| node.to_string()),
-            estimated_transfer_bytes: plan.estimated_transfer_bytes,
-            estimated_transfer_ms: plan.estimated_transfer_ms,
-            alternatives: plan.alternatives,
-            rejected: plan.rejected,
-            omitted: plan.omitted,
-            stored_at_ms: plan.stored_at_ms,
-            inputs: plan
-                .inputs
-                .iter()
-                .map(|input| JobInputResponse {
-                    destination_key: input.destination_key.clone(),
-                    bytes: input.bytes,
-                    source_node_id: input.source_node_id.map(|node| node.to_string()),
-                    transfer_ms: input.transfer_ms,
-                })
-                .collect(),
-            candidates: plan
-                .candidates
-                .iter()
-                .map(|candidate| JobCandidateResponse {
-                    node_id: candidate.node_id.to_string(),
-                    executor_kind: candidate.executor_kind.clone(),
-                    verdict: candidate.verdict.name().to_string(),
-                    rank: candidate.rank,
-                    reason: candidate.reason.clone(),
-                })
-                .collect(),
-        }),
-    }
-}
-
-pub(crate) fn bind_output_routes(
-    result: &mut Option<serde_json::Value>,
-    outputs: &[JobOutputResponse],
-) -> Result<(), JobRouteError> {
-    let Some(serde_json::Value::Object(result)) = result else {
-        return Ok(());
-    };
-    let outputs = serde_json::to_value(outputs)
-        .map_err(|error| JobRouteError::Internal(error.to_string()))?;
-    result.insert("outputs".to_string(), outputs);
-    Ok(())
-}
-
-pub(crate) fn parse_state(value: &str) -> ServerResult<JobState> {
-    match value {
-        "queued" => Ok(JobState::Queued),
-        "claimed" => Ok(JobState::Claimed),
-        "preparing" => Ok(JobState::Preparing),
-        "ready" => Ok(JobState::Ready),
-        "running" => Ok(JobState::Running),
-        "cancelling" => Ok(JobState::Cancelling),
-        "indeterminate" => Ok(JobState::Indeterminate),
-        "succeeded" => Ok(JobState::Succeeded),
-        "failed" => Ok(JobState::Failed),
-        "cancelled" => Ok(JobState::Cancelled),
-        "awaiting_key" => Ok(JobState::AwaitingKey),
-        _ => Err(ServerError::BadRequest),
-    }
-}
-
-pub(crate) fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
-    match cursor {
-        Some(cursor) => {
-            let bytes = URL_SAFE_NO_PAD
-                .decode(cursor)
-                .map_err(|_| ServerError::BadRequest)?;
-            if bytes.len() != 24 {
-                return Err(ServerError::BadRequest);
-            }
-            Ok(Some(bytes))
-        }
-        None => Ok(None),
-    }
-}
-
-pub(crate) fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
-    cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
-}
-
 fn decode_report_cursor(cursor: Option<&str>) -> ServerResult<Option<ReportCursor>> {
     cursor
         .map(|cursor| {
@@ -905,28 +471,9 @@ fn encode_report_cursor(
                 last_key,
             })
             .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
-            .map_err(|error| ServerError::InternalError(error.to_string()))
+            .map_err(|error| ServerError::InternalError(error.into()))
         })
         .transpose()
-}
-
-pub(crate) fn forwarded_job_auth(
-    bearer: Option<ValidatedBearer>,
-) -> ServerResult<Option<aruna_operations::metadata::AuthToken>> {
-    aruna_operations::metadata::api::forwarded_bearer(bearer.as_ref().map(ValidatedBearer::as_str))
-        .map_err(crate::metadata::map_api_error)
-}
-
-pub(crate) fn map_job_route(error: JobRouteError) -> ServerError {
-    match error {
-        JobRouteError::Unauthorized => ServerError::Unauthorized,
-        JobRouteError::Forbidden => ServerError::Forbidden,
-        JobRouteError::NotFound => ServerError::NotFound,
-        JobRouteError::Unavailable(_) => {
-            ServerError::ServiceUnavailableReason("job_read_unavailable".to_string())
-        }
-        JobRouteError::Internal(error) => ServerError::InternalError(error),
-    }
 }
 
 pub(crate) fn map_submit_error(
@@ -967,28 +514,10 @@ pub(crate) fn map_submit_error(
                 UploadClaimError::WrongOwner => ServerError::Forbidden,
                 UploadClaimError::Expired => ServerError::BadRequestReason(error.to_string()),
                 UploadClaimError::AlreadyClaimed => ServerError::Conflict(error.to_string()),
-                other => ServerError::InternalError(other.to_string()),
+                other => ServerError::InternalError(other.into()),
             }
         }
-        other => ServerError::InternalError(other.to_string()),
-    }
-}
-
-/// The REST status and body of a transport-independent job refusal.
-pub(crate) fn map_job_request(error: JobRequestError) -> ServerError {
-    match error {
-        JobRequestError::BadRequest => ServerError::BadRequest,
-        JobRequestError::BadRequestMessage(message) => ServerError::BadRequestMessage(message),
-        JobRequestError::Unauthorized => ServerError::Unauthorized,
-        JobRequestError::Forbidden => ServerError::Forbidden,
-        JobRequestError::NotFound => ServerError::NotFound,
-        JobRequestError::Conflict(message) => ServerError::Conflict(message),
-        JobRequestError::JobPlanConflict(message) => ServerError::JobPlanConflict(message),
-        JobRequestError::ComputeQuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
-        JobRequestError::ServiceUnavailableReason(message) => {
-            ServerError::ServiceUnavailableReason(message)
-        }
-        JobRequestError::InternalError(message) => ServerError::InternalError(message),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1072,16 +601,14 @@ caller's own jobs.
             })
         ),
         (status = 400, description = "Cursor is not a valid continuation token, or `state` is not a known job state", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_jobs(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<ListJobsQuery>,
 ) -> ServerResult<(StatusCode, Json<JobListResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let limit = query
         .limit
@@ -1098,7 +625,7 @@ pub async fn list_jobs(
         move |record| state_filter.is_none_or(|state| record.state == state),
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
 
     let jobs = records.iter().map(job_status_response).collect();
     Ok((
@@ -1285,7 +812,6 @@ additionally need WRITE on that bucket, which must belong to the same group.
         ),
         (status = 400, description = "Malformed group id, empty image, out-of-range resources, an invalid or duplicated input, output or container path, an output without a `bucket` while `workspace.mode` is `none`, a workspace or output bucket that does not exist or belongs to another group, `target` `local` on a node that serves no device plane, or a local run naming an input this device cannot read", body = ErrorResponse),
         (status = 409, description = "The idempotency key is bound to a different plan, the composition conflicts on a staged key under `collision_policy` `reject`, the active RO-Crate job limit is reached, or this device's compute plane is paused, absent or already at its run ceiling, which is counted in the admitting transaction so two submissions cannot both pass it. A quota refusal carries the exact scope, dimension and numbers in `quota`; a demand view that understates the group is refused like an exceeded cap, with `observed` at the limit", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted, the caller lacks WRITE on the group, on the named existing workspace bucket or on a bucket an output writes into, or a local run was requested by someone other than this device's owner", body = ErrorResponse),
         (status = 503, description = "Retryable, and the caller may submit again with the same idempotency key: no family holder could admit the request, the demand view could not be read or kept moving under three reads, three admission transactions in a row lost to a concurrent submission of the same group, or the id clock is unhealthy. A device submission whose referenced inputs sit on no holder of its family answers the same 503 and retrying does not clear it; submit from a node that holds the inputs, or replicate them first", body = ErrorResponse)
     ),
@@ -1305,7 +831,7 @@ pub async fn submit_job(
         PolicyRequestExtras::rest(),
     )
     .await
-    .map_err(map_job_request)?;
+    .map_err(ServerError::from)?;
     // The transport owns the HTTP status; the application outcome is `created`.
     let status = if response.created {
         StatusCode::CREATED
@@ -1515,7 +1041,6 @@ the link's group, who may manage the link.
             })
         ),
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such job, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
         (status = 503, description = "The node owning this job could not be reached or is not yet known here; retryable, the caller may repeat the read", body = ErrorResponse)
@@ -1524,12 +1049,11 @@ the link's group, who may manage the link.
 )]
 pub async fn get_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     // A distributed external job is answered from the replicated family; every
     // other job keeps the owner-routed view.
     if let Some(report) = family_report(&state.get_ctx(), &auth, job_id).await {
@@ -1592,23 +1116,27 @@ fn decode_report_row(
     let row = match kind {
         JobKind::ImportRoCrate => {
             let row: ImportReportRow = postcard::from_bytes(value)
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                .map_err(|error| ServerError::InternalError(error.into()))?;
             let visible_key = entry_key
                 .strip_prefix(&[SYSTEM_ENTRY_PREFIX])
                 .unwrap_or(entry_key);
             if row.entry_key.as_bytes() != visible_key {
                 return Err(ServerError::InternalError(
-                    "stored import report entry key does not match its row".to_string(),
+                    "stored import report entry key does not match its row"
+                        .to_string()
+                        .into(),
                 ));
             }
             serde_json::to_value(row)
         }
         JobKind::ExportRoCrate => {
             let row: ExportReportRow = postcard::from_bytes(value)
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                .map_err(|error| ServerError::InternalError(error.into()))?;
             if row.entry_key.as_bytes() != entry_key {
                 return Err(ServerError::InternalError(
-                    "stored export report entry key does not match its row".to_string(),
+                    "stored export report entry key does not match its row"
+                        .to_string()
+                        .into(),
                 ));
             }
             serde_json::to_value(row)
@@ -1617,10 +1145,12 @@ fn decode_report_row(
             use aruna_core::structs::execution::job::{SessionReportDetail, SessionReportRow};
 
             let row: SessionReportRow = postcard::from_bytes(value)
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                .map_err(|error| ServerError::InternalError(error.into()))?;
             if row.entry_key.as_bytes() != entry_key {
                 return Err(ServerError::InternalError(
-                    "stored session report entry key does not match its row".to_string(),
+                    "stored session report entry key does not match its row"
+                        .to_string()
+                        .into(),
                 ));
             }
             let (code, message) = match &row.detail {
@@ -1646,7 +1176,7 @@ fn decode_report_row(
         }
         _ => return Err(ServerError::NotFound),
     };
-    row.map_err(|error| ServerError::InternalError(error.to_string()))
+    row.map_err(|error| ServerError::InternalError(error.into()))
 }
 
 #[utoipa::path(
@@ -1705,7 +1235,6 @@ answers 404.
             })
         ),
         (status = 400, description = "The cursor is not a decodable continuation token, or the bearer token cannot be forwarded to the owning node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (
             status = 404,
@@ -1728,13 +1257,12 @@ answers 404.
 )]
 pub async fn get_job_report(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(job_id): Path<String>,
     Query(query): Query<ReportQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let cursor = decode_report_cursor(query.cursor.as_deref())?;
     if cursor
         .as_ref()
@@ -1850,7 +1378,7 @@ fn artifact_headers(owned: &OwnedArtifact) -> ServerResult<HeaderMap> {
     headers.insert(
         ETAG,
         HeaderValue::from_str(&format!("\"{}\"", hex::encode(owned.blake3)))
-            .map_err(|error| ServerError::InternalError(error.to_string()))?,
+            .map_err(|error| ServerError::InternalError(error.into()))?,
     );
     let encoded = utf8_percent_encode(&owned.filename, NON_ALPHANUMERIC);
     let fallback = ascii_filename(&owned.filename);
@@ -1859,7 +1387,7 @@ fn artifact_headers(owned: &OwnedArtifact) -> ServerResult<HeaderMap> {
         HeaderValue::from_str(&format!(
             "attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
         ))
-        .map_err(|error| ServerError::InternalError(error.to_string()))?,
+        .map_err(|error| ServerError::InternalError(error.into()))?,
     );
     Ok(headers)
 }
@@ -1887,7 +1415,7 @@ async fn artifact_response(
     headers: HeaderMap,
     download: bool,
 ) -> ServerResult<Response> {
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let now_ms = aruna_core::time::unix_timestamp_millis();
     // A destination realm reads with an export grant, only here on the owner node.
     let grant = crate::routes::federation::export::grant_header(&headers)?;
@@ -1966,13 +1494,13 @@ async fn artifact_response(
     response_headers.insert(
         CONTENT_LENGTH,
         HeaderValue::from_str(&content_length.to_string())
-            .map_err(|error| ServerError::InternalError(error.to_string()))?,
+            .map_err(|error| ServerError::InternalError(error.into()))?,
     );
     if let Some(content_range) = content_range {
         response_headers.insert(
             CONTENT_RANGE,
             HeaderValue::from_str(&content_range)
-                .map_err(|error| ServerError::InternalError(error.to_string()))?,
+                .map_err(|error| ServerError::InternalError(error.into()))?,
         );
     }
     let body = if download && content_length > 0 {
@@ -2005,7 +1533,9 @@ async fn artifact_response(
             ArtifactLookup::Ready(current) if owned.same_content(&current) => {
                 read.ok_or_else(|| {
                     ServerError::InternalError(
-                        "artifact owner omitted the response body".to_string(),
+                        "artifact owner omitted the response body"
+                            .to_string()
+                            .into(),
                     )
                 })?
             }
@@ -2036,7 +1566,9 @@ async fn artifact_response(
         };
         if read.stream_size != content_length {
             return Err(ServerError::InternalError(
-                "artifact reader returned an unexpected range size".to_string(),
+                "artifact reader returned an unexpected range size"
+                    .to_string()
+                    .into(),
             ));
         }
         download::body(read.blob, permit)
@@ -2082,7 +1614,6 @@ kind that produces no crate.
         (status = 200, description = "The complete RO-Crate as an `application/zip` byte stream, with `Content-Length`, `ETag`, `Accept-Ranges: bytes` and an attachment `Content-Disposition`"),
         (status = 206, description = "The requested byte range of the crate as `application/zip`, with `Content-Range` and a `Content-Length` covering the range only"),
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No downloadable crate: unknown job, a foreign job, a kind that produces none, or an unfinished export, coded `artifact_pending` with the job's state", body = ErrorResponse),
         (status = 410, description = "The crate's retention window has passed and it has been deleted; a retry will not bring it back", body = ErrorResponse),
@@ -2133,7 +1664,6 @@ in header `x-aruna-export-grant` is accepted as for the download.
         (status = 200, description = "Headers for the complete `application/zip` crate: `Content-Length`, `ETag`, `Accept-Ranges: bytes` and an attachment `Content-Disposition`. No body is sent"),
         (status = 206, description = "Headers for the requested byte range, including `Content-Range` and a `Content-Length` covering the range only. No body is sent"),
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No crate to describe: unknown job, a foreign job, a kind that produces none, or an unfinished export, coded `artifact_pending` with the job's state", body = ErrorResponse),
         (status = 410, description = "The crate's retention window has passed and it has been deleted; a retry will not bring it back", body = ErrorResponse),
@@ -2185,7 +1715,6 @@ Self-scoped like the status read: only the submitter may delete, and anybody els
     responses(
         (status = 204, description = "The run was removed from this node's lists"),
         (status = 400, description = "The job id is malformed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "This node lists no such run of the caller; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
         (status = 409, description = "The job is still live, named by its state, or a run's container cleanup is still queued; cancel it or retry once it settled", body = ErrorResponse),
@@ -2195,14 +1724,13 @@ Self-scoped like the status read: only the submitter may delete, and anybody els
 )]
 pub async fn delete_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let outcome = delete_owned_run(&state.get_ctx(), &auth, job_id)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     match outcome {
         RunDelete::Deleted => Ok(StatusCode::NO_CONTENT),
         RunDelete::Unrecorded(error) => Err(ServerError::ServiceUnavailableReason(format!(
@@ -2289,7 +1817,6 @@ Self-scoped like the status read: only the submitter may cancel, and anybody els
             })
         ),
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such job, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
         (status = 503, description = "The node owning this job could not be reached, so no cancellation was recorded; retryable, the caller may repeat the request", body = ErrorResponse)
@@ -2298,12 +1825,11 @@ Self-scoped like the status read: only the submitter may cancel, and anybody els
 )]
 pub async fn cancel_job(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(job_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<JobStatusResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
 
     let outcome = cancel_job_routed(
         &state.get_ctx(),

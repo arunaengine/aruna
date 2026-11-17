@@ -2,16 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ensure_permission, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::access::groups::refuse_group_edit;
 use crate::server::state::ServerState;
-use aruna_core::errors::StorageError;
 use aruna_core::request_policy::{
     CompiledPolicySet, PolicyDecision, PolicyKind, PolicyRequest, PolicySession, PolicyTraceEntry,
     RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
 };
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::set_policies::{SetGroupConfig, SetGroupError, SetGroupOperation};
@@ -19,9 +20,9 @@ use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -32,15 +33,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "access/policies", description = "Deny-only CEL request policies")),
-    components(schemas(
-        PolicyTraceDoc,
-        PolicyKindDoc,
-        PolicyResultDoc,
-        ScopedTraceEntry
-    ))
-)]
+#[openapi(components(schemas(PolicyTraceDoc, PolicyKindDoc, PolicyResultDoc, ScopedTraceEntry)))]
 pub struct PoliciesApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -262,7 +255,7 @@ fn map_policy(policy: &RequestPolicy) -> PolicyBody {
 }
 
 fn set_hash_hex(policies: &[RequestPolicy]) -> String {
-    hex_encode(&policy_set_hash(policies))
+    hex::encode(policy_set_hash(policies))
 }
 
 /// Decodes a client-supplied `expected_hash` into the 32-byte digest the set
@@ -272,16 +265,6 @@ fn parse_expected_hash(hash: &str) -> ServerResult<[u8; 32]> {
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(ServerError::BadRequest)
-}
-
-fn hex_encode(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(64), |mut out, byte| {
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
 }
 
 fn policies_response(policies: &[RequestPolicy]) -> PoliciesResponse {
@@ -306,7 +289,7 @@ async fn realm_policies(
         Err(aruna_operations::realm::get_config::GetConfigError::DocumentNotFound) => {
             Ok(Vec::new())
         }
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -327,7 +310,7 @@ async fn group_policies(
             aruna_operations::groups::get_group::GetGroupError::GroupNotFound
             | aruna_operations::groups::get_group::GetGroupError::DocNotFound,
         ) => Ok(Vec::new()),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -404,16 +387,14 @@ async fn require_group_read(
                 "set_hash": "0ce7c556ff2991526058a20c2372cae9b6ea5276638be50197e42f74aa988e18"
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_realm_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let policies = realm_policies(&state, &auth).await?;
     Ok((StatusCode::OK, Json(policies_response(&policies))))
 }
@@ -477,7 +458,6 @@ node serves it, and every other node relays the call to one.
             })
         ),
         (status = 400, description = "Unknown policy kind, malformed policy or hash, or a set that breaks the size or compile limits", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not write the realm configuration", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "The stored set no longer matches `expected_hash` and nothing was written; re-read the set and retry", body = ErrorResponse),
@@ -488,10 +468,9 @@ node serves it, and every other node relays the call to one.
 )]
 pub async fn set_realm_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<SetPoliciesRequest>,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     // Request policies live at this boundary; the operation only checks roles.
     ensure_permission(
         &state,
@@ -515,11 +494,7 @@ pub async fn set_realm_policies(
 
     let document = drive(
         SetPoliciesOperation::new(SetPoliciesConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
+            actor: actor(&state, &auth),
             auth_context: auth.clone(),
             policies,
             expected_hash,
@@ -536,12 +511,8 @@ pub async fn set_realm_policies(
         SetPoliciesError::StaleHash => {
             ServerError::Conflict("stored realm policy set changed".to_string())
         }
-        SetPoliciesError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        SetPoliciesError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     })?;
     crate::routes::storage::abe::epoch_due(&state, &auth, None).await;
 
@@ -586,17 +557,15 @@ which the group's built-in `user` and `admin` roles both grant.
                 "set_hash": "0ce7c556ff2991526058a20c2372cae9b6ea5276638be50197e42f74aa988e18"
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not read this group's configuration", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_group_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let policies = group_policies(&state, &auth, group_id).await?;
     Ok((StatusCode::OK, Json(policies_response(&policies))))
@@ -661,7 +630,6 @@ pub async fn get_group_policies(
             })
         ),
         (status = 400, description = "Malformed group id, unknown policy kind, malformed hash, or a set that breaks the size or compile limits", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not write this group's configuration", body = ErrorResponse),
         (status = 404, description = "This node holds no authorization document for the group", body = ErrorResponse),
         (status = 409, description = "The stored set no longer matches `expected_hash` and nothing was written, or this node is a device where group changes are made through the realm", body = ErrorResponse),
@@ -671,11 +639,10 @@ pub async fn get_group_policies(
 )]
 pub async fn set_group_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<SetPoliciesRequest>,
 ) -> ServerResult<(StatusCode, Json<PoliciesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     refuse_group_edit(&state).await?;
     // Request policies live at this boundary; the operation only checks roles.
@@ -695,11 +662,7 @@ pub async fn set_group_policies(
 
     let document = drive(
         SetGroupOperation::new(SetGroupConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
+            actor: actor(&state, &auth),
             auth_context: auth.clone(),
             group_id,
             policies,
@@ -715,12 +678,8 @@ pub async fn set_group_policies(
         SetGroupError::StaleHash => {
             ServerError::Conflict("stored group policy set changed".to_string())
         }
-        SetGroupError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        SetGroupError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     })?;
     crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
 
@@ -773,17 +732,15 @@ additionally requires READ on that group's configuration path.
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not read the realm or group configuration", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn effective_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<EffectiveQuery>,
 ) -> ServerResult<(StatusCode, Json<EffectivePoliciesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let mut policies: Vec<ScopedPolicy> = realm_policies(&state, &auth)
         .await?
         .iter()
@@ -850,17 +807,15 @@ compiling caller-supplied expressions to policy authors.
                 "unknown_functions": []
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not read the realm configuration", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn validate_policy(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<ValidatePolicyRequest>,
 ) -> ServerResult<(StatusCode, Json<ValidatePolicyResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     // Validation compiles caller-supplied CEL; restrict it to policy authors.
     require_config_read(&state, &auth).await?;
     let _ = parse_kind(&request.kind)?;
@@ -943,17 +898,15 @@ as if it were read directly.
             })
         ),
         (status = 400, description = "Malformed group id, unknown scope or policy kind, or candidate policies that break the size or compile limits", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller may not read the realm configuration or administer the named group", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn dry_run_policy(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<DryRunRequest>,
 ) -> ServerResult<(StatusCode, Json<DryRunResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     // Dry runs compile caller-supplied CEL; restrict them to policy authors.
     match request.group_id.as_deref() {
         Some(group_id) => {

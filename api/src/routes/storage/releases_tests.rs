@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::identity::auth::AuthContext;
 use std::collections::HashMap;
 
 use aruna_core::effects::StorageEffect;
@@ -14,6 +15,7 @@ use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key}
 use aruna_operations::s3::object::origin::read_origin;
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::mcp::data::{WriteObjectInput, store_text};
 use crate::routes::storage::origin::{OriginParams, OriginResponse, get_origin};
 use crate::tests::distributed::{BUCKET, Node, node_state};
@@ -54,7 +56,7 @@ async fn publish(
 ) -> ServerResult<PublishReleaseResponse> {
     publish_release(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         HeaderMap::new(),
         Path(BUCKET.to_string()),
@@ -67,7 +69,7 @@ async fn publish(
 async fn list(node: &Node) -> ReleaseListResponse {
     let Json(listed) = list_releases(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         Path(BUCKET.to_string()),
     )
@@ -83,7 +85,7 @@ async fn origin(node: &Node, key: &str) -> OriginResponse {
     };
     let Json(answer) = get_origin(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         HeaderMap::new(),
         Path(BUCKET.to_string()),
@@ -253,7 +255,7 @@ async fn files(
 ) -> ServerResult<ReleaseFilesResponse> {
     list_release_files(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         HeaderMap::new(),
         Path((BUCKET.to_string(), version_id.to_string())),
@@ -450,7 +452,7 @@ async fn purge_keeps_pinned() {
 
     let submitted = submit_purge(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Json(SubmitPurgeRequest {
             scope: PurgeScopeRequest::File {
                 bucket: BUCKET.to_string(),

@@ -8,18 +8,17 @@ use std::sync::Arc;
 use aruna_core::errors::StorageError;
 use aruna_core::realm_vault::RealmVaultKey;
 use aruna_core::secrets::SecretRecord;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::secrets::SecretChange;
 use aruna_operations::secrets::realm::{RealmChange, RealmSecretError, RealmSecretOperation};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use ulid::Ulid;
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -28,15 +27,14 @@ use super::{
     SecretView, change_error, create_change, expected, page, parse_name, replace_change,
     rotate_change, view,
 };
-use crate::auth::{ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-pub struct RealmSecretsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(RealmSecretsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_realm_secrets, create_realm_secret))
         .routes(routes!(
             get_realm_secret,
@@ -46,8 +44,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(rotate_realm_secret))
 }
 
-async fn manager(state: &Arc<ServerState>, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
-    let auth = require_unrestricted_auth(state, auth)?;
+async fn manager(state: &Arc<ServerState>, auth: AuthContext) -> ServerResult<AuthContext> {
     let path = policy_admin_path(state.get_realm_id());
     ensure_permission(state, &auth, path, Permission::WRITE).await?;
     Ok(auth)
@@ -62,7 +59,7 @@ async fn records(state: &Arc<ServerState>) -> ServerResult<Vec<SecretRecord>> {
     .await
     .map_err(|error| match error {
         GetConfigError::DocumentNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     Ok(config.secrets)
 }
@@ -80,11 +77,7 @@ async fn change(
         return Err(ServerError::Forbidden);
     };
     let input = RealmChange {
-        actor: Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor: actor(state, auth),
         vault_key: RealmVaultKey::derive(realm_signing_key),
         change,
         now_ms: unix_timestamp_millis(),
@@ -103,7 +96,7 @@ fn realm_error(error: RealmSecretError) -> ServerError {
         RealmSecretError::Storage(StorageError::TransactionConflict) => ServerError::Conflict(
             "concurrent realm configuration update conflict; retry".to_string(),
         ),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -135,7 +128,6 @@ const SECRET_EXAMPLE: &str = r#"{"name": "catalog-key", "kind": "bearer", "descr
         (status = 200, description = "One page of realm secrets", body = SecretPage,
             example = json!({"secrets": [serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default()]})),
         (status = 400, description = "Invalid cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
@@ -143,7 +135,7 @@ const SECRET_EXAMPLE: &str = r#"{"name": "catalog-key", "kind": "bearer", "descr
 )]
 pub async fn list_realm_secrets(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<SecretListQuery>,
 ) -> ServerResult<Json<SecretPage>> {
     manager(&state, auth).await?;
@@ -170,7 +162,6 @@ pub async fn list_realm_secrets(
         (status = 200, description = "The secret", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No realm secret with this name", body = ErrorResponse)
     ),
@@ -178,7 +169,7 @@ pub async fn list_realm_secrets(
 )]
 pub async fn get_realm_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
 ) -> ServerResult<Json<SecretView>> {
     manager(&state, auth).await?;
@@ -219,7 +210,6 @@ pub async fn get_realm_secret(
         (status = 201, description = "The stored secret, without field values", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name, kind, fields, settings or use rules", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 409, description = "The name exists, or a concurrent realm configuration update; retry", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
@@ -229,12 +219,13 @@ pub async fn get_realm_secret(
 )]
 pub async fn create_realm_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<CreateSecretRequest>,
 ) -> ServerResult<(StatusCode, Json<SecretView>)> {
     let auth = manager(&state, auth).await?;
     let stored = change(&state, &auth, create_change(request)?).await?;
-    let info = stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string()))?;
+    let info =
+        stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string().into()))?;
     Ok((StatusCode::CREATED, Json(view(info))))
 }
 
@@ -257,7 +248,6 @@ pub async fn create_realm_secret(
         (status = 200, description = "The changed secret", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name, settings or use rules", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No realm secret with this name", body = ErrorResponse),
         (status = 409, description = "A concurrent realm configuration update; retry", body = ErrorResponse),
@@ -267,7 +257,7 @@ pub async fn create_realm_secret(
 )]
 pub async fn replace_realm_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
     Json(request): Json<ReplaceSecretRequest>,
@@ -304,7 +294,6 @@ pub async fn replace_realm_secret(
         (status = 200, description = "The rotated secret, without field values", body = SecretView,
             example = json!(serde_json::from_str::<serde_json::Value>(SECRET_EXAMPLE).unwrap_or_default())),
         (status = 400, description = "Invalid name or fields", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No realm secret with this name", body = ErrorResponse),
         (status = 409, description = "A concurrent realm configuration update; retry", body = ErrorResponse),
@@ -314,7 +303,7 @@ pub async fn replace_realm_secret(
 )]
 pub async fn rotate_realm_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
     Json(request): Json<RotateSecretRequest>,
@@ -346,7 +335,6 @@ pub async fn rotate_realm_secret(
     responses(
         (status = 204, description = "The secret is gone"),
         (status = 400, description = "Invalid name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or not a realm admin", body = ErrorResponse),
         (status = 404, description = "No realm secret with this name", body = ErrorResponse),
         (status = 409, description = "A concurrent realm configuration update; retry", body = ErrorResponse),
@@ -356,7 +344,7 @@ pub async fn rotate_realm_secret(
 )]
 pub async fn delete_realm_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> ServerResult<StatusCode> {

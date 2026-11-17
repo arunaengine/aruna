@@ -8,6 +8,7 @@ use super::visit::{
     create_ticket, download_file, list_files, open_share, upload_file,
 };
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::tests::members::{BUCKET, Members, members};
 use crate::tests::routes::test_state;
 use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -138,8 +139,10 @@ async fn visit(shared: &Shared, mode: ShareModeBody) -> (ShareDetails, String) {
         password: None,
     };
     let state = State(shared.state.clone());
-    let auth = Extension(Some(shared.owner.clone()));
-    let (_, Json(link)) = create_share(state, auth, Json(request)).await.unwrap();
+    let auth = shared.owner.clone();
+    let (_, Json(link)) = create_share(state, UnrestrictedAuth(auth), Json(request))
+        .await
+        .unwrap();
     let headers = share_headers(&link.token);
     let opened = open_share(
         State(shared.state.clone()),
@@ -373,9 +376,9 @@ async fn uploads_reach_coordinator() {
     assert_eq!(stored(&shared, 1, "y (1).txt").await.unwrap(), b"other");
     assert_eq!(stored(&shared, 1, "z.txt").await.unwrap(), b"again");
     let state = State(shared.state.clone());
-    let auth = Extension(Some(shared.owner.clone()));
+    let auth = shared.owner.clone();
     let query = Query(ShareLogQuery::default());
-    let Json(log) = share_log(state, auth, Path(link.share.id), query)
+    let Json(log) = share_log(state, UnrestrictedAuth(auth), Path(link.share.id), query)
         .await
         .unwrap();
     let sizes: Vec<_> = log.entries.iter().filter_map(|entry| entry.bytes).collect();
@@ -441,9 +444,9 @@ async fn remote_key_downloads() {
         "not_found"
     );
     let state = State(shared.state.clone());
-    let auth = Extension(Some(shared.owner.clone()));
+    let auth = shared.owner.clone();
     let query = Query(ShareLogQuery::default());
-    let Json(log) = share_log(state, auth, Path(link.share.id), query)
+    let Json(log) = share_log(state, UnrestrictedAuth(auth), Path(link.share.id), query)
         .await
         .unwrap();
     let download = log
@@ -469,8 +472,8 @@ async fn ended_link_refused() {
     let (link, opened) = visit(&shared, ShareModeBody::Read).await;
     let issued = ticket(&shared, &opened, "y.txt").await.unwrap();
     let state = State(shared.state.clone());
-    let auth = Extension(Some(shared.owner.clone()));
-    revoke_share(state, auth, Path(link.share.id))
+    let auth = shared.owner.clone();
+    revoke_share(state, UnrestrictedAuth(auth), Path(link.share.id))
         .await
         .unwrap();
     assert_eq!(
@@ -488,7 +491,7 @@ async fn ended_link_refused() {
         .await
         .unwrap()
         .unwrap();
-    stored.expires_at = Some(unix_now() - 1);
+    stored.expires_at = Some(unix_timestamp_secs() - 1);
     let Effect::Storage(write) = save_effect(&stored).unwrap() else {
         panic!("a link record is one storage write");
     };
@@ -564,8 +567,9 @@ async fn member_part(
         expires_at: None,
         password: None,
     };
-    let auth = Extension(Some(test.auth.clone()));
-    let (_, Json(link)) = create_share(State(state.clone()), auth, Json(request)).await?;
+    let auth = test.auth.clone();
+    let (_, Json(link)) =
+        create_share(State(state.clone()), UnrestrictedAuth(auth), Json(request)).await?;
     let open = Some(Json(OpenShareRequest::default()));
     let headers = share_headers(&link.token);
     let opened = open_share(State(state.clone()), peer(), headers, open).await;
@@ -685,8 +689,8 @@ async fn dataset_global_parts() {
         expires_at: None,
         password: None,
     };
-    let auth = Extension(Some(test.auth.clone()));
-    let (_, Json(link)) = create_share(State(state.clone()), auth, Json(request))
+    let auth = test.auth.clone();
+    let (_, Json(link)) = create_share(State(state.clone()), UnrestrictedAuth(auth), Json(request))
         .await
         .unwrap();
     let open = Some(Json(OpenShareRequest::default()));
@@ -748,8 +752,10 @@ async fn escaped_folder_listed() {
         password: None,
     };
     let state = State(shared.state.clone());
-    let auth = Extension(Some(shared.owner.clone()));
-    let (_, Json(link)) = create_share(state, auth, Json(request)).await.unwrap();
+    let auth = shared.owner.clone();
+    let (_, Json(link)) = create_share(state, UnrestrictedAuth(auth), Json(request))
+        .await
+        .unwrap();
     let open = Some(Json(OpenShareRequest::default()));
     let opened = open_share(
         State(shared.state.clone()),
@@ -821,8 +827,8 @@ async fn content_skips_unreadable() {
         expires_at: None,
         password: None,
     };
-    let auth = Extension(Some(test.auth.clone()));
-    let (_, Json(link)) = create_share(State(state.clone()), auth, Json(request))
+    let auth = test.auth.clone();
+    let (_, Json(link)) = create_share(State(state.clone()), UnrestrictedAuth(auth), Json(request))
         .await
         .unwrap();
     let open = Some(Json(OpenShareRequest::default()));

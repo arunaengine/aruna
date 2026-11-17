@@ -6,6 +6,7 @@ use super::{
     CreateImportRequest, UpdateImportRequest, create_import, delete_import, get_import,
     get_renames, list_group_imports, run_import, start_renames, update_import,
 };
+use crate::auth::RealmAuth;
 use crate::error::ServerError;
 use crate::tests::storage_routing::{TestState, setup_state};
 use aruna_core::effects::StorageEffect;
@@ -79,26 +80,53 @@ pub(crate) fn request(
 #[tokio::test]
 async fn requires_group_admin() {
     let test = setup_state().await;
-    let other = || Extension(Some(test.other_auth.clone()));
+    let other = || test.other_auth.clone();
     let group = test.group_id.to_string();
     let rule = (group.clone(), Ulid::generate().to_string());
 
-    let listed = list_group_imports(State(test.state.clone()), other(), Path(group.clone())).await;
+    let listed = list_group_imports(
+        State(test.state.clone()),
+        RealmAuth(other()),
+        Path(group.clone()),
+    )
+    .await;
     assert!(matches!(listed, Err(ServerError::Forbidden)));
     let body = Json(request(&test, Ulid::generate(), ""));
-    let created = create_import(State(test.state.clone()), other(), Path(group), body).await;
+    let created = create_import(
+        State(test.state.clone()),
+        RealmAuth(other()),
+        Path(group),
+        body,
+    )
+    .await;
     assert!(matches!(created, Err(ServerError::Forbidden)));
-    let read = get_import(State(test.state.clone()), other(), Path(rule.clone())).await;
+    let read = get_import(
+        State(test.state.clone()),
+        RealmAuth(other()),
+        Path(rule.clone()),
+    )
+    .await;
     assert!(matches!(read, Err(ServerError::Forbidden)));
     let body = Json(UpdateImportRequest {
         schedule: None,
         write_pattern: None,
     });
-    let updated = update_import(State(test.state.clone()), other(), Path(rule.clone()), body).await;
+    let updated = update_import(
+        State(test.state.clone()),
+        RealmAuth(other()),
+        Path(rule.clone()),
+        body,
+    )
+    .await;
     assert!(matches!(updated, Err(ServerError::Forbidden)));
-    let deleted = delete_import(State(test.state.clone()), other(), Path(rule.clone())).await;
+    let deleted = delete_import(
+        State(test.state.clone()),
+        RealmAuth(other()),
+        Path(rule.clone()),
+    )
+    .await;
     assert!(matches!(deleted, Err(ServerError::Forbidden)));
-    let run = run_import(State(test.state.clone()), other(), Path(rule)).await;
+    let run = run_import(State(test.state.clone()), RealmAuth(other()), Path(rule)).await;
     assert!(matches!(run, Err(ServerError::Forbidden)));
 }
 
@@ -106,34 +134,64 @@ async fn requires_group_admin() {
 async fn rejects_bad_input() {
     let test = setup_state().await;
     let backend_id = register_backend(&test).await;
-    let auth = || Extension(Some(test.auth.clone()));
+    let auth = || test.auth.clone();
     let group = || Path(test.group_id.to_string());
 
     let folder = Json(request(&test, backend_id, "raw"));
-    let result = create_import(State(test.state.clone()), auth(), group(), folder).await;
+    let result = create_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        group(),
+        folder,
+    )
+    .await;
     assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 
     let mut scheduled = request(&test, backend_id, "raw/");
     scheduled.schedule = Some("every night".to_string());
-    let result = create_import(State(test.state.clone()), auth(), group(), Json(scheduled)).await;
+    let result = create_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        group(),
+        Json(scheduled),
+    )
+    .await;
     assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 
     let mut pattern = request(&test, backend_id, "raw/");
     pattern.write_pattern = Some("{dir}{id}".to_string());
-    let result = create_import(State(test.state.clone()), auth(), group(), Json(pattern)).await;
+    let result = create_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        group(),
+        Json(pattern),
+    )
+    .await;
     assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 
     let mut reserved = request(&test, backend_id, "raw/");
     reserved.write_prefix = Some("_aruna_backend_probe/".to_string());
-    let result = create_import(State(test.state.clone()), auth(), group(), Json(reserved)).await;
+    let result = create_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        group(),
+        Json(reserved),
+    )
+    .await;
     assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 
     let unknown = Json(request(&test, Ulid::generate(), "raw/"));
-    let result = create_import(State(test.state.clone()), auth(), group(), unknown).await;
+    let result = create_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        group(),
+        unknown,
+    )
+    .await;
     assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 
     let missing = Path((test.group_id.to_string(), Ulid::generate().to_string()));
-    let result = get_import(State(test.state.clone()), auth(), missing).await;
+    let result = get_import(State(test.state.clone()), RealmAuth(auth()), missing).await;
     assert!(matches!(result, Err(ServerError::NotFound)));
 }
 
@@ -141,14 +199,18 @@ async fn rejects_bad_input() {
 async fn manages_rule() {
     let test = setup_state().await;
     let backend_id = register_backend(&test).await;
-    let auth = || Extension(Some(test.auth.clone()));
+    let auth = || test.auth.clone();
     let group = test.group_id.to_string();
 
     let body = Json(request(&test, backend_id, "raw/"));
-    let (status, Json(created)) =
-        create_import(State(test.state.clone()), auth(), Path(group.clone()), body)
-            .await
-            .unwrap();
+    let (status, Json(created)) = create_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        Path(group.clone()),
+        body,
+    )
+    .await
+    .unwrap();
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(created.next_run_at, None);
     assert!(created.last_run.is_none());
@@ -171,56 +233,76 @@ async fn manages_rule() {
             write_pattern: write_pattern.map(str::to_string),
         })
     };
-    let Json(updated) = update_import(State(test.state.clone()), auth(), rule(), body(None))
-        .await
-        .unwrap();
+    let Json(updated) = update_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        rule(),
+        body(None),
+    )
+    .await
+    .unwrap();
     assert_eq!(updated.schedule.as_deref(), Some("0 3 * * *"));
     assert!(updated.next_run_at.is_some());
     // The pattern changes in place, under the same rule id.
     let prefix = Some("{dir}{id}_{name}");
-    let Json(updated) = update_import(State(test.state.clone()), auth(), rule(), body(prefix))
-        .await
-        .unwrap();
+    let Json(updated) = update_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        rule(),
+        body(prefix),
+    )
+    .await
+    .unwrap();
     assert_eq!(updated.import_id, created.import_id);
     assert_eq!(updated.write_pattern, "{dir}{id}_{name}");
     let bad = update_import(
         State(test.state.clone()),
-        auth(),
+        RealmAuth(auth()),
         rule(),
         body(Some("{id}")),
     )
     .await;
     assert!(matches!(bad, Err(ServerError::BadRequestMessage(_))));
 
-    let (status, Json(run)) = run_import(State(test.state.clone()), auth(), rule())
+    let (status, Json(run)) = run_import(State(test.state.clone()), RealmAuth(auth()), rule())
         .await
         .unwrap();
     assert_eq!(status, StatusCode::ACCEPTED);
-    let again = run_import(State(test.state.clone()), auth(), rule()).await;
+    let again = run_import(State(test.state.clone()), RealmAuth(auth()), rule()).await;
     assert!(
         matches!(again, Err(ServerError::Conflict(_))),
         "the first run is still queued"
     );
     let suffix = Some("{dir}{name}~{id}");
-    let changed = update_import(State(test.state.clone()), auth(), rule(), body(suffix)).await;
+    let changed = update_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        rule(),
+        body(suffix),
+    )
+    .await;
     assert!(
         matches!(changed, Err(ServerError::Conflict(_))),
         "no pattern change while a run is queued"
     );
-    let Json(read) = get_import(State(test.state.clone()), auth(), rule())
+    let Json(read) = get_import(State(test.state.clone()), RealmAuth(auth()), rule())
         .await
         .unwrap();
     assert_eq!(read.last_run.map(|last| last.job_id), Some(run.job_id));
 
-    let listed = list_group_imports(State(test.state.clone()), auth(), Path(group.clone()))
-        .await
-        .unwrap();
+    let listed = list_group_imports(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        Path(group.clone()),
+    )
+    .await
+    .unwrap();
     assert_eq!(listed.imports.len(), 1);
-    let status = delete_import(State(test.state.clone()), auth(), rule())
+    let status = delete_import(State(test.state.clone()), RealmAuth(auth()), rule())
         .await
         .unwrap();
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let gone = get_import(State(test.state.clone()), auth(), rule()).await;
+    let gone = get_import(State(test.state.clone()), RealmAuth(auth()), rule()).await;
     assert!(matches!(gone, Err(ServerError::NotFound)));
 }
 
@@ -251,13 +333,17 @@ pub(crate) fn bearer(test: &TestState) -> Extension<Option<crate::auth::Validate
 async fn starts_renames() {
     let test = setup_state().await;
     let backend_id = register_backend(&test).await;
-    let auth = || Extension(Some(test.auth.clone()));
+    let auth = || test.auth.clone();
     let group = test.group_id.to_string();
     let body = Json(request(&test, backend_id, "raw/"));
-    let (_, Json(created)) =
-        create_import(State(test.state.clone()), auth(), Path(group.clone()), body)
-            .await
-            .unwrap();
+    let (_, Json(created)) = create_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        Path(group.clone()),
+        body,
+    )
+    .await
+    .unwrap();
     let rule = || Path((group.clone(), created.import_id.clone()));
     // A token limited to some paths could reach files outside them.
     let restricted = || {
@@ -267,14 +353,14 @@ async fn starts_renames() {
             permission: Permission::WRITE,
         };
         let auth = test.auth.clone();
-        Extension(Some(AuthContext {
+        AuthContext {
             path_restrictions: Some(vec![path]),
             ..auth
-        }))
+        }
     };
     let listed = get_renames(
         State(test.state.clone()),
-        restricted(),
+        RealmAuth(restricted()),
         rule(),
         Default::default(),
     )
@@ -282,7 +368,7 @@ async fn starts_renames() {
     assert!(matches!(listed, Err(ServerError::Forbidden)));
     let started = start_renames(
         State(test.state.clone()),
-        restricted(),
+        RealmAuth(restricted()),
         bearer(&test),
         rule(),
     )
@@ -291,7 +377,7 @@ async fn starts_renames() {
 
     let Json(found) = get_renames(
         State(test.state.clone()),
-        auth(),
+        RealmAuth(auth()),
         rule(),
         Default::default(),
     )
@@ -301,12 +387,22 @@ async fn starts_renames() {
     assert!(found.progress.is_none());
     // The rename is a move of the rule's folder, shown as the rule's progress.
     // Without a bearer token nothing could check its revocation later.
-    let unsigned = start_renames(State(test.state.clone()), auth(), Extension(None), rule()).await;
+    let unsigned = start_renames(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        Extension(None),
+        rule(),
+    )
+    .await;
     assert!(matches!(unsigned, Err(ServerError::Unauthorized)));
-    let (status, Json(started)) =
-        start_renames(State(test.state.clone()), auth(), bearer(&test), rule())
-            .await
-            .unwrap();
+    let (status, Json(started)) = start_renames(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        bearer(&test),
+        rule(),
+    )
+    .await
+    .unwrap();
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(started.prefix, "imported/");
     // The plan's count of files, none here, is stored for this move.
@@ -330,7 +426,7 @@ async fn starts_renames() {
     assert_eq!(RenameTotal::from_bytes(&row).unwrap(), planned);
     let Json(found) = get_renames(
         State(test.state.clone()),
-        auth(),
+        RealmAuth(auth()),
         rule(),
         Default::default(),
     )
@@ -342,7 +438,7 @@ async fn starts_renames() {
         schedule: None,
         write_pattern: Some("{dir}{id}_{name}".to_string()),
     });
-    let changed = update_import(State(test.state.clone()), auth(), rule(), body).await;
+    let changed = update_import(State(test.state.clone()), RealmAuth(auth()), rule(), body).await;
     assert!(matches!(changed, Err(ServerError::Conflict(_))));
 }
 
@@ -351,16 +447,21 @@ async fn routes_new_uploads() {
     let test = setup_state().await;
     let backend_id = register_backend(&test).await;
     let write_backend = register_backend(&test).await;
-    let auth = || Extension(Some(test.auth.clone()));
+    let auth = || test.auth.clone();
     let group = || Path(test.group_id.to_string());
 
     let mut body = request(&test, backend_id, "raw/");
     body.write_backend_id = Some(write_backend.to_string());
     body.write_prefix = Some("uploads/".to_string());
     body.write_pattern = Some("{dir}{name}".to_string());
-    let (_, Json(created)) = create_import(State(test.state.clone()), auth(), group(), Json(body))
-        .await
-        .unwrap();
+    let (_, Json(created)) = create_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        group(),
+        Json(body),
+    )
+    .await
+    .unwrap();
     assert_eq!(created.write_backend_id, Some(write_backend.to_string()));
     assert_eq!(created.write_prefix.as_deref(), Some("uploads/"));
     assert_eq!(created.write_pattern, "{dir}{name}");
@@ -378,15 +479,26 @@ async fn routes_new_uploads() {
     // A second rule may not read the folder the first one writes to.
     let mut other = request(&test, write_backend, "uploads/x/");
     other.key_prefix = "other/".to_string();
-    let result = create_import(State(test.state.clone()), auth(), group(), Json(other)).await;
+    let result = create_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        group(),
+        Json(other),
+    )
+    .await;
     assert!(matches!(result, Err(ServerError::Conflict(_))));
 
     // Defaults stay unset and the pattern keeps the name, adding the id only when it is taken.
     let mut plain = request(&test, backend_id, "elsewhere/");
     plain.key_prefix = "plain/".to_string();
-    let (_, Json(created)) = create_import(State(test.state.clone()), auth(), group(), Json(plain))
-        .await
-        .unwrap();
+    let (_, Json(created)) = create_import(
+        State(test.state.clone()),
+        RealmAuth(auth()),
+        group(),
+        Json(plain),
+    )
+    .await
+    .unwrap();
     assert_eq!(created.write_backend_id, None);
     assert_eq!(created.write_prefix, None);
     assert_eq!(created.write_pattern, "{dir}{name}");

@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ensure_permission, parse_group_id, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::admin_tokens::TOKEN_PAGE;
 use crate::routes::access::groups::{PaginationParams, ensure_group_admin, load_group};
@@ -23,25 +24,22 @@ use aruna_operations::groups::tokens::{GroupTokensError, TokenStatus};
 use aruna_operations::jobs::recent::RecentJobsOperation;
 use aruna_operations::node::usage_stats::RealmUsageScope;
 use aruna_operations::realm::get_config::GetConfigOperation;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::warn;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 /// Jobs that finished within this window count as recent.
 const RECENT_MS: u64 = 24 * 60 * 60 * 1000;
 
-#[derive(OpenApi)]
-pub struct GroupStatsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(GroupStatsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_group_statistics))
         .routes(routes!(list_group_statistics))
 }
@@ -200,7 +198,6 @@ async fn group_stats(
                 "active_tokens": 3
             })),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller does not administer the group", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
@@ -208,10 +205,9 @@ async fn group_stats(
 )]
 pub async fn get_group_statistics(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GroupStatsResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_group_admin(&state, &auth, group_id).await?;
     let allowed = drive(
@@ -219,7 +215,7 @@ pub async fn get_group_statistics(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     if !allowed {
         return Err(ServerError::Forbidden);
     }
@@ -300,24 +296,22 @@ async fn active_tokens(
                     "recent_jobs": 7
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller is not a realm groups administrator", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_group_statistics(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(page): Query<PaginationParams>,
 ) -> ServerResult<(StatusCode, Json<GroupStatsList>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     ensure_permission(&state, &auth, realm_groups_path(&auth), Permission::WRITE).await?;
     let limit = page.limit_or(100).clamp(1, 1_000) as usize;
     let offset = page.offset_or(0) as usize;
     let groups = ListGroupOperation::with_pagination(limit, offset);
     let groups = drive(groups, &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let context = stats_context(&state).await;
     let mut response = GroupStatsList { groups: Vec::new() };
     for group in groups {

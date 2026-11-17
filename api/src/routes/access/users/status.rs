@@ -2,19 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::UserId;
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::Actor;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::drive;
 use aruna_operations::users::account_status::{
     AccountStatusConfig, AccountStatusError, AccountStatusOperation,
 };
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -38,7 +38,7 @@ fn map_status_error(error: AccountStatusError) -> ServerError {
         AccountStatusError::Administrator => ServerError::Conflict(
             "a realm administrator cannot be deactivated; remove the role first".to_string(),
         ),
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -74,7 +74,6 @@ A service account never changes any account's status.
     responses(
         (status = 204, description = "The account has the requested status"),
         (status = 400, description = "The id is not a user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm, the caller is a service account, or the caller lacks the administration grant", body = ErrorResponse),
         (status = 404, description = "This node holds no account with that id", body = ErrorResponse),
         (status = 409, description = "The account holds the realm administrator role", body = ErrorResponse)
@@ -83,11 +82,10 @@ A service account never changes any account's status.
 )]
 async fn put_status(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
     Json(request): Json<AccountStatusRequest>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let target = UserId::from_string(&id).map_err(|_| ServerError::BadRequest)?;
     drive(
         AccountStatusOperation::new(AccountStatusConfig {

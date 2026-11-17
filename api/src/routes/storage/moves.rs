@@ -4,33 +4,28 @@
 
 use super::compression::MigrationProgress;
 use super::routing::ensure_group_admin;
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::format::CompressionMigration;
 use aruna_operations::blob::migration::misplaced::count_misplaced;
 use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::s3::bucket::compression::MigrationStatusOperation;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::storage_move::{StartMoveError, StartMoveOperation};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct StorageMoveDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageMoveDoc::openapi())
-        .routes(routes!(get_bucket_move, start_bucket_move))
+    OpenApiRouter::new().routes(routes!(get_bucket_move, start_bucket_move))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, IntoParams)]
@@ -68,18 +63,6 @@ pub struct BucketMoveStarted {
     /// The keys the move handles.
     pub prefix: String,
     pub progress: MigrationProgress,
-}
-
-async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::Ulid> {
-    let info = drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await;
-    info.map(|info| info.group_id).map_err(|error| match error {
-        GetBucketError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
-    })
 }
 
 #[utoipa::path(
@@ -128,7 +111,6 @@ async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::U
                 }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
@@ -136,23 +118,22 @@ async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::U
 )]
 pub async fn get_bucket_move(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Query(query): Query<BucketMoveQuery>,
 ) -> ServerResult<Json<BucketMoveResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     let path = bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), &bucket);
     crate::auth::ensure_permission(&state, &auth, path, Permission::READ).await?;
     let counted = count_misplaced(&state.get_ctx(), &bucket, &query.prefix, None)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let status = drive(
         MigrationStatusOperation::new(bucket.clone()),
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let last = status.filter(|record| record.moving);
     Ok(Json(BucketMoveResponse {
         bucket,
@@ -217,7 +198,6 @@ pub async fn get_bucket_move(
                 }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse),
         (status = 409, description = "`bucket_encrypted`: the bucket is encrypted or changes its encryption; `move_running`: a move with another prefix is unfinished", body = ErrorResponse)
@@ -226,15 +206,14 @@ pub async fn get_bucket_move(
 )]
 pub async fn start_bucket_move(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     request: Option<Json<BucketMoveRequest>>,
 ) -> ServerResult<(StatusCode, Json<BucketMoveStarted>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let prefix = request
         .map(|Json(request)| request.prefix)
         .unwrap_or_default();
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms());
     let record: CompressionMigration = drive(operation, &state.get_ctx())
@@ -277,7 +256,7 @@ pub(crate) fn move_refusal(error: StartMoveError) -> ServerError {
             "bucket_encrypted",
             "an encrypted bucket keeps its stored files where they are".to_string(),
         ),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

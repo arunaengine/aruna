@@ -3,23 +3,23 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::routing::ensure_group_admin;
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::broken::{BrokenReason, StorageCheck};
 use aruna_operations::blob::migration::check::{clean_broken, is_current, list_broken, read_check};
 use aruna_operations::driver::{drive, now_ms};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::storage_check::{StartCheckError, StartCheckOperation};
 use aruna_operations::s3::object::delete::DeleteObjectInput;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -28,12 +28,8 @@ const PAGE_MAX: usize = 1000;
 /// Recorded rows one request reads at most, hidden ones included.
 const SCAN_MAX: usize = 10_000;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct StorageCheckDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageCheckDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_bucket_check, start_bucket_check))
         .routes(routes!(clean_bucket_check))
 }
@@ -145,18 +141,6 @@ fn parse_after(after: Option<&str>) -> ServerResult<Option<aruna_core::types::Ke
     }
 }
 
-async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::Ulid> {
-    let info = drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await;
-    info.map(|info| info.group_id).map_err(|error| match error {
-        GetBucketError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
-    })
-}
-
 async fn ensure_bucket(
     state: &ServerState,
     auth: &AuthContext,
@@ -218,7 +202,6 @@ async fn ensure_bucket(
             })
         ),
         (status = 400, description = "Invalid `after` or `limit`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "10000 recorded files were read without one this caller may see", body = ErrorResponse)
@@ -227,11 +210,10 @@ async fn ensure_bucket(
 )]
 pub async fn get_bucket_check(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Query(query): Query<BucketCheckQuery>,
 ) -> ServerResult<Json<BucketCheckResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let limit = query.limit.unwrap_or(100);
     if !(1..=PAGE_MAX).contains(&limit) {
         return Err(ServerError::BadRequestReason(
@@ -239,12 +221,12 @@ pub async fn get_bucket_check(
         ));
     }
     let after = parse_after(query.after.as_deref())?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_bucket(&state, &auth, &bucket, group_id, Permission::READ).await?;
     let ctx = state.get_ctx();
     let progress = read_check(&ctx, &bucket)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let (broken, next) =
         visible_page(&state, &auth, group_id, &bucket, after, limit, SCAN_MAX).await?;
     Ok(Json(BucketCheckResponse {
@@ -278,7 +260,7 @@ async fn visible_page(
         let page = limit.min(scan - examined);
         let (rows, more) = list_broken(&ctx, bucket, after.take(), page)
             .await
-            .map_err(ServerError::InternalError)?;
+            .map_err(|error| ServerError::InternalError(error.into()))?;
         for (key, row) in rows {
             if broken.len() == limit {
                 return Ok((broken, next));
@@ -289,7 +271,7 @@ async fn visible_page(
             }
             next = Some(
                 key.to_bytes()
-                    .map_err(|e| ServerError::InternalError(e.to_string()))?,
+                    .map_err(|e| ServerError::InternalError(e.into()))?,
             );
             broken.push(BrokenFile {
                 key: key.key,
@@ -321,7 +303,7 @@ async fn visible(
 ) -> ServerResult<bool> {
     if !is_current(&state.get_ctx(), key)
         .await
-        .map_err(ServerError::InternalError)?
+        .map_err(|error| ServerError::InternalError(error.into()))?
     {
         return Ok(false);
     }
@@ -363,7 +345,6 @@ async fn visible(
                 "started_at_ms": 1790000000000_u64
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse)
     ),
@@ -371,18 +352,17 @@ async fn visible(
 )]
 pub async fn start_bucket_check(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<(StatusCode, Json<CheckProgress>)> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let operation = StartCheckOperation::new(bucket, group_id, now_ms());
     let record = drive(operation, &state.get_ctx())
         .await
         .map_err(|error| match error {
             StartCheckError::NoSuchBucket => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     Ok((StatusCode::ACCEPTED, Json(record.into())))
 }
@@ -418,7 +398,6 @@ on the owning group's admin path, as for the bucket's storage settings.
             example = json!({ "bucket": "research-raw", "deleted": 2, "kept": 0, "denied": 0 })
         ),
         (status = 400, description = "Invalid `after`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the bucket or the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "10000 recorded files were read without one this caller may see", body = ErrorResponse)
@@ -427,13 +406,12 @@ on the owning group's admin path, as for the bucket's storage settings.
 )]
 pub async fn clean_bucket_check(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Query(query): Query<CleanupQuery>,
 ) -> ServerResult<Json<BucketCleanupResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let after = parse_after(query.after.as_deref())?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_bucket(&state, &auth, &bucket, group_id, Permission::WRITE).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
     let template = DeleteObjectInput {
@@ -454,7 +432,7 @@ pub async fn clean_bucket_check(
         SCAN_MAX,
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     if cleaned.exhausted {
         return Err(scan_limit());
     }

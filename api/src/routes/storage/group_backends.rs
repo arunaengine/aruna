@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::routing::ensure_group_admin;
 use crate::server::state::ServerState;
@@ -20,30 +21,21 @@ use aruna_operations::groups::backends::query::{
     GetBackendOperation, ListBackendsOperation, check_bucket,
 };
 use aruna_operations::groups::backends::replace::ReplaceBackendOperation;
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((
-        name = "data/storage",
-        description = "Tenant-registered write backends on a group's own object storage"
-    ))
-)]
-pub struct GroupBackendsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(GroupBackendsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_group_backend, list_group_backends))
         .routes(routes!(
             get_group_backend,
@@ -208,16 +200,15 @@ fn map_create_error(error: CreateBackendError) -> ServerError {
         CreateBackendError::NotFound => ServerError::NotFound,
         CreateBackendError::Invalid(error) => ServerError::BadRequestMessage(error.to_string()),
         CreateBackendError::Unreachable(error) => ServerError::BadRequestMessage(error.reason()),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
 async fn admin_of_group(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     group_id: &str,
 ) -> ServerResult<(Ulid, AuthContext)> {
-    let auth = require_realm_auth(state, auth)?;
     let group_id = parse_group_id(group_id)?;
     ensure_group_admin(state, &auth, group_id).await?;
     Ok((group_id, auth))
@@ -316,7 +307,6 @@ group's data, so the group write rights that suffice for objects are not enough.
             description = "Invalid group id, unknown kind, rejected configuration or cleanup policy, or a failed probe, including when the store was merely unreachable",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -327,7 +317,7 @@ group's data, so the group write rights that suffice for objects are not enough.
 )]
 pub async fn create_group_backend(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<CreateBackendRequest>,
 ) -> ServerResult<(StatusCode, Json<GroupBackendResponse>)> {
@@ -384,7 +374,6 @@ administrator right that listing backends takes.
             })
         ),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -395,7 +384,7 @@ administrator right that listing backends takes.
 )]
 pub async fn list_import_roots(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<Json<ImportRootsResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -454,7 +443,6 @@ administrator right that registration takes.
             })
         ),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -465,14 +453,14 @@ administrator right that registration takes.
 )]
 pub async fn list_group_backends(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<Json<ListBackendsResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
 
     let backends = drive(ListBackendsOperation::new(group_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
 
     Ok(Json(ListBackendsResponse {
         backends: backends.into_iter().map(Into::into).collect(),
@@ -519,7 +507,6 @@ pub async fn list_group_backends(
             description = "The group id or the backend id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -535,7 +522,7 @@ pub async fn list_group_backends(
 )]
 pub async fn get_group_backend(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id)): Path<(String, String)>,
 ) -> ServerResult<Json<GroupBackendResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -543,7 +530,7 @@ pub async fn get_group_backend(
 
     let record = drive(GetBackendOperation::new(backend_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|record| record.group_id == group_id)
         .ok_or(ServerError::NotFound)?;
 
@@ -627,7 +614,6 @@ pub async fn get_group_backend(
             description = "An id is not a ULID, the configuration or cleanup policy failed validation, the request would move the backend to another store, or the probe failed, including when the store was merely unreachable",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -643,7 +629,7 @@ pub async fn get_group_backend(
 )]
 pub async fn replace_group_backend(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id)): Path<(String, String)>,
     Json(request): Json<CreateBackendRequest>,
 ) -> ServerResult<Json<GroupBackendResponse>> {
@@ -711,7 +697,6 @@ pub async fn replace_group_backend(
             description = "The group id or the backend id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -727,7 +712,7 @@ pub async fn replace_group_backend(
 )]
 pub async fn delete_group_backend(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
     set_disabled(&state, auth, &group_id, &backend_id, true).await?;
@@ -781,7 +766,6 @@ pub async fn delete_group_backend(
             description = "The group id or the backend id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -797,7 +781,7 @@ pub async fn delete_group_backend(
 )]
 pub async fn enable_group_backend(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id)): Path<(String, String)>,
 ) -> ServerResult<Json<GroupBackendResponse>> {
     let record = set_disabled(&state, auth, &group_id, &backend_id, false).await?;
@@ -847,7 +831,6 @@ pub async fn enable_group_backend(
             description = "The group id or the backend id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path; a group that does not exist answers the same way",
@@ -863,7 +846,7 @@ pub async fn enable_group_backend(
 )]
 pub async fn backend_reclaim_status(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id)): Path<(String, String)>,
 ) -> ServerResult<Json<ReclaimStatusResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -872,12 +855,12 @@ pub async fn backend_reclaim_status(
 
     drive(GetBackendOperation::new(backend_id), &context)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|record| record.group_id == group_id)
         .ok_or(ServerError::NotFound)?;
     let status = backend_status(&context, &BackendRef::Group(backend_id))
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
 
     Ok(Json(ReclaimStatusResponse {
         pending_candidates: status.pending_candidates,
@@ -919,7 +902,6 @@ pub async fn backend_reclaim_status(
             description = "An id is not a ULID, the name is no valid bucket name, the storage has a fixed bucket, or the storage could not be reached",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group admin path",
@@ -935,7 +917,7 @@ pub async fn backend_reclaim_status(
 )]
 pub async fn check_provider_bucket(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, backend_id, bucket)): Path<(String, String, String)>,
 ) -> ServerResult<Json<ProviderBucketResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -943,7 +925,7 @@ pub async fn check_provider_bucket(
     let context = state.get_ctx();
     let record = drive(GetBackendOperation::new(backend_id), &context)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|record| record.group_id == group_id)
         .ok_or(ServerError::NotFound)?;
     if !record.splits() {
@@ -968,7 +950,7 @@ pub async fn check_provider_bucket(
 
 async fn set_disabled(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     group_id: &str,
     backend_id: &str,
     disabled: bool,
@@ -983,7 +965,7 @@ async fn set_disabled(
     .await
     .map_err(|error| match error {
         SetDisabledError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })
 }
 

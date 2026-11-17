@@ -6,6 +6,7 @@ use super::{
     BlobCopyCompliance, BlobCopyOrigin, BlobCopyState, BlobCopyStorage, BlobLocationsQuery,
     blob_locations, copy_response, pending_copy,
 };
+use crate::auth::RealmAuth;
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
 use crate::server::state::ServerState;
@@ -480,7 +481,7 @@ async fn locations_require_read() {
 
     let denied = blob_locations(
         State(state.clone()),
-        Extension(Some(auth_for(stranger, realm_id))),
+        RealmAuth(auth_for(stranger, realm_id)),
         Extension(None),
         axum::http::HeaderMap::new(),
         locations_query(),
@@ -490,7 +491,7 @@ async fn locations_require_read() {
 
     let allowed = blob_locations(
         State(state),
-        Extension(Some(auth_for(owner, realm_id))),
+        RealmAuth(auth_for(owner, realm_id)),
         Extension(None),
         axum::http::HeaderMap::new(),
         locations_query(),
@@ -510,7 +511,7 @@ async fn policy_denies_locations() {
 
     let denied = blob_locations(
         State(state),
-        Extension(Some(auth_for(owner, realm_id))),
+        RealmAuth(auth_for(owner, realm_id)),
         Extension(None),
         axum::http::HeaderMap::new(),
         locations_query(),

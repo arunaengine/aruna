@@ -5,33 +5,27 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use aruna_core::id::NodeId;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{RemoteBinding, SyncRefusal};
 use aruna_operations::device::compute::{ComputeStatus, compute_status};
 use aruna_operations::device::publish_run::{
     PublishRunError, PublishRunInput, PublishedRun, local_run_crate, publish_run,
 };
 
-use crate::auth::require_owner;
+use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::execution::jobs::{map_job_request, map_local_error};
+use crate::routes::execution::jobs::map_local_error;
 use crate::server::state::ServerState;
 
-/// The device tag itself is declared by the device plane's own document.
-#[derive(OpenApi)]
-#[openapi()]
-pub struct DeviceComputeDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DeviceComputeDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_device_compute))
         .routes(routes!(publish_device_run))
         .routes(routes!(get_local_crate))
@@ -123,18 +117,15 @@ for.
                 "running": 1,
                 "queued": 0
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn get_device_compute(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
 ) -> ServerResult<Json<DeviceComputeResponse>> {
-    let auth = require_owner(&state, auth).await?;
     let status = compute_status(&state.get_ctx(), auth.user_id)
         .await
         .map_err(map_local_error)?;
@@ -254,7 +245,6 @@ for.
                 "run_crate": {"status": "written", "resource": "01JZ7Q3V4K8M2N6P0R5S9T1W3Y"}
             })),
         (status = 400, description = "The node is no realm server, or the bucket does not exist there", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the device owner, or the realm refused the owner's write", body = ErrorResponse),
         (status = 404, description = "No such local run, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The run has not finished, two outputs share one key, or it is published to another target", body = ErrorResponse),
@@ -265,12 +255,11 @@ for.
 )]
 async fn publish_device_run(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Path(job_id): Path<String>,
     Json(request): Json<PublishRunRequest>,
 ) -> ServerResult<Json<PublishRunResponse>> {
-    let auth = require_owner(&state, auth).await?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let node_id = NodeId::from_str(&request.node_id)
         .map_err(|_| ServerError::BadRequestReason("node_id is not a node id".to_string()))?;
     let published = publish_run(
@@ -316,7 +305,6 @@ for.
                 {"@id": "./", "@type": "Dataset", "name": "Run bakta", "mentions": {"@id": "#run-01JZ7Q3V4K8M2N6P0R5S9T1W3X"}}
             ]
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the device owner", body = ErrorResponse),
         (status = 404, description = "No such local run or no crate for it, or this node is not a user node", body = ErrorResponse),
         (status = 503, description = "This device could not read its state now", body = ErrorResponse)
@@ -325,11 +313,10 @@ for.
 )]
 async fn get_local_crate(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
-    let auth = require_owner(&state, auth).await?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let jsonld = local_run_crate(&state.get_ctx(), job_id, auth.user_id)
         .await
         .map_err(map_publish_error)?;

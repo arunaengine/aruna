@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{parse_group_id, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::credentials::{
     CreatePathRestriction, CreateS3Response, authorize_credential_issuance,
@@ -31,25 +32,21 @@ use aruna_operations::users::service_account::create::{
     CreateServiceConfig, CreateServiceError, CreateServiceOperation,
 };
 use aruna_operations::users::service_account::list::{ListServiceError, ListServiceOperation};
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::SystemTime;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 const SERVICE_LABEL: &str = "service account";
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "access/service-accounts", description = "Service accounts of a group")))]
-pub struct ServiceApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ServiceApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_account, list_accounts))
         .routes(routes!(create_token))
         .routes(routes!(create_credential))
@@ -100,7 +97,7 @@ fn map_check_error(error: ServiceCheckError) -> ServerError {
         ServiceCheckError::Deactivated => {
             ServerError::Conflict("the service account is deactivated".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -135,18 +132,16 @@ fn map_check_error(error: ServiceCheckError) -> ServerError {
                 "active": true
             })),
         (status = 400, description = "The group id or the name is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or from another realm, the caller is a service account, or the caller is no group administrator", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 async fn create_account(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<String>,
     Json(request): Json<CreateServiceRequest>,
 ) -> ServerResult<(StatusCode, Json<ServiceAccountResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let user = drive(
         CreateServiceOperation::new(CreateServiceConfig {
@@ -169,7 +164,7 @@ async fn create_account(
         CreateServiceError::InvalidName => {
             ServerError::BadRequestReason("the name must be 1 to 256 bytes".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     })?;
     Ok((StatusCode::CREATED, Json(account_response(user))))
 }
@@ -192,23 +187,21 @@ async fn create_account(
                 "active": true
             }] })),
         (status = 400, description = "The group id is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or from another realm, the caller is a service account, or the caller is no group administrator", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 async fn list_accounts(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ListServiceResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let accounts = drive(ListServiceOperation::new(auth, group_id), &state.get_ctx())
         .await
         .map_err(|error| match error {
             ListServiceError::Unauthorized => ServerError::Forbidden,
-            error => ServerError::InternalError(error.to_string()),
+            error => ServerError::InternalError(error.into()),
         })?;
     let accounts = accounts.into_iter().map(account_response).collect();
     Ok((StatusCode::OK, Json(ListServiceResponse { accounts })))
@@ -254,7 +247,6 @@ async fn list_accounts(
                 "expires_at": "2026-04-09T12:00:00Z"
             })),
         (status = 400, description = "Invalid ids, lifetime or restrictions", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller may not administer the group's service accounts, or a scope exceeds the service account's access", body = ErrorResponse),
         (status = 404, description = "The group owns no service account with that id", body = ErrorResponse),
         (status = 409, description = "The service account is deactivated, or holds 256 active sessions", body = ErrorResponse)
@@ -263,11 +255,10 @@ async fn list_accounts(
 )]
 async fn create_token(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, account_id)): Path<(String, String)>,
     Json(request): Json<ServiceTokenRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateSessionResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let account_id = UserId::from_string(&account_id).map_err(|_| ServerError::BadRequest)?;
     crate::routes::plugin_installs::refuse_plugin_account(&state, account_id).await?;
@@ -371,7 +362,6 @@ async fn create_token(
                 "access_secret": "<one-time-secret-shown-only-in-this-response>"
             })),
         (status = 400, description = "Invalid ids, lifetime or restrictions", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller may not administer the group's service accounts, the account has no usable access to the group's data, or a restriction exceeds it", body = ErrorResponse),
         (status = 404, description = "The group owns no service account with that id", body = ErrorResponse),
         (status = 409, description = "The service account is deactivated, acts for a plugin install, or holds 16 active credentials", body = ErrorResponse)
@@ -380,11 +370,10 @@ async fn create_token(
 )]
 async fn create_credential(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, account_id)): Path<(String, String)>,
     Json(request): Json<ServiceCredentialRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateS3Response>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let account_id = UserId::from_string(&account_id).map_err(|_| ServerError::BadRequest)?;
     crate::routes::plugin_installs::refuse_plugin_account(&state, account_id).await?;
@@ -440,7 +429,7 @@ async fn create_credential(
                 CreateUserError::LimitReached => {
                     ServerError::Conflict("active credential limit reached".to_string())
                 }
-                error => ServerError::InternalError(error.to_string()),
+                error => ServerError::InternalError(error.into()),
             })?;
     Ok((
         StatusCode::CREATED,

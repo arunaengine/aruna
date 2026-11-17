@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::auth::{parse_group_id, require_unrestricted_auth};
+use crate::auth::parse_group_id;
 use crate::error::{ServerError, ServerResult};
 use crate::routes::access::groups::ensure_group_admin;
 use crate::server::state::ServerState;
@@ -254,10 +254,9 @@ pub(crate) fn change_error(error: ChangeError) -> ServerError {
 /// The owner a request manages, after its manager check. Devices never hold the documents.
 async fn owner_for(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     group_id: Option<&str>,
 ) -> ServerResult<(AuthContext, SecretOwner)> {
-    let auth = require_unrestricted_auth(state, auth)?;
     if matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
         return Err(ServerError::Forbidden);
     }
@@ -300,7 +299,7 @@ async fn owner_change(
 fn owner_error(error: OwnerSecretError) -> ServerError {
     match error {
         OwnerSecretError::Change(error) => change_error(error),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

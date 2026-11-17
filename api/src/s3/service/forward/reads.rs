@@ -6,12 +6,13 @@
 // The holder checks the caller on its own path; a holder that fails is skipped for a while.
 
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
 use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::routing::route_read;
@@ -74,12 +75,6 @@ pub(in crate::s3::service) fn stale_error(mut error: S3Error, range_id: Ulid) ->
     mark_stale(&mut headers, &[range_id]);
     error.set_headers(headers);
     error
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 /// The read of one object the holder receives instead of this node.
@@ -258,7 +253,7 @@ impl ArunaS3Service {
                 Err(error) => return Err(guard_error(&error)),
             };
         let holders = key_holders(self.state.as_ref(), binding.set_id, key).await;
-        let node_id = choose_holder(self.state.as_ref(), &holders, now_ms())
+        let node_id = choose_holder(self.state.as_ref(), &holders, unix_timestamp_millis())
             .await
             .map_or(coordinator, |chosen| chosen.node_id);
         let holder = Forward {
@@ -432,7 +427,11 @@ impl ArunaS3Service {
                 .status_code()
                 .is_none_or(|status| status.is_server_error())
         {
-            avoid_holder(self.state.as_ref(), forward.node_id, now_ms());
+            avoid_holder(
+                self.state.as_ref(),
+                forward.node_id,
+                unix_timestamp_millis(),
+            );
         }
         result
     }

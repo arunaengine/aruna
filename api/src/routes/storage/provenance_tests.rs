@@ -10,8 +10,9 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use ulid::Ulid;
 
 use super::*;
+use crate::auth::RealmAuth;
+use crate::lookup::bucket_info;
 use crate::mcp::data::{WriteObjectInput, store_text};
-use crate::routes::storage::deletion::bucket_info;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, LOCAL, Node, PEER, node_id, node_state, publish_api,
 };
@@ -129,7 +130,7 @@ async fn silent_node_incomplete() {
     let export = |bearer: Option<ValidatedBearer>, version: Option<String>| {
         export_provenance(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             Extension(bearer),
             Query(ExportParams {
                 version,
@@ -342,7 +343,7 @@ async fn nests_release_crates() {
     };
     let Json(_) = publish_release(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         HeaderMap::new(),
         Path(BUCKET.to_string()),

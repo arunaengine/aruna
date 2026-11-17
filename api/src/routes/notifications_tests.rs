@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::extract;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -25,6 +27,7 @@ use aruna_operations::notifications::inbox::upsert_inbox_records;
 use aruna_operations::notifications::routing::route_watch_event;
 use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
 use aruna_storage::storage::FjallStorage;
+use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use byteview::ByteView;
@@ -271,14 +274,9 @@ fn bearer() -> Extension<Option<ValidatedBearer>> {
 async fn list_requires_auth() {
     let realm_id = realm_id(1);
     let (_dir, state) = build_state(realm_id, node(1)).await;
-    let error = list_notifications(
-        State(state),
-        Extension(None),
-        Query(ListNotificationsQuery::default()),
-    )
-    .await
-    .expect_err("missing auth must be rejected");
-    assert!(matches!(error, ServerError::Unauthorized));
+    // `list_notifications` takes `UnrestrictedAuth`, so the refusal is the extractor's.
+    let error = extract::<UnrestrictedAuth>(&state, None).await;
+    assert_eq!(error.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -292,31 +290,9 @@ async fn restricted_token_rejected() {
         permission: Permission::READ,
     }]);
 
-    let list_err = list_notifications(
-        State(state.clone()),
-        Extension(Some(auth.clone())),
-        Query(ListNotificationsQuery::default()),
-    )
-    .await
-    .expect_err("delegated token must be rejected");
-    assert!(matches!(list_err, ServerError::Forbidden));
-
-    let unread_err = unread_count(State(state.clone()), Extension(Some(auth.clone())))
-        .await
-        .expect_err("delegated token must be rejected");
-    assert!(matches!(unread_err, ServerError::Forbidden));
-
-    let mark_err = mark_read(
-        State(state),
-        Extension(Some(auth)),
-        Json(MarkReadRequest {
-            ids: Vec::new(),
-            up_to_ms: None,
-        }),
-    )
-    .await
-    .expect_err("delegated token must be rejected");
-    assert!(matches!(mark_err, ServerError::Forbidden));
+    // The inbox routes take `UnrestrictedAuth`, so the refusal is its check.
+    let refused = crate::auth::require_unrestricted_auth(&state, Some(auth));
+    assert!(matches!(refused, Err(ServerError::Forbidden)));
 }
 
 #[test]
@@ -353,7 +329,7 @@ async fn bad_ids_rejected() {
     let user_id = UserId::new(Ulid::generate(), realm_id);
     let error = mark_read(
         State(state),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         Json(MarkReadRequest {
             ids: vec!["not-a-ulid".to_string()],
             up_to_ms: None,
@@ -371,7 +347,7 @@ async fn excess_ids_rejected() {
     let user_id = UserId::new(Ulid::generate(), realm_id);
     let error = mark_read(
         State(state),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         Json(MarkReadRequest {
             ids: (0..=MARK_MAX_IDS)
                 .map(|_| Ulid::generate().to_string())
@@ -403,7 +379,7 @@ async fn local_path_serves() {
 
     let (_, listed) = list_notifications(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         Query(ListNotificationsQuery::default()),
     )
     .await
@@ -414,7 +390,7 @@ async fn local_path_serves() {
 
     let (_, unread) = unread_count(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
     )
     .await
     .expect("unread succeeds");
@@ -428,7 +404,7 @@ async fn local_path_serves() {
         .collect::<Vec<_>>();
     let (_, marked) = mark_read(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         Json(MarkReadRequest {
             ids,
             up_to_ms: None,
@@ -439,7 +415,7 @@ async fn local_path_serves() {
     assert_eq!(marked.marked, 3);
 
     let (_, unread_after) =
-        unread_count(State(state), Extension(Some(auth_for(user_id, realm_id))))
+        unread_count(State(state), UnrestrictedAuth(auth_for(user_id, realm_id)))
             .await
             .expect("unread after succeeds");
     assert_eq!(unread_after.count, 0);
@@ -916,7 +892,7 @@ async fn local_watch_crud() {
 
     let (status, created) = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: path_prefix.clone(),
@@ -931,7 +907,7 @@ async fn local_watch_crud() {
 
     let (_, listed) = list_watches(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
     )
     .await
     .expect("list succeeds");
@@ -940,14 +916,14 @@ async fn local_watch_crud() {
 
     let status = delete_watch(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         Path(created.id.clone()),
     )
     .await
     .expect("delete succeeds");
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (_, empty) = list_watches(State(state), Extension(Some(auth_for(user_id, realm_id))))
+    let (_, empty) = list_watches(State(state), UnrestrictedAuth(auth_for(user_id, realm_id)))
         .await
         .expect("list after delete succeeds");
     assert!(empty.watches.is_empty());
@@ -968,7 +944,7 @@ async fn lists_unauthorized_watch() {
 
     let (status, created) = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(reader, realm_id))),
+        UnrestrictedAuth(auth_for(reader, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: format!("meta/{group_id}/"),
@@ -982,7 +958,7 @@ async fn lists_unauthorized_watch() {
 
     let (_, listed) = list_watches(
         State(state.clone()),
-        Extension(Some(auth_for(reader, realm_id))),
+        UnrestrictedAuth(auth_for(reader, realm_id)),
     )
     .await
     .expect("list succeeds");
@@ -993,7 +969,7 @@ async fn lists_unauthorized_watch() {
 
     let (_, listed) = list_watches(
         State(state.clone()),
-        Extension(Some(auth_for(reader, realm_id))),
+        UnrestrictedAuth(auth_for(reader, realm_id)),
     )
     .await
     .expect("list after revocation succeeds");
@@ -1022,7 +998,7 @@ async fn policy_denies_watches() {
 
     let (status, _) = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         bearer(),
         Json(request()),
     )
@@ -1047,7 +1023,7 @@ async fn policy_denies_watches() {
 
     let denied = create_watch(
         State(state),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         bearer(),
         Json(request()),
     )
@@ -1072,7 +1048,7 @@ async fn watch_requires_read() {
 
     let error = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(unauthorized, realm_id))),
+        UnrestrictedAuth(auth_for(unauthorized, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: path_prefix.clone(),
@@ -1088,7 +1064,7 @@ async fn watch_requires_read() {
 
     let (status, created) = create_watch(
         State(state),
-        Extension(Some(auth_for(authorized, realm_id))),
+        UnrestrictedAuth(auth_for(authorized, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: path_prefix.clone(),
@@ -1117,7 +1093,7 @@ async fn watch_uses_canonical() {
 
     let error = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(unauthorized, realm_id))),
+        UnrestrictedAuth(auth_for(unauthorized, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: path_prefix.clone(),
@@ -1130,7 +1106,7 @@ async fn watch_uses_canonical() {
 
     let (status, created) = create_watch(
         State(state),
-        Extension(Some(auth_for(authorized, realm_id))),
+        UnrestrictedAuth(auth_for(authorized, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: path_prefix.clone(),
@@ -1159,7 +1135,7 @@ async fn cross_group_watch() {
 
     let (_, created) = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(watcher, realm_id))),
+        UnrestrictedAuth(auth_for(watcher, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: watch_resource_path(
@@ -1220,7 +1196,7 @@ async fn missing_group_forbidden() {
 
     let missing = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(caller, realm_id))),
+        UnrestrictedAuth(auth_for(caller, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: format!("meta/{}/datasets", Ulid::generate()),
@@ -1233,7 +1209,7 @@ async fn missing_group_forbidden() {
 
     let unreadable = create_watch(
         State(state),
-        Extension(Some(auth_for(caller, realm_id))),
+        UnrestrictedAuth(auth_for(caller, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: format!("meta/{existing_group}/datasets"),
@@ -1257,7 +1233,7 @@ async fn mixed_events_rejected() {
 
     let error = create_watch(
         State(state),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix,
@@ -1277,7 +1253,7 @@ async fn watch_validates_input() {
 
     let empty_prefix = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: String::new(),
@@ -1290,7 +1266,7 @@ async fn watch_validates_input() {
 
     let leading_slash = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: "/bucket".to_string(),
@@ -1303,7 +1279,7 @@ async fn watch_validates_input() {
 
     let empty_events = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: "bucket".to_string(),
@@ -1316,7 +1292,7 @@ async fn watch_validates_input() {
 
     let unknown_event = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: "bucket".to_string(),
@@ -1329,7 +1305,7 @@ async fn watch_validates_input() {
 
     let unscoped_data = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: "reports".to_string(),
@@ -1343,7 +1319,7 @@ async fn watch_validates_input() {
     let group_id = Ulid::generate();
     let unscoped_metadata = create_watch(
         State(state.clone()),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: format!("meta/{group_id}"),
@@ -1356,7 +1332,7 @@ async fn watch_validates_input() {
 
     let noncanonical_metadata = create_watch(
         State(state),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         bearer(),
         Json(CreateWatchRequest {
             path_prefix: format!("meta/{group_id}/datasets/proteomics/"),
@@ -1375,7 +1351,7 @@ async fn delete_rejects_id() {
     let user_id = UserId::new(Ulid::generate(), realm_id);
     let error = delete_watch(
         State(state),
-        Extension(Some(auth_for(user_id, realm_id))),
+        UnrestrictedAuth(auth_for(user_id, realm_id)),
         Path("not-a-ulid".to_string()),
     )
     .await
@@ -1398,30 +1374,7 @@ async fn rejects_restricted_watch() {
         permission: Permission::READ,
     }]);
 
-    let list_err = list_watches(State(state.clone()), Extension(Some(auth.clone())))
-        .await
-        .expect_err("delegated token must be rejected");
-    assert!(matches!(list_err, ServerError::Forbidden));
-
-    let create_err = create_watch(
-        State(state.clone()),
-        Extension(Some(auth.clone())),
-        bearer(),
-        Json(CreateWatchRequest {
-            path_prefix: watch_resource_path(group_id, holder, "bucket", "allowed/"),
-            events: vec!["data_uploaded".to_string()],
-        }),
-    )
-    .await
-    .expect_err("delegated token must be rejected");
-    assert!(matches!(create_err, ServerError::Forbidden));
-
-    let delete_err = delete_watch(
-        State(state),
-        Extension(Some(auth)),
-        Path(Ulid::generate().to_string()),
-    )
-    .await
-    .expect_err("delegated token must be rejected");
-    assert!(matches!(delete_err, ServerError::Forbidden));
+    // The watch routes take `UnrestrictedAuth`, so the refusal is its check.
+    let refused = crate::auth::require_unrestricted_auth(&state, Some(auth));
+    assert!(matches!(refused, Err(ServerError::Forbidden)));
 }

@@ -300,7 +300,7 @@ async fn lists_readable_objects() {
     use rmcp::handler::server::wrapper::Parameters;
     let node = crate::tests::distributed::node_state().await;
     let bucket = crate::tests::distributed::BUCKET;
-    let info = crate::routes::storage::deletion::bucket_info(&node.state, bucket)
+    let info = crate::lookup::bucket_info(&node.state, bucket)
         .await
         .unwrap();
     for key in ["a.md", "secret.md", "z.md"] {
@@ -681,7 +681,7 @@ async fn lists_public_prefix() {
     use aruna_core::structs::identity::auth::Actor;
     use rmcp::handler::server::wrapper::Parameters;
     let node = node_state().await;
-    let info = crate::routes::storage::deletion::bucket_info(&node.state, BUCKET)
+    let info = crate::lookup::bucket_info(&node.state, BUCKET)
         .await
         .unwrap();
     for key in ["closed.md", "open/b.md"] {
@@ -763,7 +763,7 @@ async fn aggregate_hides_keys() {
     use aruna_core::structs::identity::auth::Actor;
     use rmcp::handler::server::wrapper::Parameters;
     let node = node_state().await;
-    let info = crate::routes::storage::deletion::bucket_info(&node.state, BUCKET)
+    let info = crate::lookup::bucket_info(&node.state, BUCKET)
         .await
         .unwrap();
     for key in ["open.txt", "open.txt.secret"] {
@@ -816,9 +816,7 @@ async fn aggregate_work_bounded() {
     use rmcp::handler::server::wrapper::Parameters;
     let node = node_state().await;
     let state = &node.state;
-    let info = crate::routes::storage::deletion::bucket_info(state, BUCKET)
-        .await
-        .unwrap();
+    let info = crate::lookup::bucket_info(state, BUCKET).await.unwrap();
     let input = WriteObjectInput {
         node_id: None,
         bucket: BUCKET.to_string(),

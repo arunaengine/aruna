@@ -9,7 +9,7 @@ use std::sync::Arc;
 use aruna_core::UserId;
 use aruna_core::errors::StorageError;
 use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::GroupId;
 use aruna_operations::plugins::account::plugin_account;
@@ -26,29 +26,28 @@ use aruna_operations::plugins::records::RecordError;
 use aruna_operations::users::service_account::group_admin_path;
 use aruna_plugins::manifest::Manifest;
 use aruna_plugins::permission::Grant;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth, require_unrestricted_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
-#[derive(OpenApi)]
-pub struct InstallsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(InstallsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(install))
         .routes(routes!(list_installs))
         .routes(routes!(get_install, remove))
@@ -226,7 +225,6 @@ relays it to one.
         (status = 200, description = "The summary of a preview", body = InstallSummary, example = json!(view_example()["summary"])),
         (status = 201, description = "The active install", body = InstallView, example = json!(view_example())),
         (status = 400, description = "Invalid settings or grants, or the plugin cannot be installed yet", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin or lacks a granted right", body = ErrorResponse),
         (status = 404, description = "No published version matches", body = ErrorResponse),
         (status = 409, description = "The id belongs to another request, or a step failed", body = ErrorResponse),
@@ -236,12 +234,11 @@ relays it to one.
 )]
 pub async fn install(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(name): Path<String>,
     Query(query): Query<InstallQuery>,
     Json(body): Json<InstallBody>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_id(&body.group)?;
     ensure_admin(&state, &auth, group_id).await?;
     let request = InstallRequest {
@@ -302,17 +299,15 @@ pub async fn install(
     responses(
         (status = 200, description = "One page of installs", body = InstallPage, example = json!({"installs": [view_example()], "next": null})),
         (status = 400, description = "The group id or the limit is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_installs(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<InstallListQuery>,
 ) -> ServerResult<Json<InstallPage>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_id(&query.group)?;
     ensure_admin(&state, &auth, group_id).await?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
@@ -359,7 +354,6 @@ pub async fn list_installs(
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 200, description = "The install", body = InstallView, example = json!(view_example())),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse)
     ),
@@ -367,10 +361,9 @@ pub async fn list_installs(
 )]
 pub async fn get_install(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<InstallView>> {
-    let auth = require_realm_auth(&state, auth)?;
     let install_id = parse_id(&id)?;
     let config = load_config(&state).await?;
     let install = (config.installs.iter())
@@ -398,7 +391,6 @@ the call and every other node relays it to one.
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 204, description = "The install is removed"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 409, description = "The install changed meanwhile, or a step failed", body = ErrorResponse)
@@ -407,7 +399,7 @@ the call and every other node relays it to one.
 )]
 pub async fn remove(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
@@ -416,14 +408,6 @@ pub async fn remove(
         .await
         .map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-pub(crate) fn actor(state: &ServerState, auth: &AuthContext) -> Actor {
-    Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    }
 }
 
 pub(crate) fn parse_id(id: &str) -> ServerResult<Ulid> {
@@ -471,10 +455,9 @@ pub(crate) async fn secret_session(
 /// The caller and install of a change, after the caller proved admin of the install's group.
 pub(crate) async fn admin_call(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     id: &str,
 ) -> ServerResult<(AuthContext, Ulid)> {
-    let auth = require_realm_auth(state, auth)?;
     let install_id = parse_id(id)?;
     let config = load_config(state).await?;
     let install = (config.installs.iter())
@@ -658,7 +641,9 @@ pub(crate) fn map_error(error: InstallError) -> ServerError {
             RecordError::Stale(_) | RecordError::StorageError(StorageError::TransactionConflict),
         ) => ServerError::Conflict(message),
         InstallError::Unavailable(_) => ServerError::ServiceUnavailableReason(message),
-        InstallError::Manifest(_) | InstallError::Record(_) => ServerError::InternalError(message),
+        InstallError::Manifest(_) | InstallError::Record(_) => {
+            ServerError::InternalError(message.into())
+        }
     }
 }
 
@@ -672,7 +657,7 @@ pub(crate) async fn refuse_plugin_account(
         Ok(true) => Err(ServerError::Conflict(
             "the account acts for a plugin install; change the install instead".into(),
         )),
-        Err(error) => Err(ServerError::InternalError(error)),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -701,6 +686,7 @@ mod tests {
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::plugin_installs::InstallState;
     use aruna_core::plugins::PublishedPlugin;
+    use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction};
     use aruna_core::structs::identity::realm::RealmId;
 
@@ -784,7 +770,7 @@ mod tests {
         });
         let refused = put_grants(
             State(state.clone()),
-            Extension(Some(restricted.clone())),
+            RealmAuth(restricted.clone()),
             id,
             body,
         );

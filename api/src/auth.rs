@@ -5,7 +5,7 @@
 use crate::error::{OidcError, ServerError, ServerResult, TokenError};
 use crate::server::state::ServerState;
 use crate::telemetry::record_auth_context;
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission, TokenClaims};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::blob::object_permission_path;
@@ -15,10 +15,12 @@ use aruna_operations::auth::bearer_token::{
 use aruna_operations::auth::request_authorization::AuthorizeError;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
-use axum::extract::Request;
+use axum::Extension;
+use axum::extract::{FromRequestParts, Request};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use http::HeaderMap;
+use http::request::Parts;
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
@@ -27,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -575,7 +578,7 @@ pub(crate) async fn require_owner(
         GetConfigError::DocumentNotFound => ServerError::ServiceUnavailableReason(
             "the realm configuration has not reached this device yet".to_string(),
         ),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     let node_id = state.get_node_id().to_string();
     let owner = config
@@ -588,6 +591,101 @@ pub(crate) async fn require_owner(
         return Err(ServerError::Forbidden);
     }
     Ok(auth)
+}
+
+/// A signed-in caller of any realm; answers like a missing token otherwise.
+pub struct TokenAuth(pub AuthContext);
+
+/// A signed-in caller of this realm, checked by [`require_realm_auth`].
+pub struct RealmAuth(pub AuthContext);
+
+/// A caller of this realm without path restrictions, checked by [`require_unrestricted_auth`].
+pub struct UnrestrictedAuth(pub AuthContext);
+
+/// The bound owner of this device, checked by [`require_owner`].
+pub struct OwnerAuth(pub AuthContext);
+
+/// Reads the context the auth middleware stored; a missing one answers like `Extension` does.
+async fn request_auth(
+    parts: &mut Parts,
+    state: &Arc<ServerState>,
+) -> Result<Option<AuthContext>, Response> {
+    Extension::<Option<AuthContext>>::from_request_parts(parts, state)
+        .await
+        .map(|Extension(auth)| auth)
+        .map_err(IntoResponse::into_response)
+}
+
+impl FromRequestParts<Arc<ServerState>> for TokenAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<ServerState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = request_auth(parts, state).await?;
+        auth.map(Self)
+            .ok_or_else(|| ServerError::Unauthorized.into_response())
+    }
+}
+
+impl FromRequestParts<Arc<ServerState>> for RealmAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<ServerState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = request_auth(parts, state).await?;
+        require_realm_auth(state, auth)
+            .map(Self)
+            .map_err(IntoResponse::into_response)
+    }
+}
+
+impl FromRequestParts<Arc<ServerState>> for UnrestrictedAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<ServerState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = request_auth(parts, state).await?;
+        require_unrestricted_auth(state, auth)
+            .map(Self)
+            .map_err(IntoResponse::into_response)
+    }
+}
+
+impl FromRequestParts<Arc<ServerState>> for OwnerAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<ServerState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = request_auth(parts, state).await?;
+        require_owner(state, auth)
+            .await
+            .map(Self)
+            .map_err(IntoResponse::into_response)
+    }
+}
+
+/// Runs an auth extractor on a request that carries `auth` as the middleware leaves it.
+#[cfg(test)]
+pub(crate) async fn extract<T>(
+    state: &Arc<ServerState>,
+    auth: Option<AuthContext>,
+) -> Result<T, axum::http::StatusCode>
+where
+    T: FromRequestParts<Arc<ServerState>, Rejection = Response>,
+{
+    let (mut parts, ()) = Request::new(()).into_parts();
+    parts.extensions.insert(auth);
+    T::from_request_parts(&mut parts, state)
+        .await
+        .map_err(|response| response.status())
 }
 
 pub(crate) async fn ensure_permission(
@@ -636,13 +734,8 @@ pub(crate) async fn ensure_permission_with(
 /// fault stays internal, and only real denials become `Forbidden`.
 pub(crate) fn map_authorize_error(error: AuthorizeError) -> ServerError {
     match error {
-        AuthorizeError::Storage(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        AuthorizeError::Storage(error) => ServerError::InternalError(error.to_string()),
-        AuthorizeError::CheckFailed(message) => ServerError::InternalError(message),
+        AuthorizeError::Storage(error) => error.into(),
+        AuthorizeError::CheckFailed(message) => ServerError::InternalError(message.into()),
         AuthorizeError::PermissionDenied | AuthorizeError::Policy(_) => ServerError::Forbidden,
     }
 }
@@ -2126,5 +2219,104 @@ mod test {
         handle_token(&state, &token).await.unwrap();
 
         assert_eq!(state.issuer_cache_len().await, 1);
+    }
+
+    /// A user node with a fresh store; the routes below refuse before they read it.
+    async fn extractor_state() -> (tempfile::TempDir, std::sync::Arc<ServerState>) {
+        use crate::tests::routes::{test_context, test_state, test_storage};
+        let (dir, storage) = test_storage();
+        let realm_key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let realm_id = RealmId::from_bytes(realm_key.verifying_key().to_bytes());
+        let state = test_state(
+            std::sync::Arc::new(test_context(storage)),
+            realm_id,
+            iroh::SecretKey::from_bytes(&[6; 32]).public(),
+            NodeCapabilities::user_node(realm_id).unwrap(),
+        )
+        .await;
+        (dir, std::sync::Arc::new(state))
+    }
+
+    fn caller(realm_id: RealmId) -> aruna_core::structs::identity::auth::AuthContext {
+        aruna_core::structs::identity::auth::AuthContext {
+            user_id: UserId::local(ulid::Ulid::from_bytes([7; 16]), realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    // A request with one fault keeps its answer; only a request with two faults now
+    // meets the token check first.
+    #[tokio::test]
+    async fn realm_keeps_faults() {
+        use crate::tests::routes::send_json;
+        use axum::http::StatusCode;
+        let (_dir, state) = extractor_state().await;
+        let own = caller(state.get_realm_id());
+        let foreign = caller(RealmId::from_bytes([8; 32]));
+        let route = crate::routes::portal::router;
+        let put = |body| ("PUT", "/system/realm/portal-features", body);
+        let valid = r#"{"features":{"compute":false}}"#;
+        let cases = [
+            (None, valid, StatusCode::UNAUTHORIZED),
+            (Some(foreign), valid, StatusCode::FORBIDDEN),
+            (Some(own), "{", StatusCode::BAD_REQUEST),
+            (None, "{", StatusCode::UNAUTHORIZED),
+        ];
+        for (auth, body, expected) in cases {
+            let status = send_json(route(), state.clone(), auth, put(body)).await;
+            assert_eq!(status, expected, "body {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unrestricted_keeps_faults() {
+        use crate::tests::routes::send_json;
+        use axum::http::StatusCode;
+        let (_dir, state) = extractor_state().await;
+        let own = caller(state.get_realm_id());
+        let restricted = aruna_core::structs::identity::auth::AuthContext {
+            path_restrictions: Some(Vec::new()),
+            ..own.clone()
+        };
+        let route = crate::routes::webhooks::router;
+        let put = |body| ("PUT", "/system/notifications/webhook", body);
+        let valid = r#"{"url":"https://example.org/hook"}"#;
+        let cases = [
+            (None, valid, StatusCode::UNAUTHORIZED),
+            (
+                Some(caller(RealmId::from_bytes([8; 32]))),
+                valid,
+                StatusCode::FORBIDDEN,
+            ),
+            (Some(restricted), valid, StatusCode::FORBIDDEN),
+            (Some(own), "{", StatusCode::BAD_REQUEST),
+            (None, "{", StatusCode::UNAUTHORIZED),
+        ];
+        for (auth, body, expected) in cases {
+            let status = send_json(route(), state.clone(), auth, put(body)).await;
+            assert_eq!(status, expected, "body {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_keeps_faults() {
+        use crate::tests::routes::send_json;
+        use axum::http::StatusCode;
+        let (_dir, state) = extractor_state().await;
+        let foreign = caller(RealmId::from_bytes([8; 32]));
+        let route = crate::routes::access::credentials::router;
+        let post = |body| ("POST", "/access/credentials", body);
+        let valid = r#"{"group_id":"01JZ8Y6T0K4W7M2N9Q5R3S8V1X"}"#;
+        let cases = [
+            (None, valid, StatusCode::UNAUTHORIZED),
+            (Some(foreign), "{", StatusCode::BAD_REQUEST),
+            (None, "{", StatusCode::UNAUTHORIZED),
+        ];
+        for (auth, body, expected) in cases {
+            let status = send_json(route(), state.clone(), auth, post(body)).await;
+            assert_eq!(status, expected, "body {body}");
+        }
     }
 }

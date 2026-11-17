@@ -19,29 +19,25 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::mcp::data::{ObjectOutput, object_output};
+use crate::lookup::bucket_info;
+use crate::lookup::map_guard_error;
+use crate::lookup::{ObjectOutput, object_output};
+use crate::lookup::{RestForward, relay_get, relayed_set};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
-use crate::routes::storage::deletion::bucket_info;
-use crate::routes::storage::distributed::map_guard_error;
-use crate::routes::storage::relay::{RestForward, relay_get, relayed_set};
 use crate::server::state::ServerState;
 
 /// Entries one page returns by default and at most.
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct ObjectsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ObjectsDoc::openapi()).routes(routes!(list_objects))
+    OpenApiRouter::new().routes(routes!(list_objects))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, IntoParams)]
@@ -160,7 +156,7 @@ pub(crate) fn page_error(error: PageError<ServerError>) -> ServerError {
         PageError::Cursor => ServerError::BadRequestReason(error.to_string()),
         PageError::Unanswered { .. } => ServerError::ServiceUnavailableReason(error.to_string()),
         PageError::Guard(error) => map_guard_error(error),
-        PageError::Internal(error) => ServerError::InternalError(error),
+        PageError::Internal(error) => ServerError::InternalError(error.into()),
         PageError::Relay(error) => error,
     }
 }

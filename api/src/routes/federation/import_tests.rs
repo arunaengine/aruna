@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::routes::federation::export::{GRANT_HEADER, encode_header};
 use crate::routes::rocrate_import::{UploadRoCrateResponse, upload_rocrate};
 use aruna_blob::blob::BlobHandler;
@@ -36,6 +37,7 @@ use aruna_operations::jobs::import::{
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use axum::Extension;
 use axum::body::Body;
 use axum::http::HeaderValue;
 use axum::http::header::CONTENT_TYPE;
@@ -421,7 +423,7 @@ async fn import(
         secret: hex::encode(secret),
     };
     let state = State(fixture.state.clone());
-    let (_, Json(response)) = create_import(state, Extension(Some(auth)), Json(request)).await?;
+    let (_, Json(response)) = create_import(state, UnrestrictedAuth(auth), Json(request)).await?;
     Ok(response)
 }
 
@@ -459,7 +461,7 @@ async fn submit(
         idempotency_key: Some(key.to_string()),
     };
     let state = State(fixture.state.clone());
-    let (_, Json(response)) = submit_import(state, Extension(Some(auth)), Json(request)).await?;
+    let (_, Json(response)) = submit_import(state, UnrestrictedAuth(auth), Json(request)).await?;
     Ok(response)
 }
 

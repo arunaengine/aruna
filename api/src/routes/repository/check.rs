@@ -6,15 +6,15 @@ use std::sync::Arc;
 
 use aruna_core::repository::rules::Mapped;
 use aruna_core::repository::{KindDescriptor, kinds};
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::links::{connector, metadata_json, parse_ulid, readable, requirements};
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ProfileFindingResponse, ServerError, ServerResult};
 use crate::metadata::ensure_metadata_scope;
 use crate::server::state::ServerState;
@@ -114,9 +114,9 @@ pub struct CheckResponse {
 fn kind_view(descriptor: &KindDescriptor) -> ServerResult<RepositoryKindResponse> {
     let rules = descriptor
         .rules()
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let targets = serde_json::to_value(&rules.targets)
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let profiles = descriptor
         .profiles
         .iter()
@@ -176,11 +176,7 @@ Kinds that only harvest, such as oai_pmh, are not listed."#,
         (status = 401, description = "Authentication required", body = ErrorResponse)
     ), security(("bearer_auth" = []))
 )]
-pub async fn list_kinds(
-    State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
-) -> ServerResult<Json<Vec<RepositoryKindResponse>>> {
-    require_unrestricted_auth(&state, auth)?;
+pub async fn list_kinds(_: UnrestrictedAuth) -> ServerResult<Json<Vec<RepositoryKindResponse>>> {
     kinds()
         .iter()
         .map(kind_view)
@@ -234,7 +230,7 @@ Invalid input returns 400, with code not_supported for a repository kind that ca
 )]
 pub async fn check_repository(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(document_id): Path<String>,
     Json(request): Json<CheckRequest>,
 ) -> ServerResult<Json<CheckResponse>> {

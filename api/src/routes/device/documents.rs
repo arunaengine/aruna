@@ -5,23 +5,21 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::replica::{
     ReplicaOrigin, ReplicaRecord, cache_budget, cache_usage, list_replicas,
 };
 use aruna_operations::device::selection::{SelectionError, deselect_document, select_document};
-
-use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -128,18 +126,15 @@ for.
                 "cacheBudgetBytes": 2000000000_i64,
                 "cacheUsedBytes": 48213
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn list_documents(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
 ) -> ServerResult<Json<DeviceDocumentList>> {
-    require_owner(&state, auth).await?;
     let context = state.get_ctx();
     let replicas = list_replicas(&context)
         .await
@@ -189,7 +184,6 @@ for.
                 "realmClockSize": 1
             })),
         (status = 400, description = "The document id is not a ULID, or a holder refused the document", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "No such document, or this node is not a user node", body = ErrorResponse),
         (status = 409, description = "The document has unpublished edits", body = ErrorResponse),
@@ -199,11 +193,10 @@ for.
 )]
 async fn set_selection(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(document_id): Path<String>,
     Json(request): Json<SelectDocumentRequest>,
 ) -> ServerResult<Json<DeviceDocument>> {
-    require_owner(&state, auth).await?;
     let document_id = Ulid::from_str(&document_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
     let replica = match request.selected {

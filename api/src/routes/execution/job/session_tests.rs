@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::{BackendCaps, ExecutorBackend, SessionChannel};
 use aruna_compute::session::{SessionConfig, SessionPhase};
@@ -288,7 +289,7 @@ async fn hides_foreign_job() {
     let (_dir, state, job_id, _helper) = build_node(owner).await;
     let response = get_session(
         State(state),
-        Extension(auth_for(user(9))),
+        UnrestrictedAuth(auth_for(user(9)).expect("a signed-in caller")),
         Path(job_id.to_string()),
     )
     .await;
@@ -301,7 +302,7 @@ async fn hides_unknown_job() {
     let (_dir, state, _job_id, _helper) = build_node(owner).await;
     let response = get_session(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(JobId::from_bytes([8u8; 16]).to_string()),
     )
     .await;
@@ -311,15 +312,16 @@ async fn hides_unknown_job() {
 #[tokio::test]
 async fn refuses_restricted_token() {
     let owner = user(2);
-    let (_dir, state, job_id, _helper) = build_node(owner).await;
+    let (_dir, state, _job, _helper) = build_node(owner).await;
     let auth = Some(AuthContext {
         user_id: owner,
         realm_id: realm(),
         path_restrictions: Some(Vec::new()),
         session: None,
     });
-    let response = get_session(State(state), Extension(auth), Path(job_id.to_string())).await;
-    assert!(matches!(response, Err(ServerError::Forbidden)));
+    // `get_session` takes `UnrestrictedAuth`, so the refusal is the extractor's.
+    let response = crate::auth::extract::<UnrestrictedAuth>(&state, auth).await;
+    assert_eq!(response.err(), Some(StatusCode::FORBIDDEN));
 }
 
 #[tokio::test]
@@ -329,7 +331,7 @@ async fn refuses_early_cells() {
     let (_dir, state, job_id, _helper) = build_node(owner).await;
     let response = submit_cell(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SubmitCellRequest {
             cell_id: "c1".to_string(),
@@ -348,7 +350,7 @@ async fn refuses_unregistered_cell() {
     drop_session(&state, job_id);
     let response = submit_cell(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SubmitCellRequest {
             cell_id: "c1".to_string(),
@@ -368,7 +370,7 @@ async fn limits_submit_burst() {
     for index in 0..aruna_core::compute::session::MAX_SUBMITS {
         let response = submit_cell(
             State(state.clone()),
-            Extension(auth_for(owner)),
+            UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
             Path(job_id.to_string()),
             Json(SubmitCellRequest {
                 cell_id: format!("c{index}"),
@@ -381,7 +383,7 @@ async fn limits_submit_burst() {
     }
     let refused = submit_cell(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SubmitCellRequest {
             cell_id: "late".to_string(),
@@ -401,7 +403,7 @@ async fn busy_cell_conflicts() {
     for expected in [StatusCode::ACCEPTED, StatusCode::CONFLICT] {
         let response = submit_cell(
             State(state.clone()),
-            Extension(auth_for(owner)),
+            UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
             Path(job_id.to_string()),
             Json(SubmitCellRequest {
                 cell_id: "c1".to_string(),
@@ -422,7 +424,7 @@ async fn resumes_from_after() {
     make_ready(&state, job_id, &mut helper).await;
     let response = stream_session(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Query(EventsQuery { after: Some(1) }),
         HeaderMap::new(),
@@ -457,7 +459,7 @@ async fn stream_reports_gap() {
     assert!(session.subscribe(1).is_err(), "the ring rolled over");
     let response = stream_session(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Query(EventsQuery { after: Some(1) }),
         HeaderMap::new(),
@@ -477,7 +479,7 @@ async fn end_answers_status() {
     for _ in 0..2 {
         let response = end_session(
             State(state.clone()),
-            Extension(auth_for(owner)),
+            UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
             Path(job_id.to_string()),
         )
         .await
@@ -582,7 +584,7 @@ async fn reported_reason_wins() {
 fn failed_item_redacted() {
     let failed = failed_input(
         "data/b.txt".to_string(),
-        &ServerError::InternalError("private backend detail".to_string()),
+        &ServerError::InternalError("private backend detail".to_string().into()),
     );
     assert!(!failed.error.contains("private backend detail"));
 }
@@ -778,7 +780,7 @@ async fn checks_keys_first() {
     let (_dir, state, job_id, _helper) = build_node(owner).await;
     let response = stage_inputs(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest {
             items: vec![input("source", "data/a.txt"), input("source", "../escape")],
@@ -801,7 +803,7 @@ async fn queues_reference_copy() {
 
     let response = stage_inputs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest {
             items: vec![input("source", "data/genomes/ref.fna")],
@@ -860,7 +862,7 @@ async fn link_crosses_groups() {
     item.strategy = SessionInputStrategy::Reference;
     let response = stage_inputs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest { items: vec![item] }),
     )
@@ -907,7 +909,7 @@ async fn refuses_unreadable_source() {
 
     let response = stage_inputs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest {
             items: vec![input("foreign", "data/ref.fna")],
@@ -930,7 +932,7 @@ async fn keeps_refusal_reason() {
 
     let response = stage_inputs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest {
             items: vec![input("missing", "data/a.txt")],
@@ -991,7 +993,7 @@ fn queued_is_progress() {
 async fn session_body(state: &Arc<ServerState>, owner: UserId, job_id: JobId) -> SessionResponse {
     let response = get_session(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
     )
     .await

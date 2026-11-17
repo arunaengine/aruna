@@ -14,20 +14,12 @@ pub mod wipe;
 
 use std::sync::Arc;
 
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(tags((
-    name = "device",
-    description = "Owner-only controls a user node serves for the machine it runs on"
-)))]
-pub struct DeviceApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DeviceApiDoc::openapi())
+    OpenApiRouter::new()
         .merge(buckets::router())
         .merge(documents::router())
         .merge(drafts::router())

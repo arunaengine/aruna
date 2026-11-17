@@ -37,7 +37,7 @@ async fn storage_failure_internal() {
 
     assert!(matches!(
         result,
-        Err(ServerError::InternalError(message)) if message == "Channel closed"
+        Err(ServerError::InternalError(message)) if message.to_string() == "Channel closed"
     ));
 }
 

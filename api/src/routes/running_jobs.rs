@@ -4,7 +4,7 @@
 
 use crate::auth::permission_granted;
 use crate::error::{ServerError, ServerResult};
-use crate::routes::execution::jobs::{JobProgressResponse, rfc3339};
+use crate::jobs::{JobProgressResponse, rfc3339};
 use crate::routes::info::{InfoAccess, info_access};
 use crate::server::state::ServerState;
 use aruna_core::jobs::{JobTarget, RunningJobView};
@@ -203,7 +203,7 @@ async fn may_read(
     let context = state.get_ctx();
     let access = BucketAccess::load(&context, auth, (realm_id, group_id, node_id), bucket)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     // A prefix shows only when the caller may read every key the job may touch below it.
     let path = path.as_deref().unwrap_or_default();
     Ok(match exact {

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::openapi::ApiDoc;
 use crate::tests::routes::{
     seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
@@ -21,6 +22,7 @@ use aruna_core::structs::execution::staging::{
 };
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
     VersionKey,
@@ -113,7 +115,7 @@ async fn references_hide_denied() {
 
     let (_, Json(page)) = list_references(
         State(test.state.clone()),
-        Extension(Some(auth)),
+        RealmAuth(auth),
         Query(ReferenceListQuery {
             bucket: test.bucket.clone(),
             prefix: Some("data/".to_string()),
@@ -138,7 +140,7 @@ async fn references_list_bindings() {
 
     let (status, Json(mut first)) = list_references(
         State(test.state.clone()),
-        Extension(Some(test.auth_bucket_read.clone())),
+        RealmAuth(test.auth_bucket_read.clone()),
         Query(ReferenceListQuery {
             bucket: test.bucket.clone(),
             prefix: Some("data/".to_string()),
@@ -153,7 +155,7 @@ async fn references_list_bindings() {
 
     let (_, Json(second)) = list_references(
         State(test.state.clone()),
-        Extension(Some(test.auth_bucket_read.clone())),
+        RealmAuth(test.auth_bucket_read.clone()),
         Query(ReferenceListQuery {
             bucket: test.bucket.clone(),
             prefix: Some("data/".to_string()),
@@ -224,7 +226,7 @@ async fn references_deny_read() {
 
     let result = list_references(
         State(test.state),
-        Extension(Some(test.without_source_read)),
+        RealmAuth(test.without_source_read),
         Query(ReferenceListQuery {
             bucket: test.bucket,
             prefix: None,
@@ -1066,7 +1068,7 @@ mod distributed {
     ) -> ServerResult<(StatusCode, Json<SubmitStagingResponse>)> {
         submit_staging(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             bearer(),
             axum::http::HeaderMap::new(),
             Json(request),
@@ -1085,7 +1087,7 @@ mod distributed {
         let stage = |key: &str| {
             stage_blob(
                 State(node.state.clone()),
-                Extension(Some(node.owner.clone())),
+                RealmAuth(node.owner.clone()),
                 bearer(),
                 axum::http::HeaderMap::new(),
                 Json(StageRequest::Snapshot(target(&node, key))),
@@ -1261,7 +1263,7 @@ async fn references_state_completeness() {
     let page = |prefix: &str| {
         list_references(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             Query(ReferenceListQuery {
                 bucket: BUCKET.to_string(),
                 prefix: Some(prefix.to_string()),

@@ -3,11 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
+use crate::auth::extract;
 use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
 };
 use aruna_core::UserId;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+use axum::http::StatusCode;
 use tempfile::TempDir;
 
 struct Setup {
@@ -76,7 +80,7 @@ async fn create(setup: &Setup) -> RepositoryResponse {
     let token = HashMap::from([("token".to_string(), "secret-token-value".to_string())]);
     create_repository(
         State(setup.state.clone()),
-        Extension(Some(setup.owner.clone())),
+        RealmAuth(setup.owner.clone()),
         Path(setup.group_id.to_string()),
         Json(request(Some(token))),
     )
@@ -97,7 +101,7 @@ async fn crud_hides_secret() {
 
     let Json(listed) = list_repositories(
         State(setup.state.clone()),
-        Extension(Some(setup.owner.clone())),
+        RealmAuth(setup.owner.clone()),
         Path(setup.group_id.to_string()),
     )
     .await
@@ -112,7 +116,7 @@ async fn crud_hides_secret() {
     let path = (setup.group_id.to_string(), created.connector_id.clone());
     let Json(kept) = replace_repository(
         State(setup.state.clone()),
-        Extension(Some(setup.owner.clone())),
+        RealmAuth(setup.owner.clone()),
         Path(path.clone()),
         Json(RepositoryRequest {
             community: None,
@@ -126,7 +130,7 @@ async fn crud_hides_secret() {
 
     let Json(cleared) = replace_repository(
         State(setup.state.clone()),
-        Extension(Some(setup.owner.clone())),
+        RealmAuth(setup.owner.clone()),
         Path(path.clone()),
         Json(request(Some(HashMap::new()))),
     )
@@ -136,7 +140,7 @@ async fn crud_hides_secret() {
 
     let status = delete_repository(
         State(setup.state.clone()),
-        Extension(Some(setup.owner.clone())),
+        RealmAuth(setup.owner.clone()),
         Path(path.clone()),
     )
     .await
@@ -144,7 +148,7 @@ async fn crud_hides_secret() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let missing = get_repository(
         State(setup.state.clone()),
-        Extension(Some(setup.owner.clone())),
+        RealmAuth(setup.owner.clone()),
         Path(path),
     )
     .await;
@@ -155,17 +159,13 @@ async fn crud_hides_secret() {
 async fn routes_require_permission() {
     let setup = setup().await;
     let created = create(&setup).await;
-    let anonymous = list_repositories(
-        State(setup.state.clone()),
-        Extension(None),
-        Path(setup.group_id.to_string()),
-    )
-    .await;
-    assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+    // `list_repositories` takes `RealmAuth`, so the refusal is the extractor's.
+    let anonymous = extract::<RealmAuth>(&setup.state, None).await;
+    assert_eq!(anonymous.err(), Some(StatusCode::UNAUTHORIZED));
 
     let denied = get_repository(
         State(setup.state.clone()),
-        Extension(Some(setup.stranger.clone())),
+        RealmAuth(setup.stranger.clone()),
         Path((setup.group_id.to_string(), created.connector_id.clone())),
     )
     .await;
@@ -173,7 +173,7 @@ async fn routes_require_permission() {
 
     let wrong_group = get_repository(
         State(setup.state.clone()),
-        Extension(Some(setup.stranger.clone())),
+        RealmAuth(setup.stranger.clone()),
         Path((setup.other_group.to_string(), created.connector_id)),
     )
     .await;
@@ -192,7 +192,7 @@ async fn rejects_invalid_config() {
     ] {
         let result = create_repository(
             State(setup.state.clone()),
-            Extension(Some(setup.owner.clone())),
+            RealmAuth(setup.owner.clone()),
             Path(setup.group_id.to_string()),
             Json(body),
         )

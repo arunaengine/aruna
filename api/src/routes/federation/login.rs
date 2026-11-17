@@ -3,13 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::{CreateSessionResponse, map_create_error, unix_rfc3339};
 use crate::server::state::ServerState;
 use aruna_core::federation::{RealmDescriptor, Signed};
 use aruna_core::handoff::{HandoffError, LoginHandoff};
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::drive;
 use aruna_operations::federation::login::{
@@ -27,7 +26,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::{Arc, LazyLock};
 use tracing::info;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -44,12 +43,8 @@ fn login_limiter() -> DefaultKeyedRateLimiter<IpAddr> {
     RateLimiter::keyed(Quota::per_minute(rate))
 }
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct LoginApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(LoginApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_login_handoff))
         .routes(routes!(create_federated_session))
 }
@@ -157,17 +152,15 @@ sessions and other session kinds are refused, so a login cannot chain to a third
         "signature": "<hex ed25519 signature>"
     })),
         (status = 400, description = "A malformed nonce, or a descriptor that does not verify", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not an unrestricted portal session of a local user, or the user is deactivated", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn create_login_handoff(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<LoginHandoffRequest>,
 ) -> ServerResult<Json<Signed<LoginHandoff>>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let nonce_valid = hex::decode(&request.nonce).is_ok_and(|bytes| bytes.len() == SECRET_LEN);
     if !nonce_valid {
         return Err(ServerError::BadRequestReason(
@@ -186,7 +179,7 @@ pub async fn create_login_handoff(
         .map_err(|error| match error {
             IssueHandoffError::Refused | IssueHandoffError::Deactivated => ServerError::Forbidden,
             IssueHandoffError::Invalid(error) => ServerError::BadRequestReason(error.to_string()),
-            error => ServerError::InternalError(error.to_string()),
+            error => ServerError::InternalError(error.into()),
         })?;
     Ok(Json(signed))
 }
@@ -296,7 +289,7 @@ pub async fn create_federated_session(
                 ServerError::Refused(StatusCode::FORBIDDEN, "login_cut_off", error.to_string())
             }
             FederatedLoginError::Session(error) => map_create_error(error),
-            error => ServerError::InternalError(error.to_string()),
+            error => ServerError::InternalError(error.into()),
         })?;
     let account = created.session.user_id;
     info!(%handoff_id, %user_id, %account, "Federated login accepted");
@@ -332,13 +325,14 @@ async fn name_hint(state: &ServerState, name: &str) -> ServerResult<bool> {
     });
     let found = drive(search, &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(!found.users.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::RealmAuth;
     use crate::auth::handle_token;
     use crate::routes::access::sessions::{CreateSessionRequest, create_session};
     use crate::tests::routes::{test_context, test_state, test_storage};
@@ -349,6 +343,7 @@ mod tests {
     use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
     use aruna_core::handoff::secret_nonce;
     use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
+    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
     use aruna_operations::auth::bearer_token::{
@@ -516,7 +511,7 @@ mod tests {
 
         let child = create_session(
             State(state.clone()),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(Some(crate::auth::ValidatedBearer::new_for_test(
                 created.session.token,
             ))),
@@ -588,7 +583,7 @@ mod tests {
         };
         let error = create_login_handoff(
             State(state.clone()),
-            Extension(Some(federated)),
+            UnrestrictedAuth(federated),
             Json(request()),
         )
         .await
@@ -602,7 +597,7 @@ mod tests {
         };
         let Json(signed) = create_login_handoff(
             State(state.clone()),
-            Extension(Some(local)),
+            UnrestrictedAuth(local),
             Json(request()),
         )
         .await

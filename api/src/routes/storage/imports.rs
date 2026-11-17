@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::compression::MigrationProgress;
 use crate::routes::storage::moves::{BucketMoveStarted, move_refusal};
@@ -31,16 +32,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct BackendImportsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BackendImportsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_import, list_group_imports))
         .routes(routes!(get_import, update_import, delete_import))
         .routes(routes!(run_import))
@@ -167,16 +164,15 @@ pub(super) fn map_error(error: ImportRuleError) -> ServerError {
         ImportRuleError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
         ImportRuleError::NotFound => ServerError::NotFound,
         ImportRuleError::Forbidden => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
 pub(super) async fn admin_of_group(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     group_id: &str,
 ) -> ServerResult<(Ulid, AuthContext)> {
-    let auth = require_realm_auth(state, auth)?;
     let group_id = parse_group_id(group_id)?;
     ensure_group_admin(state, &auth, group_id).await?;
     Ok((group_id, auth))
@@ -325,7 +321,6 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
             })
         ),
         (status = 400, description = "Invalid ids, prefixes, schedule, bucket or backend, or a backend bucket that cannot be found, created or written", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or on the bucket", body = ErrorResponse),
         (status = 409, description = "A routing rule for the folder names another target, another rule imports into an overlapping folder or shares a backend folder it does not both read and write, a folder lies in the default rule's bucket, or the group is being deleted", body = ErrorResponse)
     ),
@@ -333,7 +328,7 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
 )]
 pub async fn create_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<CreateImportRequest>,
 ) -> ServerResult<(StatusCode, Json<ImportResponse>)> {
@@ -417,14 +412,13 @@ pub async fn create_import(
             })
         ),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_group_imports(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<Json<ListImportsResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -479,7 +473,6 @@ pub async fn list_group_imports(
             })
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -487,7 +480,7 @@ pub async fn list_group_imports(
 )]
 pub async fn get_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<ImportResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -550,7 +543,6 @@ pub async fn get_import(
             })
         ),
         (status = 400, description = "Invalid ids, schedule or pattern", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "The group is being deleted, a run or move has not finished, or a compressed or encrypted bucket would become a 1:1 link", body = ErrorResponse)
@@ -559,7 +551,7 @@ pub async fn get_import(
 )]
 pub async fn update_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     Json(request): Json<UpdateImportRequest>,
 ) -> ServerResult<Json<ImportResponse>> {
@@ -604,7 +596,6 @@ pub async fn update_import(
     responses(
         (status = 204, description = "The rule was removed"),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "The bucket still holds files or has no other storage, or the group is being deleted", body = ErrorResponse)
@@ -613,7 +604,7 @@ pub async fn update_import(
 )]
 pub async fn delete_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -667,7 +658,6 @@ pub async fn delete_import(
             example = json!({"job_id": "01JJ0B0123456789ABCDEFGHJK"})
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "The last run of this rule has not finished", body = ErrorResponse)
@@ -676,7 +666,7 @@ pub async fn delete_import(
 )]
 pub async fn run_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<RunImportResponse>)> {
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
@@ -820,7 +810,6 @@ key the caller may read are counted and listed.
             })
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -828,7 +817,7 @@ key the caller may read are counted and listed.
 )]
 pub async fn get_renames(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     axum::extract::Query(page): axum::extract::Query<RenamePageQuery>,
 ) -> ServerResult<Json<ImportRenamesResponse>> {
@@ -866,13 +855,13 @@ pub async fn get_renames(
         (page.filter.as_deref(), after, limit),
     )
     .await
-    .map_err(ServerError::InternalError)?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let status = drive(
         MigrationStatusOperation::new(rule.bucket.clone()),
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let last = status.filter(|record| record.moving && record.prefix == rule.key_prefix);
     let (files, plan) = (found.entries.into_iter(), found.plan);
     Ok(Json(ImportRenamesResponse {
@@ -958,7 +947,6 @@ restrictions are refused.
             })
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path, the bucket or a key, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "`bucket_encrypted`, `move_running` or `rule_changed`", body = ErrorResponse)
@@ -967,7 +955,7 @@ restrictions are refused.
 )]
 pub async fn start_renames(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<BucketMoveStarted>)> {

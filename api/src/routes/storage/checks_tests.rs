@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{BucketCheckQuery, CleanupQuery, clean_bucket_check, get_bucket_check, visible_page};
+use crate::auth::RealmAuth;
 use crate::error::ServerError;
 use crate::tests::storage_routing::{TestState, setup_state};
 use aruna_core::effects::StorageEffect;
@@ -15,7 +16,6 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::broken::{BrokenReason, BrokenVersion};
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_operations::blob::migration::check::clean_broken;
-use axum::Extension;
 use axum::extract::{Path, Query, State};
 use std::time::SystemTime;
 use ulid::Ulid;
@@ -125,7 +125,7 @@ async fn cleanup_checks_objects() {
 
     let response = clean_bucket_check(
         State(test.state.clone()),
-        Extension(Some(restricted)),
+        RealmAuth(restricted),
         Path(test.bucket.clone()),
         Query(CleanupQuery::default()),
     )
@@ -143,7 +143,7 @@ async fn cleanup_checks_objects() {
 
     let refused = clean_bucket_check(
         State(test.state.clone()),
-        Extension(Some(test.other_auth.clone())),
+        RealmAuth(test.other_auth.clone()),
         Path(test.bucket.clone()),
         Query(CleanupQuery::default()),
     )
@@ -182,7 +182,7 @@ async fn listing_hides_rows() {
 
     let response = get_bucket_check(
         State(test.state.clone()),
-        Extension(Some(restricted)),
+        RealmAuth(restricted),
         Path(test.bucket.clone()),
         Query(BucketCheckQuery::default()),
     )
@@ -217,7 +217,7 @@ async fn cleanup_clears_vanished() {
 
     let response = clean_bucket_check(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.bucket.clone()),
         Query(CleanupQuery::default()),
     )
@@ -228,7 +228,7 @@ async fn cleanup_clears_vanished() {
     assert_eq!((response.deleted, response.kept), (0, 0));
     let listed = get_bucket_check(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.bucket.clone()),
         Query(BucketCheckQuery::default()),
     )
@@ -277,7 +277,7 @@ async fn cursor_names_visible() {
         };
         let page = get_bucket_check(
             State(test.state.clone()),
-            Extension(Some(hiding(&test))),
+            RealmAuth(hiding(&test)),
             Path(test.bucket.clone()),
             Query(query),
         )

@@ -9,15 +9,15 @@ use std::sync::Arc;
 use aruna_core::realm_vault::RealmSealKey;
 use aruna_core::secret_registers::SecretOwner;
 use aruna_core::secrets::SecretFields;
-use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
+use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_operations::driver::drive;
 use aruna_operations::secrets::SecretChange;
 use aruna_operations::secrets::owner::{OwnerSecretError, ReadbackOperation, open_value};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -26,15 +26,12 @@ use super::{
     SecretView, change_error, entry_example, entry_view, expected, owner_change, owner_create,
     owner_error, owner_for, owner_list, owner_read, parse_name, replace_change, rotate_change,
 };
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-pub struct UserSecretsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(UserSecretsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_user_secrets, create_user_secret))
         .routes(routes!(
             get_user_secret,
@@ -70,13 +67,12 @@ the call."#,
     responses(
         (status = 200, description = "One page of user secrets", body = SecretPage, example = json!({"secrets": [entry_example()]})),
         (status = 400, description = "Invalid cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse)
     ),
     security(("bearer_auth" = [])))]
 pub async fn list_user_secrets(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<SecretListQuery>,
 ) -> ServerResult<Json<SecretPage>> {
     let (_, secret_owner) = owner_for(&state, auth, None).await?;
@@ -93,14 +89,13 @@ the call."#,
     responses(
         (status = 200, description = "The secret", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse)
     ),
     security(("bearer_auth" = [])))]
 pub async fn get_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
 ) -> ServerResult<Json<SecretView>> {
     let (_, secret_owner) = owner_for(&state, auth, None).await?;
@@ -125,20 +120,20 @@ the call.
     responses(
         (status = 201, description = "The stored secret, without field values", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse),
         (status = 409, description = "The name exists in this node's view", body = ErrorResponse)
     ),
     security(("bearer_auth" = [])))]
 pub async fn create_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<CreateSecretRequest>,
 ) -> ServerResult<(StatusCode, Json<SecretView>)> {
     let (auth, secret_owner) = owner_for(&state, auth, None).await?;
     let (create, readable) = owner_create(request)?;
     let stored = owner_change(&state, &auth, secret_owner, create, readable).await?;
-    let entry = stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string()))?;
+    let entry =
+        stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string().into()))?;
     Ok((StatusCode::CREATED, Json(entry_view(entry))))
 }
 
@@ -154,7 +149,6 @@ the call."#,
     responses(
         (status = 200, description = "The changed secret", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)
@@ -162,7 +156,7 @@ the call."#,
     security(("bearer_auth" = [])))]
 pub async fn replace_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
     Json(request): Json<ReplaceSecretRequest>,
@@ -187,7 +181,6 @@ the call."#,
     responses(
         (status = 200, description = "The rotated secret, without field values", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)
@@ -195,7 +188,7 @@ the call."#,
     security(("bearer_auth" = [])))]
 pub async fn rotate_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
     Json(request): Json<RotateSecretRequest>,
@@ -222,7 +215,6 @@ the call.
     responses(
         (status = 204, description = "The secret is deleted in this node's view"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)
@@ -230,7 +222,7 @@ the call.
     security(("bearer_auth" = [])))]
 pub async fn delete_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> ServerResult<StatusCode> {
@@ -258,7 +250,6 @@ serves the call and checks the token itself; every other node relays it to one.
     responses(
         (status = 200, description = "The field values", body = SecretValueView, example = json!({"fields": {"token": "EXAMPLE-TOKEN-PLACEHOLDER"}, "revision": "01JLIFE000123456789ABCDEFG.01JINFO000123456789ABCDEFG.01JVALUE00123456789ABCDEFG"})),
         (status = 400, description = "Invalid name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, a secret that is not readable, or a node that cannot open values", body = ErrorResponse),
         (status = 404, description = "No complete secret with this name in this node's view", body = ErrorResponse),
         (status = 503, description = "The audit row could not be written, or no management node was reachable", body = ErrorResponse)
@@ -266,10 +257,9 @@ serves the call and checks the token itself; every other node relays it to one.
     security(("bearer_auth" = [])))]
 pub async fn read_user_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(name): Path<String>,
 ) -> ServerResult<Json<SecretValueView>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let NodeCapabilities::Management {
         realm_signing_key, ..
     } = state.node_capabilities()
@@ -290,12 +280,12 @@ pub async fn read_user_secret(
             OwnerSecretError::Storage(_) => {
                 ServerError::ServiceUnavailableReason("the audit row was not written".to_string())
             }
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     let key = RealmSealKey::derive(realm_signing_key);
     let bytes = open_value(&key, &state.get_realm_id(), &entry).map_err(owner_error)?;
-    let fields = SecretFields::decode(&bytes)
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let fields =
+        SecretFields::decode(&bytes).map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(Json(SecretValueView {
         fields: (fields.names().zip(fields.values()))
             .map(|(name, value)| (name.to_string(), value.to_string()))

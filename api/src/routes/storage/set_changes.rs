@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -27,17 +27,14 @@ use super::distributed::{
     admission_response, behaviour, map_create_error, node, owned_status, settings_of, strategy,
 };
 use super::routing::ensure_group_admin;
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::bucket::usage::range_sizes;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct SetChangesDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SetChangesDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(join_distributed))
         .routes(routes!(leave_distributed))
         .routes(routes!(copy_distributed))
@@ -145,11 +142,10 @@ fn change_response(set_id: Ulid, revision: DistributionRevision) -> ChangeRespon
 /// The caller after the group admin check, with the bearer token the publisher checks again.
 async fn admin(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     bearer: Option<ValidatedBearer>,
     (group_id, set_id): (Ulid, Ulid),
 ) -> ServerResult<(AuthContext, Option<aruna_operations::metadata::AuthToken>)> {
-    let auth = require_realm_auth(state, auth)?;
     ensure_group_admin(state, &auth, group_id).await?;
     owned_status(state, group_id, set_id).await?;
     let bearer = crate::metadata::forwarded_auth_token(bearer)?;
@@ -197,7 +193,6 @@ async fn admin(
     responses(
         (status = 201, description = "The member's admission", body = AdmissionResponse, example = admission_example),
         (status = 400, description = "Invalid node, range or coverage", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse),
         (status = 409, description = "The publisher refused the change", body = ErrorResponse),
@@ -207,7 +202,7 @@ async fn admin(
 )]
 pub async fn join_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
     Json(request): Json<JoinRequest>,
@@ -257,7 +252,6 @@ pub async fn join_distributed(
     responses(
         (status = 200, description = "The revision that took the change", body = ChangeResponse, example = change_example),
         (status = 400, description = "The member still coordinates a range", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse),
         (status = 409, description = "The publisher refused the change", body = ErrorResponse),
@@ -267,7 +261,7 @@ pub async fn join_distributed(
 )]
 pub async fn leave_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id, member_id)): Path<(Ulid, Ulid, Ulid)>,
 ) -> ServerResult<Json<ChangeResponse>> {
@@ -315,7 +309,6 @@ pub async fn leave_distributed(
     responses(
         (status = 202, description = "The member's admission for the new copy", body = AdmissionResponse, example = admission_example),
         (status = 400, description = "Unknown range, or the member cannot take a copy of it; the message names the eligible members", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse),
         (status = 409, description = "The publisher refused the change, for example while the range moves", body = ErrorResponse),
@@ -325,7 +318,7 @@ pub async fn leave_distributed(
 )]
 pub async fn copy_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
     Json(request): Json<CopyRequest>,
@@ -381,7 +374,6 @@ pub async fn copy_distributed(
             "upper_id": "01JMPRT5123456789ABCDEFGHJ"
         })),
         (status = 400, description = "Unknown range, or no key given and this node keeps no key sample of the range", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse),
         (status = 409, description = "The publisher refused the split: a key outside the range, an open transfer, a filling copy or a deletion", body = ErrorResponse),
@@ -391,7 +383,7 @@ pub async fn copy_distributed(
 )]
 pub async fn split_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
     Json(request): Json<SplitRequest>,
@@ -450,7 +442,6 @@ pub async fn split_distributed(
     responses(
         (status = 202, description = "The revision that opened the transfer", body = ChangeResponse, example = change_example),
         (status = 400, description = "Unknown range, or the member is not a ready `copy` replica of it; the message names the eligible members", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse),
         (status = 409, description = "The publisher refused the change", body = ErrorResponse),
@@ -460,7 +451,7 @@ pub async fn split_distributed(
 )]
 pub async fn transfer_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
     Json(request): Json<TransferRequest>,
@@ -506,7 +497,6 @@ pub async fn transfer_distributed(
     responses(
         (status = 200, description = "The revision that took the change", body = ChangeResponse, example = change_example),
         (status = 400, description = "Invalid settings", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse),
         (status = 409, description = "The publisher refused the change", body = ErrorResponse),
@@ -516,7 +506,7 @@ pub async fn transfer_distributed(
 )]
 pub async fn settings_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
     Json(request): Json<SettingsRequest>,
@@ -552,7 +542,6 @@ pub async fn settings_distributed(
     ),
     responses(
         (status = 202, description = "The revision that recorded the deletion", body = ChangeResponse, example = change_example),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse),
         (status = 409, description = "The publisher refused the change", body = ErrorResponse),
@@ -562,7 +551,7 @@ pub async fn settings_distributed(
 )]
 pub async fn delete_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<(StatusCode, Json<ChangeResponse>)> {

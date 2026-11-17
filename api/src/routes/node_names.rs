@@ -3,22 +3,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ensure_permission, require_realm_auth, require_unrestricted_auth};
+use crate::auth::ensure_permission;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::NodeCoordinates;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::node_name::{
     NameScope, NodeChange, NodeNameConfig, NodeNameError, NodeNameOperation,
 };
+use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -128,22 +130,19 @@ management node serves the call and every other node relays it to one.
     responses(
         (status = 200, description = "The name and map place stored after the change", body = NodeNameResponse, example = json!({"node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978", "display_name": "Giessen storage 1", "place": "Giessen", "coordinates": {"lat": 50.5841, "lon": 8.6784}})),
         (status = 400, description = "Malformed body, a body naming no field, a name or place that is empty, longer than 64 characters or holds control characters, or coordinates out of range", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "No realm node carries this node id, or this node holds no realm configuration", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn name_realm_node(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(node_id): Path<String>,
     request: Result<Json<NodeNameRequest>, JsonRejection>,
 ) -> ServerResult<(StatusCode, Json<NodeNameResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     // Request policies live at this boundary; the operation only checks roles.
@@ -184,22 +183,19 @@ the call and every other node relays it to one.
     responses(
         (status = 200, description = "The name and map place stored after the change", body = NodeNameResponse, example = json!({"node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978", "display_name": "Lab laptop", "place": null, "coordinates": null})),
         (status = 400, description = "Malformed body, a body naming no field, a name or place that is empty, longer than 64 characters or holds control characters, or coordinates out of range", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No enrolled device of the calling user carries this id", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn name_own_device(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
     request: Result<Json<NodeNameRequest>, JsonRejection>,
 ) -> ServerResult<(StatusCode, Json<NodeNameResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     set_name(&state, auth, &id, request, NameScope::Owner).await
@@ -228,11 +224,7 @@ async fn set_name(
         coordinates,
     };
     let config = NodeNameConfig {
-        actor: Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor: actor(state, &auth),
         auth_context: auth,
         node_id,
         change,
@@ -263,11 +255,7 @@ fn map_name_error(error: NodeNameError) -> ServerError {
         NodeNameError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm configuration update; retry".to_string())
         }
-        NodeNameError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        NodeNameError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }

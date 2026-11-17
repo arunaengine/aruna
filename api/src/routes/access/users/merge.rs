@@ -3,14 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{GetUserResponse, validate_oidc_token};
-use crate::auth::{ValidatedBearer, claims_for_revocation, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ValidatedBearer, claims_for_revocation};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::federation::link::bearer_auth_time;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::link::MAX_LINK_SECS;
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, oidc_subject_key};
+use aruna_core::structs::identity::auth::{AuthContext, oidc_subject_key};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::bearer_token::decode_bearer_token;
 use aruna_operations::driver::drive;
@@ -119,7 +121,7 @@ fn map_merge_error(error: MergeError) -> ServerError {
         MergeError::Storage(_) | MergeError::Vault(_) | MergeError::PlacementFenced => {
             ServerError::ServiceUnavailableReason(message)
         }
-        _ => ServerError::InternalError(message),
+        _ => ServerError::InternalError(message.into()),
     }
 }
 
@@ -175,7 +177,6 @@ that account. Both prove control; a matching email or name is never enough.
                 "subjects": 1, "groups": 2, "realm_roles": 0, "devices": 1, "attributes": 3,
                 "attributes_not_copied": [],
                 "secondaries": 0, "repeated": false })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A login is too old, the other token is invalid or of another realm, both name the same account, or an account is deactivated or a service account (code `merge_refused`)", body = ErrorResponse),
         (status = 404, description = "This node holds no record of one of the accounts", body = ErrorResponse),
         (status = 409, description = "The other account holds a vault the caller's vault does not hold unchanged (code `vault_present`), or a role of it denies part of what it hands over and part of the caller's own access (code `role_conflict`, naming the role)", body = ErrorResponse),
@@ -186,11 +187,10 @@ that account. Both prove control; a matching email or name is never enough.
 )]
 async fn merge_account(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<MergeAccountRequest>,
 ) -> ServerResult<Json<MergeAccountResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     charge(&state, auth.user_id)?;
     if !state.is_management_node() {
         return Err(not_coordinator(MergeError::NotCoordinator.to_string()));
@@ -210,11 +210,7 @@ async fn merge_account(
         .try_into()
         .map_err(|_| refused(MergeError::TokenInvalid.to_string()))?;
     let config = MergeUsersConfig {
-        actor: Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor: actor(&state, &auth),
         survivor: auth,
         survivor_login,
         survivor_token: survivor_token.and_then(|token| AuthToken::bearer(token).ok()),
@@ -283,11 +279,10 @@ minutes after its provider login.
 )]
 async fn attach_subject(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<AttachSubjectRequest>,
 ) -> ServerResult<Json<GetUserResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     charge(&state, auth.user_id)?;
     if !state.is_management_node() {
         return Err(not_coordinator(MergeError::NotCoordinator.to_string()));
@@ -304,11 +299,7 @@ async fn attach_subject(
     let subject = oidc_subject_key(&identity.issuer, &identity.subject_id)
         .map_err(|_| ServerError::Unauthorized)?;
     let input = UpdateUserInput {
-        actor: Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor: actor(&state, &auth),
         self_realm_id: state.get_realm_id(),
         user_id: auth.user_id.to_string(),
         auth_context: auth,
@@ -330,7 +321,7 @@ async fn attach_subject(
             UpdateUserError::StorageError(_) | UpdateUserError::PlacementFenced => {
                 ServerError::ServiceUnavailableReason(error.to_string())
             }
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     Ok(Json(user.into()))
 }
@@ -362,7 +353,6 @@ async fn attach_subject(
     responses(
         (status = 204, description = "The node runs account merges from now on"),
         (status = 400, description = "The node id is malformed or names no management node of this realm", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller lacks the administration grant or the token is path-restricted", body = ErrorResponse),
         (status = 503, description = "This node does not coordinate merges (code `not_coordinator`) or could not pass the call on (code `no_management_node`); retry", body = ErrorResponse)
     ),
@@ -370,10 +360,9 @@ async fn attach_subject(
 )]
 async fn hand_off(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<HandoffRequest>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if !state.is_management_node() {
         return Err(not_coordinator(MergeError::NotCoordinator.to_string()));
     }
@@ -382,11 +371,7 @@ async fn hand_off(
         .parse()
         .map_err(|_| ServerError::BadRequestReason("malformed node id".to_string()))?;
     let config = HandoffConfig {
-        actor: Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor: actor(&state, &auth),
         auth_context: auth,
         node_id,
     };
@@ -437,7 +422,7 @@ mod tests {
         };
         let merged = merge_account(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            UnrestrictedAuth(auth.clone()),
             Extension(None),
             Json(merge),
         )
@@ -448,7 +433,7 @@ mod tests {
         };
         let attached = attach_subject(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            UnrestrictedAuth(auth.clone()),
             Extension(None),
             Json(attach),
         )
@@ -457,7 +442,7 @@ mod tests {
         let handoff = HandoffRequest {
             node_id: node_id.to_string(),
         };
-        let handed = hand_off(State(state), Extension(Some(auth)), Json(handoff)).await;
+        let handed = hand_off(State(state), UnrestrictedAuth(auth), Json(handoff)).await;
         assert_eq!(code(handed.err().unwrap()), expected);
     }
 }

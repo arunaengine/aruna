@@ -5,32 +5,28 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
+use crate::lookup::{relay_json, rest_target};
 use crate::mcp::data::{TextObjectRequest, WriteObjectInput, WriteObjectOutput, store_text};
-use crate::routes::storage::deletion::bucket_info;
-use crate::routes::storage::relay::{relay_json, rest_target};
 use crate::server::state::ServerState;
 
 /// The largest text body one write stores, as for the MCP text tool.
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct TextDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(TextDoc::openapi()).routes(routes!(write_text_object))
+    OpenApiRouter::new().routes(routes!(write_text_object))
 }
 
 #[utoipa::path(
@@ -66,7 +62,6 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
             "node_id": "1f2e3d4c5b6a79880f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"
         })),
         (status = 400, description = "The key is not a valid object key", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the object's path, or the bucket is a read-only offered directory", body = ErrorResponse),
         (status = 404, description = "No such bucket", body = ErrorResponse),
         (status = 413, description = "The text is larger than 1 MiB", body = ErrorResponse),
@@ -76,13 +71,12 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 )]
 pub async fn write_text_object(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Path(bucket): Path<String>,
     Json(request): Json<TextObjectRequest>,
 ) -> ServerResult<Json<WriteObjectOutput>> {
-    let auth = require_realm_auth(&state, auth)?;
     crate::s3::util::validate_object_key(&request.key)
         .map_err(|_| ServerError::BadRequestReason("the key is not a valid object key".into()))?;
     if request.text.len() > MAX_TEXT_BYTES {
@@ -95,7 +89,7 @@ pub async fn write_text_object(
         .await
         .map_err(|error| match error {
             OfferedDirectoryError::ReadOnly(_) => ServerError::Forbidden,
-            error => ServerError::InternalError(error.to_string()),
+            error => ServerError::InternalError(error.into()),
         })?;
     let info = bucket_info(&state, &bucket).await?;
     let path = object_permission_path(

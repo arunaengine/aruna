@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::extract;
 use crate::tests::storage_routing::{TestState, setup_state};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -12,6 +14,7 @@ use aruna_core::structs::storage::blob::{
     BackendRef, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::format::EncodingClass;
+use axum::http::StatusCode;
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -82,36 +85,49 @@ async fn refuses_other_callers() {
     let test = setup_state().await;
     let state = || State(test.state.clone());
     let bucket = || Path(test.bucket.clone());
-    let missing = preview_rename(state(), Extension(None), bucket(), folders("", "a/")).await;
-    assert!(matches!(missing, Err(ServerError::Unauthorized)));
-    let other = Extension(Some(test.other_auth.clone()));
-    let denied = rename_keys(state(), other, bucket(), keys("", "a/", &["x"])).await;
+    // `preview_rename` takes `UnrestrictedAuth`, so the token refusals are the extractor's.
+    let missing = extract::<UnrestrictedAuth>(&test.state, None).await;
+    assert_eq!(missing.err(), Some(StatusCode::UNAUTHORIZED));
+    let other = test.other_auth.clone();
+    let denied = rename_keys(
+        state(),
+        UnrestrictedAuth(other),
+        bucket(),
+        keys("", "a/", &["x"]),
+    )
+    .await;
     assert!(matches!(denied, Err(ServerError::Forbidden)));
     // A token limited to some paths could reach keys outside them.
     let restriction = PathRestriction {
         pattern: format!("/{}/**", test.state.get_realm_id()),
         permission: Permission::WRITE,
     };
-    let restricted = Extension(Some(AuthContext {
+    let restricted = AuthContext {
         path_restrictions: Some(vec![restriction]),
         ..test.auth.clone()
-    }));
-    let limited = preview_rename(state(), restricted, bucket(), folders("", "a/")).await;
-    assert!(matches!(limited, Err(ServerError::Forbidden)));
-    let auth = Extension(Some(test.auth.clone()));
+    };
+    let limited = extract::<UnrestrictedAuth>(&test.state, Some(restricted)).await;
+    assert_eq!(limited.err(), Some(StatusCode::FORBIDDEN));
+    let auth = test.auth.clone();
     let unknown = Path("missing".to_string());
-    let gone = preview_rename(state(), auth, unknown, folders("", "a/")).await;
+    let gone = preview_rename(state(), UnrestrictedAuth(auth), unknown, folders("", "a/")).await;
     assert!(matches!(gone, Err(ServerError::NotFound)));
 }
 
 #[tokio::test]
 async fn refuses_bad_folders() {
     let test = setup_state().await;
-    let auth = || Extension(Some(test.auth.clone()));
+    let auth = || test.auth.clone();
     let state = || State(test.state.clone());
     let bucket = || Path(test.bucket.clone());
     for (from, to) in [("a", "b/"), ("a/", "a/"), ("", "../b/")] {
-        let refused = preview_rename(state(), auth(), bucket(), folders(from, to)).await;
+        let refused = preview_rename(
+            state(),
+            UnrestrictedAuth(auth()),
+            bucket(),
+            folders(from, to),
+        )
+        .await;
         assert!(
             matches!(refused, Err(ServerError::BadRequestMessage(_))),
             "{from} {to}"
@@ -122,7 +138,7 @@ async fn refuses_bad_folders() {
         keys("", "a/", &["x", "x"]),
         keys("sub/", "a/", &["x"]),
     ] {
-        let refused = rename_keys(state(), auth(), bucket(), body.clone()).await;
+        let refused = rename_keys(state(), UnrestrictedAuth(auth()), bucket(), body.clone()).await;
         assert!(
             matches!(refused, Err(ServerError::BadRequestMessage(_))),
             "{body:?}"
@@ -133,13 +149,18 @@ async fn refuses_bad_folders() {
 #[tokio::test]
 async fn renames_previewed_keys() {
     let test = setup_state().await;
-    let auth = || Extension(Some(test.auth.clone()));
+    let auth = || test.auth.clone();
     let state = || State(test.state.clone());
     let bucket = || Path(test.bucket.clone());
     let id = object(&test, "x.csv").await;
-    let Json(preview) = preview_rename(state(), auth(), bucket(), folders("", "archive/"))
-        .await
-        .unwrap();
+    let Json(preview) = preview_rename(
+        state(),
+        UnrestrictedAuth(auth()),
+        bucket(),
+        folders("", "archive/"),
+    )
+    .await
+    .unwrap();
     assert_eq!(preview.bucket, test.bucket);
     assert!(!preview.truncated);
     let [item] = preview.items.as_slice() else {
@@ -153,15 +174,20 @@ async fn renames_previewed_keys() {
     assert_eq!(item.conflict, None);
 
     let body = || keys("", "archive/", &["x.csv"]);
-    let Json(renamed) = rename_keys(state(), auth(), bucket(), body())
+    let Json(renamed) = rename_keys(state(), UnrestrictedAuth(auth()), bucket(), body())
         .await
         .unwrap();
     assert_eq!(renamed.items, preview.items);
     // The old key is gone, so the same rename again is a conflict and changes nothing.
-    let again = rename_keys(state(), auth(), bucket(), body()).await;
+    let again = rename_keys(state(), UnrestrictedAuth(auth()), bucket(), body()).await;
     assert!(matches!(again, Err(ServerError::Conflict(_))));
-    let Json(after) = preview_rename(state(), auth(), bucket(), folders("archive/", "done/"))
-        .await
-        .unwrap();
+    let Json(after) = preview_rename(
+        state(),
+        UnrestrictedAuth(auth()),
+        bucket(),
+        folders("archive/", "done/"),
+    )
+    .await
+    .unwrap();
     assert_eq!(after.items[0].from, "archive/x.csv");
 }

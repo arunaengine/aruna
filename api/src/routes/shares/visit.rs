@@ -39,25 +39,26 @@ use axum::response::{IntoResponse, Response};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::relay::{
     ShareRelay, UploadStream, counted_blob, member_error, share_access, upload_error,
 };
-use super::{ShareModeBody, log_event, rfc3339, unix_now};
+use super::{ShareModeBody, log_event, rfc3339};
 use crate::auth::ensure_permission_with;
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::forwarded::client_ip;
+use crate::lookup::bucket_info;
 use crate::mcp::data::store_stream;
 use crate::rate_limit::LocalKey;
 use crate::routes::federation::import::shared_stream;
-use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::objects::page_error;
 use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
+use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::s3::object::pages::{self, ListRequest, PageError, PageScope};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -68,13 +69,9 @@ const MAX_JSON_BYTES: usize = 64 * 1024;
 /// The longest one upload may take; a stalled body also ends after the import idle timeout.
 const UPLOAD_SECS: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct VisitDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     // Uploads stream their body unbuffered; every other visitor body is small JSON.
-    let small = OpenApiRouter::with_openapi(VisitDoc::openapi())
+    let small = OpenApiRouter::new()
         .routes(routes!(open_share))
         .routes(routes!(list_files))
         .routes(routes!(create_ticket))
@@ -188,7 +185,7 @@ pub(crate) fn visit_error(error: ShareError) -> ServerError {
         ),
         ShareError::Denied => ServerError::Forbidden,
         ShareError::Rule(error) => ServerError::BadRequestReason(error.to_string()),
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -236,7 +233,7 @@ pub(crate) fn event(action: ShareAction, key: Option<String>, ip: IpAddr) -> Sha
 async fn active_link(state: &ServerState, id: Ulid, now: u64) -> ServerResult<ShareLink> {
     let link = drive(GetShareOperation::new(id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|link| link.active(now))
         .ok_or_else(unavailable)?;
     // A deactivated creator ends every link at once.
@@ -256,7 +253,7 @@ pub(crate) async fn visited_link(
     let ShareToken::Visit { expires_at, .. } = token else {
         return Err(unavailable());
     };
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let link = active_link(state, token.share_id(), now).await?;
     match link.admits(&token, now) {
         true => Ok((link, expires_at)),
@@ -389,7 +386,7 @@ pub async fn open_share(
     let config = OpenShareConfig {
         token,
         password: request.and_then(|Json(request)| request.password),
-        now: unix_now(),
+        now: unix_timestamp_secs(),
         entry_id: Ulid::generate(),
         client: client_network(ip),
     };
@@ -400,7 +397,7 @@ pub async fn open_share(
         runtime.block_on(drive(OpenShareOperation::new(config), &context))
     })
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?
+    .map_err(|error| ServerError::InternalError(error.into()))?
     .map_err(visit_error)?;
     let OpenedShare {
         link,
@@ -554,7 +551,7 @@ pub(crate) fn sign_ticket(
     (bucket, key): (&str, &str),
     version_id: Option<Ulid>,
 ) -> ServerResult<TicketResponse> {
-    let expires_at = (unix_now() + TICKET_SECS).min(visit_end);
+    let expires_at = (unix_timestamp_secs() + TICKET_SECS).min(visit_end);
     let body = TicketBody {
         share_id: link.id,
         bucket: bucket.to_string(),
@@ -565,7 +562,7 @@ pub(crate) fn sign_ticket(
     };
     let ticket = link
         .ticket(&body)
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(TicketResponse {
         path: format!("/api/v1/shares/download?ticket={ticket}"),
         expires_at: rfc3339(expires_at),
@@ -590,7 +587,7 @@ pub(crate) async fn current_version(
             | HeadObjectError::NoSuchVersion
             | HeadObjectError::DeleteMarker,
         ) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -710,7 +707,7 @@ pub async fn download_file(
     Query(query): Query<DownloadQuery>,
 ) -> ServerResult<Response> {
     let ip = visitor_ip(&state, peer, &headers);
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let share_id = ticket_share(&query.ticket).ok_or_else(unavailable)?;
     let link = active_link(&state, share_id, now).await?;
     let ticket = link
@@ -813,7 +810,7 @@ async fn claim_key(
     wanted: &str,
     user: &UserAccess,
 ) -> ServerResult<String> {
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let until = now + UPLOAD_SECS.as_secs();
     let mut number = 0;
     loop {

@@ -6,24 +6,26 @@ use std::sync::Arc;
 
 use aruna_core::structs::execution::harvest::{HarvestJobSpec, HarvestSelector};
 use aruna_core::structs::execution::job::JobPayload;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_operations::driver::drive;
 use aruna_operations::harvest::create_source::{
     CreateSourceError, CreateSourceInput, CreateSourceOperation,
 };
 use aruna_operations::jobs::service::{lookup_job_dedup, submit_harvest_job};
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 
-use crate::auth::{parse_group_id, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::jobs::job_urls;
 use crate::metadata::ensure_metadata_scope;
-use crate::routes::execution::jobs::{job_urls, map_submit_error};
+use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -90,7 +92,6 @@ pub struct HarvestResponse {
             "report_url": "https://node-a.example.org/api/v1/compute/jobs/01JHRVST0123456789ABCDEFGH/report"
         })),
         (status = 400, description = "Invalid ids, namespace, target prefix or metadata prefix, or a connector that is not OAI-PMH", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token, or no WRITE on the group's metadata path", body = ErrorResponse),
         (status = 404, description = "The connector does not exist in the group", body = ErrorResponse),
         (status = 409, description = "Another source definition, an unfinished run of the source, an idempotency key bound to another job, or a group being deleted", body = ErrorResponse),
@@ -100,11 +101,10 @@ pub struct HarvestResponse {
 )]
 pub async fn submit_harvest(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
     Json(request): Json<HarvestRequest>,
 ) -> ServerResult<(StatusCode, Json<HarvestResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = Ulid::from_string(&connector_id)
         .map_err(|_| ServerError::BadRequestReason("connector_id is not a ULID".to_string()))?;
@@ -184,9 +184,7 @@ fn source_error(error: CreateSourceError) -> ServerError {
         | CreateSourceError::Storage(_)
         | CreateSourceError::Conversion(_)
         | CreateSourceError::Failed
-        | CreateSourceError::InvalidStateEvent { .. } => {
-            ServerError::InternalError(error.to_string())
-        }
+        | CreateSourceError::InvalidStateEvent { .. } => ServerError::InternalError(error.into()),
     }
 }
 

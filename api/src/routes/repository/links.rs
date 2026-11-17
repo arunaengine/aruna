@@ -21,18 +21,19 @@ use aruna_operations::jobs::repository::links::{
     LinkChange, LinkError, change_link, list_links, read_link,
 };
 use aruna_operations::jobs::repository::{Action, TransferError, seal_token, supports};
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use crate::auth::{ensure_permission, ensure_permission_with, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ensure_permission, ensure_permission_with};
 use crate::error::{ErrorResponse, ProfileFindingResponse, ServerError, ServerResult};
+use crate::jobs::job_urls;
 use crate::metadata::{ensure_metadata_scope, load_document_record, parse_document_id};
-use crate::routes::execution::jobs::job_urls;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -305,7 +306,7 @@ pub(in crate::routes) fn link_error(error: LinkError) -> ServerError {
         LinkError::ForeignToken
         | LinkError::Storage(_)
         | LinkError::Conversion(_)
-        | LinkError::Unexpected(_) => ServerError::InternalError(error.to_string()),
+        | LinkError::Unexpected(_) => ServerError::InternalError(error.into()),
     }
 }
 
@@ -425,10 +426,9 @@ pub(in crate::routes) fn metadata_json(
 /// READ on the dataset gates every link route.
 pub(in crate::routes) async fn readable(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     document_id: &str,
 ) -> ServerResult<(AuthContext, Ulid)> {
-    let auth = require_unrestricted_auth(state, auth)?;
     let document_id = parse_document_id(document_id)?;
     let record = load_document_record(state, document_id).await?;
     ensure_permission_with(
@@ -446,7 +446,7 @@ pub(in crate::routes) async fn readable(
 /// on the link's owner node.
 pub(in crate::routes) async fn managed(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     document_id: &str,
     link_id: &str,
 ) -> ServerResult<(AuthContext, RepositoryLink)> {
@@ -569,7 +569,7 @@ An unknown dataset, or a connector that does not exist in the group, returns 404
 )]
 pub async fn create_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(document_id): Path<String>,
     Json(request): Json<CreateLinkRequest>,
 ) -> ServerResult<(StatusCode, Json<RepositoryLinkResponse>)> {
@@ -696,7 +696,7 @@ Every holder of the dataset lists its links. owner_node_url names the node that 
 )]
 pub async fn list_repository_links(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(document_id): Path<String>,
 ) -> ServerResult<Json<Vec<RepositoryLinkResponse>>> {
     let (_, document_id) = readable(&state, auth, &document_id).await?;

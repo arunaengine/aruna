@@ -2,18 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{
-    ValidatedBearer, ensure_permission, ensure_permission_with, require_unrestricted_auth,
-};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ValidatedBearer, ensure_permission, ensure_permission_with};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::routes::storage::blobs::plaintext_holder;
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{
-    BucketInfo, bucket_permission_path, ensure_confined_path,
-};
+use aruna_core::structs::storage::blob::{bucket_permission_path, ensure_confined_path};
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
@@ -32,7 +30,6 @@ use aruna_operations::replication::queue::{QueueBlobOperation, relationship_job_
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::sync::mirror_repair::{
     SyncMirrorIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
     request_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
@@ -53,20 +50,14 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::warn;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 pub mod quarantine;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "data/sync", description = "S3 bucket synchronization"))
-)]
-pub struct SyncApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SyncApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_sync, list_sync))
         .routes(routes!(get_sync, update_sync, delete_sync))
         .routes(routes!(run_sync))
@@ -345,7 +336,6 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
             })
         ),
         (status = 400, description = "The endpoints are identical, a bucket name is empty or contains `/`, the bucket is a workspace bucket, the prefix is not a confined relative path, or the target node id does not parse", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm or path-restricted, no READ on the source bucket, the target node refused the mirror, `not_holder` when `plaintext` is set and the caller is no current key holder of the encrypted source bucket, or `plaintext_required` when the encrypted source would copy into a bucket of this node that does not encrypt",
@@ -369,11 +359,10 @@ node checks WRITE on the target bucket before it accepts its half of the relatio
 )]
 pub async fn create_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateSyncRequest>,
 ) -> ServerResult<(StatusCode, Json<SyncRelationshipResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     validate_endpoint(&request.source.bucket, request.source.prefix.as_deref())?;
     validate_endpoint(&request.target.bucket, request.target.prefix.as_deref())?;
@@ -398,7 +387,7 @@ pub async fn create_sync(
         ));
     }
 
-    let source_info = load_bucket(&state, &request.source.bucket).await?;
+    let source_info = bucket_info(&state, &request.source.bucket).await?;
     ensure_permission(
         &state,
         &auth,
@@ -458,7 +447,7 @@ pub async fn create_sync(
     let context = state.get_ctx();
     stage_mirror_reconcile(&context, &relationship)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     if let Err(error) = create_mirror(
         &state,
         &auth,
@@ -474,10 +463,10 @@ pub async fn create_sync(
 
     if plaintext {
         let consent = consent_write(relationship_consent(relationship.id), auth.user_id)
-            .map_err(ServerError::InternalError)?;
+            .map_err(|error| ServerError::InternalError(error.into()))?;
         store_consent(&context, consent)
             .await
-            .map_err(ServerError::InternalError)?;
+            .map_err(|error| ServerError::InternalError(error.into()))?;
     }
     activate_sync(&state, &relationship).await?;
 
@@ -566,17 +555,15 @@ pub async fn create_sync(
             })
         ),
         (status = 400, description = "The bucket or prefix filter was present but empty", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(params): Query<SyncListParams>,
 ) -> ServerResult<Json<SyncListResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if params.bucket.as_deref().is_some_and(str::is_empty)
         || params.prefix.as_deref().is_some_and(str::is_empty)
     {
@@ -681,7 +668,6 @@ creator may read a relationship, so one created by somebody else is refused rath
             })
         ),
         (status = 400, description = "The path segment is not a valid relationship ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, or the relationship was created by another user", body = ErrorResponse),
         (status = 404, description = "This node holds no relationship with that id, or it is a detached serving stub", body = ErrorResponse)
     ),
@@ -689,10 +675,9 @@ creator may read a relationship, so one created by somebody else is refused rath
 )]
 pub async fn get_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<SyncDetailResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let (relationship, _) = load_relationship(&state, id).await?;
     ensure_creator(&auth, &relationship)?;
@@ -789,7 +774,6 @@ creator may change a relationship, and READ on the source bucket is checked as w
             })
         ),
         (status = 400, description = "The path segment is not a valid relationship ULID, or the relationship is in reference mode and the request asked for anything other than preserve", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, the relationship was created by another user, or no READ on the source bucket", body = ErrorResponse),
         (status = 404, description = "This node holds no source-side relationship with that id, or the source bucket has gone", body = ErrorResponse),
         (status = 500, description = "The change could not be stored, or a resume stored the new state but failed to queue its catch-up backfill; that backfill is then queued with the run endpoint", body = ErrorResponse),
@@ -799,12 +783,11 @@ creator may change a relationship, and READ on the source bucket is checked as w
 )]
 pub async fn update_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(id): Path<String>,
     Json(request): Json<UpdateSyncRequest>,
 ) -> ServerResult<Json<SyncRelationshipResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let id = parse_id(&id)?;
     let mut relationship =
@@ -834,7 +817,7 @@ pub async fn update_sync(
         annotate(&state, &mut response).await?;
         return Ok(Json(response));
     }
-    let source_group_id = load_bucket(
+    let source_group_id = bucket_info(
         &state,
         relationship
             .source
@@ -846,7 +829,7 @@ pub async fn update_sync(
     let context = state.get_ctx();
     stage_mirror_reconcile(&context, &relationship)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     if let Err(error) = create_mirror(
         &state,
         &auth,
@@ -918,7 +901,6 @@ creator may run a relationship, and READ on the source bucket is checked as well
             })
         ),
         (status = 400, description = "The path segment is not a valid relationship ULID, or the stored relationship has no usable source bucket", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, the relationship was created by another user, or no READ on the source bucket", body = ErrorResponse),
         (status = 404, description = "This node holds no source-side relationship with that id, or the source bucket has gone", body = ErrorResponse),
     ),
@@ -926,10 +908,9 @@ creator may run a relationship, and READ on the source bucket is checked as well
 )]
 pub async fn run_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<SyncRunResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let mut relationship =
         get_relationship(&state, id, SyncRelationshipDirection::Outgoing).await?;
@@ -942,7 +923,7 @@ pub async fn run_sync(
         let context = state.get_ctx();
         if !store_sync_status(&context, &relationship)
             .await
-            .map_err(|error| ServerError::InternalError(error.to_string()))?
+            .map_err(|error| ServerError::InternalError(error.into()))?
         {
             return Err(ServerError::NotFound);
         }
@@ -982,7 +963,6 @@ the source bucket for a source-side relationship, the target bucket for a mirror
     responses(
         (status = 204, description = "The relationship is removed on this node and the peer's mirror is being dropped; synchronized objects are retained on both sides"),
         (status = 400, description = "The path segment is not a valid relationship ULID, or the stored relationship has no usable bucket for this node's side", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, the relationship was created by another user, or no WRITE on this node's endpoint bucket", body = ErrorResponse),
         (status = 404, description = "This node holds no relationship with that id, it is already a detached serving stub, or the endpoint bucket has gone", body = ErrorResponse)
     ),
@@ -990,10 +970,9 @@ the source bucket for a source-side relationship, the target bucket for a mirror
 )]
 pub async fn delete_sync(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = parse_id(&id)?;
     let (relationship, direction) = load_relationship(&state, id).await?;
     ensure_creator(&auth, &relationship)?;
@@ -1002,13 +981,13 @@ pub async fn delete_sync(
     let context = state.get_ctx();
     stage_mirror_delete(&context, &relationship)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     match direction {
         // References retain a serving stub for target-held data; other modes are removed.
         SyncRelationshipDirection::Outgoing => {
             remove_outgoing_relationship(&context, relationship.clone())
                 .await
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                .map_err(|error| ServerError::InternalError(error.into()))?;
         }
         SyncRelationshipDirection::Incoming => {
             delete_relationship(&state, relationship.clone(), direction).await?;
@@ -1063,19 +1042,6 @@ fn make_endpoint(
     .map_err(|error| ServerError::BadRequestReason(error.to_string()))
 }
 
-async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(bucket_info) => Ok(bucket_info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
-    }
-}
-
 async fn ensure_source_read(
     state: &ServerState,
     auth: &AuthContext,
@@ -1085,7 +1051,7 @@ async fn ensure_source_read(
         .source
         .bucket()
         .ok_or_else(|| ServerError::BadRequestReason("invalid source ARN".to_string()))?;
-    let bucket_info = load_bucket(state, bucket).await?;
+    let bucket_info = bucket_info(state, bucket).await?;
     ensure_permission(
         state,
         auth,
@@ -1111,7 +1077,7 @@ async fn ensure_sync_write(
         SyncRelationshipDirection::Incoming => relationship.target.bucket(),
     }
     .ok_or_else(|| ServerError::BadRequestReason("invalid sync bucket ARN".to_string()))?;
-    let bucket_info = load_bucket(state, bucket).await?;
+    let bucket_info = bucket_info(state, bucket).await?;
     ensure_permission_with(
         state,
         auth,
@@ -1139,7 +1105,7 @@ async fn create_mirror(
             .target
             .bucket()
             .ok_or(ServerError::BadRequest)?;
-        let bucket_info = load_bucket(state, bucket).await?;
+        let bucket_info = bucket_info(state, bucket).await?;
         ensure_permission_with(
             state,
             auth,
@@ -1239,7 +1205,7 @@ fn map_create_error(error: SyncRelationshipError) -> ServerError {
         SyncRelationshipError::RolledBack => ServerError::BadGatewayReason(
             "the target did not confirm the mirror and it was rolled back".to_string(),
         ),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1274,7 +1240,7 @@ async fn queue_relationship(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(result.queued)
 }
 
@@ -1288,7 +1254,7 @@ async fn store_relationship(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))
+    .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 async fn delete_relationship(
@@ -1301,7 +1267,7 @@ async fn delete_relationship(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))
+    .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 async fn list_relationships(
@@ -1314,7 +1280,7 @@ async fn list_relationships(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))
+    .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 /// Detached stubs only keep retained reference data readable; the management
@@ -1338,7 +1304,7 @@ async fn get_relationship(
     .await
     .map_err(|error| match error {
         SyncRelationshipError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })
     .and_then(visible)
 }
@@ -1359,14 +1325,14 @@ async fn load_relationship(
                 .await
                 .map(|relationship| (relationship, SyncRelationshipDirection::Incoming))
         }
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
 async fn load_job_stats(state: &ServerState, id: Ulid) -> ServerResult<(usize, Option<u64>)> {
     let (pending, oldest) = relationship_job_stats(&state.get_ctx(), id)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok((
         pending,
         oldest.map(|oldest| unix_timestamp_millis().saturating_sub(oldest)),
@@ -1468,10 +1434,12 @@ async fn annotate(
     let id = parse_id(&response.id)?;
     let context = state.get_ctx();
     let consent = read_consent(&context, relationship_consent(id)).await;
-    response.plaintext = consent.map_err(ServerError::InternalError)?.is_some();
+    response.plaintext = consent
+        .map_err(|error| ServerError::InternalError(error.into()))?
+        .is_some();
     let awaiting = awaiting_jobs(&context, id).await;
     response.status.awaiting_key =
-        awaiting.map_err(|error| ServerError::InternalError(error.to_string()))?;
+        awaiting.map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(())
 }
 
@@ -1481,11 +1449,11 @@ async fn refuse_plain_target(state: &ServerState, source: &str, target: &str) ->
     let encrypted = |bucket| source_encrypted(&context, bucket);
     let source = encrypted(source)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     if !source
         || encrypted(target)
             .await
-            .map_err(ServerError::InternalError)?
+            .map_err(|error| ServerError::InternalError(error.into()))?
     {
         return Ok(());
     }

@@ -17,27 +17,24 @@ use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::source::edit::{
     SourceChange, SourceEditError, SourceEditInput, SourceEditOperation, SourceEditResult,
 };
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
 /// Version rows one call reads; `next` continues after them.
 const PAGE: usize = 1000;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct SourceEditDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SourceEditDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(add_sources))
         .routes(routes!(remove_sources))
 }
@@ -113,13 +110,9 @@ impl From<SourceEditResult> for SourceEditResponse {
 /// coordinators change its rows.
 async fn authorize(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     bucket: &str,
 ) -> ServerResult<(AuthContext, BucketInfo)> {
-    let auth = require_realm_auth(state, auth)?;
-    if auth.path_restrictions.is_some() {
-        return Err(ServerError::Forbidden);
-    }
     let info = match drive(
         GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
@@ -128,7 +121,7 @@ async fn authorize(
     {
         Ok(info) => info,
         Err(GetBucketError::NotFound) => return Err(ServerError::NotFound),
-        Err(other) => return Err(ServerError::InternalError(other.to_string())),
+        Err(other) => return Err(ServerError::InternalError(other.into())),
     };
     let path = bucket_permission_path(
         state.get_realm_id(),
@@ -177,7 +170,7 @@ async fn edit(
         Err(error @ (SourceEditError::BucketChanged | SourceEditError::ConnectorChanged)) => {
             Err(ServerError::Conflict(error.to_string()))
         }
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -228,7 +221,6 @@ A version whose new source the caller may not read, or whose new path is not can
             example = json!({"scanned": 1000, "changed": 998, "kept_last": 0, "kept_unproven": 0, "denied": 0, "next": "0a6e6362692d72656673657131"})
         ),
         (status = 400, description = "Invalid connector id or `after`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "Bucket or connector not found on this node", body = ErrorResponse),
         (status = 409, description = "A distributed bucket, or the bucket or connector changed during the edit", body = ErrorResponse)
@@ -237,7 +229,7 @@ A version whose new source the caller may not read, or whose new path is not can
 )]
 pub async fn add_sources(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<AddSourcesRequest>,
 ) -> ServerResult<Json<SourceEditResponse>> {
@@ -251,7 +243,7 @@ pub async fn add_sources(
     let connector = match drive(GetSourceOperation::new(input), &state.get_ctx()).await {
         Ok(found) => found.connector,
         Err(GetSourceError::NotFound) => return Err(ServerError::NotFound),
-        Err(error) => return Err(ServerError::InternalError(error.to_string())),
+        Err(error) => return Err(ServerError::InternalError(error.into())),
     };
     let mapping = SourceMapping {
         connector_id,
@@ -266,7 +258,7 @@ pub async fn add_sources(
     );
     let rules = permission_rules(&state.get_ctx(), &auth, &read_root)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let change = SourceChange::Add {
         mapping,
         connector,
@@ -311,7 +303,6 @@ pub async fn add_sources(
             example = json!({"scanned": 2, "changed": 1, "kept_last": 1, "kept_unproven": 0, "denied": 0})
         ),
         (status = 400, description = "Invalid connector id or `after`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "A distributed bucket, or the bucket or connector changed during the edit", body = ErrorResponse)
@@ -320,7 +311,7 @@ pub async fn add_sources(
 )]
 pub async fn remove_sources(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<RemoveSourcesRequest>,
 ) -> ServerResult<Json<SourceEditResponse>> {

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::tests::distributed::{BUCKET, Node, PEER, distribute, node_id, node_state};
 use aruna_core::structs::storage::distribution::DistributionSnapshot;
 
@@ -25,7 +26,7 @@ async fn settings(
 ) -> ServerResult<Json<ChangeResponse>> {
     settings_distributed(
         State(node.state.clone()),
-        Extension(auth.cloned()),
+        RealmAuth(crate::auth::require_realm_auth(&node.state, auth.cloned())?),
         bearer(),
         Path((node.group_id, set_id)),
         Json(request),
@@ -71,7 +72,7 @@ async fn publishes_changes() {
     // The status reads back every setting, unset ones as null, in the shape the change takes.
     let Json(read) = crate::routes::storage::distributed::get_distributed(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Path((node.group_id, set_id)),
     )
     .await
@@ -91,7 +92,7 @@ async fn publishes_changes() {
 
     let (status, Json(deleted)) = delete_distributed(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         bearer(),
         Path((node.group_id, set_id)),
     )
@@ -111,7 +112,7 @@ async fn member_changes_refused() {
     let leave = |member_id: Ulid| {
         leave_distributed(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             bearer(),
             Path((node.group_id, set_id, member_id)),
         )
@@ -126,7 +127,7 @@ async fn member_changes_refused() {
     let join = |request: JoinRequest| {
         join_distributed(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             bearer(),
             Path((node.group_id, set_id)),
             Json(request),
@@ -170,7 +171,7 @@ async fn transfers_refused() {
     let transfer = |request: TransferRequest| {
         transfer_distributed(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             bearer(),
             Path((node.group_id, set_id)),
             Json(request),
@@ -204,7 +205,7 @@ async fn transfers_refused() {
 async fn status(node: &Node, set_id: Ulid) -> super::super::distributed::DistributedResponse {
     let Json(read) = crate::routes::storage::distributed::get_distributed(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Path((node.group_id, set_id)),
     )
     .await
@@ -227,7 +228,7 @@ async fn copy_waits_fill() {
     let copy = |auth: &AuthContext, request: CopyRequest| {
         copy_distributed(
             State(node.state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             bearer(),
             Path((node.group_id, set_id)),
             Json(request),
@@ -265,7 +266,7 @@ async fn copy_waits_fill() {
     // The filling copy takes no transfer and blocks a split of the range.
     let transfer = transfer_distributed(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         bearer(),
         Path((node.group_id, set_id)),
         Json(TransferRequest {
@@ -301,7 +302,7 @@ async fn split(
     };
     split_distributed(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         bearer(),
         Path((node.group_id, set_id)),
         Json(request),

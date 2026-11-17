@@ -21,7 +21,6 @@ pub mod objects;
 pub mod organize;
 pub mod origin;
 pub mod provenance;
-pub mod relay;
 pub mod releases;
 pub mod rename;
 pub mod routing;

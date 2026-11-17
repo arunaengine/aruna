@@ -20,16 +20,15 @@ use aruna_operations::jobs::lifecycle::ids::session_of;
 use aruna_operations::jobs::service::read_session_reason;
 use aruna_operations::jobs::service::submit_copy_job;
 use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::copy::{
     CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use futures_util::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,16 +36,17 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{blob_permission_path, ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{blob_permission_path, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::owned_session_job;
-use crate::routes::execution::jobs::{
-    JobStatusResponse, coded_response, job_status_response, map_job_request, map_submit_error,
-};
+use crate::jobs::{JobStatusResponse, job_status_response};
+use crate::lookup::bucket_info;
+use crate::routes::execution::jobs::{coded_response, map_submit_error};
 use crate::routes::staging::queue_live_replication;
 use crate::server::state::ServerState;
 
@@ -55,12 +55,8 @@ const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// Objects one staging call brings into the workspace bucket.
 const MAX_STAGED_ITEMS: usize = 64;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "compute/sessions", description = "Interactive notebook sessions")))]
-pub struct JobSessionDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(JobSessionDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_session))
         .routes(routes!(stream_session))
         .routes(routes!(submit_cell))
@@ -428,7 +424,6 @@ like cancel: only the submitter, and anybody else's job answers 404.
             "idle_after_ms": 1800000, "idle_deadline_ms": 1755501800000_u64,
             "credential_expires_at_ms": 1755503600000_u64, "last_event_id": 1, "cells": []
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "Another node runs this session; code `session_not_here`", body = ErrorResponse)
@@ -437,13 +432,12 @@ like cancel: only the submitter, and anybody else's job answers 404.
 )]
 pub async fn get_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => Ok(Json(session_response(&session, true)).into_response()),
         Err(response) => Ok(response),
@@ -474,7 +468,6 @@ like cancel.
     ),
     responses(
         (status = 200, description = "The event stream", body = SessionResponse, content_type = "text/event-stream"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "Another node runs this session; code `session_not_here`", body = ErrorResponse)
@@ -483,15 +476,14 @@ like cancel.
 )]
 pub async fn stream_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Query(query): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, true).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -633,7 +625,6 @@ like cancel.
     responses(
         (status = 202, description = "The cell was queued", body = SubmitCellResponse, example = json!({"cell_id": "cell-1", "position": 1})),
         (status = 400, description = "An invalid cell id or oversized code", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session is not ready, or that cell is busy", body = ErrorResponse),
@@ -644,14 +635,13 @@ like cancel.
 )]
 pub async fn submit_cell(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Json(request): Json<SubmitCellRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -685,7 +675,6 @@ like cancel.
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
     responses(
         (status = 202, description = "The interrupt was sent"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session has ended", body = ErrorResponse)
@@ -694,13 +683,12 @@ like cancel.
 )]
 pub async fn interrupt_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -735,7 +723,6 @@ like cancel.
             "updated_at": "2025-08-18T05:33:20Z", "progress": {"current": 0, "total": null, "unit": "items"},
             "workspace_bucket": "lab-data", "workspace_mode": "existing", "locally_exhausted": false
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "Another node runs this session; code `session_not_here`", body = ErrorResponse)
@@ -744,13 +731,12 @@ like cancel.
 )]
 pub async fn end_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -800,7 +786,6 @@ like cancel, and each source additionally needs the caller's read permission on 
             "failed": []
         })),
         (status = 400, description = "An invalid destination key, too many items, or a source on another node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted, or the caller may not read a source", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session has ended", body = ErrorResponse)
@@ -809,14 +794,13 @@ like cancel, and each source additionally needs the caller's read permission on 
 )]
 pub async fn stage_inputs(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Json(request): Json<SessionInputsRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -827,7 +811,7 @@ pub async fn stage_inputs(
         )));
     }
     let bucket = record.workspace_bucket.clone().ok_or_else(|| {
-        ServerError::InternalError("a session has no workspace bucket".to_string())
+        ServerError::InternalError("a session has no workspace bucket".to_string().into())
     })?;
     let node_id = state.get_node_id().to_string();
     let mut items = Vec::with_capacity(request.items.len());
@@ -928,19 +912,6 @@ fn failed_input(dest_key: String, error: &ServerError) -> FailedInputResponse {
     }
 }
 
-/// The bucket a name resolves to here. Absence reads as 404 like every other
-/// name the caller may not see.
-async fn bucket_info(
-    context: &aruna_operations::driver::DriverContext,
-    bucket: &str,
-) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
-    match drive(GetBucketOperation::new(bucket.to_string()), context).await {
-        Ok(info) => Ok(info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
-    }
-}
-
 /// What one item became: an object in the bucket, or a job still bringing it.
 enum InputOutcome {
     Staged(StagedInputResponse),
@@ -958,8 +929,8 @@ async fn stage_one(
 ) -> ServerResult<InputOutcome> {
     let node_id = state.get_node_id();
     let context = state.get_ctx();
-    let source_info = bucket_info(&context, &item.bucket).await?;
-    let dest_info = bucket_info(&context, bucket).await?;
+    let source_info = bucket_info(state, &item.bucket).await?;
+    let dest_info = bucket_info(state, bucket).await?;
     ensure_permission(
         state,
         auth,
@@ -1003,7 +974,7 @@ async fn stage_one(
     }
     let realm_config = drive(GetConfigOperation::new(state.get_realm_id()), &context)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let input = CopyObjectInput {
         source_bucket: item.bucket,
         source_key: item.key,
@@ -1105,7 +1076,7 @@ fn head_error(error: HeadObjectError) -> ServerError {
         HeadObjectError::NoSuchKey
         | HeadObjectError::NoSuchVersion
         | HeadObjectError::DeleteMarker => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1131,7 +1102,6 @@ like cancel.
             "path": "", "entries": [{"name": "result.txt", "kind": "file", "bytes": 42, "modified_ms": 1755500000000_u64}]
         })),
         (status = 400, description = "A path that leaves the working directory", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session has ended", body = ErrorResponse)
@@ -1140,14 +1110,13 @@ like cancel.
 )]
 pub async fn list_scratch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Query(query): Query<ScratchQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -1184,7 +1153,6 @@ like cancel.
     responses(
         (status = 200, description = "The file bytes", content_type = "application/octet-stream"),
         (status = 400, description = "A path that leaves the working directory", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session has ended", body = ErrorResponse),
@@ -1194,14 +1162,13 @@ like cancel.
 )]
 pub async fn read_scratch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Query(query): Query<ScratchReadQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
+        .map_err(ServerError::from)?;
     let session = match live_session(&state, &record, physical_job_id, false).await {
         Ok(session) => session,
         Err(response) => return Ok(response),
@@ -1222,9 +1189,13 @@ pub async fn read_scratch(
     let encoded = body
         .get("base64")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| ServerError::InternalError("session read carries no bytes".to_string()))?;
+        .ok_or_else(|| {
+            ServerError::InternalError("session read carries no bytes".to_string().into())
+        })?;
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-        .map_err(|_| ServerError::InternalError("session read is not decodable".to_string()))?;
+        .map_err(|_| {
+            ServerError::InternalError("session read is not decodable".to_string().into())
+        })?;
     let content_type = key_content_type(&query.path);
     Ok((
         StatusCode::OK,

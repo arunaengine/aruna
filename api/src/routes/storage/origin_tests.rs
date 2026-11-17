@@ -4,8 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
+use crate::lookup::RELAY_SET_HEADER;
 use crate::mcp::data::{WriteObjectInput, store_text};
-use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
     replicate, write,
@@ -50,7 +51,7 @@ async fn origin(
     };
     get_origin(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         headers,
         Path(bucket.to_string()),
@@ -518,7 +519,7 @@ async fn sources(
 ) -> ServerResult<FileSourcesResponse> {
     get_sources(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Path(bucket.to_string()),
     )
     .await
@@ -580,11 +581,11 @@ async fn by_version(
     let mut headers = HeaderMap::new();
     if let Some(named) = named {
         let value = named.to_string().parse().unwrap();
-        headers.insert(crate::routes::storage::relay::RELAY_NODE_HEADER, value);
+        headers.insert(crate::lookup::RELAY_NODE_HEADER, value);
     }
     get_version_origin(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         headers,
         Query(VersionOriginParams {

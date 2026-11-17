@@ -6,7 +6,8 @@ use super::{
     authorize_credential_issuance, build_credential_restrictions, format_node_id,
     format_system_time, serialize_restrictions,
 };
-use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
+use crate::auth::ValidatedBearer;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
@@ -150,11 +151,10 @@ write scope on that group's data path. A read-only member receives a read-only s
 )]
 pub async fn create_s3_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<S3SessionRequest>,
 ) -> ServerResult<(StatusCode, Json<SessionTokenResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let group_id = request
         .group_id
@@ -226,16 +226,14 @@ group of the caller.
                 }]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_s3_sessions(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<S3SessionsResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let now = SystemTime::now();
     let issued_by = *state.get_node_id().as_bytes();
     let s3_endpoint = state
@@ -245,7 +243,7 @@ pub async fn list_s3_sessions(
         .map(|interface| interface.base_url);
     let sessions = drive(ListSessionsOperation::new(auth.user_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .into_iter()
         .filter(|session| session.issued_by == issued_by && !session.is_expired(now))
         .map(|session| session_summary(session, s3_endpoint.clone()))
@@ -309,15 +307,14 @@ must still be a member of the session's group with READ or WRITE on some path un
 )]
 pub async fn refresh_s3_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(access_key_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<SessionTokenResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let session = drive(GetS3Operation::new(access_key_id.clone()), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)?;
     if session.user_identity != auth.user_id || session.issued_by != *state.get_node_id().as_bytes()
     {
@@ -367,7 +364,6 @@ membership is not rechecked, so a session stays revocable after the caller left 
     params(("access_key_id" = String, Path, description = "Access key id returned by the session exchange")),
     responses(
         (status = 204, description = "Session deleted from this node"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "Session not found on this node, or it belongs to another user", body = ErrorResponse)
     ),
@@ -375,10 +371,9 @@ membership is not rechecked, so a session stays revocable after the caller left 
 )]
 pub async fn revoke_s3_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(access_key_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     drive(
         RevokeS3Operation::new(RevokeS3Config {
             access_key: access_key_id,
@@ -416,7 +411,7 @@ async fn ensure_membership(
     .await
     .map_err(|error| match error {
         GetGroupError::GroupNotFound | GetGroupError::DocNotFound => ServerError::Forbidden,
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.into()),
     })?;
     authorization
         .roles
@@ -429,12 +424,14 @@ async fn ensure_membership(
 fn session_expiry(now: SystemTime, bearer_expiry: u64) -> ServerResult<SystemTime> {
     let now_secs = now
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| ServerError::InternalError("system clock precedes Unix epoch".to_string()))?
+        .map_err(|_| {
+            ServerError::InternalError("system clock precedes Unix epoch".to_string().into())
+        })?
         .as_secs();
     let expires_at = now_secs
         .checked_add(60 * 60)
         .ok_or(ServerError::InternalError(
-            "session expiry overflow".to_string(),
+            "session expiry overflow".to_string().into(),
         ))?
         .min(bearer_expiry);
     if expires_at <= now_secs {
@@ -516,7 +513,7 @@ fn session_summary(session: S3Session, s3_endpoint: Option<String>) -> SessionSu
 fn map_create_error(error: S3SessionError) -> ServerError {
     match error {
         S3SessionError::InvalidExpiry => ServerError::Unauthorized,
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -536,7 +533,7 @@ fn map_refresh_error(error: S3SessionError) -> ServerError {
         S3SessionError::Idle => ServerError::Conflict("session is idle".to_string()),
         S3SessionError::Expired => ServerError::Conflict("session has expired".to_string()),
         S3SessionError::InvalidExpiry => ServerError::Unauthorized,
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -546,7 +543,7 @@ fn map_revoke_error(error: S3SessionError) -> ServerError {
         | S3SessionError::WrongIssuer
         | S3SessionError::WrongOwner
         | S3SessionError::InvalidAccessKey => ServerError::NotFound,
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 

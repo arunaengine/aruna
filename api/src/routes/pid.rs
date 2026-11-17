@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -39,22 +39,14 @@ use aruna_operations::metadata::persistent_id::forward::{
 use aruna_operations::metadata::secondary_ids::IdentifierMatch;
 use aruna_operations::realm::get_config::GetConfigOperation;
 
-use crate::auth::{ValidatedBearer, ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ValidatedBearer, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::{forwarded_auth_token, map_api_error};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags(
-        (name = "pid", description = "w3id persistent identifier landing and lifecycle"),
-        (name = "metadata/pids", description = "Persistent identifiers for metadata documents")
-    )
-)]
-pub struct PidApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(PidApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(resolve_pid, withdraw_pid))
         .routes(routes!(resolve_profile_pid))
         .routes(routes!(list_persistent_ids))
@@ -162,8 +154,13 @@ async fn document_landing(
         if let Some(page) = page {
             return redirect(&page);
         }
-        if let Some(holder) =
-            choose_holder(ctx.as_ref(), state.get_node_id(), document_id, now_ms()).await
+        if let Some(holder) = choose_holder(
+            ctx.as_ref(),
+            state.get_node_id(),
+            document_id,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .await
         {
             let api = holder.urls.api.as_deref().unwrap_or_default();
             return redirect(&rocrate_url(api, document_id));
@@ -176,13 +173,7 @@ async fn document_landing(
 /// already carry the `/api/v1` nest.
 fn rocrate_url(api: &str, document_id: Ulid) -> String {
     let path = format!("/metadata/{document_id}/rocrate?here=true");
-    crate::routes::storage::relay::relay_url(api, &path)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+    crate::lookup::relay_url(api, &path)
 }
 
 #[utoipa::path(
@@ -646,7 +637,7 @@ pub(crate) async fn list_persistent_ids(
     let ctx = state.get_ctx();
     let record = load_document_record(&ctx, document_id)
         .await
-        .map_err(|error| ServerError::InternalError(format!("{error:?}")))?;
+        .map_err(|error| ServerError::InternalError(format!("{error:?}").into()))?;
     let routed = read_pid_routed(&ctx, state.get_realm_id(), document_id).await;
     match routed {
         Ok(Some(mapping)) => {
@@ -836,7 +827,6 @@ fn validated_withdrawal_reason(request: &WithdrawPersistentRequest) -> ServerRes
     responses(
         (status = 204, description = "The withdrawal is durable on the PID authority"),
         (status = 400, description = "Malformed id, unsupported provider, wrong confirmation, or invalid reason", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller lacks WRITE on the realm PID administration path", body = ErrorResponse),
         (status = 404, description = "No identifier is registered for this document", body = ErrorResponse),
         (status = 503, description = "The PID authority is unreachable; retryable", body = ErrorResponse)
@@ -845,12 +835,11 @@ fn validated_withdrawal_reason(request: &WithdrawPersistentRequest) -> ServerRes
 )]
 async fn withdraw_pid(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Json(request): Json<WithdrawPersistentRequest>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
     let reason = validated_withdrawal_reason(&request)?;
     let ctx = state.get_ctx();

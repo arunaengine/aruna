@@ -43,16 +43,17 @@ use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi};
+use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, bearer_auth, ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, bearer_auth, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::metadata::{MetadataRoCrateResponse, RoCrateExportParams};
 use crate::routes::execution::runs::run_answer;
 use crate::routes::metadata::rocrate::export_metadata_rocrate;
-use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::origin::version_answer;
 use crate::server::state::ServerState;
 
@@ -67,12 +68,8 @@ const PIPE_BYTES: usize = 64 * 1024;
 /// A regular file readable by everyone, so an unpacked crate opens without a chmod.
 const FILE_MODE: u16 = 0o100_644;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct ProvenanceApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ProvenanceApiDoc::openapi()).routes(routes!(export_provenance))
+    OpenApiRouter::new().routes(routes!(export_provenance))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -113,17 +110,15 @@ it, as the origin and run routes do.
     responses(
         (status = 200, description = "RO-Crate ZIP stream", content_type = "application/zip"),
         (status = 400, description = "Neither or both of version and dataset given", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn export_provenance(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Query(params): Query<ExportParams>,
 ) -> ServerResult<Response> {
-    require_realm_auth(&state, auth)?;
     // Every hop checks this token again, so an export needs one.
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let start = match (params.version, params.dataset) {
@@ -196,7 +191,7 @@ fn start_export(caller: Caller, start: Start) -> ServerResult<Response> {
             "attachment; filename=\"provenance.zip\"",
         )
         .body(Body::from_stream(body))
-        .map_err(|error| ServerError::InternalError(error.to_string()))
+        .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 enum Start {
@@ -545,7 +540,7 @@ async fn release_crate(
     match read_crate(context.as_ref(), read).await {
         Ok(found) if found.metadata.contains_key(RELEASE_TAG) => {
             serde_json::from_slice(&found.bytes)
-                .map_err(|error| ServerError::InternalError(error.to_string()))
+                .map_err(|error| ServerError::InternalError(error.into()))
         }
         Ok(_) | Err(CrateReadError::Missing) => Err(ServerError::NotFound),
         Err(CrateReadError::Failed(reason)) => Err(ServerError::ServiceUnavailableReason(reason)),
@@ -582,7 +577,7 @@ async fn remote_crate(
             break;
         }
     }
-    serde_json::from_slice(&bytes).map_err(|error| ServerError::InternalError(error.to_string()))
+    serde_json::from_slice(&bytes).map_err(|error| ServerError::InternalError(error.into()))
 }
 
 fn holder_silent() -> ServerError {
@@ -618,7 +613,7 @@ fn classify(answer: ServerResult<serde_json::Value>) -> Read {
 }
 
 fn to_value(answer: &impl serde::Serialize) -> ServerResult<serde_json::Value> {
-    serde_json::to_value(answer).map_err(|error| ServerError::InternalError(error.to_string()))
+    serde_json::to_value(answer).map_err(|error| ServerError::InternalError(error.into()))
 }
 
 /// A run crate read under the token as it holds now, checked again after the run read;
@@ -644,7 +639,9 @@ async fn crate_document(caller: &Caller, auth: &AuthContext, document_id: &str) 
     .await;
     classify(answer.and_then(|(_, Json(answer))| match answer {
         MetadataRoCrateResponse::Projected(projected) => Ok(projected.rocrate),
-        MetadataRoCrateResponse::Raw(_) => Err(ServerError::InternalError("raw view".to_string())),
+        MetadataRoCrateResponse::Raw(_) => {
+            Err(ServerError::InternalError("raw view".to_string().into()))
+        }
     }))
 }
 

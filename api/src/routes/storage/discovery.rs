@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::routing::ensure_group_admin;
 use crate::server::state::ServerState;
@@ -13,22 +14,18 @@ use aruna_operations::groups::imports::discovery::{
     FileOutcome, SetDiscoveryOperation, authorized_preview, bucket_access, read_discovery,
 };
 use aruna_operations::groups::imports::{ImportRuleError, read_import};
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct DiscoveryDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DiscoveryDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_discovery, put_discovery))
         .routes(routes!(preview_rules))
 }
@@ -88,7 +85,7 @@ fn map_error(error: ImportRuleError) -> ServerError {
         ImportRuleError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
         ImportRuleError::NotFound => ServerError::NotFound,
         ImportRuleError::Forbidden => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -115,11 +112,10 @@ fn from_rules(rules: Vec<DiscoveryRule>) -> DiscoveryRules {
 
 async fn admin_rule(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     group_id: &str,
     import_id: &str,
 ) -> ServerResult<(AuthContext, Ulid, Ulid)> {
-    let auth = require_realm_auth(state, auth)?;
     let group_id = parse_group_id(group_id)?;
     ensure_group_admin(state, &auth, group_id).await?;
     let import_id = Ulid::from_str(import_id).map_err(|_| ServerError::BadRequest)?;
@@ -146,7 +142,6 @@ async fn admin_rule(
             example = json!({"rules": [{"pattern": "*.faa.gz", "folder": "proteins/"}]})
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -154,7 +149,7 @@ async fn admin_rule(
 )]
 pub async fn get_discovery(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<DiscoveryRules>> {
     let (_, group_id, import_id) = admin_rule(&state, auth, &group_id, &import_id).await?;
@@ -234,7 +229,6 @@ bucket, including request policies. Tokens with path restrictions are refused.
             ]})
         ),
         (status = 400, description = "Invalid ids, patterns or folders, or patterns that overlap", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "The group is being deleted", body = ErrorResponse)
@@ -243,7 +237,7 @@ bucket, including request policies. Tokens with path restrictions are refused.
 )]
 pub async fn put_discovery(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     Json(request): Json<DiscoveryRules>,
 ) -> ServerResult<Json<DiscoveryRules>> {
@@ -318,7 +312,6 @@ bucket, including request policies. Tokens with path restrictions are refused.
             })
         ),
         (status = 400, description = "Invalid ids, patterns or folders, or patterns that overlap", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -326,7 +319,7 @@ bucket, including request policies. Tokens with path restrictions are refused.
 )]
 pub async fn preview_rules(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     Json(request): Json<DiscoveryPreviewRequest>,
 ) -> ServerResult<Json<DiscoveryPreviewResponse>> {

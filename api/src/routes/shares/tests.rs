@@ -8,8 +8,9 @@ use super::visit::{
     download_file, list_files, open_share, upload_file,
 };
 use super::*;
+use crate::auth::UnrestrictedAuth;
+use crate::lookup::bucket_info;
 use crate::mcp::data::{WriteObjectInput, store_text};
-use crate::routes::storage::deletion::bucket_info;
 use crate::tests::distributed::{BUCKET, Node, node_state};
 use aruna_core::structs::identity::auth::{PathRestriction, Permission, SessionRef};
 use axum::body::{Body, to_bytes};
@@ -72,7 +73,10 @@ async fn create(
 ) -> ServerResult<ShareDetails> {
     create_share(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(crate::auth::require_unrestricted_auth(
+            &node.state,
+            Some(auth.clone()),
+        )?),
         Json(request),
     )
     .await
@@ -172,14 +176,14 @@ async fn owner_manages_links() {
     assert_eq!(created.share.status, ShareStatus::Active);
     let Json(listed) = list_shares(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        UnrestrictedAuth(node.owner.clone()),
     )
     .await
     .unwrap();
     assert_eq!(listed.shares.len(), 1);
     let Json(again) = get_share(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        UnrestrictedAuth(node.owner.clone()),
         Path(created.share.id.clone()),
     )
     .await
@@ -188,14 +192,14 @@ async fn owner_manages_links() {
     // Another user neither reads nor revokes the link.
     let foreign = get_share(
         State(node.state.clone()),
-        Extension(Some(node.stranger.clone())),
+        UnrestrictedAuth(node.stranger.clone()),
         Path(created.share.id.clone()),
     )
     .await;
     assert!(matches!(foreign, Err(ServerError::NotFound)));
     let Json(stranger_list) = list_shares(
         State(node.state.clone()),
-        Extension(Some(node.stranger.clone())),
+        UnrestrictedAuth(node.stranger.clone()),
     )
     .await
     .unwrap();
@@ -203,7 +207,7 @@ async fn owner_manages_links() {
     assert!(open(&node, &created.token, None).await.is_ok());
     revoke_share(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        UnrestrictedAuth(node.owner.clone()),
         Path(created.share.id.clone()),
     )
     .await
@@ -333,7 +337,7 @@ async fn password_opens_once() {
     );
     let Json(log) = share_log(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        UnrestrictedAuth(node.owner.clone()),
         Path(link.share.id.clone()),
         Query(ShareLogQuery::default()),
     )
@@ -481,8 +485,8 @@ async fn unique_upload_names() {
     let claim = aruna_operations::shares::names::ClaimNameOperation::new(
         BUCKET,
         "drop/a.txt",
-        unix_now(),
-        unix_now() + 60,
+        unix_timestamp_secs(),
+        unix_timestamp_secs() + 60,
     );
     assert!(drive(claim, &node.state.get_ctx()).await.unwrap());
     assert_eq!(
@@ -564,7 +568,7 @@ async fn visit_ends_ticket() {
         .await
         .unwrap()
         .unwrap();
-    let visit_end = unix_now() + 5;
+    let visit_end = unix_timestamp_secs() + 5;
     let short_visit = stored.visit_token(visit_end);
     let Json(ticket) = create_ticket(
         State(node.state.clone()),
@@ -597,7 +601,7 @@ async fn owner_sees_counts() {
     upload(&node, &visit, "b.txt", "beta").await.unwrap();
     let Json(listed) = list_shares(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        UnrestrictedAuth(node.owner.clone()),
     )
     .await
     .unwrap();
@@ -606,7 +610,7 @@ async fn owner_sees_counts() {
     assert!(share.last_access_at.is_some());
     let Json(details) = get_share(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        UnrestrictedAuth(node.owner.clone()),
         Path(link.share.id.clone()),
     )
     .await
@@ -660,7 +664,7 @@ async fn deactivation_ends_open() {
     }
     let Json(details) = get_share(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        UnrestrictedAuth(node.owner.clone()),
         Path(link.share.id.clone()),
     )
     .await
@@ -668,7 +672,7 @@ async fn deactivation_ends_open() {
     assert!(details.share.last_access_at.is_none());
     let Json(log) = share_log(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        UnrestrictedAuth(node.owner.clone()),
         Path(link.share.id.clone()),
         Query(ShareLogQuery::default()),
     )

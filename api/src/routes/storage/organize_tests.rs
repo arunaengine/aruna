@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::{RealmAuth, extract};
 use crate::routes::storage::imports::create_import;
 use crate::routes::storage::imports::tests::{bearer, register_backend, request};
 use crate::tests::storage_routing::{TestState, setup_state};
@@ -17,11 +18,16 @@ async fn rule(test: &TestState) -> (String, String) {
     let backend_id = register_backend(test).await;
     let mut body = request(test, backend_id, "raw/");
     body.key_prefix = String::new();
-    let auth = Extension(Some(test.auth.clone()));
+    let auth = test.auth.clone();
     let group = Path(test.group_id.to_string());
-    let (_, Json(created)) = create_import(State(test.state.clone()), auth, group, Json(body))
-        .await
-        .unwrap();
+    let (_, Json(created)) = create_import(
+        State(test.state.clone()),
+        RealmAuth(auth),
+        group,
+        Json(body),
+    )
+    .await
+    .unwrap();
     (test.group_id.to_string(), created.import_id)
 }
 
@@ -77,41 +83,42 @@ async fn refuses_other_callers() {
     let test = setup_state().await;
     let ids = rule(&test).await;
     let path = || Path(ids.clone());
-    let other = || Extension(Some(test.other_auth.clone()));
+    let other = || test.other_auth.clone();
     let restricted = || {
         let pattern = format!("/{}/g/{}/**", test.state.get_realm_id(), test.group_id);
         let restriction = PathRestriction {
             pattern,
             permission: Permission::WRITE,
         };
-        Extension(Some(AuthContext {
+        AuthContext {
             path_restrictions: Some(vec![restriction]),
             ..test.auth.clone()
-        }))
+        }
     };
     for auth in [other(), restricted()] {
         let state = || State(test.state.clone());
         let page = preview_move(
             state(),
-            auth.clone(),
+            RealmAuth(auth.clone()),
             path(),
             moving(PageRequest::default()),
         );
         assert!(matches!(page.await, Err(ServerError::Forbidden)));
         let body = Json(PageRequest::default());
-        let page = preview_duplicates(state(), auth.clone(), path(), body);
+        let page = preview_duplicates(state(), RealmAuth(auth.clone()), path(), body);
         assert!(matches!(page.await, Err(ServerError::Forbidden)));
-        let job = get_job(state(), auth.clone(), path()).await;
+        let job = get_job(state(), RealmAuth(auth.clone()), path()).await;
         assert!(matches!(job, Err(ServerError::Forbidden)));
         let (group, rule) = ids.clone();
         let action = Path((group, rule, "abort".to_string()));
-        let control = control_job(state(), auth.clone(), action).await;
+        let control = control_job(state(), RealmAuth(auth.clone()), action).await;
         assert!(matches!(control, Err(ServerError::Forbidden)));
-        let started = start_duplicates(state(), auth, bearer(&test), path()).await;
+        let started = start_duplicates(state(), RealmAuth(auth), bearer(&test), path()).await;
         assert!(matches!(started, Err(ServerError::Forbidden)));
     }
-    let anonymous = get_job(State(test.state.clone()), Extension(None), path()).await;
-    assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+    // `get_job` takes `RealmAuth`, so the refusal is the extractor's.
+    let anonymous = extract::<RealmAuth>(&test.state, None).await;
+    assert_eq!(anonymous.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -120,7 +127,7 @@ async fn pages_move_preview() {
     let ids = rule(&test).await;
     let path = || Path(ids.clone());
     keys(&test, 250).await;
-    let auth = || Extension(Some(test.auth.clone()));
+    let auth = || test.auth.clone();
     let state = || State(test.state.clone());
 
     let (mut after, mut items) = (None, Vec::new());
@@ -130,7 +137,7 @@ async fn pages_move_preview() {
             limit: Some(100),
             after,
         };
-        let Json(found) = preview_move(state(), auth(), path(), moving(page))
+        let Json(found) = preview_move(state(), RealmAuth(auth()), path(), moving(page))
             .await
             .unwrap();
         assert_eq!((found.total, found.complete), (250, true));
@@ -155,12 +162,12 @@ async fn pages_move_preview() {
         },
     ];
     for page in invalid {
-        let result = preview_move(state(), auth(), path(), moving(page)).await;
+        let result = preview_move(state(), RealmAuth(auth()), path(), moving(page)).await;
         assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
     }
     let mut bad = moving(PageRequest::default());
     bad.request.target = "proteins/".to_string();
-    let result = preview_move(state(), auth(), path(), bad).await;
+    let result = preview_move(state(), RealmAuth(auth()), path(), bad).await;
     assert!(matches!(result, Err(ServerError::BadRequestMessage(_))));
 }
 
@@ -170,52 +177,59 @@ async fn controls_jobs() {
     let ids = rule(&test).await;
     let path = || Path(ids.clone());
     keys(&test, 3).await;
-    let auth = || Extension(Some(test.auth.clone()));
+    let auth = || test.auth.clone();
     let state = || State(test.state.clone());
     let action = |action: &str| {
         let (group, rule) = ids.clone();
         Path((group, rule, action.to_string()))
     };
-    let Json(none) = get_job(state(), auth(), path()).await.unwrap();
+    let Json(none) = get_job(state(), RealmAuth(auth()), path()).await.unwrap();
     assert!(none.is_none());
     let body = || Json(moving(PageRequest::default()).0.request);
 
-    let unsigned = start_move(state(), auth(), Extension(None), path(), body()).await;
+    let unsigned = start_move(state(), RealmAuth(auth()), Extension(None), path(), body()).await;
     assert!(matches!(unsigned, Err(ServerError::Unauthorized)));
-    let (status, Json(started)) = start_move(state(), auth(), bearer(&test), path(), body())
-        .await
-        .unwrap();
+    let (status, Json(started)) =
+        start_move(state(), RealmAuth(auth()), bearer(&test), path(), body())
+            .await
+            .unwrap();
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!((started.kind.as_str(), started.total), ("move", 3));
-    let again = start_duplicates(state(), auth(), bearer(&test), path()).await;
+    let again = start_duplicates(state(), RealmAuth(auth()), bearer(&test), path()).await;
     assert!(matches!(
         again,
         Err(ServerError::Refused(StatusCode::CONFLICT, "job_running", _))
     ));
 
-    let Json(paused) = control_job(state(), auth(), action("pause")).await.unwrap();
+    let Json(paused) = control_job(state(), RealmAuth(auth()), action("pause"))
+        .await
+        .unwrap();
     assert_eq!(paused.state, "paused");
-    let Json(aborted) = control_job(state(), auth(), action("abort")).await.unwrap();
+    let Json(aborted) = control_job(state(), RealmAuth(auth()), action("abort"))
+        .await
+        .unwrap();
     assert_eq!(
         (aborted.state.as_str(), aborted.controls),
         ("aborted", false)
     );
-    let ended = control_job(state(), auth(), action("resume")).await;
+    let ended = control_job(state(), RealmAuth(auth()), action("resume")).await;
     assert!(matches!(
         ended,
         Err(ServerError::Refused(StatusCode::CONFLICT, "no_job", _))
     ));
-    let unknown = control_job(state(), auth(), action("stop")).await;
+    let unknown = control_job(state(), RealmAuth(auth()), action("stop")).await;
     assert!(matches!(unknown, Err(ServerError::BadRequestMessage(_))));
 
     // A new job may start after the abort.
-    let (_, Json(next)) = start_duplicates(state(), auth(), bearer(&test), path())
+    let (_, Json(next)) = start_duplicates(state(), RealmAuth(auth()), bearer(&test), path())
         .await
         .unwrap();
     assert_eq!(next.kind, "duplicates");
-    let Json(shown) = get_job(state(), auth(), path()).await.unwrap();
+    let Json(shown) = get_job(state(), RealmAuth(auth()), path()).await.unwrap();
     assert_eq!(shown.map(|job| job.kind), Some("duplicates".to_string()));
-    let Json(status) = link_status(state(), auth(), path()).await.unwrap();
+    let Json(status) = link_status(state(), RealmAuth(auth()), path())
+        .await
+        .unwrap();
     assert_eq!((status.files, status.conflicts.len()), (None, 0));
 }
 
@@ -301,10 +315,14 @@ async fn shows_rename_total() {
     put(COMPRESSION_MIGRATION_KEYSPACE, record.to_bytes().unwrap()).await;
     put(RENAME_MOVE_KEYSPACE, request.to_bytes().unwrap()).await;
     let shown = || async {
-        let auth = Extension(Some(test.auth.clone()));
-        let Json(job) = get_job(State(test.state.clone()), auth, Path(ids.clone()))
-            .await
-            .unwrap();
+        let auth = test.auth.clone();
+        let Json(job) = get_job(
+            State(test.state.clone()),
+            RealmAuth(auth),
+            Path(ids.clone()),
+        )
+        .await
+        .unwrap();
         let job = job.unwrap();
         (job.kind, job.total, job.counted)
     };
@@ -321,8 +339,8 @@ async fn shows_rename_total() {
     }
     // A pause answers the same total.
     let path = Path((ids.0.clone(), ids.1.clone(), "pause".to_string()));
-    let auth = Extension(Some(test.auth.clone()));
-    let Json(paused) = control_job(State(test.state.clone()), auth, path)
+    let auth = test.auth.clone();
+    let Json(paused) = control_job(State(test.state.clone()), RealmAuth(auth), path)
         .await
         .unwrap();
     assert_eq!((paused.total, paused.counted), (40, true));

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::tests::routes::{seed_group_docs, seed_realm_auth, seed_realm_config, test_state};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::effects::StorageEffect;
@@ -190,7 +191,7 @@ async fn lists_then_removes() {
     let list = || {
         list_holders(
             State(fixture.state.clone()),
-            Extension(Some(fixture.owner.clone())),
+            UnrestrictedAuth(fixture.owner.clone()),
             Path(BUCKET.to_string()),
         )
     };
@@ -204,7 +205,7 @@ async fn lists_then_removes() {
     assert!(users.contains(&grantee.to_string()));
     let removed = remove_holder(
         State(fixture.state.clone()),
-        Extension(Some(fixture.owner.clone())),
+        UnrestrictedAuth(fixture.owner.clone()),
         Path((BUCKET.to_string(), grantee.to_string())),
         Query(RemovalQuery {
             revision: before.revision.clone(),
@@ -226,7 +227,7 @@ async fn lists_then_removes() {
     // The old revision no longer names the current holders.
     let stale = remove_holder(
         State(fixture.state.clone()),
-        Extension(Some(fixture.owner.clone())),
+        UnrestrictedAuth(fixture.owner.clone()),
         Path((BUCKET.to_string(), grantee.to_string())),
         Query(RemovalQuery {
             revision: before.revision,
@@ -268,7 +269,7 @@ async fn federated_keys_checked() {
     }
     let Json(grant) = grant_holder(
         State(fixture.state.clone()),
-        Extension(Some(fixture.owner.clone())),
+        UnrestrictedAuth(fixture.owner.clone()),
         Path(BUCKET.to_string()),
         Json(GrantRequest {
             user_id: foreign.to_string(),
@@ -279,7 +280,7 @@ async fn federated_keys_checked() {
     assert_eq!(grant.user_id, foreign.to_string());
     let anonymous = grant_holder(
         State(fixture.state.clone()),
-        Extension(Some(fixture.owner.clone())),
+        UnrestrictedAuth(fixture.owner.clone()),
         Path(BUCKET.to_string()),
         Json(GrantRequest {
             user_id: UserId::nil(RealmId([9; 32])).to_string(),
@@ -293,7 +294,7 @@ async fn federated_keys_checked() {
     };
     let extend = extend_unlock(
         State(fixture.state.clone()),
-        Extension(Some(stranger)),
+        UnrestrictedAuth(stranger),
         Path(BUCKET.to_string()),
         Json(ExtendRequest {
             generation: 1,

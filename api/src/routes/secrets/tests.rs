@@ -12,13 +12,14 @@ use aruna_operations::driver::drive;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::{Extension, Json};
 use tempfile::TempDir;
 use ulid::Ulid;
 
 use super::{group, node, realm, user, *};
+use crate::auth::UnrestrictedAuth;
 use crate::server::state::ServerState;
 use crate::tests::routes::{test_context, test_state, test_storage};
 
@@ -59,13 +60,13 @@ async fn setup_state() -> (TempDir, Arc<ServerState>, UserId) {
     (dir, state, actor.user_id)
 }
 
-fn auth(state: &ServerState, user_id: UserId) -> Extension<Option<AuthContext>> {
-    Extension(Some(AuthContext {
+fn auth(state: &ServerState, user_id: UserId) -> AuthContext {
+    AuthContext {
         user_id,
         realm_id: state.get_realm_id(),
         path_restrictions: None,
         session: None,
-    }))
+    }
 }
 
 fn create(name: &str) -> Json<CreateSecretRequest> {
@@ -101,29 +102,49 @@ fn path(name: &str) -> Path<String> {
 async fn node_secret_flow() {
     let (_dir, state, admin) = setup_state().await;
     let member = UserId::local(Ulid::generate(), state.get_realm_id());
-    let refused =
-        node::create_node_secret(State(state.clone()), auth(&state, member), create("a")).await;
+    let refused = node::create_node_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, member)),
+        create("a"),
+    )
+    .await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
 
-    let created = node::create_node_secret(State(state.clone()), auth(&state, admin), create("a"));
+    let created = node::create_node_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        create("a"),
+    );
     let (status, Json(created)) = created.await.unwrap();
     assert_eq!(
         (status, created.fields.as_slice()),
         (StatusCode::CREATED, ["token".to_string()].as_slice())
     );
-    let again =
-        node::create_node_secret(State(state.clone()), auth(&state, admin), create("a")).await;
+    let again = node::create_node_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        create("a"),
+    )
+    .await;
     assert!(matches!(again, Err(ServerError::Conflict(_))));
-    let second = node::create_node_secret(State(state.clone()), auth(&state, admin), create("b"));
+    let second = node::create_node_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        create("b"),
+    );
     assert_eq!(second.await.unwrap().0, StatusCode::CREATED);
 
     let query = Query(SecretListQuery {
         cursor: None,
         limit: Some(1),
     });
-    let Json(first) = node::list_node_secrets(State(state.clone()), auth(&state, admin), query)
-        .await
-        .unwrap();
+    let Json(first) = node::list_node_secrets(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        query,
+    )
+    .await
+    .unwrap();
     assert_eq!(first.secrets.len(), 1);
     assert_eq!(first.next_cursor.as_deref(), Some("a"));
     let shown = serde_json::to_string(&first).unwrap();
@@ -131,7 +152,7 @@ async fn node_secret_flow() {
 
     let stale = node::rotate_node_secret(
         State(state.clone()),
-        auth(&state, admin),
+        UnrestrictedAuth(auth(&state, admin)),
         path("a"),
         matching("01JREVIS00123456789ABCDEFG.x"),
         rotate(),
@@ -142,26 +163,35 @@ async fn node_secret_flow() {
     ));
     let rotated = node::rotate_node_secret(
         State(state.clone()),
-        auth(&state, admin),
+        UnrestrictedAuth(auth(&state, admin)),
         path("a"),
         matching(&created.revision),
         rotate(),
     );
     let Json(rotated) = rotated.await.unwrap();
     assert_ne!(rotated.revision, created.revision);
-    let Json(read) = node::get_node_secret(State(state.clone()), auth(&state, admin), path("a"))
-        .await
-        .unwrap();
+    let Json(read) = node::get_node_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        path("a"),
+    )
+    .await
+    .unwrap();
     assert_eq!(read, rotated);
 
     let deleted = node::delete_node_secret(
         State(state.clone()),
-        auth(&state, admin),
+        UnrestrictedAuth(auth(&state, admin)),
         path("a"),
         HeaderMap::new(),
     );
     assert_eq!(deleted.await.unwrap(), StatusCode::NO_CONTENT);
-    let gone = node::get_node_secret(State(state.clone()), auth(&state, admin), path("a")).await;
+    let gone = node::get_node_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        path("a"),
+    )
+    .await;
     assert!(matches!(gone, Err(ServerError::NotFound)));
 }
 
@@ -170,16 +200,28 @@ async fn realm_secret_flow() {
     let (_dir, state, admin) = setup_state().await;
     let mut readable = create("a");
     readable.0.readable = true;
-    let refused =
-        realm::create_realm_secret(State(state.clone()), auth(&state, admin), readable).await;
+    let refused = realm::create_realm_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        readable,
+    )
+    .await;
     assert!(matches!(refused, Err(ServerError::BadRequestReason(_))));
     let mut bad = create("a");
     bad.0.kind = "plugin.x.y".to_string();
-    let refused = realm::create_realm_secret(State(state.clone()), auth(&state, admin), bad).await;
+    let refused = realm::create_realm_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        bad,
+    )
+    .await;
     assert!(matches!(refused, Err(ServerError::BadRequestReason(_))));
 
-    let created =
-        realm::create_realm_secret(State(state.clone()), auth(&state, admin), create("a"));
+    let created = realm::create_realm_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        create("a"),
+    );
     let (_, Json(created)) = created.await.unwrap();
     let replace = Json(ReplaceSecretRequest {
         description: "Renamed".to_string(),
@@ -188,7 +230,7 @@ async fn realm_secret_flow() {
     });
     let replaced = realm::replace_realm_secret(
         State(state.clone()),
-        auth(&state, admin),
+        UnrestrictedAuth(auth(&state, admin)),
         path("a"),
         matching(&created.revision),
         replace,
@@ -196,20 +238,29 @@ async fn realm_secret_flow() {
     let Json(replaced) = replaced.await.unwrap();
     assert_eq!(replaced.description, "Renamed");
     let query = Query(SecretListQuery::default());
-    let Json(listed) = realm::list_realm_secrets(State(state.clone()), auth(&state, admin), query)
-        .await
-        .unwrap();
+    let Json(listed) = realm::list_realm_secrets(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        query,
+    )
+    .await
+    .unwrap();
     assert_eq!(listed.secrets, std::slice::from_ref(&replaced));
     assert!(!serde_json::to_string(&listed).unwrap().contains(CANARY));
 
     let deleted = realm::delete_realm_secret(
         State(state.clone()),
-        auth(&state, admin),
+        UnrestrictedAuth(auth(&state, admin)),
         path("a"),
         HeaderMap::new(),
     );
     assert_eq!(deleted.await.unwrap(), StatusCode::NO_CONTENT);
-    let gone = realm::get_realm_secret(State(state.clone()), auth(&state, admin), path("a")).await;
+    let gone = realm::get_realm_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        path("a"),
+    )
+    .await;
     assert!(matches!(gone, Err(ServerError::NotFound)));
 }
 
@@ -227,31 +278,55 @@ async fn user_secret_readback() {
     let (_dir, state, admin) = setup_state().await;
     let mut readable = create("orcid");
     readable.0.readable = true;
-    let created = user::create_user_secret(State(state.clone()), auth(&state, admin), readable);
+    let created = user::create_user_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        readable,
+    );
     let (_, Json(created)) = created.await.unwrap();
     assert!(created.readable && !created.incomplete);
-    let read = user::read_user_secret(State(state.clone()), auth(&state, admin), path("orcid"));
+    let read = user::read_user_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        path("orcid"),
+    );
     let Json(value) = read.await.unwrap();
     assert_eq!(value.fields["token"], CANARY);
     assert!(!format!("{value:?}").contains(CANARY));
 
     // An unreadable secret never reads back; another user never sees the caller's secrets.
-    user::create_user_secret(State(state.clone()), auth(&state, admin), create("hidden"))
-        .await
-        .map(|(status, _)| assert_eq!(status, StatusCode::CREATED))
-        .unwrap();
-    let refused = user::read_user_secret(State(state.clone()), auth(&state, admin), path("hidden"));
+    user::create_user_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        create("hidden"),
+    )
+    .await
+    .map(|(status, _)| assert_eq!(status, StatusCode::CREATED))
+    .unwrap();
+    let refused = user::read_user_secret(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        path("hidden"),
+    );
     assert!(matches!(refused.await, Err(ServerError::Forbidden)));
     let other = UserId::local(Ulid::generate(), state.get_realm_id());
     let query = Query(SecretListQuery::default());
-    let Json(listed) = user::list_user_secrets(State(state.clone()), auth(&state, other), query)
-        .await
-        .unwrap();
+    let Json(listed) = user::list_user_secrets(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, other)),
+        query,
+    )
+    .await
+    .unwrap();
     assert!(listed.secrets.is_empty());
     let query = Query(SecretListQuery::default());
-    let Json(own) = user::list_user_secrets(State(state.clone()), auth(&state, admin), query)
-        .await
-        .unwrap();
+    let Json(own) = user::list_user_secrets(
+        State(state.clone()),
+        UnrestrictedAuth(auth(&state, admin)),
+        query,
+    )
+    .await
+    .unwrap();
     assert_eq!(own.secrets.len(), 2);
     assert!(!serde_json::to_string(&own).unwrap().contains(CANARY));
 }
@@ -276,7 +351,7 @@ async fn group_secret_managers() {
     let member = UserId::local(Ulid::generate(), state.get_realm_id());
     let refused = group::create_group_secret(
         State(state.clone()),
-        auth(&state, member),
+        UnrestrictedAuth(auth(&state, member)),
         Path(group_id.clone()),
         create("a"),
     );
@@ -285,7 +360,7 @@ async fn group_secret_managers() {
     readable.0.readable = true;
     let refused = group::create_group_secret(
         State(state.clone()),
-        auth(&state, admin),
+        UnrestrictedAuth(auth(&state, admin)),
         Path(group_id.clone()),
         readable,
     );
@@ -295,14 +370,14 @@ async fn group_secret_managers() {
     ));
     let created = group::create_group_secret(
         State(state.clone()),
-        auth(&state, admin),
+        UnrestrictedAuth(auth(&state, admin)),
         Path(group_id.clone()),
         create("a"),
     );
     let (_, Json(created)) = created.await.unwrap();
     let rotated = group::rotate_group_secret(
         State(state.clone()),
-        auth(&state, admin),
+        UnrestrictedAuth(auth(&state, admin)),
         Path((group_id.clone(), "a".to_string())),
         matching(&created.revision),
         rotate(),
@@ -311,7 +386,7 @@ async fn group_secret_managers() {
     assert_ne!(rotated.revision, created.revision);
     let stale = group::delete_group_secret(
         State(state.clone()),
-        auth(&state, admin),
+        UnrestrictedAuth(auth(&state, admin)),
         Path((group_id.clone(), "a".to_string())),
         matching(&created.revision),
     );

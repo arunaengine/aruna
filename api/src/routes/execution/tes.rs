@@ -73,27 +73,24 @@ const DEFAULT_PAGE_SIZE: usize = 256;
 const MAX_PAGE_SIZE: usize = 512;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "tes", description = "GA4GH TES v1.1 task execution facade")),
-    components(schemas(
-        TesServiceInfo,
-        TesServiceType,
-        TesServiceOrganization,
-        TesTask,
-        TesExecutor,
-        TesInput,
-        TesOutput,
-        TesResources,
-        TesFileType,
-        TesState,
-        TesExecutorLog,
-        TesFileLog,
-        TesTaskLog,
-        TesTaskResponse,
-        TesTasksResponse,
-        TesErrorPayload
-    ))
-)]
+#[openapi(components(schemas(
+    TesServiceInfo,
+    TesServiceType,
+    TesServiceOrganization,
+    TesTask,
+    TesExecutor,
+    TesInput,
+    TesOutput,
+    TesResources,
+    TesFileType,
+    TesState,
+    TesExecutorLog,
+    TesFileLog,
+    TesTaskLog,
+    TesTaskResponse,
+    TesTasksResponse,
+    TesErrorPayload
+)))]
 pub struct TesApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -726,7 +723,7 @@ pub async fn create_task(
         };
     }
 
-    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+    let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
             Some(aruna_operations::metadata::AuthToken::internal(
                 caller.auth.clone(),
@@ -903,7 +900,7 @@ pub async fn get_task(
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
 
-    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+    let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
             Some(aruna_operations::metadata::AuthToken::internal(
                 caller.auth.clone(),
@@ -1187,7 +1184,7 @@ pub async fn cancel_task(
         Ok(job_id) => job_id,
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
-    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+    let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
             Some(aruna_operations::metadata::AuthToken::internal(
                 caller.auth.clone(),
@@ -2175,7 +2172,9 @@ async fn ensure_group_write(
     )
     .await
     .map_err(|error| match error {
-        crate::error::ServerError::InternalError(message) => TesError::internal(message),
+        crate::error::ServerError::InternalError(message) => {
+            TesError::internal(message.to_string())
+        }
         _ => TesError::forbidden("no write access to group"),
     })
 }

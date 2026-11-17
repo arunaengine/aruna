@@ -179,7 +179,7 @@ pub(crate) fn server_error(error: crate::error::ServerError) -> CallToolResult {
 
 pub(crate) fn internal_error(message: impl std::fmt::Display) -> CallToolResult {
     server_error(crate::error::ServerError::InternalError(
-        message.to_string(),
+        message.to_string().into(),
     ))
 }
 

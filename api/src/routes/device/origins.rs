@@ -5,18 +5,17 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::require_owner;
+use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::device::sync::outbox::local_origin;
 
 use super::folders::map_folder_error;
@@ -65,7 +64,6 @@ for.
                 "fingerprint": "1000-18a2b3c4d5e6f708-18a2b3c4d5e6f708-2a"
             })),
         (status = 400, description = "The version id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This device did not publish the version, or this node is not a user node", body = ErrorResponse),
         (status = 503, description = "The realm configuration has not reached this device yet, or its state could not be read", body = ErrorResponse)
@@ -74,10 +72,9 @@ for.
 )]
 async fn get_local_origin(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
     Path(version_id): Path<String>,
 ) -> ServerResult<Json<DeviceOrigin>> {
-    require_owner(&state, auth).await?;
     let version_id = Ulid::from_str(&version_id).map_err(|_| ServerError::BadRequest)?;
     let origin = local_origin(&state.get_ctx(), version_id)
         .await

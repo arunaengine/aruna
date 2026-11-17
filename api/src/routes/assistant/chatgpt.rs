@@ -164,7 +164,9 @@ async fn exchange_tokens(
         .finish();
     let response = state
         .assistant_client()
-        .ok_or_else(|| ServerError::InternalError("assistant client unavailable".to_string()))?
+        .ok_or_else(|| {
+            ServerError::InternalError("assistant client unavailable".to_string().into())
+        })?
         .post(format!("{}/oauth/token", state.chatgpt_issuer()))
         .header("content-type", "application/x-www-form-urlencoded")
         .body(body)
@@ -219,7 +221,6 @@ refused. The provider is registered for the calling user alone.
                 "interval_seconds": 5,
                 "expires_at": "2026-04-09T12:15:00Z"
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse),
         (status = 502, description = "The ChatGPT issuer was unreachable or refused the device login", body = ErrorResponse)
@@ -240,7 +241,9 @@ pub async fn start_login(
         .unwrap_or_else(|| "ChatGPT".to_string());
     let response = state
         .assistant_client()
-        .ok_or_else(|| ServerError::InternalError("assistant client unavailable".to_string()))?
+        .ok_or_else(|| {
+            ServerError::InternalError("assistant client unavailable".to_string().into())
+        })?
         .post(format!(
             "{}/api/accounts/deviceauth/usercode",
             state.chatgpt_issuer()
@@ -295,7 +298,7 @@ pub async fn start_login(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok((
         StatusCode::CREATED,
         Json(ChatgptLoginResponse {
@@ -332,7 +335,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     responses(
         (status = 200, description = "How far the login has come", body = LoginPollResponse,
             example = json!({"status": "pending"})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such ChatGPT provider for this user, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
@@ -374,16 +376,20 @@ pub async fn poll_login(
     }
     let mut secret = provider
         .open_secret(state.credential_encryption_key())
-        .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
+        .map_err(|_| {
+            ServerError::InternalError("provider secret unavailable".to_string().into())
+        })?;
     let device_auth_id = secret.device_auth_id.as_ref().ok_or_else(|| {
-        ServerError::InternalError("ChatGPT pending login is incomplete".to_string())
+        ServerError::InternalError("ChatGPT pending login is incomplete".to_string().into())
     })?;
     let user_code = secret.user_code.as_ref().ok_or_else(|| {
-        ServerError::InternalError("ChatGPT pending login is incomplete".to_string())
+        ServerError::InternalError("ChatGPT pending login is incomplete".to_string().into())
     })?;
     let response = state
         .assistant_client()
-        .ok_or_else(|| ServerError::InternalError("assistant client unavailable".to_string()))?
+        .ok_or_else(|| {
+            ServerError::InternalError("assistant client unavailable".to_string().into())
+        })?
         .post(format!(
             "{}/api/accounts/deviceauth/token",
             state.chatgpt_issuer()
@@ -447,7 +453,7 @@ pub async fn poll_login(
     provider.login_interval_seconds = None;
     provider
         .encrypt_secret(state.credential_encryption_key(), &secret)
-        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string()))?;
+        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     save_provider(&state, auth.user_id, expected, provider).await?;
     Ok((
         StatusCode::OK,
@@ -464,13 +470,17 @@ pub(super) async fn refresh_provider(
     let prior_obtained = provider.token_obtained_at;
     let prior_secret = provider
         .open_secret(state.credential_encryption_key())
-        .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
+        .map_err(|_| {
+            ServerError::InternalError("provider secret unavailable".to_string().into())
+        })?;
     let refresh_lock = state.chatgpt_lock(&provider.provider_id).await;
     let _guard = refresh_lock.lock().await;
     let mut provider = load_provider(state, provider.user_id, provider.provider_id).await?;
     let mut secret = provider
         .open_secret(state.credential_encryption_key())
-        .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
+        .map_err(|_| {
+            ServerError::InternalError("provider secret unavailable".to_string().into())
+        })?;
     if provider.token_obtained_at != prior_obtained
         || secret.access_token != prior_secret.access_token
         || secret.refresh_token != prior_secret.refresh_token
@@ -484,7 +494,9 @@ pub(super) async fn refresh_provider(
     })?;
     let response = state
         .assistant_client()
-        .ok_or_else(|| ServerError::InternalError("assistant client unavailable".to_string()))?
+        .ok_or_else(|| {
+            ServerError::InternalError("assistant client unavailable".to_string().into())
+        })?
         .post(format!("{}/oauth/token", state.chatgpt_issuer()))
         .json(&RefreshRequest {
             client_id: CODEX_CLIENT_ID,
@@ -516,7 +528,7 @@ pub(super) async fn refresh_provider(
     provider.token_obtained_at = Some(unix_timestamp_secs());
     provider
         .encrypt_secret(state.credential_encryption_key(), &secret)
-        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string()))?;
+        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     save_provider(state, provider.user_id, expected, provider).await
 }
 

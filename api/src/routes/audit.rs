@@ -21,18 +21,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "metadata/audit", description = "Audit trail reads"))
-)]
-pub struct AuditApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(AuditApiDoc::openapi()).routes(routes!(list_audit))
+    OpenApiRouter::new().routes(routes!(list_audit))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
@@ -241,7 +235,7 @@ pub async fn list_audit(
         ListAuditError::Unavailable => ServerError::ServiceUnavailable,
         ListAuditError::Unauthorized => ServerError::Unauthorized,
         ListAuditError::InvalidCursor => ServerError::BadRequest,
-        ListAuditError::Storage(message) => ServerError::InternalError(message),
+        ListAuditError::Storage(message) => ServerError::InternalError(message.into()),
     })?;
 
     Ok((

@@ -2,10 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{
-    ensure_permission, permission_granted, require_realm_auth, require_unrestricted_auth,
-};
+use crate::auth::RealmAuth;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ensure_permission, permission_granted};
 use crate::error::{ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::federation::AcceptedRealmsSetting;
 use crate::routes::node_names::CoordinatesBody;
 pub use crate::server::state::PortalStatus;
@@ -14,7 +15,7 @@ use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind, ReplicaQuota};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
@@ -55,21 +56,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags(
-        (name = "system/info", description = "Node information and usage"),
-        (name = "system/realm", description = "Realm configuration, placement and quota")
-    )
-)]
-pub struct InfoApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(InfoApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_info))
         .routes(routes!(get_realm_info))
         .routes(routes!(get_realm_placement, mutate_realm_placement))
@@ -1295,7 +1287,7 @@ pub(crate) async fn run_realm_info(
         aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     let realm_authenticated = auth.is_some_and(|auth| auth.realm_id == state.get_realm_id());
 
@@ -1357,7 +1349,7 @@ pub(crate) async fn run_realm_info(
     let (discovery, nodes, quota) = if realm_authenticated {
         let present_nodes = load_realm_presence(state).await;
         let discovery = serde_json::to_value(&config.discovery)
-            .map_err(|error| ServerError::InternalError(error.to_string()))?;
+            .map_err(|error| ServerError::InternalError(error.into()))?;
         let contacts = state.peer_contacts();
         let names = node_names(state, config.realm_id).await;
         let nodes = map_realm_nodes(
@@ -1722,7 +1714,6 @@ management node serves the call and every other node relays it to one.
                 }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 500, description = "The stored realm configuration could not be read or decoded here", body = crate::error::ErrorResponse),
@@ -1744,7 +1735,7 @@ pub async fn get_realm_placement(
         aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     Ok((
         StatusCode::OK,
@@ -1864,30 +1855,23 @@ management node serves the call and every other node relays it to one.
             })
         ),
         (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, a node the realm does not place, a location or label the placement map refuses, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "The strategy is still referenced by a binding or override (`StrategyReferenced`), so removing it would leave a dangling reference, the placement handle space is exhausted, or another update of the realm configuration won the race; the caller may retry", body = crate::error::ErrorResponse),
         (status = 500, description = "The realm configuration could not be read or written here", body = crate::error::ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn mutate_realm_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     request: Result<Json<RealmPlacementRequest>, JsonRejection>,
 ) -> ServerResult<(StatusCode, Json<RealmPlacementResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     let action = request.into_core()?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
+    let actor = actor(&state, &auth);
     let context = state.get_ctx();
     let document = match action {
         RealmPlacementAction::Mutation(mutation) => {
@@ -1925,7 +1909,7 @@ pub async fn mutate_realm_placement(
                     aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
                         ServerError::NotFound
                     }
-                    other => ServerError::InternalError(other.to_string()),
+                    other => ServerError::InternalError(other.into()),
                 })?
         }
     };
@@ -1950,12 +1934,8 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
         HandleAllocationError::Storage(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent placement provisioning conflict; retry".to_string())
         }
-        HandleAllocationError::Storage(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        HandleAllocationError::Storage(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1982,12 +1962,8 @@ fn map_placement_error(error: MutatePlacementError) -> ServerError {
         MutatePlacementError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm placement update conflict; retry".to_string())
         }
-        MutatePlacementError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        MutatePlacementError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -2072,21 +2048,18 @@ management node serves the call and every other node relays it to one.
             })
         ),
         (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a zero device cap or device limit", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = crate::error::ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn set_realm_quota(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<RealmQuotaConfig>,
 ) -> ServerResult<(StatusCode, Json<RealmQuotaConfig>)> {
-    let auth = require_realm_auth(&state, auth)?;
     // Request policies live at this boundary; the operation only checks roles.
     ensure_permission(
         &state,
@@ -2096,11 +2069,7 @@ pub async fn set_realm_quota(
     )
     .await?;
     let (quota, replicas) = request.into_quota_config()?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
+    let actor = actor(&state, &auth);
     let stored = drive(
         SetQuotaOperation::new(SetQuotaConfig {
             actor,
@@ -2124,12 +2093,8 @@ fn map_quota_error(error: SetQuotaError) -> ServerError {
         SetQuotaError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm quota update conflict; retry".to_string())
         }
-        SetQuotaError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        SetQuotaError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -2288,7 +2253,7 @@ impl UsageResponse {
 pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerResult<UsageCounters> {
     drive(LoadCountersOperation::new(key), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))
+        .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 /// The realm or group bucket total with each distributed bucket once; `None` when this node cannot
@@ -2326,7 +2291,7 @@ pub async fn load_realm_usage(
         scope,
     )
     .await
-    .map_err(ServerError::InternalError)
+    .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 #[utoipa::path(
@@ -2382,16 +2347,14 @@ checked, because the figures are realm-wide totals and not per-caller views.
                 "metadata_documents": 4096
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token is path-restricted, or the caller is not a member of this realm", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_usage(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<UsageResponse>)> {
-    require_unrestricted_auth(&state, auth)?;
     let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
     let realm = load_realm_usage(&state, RealmUsageScope::Global).await?;
     let mut response = UsageResponse::new(local, realm.counters);

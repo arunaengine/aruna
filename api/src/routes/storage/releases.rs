@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
 use aruna_operations::s3::bucket::release::publish::{
     self as release_publish, PublishError, PublishInput, ReleaseSpec,
@@ -17,23 +16,20 @@ use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::bucket::metadata::BucketIdentifierBody;
-use super::deletion::bucket_info;
-use super::relay::{copy_miss, query_path, read_holders, relay_json, relay_read, rest_target};
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
+use crate::lookup::{copy_miss, query_path, read_holders, relay_json, relay_read, rest_target};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct ReleasesApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ReleasesApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(publish_release, list_releases))
         .routes(routes!(list_release_files))
 }
@@ -123,7 +119,6 @@ under `prefix`, or nothing is published.
             "replayed": false
         })),
         (status = 400, description = "Invalid identifier link or run id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the bucket, neither admin nor curator, or a file under the prefix is not readable", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "The key changed while the release was written", body = ErrorResponse),
@@ -133,13 +128,12 @@ under `prefix`, or nothing is published.
 )]
 pub async fn publish_release(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Path(bucket): Path<String>,
     Json(request): Json<PublishReleaseRequest>,
 ) -> ServerResult<Json<PublishReleaseResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let spec = release_spec(&request)?;
     let info = bucket_info(&state, &bucket).await?;
     // In a distributed bucket the coordinator of the key's range writes it.
@@ -220,7 +214,6 @@ fn release_spec(request: &PublishReleaseRequest) -> ServerResult<ReleaseSpec> {
             "releases": [{"key": "bakta/6.0/ro-crate-metadata.json", "version_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "label": "6.0", "prefix": "bakta/6.0/"}],
             "complete": true
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "The releases could not be read now", body = ErrorResponse)
     ),
@@ -228,11 +221,10 @@ fn release_spec(request: &PublishReleaseRequest) -> ServerResult<ReleaseSpec> {
 )]
 pub async fn list_releases(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<ReleaseListResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let scope = BucketScope {
         realm_id: state.get_realm_id(),
@@ -353,7 +345,6 @@ pub struct ReleaseFilesResponse {
             "next": "db/pfam/"
         })),
         (status = 400, description = "Invalid version id, delimiter or limit", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the release crate", body = ErrorResponse),
         (status = 404, description = "Bucket not found, or the version is gone or no release", body = ErrorResponse),
         (status = 503, description = "The release crate could not be read now", body = ErrorResponse)
@@ -362,13 +353,12 @@ pub struct ReleaseFilesResponse {
 )]
 pub async fn list_release_files(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Path((bucket, version_id)): Path<(String, String)>,
     Query(params): Query<ReleaseFilesParams>,
 ) -> ServerResult<Json<ReleaseFilesResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let version: Ulid = (version_id.parse())
         .map_err(|_| ServerError::BadRequestMessage(format!("`{version_id}` is not an id")))?;
     let folders = match params.delimiter.as_deref() {

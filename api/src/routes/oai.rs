@@ -12,7 +12,6 @@ use axum::response::Response;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -61,14 +60,8 @@ const OAI_PMH_OPEN: &str = concat!(
     "http://www.openarchives.org/OAI/2.0/OAI-PMH.xsd\">"
 );
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "oai", description = "OAI-PMH 2.0 metadata harvesting"))
-)]
-pub struct OaiApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(OaiApiDoc::openapi()).routes(routes!(handle_oai, handle_oai_post))
+    OpenApiRouter::new().routes(routes!(handle_oai, handle_oai_post))
 }
 
 /// The six protocol arguments, already validated against the verb's matrix.
@@ -775,6 +768,7 @@ fn status_response(status: StatusCode) -> Response {
 
 /// Escapes the five XML entities and drops characters XML 1.0 cannot represent,
 /// so a conforming harvester can always parse the response.
+/// Not `quick_xml::escape::escape`: that one writes `\r` as `&#13;`, this keeps it raw.
 fn escape_xml(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::UnrestrictedAuth;
 use crate::auth::{
     ValidatedBearer, ensure_permission, permission_granted, require_unrestricted_auth,
 };
@@ -60,18 +61,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{Instrument, Span, field, info_span, trace, warn};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "access/groups", description = "Group management operations"))
-)]
-pub struct GroupsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(GroupsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_group, list_groups))
         .routes(routes!(get_group, update_group, delete_group))
         .routes(routes!(set_group_location))
@@ -370,7 +365,7 @@ pub(crate) async fn load_group(
 fn map_group_error(error: GetGroupError) -> ServerError {
     match error {
         GetGroupError::GroupNotFound | GetGroupError::DocNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -459,7 +454,6 @@ realm's per-user group quota, from which WRITE on the realm group-admin path exe
             })
         ),
         (status = 400, description = "Malformed request body, or a name that is empty, blank or longer than 256 bytes once trimmed; the name is checked here, so a user node refuses it without forwarding", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse),
         (status = 409, description = "The caller's group quota is exhausted, or a concurrent create conflicted; the latter is retryable unchanged", body = ErrorResponse),
         (status = 503, description = "No eligible realm peer accepted the create forwarded from a user node; retryable, the response carries Retry-After", body = ErrorResponse)
@@ -526,7 +520,7 @@ pub async fn create_group(
     } else {
         let realm_config = drive(GetConfigOperation::new(realm_id), &state.get_ctx())
             .await
-            .map_err(|err| ServerError::InternalError(err.to_string()))?;
+            .map_err(|err| ServerError::InternalError(err.into()))?;
         realm_config.quota.max_groups_for(&auth.user_id)
     };
 
@@ -568,7 +562,7 @@ pub async fn create_group(
             ServerError::Conflict("concurrent group creation conflict; retry".to_string())
         }
         CreateGroupError::InvalidDisplayName => ServerError::BadRequest,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     create_span.record("group_id", field::display(result.0.group_id));
     request_span.record("group_id", field::display(result.0.group_id));
@@ -631,17 +625,15 @@ because every realm member sees each group's id, realm and display name.
             })
         ),
         (status = 400, description = "The `include` parameter names an unsupported extra", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_groups(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<ListGroupsQuery>,
 ) -> ServerResult<(StatusCode, Json<ListGroupsResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let include_roles = parse_group_include(query.include.as_deref())?;
     let limit = query.limit_or(100).clamp(1, 1_000);
     let offset = query.offset_or(0);
@@ -650,7 +642,7 @@ pub async fn list_groups(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.into()))?;
     Ok((
         StatusCode::OK,
         Json(ListGroupsResponse {
@@ -692,7 +684,7 @@ async fn build_api_groups(
                 &state.get_ctx(),
             )
             .await
-            .map_err(|err| ServerError::InternalError(err.to_string()))?;
+            .map_err(|err| ServerError::InternalError(err.into()))?;
             let is_member = is_group_member(&auth_doc, caller);
             Some(map_visible_roles(auth_doc, group.realm_id, is_member))
         } else {
@@ -750,7 +742,6 @@ because every realm member may look up any group in the realm.
             })
         ),
         (status = 400, description = "The path segment is not a valid ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
@@ -850,7 +841,6 @@ administrative path or on the realm group-administration path.
             })
         ),
         (status = 400, description = "The path segment is not a valid ULID, or the name is empty or longer than 256 characters", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller administers neither the group nor the realm's groups", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse),
         (status = 409, description = "This node is a device, a concurrent write conflicted, or the group's bucket cut over; the latter two are retryable unchanged", body = ErrorResponse)
@@ -948,7 +938,6 @@ prefix.
              "dataset_location": {"bucket": "lab-data", "prefix": "datasets/"}
          })),
         (status = 400, description = "Invalid group id, bucket name or prefix, or a bucket of another group or missing on this node, with the reason in the message", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, the caller administers neither the group nor the realm's groups, or WRITE is denied on the bucket", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse),
         (status = 409, description = "This node is a device, a concurrent write conflicted, or the group's bucket cut over; the latter two are retryable unchanged", body = ErrorResponse),
@@ -1021,7 +1010,6 @@ administrative path or on the realm group-administration path.
     responses(
         (status = 204, description = "Empty group deleted, or its deletion was already committed"),
         (status = 400, description = "Invalid group identifier", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller may not administer this group", body = ErrorResponse),
         (status = 404, description = "Group not found", body = ErrorResponse),
         (status = 409, description = "Group still owns resources, or deletion must be retried", body = ErrorResponse),
@@ -1133,7 +1121,6 @@ carrying WRITE on the group's administrative path or on the realm group-administ
             })
         ),
         (status = 400, description = "Invalid group identifier", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller may not administer this group", body = ErrorResponse),
         (status = 404, description = "Group not found", body = ErrorResponse),
         (status = 503, description = "This node cannot run the check", body = ErrorResponse)
@@ -1201,7 +1188,7 @@ fn map_rename_error(error: UpdateGroupError) -> ServerError {
         UpdateGroupError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent group update conflict; retry".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1210,7 +1197,7 @@ fn map_member_error(error: AddUserError) -> ServerError {
         AddUserError::Unauthorized => ServerError::Forbidden,
         AddUserError::InvalidUserId => ServerError::BadRequest,
         AddUserError::RoleNotFound | AddUserError::DocNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1225,7 +1212,7 @@ fn map_role_error(error: AddRoleError) -> ServerError {
         AddRoleError::CheckPermissionsError(
             AuthorizationError::GroupNotFound | AuthorizationError::DocNotFound,
         ) => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1237,7 +1224,7 @@ fn map_removal_error(error: RemoveFromError) -> ServerError {
         RemoveFromError::LastAdmin => {
             ServerError::Conflict("the last admin of a group cannot be removed".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1306,7 +1293,6 @@ Membership is the only permission check, so a realm administrator who is not a m
             })
         ),
         (status = 400, description = "The path segment is not a valid ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller is not a member of the group", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse)
     ),
@@ -1427,7 +1413,6 @@ member list is never exposed to a non-member.
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, or the caller is not a member of the group", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -1565,7 +1550,6 @@ administrative path for the user being added, so authority can be granted per me
             })
         ),
         (status = 400, description = "Malformed ids, a user id standing for everyone, or no default `user` role to fall back on", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path for this member", body = ErrorResponse),
         (status = 404, description = "No such group on this node, or one of the requested roles does not exist", body = ErrorResponse),
         (status = 409, description = "This node is a device; group changes are made through the realm", body = ErrorResponse)
@@ -1669,7 +1653,6 @@ permission; removing anyone else requires WRITE on the group's administrative pa
     responses(
         (status = 204, description = "The membership or role assignment is gone"),
         (status = 400, description = "Malformed group, user or role id, or a user id standing for everyone", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path for this member", body = ErrorResponse),
         (status = 409, description = "The removal would leave the group without an administrator, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
@@ -1745,7 +1728,6 @@ because the caller is the only user affected.
     responses(
         (status = 204, description = "The caller no longer holds any role in the group"),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted", body = ErrorResponse),
         (status = 409, description = "The caller is the group's last administrator, or this node is a device where group changes are made through the realm", body = ErrorResponse)
     ),
@@ -1834,7 +1816,6 @@ administrative path.
             })
         ),
         (status = 400, description = "Reserved or empty name, an unknown grant value, a permission path outside the group, a malformed assigned user, or a public role asking for more than `READ`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path", body = ErrorResponse),
         (status = 404, description = "No such group on this node", body = ErrorResponse),
         (status = 409, description = "This node is a device; group changes are made through the realm", body = ErrorResponse)
@@ -1924,7 +1905,7 @@ pub async fn create_group_role(
     let role = map_roles(auth_doc, realm_id)
         .into_iter()
         .find(|role| role.role_id == role_id.to_string())
-        .ok_or_else(|| ServerError::InternalError("created role missing".to_string()))?;
+        .ok_or_else(|| ServerError::InternalError("created role missing".to_string().into()))?;
 
     // A DENY rule can narrow existing READ scopes.
     if narrows {
@@ -1961,7 +1942,6 @@ administrative path.
     responses(
         (status = 204, description = "The role and all of its assignments are gone"),
         (status = 400, description = "Malformed group or role id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted, or the caller lacks WRITE on the group's administrative path", body = ErrorResponse),
         (status = 404, description = "No such role in this group, or the group is not present on this node", body = ErrorResponse),
         (status = 409, description = "The built-in `admin` role cannot be deleted, or this node is a device where group changes are made through the realm", body = ErrorResponse)
@@ -2004,7 +1984,7 @@ pub async fn delete_group_role(
         RemoveGroupError::AdminRoleUndeletable => {
             ServerError::Conflict("the admin role cannot be deleted".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
 
@@ -2092,19 +2072,17 @@ bucket level and READ on the bucket or listed prefix inside one.
             })
         ),
         (status = 400, description = "Malformed group id, a prefix outside this node's group data path, or an unreadable continuation token", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm, the caller is not a member of the group, or the caller lacks READ on the browsed path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_data_paths(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
     Path(group_id): Path<String>,
     Query(query): Query<DataPathsQuery>,
 ) -> ServerResult<(StatusCode, Json<DataPathsResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let (_, auth_doc) = load_group(&state, group_id).await?;
     if !is_group_member(&auth_doc, auth.user_id) {
@@ -2212,7 +2190,7 @@ async fn list_group_buckets(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.into()))?;
 
     let entries = result
         .buckets
@@ -2294,7 +2272,7 @@ async fn listed_bucket(
     {
         Ok(info) => Ok(Some(info)),
         Err(GetBucketError::NotFound) => Ok(None),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
+        Err(err) => Err(ServerError::InternalError(err.into())),
     }
 }
 
@@ -2310,7 +2288,7 @@ pub(crate) async fn get_bucket_group(
     {
         Ok(info) => Ok(Some(info.group_id)),
         Err(GetBucketError::NotFound) => Ok(None),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
+        Err(err) => Err(ServerError::InternalError(err.into())),
     }
 }
 
