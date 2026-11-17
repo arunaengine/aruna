@@ -2,12 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoError, IoResult, Next};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::Operation;
-use aruna_core::rows::read_row;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::types::Effects;
+use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,49 +38,91 @@ pub enum GetBucketError {
     Incomplete,
 }
 
-impl From<IoError> for GetBucketError {
-    fn from(error: IoError) -> Self {
-        match error {
-            IoError::Storage(error) => Self::StorageError(error),
-            IoError::Unexpected { expected, got } => Self::InvalidStateEvent {
-                state: GetBucketState::ReadBucket,
-                expected,
-                received: got,
-            },
-            _ => Self::Incomplete,
-        }
-    }
-}
-
 #[derive(Debug, PartialEq)]
 pub struct GetBucketOperation {
     bucket: String,
+    state: GetBucketState,
+    result: Option<Result<BucketInfo, GetBucketError>>,
 }
 
 impl GetBucketOperation {
     pub fn new(bucket: String) -> Self {
-        Self { bucket }
+        Self {
+            bucket,
+            state: GetBucketState::Init,
+            result: None,
+        }
+    }
+
+    fn emit_error(&mut self, error: GetBucketError) -> Effects {
+        self.state = GetBucketState::Error;
+        self.result = Some(Err(error));
+        smallvec![]
+    }
+
+    fn handle_init(&mut self) -> Effects {
+        self.state = GetBucketState::ReadBucket;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.bucket.as_bytes().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn handle_bucket_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(GetBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: (event).label(),
+            });
+        };
+
+        self.state = GetBucketState::Finish;
+        self.result = Some(match value {
+            Some(bytes) => BucketInfo::from_bytes(&bytes).map_err(GetBucketError::ConversionError),
+            None => Err(GetBucketError::NotFound),
+        });
+        smallvec![]
     }
 }
 
-impl Operation for GetBucketOperation {
+impl EffectOperation for GetBucketOperation {
     type Output = BucketInfo;
     type Error = GetBucketError;
 
-    fn first(&mut self) -> Result<Next<BucketInfo>, GetBucketError> {
-        Ok(Next::Call(read_row(
-            S3_BUCKET_KEYSPACE,
-            self.bucket.as_bytes(),
-        )))
+    fn start(&mut self) -> Effects {
+        self.handle_init()
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<BucketInfo>, GetBucketError> {
-        let bytes = result.value()?.ok_or(GetBucketError::NotFound)?;
-        Ok(Next::Done(BucketInfo::from_bytes(&bytes)?))
+    fn step(&mut self, event: Event) -> Effects {
+        match (&self.state, event) {
+            (GetBucketState::ReadBucket, Event::Storage(StorageEvent::Error { error })) => {
+                self.emit_error(error.into())
+            }
+            (GetBucketState::ReadBucket, event) => self.handle_bucket_read(event),
+            (_, event) => self.emit_error(GetBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "no event",
+                received: (event).label(),
+            }),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, GetBucketState::Finish | GetBucketState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.result.unwrap_or(Err(GetBucketError::Incomplete))
     }
 
     fn expected_error(error: &Self::Error) -> bool {
         matches!(error, GetBucketError::NotFound)
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
     }
 }
 
@@ -86,11 +130,10 @@ impl Operation for GetBucketOperation {
 mod state_machine_tests {
     use super::{GetBucketError, GetBucketOperation};
     use aruna_core::UserId;
-    use aruna_core::calls::{IoError, IoResult, Next};
-    use aruna_core::errors::StorageError;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-    use aruna_core::operation::Operation;
-    use aruna_core::rows::read_row;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::format::Compression;
@@ -110,22 +153,34 @@ mod state_machine_tests {
         }
     }
 
-    fn read_result(value: Option<Vec<u8>>) -> IoResult {
-        IoResult::Values(vec![value.map(Into::into)])
+    fn read_result(bucket: &str, value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: bucket.as_bytes().to_vec().into(),
+            value: value.map(Into::into),
+        })
     }
 
     #[test]
     fn bucket_not_found() {
         let mut operation = GetBucketOperation::new("missing".to_owned());
+
+        assert!(!operation.is_complete());
+        let effects = operation.start();
         assert_eq!(
-            operation.first(),
-            Ok(Next::Call(read_row(
-                S3_BUCKET_KEYSPACE,
-                b"missing".as_slice()
-            )))
+            effects.as_slice(),
+            &[Effect::Storage(StorageEffect::Read {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: b"missing".to_vec().into(),
+                txn_id: None,
+            })]
         );
-        let missing = operation.next(read_result(None));
-        assert_eq!(missing, Err(GetBucketError::NotFound));
+        assert!(!operation.is_complete());
+
+        let effects = operation.step(read_result("missing", None));
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize(), Err(GetBucketError::NotFound));
     }
 
     #[test]
@@ -133,16 +188,23 @@ mod state_machine_tests {
         let info = fixed_bucket_info();
         let bytes = info.to_bytes().expect("fixture encodes");
         let mut operation = GetBucketOperation::new("bucket".to_owned());
-        assert_eq!(
-            operation.next(read_result(Some(bytes))),
-            Ok(Next::Done(info))
-        );
+        operation.start();
+
+        let effects = operation.step(read_result("bucket", Some(bytes)));
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize(), Ok(info));
     }
 
     #[test]
     fn malformed_record_rejected() {
         let mut operation = GetBucketOperation::new("bucket".to_owned());
-        let error = (operation.next(read_result(Some(vec![0xff, 0x00, 0x01]))))
+        operation.start();
+
+        operation.step(read_result("bucket", Some(vec![0xff, 0x00, 0x01])));
+        let error = operation
+            .finalize()
             .expect_err("malformed record must fail");
         assert!(
             matches!(error, GetBucketError::ConversionError(_)),
@@ -151,17 +213,58 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn io_errors_map() {
-        let storage = StorageError::ReadError("boom".to_string());
-        let error = GetBucketError::from(IoError::Storage(storage.clone()));
-        assert_eq!(error, GetBucketError::StorageError(storage));
+    fn storage_error_finalize() {
         let mut operation = GetBucketOperation::new("bucket".to_owned());
-        let error = operation
-            .next(IoResult::Done)
-            .expect_err("wrong result must fail");
+        operation.start();
+
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: aruna_core::errors::StorageError::ReadError("boom".to_string()),
+        }));
+
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(GetBucketError::StorageError(
+                aruna_core::errors::StorageError::ReadError("boom".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_event() {
+        let mut operation = GetBucketOperation::new("bucket".to_owned());
+        operation.start();
+
+        assert!(
+            operation
+                .step(Event::Storage(StorageEvent::SyncAllFinished))
+                .is_empty(),
+            "invalid event emits no effects"
+        );
+        let error = operation.finalize().expect_err("invalid event must fail");
         assert!(matches!(error, GetBucketError::InvalidStateEvent { .. }));
-        let aborted = GetBucketError::from(IoError::Aborted);
-        assert_eq!(aborted, GetBucketError::Incomplete);
+    }
+
+    #[test]
+    fn rejects_late_events() {
+        // An event after the answer, or before start, is refused instead of ignored.
+        let info = fixed_bucket_info();
+        let mut finished = GetBucketOperation::new("bucket".to_owned());
+        finished.start();
+        finished.step(read_result("bucket", Some(info.to_bytes().unwrap())));
+        finished.step(read_result("bucket", None));
+        assert!(matches!(
+            finished.finalize(),
+            Err(GetBucketError::InvalidStateEvent { .. })
+        ));
+        let mut fresh = GetBucketOperation::new("bucket".to_owned());
+        assert!(fresh.step(read_result("bucket", None)).is_empty());
+        assert!(fresh.is_complete());
+        assert!(matches!(
+            fresh.finalize(),
+            Err(GetBucketError::InvalidStateEvent { .. })
+        ));
     }
 
     #[test]
@@ -172,5 +275,11 @@ mod state_machine_tests {
         assert!(!GetBucketOperation::expected_error(
             &GetBucketError::Incomplete
         ));
+    }
+
+    #[test]
+    fn early_finalize_incomplete() {
+        let operation = GetBucketOperation::new("bucket".to_owned());
+        assert_eq!(operation.finalize(), Err(GetBucketError::Incomplete));
     }
 }
