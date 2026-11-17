@@ -8,15 +8,20 @@ use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::execution::notification_watch::{
-    WATCH_USER_CAP, WatchSubscription, watch_subscription_prefix,
+    WATCH_USER_CAP, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
+    watch_subscription_prefix,
 };
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::{Key, KeySpace, Value};
 use ulid::Ulid;
 
 use crate::notifications::unexpected;
+use crate::notifications::watch::check::{WatchCheckError, WatchCheckOperation};
 use crate::notifications::watch::digest::dirty_marker_write;
+use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
-    WatchReplication, WatchSubscriptionError, watch_subscription_target,
+    WatchReplication, WatchSubscriptionError, validated_subscription, watch_subscription_target,
+    watch_upsert_replication,
 };
 use crate::sync::outbox_record::{outbox_write_entry, schedule_drain_effect};
 
@@ -227,6 +232,80 @@ impl Operation for StoreWatchOperation {
             Ok(changed) => Ok(Next::Done(changed)),
             Err(error) => self.failed(error),
         }
+    }
+}
+
+/// Creates a watch on the holder: the holder checks the owner's READ on the watched path itself,
+/// since a proxying peer's assertion is not authority, then stores the watch and its replication.
+#[derive(Debug, PartialEq)]
+pub struct CreateWatchOperation {
+    subscription: WatchSubscription,
+    replication: Option<WatchReplication>,
+    storing: bool,
+}
+
+impl CreateWatchOperation {
+    pub fn new(
+        local: aruna_core::NodeId,
+        owner: UserId,
+        (path_prefix, event_mask): (String, WatchEventMask),
+        authorization: WatchAuthorizationBinding,
+        now_ms: u64,
+    ) -> Result<Self, WatchSubscriptionError> {
+        let subscription =
+            validated_subscription(owner, path_prefix, event_mask, now_ms, authorization)?;
+        let replication = watch_upsert_replication(local, &subscription)?;
+        Ok(Self {
+            subscription,
+            replication: Some(replication),
+            storing: false,
+        })
+    }
+}
+
+impl Operation for CreateWatchOperation {
+    type Output = WatchSubscription;
+    type Error = WatchSubscriptionError;
+
+    fn first(&mut self) -> Result<Next<WatchSubscription>, WatchSubscriptionError> {
+        let owner = self.subscription.owner;
+        let auth = AuthContext {
+            user_id: owner,
+            realm_id: owner.realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let watch = &self.subscription;
+        let check = WatchCheckOperation::creation(
+            owner.realm_id,
+            &auth,
+            &watch.path_prefix,
+            watch.event_mask,
+        );
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<WatchSubscription>, WatchSubscriptionError> {
+        if self.storing {
+            result.child::<bool, WatchSubscriptionError>()??;
+            return Ok(Next::Done(self.subscription.clone()));
+        }
+        let check = result.child::<WatchAuthorization, WatchCheckError>()?;
+        match check.map_err(|error| WatchSubscriptionError::Storage(error.to_string()))? {
+            WatchAuthorization::Authorized => {}
+            WatchAuthorization::Denied(reason) => {
+                return Err(WatchSubscriptionError::Unauthorized(reason.metric_reason()));
+            }
+            WatchAuthorization::Unavailable(error) => {
+                return Err(WatchSubscriptionError::AuthorizationUnavailable(error));
+            }
+        }
+        self.storing = true;
+        let store = StoreWatchOperation::create(self.subscription.clone(), self.replication.take());
+        Ok(Next::Call(IoCall::child(store)))
     }
 }
 
