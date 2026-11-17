@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
+use crate::jobs::demand::group_demand;
 use crate::jobs::records::rows::from_bytes;
-use crate::node::node_info::group_demand;
 use aruna_core::NodeId;
 use aruna_core::compute::quota::{
     ComputeQuota, QuotaDenied, ResourceTotals, admits, understated_denial,
